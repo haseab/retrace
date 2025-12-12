@@ -1,1 +1,1 @@
-The open source and free version of Rewind AI
+The open source and free version of software like Rewind AI
