@@ -1,0 +1,274 @@
+import Foundation
+import Shared
+
+/// Main search manager implementing SearchProtocol
+/// Coordinates query parsing, FTS search, and result ranking
+public actor SearchManager: SearchProtocol {
+
+    // MARK: - Dependencies
+
+    private let database: any DatabaseProtocol
+    private let ftsEngine: any FTSProtocol
+    private let queryParser: QueryParser
+    private let resultRanker: ResultRanker
+    private let snippetGenerator: SnippetGenerator
+
+    // MARK: - State
+
+    private var config: SearchConfig
+    private var isInitialized = false
+
+    // Statistics
+    private var totalSearches = 0
+    private var searchTimes: [Double] = []
+
+    // MARK: - Initialization
+
+    public init(
+        database: any DatabaseProtocol,
+        ftsEngine: any FTSProtocol
+    ) {
+        self.database = database
+        self.ftsEngine = ftsEngine
+        self.queryParser = QueryParser()
+        self.resultRanker = ResultRanker()
+        self.snippetGenerator = SnippetGenerator()
+        self.config = .default
+    }
+
+    // MARK: - SearchProtocol: Lifecycle
+
+    public func initialize(config: SearchConfig) async throws {
+        self.config = config
+        isInitialized = true
+        Log.info("Search manager initialized", category: .search)
+    }
+
+    // MARK: - SearchProtocol: Full-Text Search
+
+    public func search(query: SearchQuery) async throws -> SearchResults {
+        guard isInitialized else {
+            throw SearchError.indexNotReady
+        }
+
+        let startTime = Date()
+
+        // Validate query
+        let validationErrors = queryParser.validate(query: query)
+        if !validationErrors.isEmpty {
+            throw SearchError.invalidQuery(reason: validationErrors.first?.message ?? "Invalid query")
+        }
+
+        // Parse query
+        let parsed = try queryParser.parse(rawQuery: query.text)
+
+        // Build FTS query
+        let ftsQuery = parsed.toFTSQuery()
+
+        // Build filters
+        var filters = query.filters
+        if let appFilter = parsed.appFilter {
+            filters = SearchFilters(
+                startDate: filters.startDate ?? parsed.dateRange.start,
+                endDate: filters.endDate ?? parsed.dateRange.end,
+                appBundleIDs: [appFilter],
+                excludedAppBundleIDs: filters.excludedAppBundleIDs
+            )
+        } else if parsed.dateRange.start != nil || parsed.dateRange.end != nil {
+            filters = SearchFilters(
+                startDate: filters.startDate ?? parsed.dateRange.start,
+                endDate: filters.endDate ?? parsed.dateRange.end,
+                appBundleIDs: filters.appBundleIDs,
+                excludedAppBundleIDs: filters.excludedAppBundleIDs
+            )
+        }
+
+        // Execute FTS search
+        let ftsMatches = try await ftsEngine.search(
+            query: ftsQuery,
+            filters: filters,
+            limit: query.limit,
+            offset: query.offset
+        )
+
+        // Get total count for pagination
+        let totalCount = try await ftsEngine.getMatchCount(query: ftsQuery, filters: filters)
+
+        // Convert FTS matches to SearchResults
+        var results: [SearchResult] = []
+        for match in ftsMatches {
+            // Get frame reference to get segment info
+            if let frame = try await database.getFrame(id: match.frameID) {
+                let result = SearchResult(
+                    id: match.frameID,
+                    timestamp: match.timestamp,
+                    snippet: match.snippet,
+                    matchedText: snippetGenerator.extractMatchedText(from: match.snippet),
+                    relevanceScore: normalizeRank(match.rank),
+                    metadata: FrameMetadata(
+                        appBundleID: nil,
+                        appName: match.appName,
+                        windowTitle: match.windowTitle,
+                        browserURL: nil
+                    ),
+                    segmentID: frame.segmentID,
+                    frameIndex: frame.frameIndexInSegment
+                )
+                results.append(result)
+            }
+        }
+
+        // Rank results
+        let rankedResults = resultRanker.rank(results, forQuery: query.text)
+
+        // Filter by minimum relevance score
+        let filteredResults = rankedResults.filter { $0.relevanceScore >= config.minimumRelevanceScore }
+
+        let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+
+        // Update statistics
+        totalSearches += 1
+        searchTimes.append(Double(searchTimeMs))
+
+        Log.searchQuery(query: query.text, resultCount: filteredResults.count, timeMs: searchTimeMs)
+
+        return SearchResults(
+            query: query,
+            results: filteredResults,
+            totalCount: totalCount,
+            searchTimeMs: searchTimeMs
+        )
+    }
+
+    public func search(text: String, limit: Int) async throws -> SearchResults {
+        return try await search(query: SearchQuery(text: text, limit: limit))
+    }
+
+    public func getSuggestions(prefix: String, limit: Int) async throws -> [String] {
+        guard isInitialized else {
+            throw SearchError.indexNotReady
+        }
+
+        // Use prefix search to find matching terms
+        // Search for "prefix*" to get documents containing words starting with prefix
+        let prefixQuery = "\(prefix)*"
+
+        do {
+            let results = try await ftsEngine.search(
+                query: prefixQuery,
+                filters: SearchFilters(),
+                limit: min(limit * 3, 100),  // Get more results to extract unique words
+                offset: 0
+            )
+
+            // Extract unique words from snippets that start with prefix
+            var suggestions = Set<String>()
+            let lowercasePrefix = prefix.lowercased()
+
+            for match in results {
+                // Parse words from snippet
+                let words = match.snippet
+                    .components(separatedBy: CharacterSet.whitespacesAndNewlines)
+                    .map { word in
+                        // Remove punctuation
+                        word.trimmingCharacters(in: CharacterSet.punctuationCharacters)
+                            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                            .lowercased()
+                    }
+                    .filter { word in
+                        // Only keep words that start with prefix
+                        !word.isEmpty && word.hasPrefix(lowercasePrefix)
+                    }
+
+                suggestions.formUnion(words)
+
+                if suggestions.count >= limit {
+                    break
+                }
+            }
+
+            // Return sorted suggestions
+            return Array(suggestions)
+                .sorted()
+                .prefix(limit)
+                .map { $0 }
+        } catch {
+            // If prefix search fails (e.g., empty prefix), return empty
+            return []
+        }
+    }
+
+
+    // MARK: - SearchProtocol: Indexing
+
+    public func index(text: ExtractedText) async throws {
+        guard isInitialized else {
+            throw SearchError.indexNotReady
+        }
+
+        // Skip empty text
+        guard !text.isEmpty else {
+            return
+        }
+
+        // Create indexed document
+        let document = IndexedDocument(
+            id: 0,  // Will be assigned by database
+            frameID: text.frameID,
+            timestamp: text.timestamp,
+            content: text.fullText,
+            appName: text.metadata.appName,
+            windowTitle: text.metadata.windowTitle,
+            browserURL: text.metadata.browserURL
+        )
+
+        // Insert into database (which updates FTS index)
+        let _ = try await database.insertDocument(document)
+
+        Log.debug("Indexed document for frame \(text.frameID.stringValue.prefix(8))", category: .search)
+    }
+
+    public func removeFromIndex(frameID: FrameID) async throws {
+        // Get document to delete
+        if let doc = try await database.getDocument(frameID: frameID) {
+            try await database.deleteDocument(id: doc.id)
+            Log.debug("Removed document for frame \(frameID.stringValue.prefix(8))", category: .search)
+        }
+    }
+
+    public func rebuildIndex() async throws {
+        Log.info("Rebuilding FTS index", category: .search)
+        try await ftsEngine.rebuildIndex()
+        Log.info("FTS index rebuild complete", category: .search)
+    }
+
+    // MARK: - SearchProtocol: Statistics
+
+    public func getStatistics() async -> SearchStatistics {
+        let dbStats = (try? await database.getStatistics()) ?? DatabaseStatistics(
+            frameCount: 0,
+            segmentCount: 0,
+            documentCount: 0,
+            databaseSizeBytes: 0,
+            oldestFrameDate: nil,
+            newestFrameDate: nil
+        )
+
+        let avgSearchTime = searchTimes.isEmpty ? 0.0 : searchTimes.reduce(0, +) / Double(searchTimes.count)
+
+        return SearchStatistics(
+            totalDocuments: dbStats.documentCount,
+            totalSearches: totalSearches,
+            averageSearchTimeMs: avgSearchTime
+        )
+    }
+
+    // MARK: - Private Helpers
+
+    /// Normalize BM25 rank to 0-1 relevance score
+    private func normalizeRank(_ bm25Rank: Double) -> Double {
+        // BM25 returns negative values (more negative = better match)
+        // Normalize to 0-1 range: higher score for more negative BM25
+        return -bm25Rank / (1.0 + abs(bm25Rank))
+    }
+}

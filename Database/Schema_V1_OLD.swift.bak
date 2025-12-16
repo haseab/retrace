@@ -1,0 +1,634 @@
+import Foundation
+import SQLite3
+
+// MARK: - SQLite Constants
+
+/// SQLITE_TRANSIENT constant for Swift - tells SQLite to make its own copy of the string
+let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                           RETRACE DATABASE SCHEMA                            ║
+// ║                                  Version 1                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+//
+// ┌─────────────────────────────────────────────────────────────────────────────┐
+// │                              SCHEMA OVERVIEW                                 │
+// ├─────────────────────────────────────────────────────────────────────────────┤
+// │                                                                             │
+// │   ┌──────────────┐       ┌──────────────┐       ┌──────────────────┐       │
+// │   │   segments   │──────<│    frames    │>──────│   app_sessions   │       │
+// │   │   (video)    │ 1:N   │  (captures)  │  N:1  │  (app tracking)  │       │
+// │   └──────────────┘       └──────┬───────┘       └────────┬─────────┘       │
+// │                                 │                        │                  │
+// │                                 │ 1:1                    │                  │
+// │                                 ▼                        │                  │
+// │                          ┌──────────────┐                │                  │
+// │                          │  documents   │                │                  │
+// │                          │  (OCR text)  │                │                  │
+// │                          └──────┬───────┘                │                  │
+// │                                 │                        │                  │
+// │              ┌──────────────────┼────────────────────────┘                  │
+// │              │                  │                                           │
+// │              ▼                  ▼                                           │
+// │   ┌───────────────────┐  ┌─────────────────┐                               │
+// │   │ document_sessions │  │  documents_fts  │  (Full-Text Search)           │
+// │   │   (junction)      │  │  (virtual)      │                               │
+// │   └───────────────────┘  └─────────────────┘                               │
+// │                                                                             │
+// │   Supporting Tables:                                                        │
+// │   • text_regions    - OCR bounding boxes for UI highlighting               │
+// │   • audio_captures  - Speech-to-text (future)                              │
+// │   • encoding_queue  - Async video encoding jobs                            │
+// │   • deletion_queue  - Deferred file cleanup                                │
+// │                                                                             │
+// └─────────────────────────────────────────────────────────────────────────────┘
+
+/// SQL schema definitions for Retrace database
+/// Owner: DATABASE agent
+enum Schema {
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │                            SCHEMA VERSION                               │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    static let currentVersion = 1
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │                             TABLE NAMES                                 │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    enum Tables {
+        static let segments = "segments"
+        static let frames = "frames"
+        static let appSessions = "app_sessions"
+        static let textRegions = "text_regions"
+        static let audioCaptures = "audio_captures"
+        static let audioSentences = "audio_sentences"
+        static let audioSentencesFTS = "audio_sentences_fts"
+        static let documents = "documents"
+        static let documentsFTS = "documents_fts"
+        static let documentSessions = "document_sessions"
+        static let sessionSegments = "session_segments"
+        static let encodingQueue = "encoding_queue"
+        static let deletionQueue = "deletion_queue"
+        static let schemaMigrations = "schema_migrations"
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │                         SCHEMA MIGRATIONS                               │
+    // │  Tracks which migrations have been applied to this database             │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    static let createSchemaMigrationsTable = """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version     INTEGER PRIMARY KEY,
+            applied_at  INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+        );
+        """
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                           CORE TABLES                                   ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ SEGMENTS                                                                │
+    // │ Video files containing multiple frames (5-min chunks)                   │
+    // │                                                                         │
+    // │ Relationships:                                                          │
+    // │   segments 1:N frames (one video contains many frames)                  │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               TEXT PK     UUID identifier
+    //  start_time       INTEGER     First frame timestamp (ms since epoch)
+    //  end_time         INTEGER     Last frame timestamp (ms since epoch)
+    //  frame_count      INTEGER     Number of frames in segment
+    //  file_size_bytes  INTEGER     Size of video file on disk
+    //  relative_path    TEXT        Path relative to storage root
+    //  width            INTEGER     Video width in pixels
+    //  height           INTEGER     Video height in pixels
+    //  source           TEXT        'native' | 'rewind' | 'screen_memory'
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createSegmentsTable = """
+        CREATE TABLE segments (
+            id               TEXT PRIMARY KEY,
+            start_time       INTEGER NOT NULL,
+            end_time         INTEGER NOT NULL,
+            frame_count      INTEGER NOT NULL,
+            file_size_bytes  INTEGER NOT NULL,
+            relative_path    TEXT NOT NULL,
+            width            INTEGER NOT NULL,
+            height           INTEGER NOT NULL,
+            source           TEXT DEFAULT 'native',
+            created_at       INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+        );
+        """
+
+    static let createSegmentsTimeIndex = """
+        CREATE INDEX idx_segments_time ON segments(start_time, end_time);
+        """
+
+    static let createSegmentsSourceIndex = """
+        CREATE INDEX idx_segments_source ON segments(source);
+        """
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ FRAMES                                                                  │
+    // │ Individual screen captures with metadata                                │
+    // │                                                                         │
+    // │ Relationships:                                                          │
+    // │   frames N:1 segments     (many frames in one video)                    │
+    // │   frames N:1 app_sessions (many frames in one app session)              │
+    // │   frames 1:1 documents    (one frame has one OCR document)              │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               TEXT PK     Composite: {timestamp}_{displayID}_{hash}
+    //  segment_id       TEXT FK     → segments.id
+    //  session_id       TEXT FK     → app_sessions.id (nullable)
+    //  timestamp        INTEGER     Capture time (ms since epoch)
+    //  frame_index      INTEGER     Position within segment (0-indexed)
+    //  encoding_status  TEXT        'pending' | 'encoding' | 'success' | 'failed'
+    //  app_bundle_id    TEXT        e.g., 'com.apple.Safari'
+    //  app_name         TEXT        e.g., 'Safari'
+    //  window_title     TEXT        e.g., 'GitHub - retrace'
+    //  browser_url      TEXT        URL if browser (nullable)
+    //  source           TEXT        'native' | 'rewind' | 'screen_memory'
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createFramesTable = """
+        CREATE TABLE frames (
+            id               TEXT PRIMARY KEY,
+            segment_id       TEXT NOT NULL,
+            session_id       TEXT,
+            timestamp        INTEGER NOT NULL,
+            frame_index      INTEGER NOT NULL,
+            encoding_status  TEXT DEFAULT 'pending',
+            app_bundle_id    TEXT,
+            app_name         TEXT,
+            window_title     TEXT,
+            browser_url      TEXT,
+            source           TEXT DEFAULT 'native',
+            created_at       INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES app_sessions(id) ON DELETE SET NULL
+        );
+        """
+
+    static let createFramesTimestampIndex   = "CREATE INDEX idx_frames_timestamp ON frames(timestamp);"
+    static let createFramesSegmentIndex     = "CREATE INDEX idx_frames_segment ON frames(segment_id);"
+    static let createFramesAppIndex         = "CREATE INDEX idx_frames_app ON frames(app_bundle_id);"
+    static let createFramesSourceIndex      = "CREATE INDEX idx_frames_source ON frames(source);"
+    static let createFramesSessionIndex     = "CREATE INDEX idx_frames_session ON frames(session_id);"
+    static let createFramesEncodingStatusIndex = "CREATE INDEX idx_frames_encoding_status ON frames(encoding_status);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ APP_SESSIONS                                                            │
+    // │ Continuous periods of using a specific app/window                       │
+    // │                                                                         │
+    // │ Relationships:                                                          │
+    // │   app_sessions 1:N frames (one session spans many frames)               │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               TEXT PK     UUID identifier
+    //  app_bundle_id    TEXT        e.g., 'com.apple.Safari'
+    //  app_name         TEXT        e.g., 'Safari'
+    //  window_title     TEXT        e.g., 'GitHub - retrace'
+    //  browser_url      TEXT        URL if browser (nullable)
+    //  display_id       INTEGER     Which monitor
+    //  start_time       INTEGER     Session start (ms since epoch)
+    //  end_time         INTEGER     Session end (nullable if ongoing)
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createAppSessionsTable = """
+        CREATE TABLE app_sessions (
+            id              TEXT PRIMARY KEY,
+            app_bundle_id   TEXT NOT NULL,
+            app_name        TEXT,
+            window_title    TEXT,
+            browser_url     TEXT,
+            display_id      INTEGER,
+            start_time      INTEGER NOT NULL,
+            end_time        INTEGER,
+            created_at      INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+        );
+        """
+
+    static let createAppSessionsTimeIndex = "CREATE INDEX idx_app_sessions_time ON app_sessions(start_time, end_time);"
+    static let createAppSessionsAppIndex  = "CREATE INDEX idx_app_sessions_app ON app_sessions(app_bundle_id);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ DOCUMENTS                                                               │
+    // │ Searchable OCR text extracted from frames                               │
+    // │                                                                         │
+    // │ Relationships:                                                          │
+    // │   documents 1:1 frames       (one document per frame)                   │
+    // │   documents → documents_fts  (auto-synced via triggers)                 │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               INTEGER PK  Auto-increment (used as FTS rowid)
+    //  frame_id         TEXT FK     → frames.id (UNIQUE)
+    //  content          TEXT        Full OCR text from frame
+    //  app_name         TEXT        Denormalized for faster search
+    //  window_title     TEXT        Denormalized for faster search
+    //  browser_url      TEXT        Denormalized for faster search
+    //  timestamp        INTEGER     Denormalized for faster search
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createDocumentsTable = """
+        CREATE TABLE documents (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id      TEXT NOT NULL UNIQUE,
+            content       TEXT NOT NULL,
+            app_name      TEXT,
+            window_title  TEXT,
+            browser_url   TEXT,
+            timestamp     INTEGER NOT NULL,
+            created_at    INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        );
+        """
+
+    static let createDocumentsTimestampIndex = "CREATE INDEX idx_documents_timestamp ON documents(timestamp);"
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                        FULL-TEXT SEARCH (FTS5)                          ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ DOCUMENTS_FTS                                                           │
+    // │ FTS5 virtual table for fast text search                                 │
+    // │                                                                         │
+    // │ Features:                                                               │
+    // │   • Porter stemming: "running" matches "run", "ran"                     │
+    // │   • Unicode support: handles international text                         │
+    // │   • BM25 ranking: relevance-sorted results                              │
+    // │   • Snippets: highlighted search matches                                │
+    // │                                                                         │
+    // │ Auto-synced from documents table via triggers                           │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    static let createDocumentsFTSTable = """
+        CREATE VIRTUAL TABLE documents_fts USING fts5(
+            content,
+            app_name,
+            window_title,
+            content='documents',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+        """
+
+    // FTS Sync Triggers - Keep documents_fts in sync with documents table
+    static let createDocumentsFTSInsertTrigger = """
+        CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+            INSERT INTO documents_fts(rowid, content, app_name, window_title)
+            VALUES (new.id, new.content, new.app_name, new.window_title);
+        END;
+        """
+
+    static let createDocumentsFTSDeleteTrigger = """
+        CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, content, app_name, window_title)
+            VALUES ('delete', old.id, old.content, old.app_name, old.window_title);
+        END;
+        """
+
+    static let createDocumentsFTSUpdateTrigger = """
+        CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+            INSERT INTO documents_fts(documents_fts, rowid, content, app_name, window_title)
+            VALUES ('delete', old.id, old.content, old.app_name, old.window_title);
+            INSERT INTO documents_fts(rowid, content, app_name, window_title)
+            VALUES (new.id, new.content, new.app_name, new.window_title);
+        END;
+        """
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                          SUPPORTING TABLES                              ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ TEXT_REGIONS                                                            │
+    // │ OCR bounding boxes for UI highlighting and click-to-zoom                │
+    // │                                                                         │
+    // │ Storage estimate: ~150GB                                                │
+    // │   (200 bytes × 50 regions/frame × 15M frames/year)                      │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               INTEGER PK  Auto-increment
+    //  frame_id         TEXT FK     → frames.id
+    //  text             TEXT        The text in this region
+    //  x, y             INTEGER     Top-left corner (pixels)
+    //  width, height    INTEGER     Bounding box size (pixels)
+    //  confidence       REAL        OCR confidence 0.0-1.0
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createTextRegionsTable = """
+        CREATE TABLE text_regions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id    TEXT NOT NULL,
+            text        TEXT NOT NULL,
+            x           INTEGER NOT NULL,
+            y           INTEGER NOT NULL,
+            width       INTEGER NOT NULL,
+            height      INTEGER NOT NULL,
+            confidence  REAL,
+            created_at  INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        );
+        """
+
+    static let createTextRegionsFrameIndex = "CREATE INDEX idx_text_regions_frame ON text_regions(frame_id);"
+    static let createTextRegionsTextIndex  = "CREATE INDEX idx_text_regions_text ON text_regions(text);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ AUDIO_CAPTURES                                                          │
+    // │ Speech-to-text transcriptions (future feature)                          │
+    // │                                                                         │
+    // │ Storage estimate: ~5GB/year                                             │
+    // │   (100 bytes × 10 words/sec × 8760 hours)                               │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               INTEGER PK  Auto-increment
+    //  session_id       TEXT FK     → app_sessions.id
+    //  text             TEXT        Transcribed word/phrase
+    //  start_time       INTEGER     Word start (ms since epoch)
+    //  end_time         INTEGER     Word end (ms since epoch)
+    //  speaker          TEXT        Speaker label (future)
+    //  source           TEXT        'zoom' | 'system' | 'microphone'
+    //  confidence       REAL        Transcription confidence 0.0-1.0
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createAudioCapturesTable = """
+        CREATE TABLE audio_captures (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT,
+            text        TEXT NOT NULL,
+            start_time  INTEGER NOT NULL,
+            end_time    INTEGER NOT NULL,
+            speaker     TEXT,
+            source      TEXT,
+            confidence  REAL,
+            created_at  INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (session_id) REFERENCES app_sessions(id) ON DELETE SET NULL
+        );
+        """
+
+    static let createAudioCapturesTimeIndex    = "CREATE INDEX idx_audio_captures_time ON audio_captures(start_time, end_time);"
+    static let createAudioCapturesSessionIndex = "CREATE INDEX idx_audio_captures_session ON audio_captures(session_id);"
+    static let createAudioCapturesSourceIndex  = "CREATE INDEX idx_audio_captures_source ON audio_captures(source);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ AUDIO_SENTENCES                                                         │
+    // │ Sentence-level audio transcriptions with file storage                   │
+    // │                                                                         │
+    // │ Storage estimate: ~300MB/day (8 hours)                                  │
+    // │   Sentences: ~5s avg × 8h = 5,760 sentences/day                        │
+    // │   Audio: ~50KB/sentence × 5,760 = ~288MB/day audio files               │
+    // │   DB rows: ~200 bytes/row × 5,760 = ~1.1MB/day metadata                │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               TEXT PK     {timestamp}_{source}_{index}
+    //  session_id       TEXT FK     → app_sessions.id
+    //  text             TEXT        Sentence transcription
+    //  start_time       INTEGER     Sentence start (ms since epoch)
+    //  end_time         INTEGER     Sentence end (ms since epoch)
+    //  duration         REAL        Duration in seconds
+    //  source           TEXT        'microphone' | 'system_audio'
+    //  confidence       REAL        Average word confidence 0.0-1.0
+    //  word_count       INTEGER     Number of words in sentence
+    //  file_path        TEXT        Relative path to M4A file
+    //  file_size        INTEGER     File size in bytes
+    //  created_at       INTEGER     Row creation timestamp
+
+    static let createAudioSentencesTable = """
+        CREATE TABLE audio_sentences (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT,
+            text        TEXT NOT NULL,
+            start_time  INTEGER NOT NULL,
+            end_time    INTEGER NOT NULL,
+            duration    REAL,
+            source      TEXT NOT NULL,
+            confidence  REAL,
+            word_count  INTEGER,
+            file_path   TEXT NOT NULL,
+            file_size   INTEGER,
+            created_at  INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (session_id) REFERENCES app_sessions(id) ON DELETE SET NULL
+        );
+        """
+
+    static let createAudioSentencesTimeIndex    = "CREATE INDEX idx_audio_sentences_time ON audio_sentences(start_time, end_time);"
+    static let createAudioSentencesSessionIndex = "CREATE INDEX idx_audio_sentences_session ON audio_sentences(session_id);"
+    static let createAudioSentencesSourceIndex  = "CREATE INDEX idx_audio_sentences_source ON audio_sentences(source);"
+
+    // FTS5 for audio sentences
+    static let createAudioSentencesFTSTable = """
+        CREATE VIRTUAL TABLE audio_sentences_fts USING fts5(
+            text,
+            content='audio_sentences',
+            content_rowid='rowid',
+            tokenize='porter unicode61'
+        );
+        """
+
+    static let createAudioSentencesFTSInsertTrigger = """
+        CREATE TRIGGER audio_sentences_fts_insert AFTER INSERT ON audio_sentences BEGIN
+            INSERT INTO audio_sentences_fts(rowid, text) VALUES (new.rowid, new.text);
+        END;
+        """
+
+    static let createAudioSentencesFTSDeleteTrigger = """
+        CREATE TRIGGER audio_sentences_fts_delete AFTER DELETE ON audio_sentences BEGIN
+            DELETE FROM audio_sentences_fts WHERE rowid = old.rowid;
+        END;
+        """
+
+    static let createAudioSentencesFTSUpdateTrigger = """
+        CREATE TRIGGER audio_sentences_fts_update AFTER UPDATE ON audio_sentences BEGIN
+            UPDATE audio_sentences_fts SET text = new.text WHERE rowid = new.rowid;
+        END;
+        """
+
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                          JUNCTION TABLES                                ║
+    // ║              (For query performance at scale)                           ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ DOCUMENT_SESSIONS                                                       │
+    // │ Links documents to sessions for fast search filtering                   │
+    // │                                                                         │
+    // │ Without this: FTS → documents → frames → app_sessions (3 JOINs)         │
+    // │ With this:    FTS → document_sessions (1 lookup)                        │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    static let createDocumentSessionsTable = """
+        CREATE TABLE document_sessions (
+            document_id  INTEGER NOT NULL,
+            session_id   TEXT NOT NULL,
+            timestamp    INTEGER NOT NULL,
+            PRIMARY KEY (document_id, session_id),
+            FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+            FOREIGN KEY (session_id) REFERENCES app_sessions(id) ON DELETE CASCADE
+        );
+        """
+
+    static let createDocumentSessionsDocIndex     = "CREATE INDEX idx_document_sessions_doc ON document_sessions(document_id);"
+    static let createDocumentSessionsSessionIndex = "CREATE INDEX idx_document_sessions_session ON document_sessions(session_id);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ SESSION_SEGMENTS                                                        │
+    // │ Links sessions to video segments for efficient video retrieval          │
+    // │                                                                         │
+    // │ Note: One session can span multiple segments, and one segment can       │
+    // │       contain multiple sessions (many-to-many relationship)             │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    static let createSessionSegmentsTable = """
+        CREATE TABLE session_segments (
+            session_id  TEXT NOT NULL,
+            segment_id  TEXT NOT NULL,
+            PRIMARY KEY (session_id, segment_id),
+            FOREIGN KEY (session_id) REFERENCES app_sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY (segment_id) REFERENCES segments(id) ON DELETE CASCADE
+        );
+        """
+
+    static let createSessionSegmentsSessionIndex = "CREATE INDEX idx_session_segments_session ON session_segments(session_id);"
+    static let createSessionSegmentsSegmentIndex = "CREATE INDEX idx_session_segments_segment ON session_segments(segment_id);"
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                         ASYNC PROCESSING QUEUES                         ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ ENCODING_QUEUE                                                          │
+    // │ Async video encoding jobs (frames waiting to be encoded)                │
+    // │                                                                         │
+    // │ Status flow: pending → encoding → success/failed                        │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               INTEGER PK  Auto-increment
+    //  frame_id         TEXT FK     → frames.id (UNIQUE)
+    //  priority         INTEGER     Higher = processed first
+    //  retry_count      INTEGER     Number of failed attempts
+    //  error_message    TEXT        Last error if failed
+    //  status           TEXT        'pending' | 'encoding' | 'success' | 'failed'
+    //  created_at       INTEGER     Job creation timestamp
+    //  updated_at       INTEGER     Last status change
+
+    static let createEncodingQueueTable = """
+        CREATE TABLE encoding_queue (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            frame_id       TEXT NOT NULL UNIQUE,
+            priority       INTEGER DEFAULT 0,
+            retry_count    INTEGER DEFAULT 0,
+            error_message  TEXT,
+            status         TEXT DEFAULT 'pending',
+            created_at     INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            updated_at     INTEGER DEFAULT (strftime('%s', 'now') * 1000),
+            FOREIGN KEY (frame_id) REFERENCES frames(id) ON DELETE CASCADE
+        );
+        """
+
+    static let createEncodingQueueStatusIndex = "CREATE INDEX idx_encoding_queue_status ON encoding_queue(status, priority DESC);"
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ DELETION_QUEUE                                                          │
+    // │ Deferred file cleanup (delete files in background)                      │
+    // │                                                                         │
+    // │ Why deferred? Deleting large video files can be slow. Queue them        │
+    // │ here and process during idle time.                                      │
+    // └─────────────────────────────────────────────────────────────────────────┘
+    //
+    //  Column           Type        Description
+    //  ──────────────── ─────────── ────────────────────────────────────────────
+    //  id               INTEGER PK  Auto-increment
+    //  entity_type      TEXT        'segment' | 'frame' | 'document'
+    //  entity_id        TEXT        ID of the deleted entity
+    //  file_path        TEXT        Path to file to delete (if applicable)
+    //  created_at       INTEGER     When deletion was queued
+
+    static let createDeletionQueueTable = """
+        CREATE TABLE deletion_queue (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type  TEXT NOT NULL,
+            entity_id    TEXT NOT NULL,
+            file_path    TEXT,
+            created_at   INTEGER DEFAULT (strftime('%s', 'now') * 1000)
+        );
+        """
+
+    static let createDeletionQueueTypeIndex = "CREATE INDEX idx_deletion_queue_type ON deletion_queue(entity_type);"
+
+    // ╔═════════════════════════════════════════════════════════════════════════╗
+    // ║                           PRAGMA SETTINGS                               ║
+    // ║                  (Applied on every database connection)                 ║
+    // ╚═════════════════════════════════════════════════════════════════════════╝
+
+    /// WAL mode: Allows concurrent reads while writing
+    static let enableWAL = "PRAGMA journal_mode=WAL;"
+
+    /// NORMAL sync: Faster than FULL, still crash-safe with WAL
+    static let setSynchronousNormal = "PRAGMA synchronous=NORMAL;"
+
+    /// Enable foreign key constraint enforcement
+    static let enableForeignKeys = "PRAGMA foreign_keys=ON;"
+
+    /// Use memory for temp tables (faster)
+    static let setTempStoreMemory = "PRAGMA temp_store=MEMORY;"
+
+    /// Checkpoint WAL every ~4MB (1000 pages × 4KB)
+    static let setWALAutocheckpoint = "PRAGMA wal_autocheckpoint=1000;"
+
+    /// All pragmas to run on database initialization
+    static var initializationPragmas: [String] {
+        [
+            enableWAL,
+            setSynchronousNormal,
+            enableForeignKeys,
+            setTempStoreMemory,
+            setWALAutocheckpoint
+        ]
+    }
+}
+
+// ╔═════════════════════════════════════════════════════════════════════════════╗
+// ║                          DATE CONVERSION UTILITIES                          ║
+// ╚═════════════════════════════════════════════════════════════════════════════╝
+
+extension Schema {
+
+    /// Convert Swift Date → SQLite timestamp (milliseconds since Unix epoch)
+    static func dateToTimestamp(_ date: Date) -> Int64 {
+        Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    /// Convert SQLite timestamp (milliseconds) → Swift Date
+    static func timestampToDate(_ timestamp: Int64) -> Date {
+        Date(timeIntervalSince1970: Double(timestamp) / 1000)
+    }
+
+    /// Get current timestamp in milliseconds
+    static func currentTimestamp() -> Int64 {
+        dateToTimestamp(Date())
+    }
+}

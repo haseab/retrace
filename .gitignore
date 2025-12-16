@@ -1,0 +1,82 @@
+# Dependencies
+.build
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+out/
+*.exe
+*.dll
+*.so
+*.dylib
+# EXCEPT bundled libraries
+!Vendors/**/lib/*.dylib
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Xcode user state
+.swiftpm/xcode/
+*.xcuserstate
+xcuserdata/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+*.cache
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
+
+# Downloaded AI models (runtime downloads)
+# Models are downloaded on first launch, not bundled in repo
+models/
+*.bin
+*.gguf
+
+# Local development workspace (personal files, experiments, notes)
+/local/
+
+# Markdown files (except key docs)
+*.md
+!README.md
+!AGENTS.md
+!CONTRIBUTING.md
+!*/README.md
+!*/AGENTS.md
+
+# Xcode user-specific data
+.swiftpm/xcode/xcuserdata/
+
+# Additional build artifacts
+.tmp/
+.clang-module-cache/
+clang-module-cache/
+
+# Module maps (generated at build time)
+Processing/Audio/module.modulemap
+
+# Disabled test files
+*.swift.disabled
