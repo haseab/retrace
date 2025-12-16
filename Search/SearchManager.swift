@@ -11,7 +11,8 @@ public actor SearchManager: SearchProtocol {
     private let ftsEngine: any FTSProtocol
     private let queryParser: QueryParser
     private let resultRanker: ResultRanker
-    private let snippetGenerator: SnippetGenerator
+    // ⚠️ RELEASE 2 ONLY - Search highlighting removed for Release 1
+    // private let snippetGenerator: SnippetGenerator
 
     // MARK: - State
 
@@ -32,7 +33,8 @@ public actor SearchManager: SearchProtocol {
         self.ftsEngine = ftsEngine
         self.queryParser = QueryParser()
         self.resultRanker = ResultRanker()
-        self.snippetGenerator = SnippetGenerator()
+        // ⚠️ RELEASE 2 ONLY - Search highlighting removed for Release 1
+        // self.snippetGenerator = SnippetGenerator()
         self.config = .default
     }
 
@@ -99,11 +101,14 @@ public actor SearchManager: SearchProtocol {
         for match in ftsMatches {
             // Get frame reference to get segment info
             if let frame = try await database.getFrame(id: match.frameID) {
+                // ⚠️ RELEASE 2 ONLY - Use simple matched text extraction for Release 1
+                let matchedText = match.snippet.components(separatedBy: " ").prefix(5).joined(separator: " ")
+
                 let result = SearchResult(
                     id: match.frameID,
                     timestamp: match.timestamp,
                     snippet: match.snippet,
-                    matchedText: snippetGenerator.extractMatchedText(from: match.snippet),
+                    matchedText: matchedText,
                     relevanceScore: normalizeRank(match.rank),
                     metadata: FrameMetadata(
                         appBundleID: nil,

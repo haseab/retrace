@@ -141,7 +141,9 @@ public struct FrameViewer: View {
                         .scaleEffect(zoomScale)
                         .offset(dragOffset)
 
-                    // Bounding boxes overlay
+                    // ⚠️ RELEASE 2 ONLY - Bounding box overlay removed for Release 1
+                    // Search highlighting will be added in Release 2
+                    /*
                     if !textRegions.isEmpty {
                         BoundingBoxOverlay(
                             regions: textRegions,
@@ -151,6 +153,7 @@ public struct FrameViewer: View {
                         .scaleEffect(zoomScale)
                         .offset(dragOffset)
                     }
+                    */
                 }
                 .frame(
                     width: geometry.size.width,

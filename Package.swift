@@ -3,12 +3,14 @@ import PackageDescription
 import Foundation
 
 // MARK: - Whisper.cpp Path Configuration (Bundled)
+// ⚠️ RELEASE 2 ONLY - Audio transcription dependencies
+// Uncomment these for Release 2 (January 1st) when audio features are re-enabled
 
 /// Use bundled whisper.cpp library from Vendors directory
 /// This makes the project self-contained - no external dependencies needed for building
-let whisperPath = "Vendors/whisper"
-let whisperIncludePath = whisperPath + "/include"
-let whisperLibPath = whisperPath + "/lib"
+// let whisperPath = "Vendors/whisper"
+// let whisperIncludePath = whisperPath + "/include"
+// let whisperLibPath = whisperPath + "/lib"
 
 
 // MARK: - Package Definition
@@ -27,10 +29,11 @@ let package = Package(
         .library(name: "Search", targets: ["Search"]),
         .library(name: "Migration", targets: ["Migration"]),
         .library(name: "App", targets: ["App"]),
-        // .executable(name: "Retrace", targets: ["RetraceUI"]),
+        .executable(name: "Retrace", targets: ["RetraceUI"]),
     ],
     dependencies: [
         // NOTE: Dependencies are bundled locally in Vendors/ or will be downloaded at runtime
+        // ⚠️ RELEASE 2 ONLY:
         // whisper.cpp - bundled in Vendors/whisper/
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
     ],
@@ -60,14 +63,8 @@ let package = Package(
             path: "Database/Tests",
             exclude: [
                 "_future"  // Release 2+ tests
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
         ),
 
         // MARK: - Storage module
@@ -85,14 +82,8 @@ let package = Package(
         .testTarget(
             name: "StorageTests",
             dependencies: ["Storage", "Shared"],
-            path: "Storage/Tests",
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
-            ]
+            path: "Storage/Tests"
+            // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
         ),
 
         // MARK: - Capture module
@@ -119,14 +110,8 @@ let package = Package(
             sources: [
                 "Tests",
                 "Audio/Tests"  // Include in test target
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
         ),
 
         // MARK: - Processing module
@@ -143,26 +128,9 @@ let package = Package(
                 "README.md",
                 "AGENTS.md",
                 "PROGRESS.md"
-            ],
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-I" + whisperIncludePath + "/ggml",
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-L" + whisperLibPath,
-                    "-lwhisper",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ]),
-                .linkedFramework("Accelerate"),
-                .linkedFramework("CoreML", .when(platforms: [.macOS])),
-                .linkedFramework("Metal", .when(platforms: [.macOS]))
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+            // Re-add Accelerate, CoreML, Metal frameworks when audio transcription is re-enabled
         ),
         .testTarget(
             name: "ProcessingTests",
@@ -175,21 +143,8 @@ let package = Package(
             sources: [
                 "Tests",
                 "Audio/Tests"  // Include in test target
-            ],
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-I" + whisperIncludePath + "/ggml",
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
 
         // MARK: - Search module
@@ -241,20 +196,8 @@ let package = Package(
             exclude: [
                 "Tests",
                 "README.md"
-            ],
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
         .testTarget(
             name: "AppTests",
@@ -262,25 +205,12 @@ let package = Package(
                 "App",
                 "Shared"
             ],
-            path: "App/Tests",
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-I" + whisperIncludePath + "/ggml",
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
-            ]
+            path: "App/Tests"
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
 
         // MARK: - UI module
-        .target(
+        .executableTarget(
             name: "RetraceUI",
             dependencies: [
                 "Shared",
@@ -296,41 +226,15 @@ let package = Package(
             exclude: [
                 "Tests",
                 "README.md",
-                "AGENTS.md",
-                "RetraceApp.swift"  // Exclude @main from library target
-            ],
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
+                "AGENTS.md"
             ]
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
         .testTarget(
             name: "RetraceUITests",
             dependencies: ["RetraceUI", "Shared", "App"],
-            path: "UI/Tests",
-            cSettings: [
-                .unsafeFlags([
-                    "-I" + whisperIncludePath,
-                    "-I" + whisperIncludePath + "/ggml",
-                    "-fmodule-map-file=" + whisperPath + "/module.modulemap"
-                ])
-            ],
-            linkerSettings: [
-                .unsafeFlags([
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../Vendors/whisper/lib",
-                    "-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../../../../../Vendors/whisper/lib"
-                ])
-            ]
+            path: "UI/Tests"
+            // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
     ]
 )
