@@ -1,13 +1,15 @@
 import SwiftUI
 import App
+import Inject
 
 /// Root content view with navigation between main views
 public struct ContentView: View {
 
     // MARK: - Properties
 
+    @ObserveInjection var inject
     @State private var selectedView: MainView = .dashboard
-    @State private var showOnboarding = false
+    @State private var showOnboarding: Bool? = nil  // nil = loading, true = show onboarding, false = show main app
     @StateObject private var deeplinkHandler = DeeplinkHandler()
     @StateObject private var menuBarManager: MenuBarManager
 
@@ -24,37 +26,77 @@ public struct ContentView: View {
 
     public var body: some View {
         ZStack {
-            // Main content based on selected view
-            Group {
-                switch selectedView {
-                case .dashboard:
-                    DashboardView(coordinator: coordinator)
+            if let showOnboarding = showOnboarding {
+                if showOnboarding {
+                    // Show onboarding flow
+                    OnboardingView(coordinator: coordinator) {
+                        withAnimation {
+                            self.showOnboarding = false
+                            // Sync menu bar recording status after onboarding completes
+                            menuBarManager.syncWithCoordinator()
+                        }
+                    }
+                } else {
+                    // Main content based on selected view
+                    Group {
+                        switch selectedView {
+                        case .dashboard:
+                            DashboardView(coordinator: coordinator)
 
-                case .timeline:
-                    TimelineView(coordinator: coordinator)
+                        case .timeline:
+                            TimelineView(coordinator: coordinator)
 
-                case .search:
-                    SearchView(coordinator: coordinator)
+                        case .search:
+                            SearchView(coordinator: coordinator)
 
-                case .settings:
-                    SettingsView()
+                        case .settings:
+                            SettingsView()
+                        }
+                    }
                 }
+            } else {
+                // Loading state - show nothing or a loading indicator
+                Color.retraceBackground
+                    .ignoresSafeArea()
             }
         }
         .frame(minWidth: 1000, minHeight: 700)
+        .task {
+            // Check onboarding status FIRST before anything else
+            // This prevents flicker by determining what to show before rendering
+            await checkOnboarding()
+        }
         .onAppear {
+            // Delay activation to ensure window is fully loaded
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                // Activate app
+                let currentApp = NSRunningApplication.current
+                currentApp.activate(options: .activateIgnoringOtherApps)
+                NSApp.activate(ignoringOtherApps: true)
+
+                // Bring main window to front
+                for window in NSApp.windows {
+                    // Skip menu bar windows (level > 0 means floating/status bar)
+                    guard window.level.rawValue == 0 else { continue }
+
+                    // Set window properties
+                    window.level = .normal
+                    window.collectionBehavior = [.managed, .participatesInCycle]
+
+                    // Make key and order front
+                    window.makeKeyAndOrderFront(nil)
+                    window.orderFrontRegardless()
+                }
+            }
+
             menuBarManager.setup()
             setupNotifications()
-            checkOnboarding()
         }
         .onOpenURL { url in
             deeplinkHandler.handle(url)
         }
         .onChange(of: deeplinkHandler.activeRoute) { route in
             handleDeeplink(route)
-        }
-        .sheet(isPresented: $showOnboarding) {
-            ModelDownloadView()
         }
     }
 
@@ -104,7 +146,7 @@ public struct ContentView: View {
             selectedView = .search
             // TODO: Pass query/timestamp/app to SearchView
 
-        case .timeline(let timestamp):
+        case .timeline:
             selectedView = .timeline
             // TODO: Pass timestamp to TimelineView
         }
@@ -112,12 +154,10 @@ public struct ContentView: View {
 
     // MARK: - Onboarding
 
-    private func checkOnboarding() {
-        Task {
-            let shouldShow = await coordinator.onboardingManager.shouldShowOnboarding()
-            await MainActor.run {
-                showOnboarding = shouldShow
-            }
+    private func checkOnboarding() async {
+        let shouldShow = await coordinator.onboardingManager.shouldShowOnboarding()
+        await MainActor.run {
+            showOnboarding = shouldShow
         }
     }
 }

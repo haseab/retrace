@@ -56,8 +56,9 @@ public actor DatabaseManager: DatabaseProtocol {
         // Open database
         // Use sqlite3_open_v2 with SQLITE_OPEN_URI to support URI filenames like:
         // file:memdb_xxx?mode=memory&cache=private for unique in-memory databases
+        // SQLITE_OPEN_FULLMUTEX enables thread-safe serialized access mode
         print("[DEBUG] Opening database...")
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(expandedPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             throw DatabaseError.connectionFailed(underlying: errorMsg)
@@ -562,9 +563,10 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         // Check if encryption is enabled in UserDefaults
-        let encryptionEnabled = UserDefaults.standard.object(forKey: "encryptionEnabled") as? Bool ?? true
+        // Default to false (disabled) - user must explicitly enable it during onboarding
+        let encryptionEnabled = UserDefaults.standard.object(forKey: "encryptionEnabled") as? Bool ?? false
         guard encryptionEnabled else {
-            print("[DEBUG] Database encryption disabled")
+            print("[DEBUG] Database encryption disabled by default")
             return
         }
 
@@ -607,18 +609,32 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Save encryption key to Keychain
     private func saveKeyToKeychain(_ key: Data, service: String, account: String) throws {
+        // Create access control that allows access without user interaction
+        // This prevents the keychain password prompt on every app launch
+        guard let access = SecAccessControlCreateWithFlags(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleAfterFirstUnlock,
+            [],
+            nil
+        ) else {
+            throw DatabaseError.connectionFailed(underlying: "Failed to create keychain access control")
+        }
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: key,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            kSecAttrAccessControl as String: access
         ]
 
+        // Delete existing item first
         SecItemDelete(query as CFDictionary)
+
+        // Add new item
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to Keychain")
+            throw DatabaseError.connectionFailed(underlying: "Failed to save encryption key to Keychain (status: \(status))")
         }
     }
 

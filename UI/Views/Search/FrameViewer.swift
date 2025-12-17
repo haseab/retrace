@@ -271,22 +271,17 @@ public struct FrameViewer: View {
     private func loadFrameData() async {
         isLoading = true
 
-        do {
-            // TODO: Get actual segment ID and frame index from result
-            // For now, mock the data
-            // let imageData = try await coordinator.getFrameImage(...)
-            // frameImage = NSImage(data: imageData)
+        // TODO: Get actual segment ID and frame index from result
+        // For now, mock the data
+        // let imageData = try await coordinator.getFrameImage(...)
+        // frameImage = NSImage(data: imageData)
 
-            // TODO: Load OCR text regions from database
-            // textRegions = ...
+        // TODO: Load OCR text regions from database
+        // textRegions = ...
 
-            // Mock data for preview
-            textRegions = []
-            isLoading = false
-        } catch {
-            print("Error loading frame: \(error)")
-            isLoading = false
-        }
+        // Mock data for preview
+        textRegions = []
+        isLoading = false
     }
 
     // MARK: - Helpers

@@ -29,13 +29,16 @@ let package = Package(
         .library(name: "Search", targets: ["Search"]),
         .library(name: "Migration", targets: ["Migration"]),
         .library(name: "App", targets: ["App"]),
-        .executable(name: "Retrace", targets: ["RetraceUI"]),
+        .executable(name: "Retrace", targets: ["Retrace"]),
     ],
     dependencies: [
         // NOTE: Dependencies are bundled locally in Vendors/ or will be downloaded at runtime
         // ⚠️ RELEASE 2 ONLY:
         // whisper.cpp - bundled in Vendors/whisper/
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
+
+        // Hot reloading for development (requires InjectionIII.app)
+        .package(url: "https://github.com/krzysztofzablocki/Inject.git", from: "1.5.2"),
     ],
     targets: [
         // MARK: - Shared models and protocols
@@ -93,7 +96,6 @@ let package = Package(
             path: "Capture",
             exclude: [
                 "Tests",
-                "Audio/Tests",  // Exclude from production target
                 "README.md",
                 "AGENTS.md",
                 "PROGRESS.md"
@@ -102,16 +104,9 @@ let package = Package(
         .testTarget(
             name: "CaptureTests",
             dependencies: ["Capture", "Shared"],
-            path: "Capture",
-            exclude: [
-                "Tests/_future",       // Release 2+ tests
-                "Audio/Tests/_future"  // Release 2+ audio tests
-            ],
-            sources: [
-                "Tests",
-                "Audio/Tests"  // Include in test target
-            ]
+            path: "Capture/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper linker settings removed for Release 1
+            // ⚠️ RELEASE 2 ONLY - Audio/Tests excluded for Release 1
         ),
 
         // MARK: - Processing module
@@ -124,7 +119,6 @@ let package = Package(
             path: "Processing",
             exclude: [
                 "Tests",
-                "Audio/Tests",  // Exclude from production target
                 "README.md",
                 "AGENTS.md",
                 "PROGRESS.md"
@@ -135,16 +129,9 @@ let package = Package(
         .testTarget(
             name: "ProcessingTests",
             dependencies: ["Processing", "Shared", "Database", "Storage"],
-            path: "Processing",
-            exclude: [
-                "Tests/_future",  // Release 2+ tests (OCR, Accessibility)
-                "Audio/Tests/AUDIO_STORAGE_TESTS.md"
-            ],
-            sources: [
-                "Tests",
-                "Audio/Tests"  // Include in test target
-            ]
+            path: "Processing/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+            // ⚠️ RELEASE 2 ONLY - Audio/Tests excluded for Release 1
         ),
 
         // MARK: - Search module
@@ -211,7 +198,7 @@ let package = Package(
 
         // MARK: - UI module
         .executableTarget(
-            name: "RetraceUI",
+            name: "Retrace",
             dependencies: [
                 "Shared",
                 "App",
@@ -220,19 +207,28 @@ let package = Package(
                 "Capture",
                 "Processing",
                 "Search",
-                "Migration"
+                "Migration",
+                .product(name: "Inject", package: "Inject")
             ],
             path: "UI",
             exclude: [
                 "Tests",
                 "README.md",
                 "AGENTS.md"
+            ],
+            swiftSettings: [
+                // Export symbols for InjectionNext hot reloading
+                .unsafeFlags(["-Xfrontend", "-enable-implicit-dynamic"], .when(configuration: .debug))
+            ],
+            linkerSettings: [
+                // Export all symbols for dynamic library loading (InjectionNext)
+                .unsafeFlags(["-Xlinker", "-export_dynamic"], .when(configuration: .debug))
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
         .testTarget(
-            name: "RetraceUITests",
-            dependencies: ["RetraceUI", "Shared", "App"],
+            name: "RetraceTests",
+            dependencies: ["Retrace", "Shared", "App"],
             path: "UI/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),

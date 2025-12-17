@@ -80,3 +80,18 @@ Processing/Audio/module.modulemap
 
 # Disabled test files
 *.swift.disabled
+
+# Generated Xcode project (from xcodegen)
+Retrace.xcodeproj/
+!Retrace.xcodeproj/project.pbxproj
+!Retrace.xcodeproj/xcshareddata/
+
+# XcodeGen build config (not needed when using SPM directly)
+Debug.xcconfig
+
+# SPM resolved dependencies
+Package.resolved
+
+# Development scripts (consolidated into build_and_sign.sh and dev.sh)
+build_debug.sh
+run_debug.sh

@@ -173,7 +173,6 @@ public struct ResultRow: View {
 
     private func formatTimestamp(_ date: Date) -> String {
         let calendar = Calendar.current
-        let now = Date()
 
         if calendar.isDateInToday(date) {
             let formatter = DateFormatter()

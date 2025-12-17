@@ -117,6 +117,7 @@ struct PerceptualHash: Sendable {
 
     /// Alternative: Resize using vImage for better quality (slower)
     /// This could be used for more accurate hashing if needed
+    /// - Note: Currently unimplemented, returns nil
     private static func resizeToGrayscaleVImage(
         imageData: Data,
         width: Int,
@@ -125,23 +126,16 @@ struct PerceptualHash: Sendable {
         targetWidth: Int,
         targetHeight: Int
     ) -> [UInt8]? {
-        var sourceBuffer = vImage_Buffer(
-            data: UnsafeMutableRawPointer(mutating: (imageData as NSData).bytes),
-            height: vImagePixelCount(height),
-            width: vImagePixelCount(width),
-            rowBytes: bytesPerRow
-        )
+        // Uncommenting this implementation would require:
+        // 1. Converting BGRA to grayscale format
+        // 2. Using vImageScale_Planar8 for the resize operation
+        // For now, we use the faster nearest-neighbor approach above
 
-        var destData = [UInt8](repeating: 0, count: targetWidth * targetHeight)
-        var destBuffer = vImage_Buffer(
-            data: &destData,
-            height: vImagePixelCount(targetHeight),
-            width: vImagePixelCount(targetWidth),
-            rowBytes: targetWidth
-        )
+        // Example structure (currently unused):
+        // var sourceBuffer = vImage_Buffer(...)
+        // var destData = [UInt8](...)
+        // var destBuffer = vImage_Buffer(...)
 
-        // This would require converting BGRA to grayscale first
-        // For simplicity, we use the manual method above
         return nil
     }
 }

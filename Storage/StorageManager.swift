@@ -28,7 +28,7 @@ public actor StorageManager: StorageProtocol {
     }
 
     public func createSegmentWriter() async throws -> SegmentWriter {
-        guard let config else {
+        guard config != nil else {
             throw StorageError.directoryCreationFailed(path: "Storage not initialized")
         }
 

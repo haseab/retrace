@@ -1,5 +1,6 @@
 import SwiftUI
 import App
+import Inject
 
 /// Main app entry point
 @main
@@ -10,17 +11,42 @@ struct RetraceApp: App {
     @StateObject private var coordinatorWrapper = AppCoordinatorWrapper()
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
+    // MARK: - Initialization
+
+    init() {
+        #if DEBUG
+        // Load InjectionNext bundle for hot reloading in debug builds
+        let injectionBundlePath = "/Applications/InjectionNext.app/Contents/Resources/macOSInjection.bundle"
+        print("🔥 [Hot Reload] Looking for InjectionNext bundle at: \(injectionBundlePath)")
+
+        if let bundle = Bundle(path: injectionBundlePath) {
+            if bundle.load() {
+                print("🔥 [Hot Reload] ✅ InjectionNext bundle loaded successfully!")
+            } else {
+                print("🔥 [Hot Reload] ❌ Failed to load InjectionNext bundle")
+            }
+        } else {
+            print("🔥 [Hot Reload] ❌ InjectionNext bundle not found at path")
+            print("🔥 [Hot Reload] Make sure InjectionNext.app is installed in /Applications/")
+        }
+        #else
+        print("🔥 [Hot Reload] ⚠️  Not in DEBUG mode - hot reload disabled")
+        #endif
+    }
+
     // MARK: - Body
 
     var body: some Scene {
         WindowGroup {
             ContentView(coordinator: coordinatorWrapper.coordinator)
+                .enableInjection()
                 .task {
                     await initializeApp()
                 }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
+        .defaultPosition(.center)
         .commands {
             appCommands
         }
@@ -103,18 +129,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var menuBarManager: MenuBarManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Request permissions on first launch
-        requestPermissions()
+        // CRITICAL FIX: Ensure bundle identifier is set
+        // When running from Xcode/SPM, the bundle ID might not be set correctly
+        if Bundle.main.bundleIdentifier == nil {
+            // Set activation policy to regular (shows in Dock and can be activated)
+            // This is required when running without a proper bundle ID
+            NSApp.setActivationPolicy(.regular)
+        }
+
+        // Check if another instance is already running
+        if isAnotherInstanceRunning() {
+            print("[AppDelegate] Another instance of Retrace is already running. Activating existing instance...")
+            activateExistingInstance()
+            NSApp.terminate(nil)
+            return
+        }
 
         // Configure app appearance
         configureAppearance()
 
+        // Activate the app and bring window to front
+        // Use a slight delay to ensure window is created first
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            // Use NSRunningApplication for most reliable activation
+            let currentApp = NSRunningApplication.current
+            currentApp.activate(options: .activateIgnoringOtherApps)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
         // Menu bar will be initialized from initializeApp after coordinator is ready
+        // Note: Permissions are now handled in the onboarding flow
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    // MARK: - Single Instance Check
+
+    private func isAnotherInstanceRunning() -> Bool {
+        let runningApps = NSWorkspace.shared.runningApplications
+        let retraceApps = runningApps.filter { app in
+            // Check for Retrace by bundle identifier or name
+            return (app.bundleIdentifier?.contains("retrace") == true ||
+                    app.localizedName?.contains("Retrace") == true) &&
+                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        }
+        return !retraceApps.isEmpty
+    }
+
+    private func activateExistingInstance() {
+        let runningApps = NSWorkspace.shared.runningApplications
+        if let existingApp = runningApps.first(where: { app in
+            (app.bundleIdentifier?.contains("retrace") == true ||
+             app.localizedName?.contains("Retrace") == true) &&
+            app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        }) {
+            existingApp.activate(options: .activateIgnoringOtherApps)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

@@ -23,7 +23,7 @@ public class MenuBarManager: ObservableObject {
     public func setup() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        if let button = statusItem?.button {
+        if statusItem?.button != nil {
             // Start with custom icon showing both indicators
             updateIcon(recording: false)
         }
@@ -160,7 +160,10 @@ public class MenuBarManager: ObservableObject {
     @objc private func toggleRecording() {
         Task { @MainActor in
             do {
-                if isRecording {
+                // Check actual coordinator state first
+                let coordinatorIsRunning = await coordinator.getStatus().isRunning
+
+                if coordinatorIsRunning {
                     try await coordinator.stopPipeline()
                     updateRecordingStatus(false)
                 } else {
@@ -169,6 +172,19 @@ public class MenuBarManager: ObservableObject {
                 }
             } catch {
                 print("Failed to toggle recording: \(error)")
+                // Sync state with coordinator on error
+                let actualState = await coordinator.getStatus().isRunning
+                updateRecordingStatus(actualState)
+            }
+        }
+    }
+
+    /// Sync recording status with coordinator
+    public func syncWithCoordinator() {
+        Task { @MainActor in
+            let status = await coordinator.getStatus()
+            if isRecording != status.isRunning {
+                updateRecordingStatus(status.isRunning)
             }
         }
     }

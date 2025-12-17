@@ -124,10 +124,11 @@ actor ScreenCaptureService {
 
             // Set up callback for AX permission denial
             monitor.onAccessibilityPermissionDenied = { [weak self] in
-                if let callback = await self?.onAccessibilityPermissionDenied {
+                guard let self = self else { return }
+                if let callback = self.onAccessibilityPermissionDenied {
                     await callback()
                 }
-            }
+            } as @Sendable () async -> Void
 
             await monitor.startMonitoring(config: config)
             Log.info("Private window monitoring started", category: .capture)

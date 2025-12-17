@@ -65,16 +65,20 @@ public actor ModelManager {
         public let fileSizeBytes: Int64?
 
         public var isValid: Bool {
-            guard let localPath = localPath,
-                  let fileSizeBytes = fileSizeBytes,
+            guard let path = localPath,
+                  let fileSize = fileSizeBytes,
                   isDownloaded else {
                 return false
             }
 
             // Check if file exists and size is reasonable (within 10% of expected)
+            guard FileManager.default.fileExists(atPath: path.path) else {
+                return false
+            }
+
             let expectedSize = model.sizeBytes
             let tolerance = expectedSize / 10
-            return abs(fileSizeBytes - expectedSize) < tolerance
+            return abs(fileSize - expectedSize) < tolerance
         }
     }
 
@@ -183,10 +187,10 @@ public actor ModelManager {
             throw DownloadError.downloadFailed("Invalid URL: \(model.url)")
         }
 
-        // Download to temporary file first
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("tmp")
+        // Download to temporary file first (URLSession handles temp file automatically)
+        // let tempURL = FileManager.default.temporaryDirectory
+        //     .appendingPathComponent(UUID().uuidString)
+        //     .appendingPathExtension("tmp")
 
         // Use URLSession for download with progress
         let session = URLSession.shared
@@ -263,13 +267,13 @@ public actor ModelManager {
     // MARK: - Cleanup
 
     public func deleteModel(_ model: ModelInfo) async throws {
-        let localPath = modelsDirectory.appendingPathComponent(model.filename)
+        let modelPath = modelsDirectory.appendingPathComponent(model.filename)
 
-        guard FileManager.default.fileExists(atPath: localPath.path) else {
+        guard FileManager.default.fileExists(atPath: modelPath.path) else {
             return
         }
 
-        try FileManager.default.removeItem(at: localPath)
+        try FileManager.default.removeItem(at: modelPath)
         Log.info("Deleted model: \(model.name)", category: .app)
     }
 
