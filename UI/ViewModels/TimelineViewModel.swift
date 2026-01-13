@@ -3,10 +3,10 @@ import Combine
 import Shared
 import App
 
-/// ViewModel for the Timeline view
+/// Legacy ViewModel for the Timeline view (being replaced by SimpleTimelineViewModel)
 /// Manages frame navigation, playback, and session filtering
 @MainActor
-public class TimelineViewModel: ObservableObject {
+public class LegacyTimelineViewModel: ObservableObject {
 
     // MARK: - Published State
 

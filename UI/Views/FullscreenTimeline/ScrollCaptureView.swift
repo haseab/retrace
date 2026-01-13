@@ -9,11 +9,15 @@ struct ScrollCaptureView: NSViewRepresentable {
     func makeNSView(context: Context) -> ScrollEventView {
         let view = ScrollEventView()
         view.onScroll = onScroll
+        // Set up the event monitor when the view is created
+        context.coordinator.setupEventMonitor()
         return view
     }
 
     func updateNSView(_ nsView: ScrollEventView, context: Context) {
+        // Update both the view and coordinator with the latest callback
         nsView.onScroll = onScroll
+        context.coordinator.onScroll = onScroll
     }
 
     func makeCoordinator() -> Coordinator {
@@ -22,36 +26,55 @@ struct ScrollCaptureView: NSViewRepresentable {
 
     class Coordinator {
         var onScroll: (Double) -> Void
-        var eventMonitor: Any?
+        var localMonitor: Any?
+        var globalMonitor: Any?
+        private var hasSetupMonitor = false
 
         init(onScroll: @escaping (Double) -> Void) {
             self.onScroll = onScroll
+        }
 
-            // Monitor scroll events at the application level
-            print("[ScrollCaptureView] Setting up event monitor")
-            self.eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                // Get scroll delta
-                let deltaX = event.scrollingDeltaX
-                let deltaY = event.scrollingDeltaY
+        func setupEventMonitor() {
+            guard !hasSetupMonitor else { return }
+            hasSetupMonitor = true
 
-                // Use horizontal scrolling primarily, fall back to vertical if no horizontal movement
-                let delta = abs(deltaX) > abs(deltaY) ? -deltaX : deltaY
+            print("[ScrollCaptureView] Setting up BOTH local and global event monitors")
 
-                print("[ScrollCaptureView] RAW deltaX: \(deltaX), deltaY: \(deltaY), computed delta: \(delta)")
+            // Local monitor - for when our window is key
+            self.localMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                self?.handleScrollEvent(event, source: "LOCAL")
+                return event
+            }
 
-                // Only process if there's meaningful movement
-                if abs(delta) > 0.1 {
-                    print("[ScrollCaptureView] Calling onScroll with delta: \(delta)")
-                    self?.onScroll(delta)
-                }
+            // Global monitor - for when window might not be key (high-level windows)
+            self.globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                self?.handleScrollEvent(event, source: "GLOBAL")
+            }
+        }
 
-                return event  // Pass event through to other handlers
+        private func handleScrollEvent(_ event: NSEvent, source: String) {
+            // Get scroll delta
+            let deltaX = event.scrollingDeltaX
+            let deltaY = event.scrollingDeltaY
+
+            // Use horizontal scrolling primarily, fall back to vertical if no horizontal movement
+            let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
+
+            print("[ScrollCaptureView] [\(source)] RAW deltaX: \(deltaX), deltaY: \(deltaY), computed delta: \(delta)")
+
+            // Only process if there's meaningful movement
+            if abs(delta) > 0.1 {
+                print("[ScrollCaptureView] [\(source)] Calling onScroll with delta: \(delta)")
+                self.onScroll(delta)
             }
         }
 
         deinit {
-            print("[ScrollCaptureView] Coordinator deinit - removing event monitor")
-            if let monitor = eventMonitor {
+            print("[ScrollCaptureView] Coordinator deinit - removing event monitors")
+            if let monitor = localMonitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            if let monitor = globalMonitor {
                 NSEvent.removeMonitor(monitor)
             }
         }

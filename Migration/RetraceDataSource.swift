@@ -52,7 +52,18 @@ public actor RetraceDataSource: DataSourceProtocol {
             throw DataSourceError.notConnected
         }
 
-        return try await database.getFrames(from: startDate, to: endDate, limit: limit)
+        do {
+            return try await database.getFrames(from: startDate, to: endDate, limit: limit)
+        } catch {
+            // If the table doesn't exist yet (no frames captured), return empty array
+            // This allows the DataAdapter to fall through to secondary sources
+            let errorString = String(describing: error)
+            if errorString.contains("no such table") {
+                Log.info("RetraceDataSource: frames table doesn't exist yet, returning empty array", category: .app)
+                return []
+            }
+            throw error
+        }
     }
 
     public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {

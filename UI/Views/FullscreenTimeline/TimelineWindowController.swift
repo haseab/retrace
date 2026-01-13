@@ -4,6 +4,7 @@ import App
 
 /// Manages the full-screen timeline overlay window
 /// This is a singleton that can be triggered from anywhere via keyboard shortcut
+@MainActor
 public class TimelineWindowController: NSObject {
 
     // MARK: - Singleton
@@ -16,12 +17,16 @@ public class TimelineWindowController: NSObject {
     private var coordinator: AppCoordinator?
     private var eventMonitor: Any?
     private var localEventMonitor: Any?
+    private var timelineViewModel: SimpleTimelineViewModel?
 
     /// Whether the timeline overlay is currently visible
     public private(set) var isVisible = false
 
     /// Callback when timeline closes
     public var onClose: (() -> Void)?
+
+    /// Callback for scroll events (delta value)
+    public var onScroll: ((Double) -> Void)?
 
     // MARK: - Initialization
 
@@ -51,9 +56,14 @@ public class TimelineWindowController: NSObject {
         // Create the window
         let window = createWindow(for: screen)
 
-        // Create the SwiftUI view
-        let timelineView = FullscreenTimelineView(
+        // Create and store the view model so we can forward scroll events
+        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
+        self.timelineViewModel = viewModel
+
+        // Create the SwiftUI view (using new SimpleTimelineView)
+        let timelineView = SimpleTimelineView(
             coordinator: coordinator,
+            viewModel: viewModel,
             onClose: { [weak self] in
                 self?.hide()
             }
@@ -101,6 +111,7 @@ public class TimelineWindowController: NSObject {
         }, completionHandler: { [weak self] in
             window.orderOut(nil)
             self?.window = nil
+            self?.timelineViewModel = nil
             self?.isVisible = false
             self?.onClose?()
 
@@ -153,14 +164,23 @@ public class TimelineWindowController: NSObject {
 
     private func setupEventMonitors() {
         // Monitor for escape key and toggle shortcut (global)
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            self?.handleKeyEvent(event)
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
+            if event.type == .keyDown {
+                self?.handleKeyEvent(event)
+            } else if event.type == .scrollWheel {
+                self?.handleScrollEvent(event, source: "GLOBAL")
+            }
         }
 
         // Also monitor local events (when our window is key)
-        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            if self?.handleKeyEvent(event) == true {
-                return nil // Consume the event
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
+            if event.type == .keyDown {
+                if self?.handleKeyEvent(event) == true {
+                    return nil // Consume the event
+                }
+            } else if event.type == .scrollWheel {
+                self?.handleScrollEvent(event, source: "LOCAL")
+                return nil // Consume scroll events
             }
             return event
         }
@@ -193,6 +213,26 @@ public class TimelineWindowController: NSObject {
         }
 
         return false
+    }
+
+    private func handleScrollEvent(_ event: NSEvent, source: String) {
+        guard isVisible, let viewModel = timelineViewModel else { return }
+
+        let deltaX = event.scrollingDeltaX
+        let deltaY = event.scrollingDeltaY
+
+        // Use horizontal scrolling primarily, fall back to vertical
+        let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
+
+        print("[TimelineWindowController] [\(source)] scroll: deltaX=\(deltaX), deltaY=\(deltaY), computed=\(delta)")
+
+        if abs(delta) > 0.1 {
+            onScroll?(delta)
+            // Forward scroll to view model
+            Task { @MainActor in
+                await viewModel.handleScroll(delta: CGFloat(delta))
+            }
+        }
     }
 }
 

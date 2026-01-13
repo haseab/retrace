@@ -179,11 +179,11 @@ public actor RewindDataSource: DataSourceProtocol {
             )
         }
 
-        // Bind parameters (Rewind uses ISO 8601 TEXT format WITHOUT timezone)
-        // Format: "2025-12-16T18:05:00.000" (local time, no Z suffix)
+        // Bind parameters (Rewind uses ISO 8601 TEXT format WITHOUT timezone suffix)
+        // Format: "2025-12-16T18:05:00.000" - stored in UTC
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        dateFormatter.timeZone = TimeZone.current // Use local timezone
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")! // Rewind stores timestamps in UTC
         let startISO = dateFormatter.string(from: startDate)
         let endISO = dateFormatter.string(from: effectiveEndDate)
 
@@ -250,15 +250,8 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        // Try to parse segmentID - for Rewind, we need to extract the original integer ID
-        // The segmentID.stringValue contains a UUID that was synthesized from the integer
-        // We need to query by timestamp instead since we can't reverse the UUID
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        dateFormatter.timeZone = TimeZone.current
-        let timestampISO = dateFormatter.string(from: timestamp)
-
         // Query by timestamp instead of segment ID for Rewind data
+        // (We can't reverse the synthetic UUID back to the original integer ID)
         let altSql = """
             SELECT f.videoFrameIndex, v.path, v.frameRate
             FROM frame f
@@ -273,6 +266,12 @@ public actor RewindDataSource: DataSourceProtocol {
         guard sqlite3_prepare_v2(db, altSql, -1, &altStatement, nil) == SQLITE_OK else {
             throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
         }
+
+        // Convert timestamp to UTC for database query
+        let utcFormatter = DateFormatter()
+        utcFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        utcFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let timestampISO = utcFormatter.string(from: timestamp)
 
         sqlite3_bind_text(altStatement, 1, (timestampISO as NSString).utf8String, -1, nil)
 
@@ -320,10 +319,10 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.notConnected
         }
 
-        // Query by timestamp to get video info
+        // Query by timestamp to get video info (Rewind stores timestamps in UTC)
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        dateFormatter.timeZone = TimeZone.current
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
         let timestampISO = dateFormatter.string(from: timestamp)
 
         let sql = """
@@ -414,10 +413,10 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.queryFailed(underlying: "Missing createdAt timestamp")
         }
 
-        // Parse timestamp (Rewind format: "2025-12-16T18:05:00.000" without timezone)
+        // Parse timestamp (Rewind format: "2025-12-16T18:05:00.000" stored in UTC)
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        dateFormatter.timeZone = TimeZone.current
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
         guard let timestamp = dateFormatter.date(from: createdAtText) else {
             throw DataSourceError.queryFailed(underlying: "Invalid timestamp format: \(createdAtText)")
         }

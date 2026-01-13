@@ -8,7 +8,7 @@ public struct FullscreenTimelineBar: View {
 
     // MARK: - Properties
 
-    @ObservedObject var viewModel: TimelineViewModel
+    @ObservedObject var viewModel: LegacyTimelineViewModel
     let width: CGFloat
 
     @State private var isDragging = false
@@ -290,7 +290,7 @@ public struct FullscreenTimelineBar: View {
 struct FullscreenTimelineBar_Previews: PreviewProvider {
     static var previews: some View {
         FullscreenTimelineBar(
-            viewModel: TimelineViewModel(coordinator: AppCoordinator()),
+            viewModel: LegacyTimelineViewModel(coordinator: AppCoordinator()),
             width: 1200
         )
         .frame(width: 1200, height: 100)

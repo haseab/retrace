@@ -8,7 +8,7 @@ public struct FullscreenTimelineView: View {
 
     // MARK: - Properties
 
-    @StateObject private var viewModel: TimelineViewModel
+    @StateObject private var viewModel: LegacyTimelineViewModel
     @State private var showSearch = false
     @State private var searchPosition: CGPoint = .zero
     @State private var isSearchDragging = false
@@ -22,7 +22,7 @@ public struct FullscreenTimelineView: View {
     public init(coordinator: AppCoordinator, onClose: @escaping () -> Void) {
         self.coordinator = coordinator
         self.onClose = onClose
-        _viewModel = StateObject(wrappedValue: TimelineViewModel(coordinator: coordinator))
+        _viewModel = StateObject(wrappedValue: LegacyTimelineViewModel(coordinator: coordinator))
     }
 
     // MARK: - Body

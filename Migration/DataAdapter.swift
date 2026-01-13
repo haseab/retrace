@@ -149,19 +149,11 @@ public actor DataAdapter {
         Log.info("[DataAdapter] getMostRecentFrameTimestamp: searching for latest frame", category: .app)
 
         var latestTimestamp: Date? = nil
+        let now = Date()
 
         // Check primary source first (most likely to have recent data)
-        let now = Date()
-        let farPast = Calendar.current.date(byAdding: .year, value: -5, to: now)!
-
         Log.info("[DataAdapter] Querying primary source for most recent frame...", category: .app)
-        let primaryFrames = try await primarySource.getFrames(from: farPast, to: now, limit: 1)
-        if let mostRecent = primaryFrames.first {
-            latestTimestamp = mostRecent.timestamp
-            Log.info("[DataAdapter] Primary source latest: \(mostRecent.timestamp)", category: .app)
-        } else {
-            Log.info("[DataAdapter] Primary source has no frames", category: .app)
-        }
+        latestTimestamp = try await findMostRecentInSource(primarySource, endDate: now, sourceName: "Primary")
 
         // Check secondary sources
         for (sourceType, source) in secondarySources {
@@ -169,15 +161,11 @@ public actor DataAdapter {
 
             Log.info("[DataAdapter] Querying \(sourceType.displayName) for most recent frame...", category: .app)
             let queryEnd = await source.cutoffDate ?? now
-            let frames = try await source.getFrames(from: farPast, to: queryEnd, limit: 1)
 
-            if let mostRecent = frames.first {
-                Log.info("[DataAdapter] \(sourceType.displayName) latest: \(mostRecent.timestamp)", category: .app)
-                if latestTimestamp == nil || mostRecent.timestamp > latestTimestamp! {
-                    latestTimestamp = mostRecent.timestamp
+            if let sourceLatest = try await findMostRecentInSource(source, endDate: queryEnd, sourceName: sourceType.displayName) {
+                if latestTimestamp == nil || sourceLatest > latestTimestamp! {
+                    latestTimestamp = sourceLatest
                 }
-            } else {
-                Log.info("[DataAdapter] \(sourceType.displayName) has no frames", category: .app)
             }
         }
 
@@ -190,6 +178,44 @@ public actor DataAdapter {
         }
 
         return latestTimestamp
+    }
+
+    /// Binary search to find the most recent frame in a source efficiently
+    /// Uses progressively narrowing windows to avoid loading too many frames
+    private func findMostRecentInSource(_ source: any DataSourceProtocol, endDate: Date, sourceName: String) async throws -> Date? {
+        // Start with a 1-day window from the end, progressively expand if empty
+        let calendar = Calendar.current
+        var windowDays = 1
+        let maxWindowDays = 365 * 5 // 5 years max
+
+        while windowDays <= maxWindowDays {
+            let windowStart = calendar.date(byAdding: .day, value: -windowDays, to: endDate)!
+            let frames = try await source.getFrames(from: windowStart, to: endDate, limit: 500)
+
+            if !frames.isEmpty {
+                // Frames are sorted ASC, so the last one is the most recent
+                if let mostRecent = frames.last {
+                    Log.info("[DataAdapter] \(sourceName) latest: \(mostRecent.timestamp) (found in \(windowDays)-day window)", category: .app)
+                    return mostRecent.timestamp
+                }
+            }
+
+            // Expand window exponentially: 1, 7, 30, 90, 365, 1825
+            if windowDays == 1 {
+                windowDays = 7
+            } else if windowDays == 7 {
+                windowDays = 30
+            } else if windowDays == 30 {
+                windowDays = 90
+            } else if windowDays == 90 {
+                windowDays = 365
+            } else {
+                windowDays = maxWindowDays + 1 // Exit loop
+            }
+        }
+
+        Log.info("[DataAdapter] \(sourceName) has no frames", category: .app)
+        return nil
     }
 
     /// Get image data for a specific frame

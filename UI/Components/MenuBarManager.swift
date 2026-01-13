@@ -103,12 +103,16 @@ public class MenuBarManager: ObservableObject {
         }
 
         // Also configure the timeline window controller
-        TimelineWindowController.shared.configure(coordinator: coordinator)
+        Task { @MainActor in
+            TimelineWindowController.shared.configure(coordinator: coordinator)
+        }
     }
 
     /// Toggle the fullscreen timeline overlay
     private func toggleTimelineOverlay() {
-        TimelineWindowController.shared.toggle()
+        Task { @MainActor in
+            TimelineWindowController.shared.toggle()
+        }
     }
 
     /// Toggle the dashboard window
@@ -259,7 +263,9 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func openSearch() {
         // Open timeline with search focused
-        TimelineWindowController.shared.show()
+        Task { @MainActor in
+            TimelineWindowController.shared.show()
+        }
         // The search panel will auto-show when timeline opens
     }
 
