@@ -12,8 +12,8 @@ public actor OnboardingManager {
     private static let hasDownloadedModelsKey = "hasDownloadedModels"
     private static let onboardingSkippedKey = "onboardingSkipped"
     private static let onboardingVersionKey = "onboardingVersion"
-    private static let timelineShortcutKey = "timelineShortcut"
-    private static let dashboardShortcutKey = "dashboardShortcut"
+    private static let timelineShortcutKey = "timelineShortcutConfig"
+    private static let dashboardShortcutKey = "dashboardShortcutConfig"
     private static let hasRewindDataKey = "hasRewindData"
     private static let rewindMigrationCompletedKey = "rewindMigrationCompleted"
 
@@ -35,12 +35,22 @@ public actor OnboardingManager {
         UserDefaults.standard.bool(forKey: Self.onboardingSkippedKey)
     }
 
-    public var timelineShortcut: String {
-        UserDefaults.standard.string(forKey: Self.timelineShortcutKey) ?? "T"
+    /// Timeline shortcut configuration (key + modifiers)
+    public var timelineShortcut: ShortcutConfig {
+        guard let data = UserDefaults.standard.data(forKey: Self.timelineShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultTimeline
+        }
+        return config
     }
 
-    public var dashboardShortcut: String {
-        UserDefaults.standard.string(forKey: Self.dashboardShortcutKey) ?? "D"
+    /// Dashboard shortcut configuration (key + modifiers)
+    public var dashboardShortcut: ShortcutConfig {
+        guard let data = UserDefaults.standard.data(forKey: Self.dashboardShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultDashboard
+        }
+        return config
     }
 
     public var hasRewindData: Bool? {
@@ -84,14 +94,20 @@ public actor OnboardingManager {
 
     // MARK: - Shortcuts
 
-    public func setTimelineShortcut(_ shortcut: String) {
-        UserDefaults.standard.set(shortcut, forKey: Self.timelineShortcutKey)
-        Log.info("Timeline shortcut set to: \(shortcut)", category: .app)
+    /// Set timeline shortcut (full config with key + modifiers)
+    public func setTimelineShortcut(_ config: ShortcutConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            UserDefaults.standard.set(data, forKey: Self.timelineShortcutKey)
+            Log.info("Timeline shortcut set to: \(config.displayString)", category: .app)
+        }
     }
 
-    public func setDashboardShortcut(_ shortcut: String) {
-        UserDefaults.standard.set(shortcut, forKey: Self.dashboardShortcutKey)
-        Log.info("Dashboard shortcut set to: \(shortcut)", category: .app)
+    /// Set dashboard shortcut (full config with key + modifiers)
+    public func setDashboardShortcut(_ config: ShortcutConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            UserDefaults.standard.set(data, forKey: Self.dashboardShortcutKey)
+            Log.info("Dashboard shortcut set to: \(config.displayString)", category: .app)
+        }
     }
 
     // MARK: - Rewind Data

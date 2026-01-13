@@ -1,6 +1,25 @@
 import SwiftUI
 import Shared
 
+// MARK: - Migration Source Model
+
+/// Represents a third-party app data source for migration
+public struct MigrationSource: Identifiable {
+    public let id: String
+    public let name: String
+    public let isInstalled: Bool
+    public let dataPath: String?
+    public let estimatedSize: Int64?
+
+    public init(id: String, name: String, isInstalled: Bool, dataPath: String?, estimatedSize: Int64?) {
+        self.id = id
+        self.name = name
+        self.isInstalled = isInstalled
+        self.dataPath = dataPath
+        self.estimatedSize = estimatedSize
+    }
+}
+
 /// Migration panel for importing data from other apps
 public struct MigrationPanel: View {
 

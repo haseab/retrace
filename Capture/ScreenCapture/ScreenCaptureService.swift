@@ -19,6 +19,9 @@ actor ScreenCaptureService {
     /// Callback when accessibility permission is denied
     nonisolated(unsafe) var onAccessibilityPermissionDenied: (@Sendable () async -> Void)?
 
+    /// Callback when stream stops unexpectedly (e.g., user clicks "Stop sharing" in macOS)
+    nonisolated(unsafe) var onStreamStopped: (@Sendable () async -> Void)?
+
     // MARK: - Lifecycle
 
     /// Start capturing frames with the given configuration
@@ -92,12 +95,16 @@ actor ScreenCaptureService {
         streamConfig.capturesAudio = false
         streamConfig.queueDepth = 3
 
-        // Create stream
-        let newStream = SCStream(filter: filter, configuration: streamConfig, delegate: nil)
-
-        // Create output handler
-        let output = StreamOutput(continuation: frameContinuation, displayID: activeDisplayID)
+        // Create output handler (also serves as stream delegate for lifecycle events)
+        let output = StreamOutput(
+            continuation: frameContinuation,
+            displayID: activeDisplayID,
+            onStreamStopped: self.onStreamStopped
+        )
         self.streamOutput = output
+
+        // Create stream with output as delegate to receive stop notifications
+        let newStream = SCStream(filter: filter, configuration: streamConfig, delegate: output)
 
         // Add output handler to stream
         try newStream.addStreamOutput(
@@ -226,19 +233,25 @@ actor ScreenCaptureService {
 
 // MARK: - Stream Output Handler
 
-/// Handles sample buffers from ScreenCaptureKit stream
-class StreamOutput: NSObject, SCStreamOutput, @unchecked Sendable {
+/// Handles sample buffers and lifecycle events from ScreenCaptureKit stream
+class StreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
 
     // MARK: - Properties
 
     private let continuation: AsyncStream<CapturedFrame>.Continuation
     private let displayID: UInt32
+    private let onStreamStopped: (@Sendable () async -> Void)?
 
     // MARK: - Initialization
 
-    init(continuation: AsyncStream<CapturedFrame>.Continuation, displayID: UInt32) {
+    init(
+        continuation: AsyncStream<CapturedFrame>.Continuation,
+        displayID: UInt32,
+        onStreamStopped: (@Sendable () async -> Void)? = nil
+    ) {
         self.continuation = continuation
         self.displayID = displayID
+        self.onStreamStopped = onStreamStopped
         super.init()
     }
 
@@ -292,7 +305,14 @@ class StreamOutput: NSObject, SCStreamOutput, @unchecked Sendable {
         _ stream: SCStream,
         didStopWithError error: Error
     ) {
-        // Stream stopped with error - finish the continuation
+        // Stream stopped - finish the continuation
         continuation.finish()
+
+        // Notify that stream stopped unexpectedly (e.g., user clicked "Stop sharing")
+        if let callback = onStreamStopped {
+            Task {
+                await callback()
+            }
+        }
     }
 }

@@ -1,6 +1,5 @@
 import SwiftUI
 import App
-import Inject
 
 /// Main app entry point
 @main
@@ -13,33 +12,11 @@ struct RetraceApp: App {
 
     // MARK: - Initialization
 
-    init() {
-        #if DEBUG
-        // Load InjectionNext bundle for hot reloading in debug builds
-        let injectionBundlePath = "/Applications/InjectionNext.app/Contents/Resources/macOSInjection.bundle"
-        print("🔥 [Hot Reload] Looking for InjectionNext bundle at: \(injectionBundlePath)")
-
-        if let bundle = Bundle(path: injectionBundlePath) {
-            if bundle.load() {
-                print("🔥 [Hot Reload] ✅ InjectionNext bundle loaded successfully!")
-            } else {
-                print("🔥 [Hot Reload] ❌ Failed to load InjectionNext bundle")
-            }
-        } else {
-            print("🔥 [Hot Reload] ❌ InjectionNext bundle not found at path")
-            print("🔥 [Hot Reload] Make sure InjectionNext.app is installed in /Applications/")
-        }
-        #else
-        print("🔥 [Hot Reload] ⚠️  Not in DEBUG mode - hot reload disabled")
-        #endif
-    }
-
     // MARK: - Body
 
     var body: some Scene {
         WindowGroup {
             ContentView(coordinator: coordinatorWrapper.coordinator)
-                .enableInjection()
                 .task {
                     await initializeApp()
                 }
@@ -67,14 +44,10 @@ struct RetraceApp: App {
             .keyboardShortcut("1", modifiers: .command)
 
             Button("Timeline") {
-                NotificationCenter.default.post(name: .openTimeline, object: nil)
+                // Open fullscreen timeline overlay
+                TimelineWindowController.shared.toggle()
             }
-            .keyboardShortcut("t", modifiers: [.command, .shift])
-
-            Button("Search") {
-                NotificationCenter.default.post(name: .openSearch, object: nil)
-            }
-            .keyboardShortcut("f", modifiers: .command)
+            .keyboardShortcut(.space, modifiers: [.option, .shift])
 
             Divider()
 
@@ -101,17 +74,23 @@ struct RetraceApp: App {
             try await coordinatorWrapper.initialize()
             print("[RetraceApp] Initialized successfully")
 
-            // Setup menu bar icon
+            // Setup menu bar icon and timeline window controller
             await MainActor.run {
-                let menuBar = MenuBarManager(coordinator: coordinatorWrapper.coordinator)
+                let menuBar = MenuBarManager(
+                    coordinator: coordinatorWrapper.coordinator,
+                    onboardingManager: coordinatorWrapper.coordinator.onboardingManager
+                )
                 menuBar.setup()
+
+                // Configure the timeline window controller
+                TimelineWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
 
                 // Store in AppDelegate to keep it alive
                 if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
                     appDelegate.menuBarManager = menuBar
                 }
 
-                print("[RetraceApp] Menu bar icon initialized")
+                print("[RetraceApp] Menu bar icon and timeline controller initialized")
             }
 
             // Optionally start capture immediately
@@ -212,8 +191,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Appearance
 
     private func configureAppearance() {
-        // Force dark mode for now (can be made configurable later)
-        NSApp.appearance = NSAppearance(named: .darkAqua)
+        // Read theme preference from UserDefaults
+        let themeRaw = UserDefaults.standard.string(forKey: "theme") ?? "Auto"
+        let theme = ThemePreference(rawValue: themeRaw) ?? .auto
+
+        switch theme {
+        case .auto:
+            NSApp.appearance = nil // Use system setting
+        case .light:
+            NSApp.appearance = NSAppearance(named: .aqua)
+        case .dark:
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
     }
 }
 

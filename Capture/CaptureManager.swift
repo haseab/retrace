@@ -38,6 +38,9 @@ public actor CaptureManager: CaptureProtocol {
     /// Callback for accessibility permission warnings
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
 
+    /// Callback when capture stops unexpectedly (e.g., user clicked "Stop sharing" in macOS)
+    nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
+
     // MARK: - Initialization
 
     public init(config: CaptureConfig = .default) {
@@ -77,6 +80,12 @@ public actor CaptureManager: CaptureProtocol {
         let (dedupedStream, dedupedContinuation) = AsyncStream<CapturedFrame>.makeStream()
         self.dedupedFrameContinuation = dedupedContinuation
         self._frameStream = dedupedStream
+
+        // Set up callback for when stream stops unexpectedly (e.g., user clicks "Stop sharing")
+        screenCapture.onStreamStopped = { [weak self] in
+            guard let self = self else { return }
+            await self.handleStreamStopped()
+        }
 
         // Start screen capture
         try await screenCapture.startCapture(
@@ -226,6 +235,30 @@ public actor CaptureManager: CaptureProtocol {
 
         // Notify UI layer
         onAccessibilityPermissionWarning?()
+    }
+
+    /// Handle stream stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
+    private func handleStreamStopped() async {
+        guard _isCapturing else { return }
+
+        Log.info("Screen capture stream stopped unexpectedly", category: .capture)
+
+        // Reset capture state
+        _isCapturing = false
+        rawFrameContinuation?.finish()
+        dedupedFrameContinuation?.finish()
+        rawFrameContinuation = nil
+        dedupedFrameContinuation = nil
+        lastKeptFrame = nil
+        hasShownAccessibilityWarning = false
+
+        // Stop display switch monitoring
+        await displaySwitchMonitor.stopMonitoring()
+
+        // Notify listeners
+        if let callback = onCaptureStopped {
+            await callback()
+        }
     }
 
     // MARK: - Private Helpers - Frame Processing

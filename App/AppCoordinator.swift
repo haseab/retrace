@@ -43,11 +43,11 @@ public actor AppCoordinator {
 
     // MARK: - Public Accessors
 
-    public var onboardingManager: OnboardingManager {
+    nonisolated public var onboardingManager: OnboardingManager {
         services.onboardingManager
     }
 
-    public var modelManager: ModelManager {
+    nonisolated public var modelManager: ModelManager {
         services.modelManager
     }
 
@@ -58,6 +58,12 @@ public actor AppCoordinator {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
         Log.info("AppCoordinator initialized successfully", category: .app)
+    }
+
+    /// Register Rewind data source if enabled
+    /// Should be called after onboarding completes if user opted in
+    public func registerRewindSourceIfEnabled() async throws {
+        try await services.registerRewindSourceIfEnabled()
     }
 
     /// Setup callback for accessibility permission warnings
@@ -78,6 +84,12 @@ public actor AppCoordinator {
         guard await services.capture.hasPermission() else {
             Log.error("Screen recording permission not granted", category: .app)
             throw AppError.permissionDenied(permission: "screen recording")
+        }
+
+        // Set up callback for when capture stops unexpectedly (e.g., user clicks "Stop sharing")
+        services.capture.onCaptureStopped = { [weak self] in
+            guard let self = self else { return }
+            await self.handleCaptureStopped()
         }
 
         // Start screen capture
@@ -143,6 +155,23 @@ public actor AppCoordinator {
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
         Log.info("AppCoordinator shutdown complete", category: .app)
+    }
+
+    /// Handle capture stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
+    private func handleCaptureStopped() async {
+        guard isRunning else { return }
+
+        Log.info("Capture stopped unexpectedly, cleaning up pipeline...", category: .app)
+
+        // Cancel pipeline tasks
+        captureTask?.cancel()
+        captureTask = nil
+
+        // Wait for processing queue to drain
+        await services.processing.waitForQueueDrain()
+
+        isRunning = false
+        Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
     }
 
     // MARK: - Pipeline Implementation
@@ -309,13 +338,49 @@ public actor AppCoordinator {
 
     /// Get a specific frame image by timestamp
     /// Uses real timestamps for accurate seeking (works correctly with deduplication)
+    /// Automatically routes to appropriate source via DataAdapter
     public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
-        try await services.storage.readFrame(segmentID: segmentID, timestamp: timestamp)
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to storage if adapter not available
+            return try await services.storage.readFrame(segmentID: segmentID, timestamp: timestamp)
+        }
+
+        return try await adapter.getFrameImage(segmentID: segmentID, timestamp: timestamp)
+    }
+
+    /// Get video info for a frame (returns nil if not video-based)
+    /// For Rewind frames, returns path/index to display video directly
+    public func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date, source: FrameSource) async throws -> FrameVideoInfo? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+
+        return try await adapter.getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, source: source)
     }
 
     /// Get frames in a time range
-    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 100) async throws -> [FrameReference] {
-        try await services.database.getFrames(from: startDate, to: endDate, limit: limit)
+    /// Seamlessly blends data from all sources via DataAdapter
+    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameReference] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database if adapter not available
+            return try await services.database.getFrames(from: startDate, to: endDate, limit: limit)
+        }
+
+        return try await adapter.getFrames(from: startDate, to: endDate, limit: limit)
+    }
+
+    /// Get the timestamp of the most recent frame across all sources
+    /// Returns nil if no frames exist in any source
+    public func getMostRecentFrameTimestamp() async throws -> Date? {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database - get most recent frame
+            let now = Date()
+            let farPast = Calendar.current.date(byAdding: .year, value: -5, to: now)!
+            let frames = try await services.database.getFrames(from: farPast, to: now, limit: 1)
+            return frames.first?.timestamp
+        }
+
+        return try await adapter.getMostRecentFrameTimestamp()
     }
 
     // MARK: - Session Retrieval
@@ -367,6 +432,11 @@ public actor AppCoordinator {
     }
 
     // MARK: - Statistics & Monitoring
+
+    /// Check if screen capture is currently active
+    public func isCapturing() async -> Bool {
+        await services.capture.isCapturing
+    }
 
     /// Get comprehensive app statistics
     public func getStatistics() async throws -> AppStatistics {

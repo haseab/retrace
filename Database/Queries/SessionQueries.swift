@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 // MARK: - Session Queries

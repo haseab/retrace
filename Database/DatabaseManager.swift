@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 import CryptoKit
 
@@ -565,14 +565,17 @@ public actor DatabaseManager: DatabaseProtocol {
         // Check if encryption is enabled in UserDefaults
         // Default to false (disabled) - user must explicitly enable it during onboarding
         let encryptionEnabled = UserDefaults.standard.object(forKey: "encryptionEnabled") as? Bool ?? false
-        guard encryptionEnabled else {
-            print("[DEBUG] Database encryption disabled by default")
+
+        // For unencrypted databases, simply don't set any PRAGMA key.
+        // SQLCipher will operate as regular SQLite when no key is provided on a new/plaintext database.
+        if !encryptionEnabled {
+            print("[DEBUG] Database encryption disabled - no key set")
             return
         }
 
         // Get or generate encryption key from Keychain
-        let keychainService = "com.retrace.database"
-        let keychainAccount = "sqlcipher-key"
+        let keychainService = AppPaths.keychainService
+        let keychainAccount = AppPaths.keychainAccount
 
         var keyData: Data
         do {
@@ -609,23 +612,16 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Save encryption key to Keychain
     private func saveKeyToKeychain(_ key: Data, service: String, account: String) throws {
-        // Create access control that allows access without user interaction
+        // Use kSecAttrAccessibleAfterFirstUnlock with kSecAttrSynchronizable = false
         // This prevents the keychain password prompt on every app launch
-        guard let access = SecAccessControlCreateWithFlags(
-            kCFAllocatorDefault,
-            kSecAttrAccessibleAfterFirstUnlock,
-            [],
-            nil
-        ) else {
-            throw DatabaseError.connectionFailed(underlying: "Failed to create keychain access control")
-        }
-
+        // kSecAttrSynchronizable = false ensures it stays local and doesn't prompt for iCloud Keychain
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: key,
-            kSecAttrAccessControl as String: access
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecAttrSynchronizable as String: false  // Don't sync to iCloud, stay local
         ]
 
         // Delete existing item first
@@ -654,5 +650,109 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Failed to load encryption key from Keychain")
         }
         return data
+    }
+
+    // MARK: - Static Keychain Setup (for onboarding)
+
+    /// Setup encryption key in Keychain during onboarding
+    /// Call this when user selects "Yes" for encryption and clicks Continue
+    public static func setupEncryptionKeychain() throws {
+        let keychainService = AppPaths.keychainService
+        let keychainAccount = AppPaths.keychainAccount
+
+        // Check if key already exists (without retrieving data to avoid prompts)
+        let checkQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let checkStatus = SecItemCopyMatching(checkQuery as CFDictionary, &result)
+
+        if checkStatus == errSecSuccess {
+            // Key already exists, no need to create again
+            print("[DEBUG] Encryption key already exists in Keychain, skipping setup")
+            return
+        }
+
+        // Generate new key
+        let key = SymmetricKey(size: .bits256)
+        let keyData = key.withUnsafeBytes { Data($0) }
+
+        // Use kSecAttrAccessibleAfterFirstUnlock directly (without SecAccessControlCreateWithFlags)
+        // This allows access without prompting after the device is unlocked
+        // kSecAttrSynchronizable = false ensures it stays local and doesn't prompt for iCloud Keychain
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecValueData as String: keyData,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+            kSecAttrSynchronizable as String: false  // Don't sync to iCloud, stay local
+        ]
+
+        // Delete existing item first (in case of partial state)
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new item
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw NSError(domain: "com.retrace.keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to save encryption key to Keychain (status: \(status))"])
+        }
+
+        print("[DEBUG] Generated and saved new database encryption key to Keychain during onboarding")
+    }
+
+    /// Verify we can read the encryption key from Keychain
+    /// This triggers the keychain access prompt if needed, so it's best called immediately after setup
+    public static func verifyEncryptionKeychain() throws -> Bool {
+        let keychainService = AppPaths.keychainService
+        let keychainAccount = AppPaths.keychainAccount
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess, let _ = result as? Data else {
+            throw NSError(domain: "com.retrace.keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to verify encryption key in Keychain (status: \(status))"])
+        }
+
+        return true
+    }
+
+    /// Delete the encryption key from Keychain (useful for resetting)
+    public static func deleteEncryptionKeychain() {
+        let keychainService = AppPaths.keychainService
+        let keychainAccount = AppPaths.keychainAccount
+
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: keychainAccount
+        ]
+
+        let status = SecItemDelete(deleteQuery as CFDictionary)
+        if status == errSecSuccess {
+            print("[DEBUG] Deleted encryption key from Keychain")
+        } else if status == errSecItemNotFound {
+            print("[DEBUG] No encryption key found in Keychain to delete")
+        } else {
+            print("[ERROR] Failed to delete encryption key from Keychain (status: \(status))")
+        }
     }
 }

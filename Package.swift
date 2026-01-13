@@ -12,7 +12,6 @@ import Foundation
 // let whisperIncludePath = whisperPath + "/include"
 // let whisperLibPath = whisperPath + "/lib"
 
-
 // MARK: - Package Definition
 
 let package = Package(
@@ -37,8 +36,8 @@ let package = Package(
         // whisper.cpp - bundled in Vendors/whisper/
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
 
-        // Hot reloading for development (requires InjectionIII.app)
-        .package(url: "https://github.com/krzysztofzablocki/Inject.git", from: "1.5.2"),
+        // SQLCipher for reading encrypted Rewind database
+        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0")
     ],
     targets: [
         // MARK: - Shared models and protocols
@@ -49,9 +48,15 @@ let package = Package(
         ),
 
         // MARK: - Database module
+        // NOTE: Uses SQLCipher instead of system SQLite3 because Migration module
+        // requires SQLCipher for Rewind database, and we can't mix both in one app.
+        // SQLCipher works with unencrypted databases too (just don't set PRAGMA key).
         .target(
             name: "Database",
-            dependencies: ["Shared"],
+            dependencies: [
+                "Shared",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Database",
             exclude: [
                 "Tests",
@@ -158,7 +163,10 @@ let package = Package(
         // MARK: - Migration module
         .target(
             name: "Migration",
-            dependencies: ["Shared"],
+            dependencies: [
+                "Shared",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
             path: "Migration",
             exclude: [
                 "README.md",
@@ -207,22 +215,13 @@ let package = Package(
                 "Capture",
                 "Processing",
                 "Search",
-                "Migration",
-                .product(name: "Inject", package: "Inject")
+                "Migration"
             ],
             path: "UI",
             exclude: [
                 "Tests",
                 "README.md",
                 "AGENTS.md"
-            ],
-            swiftSettings: [
-                // Export symbols for InjectionNext hot reloading
-                .unsafeFlags(["-Xfrontend", "-enable-implicit-dynamic"], .when(configuration: .debug))
-            ],
-            linkerSettings: [
-                // Export all symbols for dynamic library loading (InjectionNext)
-                .unsafeFlags(["-Xlinker", "-export_dynamic"], .when(configuration: .debug))
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),

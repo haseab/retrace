@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 /// Service for mapping between UUID-based IDs (Swift models) and INTEGER IDs (database)

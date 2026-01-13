@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import App
+import Shared
 
 /// Manages the macOS menu bar icon and status menu
 public class MenuBarManager: ObservableObject {
@@ -9,13 +10,23 @@ public class MenuBarManager: ObservableObject {
 
     private var statusItem: NSStatusItem?
     private let coordinator: AppCoordinator
+    private let onboardingManager: OnboardingManager
+    private var refreshTimer: Timer?
 
     @Published public var isRecording = false
 
+    /// Tracks whether recording indicator should be hidden (e.g., when timeline is open)
+    private var shouldHideRecordingIndicator = false
+
+    /// Cached shortcuts (loaded from OnboardingManager)
+    private var timelineShortcut: ShortcutConfig = .defaultTimeline
+    private var dashboardShortcut: ShortcutConfig = .defaultDashboard
+
     // MARK: - Initialization
 
-    public init(coordinator: AppCoordinator) {
+    public init(coordinator: AppCoordinator, onboardingManager: OnboardingManager) {
         self.coordinator = coordinator
+        self.onboardingManager = onboardingManager
     }
 
     // MARK: - Setup
@@ -28,7 +39,93 @@ public class MenuBarManager: ObservableObject {
             updateIcon(recording: false)
         }
 
-        setupMenu()
+        // Load shortcuts then setup menu and hotkeys
+        Task { @MainActor in
+            await loadShortcuts()
+            setupMenu()
+            setupTimelineNotifications()
+            setupGlobalHotkey()
+            setupAutoRefresh()
+        }
+    }
+
+    /// Setup timer to auto-refresh recording status
+    private func setupAutoRefresh() {
+        // Sync recording status every 2 seconds
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.syncWithCoordinator()
+        }
+        // Also sync immediately
+        syncWithCoordinator()
+    }
+
+    /// Load shortcuts from OnboardingManager
+    private func loadShortcuts() async {
+        timelineShortcut = await onboardingManager.timelineShortcut
+        dashboardShortcut = await onboardingManager.dashboardShortcut
+    }
+
+    /// Setup notifications for timeline open/close
+    private func setupTimelineNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: .timelineDidOpen,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hideRecordingIndicator()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .timelineDidClose,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.restoreRecordingIndicator()
+        }
+    }
+
+    /// Setup global hotkeys for timeline and dashboard
+    private func setupGlobalHotkey() {
+        // Register timeline global hotkey
+        HotkeyManager.shared.registerHotkey(
+            key: timelineShortcut.key,
+            modifiers: timelineShortcut.modifiers.nsModifiers
+        ) { [weak self] in
+            self?.toggleTimelineOverlay()
+        }
+
+        // Register dashboard global hotkey
+        HotkeyManager.shared.registerHotkey(
+            key: dashboardShortcut.key,
+            modifiers: dashboardShortcut.modifiers.nsModifiers
+        ) { [weak self] in
+            self?.toggleDashboard()
+        }
+
+        // Also configure the timeline window controller
+        TimelineWindowController.shared.configure(coordinator: coordinator)
+    }
+
+    /// Toggle the fullscreen timeline overlay
+    private func toggleTimelineOverlay() {
+        TimelineWindowController.shared.toggle()
+    }
+
+    /// Toggle the dashboard window
+    private func toggleDashboard() {
+        NotificationCenter.default.post(name: .openDashboard, object: nil)
+    }
+
+    /// Hide recording indicator (called when timeline opens)
+    private func hideRecordingIndicator() {
+        shouldHideRecordingIndicator = true
+        updateIcon(recording: false)
+    }
+
+    /// Restore recording indicator (called when timeline closes)
+    private func restoreRecordingIndicator() {
+        shouldHideRecordingIndicator = false
+        updateIcon(recording: isRecording)
     }
 
     /// Update the menu bar icon to show recording status
@@ -87,25 +184,22 @@ public class MenuBarManager: ObservableObject {
         menu.addItem(NSMenuItem.separator())
 
         // Open Timeline
-        menu.addItem(NSMenuItem(
+        let timelineItem = NSMenuItem(
             title: "Open Timeline",
             action: #selector(openTimeline),
-            keyEquivalent: "t"
-        ))
-
-        // Open Search
-        menu.addItem(NSMenuItem(
-            title: "Search",
-            action: #selector(openSearch),
-            keyEquivalent: "f"
-        ))
+            keyEquivalent: timelineShortcut.menuKeyEquivalent
+        )
+        timelineItem.keyEquivalentModifierMask = timelineShortcut.modifiers.nsModifiers
+        menu.addItem(timelineItem)
 
         // Open Dashboard
-        menu.addItem(NSMenuItem(
+        let dashboardItem = NSMenuItem(
             title: "Dashboard",
             action: #selector(openDashboard),
-            keyEquivalent: "d"
-        ))
+            keyEquivalent: dashboardShortcut.menuKeyEquivalent
+        )
+        dashboardItem.keyEquivalentModifierMask = dashboardShortcut.modifiers.nsModifiers
+        menu.addItem(dashboardItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -115,25 +209,38 @@ public class MenuBarManager: ObservableObject {
             action: #selector(toggleRecording),
             keyEquivalent: "r"
         )
+        recordingItem.keyEquivalentModifierMask = [.command, .shift]
         menu.addItem(recordingItem)
 
         menu.addItem(NSMenuItem.separator())
 
         // Settings
-        menu.addItem(NSMenuItem(
+        let settingsItem = NSMenuItem(
             title: "Settings...",
             action: #selector(openSettings),
             keyEquivalent: ","
-        ))
+        )
+        settingsItem.keyEquivalentModifierMask = .command
+        menu.addItem(settingsItem)
+
+        // Report an Issue / Get Help
+        let feedbackItem = NSMenuItem(
+            title: "Report an Issue...",
+            action: #selector(openFeedback),
+            keyEquivalent: ""
+        )
+        menu.addItem(feedbackItem)
 
         menu.addItem(NSMenuItem.separator())
 
         // Quit
-        menu.addItem(NSMenuItem(
+        let quitItem = NSMenuItem(
             title: "Quit Retrace",
             action: #selector(quit),
             keyEquivalent: "q"
-        ))
+        )
+        quitItem.keyEquivalentModifierMask = .command
+        menu.addItem(quitItem)
 
         // Set all targets
         for item in menu.items {
@@ -146,11 +253,14 @@ public class MenuBarManager: ObservableObject {
     // MARK: - Actions
 
     @objc private func openTimeline() {
-        NotificationCenter.default.post(name: .openTimeline, object: nil)
+        // Open the fullscreen timeline overlay
+        toggleTimelineOverlay()
     }
 
     @objc private func openSearch() {
-        NotificationCenter.default.post(name: .openSearch, object: nil)
+        // Open timeline with search focused
+        TimelineWindowController.shared.show()
+        // The search panel will auto-show when timeline opens
     }
 
     @objc private func openDashboard() {
@@ -162,16 +272,21 @@ public class MenuBarManager: ObservableObject {
             do {
                 // Check actual coordinator state first
                 let coordinatorIsRunning = await coordinator.getStatus().isRunning
+                print("[MenuBar] toggleRecording called, coordinatorIsRunning=\(coordinatorIsRunning)")
 
                 if coordinatorIsRunning {
+                    print("[MenuBar] Stopping pipeline...")
                     try await coordinator.stopPipeline()
+                    print("[MenuBar] Pipeline stopped, updating status to false")
                     updateRecordingStatus(false)
                 } else {
+                    print("[MenuBar] Starting pipeline...")
                     try await coordinator.startPipeline()
+                    print("[MenuBar] Pipeline started, updating status to true")
                     updateRecordingStatus(true)
                 }
             } catch {
-                print("Failed to toggle recording: \(error)")
+                print("[MenuBar] Failed to toggle recording: \(error)")
                 // Sync state with coordinator on error
                 let actualState = await coordinator.getStatus().isRunning
                 updateRecordingStatus(actualState)
@@ -193,6 +308,10 @@ public class MenuBarManager: ObservableObject {
         NotificationCenter.default.post(name: .openSettings, object: nil)
     }
 
+    @objc private func openFeedback() {
+        NotificationCenter.default.post(name: .openFeedback, object: nil)
+    }
+
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
     }
@@ -204,6 +323,25 @@ public class MenuBarManager: ObservableObject {
         setupMenu()
         updateIcon(recording: recording)
     }
+
+    /// Show the menu bar icon
+    public func show() {
+        if statusItem == nil {
+            setup()
+        }
+        statusItem?.isVisible = true
+    }
+
+    /// Hide the menu bar icon
+    public func hide() {
+        statusItem?.isVisible = false
+    }
+
+    // MARK: - Cleanup
+
+    deinit {
+        refreshTimer?.invalidate()
+    }
 }
 
 // MARK: - Notifications
@@ -213,4 +351,5 @@ extension Notification.Name {
     static let openSearch = Notification.Name("openSearch")
     static let openDashboard = Notification.Name("openDashboard")
     static let openSettings = Notification.Name("openSettings")
+    static let openFeedback = Notification.Name("openFeedback")
 }

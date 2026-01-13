@@ -1,5 +1,6 @@
 import SwiftUI
 import Shared
+import AppKit
 
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
@@ -19,15 +20,17 @@ public struct SettingsView: View {
     @AppStorage("excludeCursor") private var excludeCursor = false
 
     // Storage settings
-    @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
-    @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
+    // Hidden for now - defaults to forever/unlimited
+    // @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
+    // @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
     @AppStorage("compressionQuality") private var compressionQuality: CompressionQuality = .high
 
     // Privacy settings
-    @AppStorage("excludedApps") private var excludedAppsString = ""
-    @AppStorage("excludePrivateWindows") private var excludePrivateWindows = true
-    @AppStorage("excludeSafariPrivate") private var excludeSafariPrivate = true
-    @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
+    // Hidden for now - not implemented yet, default to allow everything
+    // @AppStorage("excludedApps") private var excludedAppsString = ""
+    // @AppStorage("excludePrivateWindows") private var excludePrivateWindows = true
+    // @AppStorage("excludeSafariPrivate") private var excludeSafariPrivate = true
+    // @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
     @AppStorage("encryptionEnabled") private var encryptionEnabled = true
 
     // MARK: - Body
@@ -50,6 +53,28 @@ public struct SettingsView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
+            // Back to Dashboard button
+            Button(action: {
+                NotificationCenter.default.post(name: .openDashboard, object: nil)
+            }) {
+                HStack(spacing: .spacingS) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+
+                    Text("Dashboard")
+                        .font(.retraceBody)
+                }
+                .foregroundColor(.retraceSecondary)
+                .padding(.horizontal, .spacingM)
+                .padding(.vertical, .spacingS)
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, .spacingM)
+
+            Divider()
+                .padding(.horizontal, .spacingM)
+                .padding(.bottom, .spacingM)
+
             ForEach(SettingsTab.allCases) { tab in
                 sidebarButton(tab: tab)
             }
@@ -113,7 +138,13 @@ public struct SettingsView: View {
 
             settingsGroup(title: "Startup") {
                 Toggle("Launch at Login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { newValue in
+                        setLaunchAtLogin(enabled: newValue)
+                    }
                 Toggle("Show Menu Bar Icon", isOn: $showMenuBarIcon)
+                    .onChange(of: showMenuBarIcon) { newValue in
+                        setMenuBarIconVisibility(visible: newValue)
+                    }
             }
 
             settingsGroup(title: "Appearance") {
@@ -123,6 +154,9 @@ public struct SettingsView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .onChange(of: theme) { newValue in
+                    applyTheme(newValue)
+                }
             }
 
             settingsGroup(title: "Keyboard Shortcuts") {
@@ -180,30 +214,32 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: .spacingL) {
             settingsHeader(title: "Storage Settings")
 
-            settingsGroup(title: "Retention Policy") {
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    Picker("Keep recordings for", selection: $retentionDays) {
-                        Text("Forever").tag(0)
-                        Text("Last 30 days").tag(30)
-                        Text("Last 90 days").tag(90)
-                        Text("Last 180 days").tag(180)
-                        Text("Last year").tag(365)
-                    }
-                }
-            }
+            // Hidden for now - retention set to forever by default
+            // settingsGroup(title: "Retention Policy") {
+            //     VStack(alignment: .leading, spacing: .spacingS) {
+            //         Picker("Keep recordings for", selection: $retentionDays) {
+            //             Text("Forever").tag(0)
+            //             Text("Last 30 days").tag(30)
+            //             Text("Last 90 days").tag(90)
+            //             Text("Last 180 days").tag(180)
+            //             Text("Last year").tag(365)
+            //         }
+            //     }
+            // }
 
-            settingsGroup(title: "Storage Limit") {
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    HStack {
-                        Text("Maximum storage:")
-                        Spacer()
-                        Text(String(format: "%.0f GB", maxStorageGB))
-                            .foregroundColor(.retraceSecondary)
-                    }
-
-                    Slider(value: $maxStorageGB, in: 10...500, step: 10)
-                }
-            }
+            // Hidden for now - storage unlimited by default
+            // settingsGroup(title: "Storage Limit") {
+            //     VStack(alignment: .leading, spacing: .spacingS) {
+            //         HStack {
+            //             Text("Maximum storage:")
+            //             Spacer()
+            //             Text(String(format: "%.0f GB", maxStorageGB))
+            //                 .foregroundColor(.retraceSecondary)
+            //         }
+            //
+            //         Slider(value: $maxStorageGB, in: 10...500, step: 10)
+            //     }
+            // }
 
             settingsGroup(title: "Compression") {
                 Picker("Quality", selection: $compressionQuality) {
@@ -247,44 +283,46 @@ public struct SettingsView: View {
                 }
             }
 
-            settingsGroup(title: "Excluded Apps") {
-                Text("Apps that will not be recorded")
-                    .font(.retraceCaption)
-                    .foregroundColor(.retraceSecondary)
+            // Hidden for now - not implemented yet, default to capture everything
+            // settingsGroup(title: "Excluded Apps") {
+            //     Text("Apps that will not be recorded")
+            //         .font(.retraceCaption)
+            //         .foregroundColor(.retraceSecondary)
+            //
+            //     // TODO: Implement app picker
+            //     Text("1Password, Bitwarden, Keychain Access")
+            //         .font(.retraceBody)
+            //         .foregroundColor(.retracePrimary)
+            //         .padding(.spacingS)
+            //         .frame(maxWidth: .infinity, alignment: .leading)
+            //         .background(Color.retraceCard)
+            //         .cornerRadius(.cornerRadiusS)
+            //
+            //     Button("Add App...") {
+            //         // TODO: Show app picker
+            //     }
+            //     .buttonStyle(RetraceSecondaryButtonStyle())
+            // }
 
-                // TODO: Implement app picker
-                Text("1Password, Bitwarden, Keychain Access")
-                    .font(.retraceBody)
-                    .foregroundColor(.retracePrimary)
-                    .padding(.spacingS)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.retraceCard)
-                    .cornerRadius(.cornerRadiusS)
-
-                Button("Add App...") {
-                    // TODO: Show app picker
-                }
-                .buttonStyle(RetraceSecondaryButtonStyle())
-            }
-
-            settingsGroup(title: "Excluded Windows") {
-                Toggle("Exclude Private/Incognito Windows", isOn: $excludePrivateWindows)
-                    .help("Automatically exclude private browsing windows from all browsers")
-
-                if excludePrivateWindows {
-                    VStack(alignment: .leading, spacing: .spacingS) {
-                        Toggle("Safari Private Browsing", isOn: $excludeSafariPrivate)
-                            .disabled(true) // Always on when excludePrivateWindows is enabled
-                        Toggle("Chrome/Edge Incognito", isOn: $excludeChromeIncognito)
-                            .disabled(true) // Always on when excludePrivateWindows is enabled
-
-                        Text("Detects: Safari (Private), Chrome (Incognito), Edge (InPrivate), Firefox (Private Browsing), Brave (Private Window)")
-                            .font(.retraceCaption)
-                            .foregroundColor(.retraceSecondary)
-                            .padding(.leading, 24)
-                    }
-                }
-            }
+            // Hidden for now - not implemented yet, default to capture everything
+            // settingsGroup(title: "Excluded Windows") {
+            //     Toggle("Exclude Private/Incognito Windows", isOn: $excludePrivateWindows)
+            //         .help("Automatically exclude private browsing windows from all browsers")
+            //
+            //     if excludePrivateWindows {
+            //         VStack(alignment: .leading, spacing: .spacingS) {
+            //             Toggle("Safari Private Browsing", isOn: $excludeSafariPrivate)
+            //                 .disabled(true) // Always on when excludePrivateWindows is enabled
+            //             Toggle("Chrome/Edge Incognito", isOn: $excludeChromeIncognito)
+            //                 .disabled(true) // Always on when excludePrivateWindows is enabled
+            //
+            //             Text("Detects: Safari (Private), Chrome (Incognito), Edge (InPrivate), Firefox (Private Browsing), Brave (Private Window)")
+            //                 .font(.retraceCaption)
+            //                 .foregroundColor(.retraceSecondary)
+            //                 .padding(.leading, 24)
+            //         }
+            //     }
+            // }
 
             settingsGroup(title: "Quick Delete") {
                 HStack(spacing: .spacingM) {
@@ -525,6 +563,57 @@ enum PermissionStatus: String {
     case granted = "Granted"
     case denied = "Denied"
     case notDetermined = "Not Determined"
+}
+
+// MARK: - Launch at Login Helper
+
+import ServiceManagement
+
+extension SettingsView {
+    /// Enable or disable launch at login using SMAppService (macOS 13+)
+    private func setLaunchAtLogin(enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status == .enabled {
+                    // Already enabled
+                    return
+                }
+                try SMAppService.mainApp.register()
+            } else {
+                guard case SMAppService.Status.enabled = SMAppService.mainApp.status else {
+                    // Already disabled
+                    return
+                }
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            print("[ERROR] Failed to \(enabled ? "enable" : "disable") launch at login: \(error)")
+        }
+    }
+
+    /// Show or hide the menu bar icon
+    private func setMenuBarIconVisibility(visible: Bool) {
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate,
+           let menuBarManager = appDelegate.menuBarManager {
+            if visible {
+                menuBarManager.show()
+            } else {
+                menuBarManager.hide()
+            }
+        }
+    }
+
+    /// Apply theme preference
+    private func applyTheme(_ theme: ThemePreference) {
+        switch theme {
+        case .auto:
+            NSApp.appearance = nil // Use system setting
+        case .light:
+            NSApp.appearance = NSAppearance(named: .aqua)
+        case .dark:
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+    }
 }
 
 // MARK: - Preview

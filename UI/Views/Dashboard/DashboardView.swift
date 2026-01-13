@@ -1,5 +1,4 @@
 import SwiftUI
-import Charts
 import Shared
 import App
 
@@ -10,6 +9,8 @@ public struct DashboardView: View {
     // MARK: - Properties
 
     @StateObject private var viewModel: DashboardViewModel
+    @State private var isPulsing = false
+    @State private var showFeedbackSheet = false
 
     // MARK: - Initialization
 
@@ -41,21 +42,8 @@ public struct DashboardView: View {
                 // Header
                 header
 
-                // Analytics cards
-                analyticsCards
-
-                // Activity chart
-                if !viewModel.activityData.isEmpty {
-                    activityChart
-                }
-
-                // Top apps
-                if !viewModel.topApps.isEmpty {
-                    topAppsSection
-                }
-
-                // Migration panel
-                migrationSection
+                // Your Week section
+                yourWeekSection
 
                 // Footer with attribution
                 footer
@@ -65,7 +53,6 @@ public struct DashboardView: View {
         .background(Color.retraceBackground)
         .task {
             await viewModel.loadStatistics()
-            await viewModel.scanForMigrationSources()
         }
     }
 
@@ -73,17 +60,37 @@ public struct DashboardView: View {
 
     private var header: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Retrace Dashboard")
-                    .font(.retraceTitle)
-                    .foregroundColor(.retracePrimary)
+            HStack(spacing: .spacingM) {
+                // Retrace logo
+                retraceLogo
+                    .frame(width: 40, height: 40)
 
-                Text("Your screen history at a glance")
-                    .font(.retraceBody)
-                    .foregroundColor(.retraceSecondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Dashboard")
+                        .font(.retraceTitle)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("Your screen history at a glance")
+                        .font(.retraceBody)
+                        .foregroundColor(.retraceSecondary)
+                }
             }
 
             Spacer()
+
+            // Recording status indicator
+            recordingIndicator
+
+            // Feedback button
+            Button(action: { showFeedbackSheet = true }) {
+                HStack(spacing: .spacingS) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 14))
+                    Text("Feedback")
+                        .font(.retraceCaption)
+                }
+            }
+            .buttonStyle(RetraceSecondaryButtonStyle())
 
             Button(action: { Task { await viewModel.loadStatistics() } }) {
                 Image(systemName: "arrow.clockwise")
@@ -91,203 +98,214 @@ public struct DashboardView: View {
             }
             .buttonStyle(RetraceSecondaryButtonStyle())
         }
-    }
-
-    // MARK: - Analytics Cards
-
-    private var analyticsCards: some View {
-        LazyVGrid(
-            columns: [
-                GridItem(.flexible()),
-                GridItem(.flexible()),
-                GridItem(.flexible())
-            ],
-            spacing: .spacingM
-        ) {
-            // Capture stats
-            AnalyticsCard(
-                title: "Frames Captured",
-                value: formatFrameCount(viewModel.databaseStats?.frameCount ?? 0),
-                subtitle: viewModel.captureStats.map { "+\($0.totalFramesCaptured) today" },
-                icon: "photo.on.rectangle.angled",
-                accentColor: .retraceAccent
-            )
-
-            // Storage stats
-            AnalyticsCard(
-                title: "Total Storage Used",
-                value: formatBytes(viewModel.storageStats?.totalStorageBytes ?? 0),
-                subtitle: viewModel.storageStats?.estimatedDaysUntilFull.map { "\($0) days until full" },
-                icon: "internaldrive",
-                accentColor: .retraceWarning
-            )
-
-            // Time tracked
-            AnalyticsCard(
-                title: "Days Recording",
-                value: formatDateRange(viewModel.databaseStats),
-                subtitle: formatCaptureUptime(viewModel.captureStats),
-                icon: "calendar",
-                accentColor: .retraceSuccess
-            )
-
-            // Search stats
-            AnalyticsCard(
-                title: "Searchable Documents",
-                value: formatNumber(viewModel.databaseStats?.documentCount ?? 0),
-                subtitle: "Full-text searchable",
-                icon: "doc.text.magnifyingglass",
-                accentColor: .retraceAccent
-            )
-
-            // Processing stats
-            AnalyticsCard(
-                title: "OCR Processing",
-                value: String(format: "%.0fms", viewModel.processingStats?.averageOCRTimeMs ?? 0),
-                subtitle: "avg processing time",
-                icon: "wand.and.stars",
-                accentColor: .retraceForeground
-            )
-
-            // Deduplication rate
-            AnalyticsCard(
-                title: "Deduplication Rate",
-                value: String(format: "%.0f%%", (viewModel.captureStats?.deduplicationRate ?? 0) * 100),
-                subtitle: "\(viewModel.captureStats?.framesDeduped ?? 0) frames saved",
-                icon: "square.on.square",
-                accentColor: .retraceSuccess
-            )
+        .sheet(isPresented: $showFeedbackSheet) {
+            FeedbackFormView()
         }
     }
 
-    // MARK: - Activity Chart
+    // MARK: - Recording Indicator
 
-    private var activityChart: some View {
-        VStack(alignment: .leading, spacing: .spacingM) {
-            Text("Recent Activity")
-                .font(.retraceTitle3)
-                .foregroundColor(.retracePrimary)
+    private var recordingIndicator: some View {
+        HStack(spacing: .spacingS) {
+            // Pulsating dot (red when not recording, green when recording)
+            ZStack {
+                // Pulse layer (animated ring)
+                Circle()
+                    .fill(viewModel.isRecording ? Color.green : Color.red)
+                    .frame(width: 12, height: 12)
+                    .scaleEffect(isPulsing ? 2.5 : 1.0)
+                    .opacity(isPulsing ? 0.0 : 0.9)
 
-            Chart(viewModel.activityData) { dataPoint in
-                LineMark(
-                    x: .value("Date", dataPoint.date),
-                    y: .value("Frames", dataPoint.framesCount)
-                )
-                .foregroundStyle(Color.retraceAccent)
-                .interpolationMethod(.catmullRom)
+                // Main dot
+                Circle()
+                    .fill(viewModel.isRecording ? Color.green : Color.red)
+                    .frame(width: 12, height: 12)
+            }
+            .onAppear {
+                withAnimation(
+                    Animation.easeOut(duration: 1.5)
+                        .repeatForever(autoreverses: false)
+                ) {
+                    isPulsing = true
+                }
+            }
 
-                AreaMark(
-                    x: .value("Date", dataPoint.date),
-                    y: .value("Frames", dataPoint.framesCount)
-                )
-                .foregroundStyle(
+            Text(viewModel.isRecording ? "Recording" : "Not Recording")
+                .font(.retraceCaption)
+                .foregroundColor(viewModel.isRecording ? .white : .white.opacity(0.9))
+        }
+        .padding(.horizontal, .spacingM)
+        .padding(.vertical, .spacingS)
+        .background(
+            RoundedRectangle(cornerRadius: .cornerRadiusM)
+                .fill(Color.clear)
+        )
+        .padding(.trailing, .spacingM)
+    }
+
+    // MARK: - Logo
+
+    private var retraceLogo: some View {
+        ZStack {
+            // Background circle with gradient
+            Circle()
+                .fill(
                     LinearGradient(
-                        colors: [
-                            Color.retraceAccent.opacity(0.3),
-                            Color.retraceAccent.opacity(0.0)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
+                        colors: [Color.retraceAccent.opacity(0.3), Color.retraceDeepBlue],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
                     )
                 )
-                .interpolationMethod(.catmullRom)
+
+            // Left triangle pointing left
+            Path { path in
+                path.move(to: CGPoint(x: 5, y: 20))
+                path.addLine(to: CGPoint(x: 18, y: 11))
+                path.addLine(to: CGPoint(x: 18, y: 29))
+                path.closeSubpath()
             }
-            .chartXAxis {
-                AxisMarks(values: .automatic) { value in
-                    AxisValueLabel(format: .dateTime.month().day())
-                        .foregroundStyle(Color.retraceSecondary)
-                }
+            .fill(Color.retracePrimary.opacity(0.9))
+
+            // Right triangle pointing right
+            Path { path in
+                path.move(to: CGPoint(x: 35, y: 20))
+                path.addLine(to: CGPoint(x: 22, y: 11))
+                path.addLine(to: CGPoint(x: 22, y: 29))
+                path.closeSubpath()
             }
-            .chartYAxis {
-                AxisMarks { value in
-                    AxisValueLabel()
-                        .foregroundStyle(Color.retraceSecondary)
-                }
-            }
-            .frame(height: 200)
-            .padding(.spacingM)
-            .background(Color.retraceCard)
-            .cornerRadius(.cornerRadiusL)
-            .retraceShadowLight()
+            .fill(Color.retracePrimary.opacity(0.9))
         }
     }
 
-    // MARK: - Top Apps
+    // MARK: - Your Week Section
 
-    private var topAppsSection: some View {
-        VStack(alignment: .leading, spacing: .spacingM) {
-            Text("Top Apps")
-                .font(.retraceTitle3)
+    private var yourWeekSection: some View {
+        VStack(alignment: .leading, spacing: .spacingL) {
+            // Section header
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Your Week")
+                        .font(.retraceTitle2)
+                        .foregroundColor(.retracePrimary)
+
+                    Text(viewModel.weekDateRange)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                }
+
+                Spacer()
+
+                // Total time this week
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(formatTotalTime(viewModel.totalWeeklyTime))
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundColor(.retraceAccent)
+
+                    Text("total screen time")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                }
+            }
+
+            // App usage list
+            if viewModel.weeklyAppUsage.isEmpty {
+                emptyStateView
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(viewModel.weeklyAppUsage.enumerated()), id: \.offset) { index, app in
+                        appUsageRow(index: index, app: app)
+
+                        if index < viewModel.weeklyAppUsage.count - 1 {
+                            Divider()
+                                .background(Color.retraceBorder)
+                        }
+                    }
+                }
+                .padding(.spacingM)
+                .background(Color.retraceCard)
+                .cornerRadius(.cornerRadiusL)
+                .retraceShadowLight()
+            }
+        }
+    }
+
+    private var emptyStateView: some View {
+        VStack(spacing: .spacingM) {
+            Image(systemName: "clock.badge.questionmark")
+                .font(.system(size: 48))
+                .foregroundColor(.retraceSecondary)
+
+            Text("No activity recorded yet")
+                .font(.retraceHeadline)
                 .foregroundColor(.retracePrimary)
 
-            VStack(spacing: .spacingS) {
-                ForEach(Array(viewModel.topApps.enumerated()), id: \.offset) { index, app in
-                    topAppRow(index: index + 1, app: app)
-                }
-            }
-            .padding(.spacingM)
-            .background(Color.retraceCard)
-            .cornerRadius(.cornerRadiusL)
-            .retraceShadowLight()
+            Text("Start using your Mac and Retrace will track your app usage.")
+                .font(.retraceBody)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
         }
+        .frame(maxWidth: .infinity)
+        .padding(.spacingXL)
+        .background(Color.retraceCard)
+        .cornerRadius(.cornerRadiusL)
     }
 
-    private func topAppRow(index: Int, app: (appBundleID: String, appName: String, duration: TimeInterval, percentage: Double)) -> some View {
+    private func appUsageRow(index: Int, app: AppUsageData) -> some View {
         HStack(spacing: .spacingM) {
-            // Rank
-            Text("\(index).")
-                .font(.retraceHeadline)
-                .foregroundColor(.retraceSecondary)
-                .frame(width: 30, alignment: .leading)
+            // App color indicator
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.sessionColor(for: app.appBundleID))
+                .frame(width: 4, height: 40)
 
-            // App icon and name
-            HStack(spacing: .spacingS) {
-                Circle()
-                    .fill(Color.sessionColor(for: app.appBundleID))
-                    .frame(width: 8, height: 8)
-
+            // App name
+            VStack(alignment: .leading, spacing: 2) {
                 Text(app.appName)
-                    .font(.retraceBody)
+                    .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
+
+                Text("\(app.sessionCount) sessions")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
             }
 
             Spacer()
 
-            // Duration
-            Text(formatDuration(app.duration))
-                .font(.retraceBody)
-                .foregroundColor(.retraceSecondary)
+            // Duration bar
+            GeometryReader { geometry in
+                HStack(spacing: 0) {
+                    Spacer()
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.sessionColor(for: app.appBundleID).opacity(0.3))
+                        .frame(width: max(geometry.size.width * app.percentage, 20))
+                }
+            }
+            .frame(width: 100, height: 8)
 
-            // Percentage
-            Text(String(format: "%.0f%%", app.percentage * 100))
-                .font(.retraceBody)
-                .fontWeight(.semibold)
-                .foregroundColor(.retraceAccent)
-                .frame(width: 50, alignment: .trailing)
+            // Duration and percentage
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(formatDuration(app.duration))
+                    .font(.retraceBody)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.retracePrimary)
+
+                Text(String(format: "%.0f%%", app.percentage * 100))
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+            .frame(width: 80, alignment: .trailing)
         }
         .padding(.vertical, .spacingS)
     }
 
-    // MARK: - Migration
+    private func formatTotalTime(_ seconds: TimeInterval) -> String {
+        let hours = Int(seconds) / 3600
+        let minutes = (Int(seconds) % 3600) / 60
 
-    private var migrationSection: some View {
-        MigrationPanel(
-            sources: viewModel.availableSources,
-            importProgress: viewModel.importProgress,
-            isImporting: viewModel.isImporting,
-            onStartImport: { source in
-                Task { await viewModel.startImport(from: source) }
-            },
-            onPauseImport: {
-                viewModel.pauseImport()
-            },
-            onCancelImport: {
-                viewModel.cancelImport()
-            },
-            onScanSources: {
-                Task { await viewModel.scanForMigrationSources() }
-            }
-        )
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else {
+            return "\(minutes)m"
+        }
     }
 
     // MARK: - Footer
@@ -319,56 +337,15 @@ public struct DashboardView: View {
 
     // MARK: - Formatting Helpers
 
-    private func formatFrameCount(_ count: Int) -> String {
-        if count >= 1_000_000 {
-            return String(format: "%.1fM", Double(count) / 1_000_000)
-        } else if count >= 1_000 {
-            return String(format: "%.1fK", Double(count) / 1_000)
-        } else {
-            return "\(count)"
-        }
-    }
-
-    private func formatBytes(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useGB, .useMB]
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
-    }
-
-    private func formatDateRange(_ stats: DatabaseStatistics?) -> String {
-        guard let stats = stats,
-              let oldest = stats.oldestFrameDate,
-              let newest = stats.newestFrameDate else {
-            return "0"
-        }
-
-        let calendar = Calendar.current
-        let days = calendar.dateComponents([.day], from: oldest, to: newest).day ?? 0
-        return "\(days)"
-    }
-
-    private func formatCaptureUptime(_ stats: CaptureStatistics?) -> String {
-        guard let stats = stats,
-              let startTime = stats.captureStartTime else {
-            return "No data"
-        }
-
-        let elapsed = Date().timeIntervalSince(startTime)
-        let hours = Int(elapsed / 3600)
-        return "\(hours)h uptime"
-    }
-
-    private func formatNumber(_ number: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
-    }
-
     private func formatDuration(_ duration: TimeInterval) -> String {
-        let hours = duration / 3600
+        let hours = Int(duration) / 3600
+        let minutes = (Int(duration) % 3600) / 60
 
-        return String(format: "%.1f hours", hours)
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else {
+            return "\(minutes)m"
+        }
     }
 }
 

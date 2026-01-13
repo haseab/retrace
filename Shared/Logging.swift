@@ -35,8 +35,8 @@ public enum Log {
 
     // MARK: - Configuration
 
-    /// Bundle identifier used as subsystem for os.log
-    private static let subsystem = Bundle.main.bundleIdentifier ?? "com.retrace.app"
+    /// Subsystem for os.log
+    private static let subsystem = AppPaths.logSubsystem
 
     /// Whether to also print to console (always true in DEBUG, configurable in release)
     #if DEBUG

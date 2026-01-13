@@ -1,46 +1,45 @@
 import SwiftUI
+import AppKit
 import App
-import Inject
+import Database
+import Shared
 
 /// Main onboarding flow with 9 steps
 /// Step 1: Welcome
-/// Step 2: Permissions
-/// Step 3: Encryption choice
-/// Step 4: Creator message with features
-/// Step 5: Rewind data decision
-/// Step 6: Keyboard shortcuts
-/// Step 7: Safety info
-/// Step 8: Quiz
-/// Step 9: Completion
+/// Step 2: Creator features
+/// Step 3: Permissions
+/// Step 4: Screen Recording Indicator Info (starts recording on continue)
+/// Step 5: Encryption choice
+/// Step 6: Rewind data decision
+/// Step 7: Keyboard shortcuts
+/// Step 8: Early Alpha / Safety info
+/// Step 9: Completion (prompts to test timeline)
 public struct OnboardingView: View {
 
     // MARK: - Properties
 
-    @ObserveInjection var inject
     @State private var currentStep: Int = 1
     @State private var hasScreenRecordingPermission = false
     @State private var hasAccessibilityPermission = false
     @State private var isCheckingPermissions = false
     @State private var permissionCheckTimer: Timer? = nil
+    @State private var screenRecordingDenied = false  // User explicitly denied in system prompt
+    @State private var screenRecordingRequested = false  // User has clicked Enable once
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
     @State private var wantsBackup: Bool? = nil
-    @State private var showRewindMigration = false
-    @State private var showRewindBackup = false
+    @State private var rewindDataSizeGB: Double? = nil
 
-    // Keyboard shortcuts (matching Rewind defaults)
-    @State private var timelineShortcut = "Space"
-    @State private var dashboardShortcut = "D"
+    // Keyboard shortcuts - initialized from defaults
+    @State private var timelineShortcut = ShortcutKey(from: .defaultTimeline)
+    @State private var dashboardShortcut = ShortcutKey(from: .defaultDashboard)
     @State private var isRecordingTimelineShortcut = false
     @State private var isRecordingDashboardShortcut = false
-
-    // Quiz
-    @State private var selectedQuizAnswer: Int? = nil
-    @State private var quizAnswered = false
+    @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
     // Encryption
-    @State private var encryptionEnabled = false
+    @State private var encryptionEnabled: Bool? = true
 
     let coordinator: AppCoordinator
     let onComplete: () -> Void
@@ -50,28 +49,34 @@ public struct OnboardingView: View {
     // MARK: - Body
 
     public var body: some View {
-        let _ = print("🔥 [Hot Reload] OnboardingView.body called at \(Date())")
-
         ZStack {
             // Background
             Color.retraceBackground
                 .ignoresSafeArea()
-                .enableInjection()
 
             VStack(spacing: 0) {
                 // Progress indicator
                 progressIndicator
                     .padding(.top, .spacingL)
 
-                // Content
+                // Content (scrollable area)
                 ScrollView {
                     VStack(spacing: .spacingXL) {
                         stepContent
+                            .transition(.opacity)
+                            .id(currentStep)
                     }
                     .padding(.horizontal, .spacingXL)
                     .padding(.vertical, .spacingL)
+                    .frame(maxWidth: 900, alignment: .top)
                 }
                 .frame(maxWidth: 900)
+
+                // Fixed navigation buttons at bottom
+                navigationButtonsFixed
+                    .padding(.horizontal, .spacingXL)
+                    .padding(.bottom, .spacingL)
+                    .frame(maxWidth: 900)
             }
         }
         .frame(minWidth: 1000, minHeight: 700)
@@ -79,6 +84,208 @@ public struct OnboardingView: View {
             // Only auto-detect Rewind data on first load
             // Don't check permissions until user reaches permissions step
             await detectRewindData()
+            // Pre-fetch creator image so it's ready when user reaches step 4
+            await prefetchCreatorImage()
+        }
+    }
+
+    // MARK: - Fixed Navigation Buttons
+
+    private var navigationButtonsFixed: some View {
+        HStack {
+            // Back button (hidden on step 1)
+            if currentStep > 1 {
+                Button(action: { withAnimation { currentStep -= 1 } }) {
+                    HStack(spacing: .spacingS) {
+                        Image(systemName: "chevron.left")
+                        Text("Back")
+                    }
+                    .font(.retraceBody)
+                    .foregroundColor(.retraceSecondary)
+                }
+                .buttonStyle(.plain)
+            } else {
+                // Invisible placeholder to maintain layout
+                HStack(spacing: .spacingS) {
+                    Image(systemName: "chevron.left")
+                    Text("Back")
+                }
+                .font(.retraceBody)
+                .foregroundColor(.clear)
+            }
+
+            Spacer()
+
+            // Continue button - different states based on current step
+            continueButton
+        }
+    }
+
+    @ViewBuilder
+    private var continueButton: some View {
+        switch currentStep {
+        case 1:
+            // Welcome - No button here (it's in the step itself)
+            EmptyView()
+
+        case 2:
+            // Creator features
+            Button(action: { withAnimation { currentStep = 3 } }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        case 3:
+            // Permissions - requires both permissions, moves to indicator step
+            Button(action: {
+                stopPermissionMonitoring()
+                withAnimation { currentStep = 4 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(hasScreenRecordingPermission && hasAccessibilityPermission ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasScreenRecordingPermission || !hasAccessibilityPermission)
+
+        case 4:
+            // Screen Recording Indicator - starts recording when user continues
+            Button(action: {
+                Task {
+                    try? await coordinator.startPipeline()
+                }
+                withAnimation { currentStep = 5 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        case 5:
+            // Encryption - requires selection
+            Button(action: {
+                print("[ONBOARDING] Encryption step - Continue button clicked")
+                print("[ONBOARDING] encryptionEnabled = \(encryptionEnabled ?? false)")
+
+                UserDefaults.standard.set(encryptionEnabled ?? false, forKey: "encryptionEnabled")
+
+                if encryptionEnabled == true {
+                    print("[ONBOARDING] Setting up encryption keychain...")
+                    do {
+                        try DatabaseManager.setupEncryptionKeychain()
+                        print("[ONBOARDING] Keychain setup complete, now verifying...")
+
+                        // Immediately verify we can read it back
+                        // This triggers the keychain access prompt in context, right after enabling encryption
+                        _ = try DatabaseManager.verifyEncryptionKeychain()
+                        print("[ONBOARDING] ✅ Encryption keychain setup and verified successfully")
+                    } catch {
+                        print("[ONBOARDING] ❌ Failed to setup encryption keychain: \(error)")
+                    }
+                } else {
+                    print("[ONBOARDING] Encryption disabled, skipping keychain setup")
+                }
+
+                withAnimation { currentStep = 6 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(encryptionEnabled != nil ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+            .disabled(encryptionEnabled == nil)
+
+        case 6:
+            // Rewind data - requires selection if data exists
+            Button(action: {
+                UserDefaults.standard.set(wantsBackup == true, forKey: "useRewindData")
+                withAnimation { currentStep = 7 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background((hasRewindData == false || wantsBackup != nil) ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+            .disabled(hasRewindData == true && wantsBackup == nil)
+
+        case 7:
+            // Keyboard shortcuts
+            Button(action: {
+                Task {
+                    // Save shortcuts to UserDefaults (full config with key + modifiers)
+                    await coordinator.onboardingManager.setTimelineShortcut(timelineShortcut.toConfig)
+                    await coordinator.onboardingManager.setDashboardShortcut(dashboardShortcut.toConfig)
+                }
+                withAnimation { currentStep = 8 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        case 8:
+            // Safety info
+            Button(action: { withAnimation { currentStep = 9 } }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        case 9:
+            // Completion - Just finish onboarding (recording already started at step 4)
+            Button(action: {
+                Task {
+                    await coordinator.onboardingManager.markOnboardingCompleted()
+                    // Register Rewind data source if user opted in during onboarding
+                    try? await coordinator.registerRewindSourceIfEnabled()
+                }
+                onComplete()
+            }) {
+                Text("Finish")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        default:
+            EmptyView()
         }
     }
 
@@ -110,19 +317,19 @@ public struct OnboardingView: View {
         case 1:
             welcomeStep
         case 2:
-            permissionsStep
+            creatorFeaturesStep
         case 3:
-            encryptionStep
+            permissionsStep
         case 4:
-            creatorMessageStep
+            screenRecordingIndicatorStep
         case 5:
-            rewindDataStep
+            encryptionStep
         case 6:
-            keyboardShortcutsStep
+            rewindDataStep
         case 7:
-            safetyInfoStep
+            keyboardShortcutsStep
         case 8:
-            quizStep
+            safetyInfoStep
         case 9:
             completionStep
         default:
@@ -135,7 +342,6 @@ public struct OnboardingView: View {
     private var welcomeStep: some View {
         VStack(spacing: .spacingXL) {
             Spacer()
-                .frame(height: .spacingXXL)
 
             // Logo
             retraceLogo
@@ -145,30 +351,29 @@ public struct OnboardingView: View {
                 .font(.system(size: 36, weight: .bold))
                 .foregroundColor(.retracePrimary)
 
-            Text("Your personal screen memory")
+            Text("Remember everything.")
                 .font(.retraceBody)
                 .foregroundColor(.retraceSecondary)
                 .multilineTextAlignment(.center)
 
-            Spacer()
-                .frame(height: .spacingXXL)
-
+            // Get Started button centered in welcome step - goes to creator features
             Button(action: { withAnimation { currentStep = 2 } }) {
                 Text("Get Started")
                     .font(.retraceHeadline)
                     .foregroundColor(.white)
-                    .frame(width: 200)
+                    .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
                     .background(Color.retraceAccent)
-                    .cornerRadius(.cornerRadiusL)
+                    .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
 
             Spacer()
         }
+        .frame(maxWidth: .infinity) // Match width with other steps to prevent layout jumping
     }
 
-    // MARK: - Step 2: Permissions
+    // MARK: - Step 4: Permissions
 
     private var permissionsStep: some View {
         VStack(spacing: .spacingXL) {
@@ -188,7 +393,9 @@ public struct OnboardingView: View {
                     title: "Screen Recording",
                     subtitle: "Required to capture your screen",
                     isGranted: hasScreenRecordingPermission,
-                    action: requestScreenRecording
+                    isDenied: screenRecordingDenied,
+                    action: requestScreenRecording,
+                    openSettingsAction: openScreenRecordingSettings
                 )
 
                 // Accessibility Permission
@@ -219,18 +426,6 @@ public struct OnboardingView: View {
                 .foregroundColor(.retraceSecondary)
 
             Spacer()
-
-            navigationButtons(
-                canContinue: hasScreenRecordingPermission && hasAccessibilityPermission,
-                continueAction: {
-                    // Stop permission monitoring
-                    stopPermissionMonitoring()
-
-                    // Don't start pipeline here - it triggers the permission dialog
-                    // Pipeline will be started at the end of onboarding
-                    withAnimation { currentStep = 3 }
-                }
-            )
         }
         .task {
             // Only start checking permissions when user reaches this step
@@ -252,59 +447,128 @@ public struct OnboardingView: View {
         title: String,
         subtitle: String,
         isGranted: Bool,
-        action: @escaping () -> Void
+        isDenied: Bool = false,
+        action: @escaping () -> Void,
+        openSettingsAction: (() -> Void)? = nil
     ) -> some View {
-        HStack(spacing: .spacingM) {
-            Image(systemName: icon)
-                .font(.system(size: 28))
-                .foregroundColor(isGranted ? .retraceSuccess : .retraceAccent)
-                .frame(width: 44)
+        VStack(alignment: .leading, spacing: .spacingS) {
+            HStack(spacing: .spacingM) {
+                Image(systemName: icon)
+                    .font(.system(size: 28))
+                    .foregroundColor(isGranted ? .retraceSuccess : (isDenied ? .retraceWarning : .retraceAccent))
+                    .frame(width: 44)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(title)
-                        .font(.retraceHeadline)
-                        .foregroundColor(.retracePrimary)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(title)
+                            .font(.retraceHeadline)
+                            .foregroundColor(.retracePrimary)
 
-                    Text("(Required)")
+                        Text("(Required)")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceWarning)
+                    }
+
+                    Text(subtitle)
                         .font(.retraceCaption)
-                        .foregroundColor(.retraceWarning)
+                        .foregroundColor(.retraceSecondary)
                 }
 
-                Text(subtitle)
-                    .font(.retraceCaption)
-                    .foregroundColor(.retraceSecondary)
+                Spacer()
+
+                if isGranted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(.retraceSuccess)
+                } else if isDenied, let openSettings = openSettingsAction {
+                    Button(action: openSettings) {
+                        Text("Open Settings")
+                            .font(.retraceBody)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, .spacingM)
+                            .padding(.vertical, .spacingS)
+                            .background(Color.retraceWarning)
+                            .cornerRadius(.cornerRadiusM)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Button(action: action) {
+                        Text("Enable")
+                            .font(.retraceBody)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, .spacingM)
+                            .padding(.vertical, .spacingS)
+                            .background(Color.retraceAccent)
+                            .cornerRadius(.cornerRadiusM)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
 
-            Spacer()
-
-            if isGranted {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 24))
-                    .foregroundColor(.retraceSuccess)
-            } else {
-                Button(action: action) {
-                    Text("Enable")
-                        .font(.retraceBody)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, .spacingM)
-                        .padding(.vertical, .spacingS)
-                        .background(Color.retraceAccent)
-                        .cornerRadius(.cornerRadiusM)
+            // Show denial message with instructions
+            if isDenied && !isGranted {
+                VStack(alignment: .leading, spacing: .spacingXS) {
+                    HStack(spacing: .spacingXS) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.retraceWarning)
+                            .font(.system(size: 12))
+                        Text("Permission may have been denied in the past")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceWarning)
+                            .fontWeight(.medium)
+                    }
+                    Text("To enable, open System Settings → Privacy & Security → Screen Recording, then toggle Retrace on.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .buttonStyle(.plain)
+                .padding(.leading, 44 + .spacingM) // Align with text above
             }
         }
         .padding(.spacingM)
     }
 
-    // MARK: - Step 3: Encryption
+    // MARK: - Step 5: Screen Recording Indicator
 
-    private var encryptionStep: some View {
+    private var screenRecordingIndicatorStep: some View {
         VStack(spacing: .spacingXL) {
             Spacer()
-                .frame(height: .spacingL)
 
+            Text("Screen Capture Indicator...")
+                .font(.system(size: 32, weight: .bold))
+                .foregroundColor(.retracePrimary)
+
+            Text("Look for this indicator in your menu bar")
+                .font(.retraceBody)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
+
+            // Screen recording indicator mockup
+            screenRecordingIndicator
+                .frame(width: 80, height: 80)
+
+            VStack(spacing: .spacingM) {
+                Text("This purple icon appears whenever your screen is being recorded.")
+                    .font(.retraceBody)
+                    .foregroundColor(.retracePrimary)
+                    .multilineTextAlignment(.center)
+
+                Text("This is Apple's updated Screen Capture UI — it lets you know Retrace is running and capturing your screen in the background.")
+                    .font(.retraceBody)
+                    .foregroundColor(.retraceSecondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, .spacingXL)
+            .frame(maxWidth: 500)
+
+            Spacer()
+        }
+    }
+
+    // MARK: - Step 6: Encryption
+
+    private var encryptionStep: some View {
+        VStack(spacing: .spacingL) {
             // Lock icon
             ZStack {
                 Circle()
@@ -317,9 +581,9 @@ public struct OnboardingView: View {
                     )
                     .frame(width: 100, height: 100)
 
-                Image(systemName: encryptionEnabled ? "lock.shield.fill" : "lock.open.fill")
+                Image(systemName: encryptionEnabled == true ? "lock.shield.fill" : "lock.open.fill")
                     .font(.system(size: 44))
-                    .foregroundColor(encryptionEnabled ? .retraceSuccess : .retraceSecondary)
+                    .foregroundColor(encryptionEnabled == true ? .retraceSuccess : .retraceSecondary)
             }
 
             Text("Database Encryption")
@@ -341,13 +605,6 @@ public struct OnboardingView: View {
                         .foregroundColor(.retracePrimary)
                 }
 
-                HStack(spacing: .spacingM) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundColor(.retraceSuccess)
-                    Text("Rewind Also Encrypts the Database")
-                        .font(.retraceBody)
-                        .foregroundColor(.retracePrimary)
-                }
 
                 HStack(spacing: .spacingM) {
                     Image(systemName: "checkmark.circle.fill")
@@ -363,176 +620,193 @@ public struct OnboardingView: View {
             .background(Color.retraceSecondaryBackground)
             .cornerRadius(.cornerRadiusL)
 
-            // Toggle button
-            Button(action: {
-                withAnimation {
-                    encryptionEnabled.toggle()
-                }
-            }) {
-                HStack(spacing: .spacingM) {
-                    Image(systemName: encryptionEnabled ? "checkmark.square.fill" : "square")
-                        .font(.system(size: 24))
-                        .foregroundColor(encryptionEnabled ? .retraceAccent : .retraceSecondary)
+            // Yes/No buttons
+            HStack(spacing: .spacingM) {
+                Button(action: {
+                    withAnimation {
+                        encryptionEnabled = true
+                    }
+                }) {
+                    HStack(spacing: .spacingM) {
+                        Image(systemName: encryptionEnabled == true ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 24))
+                            .foregroundColor(encryptionEnabled == true ? .retraceSuccess : .retraceSecondary)
 
-                    Text("Enable database encryption")
-                        .font(.retraceHeadline)
-                        .foregroundColor(.retracePrimary)
+                        Text("Yes")
+                            .font(.retraceHeadline)
+                            .foregroundColor(.retracePrimary)
+                    }
+                    .padding(.spacingM)
+                    .frame(width: 150)
+                    .background(encryptionEnabled == true ? Color.retraceSuccess.opacity(0.1) : Color.retraceSecondaryBackground)
+                    .cornerRadius(.cornerRadiusM)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: .cornerRadiusM)
+                            .stroke(encryptionEnabled == true ? Color.retraceSuccess : Color.retraceBorder, lineWidth: 2)
+                    )
                 }
-                .padding(.spacingM)
-                .frame(maxWidth: .infinity)
-                .background(Color.retraceSecondaryBackground)
-                .cornerRadius(.cornerRadiusM)
-                .overlay(
-                    RoundedRectangle(cornerRadius: .cornerRadiusM)
-                        .stroke(encryptionEnabled ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
-                )
+                .buttonStyle(.plain)
+
+                Button(action: {
+                    withAnimation {
+                        encryptionEnabled = false
+                    }
+                }) {
+                    HStack(spacing: .spacingM) {
+                        Image(systemName: encryptionEnabled == false ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 24))
+                            .foregroundColor(encryptionEnabled == false ? .retraceAccent : .retraceSecondary)
+
+                        Text("No")
+                            .font(.retraceHeadline)
+                            .foregroundColor(.retracePrimary)
+                    }
+                    .padding(.spacingM)
+                    .frame(width: 150)
+                    .background(encryptionEnabled == false ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
+                    .cornerRadius(.cornerRadiusM)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: .cornerRadiusM)
+                            .stroke(encryptionEnabled == false ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
+                    )
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
 
             Text("You can change this later in Settings.")
                 .font(.retraceCaption)
                 .foregroundColor(.retraceSecondary)
 
             Spacer()
-
-            navigationButtons(canContinue: true) {
-                // Save encryption preference to UserDefaults
-                UserDefaults.standard.set(encryptionEnabled, forKey: "encryptionEnabled")
-                withAnimation { currentStep = 4 }
-            }
         }
     }
 
-    // MARK: - Step 4: Creator Message
+    // MARK: - Creator Header
 
-    private var creatorMessageStep: some View {
-        VStack(spacing: .spacingL) {
-            // Profile header outside card
-            HStack(spacing: .spacingL) {
-                // Profile picture from GitHub
-                AsyncImage(url: URL(string: "https://avatars.githubusercontent.com/u/59128529?v=4")) { image in
+    private var creatorHeader: some View {
+        VStack(spacing: .spacingM) {
+            // Profile picture centered - preloaded on app launch
+            AsyncImage(url: URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp")) { phase in
+                switch phase {
+                case .success(let image):
                     image
                         .resizable()
                         .aspectRatio(contentMode: .fill)
-                } placeholder: {
-                    Circle()
-                        .fill(Color.retraceAccent.opacity(0.3))
-                        .overlay(
-                            Text("H")
-                                .font(.system(size: 32, weight: .bold))
-                                .foregroundColor(.white)
-                        )
-                }
-                .frame(width: 80, height: 80)
-                .clipShape(Circle())
-
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    Text("A Message From The Creators")
-                        .font(.retraceTitle)
-                        .foregroundColor(.retracePrimary)
-
-                    Text("Hey! This is a VERY EARLY alpha of Retrace. Things will break, but I'm tirelessly working towards 1:1 feature parity with Rewind (and way better).")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
+                case .failure:
+                    creatorPlaceholder
+                case .empty:
+                    creatorPlaceholder
+                @unknown default:
+                    creatorPlaceholder
                 }
             }
-            .padding(.bottom, .spacingS)
+            .frame(width: 80, height: 80)
+            .clipShape(Circle())
 
-            // Two-column feature layout
-            HStack(alignment: .top, spacing: .spacingXL) {
-                // Left column: What this version has (green)
-                VStack(alignment: .leading, spacing: .spacingM) {
-                    Text("What This Version Has")
-                        .font(.retraceHeadline)
-                        .foregroundColor(.retraceSuccess)
+            Text("Hey, thanks for trying Retrace!")
+                .font(.retraceTitle)
+                .foregroundColor(.retracePrimary)
+                .multilineTextAlignment(.center)
+        }
+    }
 
-                    VStack(alignment: .leading, spacing: .spacingS) {
-                        featureItem(icon: "checkmark.circle.fill", text: "Easy Connection to Old Rewind Data", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Decrypt and Backup your Rewind Database", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Timeline Scrolling", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Continuous Screen Capture", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Basic Search", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Keyboard Shortcuts", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Deletion of Data", color: .retraceSuccess)
-                        featureItem(icon: "checkmark.circle.fill", text: "Exclude Apps / Private Windows", color: .retraceSuccess)
-                    }
-                }
-                .padding(.spacingL)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.retraceSuccess.opacity(0.05))
-                .cornerRadius(.cornerRadiusL)
+    private var creatorPlaceholder: some View {
+        Circle()
+            .fill(Color.retraceAccent.opacity(0.3))
+            .overlay(
+                Text("H")
+                    .font(.system(size: 32, weight: .bold))
+                    .foregroundColor(.white)
+            )
+    }
 
-                // Right column: Coming soon (yellow) and Not planned (red)
+    private func prefetchCreatorImage() async {
+        // Prefetch the image into URLCache
+        guard let url = URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp") else { return }
+        do {
+            let (_, _) = try await URLSession.shared.data(from: url)
+        } catch {
+            // Ignore errors, the AsyncImage will handle fallback
+        }
+    }
+
+    // MARK: - Step 2: Creator Features
+
+    private var creatorFeaturesStep: some View {
+        VStack(spacing: 0) {
+            // Fixed header
+            creatorHeader
+                .padding(.bottom, .spacingL)
+
+            // Scrollable features container with fixed height
+            ScrollView {
                 VStack(alignment: .leading, spacing: .spacingL) {
-                    // Coming soon
+                    // What this version has (green)
                     VStack(alignment: .leading, spacing: .spacingM) {
-                        Text("Coming Jan 1")
+                        Text("What This Version Has")
+                            .font(.retraceHeadline)
+                            .foregroundColor(.retraceSuccess)
+
+                        VStack(alignment: .leading, spacing: .spacingS) {
+                            featureItem(icon: "checkmark.circle.fill", text: "Easy Connection to Old Rewind Data", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Timeline Scrolling", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Continuous Screen Capture", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Basic Search", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Basic Keyboard Shortcuts", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Deletion of Data", color: .retraceSuccess)
+                        }
+                    }
+                    .padding(.spacingL)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.retraceSuccess.opacity(0.05))
+                    .cornerRadius(.cornerRadiusL)
+
+                    // Coming soon (yellow)
+                    VStack(alignment: .leading, spacing: .spacingM) {
+                        Text("Coming Soon")
                             .font(.retraceHeadline)
                             .foregroundColor(.retraceWarning)
 
                         VStack(alignment: .leading, spacing: .spacingS) {
+                            featureItem(icon: "circle.fill", text: "Audio Recording", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "Optimized Power & Storage", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "More Settings", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "Daily Dashboard", color: .retraceWarning)
-                            featureItem(icon: "circle.fill", text: "Audio Recording", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "Search Highlighting", color: .retraceWarning)
+                            featureItem(icon: "circle.fill", text: "Exclude Apps / Private Windows", color: .retraceWarning)
+                            featureItem(icon: "circle.fill", text: "Decrypt and Backup your Rewind Database", color: .retraceWarning)
+                            featureItem(icon: "circle.fill", text: "More Advanced Shortcuts", color: .retraceWarning)
                         }
                     }
-                    .padding(.spacingM)
+                    .padding(.spacingL)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.retraceWarning.opacity(0.05))
-                    .cornerRadius(.cornerRadiusM)
+                    .cornerRadius(.cornerRadiusL)
 
-                    // Not planned yet
+                    // Not planned yet (red)
                     VStack(alignment: .leading, spacing: .spacingM) {
                         Text("Not Yet Planned")
                             .font(.retraceHeadline)
                             .foregroundColor(.retraceDanger)
 
                         VStack(alignment: .leading, spacing: .spacingS) {
-                            featureItem(icon: "xmark.circle.fill", text: "Ask Retrace Chatbot", color: .retraceDanger)
-                            featureItem(icon: "xmark.circle.fill", text: "Vector Search", color: .retraceDanger)
+                            featureItem(icon: "xmark.circle.fill", text: "'Ask Retrace' Chatbot", color: .retraceDanger)
+                            featureItem(icon: "xmark.circle.fill", text: "Embeddings / Vector Search", color: .retraceDanger)
                         }
                     }
-                    .padding(.spacingM)
+                    .padding(.spacingL)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color.retraceDanger.opacity(0.05))
-                    .cornerRadius(.cornerRadiusM)
+                    .cornerRadius(.cornerRadiusL)
                 }
-                .padding(.spacingL)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.clear)
-                .cornerRadius(.cornerRadiusL)
+                .frame(maxWidth: 600)
+                .padding(.spacingM)
             }
+            .frame(height: 350)
+            .background(Color.retraceSecondaryBackground.opacity(0.5))
+            .cornerRadius(.cornerRadiusL)
 
-            // Footer
-            VStack(alignment: .leading, spacing: .spacingS) {
-                HStack {
-                    Text("Built in 4 days. Questions?")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-
-                    Link("retrace.to/chat", destination: URL(string: "https://retrace.to/chat")!)
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceAccent)
-                }
-
-                HStack(spacing: .spacingS) {
-                    Image(systemName: "lock.shield.fill")
-                        .foregroundColor(.retraceSuccess)
-                    Text("All data is local. Nothing leaves your machine.")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary)
-                }
-            }
-            .padding(.spacingM)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.retraceSecondaryBackground)
-            .cornerRadius(.cornerRadiusM)
-
-            navigationButtons(canContinue: true) {
-                withAnimation { currentStep = 5 }
-            }
+            Spacer()
         }
     }
 
@@ -566,228 +840,159 @@ public struct OnboardingView: View {
         }
     }
 
-    // MARK: - Step 4: Rewind Data
+    // MARK: - Step 7: Rewind Data
 
     private var rewindDataStep: some View {
         VStack(spacing: .spacingL) {
-            Text("Rewind Data")
-                .font(.retraceTitle)
-                .foregroundColor(.retracePrimary)
-
-            if hasRewindData == true && wantsBackup == nil {
+            if hasRewindData == true {
                 // Rewind data detected - ask if they want to include it on Timeline
                 VStack(spacing: .spacingL) {
-                    HStack(spacing: .spacingM) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 24))
-                            .foregroundColor(.retraceSuccess)
-                        Text("Rewind data detected on this machine!")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.retraceSuccess)
+                    // Rewind-style double arrow icon
+                    rewindIcon
+                        .frame(width: 100, height: 100)
+
+                    Text("Use Rewind Data?")
+                        .font(.retraceTitle)
+                        .foregroundColor(.retracePrimary)
+                    // File info card
+                    VStack(alignment: .center, spacing: .spacingM) {
+                        HStack(spacing: .spacingM) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.retraceSuccess)
+                            Text("Rewind database detected")
+                                .font(.retraceBody)
+                                .foregroundColor(.retracePrimary)
+                        }
+
+                        VStack(alignment: .center, spacing: .spacingS) {
+                            HStack(spacing: .spacingS) {
+                                Image(systemName: "externaldrive.fill")
+                                    .foregroundColor(.retraceAccent)
+                                Text("Location")
+                                    .font(.retraceCaption)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+
+                            Text("~/Library/Application Support/com.memoryvault.MemoryVault")
+                                .font(.retraceMono)
+                                .font(.system(size: 11))
+                                .foregroundColor(.retracePrimary)
+                                .multilineTextAlignment(.center)
+
+                            if let sizeGB = rewindDataSizeGB {
+                                Text(String(format: "%.1f GB", sizeGB))
+                                    .font(.retraceCaption)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.retraceAccent)
+                            }
+                        }
                     }
+                    .padding(.spacingL)
+                    .frame(maxWidth: 500)
+                    .background(Color.retraceSecondaryBackground)
+                    .cornerRadius(.cornerRadiusL)
 
-                    Text("Do you want Retrace to include your Rewind data on the Timeline?")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-                        .multilineTextAlignment(.center)
-
-                    HStack(spacing: .spacingL) {
+                    // Yes/No buttons
+                    HStack(spacing: .spacingM) {
                         Button(action: {
                             withAnimation {
                                 wantsBackup = true
-                                showRewindMigration = true
                             }
                         }) {
-                            Text("Yes, Import")
-                                .font(.retraceHeadline)
-                                .foregroundColor(.white)
-                                .frame(width: 140)
-                                .padding(.vertical, .spacingM)
-                                .background(Color.retraceAccent)
-                                .cornerRadius(.cornerRadiusM)
+                            HStack(spacing: .spacingM) {
+                                Image(systemName: wantsBackup == true ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(wantsBackup == true ? .retraceSuccess : .retraceSecondary)
+
+                                Text("Yes, Use")
+                                    .font(.retraceHeadline)
+                                    .foregroundColor(.retracePrimary)
+                            }
+                            .padding(.spacingM)
+                            .frame(width: 180)
+                            .background(wantsBackup == true ? Color.retraceSuccess.opacity(0.1) : Color.retraceSecondaryBackground)
+                            .cornerRadius(.cornerRadiusM)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: .cornerRadiusM)
+                                    .stroke(wantsBackup == true ? Color.retraceSuccess : Color.retraceBorder, lineWidth: 2)
+                            )
                         }
                         .buttonStyle(.plain)
 
                         Button(action: {
                             withAnimation {
                                 wantsBackup = false
-                                currentStep = 6
                             }
                         }) {
-                            Text("No, Skip")
-                                .font(.retraceHeadline)
-                                .foregroundColor(.retracePrimary)
-                                .frame(width: 140)
-                                .padding(.vertical, .spacingM)
-                                .background(Color.retraceSecondaryBackground)
-                                .cornerRadius(.cornerRadiusM)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: .cornerRadiusM)
-                                        .stroke(Color.retraceBorder, lineWidth: 1)
-                                )
+                            HStack(spacing: .spacingM) {
+                                Image(systemName: wantsBackup == false ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(wantsBackup == false ? .retraceAccent : .retraceSecondary)
+
+                                Text("No, Don't Use")
+                                    .font(.retraceHeadline)
+                                    .foregroundColor(.retracePrimary)
+                            }
+                            .padding(.spacingM)
+                            .frame(width: 200)
+                            .background(wantsBackup == false ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
+                            .cornerRadius(.cornerRadiusM)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: .cornerRadiusM)
+                                    .stroke(wantsBackup == false ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
+                            )
                         }
                         .buttonStyle(.plain)
                     }
+
+                    Text("You can import Rewind data later from Settings.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
                 }
                 .padding(.spacingXL)
-                .background(Color.retraceSecondaryBackground)
+                .background(Color.clear)
                 .cornerRadius(.cornerRadiusL)
 
             } else if hasRewindData == false {
-                // No Rewind data found
+                // No Rewind data found - show embellished view
                 VStack(spacing: .spacingL) {
-                    HStack(spacing: .spacingM) {
-                        Image(systemName: "info.circle.fill")
-                            .font(.system(size: 24))
-                            .foregroundColor(.retraceSecondary)
-                        Text("No Rewind data found")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.retraceSecondary)
-                    }
+                    // Rewind icon in muted/grey state
+                    rewindIconMuted
+                        .frame(width: 100, height: 100)
 
-                    Text("If you have Rewind data you'd like to import later, you can do so from Settings.")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-                        .multilineTextAlignment(.center)
+                    Text("Import Rewind Data")
+                        .font(.retraceTitle)
+                        .foregroundColor(.retracePrimary)
+
+                    VStack(spacing: .spacingM) {
+                        HStack(spacing: .spacingM) {
+                            Image(systemName: "info.circle.fill")
+                                .font(.system(size: 20))
+                                .foregroundColor(.retraceSecondary)
+                            Text("No Rewind data found on this machine")
+                                .font(.retraceBody)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        Text("If you have Rewind data you'd like to import later, you can do so from Settings.")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.spacingL)
+                    .background(Color.retraceSecondaryBackground)
+                    .cornerRadius(.cornerRadiusL)
                 }
                 .padding(.spacingXL)
-                .background(Color.retraceSecondaryBackground)
+                .background(Color.clear)
                 .cornerRadius(.cornerRadiusL)
-
-            } else if showRewindMigration {
-                rewindMigrationPlaceholder
-            } else if showRewindBackup {
-                rewindBackupPlaceholder
             }
 
             Spacer()
-
-            // Navigation buttons
-            HStack {
-                Button(action: {
-                    withAnimation {
-                        // Reset state and go back
-                        wantsBackup = nil
-                        showRewindBackup = false
-                        showRewindMigration = false
-                        currentStep = 4
-                    }
-                }) {
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "chevron.left")
-                        Text("Back")
-                    }
-                    .font(.retraceBody)
-                    .foregroundColor(.retraceSecondary)
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                // Continue button for no-rewind-data case
-                if hasRewindData == false {
-                    Button(action: { withAnimation { currentStep = 6 } }) {
-                        Text("Continue")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, .spacingL)
-                            .padding(.vertical, .spacingM)
-                            .background(Color.retraceAccent)
-                            .cornerRadius(.cornerRadiusM)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
         }
     }
 
-    private var rewindBackupPlaceholder: some View {
-        VStack(spacing: .spacingL) {
-            Image(systemName: "externaldrive.badge.plus")
-                .font(.system(size: 48))
-                .foregroundColor(.retraceAccent)
-
-            Text("Rewind Decrypt & Backup Center")
-                .font(.retraceTitle2)
-                .foregroundColor(.retracePrimary)
-
-            Text("This feature is coming soon. You'll be able to decrypt and backup your Rewind database here.")
-                .font(.retraceBody)
-                .foregroundColor(.retraceSecondary)
-                .multilineTextAlignment(.center)
-
-            HStack(spacing: .spacingM) {
-                if hasRewindData == true {
-                    Button(action: {
-                        withAnimation {
-                            showRewindBackup = false
-                            showRewindMigration = true
-                        }
-                    }) {
-                        Text("Continue to Migration")
-                            .font(.retraceBody)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, .spacingL)
-                            .padding(.vertical, .spacingM)
-                            .background(Color.retraceAccent)
-                            .cornerRadius(.cornerRadiusM)
-                    }
-                    .buttonStyle(.plain)
-                }
-
-                Button(action: { withAnimation { currentStep = 6 } }) {
-                    Text("Continue Without Backup")
-                        .font(.retraceBody)
-                        .foregroundColor(.retracePrimary)
-                        .padding(.horizontal, .spacingL)
-                        .padding(.vertical, .spacingM)
-                        .background(Color.retraceSecondaryBackground)
-                        .cornerRadius(.cornerRadiusM)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: .cornerRadiusM)
-                                .stroke(Color.retraceBorder, lineWidth: 1)
-                        )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.spacingXL)
-        .background(Color.retraceSecondaryBackground)
-        .cornerRadius(.cornerRadiusL)
-    }
-
-    private var rewindMigrationPlaceholder: some View {
-        VStack(spacing: .spacingL) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 48))
-                .foregroundColor(.retraceAccent)
-
-            Text("Rewind Migration")
-                .font(.retraceTitle2)
-                .foregroundColor(.retracePrimary)
-
-            Text("This feature is coming soon. You'll be able to import your Rewind data here.")
-                .font(.retraceBody)
-                .foregroundColor(.retraceSecondary)
-                .multilineTextAlignment(.center)
-
-            Button(action: { withAnimation { currentStep = 6 } }) {
-                Text("Continue")
-                    .font(.retraceBody)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, .spacingL)
-                    .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
-                    .cornerRadius(.cornerRadiusM)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.spacingXL)
-        .background(Color.retraceSecondaryBackground)
-        .cornerRadius(.cornerRadiusL)
-    }
-
-    // MARK: - Step 5: Keyboard Shortcuts
+    // MARK: - Step 8: Keyboard Shortcuts
 
     @State private var shortcutError: String? = nil
 
@@ -797,7 +1002,7 @@ public struct OnboardingView: View {
                 .font(.retraceTitle)
                 .foregroundColor(.retracePrimary)
 
-            Text("Click on a shortcut to record a new key.")
+            Text("Click on a shortcut to record a new key. Press Escape or click elsewhere to cancel.")
                 .font(.retraceBody)
                 .foregroundColor(.retraceSecondary)
 
@@ -822,6 +1027,7 @@ public struct OnboardingView: View {
             .padding(.spacingXL)
             .background(Color.retraceSecondaryBackground)
             .cornerRadius(.cornerRadiusL)
+            .frame(maxWidth: 600)
 
             if let error = shortcutError {
                 HStack(spacing: .spacingS) {
@@ -838,18 +1044,23 @@ public struct OnboardingView: View {
                 .foregroundColor(.retraceSecondary)
 
             Spacer()
-
-            navigationButtons(canContinue: true) {
-                withAnimation { currentStep = 7 }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Cancel recording if user clicks outside the shortcut buttons
+            if isRecordingTimelineShortcut || isRecordingDashboardShortcut {
+                isRecordingTimelineShortcut = false
+                isRecordingDashboardShortcut = false
+                recordingTimeoutTask?.cancel()
             }
         }
     }
 
     private func shortcutRecorderRow(
         label: String,
-        shortcut: Binding<String>,
+        shortcut: Binding<ShortcutKey>,
         isRecording: Binding<Bool>,
-        otherShortcut: String
+        otherShortcut: ShortcutKey
     ) -> some View {
         HStack(spacing: .spacingL) {
             VStack(alignment: .leading, spacing: .spacingS) {
@@ -866,49 +1077,72 @@ public struct OnboardingView: View {
                 isRecordingTimelineShortcut = false
                 isRecordingDashboardShortcut = false
                 shortcutError = nil
+                recordingTimeoutTask?.cancel()
+
                 // Then start this one
                 isRecording.wrappedValue = true
-            }) {
-                HStack(spacing: .spacingM) {
-                    // Modifier keys
-                    Text("⌘")
-                        .font(.system(size: 18, weight: .medium, design: .rounded))
-                        .foregroundColor(.retraceSecondary)
-                        .frame(width: 32, height: 32)
-                        .background(Color.retraceCard)
-                        .cornerRadius(.cornerRadiusS)
 
-                    Text("⇧")
-                        .font(.system(size: 18, weight: .medium, design: .rounded))
-                        .foregroundColor(.retraceSecondary)
-                        .frame(width: 32, height: 32)
-                        .background(Color.retraceCard)
-                        .cornerRadius(.cornerRadiusS)
-
-                    Text("+")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-
-                    // Key
-                    Text(shortcut.wrappedValue)
-                        .font(.system(size: 16, weight: .semibold, design: .rounded))
-                        .foregroundColor(isRecording.wrappedValue ? .retraceAccent : .retracePrimary)
-                        .frame(minWidth: 50, minHeight: 32)
-                        .padding(.horizontal, .spacingM)
-                        .background(isRecording.wrappedValue ? Color.retraceAccent.opacity(0.2) : Color.retraceCard)
-                        .cornerRadius(.cornerRadiusS)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: .cornerRadiusS)
-                                .stroke(isRecording.wrappedValue ? Color.retraceAccent : Color.clear, lineWidth: 2)
-                        )
+                // Start 10 second timeout
+                recordingTimeoutTask = Task {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000) // 10 seconds
+                    if !Task.isCancelled {
+                        await MainActor.run {
+                            isRecording.wrappedValue = false
+                        }
+                    }
                 }
+            }) {
+                Group {
+                    if isRecording.wrappedValue {
+                        // Show "Press key combo..." when recording
+                        Text("Press key combo...")
+                            .font(.retraceBody)
+                            .foregroundColor(.retraceAccent)
+                            .frame(minWidth: 150, minHeight: 32)
+                    } else {
+                        // Show actual shortcut when not recording
+                        HStack(spacing: .spacingS) {
+                            // Display modifier keys dynamically
+                            ForEach(shortcut.wrappedValue.modifierSymbols, id: \.self) { symbol in
+                                Text(symbol)
+                                    .font(.system(size: 18, weight: .medium, design: .rounded))
+                                    .foregroundColor(.retraceSecondary)
+                                    .frame(width: 32, height: 32)
+                                    .background(Color.retraceCard)
+                                    .cornerRadius(.cornerRadiusS)
+                            }
+
+                            if !shortcut.wrappedValue.modifierSymbols.isEmpty {
+                                Text("+")
+                                    .font(.retraceBody)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+
+                            // Key
+                            Text(shortcut.wrappedValue.key)
+                                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                                .foregroundColor(.retracePrimary)
+                                .frame(minWidth: 50, minHeight: 32)
+                                .padding(.horizontal, .spacingM)
+                                .background(Color.retraceCard)
+                                .cornerRadius(.cornerRadiusS)
+                        }
+                    }
+                }
+                .padding(.spacingS)
+                .background(isRecording.wrappedValue ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
+                .cornerRadius(.cornerRadiusM)
+                .overlay(
+                    RoundedRectangle(cornerRadius: .cornerRadiusM)
+                        .stroke(isRecording.wrappedValue ? Color.retraceAccent : Color.retraceBorder, lineWidth: isRecording.wrappedValue ? 2 : 1)
+                )
             }
             .buttonStyle(.plain)
             .background(
                 // Key capture happens in a focused view
                 ShortcutCaptureField(
                     isRecording: isRecording,
-                    capturedKey: shortcut,
+                    capturedShortcut: shortcut,
                     otherShortcut: otherShortcut,
                     onDuplicateAttempt: {
                         shortcutError = "This shortcut is already in use"
@@ -916,260 +1150,203 @@ public struct OnboardingView: View {
                 )
                 .frame(width: 0, height: 0)
             )
-
-            if isRecording.wrappedValue {
-                Text("Press a key...")
-                    .font(.retraceCaption)
-                    .foregroundColor(.retraceAccent)
-            }
         }
     }
 
-    // MARK: - Step 6: Safety Info
+    // MARK: - Step 9: Early Alpha / Safety Info
 
     private var safetyInfoStep: some View {
-        VStack(spacing: .spacingL) {
-            Text("Early Alpha Notice")
-                .font(.retraceTitle)
-                .foregroundColor(.retracePrimary)
-
-            VStack(alignment: .leading, spacing: .spacingM) {
-                Text("This is an early alpha. If something breaks:")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.retracePrimary)
-
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    safetyItem(icon: "pause.circle.fill", text: "You can pause capture")
-                    safetyItem(icon: "trash.circle.fill", text: "You can delete all data")
-                    safetyItem(icon: "xmark.circle.fill", text: "You can uninstall cleanly")
-                }
-
-                Divider()
-                    .background(Color.retraceBorder)
-
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    Text("Need Support?")
-                        .font(.retraceHeadline)
-                        .foregroundColor(.retracePrimary)
-
-                    Text("If you want support, I encourage you to send the logfile that is on your machine. I'll ask for it and will be able to see what went wrong!")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-
-                    Text("I've tried to deanonymize it as much as I could.")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary)
-
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "envelope.fill")
-                            .foregroundColor(.retraceAccent)
-                        Link("retrace.to/chat", destination: URL(string: "https://retrace.to/chat")!)
-                            .font(.retraceBody)
-                            .foregroundColor(.retraceAccent)
-                    }
-                }
-            }
-            .padding(.spacingL)
-            .background(Color.retraceSecondaryBackground)
-            .cornerRadius(.cornerRadiusL)
-
-            Spacer()
-
-            navigationButtons(canContinue: true) {
-                withAnimation { currentStep = 8 }
-            }
-        }
-    }
-
-    private func safetyItem(icon: String, text: String) -> some View {
-        HStack(spacing: .spacingM) {
-            Image(systemName: icon)
-                .font(.system(size: 20))
-                .foregroundColor(.retraceAccent)
-            Text(text)
-                .font(.retraceBody)
-                .foregroundColor(.retracePrimary)
-        }
-    }
-
-    // MARK: - Step 7: Quiz
-
-    private var quizStep: some View {
-        VStack(spacing: .spacingL) {
-            Text("Almost There!")
-                .font(.retraceTitle)
-                .foregroundColor(.retracePrimary)
-
-            VStack(alignment: .leading, spacing: .spacingM) {
-                Text("Let's test if you remember what I said...")
-                    .font(.retraceBody)
-                    .foregroundColor(.retraceSecondary)
-
-                Text("Which of the features did we say we DON'T have?")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.retracePrimary)
-
-                Text("Hint: You can launch the timeline to see what it was!")
-                    .font(.retraceCaption)
-                    .foregroundColor(.retraceSecondary)
-
-                VStack(spacing: .spacingS) {
-                    quizOption(index: 0, text: "Timeline Scrolling")
-                    quizOption(index: 1, text: "Audio Recording")
-                    quizOption(index: 2, text: "Basic Search")
-                    quizOption(index: 3, text: "Delete Data")
-                }
-            }
-            .padding(.spacingL)
-            .background(Color.retraceSecondaryBackground)
-            .cornerRadius(.cornerRadiusL)
-
-            if quizAnswered {
-                if selectedQuizAnswer == 1 {
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.retraceSuccess)
-                        Text("Correct! Audio recording is coming in January.")
-                            .font(.retraceBody)
-                            .foregroundColor(.retraceSuccess)
-                    }
-                } else {
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.retraceDanger)
-                        Text("Not quite. Audio recording is what we don't have yet!")
-                            .font(.retraceBody)
-                            .foregroundColor(.retraceDanger)
-                    }
-                }
-            }
-
-            Spacer()
-
-            HStack {
-                Button(action: { withAnimation { currentStep = 7 } }) {
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "chevron.left")
-                        Text("Back")
-                    }
-                    .font(.retraceBody)
-                    .foregroundColor(.retraceSecondary)
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                // Skip option
-                Button(action: { withAnimation { currentStep = 9 } }) {
-                    Text("Skip")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-                }
-                .buttonStyle(.plain)
-
-                if quizAnswered {
-                    Button(action: { withAnimation { currentStep = 9 } }) {
-                        Text("Continue")
-                            .font(.retraceHeadline)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, .spacingL)
-                            .padding(.vertical, .spacingM)
-                            .background(Color.retraceAccent)
-                            .cornerRadius(.cornerRadiusM)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-    }
-
-    private func quizOption(index: Int, text: String) -> some View {
-        Button(action: {
-            selectedQuizAnswer = index
-            quizAnswered = true
-        }) {
-            HStack {
-                Circle()
-                    .stroke(selectedQuizAnswer == index ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
-                    .frame(width: 20, height: 20)
-                    .overlay(
-                        Circle()
-                            .fill(selectedQuizAnswer == index ? Color.retraceAccent : Color.clear)
-                            .frame(width: 12, height: 12)
-                    )
-
-                Text(text)
-                    .font(.retraceBody)
-                    .foregroundColor(.retracePrimary)
-
-                Spacer()
-            }
-            .padding(.spacingM)
-            .background(selectedQuizAnswer == index ? Color.retraceAccent.opacity(0.1) : Color.clear)
-            .cornerRadius(.cornerRadiusM)
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Step 9: Completion
-
-    private var completionStep: some View {
         VStack(spacing: .spacingXL) {
             Spacer()
 
-            Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 72))
-                .foregroundColor(.retraceSuccess)
+            // Alpha warning badge
+            VStack(spacing: .spacingM) {
+                ZStack {
+                    // Outer glow
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(Color.retraceWarning.opacity(0.15))
+                        .frame(width: 180, height: 50)
+                        .blur(radius: 10)
+
+                    // Badge
+                    HStack(spacing: .spacingS) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 18, weight: .bold))
+                        Text("EARLY ALPHA")
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                    }
+                    .foregroundColor(.retraceWarning)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(Color.retraceWarning.opacity(0.15))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.retraceWarning.opacity(0.5), lineWidth: 2)
+                            )
+                    )
+                }
+
+                Text("v0.1 - January 2026")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            // Creator section
+            VStack(spacing: .spacingM) {
+                // Profile picture
+                AsyncImage(url: URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp")) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    case .failure:
+                        creatorPlaceholder
+                    case .empty:
+                        ProgressView()
+                            .frame(width: 70, height: 70)
+                    @unknown default:
+                        creatorPlaceholder
+                    }
+                }
+                .frame(width: 70, height: 70)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 2)
+                )
+
+                Text("Thanks for being an early tester!")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
+            }
+
+            // Info card
+            VStack(alignment: .leading, spacing: .spacingM) {
+                HStack(spacing: .spacingM) {
+                    Image(systemName: "ant.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.retraceWarning)
+                    Text("Expect bugs - things will break")
+                        .font(.retraceBody)
+                        .foregroundColor(.retracePrimary)
+                }
+
+                HStack(spacing: .spacingM) {
+                    Image(systemName: "message.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.retraceAccent)
+                    Text("Please report issues often")
+                        .font(.retraceBody)
+                        .foregroundColor(.retracePrimary)
+                }
+
+                HStack(spacing: .spacingM) {
+                    Image(systemName: "wrench.and.screwdriver.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.retraceSuccess)
+                    Text("Fixes ship fast")
+                        .font(.retraceBody)
+                        .foregroundColor(.retracePrimary)
+                }
+            }
+            .padding(.spacingL)
+            .frame(maxWidth: 400)
+            .background(Color.retraceSecondaryBackground)
+            .cornerRadius(.cornerRadiusL)
+
+            Spacer()
+        }
+    }
+
+    // MARK: - Step 10: Completion
+
+    private var completionStep: some View {
+        VStack(spacing: .spacingL) {
+            Spacer()
+
+            // Logo
+            retraceLogo
+                .frame(width: 120, height: 120)
 
             Text("You're All Set!")
-                .font(.retraceTitle)
+                .font(.system(size: 36, weight: .bold))
                 .foregroundColor(.retracePrimary)
 
+            Text("Retrace is now capturing your screen in the background.")
+                .font(.retraceBody)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, .spacingXL)
+
+            // Prompt to test timeline
             VStack(spacing: .spacingM) {
-                Text("Launch Retrace Dashboard through:")
+                Text("Test it out!")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.retracePrimary)
+
+                Text("Press your timeline shortcut to see what you've recorded:")
                     .font(.retraceBody)
                     .foregroundColor(.retraceSecondary)
+                    .multilineTextAlignment(.center)
 
-                VStack(alignment: .leading, spacing: .spacingS) {
-                    HStack(spacing: .spacingM) {
-                        Image(systemName: "command")
-                        Text("Keyboard shortcut: ⌘⇧\(dashboardShortcut)")
-                            .font(.retraceMono)
+                // Display the timeline shortcut
+                HStack(spacing: .spacingS) {
+                    // Display modifier keys dynamically
+                    ForEach(timelineShortcut.modifierSymbols, id: \.self) { symbol in
+                        Text(symbol)
+                            .font(.system(size: 20, weight: .medium, design: .rounded))
+                            .foregroundColor(.retraceSecondary)
+                            .frame(width: 40, height: 40)
+                            .background(Color.retraceCard)
+                            .cornerRadius(.cornerRadiusS)
                     }
-                    .foregroundColor(.retracePrimary)
 
-                    HStack(spacing: .spacingM) {
-                        Image(systemName: "menubar.rectangle")
-                        Text("Click the menu bar icon")
+                    if !timelineShortcut.modifierSymbols.isEmpty {
+                        Text("+")
+                            .font(.retraceBody)
+                            .foregroundColor(.retraceSecondary)
                     }
-                    .foregroundColor(.retracePrimary)
+
+                    // Key
+                    Text(timelineShortcut.key)
+                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                        .foregroundColor(.retracePrimary)
+                        .frame(minWidth: 60, minHeight: 40)
+                        .padding(.horizontal, .spacingM)
+                        .background(Color.retraceAccent)
+                        .cornerRadius(.cornerRadiusS)
                 }
             }
             .padding(.spacingL)
             .background(Color.retraceSecondaryBackground)
             .cornerRadius(.cornerRadiusL)
+            .frame(maxWidth: 500)
 
             Spacer()
+        }
+    }
 
-            Button(action: {
-                Task {
-                    await coordinator.onboardingManager.markOnboardingCompleted()
-                    // Start the capture pipeline after onboarding is complete
-                    try? await coordinator.startPipeline()
-                }
-                onComplete()
-            }) {
-                Text("Start Using Retrace")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.white)
-                    .frame(width: 200)
-                    .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
-                    .cornerRadius(.cornerRadiusL)
-            }
-            .buttonStyle(.plain)
+    // MARK: - Screen Recording Indicator
 
-            Spacer()
+    private var screenRecordingIndicator: some View {
+        ZStack {
+            // Purple rounded rectangle background (matching Apple's indicator)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    LinearGradient(
+                        colors: [Color(red: 0.6, green: 0.4, blue: 0.9), Color(red: 0.5, green: 0.3, blue: 0.8)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            // Person with screen icon
+            Image(systemName: "rectangle.inset.filled.and.person.filled")
+                .font(.system(size: 36, weight: .medium))
+                .foregroundColor(.white)
         }
     }
 
@@ -1208,33 +1385,105 @@ public struct OnboardingView: View {
         }
     }
 
-    private func navigationButtons(canContinue: Bool, continueAction: @escaping () -> Void) -> some View {
-        HStack {
-            if currentStep > 1 {
-                Button(action: { withAnimation { currentStep -= 1 } }) {
-                    HStack(spacing: .spacingS) {
-                        Image(systemName: "chevron.left")
-                        Text("Back")
-                    }
-                    .font(.retraceBody)
-                    .foregroundColor(.retraceSecondary)
+    /// Rewind-style double arrow icon (⏪) matching the app's color scheme
+    private var rewindIcon: some View {
+        GeometryReader { geometry in
+            let size = min(geometry.size.width, geometry.size.height)
+            let centerX = size / 2
+            let centerY = size / 2
+            let arrowHeight = size * 0.45
+            let arrowWidth = size * 0.28
+            let gap = size * 0.02  // Small gap between arrows
+            let leftOffset = size * 0.08  // Shift arrows to the left
+
+            // Total width of both arrows + gap, centered around centerX, then shifted left
+            let totalWidth = arrowWidth * 2 + gap
+            let startX = centerX - totalWidth / 2 - leftOffset
+
+            ZStack {
+                // Background circle with gradient
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.retraceAccent.opacity(0.3), Color.retraceDeepBlue],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                // Left arrow (first rewind arrow)
+                Path { path in
+                    let tipX = startX
+                    let baseX = tipX + arrowWidth
+                    path.move(to: CGPoint(x: tipX, y: centerY))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
+                    path.closeSubpath()
                 }
-                .buttonStyle(.plain)
-            }
+                .fill(Color.retraceAccent)
 
-            Spacer()
-
-            Button(action: continueAction) {
-                Text("Continue")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, .spacingL)
-                    .padding(.vertical, .spacingM)
-                    .background(canContinue ? Color.retraceAccent : Color.retraceSecondaryColor)
-                    .cornerRadius(.cornerRadiusM)
+                // Right arrow (second rewind arrow)
+                Path { path in
+                    let tipX = startX + arrowWidth + gap
+                    let baseX = tipX + arrowWidth
+                    path.move(to: CGPoint(x: tipX, y: centerY))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
+                    path.closeSubpath()
+                }
+                .fill(Color.retraceAccent)
             }
-            .buttonStyle(.plain)
-            .disabled(!canContinue)
+        }
+    }
+
+    /// Muted version of rewind icon for "no data found" state
+    private var rewindIconMuted: some View {
+        GeometryReader { geometry in
+            let size = min(geometry.size.width, geometry.size.height)
+            let centerX = size / 2
+            let centerY = size / 2
+            let arrowHeight = size * 0.45
+            let arrowWidth = size * 0.28
+            let gap = size * 0.02  // Small gap between arrows
+            let leftOffset = size * 0.08  // Shift arrows to the left
+
+            // Total width of both arrows + gap, centered around centerX, then shifted left
+            let totalWidth = arrowWidth * 2 + gap
+            let startX = centerX - totalWidth / 2 - leftOffset
+
+            ZStack {
+                // Background circle with muted gradient
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.retraceSecondary.opacity(0.3), Color.retraceDeepBlue],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                // Left arrow (first rewind arrow) - muted
+                Path { path in
+                    let tipX = startX
+                    let baseX = tipX + arrowWidth
+                    path.move(to: CGPoint(x: tipX, y: centerY))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
+                    path.closeSubpath()
+                }
+                .fill(Color.retraceSecondary)
+
+                // Right arrow (second rewind arrow) - muted
+                Path { path in
+                    let tipX = startX + arrowWidth + gap
+                    let baseX = tipX + arrowWidth
+                    path.move(to: CGPoint(x: tipX, y: centerY))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY - arrowHeight / 2))
+                    path.addLine(to: CGPoint(x: baseX, y: centerY + arrowHeight / 2))
+                    path.closeSubpath()
+                }
+                .fill(Color.retraceSecondary)
+            }
         }
     }
 
@@ -1263,16 +1512,42 @@ public struct OnboardingView: View {
     }
 
     private func requestScreenRecording() {
-        // Use SCShareableContent to trigger the permission dialog
-        // This is an async call that will prompt for screen recording permission
+        // If already granted, nothing to do
+        if CGPreflightScreenCaptureAccess() {
+            return
+        }
+
+        // If we've already detected a denial, open settings instead
+        if screenRecordingDenied {
+            openScreenRecordingSettings()
+            return
+        }
+
+        // Mark that we've requested permission BEFORE making the request
+        screenRecordingRequested = true
+
         Task {
             do {
                 _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             } catch {
-                // Error is expected if permission is denied
+                let errorDescription = error.localizedDescription
                 print("[OnboardingView] Screen recording permission request: \(error)")
+
+                // If we get the TCC "declined" error, they denied
+                if errorDescription.contains("declined") {
+                    await MainActor.run {
+                        screenRecordingDenied = true
+                    }
+                    print("[OnboardingView] User denied - showing Open Settings button")
+                }
             }
         }
+    }
+
+    private func openScreenRecordingSettings() {
+        // Open System Settings to Screen Recording privacy pane
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+        NSWorkspace.shared.open(url)
     }
 
     private func requestAccessibility() {
@@ -1314,7 +1589,13 @@ public struct OnboardingView: View {
                 hasScreenRecordingPermission = await checkScreenRecordingPermission()
 
                 // Check accessibility
+                let previousAccessibility = hasAccessibilityPermission
                 hasAccessibilityPermission = checkAccessibilityPermission()
+
+                // If accessibility was just granted, retry setting up global hotkeys
+                if !previousAccessibility && hasAccessibilityPermission {
+                    HotkeyManager.shared.retrySetupIfNeeded()
+                }
             }
         }
     }
@@ -1334,10 +1615,32 @@ public struct OnboardingView: View {
         if fileManager.fileExists(atPath: memoryVaultPath) {
             // Found Rewind data
             hasRewindData = true
+            // Calculate folder size
+            rewindDataSizeGB = calculateFolderSizeGB(atPath: memoryVaultPath)
         } else {
             // No Rewind data found - skip the step entirely
             hasRewindData = false
         }
+    }
+
+    private func calculateFolderSizeGB(atPath path: String) -> Double {
+        let fileManager = FileManager.default
+        var totalSize: Int64 = 0
+
+        guard let enumerator = fileManager.enumerator(atPath: path) else {
+            return 0
+        }
+
+        while let file = enumerator.nextObject() as? String {
+            let filePath = (path as NSString).appendingPathComponent(file)
+            if let attributes = try? fileManager.attributesOfItem(atPath: filePath),
+               let fileSize = attributes[.size] as? Int64 {
+                totalSize += fileSize
+            }
+        }
+
+        // Convert bytes to GB
+        return Double(totalSize) / (1024 * 1024 * 1024)
     }
 }
 
@@ -1347,10 +1650,57 @@ import ScreenCaptureKit
 
 // MARK: - Shortcut Capture Field
 
+// MARK: - Shortcut Key Model
+
+struct ShortcutKey: Equatable {
+    var key: String
+    var modifiers: NSEvent.ModifierFlags
+
+    /// Create from ShortcutConfig (source of truth)
+    init(from config: ShortcutConfig) {
+        self.key = config.key
+        self.modifiers = config.modifiers.nsModifiers
+    }
+
+    /// Create directly with key and modifiers
+    init(key: String, modifiers: NSEvent.ModifierFlags) {
+        self.key = key
+        self.modifiers = modifiers
+    }
+
+    var displayString: String {
+        var parts: [String] = []
+        if modifiers.contains(.control) { parts.append("⌃") }
+        if modifiers.contains(.option) { parts.append("⌥") }
+        if modifiers.contains(.shift) { parts.append("⇧") }
+        if modifiers.contains(.command) { parts.append("⌘") }
+        parts.append(key)
+        return parts.joined(separator: " ")
+    }
+
+    var modifierSymbols: [String] {
+        var symbols: [String] = []
+        if modifiers.contains(.control) { symbols.append("⌃") }
+        if modifiers.contains(.option) { symbols.append("⌥") }
+        if modifiers.contains(.shift) { symbols.append("⇧") }
+        if modifiers.contains(.command) { symbols.append("⌘") }
+        return symbols
+    }
+
+    /// Convert to ShortcutConfig for storage
+    var toConfig: ShortcutConfig {
+        ShortcutConfig(key: key, modifiers: ShortcutModifiers(from: modifiers))
+    }
+
+    static func == (lhs: ShortcutKey, rhs: ShortcutKey) -> Bool {
+        lhs.key == rhs.key && lhs.modifiers == rhs.modifiers
+    }
+}
+
 struct ShortcutCaptureField: NSViewRepresentable {
     @Binding var isRecording: Bool
-    @Binding var capturedKey: String
-    let otherShortcut: String
+    @Binding var capturedShortcut: ShortcutKey
+    let otherShortcut: ShortcutKey
     let onDuplicateAttempt: () -> Void
 
     func makeNSView(context: Context) -> ShortcutCaptureNSView {
@@ -1380,19 +1730,34 @@ struct ShortcutCaptureField: NSViewRepresentable {
             self.parent = parent
         }
 
-        func handleKeyPress(keyCode: UInt16, characters: String?) {
+        func handleKeyPress(event: NSEvent) {
             guard parent.isRecording else { return }
 
-            let keyName = mapKeyCodeToString(keyCode: keyCode, characters: characters)
+            let keyName = mapKeyCodeToString(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers)
+            let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
 
-            // Check for duplicate
-            if keyName == parent.otherShortcut {
+            // Escape key cancels recording
+            if event.keyCode == 53 { // Escape
+                parent.isRecording = false
+                return
+            }
+
+            // Require at least one modifier key
+            if modifiers.isEmpty {
+                // Ignore shortcuts without modifiers
+                return
+            }
+
+            let newShortcut = ShortcutKey(key: keyName, modifiers: modifiers)
+
+            // Check for duplicate (same key AND same modifiers)
+            if newShortcut == parent.otherShortcut {
                 parent.onDuplicateAttempt()
                 parent.isRecording = false
                 return
             }
 
-            parent.capturedKey = keyName
+            parent.capturedShortcut = newShortcut
             parent.isRecording = false
         }
 
@@ -1407,7 +1772,19 @@ struct ShortcutCaptureField: NSViewRepresentable {
             case 124: return "→"
             case 125: return "↓"
             case 126: return "↑"
+            // Number keys (top row)
+            case 18: return "1"
+            case 19: return "2"
+            case 20: return "3"
+            case 21: return "4"
+            case 23: return "5"
+            case 22: return "6"
+            case 26: return "7"
+            case 28: return "8"
+            case 25: return "9"
+            case 29: return "0"
             default:
+                // Use charactersIgnoringModifiers to get the actual key pressed
                 if let chars = characters, !chars.isEmpty {
                     return chars.uppercased()
                 }
@@ -1425,7 +1802,7 @@ class ShortcutCaptureNSView: NSView {
 
     override func keyDown(with event: NSEvent) {
         if isRecordingEnabled {
-            coordinator?.handleKeyPress(keyCode: event.keyCode, characters: event.characters)
+            coordinator?.handleKeyPress(event: event)
         } else {
             super.keyDown(with: event)
         }

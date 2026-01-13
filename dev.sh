@@ -9,10 +9,6 @@ echo "🔨 Building Retrace (DEBUG mode)..."
 swift build -c debug
 
 echo ""
-echo "🔥 Hot Reload Ready!"
-echo "   • Make sure InjectionIII is running"
-echo "   • Edit any .swift file and save to see instant updates"
-echo ""
 echo "🚀 Starting Retrace..."
 echo ""
 

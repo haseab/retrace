@@ -25,7 +25,8 @@ public actor ServiceContainer {
     public let search: SearchManager
     public let migration: MigrationManager
     public let modelManager: ModelManager
-    public let onboardingManager: OnboardingManager
+    nonisolated public let onboardingManager: OnboardingManager
+    public var dataAdapter: DataAdapter?
 
     // MARK: - Configuration
 
@@ -44,7 +45,7 @@ public actor ServiceContainer {
     // MARK: - Initialization
 
     public init(
-        databasePath: String = "~/Library/Application Support/Retrace/retrace.db",
+        databasePath: String = AppPaths.databasePath,
         storageConfig: StorageConfig = .default,
         captureConfig: CaptureConfig = .default,
         // ⚠️ RELEASE 2 ONLY
@@ -234,10 +235,77 @@ public actor ServiceContainer {
         // 7. Migration doesn't need explicit initialization
         Log.info("✓ Migration ready", category: .app)
 
+        // 8. Initialize DataAdapter with primary and secondary sources
+        let retraceSource = RetraceDataSource(database: database, storage: storage)
+        let adapter = DataAdapter(primarySource: retraceSource)
+
+        // Register Rewind source if user opted in
+        let useRewindData = UserDefaults.standard.bool(forKey: "useRewindData")
+        Log.info("Checking Rewind source during initialization: useRewindData=\(useRewindData)", category: .app)
+
+        if useRewindData {
+            // Hardcoded password for Rewind database decryption
+            let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+            do {
+                let rewindSource = try RewindDataSource(password: rewindPassword)
+                await adapter.registerSource(rewindSource)
+                Log.info("✓ Rewind source registered during initialization", category: .app)
+            } catch {
+                Log.warning("Failed to create Rewind source during initialization: \(error)", category: .app)
+            }
+        } else {
+            Log.info("⊘ Rewind source not registered during initialization (useRewindData is false)", category: .app)
+        }
+
+        // Initialize the adapter (connects all sources)
+        try await adapter.initialize()
+        self.dataAdapter = adapter
+        Log.info("✓ DataAdapter initialized", category: .app)
+
         // Capture is initialized when startCapture() is called
 
         isInitialized = true
         Log.info("All services initialized successfully", category: .app)
+    }
+
+    /// Register Rewind data source if user has opted in
+    /// Can be called after initialization (e.g., after onboarding completes)
+    public func registerRewindSourceIfEnabled() async throws {
+        guard isInitialized else {
+            Log.warning("Cannot register Rewind source - ServiceContainer not initialized", category: .app)
+            return
+        }
+
+        guard let adapter = dataAdapter else {
+            Log.warning("Cannot register Rewind source - DataAdapter not available", category: .app)
+            return
+        }
+
+        let useRewindData = UserDefaults.standard.bool(forKey: "useRewindData")
+        Log.info("Checking if Rewind source should be registered: useRewindData=\(useRewindData)", category: .app)
+
+        if useRewindData {
+            // Check if already registered
+            let sources = await adapter.registeredSources
+            if sources.contains(.rewind) {
+                Log.info("Rewind source already registered, skipping", category: .app)
+                return
+            }
+
+            // Hardcoded password for Rewind database decryption
+            let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+            do {
+                let rewindSource = try RewindDataSource(password: rewindPassword)
+                await adapter.registerSource(rewindSource)
+                try await rewindSource.connect()
+                Log.info("✓ Rewind source registered and connected after initialization", category: .app)
+            } catch {
+                Log.warning("Failed to create Rewind source: \(error)", category: .app)
+                throw error
+            }
+        } else {
+            Log.info("⊘ Rewind source not registered (useRewindData is false)", category: .app)
+        }
     }
 
     /// Shutdown all services gracefully
@@ -266,6 +334,10 @@ public actor ServiceContainer {
         // ⚠️ RELEASE 2 ONLY
         // // Audio processing will complete when stream ends
         // Log.info("✓ Audio processing drained", category: .app)
+
+        // Shutdown DataAdapter (disconnects all sources)
+        await dataAdapter?.shutdown()
+        Log.info("✓ DataAdapter shutdown", category: .app)
 
         // Close database connections
         try await ftsEngine.close()
@@ -311,11 +383,12 @@ public actor ServiceContainer {
 extension StorageConfig {
     public static var `default`: StorageConfig {
         // Read settings from UserDefaults (synced with Settings UI)
-        let retentionDays = UserDefaults.standard.object(forKey: "retentionDays") as? Int ?? 90
-        let maxStorageGB = UserDefaults.standard.object(forKey: "maxStorageGB") as? Double ?? 50.0
+        // Defaults: retention = forever (0/nil), storage = unlimited (500GB max)
+        let retentionDays = UserDefaults.standard.object(forKey: "retentionDays") as? Int ?? 0
+        let maxStorageGB = UserDefaults.standard.object(forKey: "maxStorageGB") as? Double ?? 500.0
 
         return StorageConfig(
-            storageRootPath: "~/Library/Application Support/Retrace",
+            storageRootPath: AppPaths.storageRoot,
             retentionDays: retentionDays == 0 ? nil : retentionDays, // 0 = forever
             maxStorageGB: maxStorageGB,
             segmentDurationSeconds: 300  // 5 minutes
@@ -327,14 +400,15 @@ extension CaptureConfig {
     public static var `default`: CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
         let captureRate = UserDefaults.standard.object(forKey: "captureRate") as? Double ?? 0.5
-        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? true
+        // Default to false - capture everything (private windows exclusion not implemented yet)
+        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? false
 
         return CaptureConfig(
             captureIntervalSeconds: 1.0 / captureRate, // Convert FPS to interval
             adaptiveCaptureEnabled: true,
             deduplicationThreshold: 0.90, // 0.90 = strict (filters static/similar frames, keeps only >10% different)
             maxResolution: .uhd4K,
-            excludedAppBundleIDs: [],
+            excludedAppBundleIDs: [], // Empty - no apps excluded by default
             excludePrivateWindows: excludePrivateWindows
         )
     }

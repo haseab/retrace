@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import SQLCipher
 import Shared
 
 /// CRUD operations for frames table
@@ -92,7 +92,7 @@ enum FrameQueries {
                    app_bundle_id, app_name, window_title, browser_url, source
             FROM frames
             WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp ASC
             LIMIT ?;
             """
 
@@ -134,7 +134,7 @@ enum FrameQueries {
                    app_bundle_id, app_name, window_title, browser_url, source
             FROM frames
             WHERE app_bundle_id = ?
-            ORDER BY timestamp DESC
+            ORDER BY timestamp ASC
             LIMIT ? OFFSET ?;
             """
 

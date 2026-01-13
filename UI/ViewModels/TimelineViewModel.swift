@@ -12,6 +12,7 @@ public class TimelineViewModel: ObservableObject {
 
     @Published public var currentFrame: FrameReference?
     @Published public var currentFrameImage: NSImage?
+    @Published public var currentFrameVideoInfo: FrameVideoInfo?
     @Published public var frames: [FrameReference] = []
     @Published public var sessions: [AppSession] = []
     @Published public var selectedSession: AppSession?
@@ -26,6 +27,12 @@ public class TimelineViewModel: ObservableObject {
     // Filter state
     @Published public var filteredByApp: String?
 
+    // Infinite scroll state
+    @Published public var isLoadingMore = false
+    private var hasMoreDataBackward = true  // Can load older frames
+    private var oldestLoadedDate: Date?
+    private var newestLoadedDate: Date?
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -34,7 +41,7 @@ public class TimelineViewModel: ObservableObject {
 
     // MARK: - Constants
 
-    private let frameLoadBatchSize = 100
+    private let frameLoadBatchSize = 500  // Increased for better performance with Rewind data
 
     // MARK: - Initialization
 
@@ -77,6 +84,13 @@ public class TimelineViewModel: ObservableObject {
                 limit: frameLoadBatchSize
             )
 
+            // Track date boundaries for infinite scroll
+            oldestLoadedDate = range.start
+            newestLoadedDate = range.end
+
+            // Check if we have more data
+            hasMoreDataBackward = !frames.isEmpty
+
             // Load sessions
             sessions = try await loadSessions(in: range)
 
@@ -97,9 +111,69 @@ public class TimelineViewModel: ObservableObject {
         return try await coordinator.getSessions(from: range.start, to: range.end)
     }
 
+    // MARK: - Infinite Scroll
+
+    /// Load more frames when scrolling to the left (older data)
+    /// This is where Rewind data will be fetched automatically
+    public func loadMoreFramesBackward() async {
+        guard !isLoadingMore, hasMoreDataBackward, let oldestDate = oldestLoadedDate else {
+            return
+        }
+
+        isLoadingMore = true
+
+        do {
+            // Calculate new date range (going back in time)
+            let newEndDate = oldestDate
+            let newStartDate: Date
+            switch zoomLevel {
+            case .hour:
+                newStartDate = Calendar.current.date(byAdding: .hour, value: -1, to: newEndDate)!
+            case .day:
+                newStartDate = Calendar.current.date(byAdding: .day, value: -1, to: newEndDate)!
+            case .week:
+                newStartDate = Calendar.current.date(byAdding: .weekOfYear, value: -1, to: newEndDate)!
+            }
+
+            // Fetch older frames (this will automatically use Rewind if before Dec 19, 2025)
+            let olderFrames = try await coordinator.getFrames(
+                from: newStartDate,
+                to: newEndDate,
+                limit: frameLoadBatchSize
+            )
+
+            if olderFrames.isEmpty {
+                hasMoreDataBackward = false
+            } else {
+                // Prepend older frames
+                frames = olderFrames + frames
+                oldestLoadedDate = newStartDate
+
+                // Load sessions for the new range
+                let newSessions = try await loadSessions(in: DateRange(start: newStartDate, end: newEndDate))
+                sessions = newSessions + sessions
+            }
+
+            isLoadingMore = false
+        } catch {
+            self.error = "Failed to load more frames: \(error.localizedDescription)"
+            isLoadingMore = false
+        }
+    }
+
+    /// Check if we're near the left edge and should load more
+    public func checkScrollPosition(scrollOffset: CGFloat, totalWidth: CGFloat) async {
+        // If scrolled within 20% of the left edge, load more
+        let threshold = totalWidth * 0.2
+        if scrollOffset < threshold && !isLoadingMore {
+            await loadMoreFramesBackward()
+        }
+    }
+
     // MARK: - Frame Navigation
 
     public func selectFrame(_ frame: FrameReference) async {
+        Log.debug("[TimelineViewModel] selectFrame called - timestamp: \(frame.timestamp), source: \(frame.source)", category: .app)
         currentFrame = frame
         await loadFrameImage(frame)
     }
@@ -148,6 +222,117 @@ public class TimelineViewModel: ObservableObject {
     public func jumpHours(_ hours: Int) async {
         let newDate = currentDate.addingTimeInterval(TimeInterval(hours * 3600))
         await jumpToTimestamp(newDate)
+    }
+
+    // MARK: - Fullscreen Timeline Support
+
+    /// Load the most recent frame - used when opening fullscreen timeline
+    /// Shows the last captured frame immediately
+    /// If no frames in last hour, finds where data exists and loads an hour around that
+    public func loadMostRecentFrame() async {
+        isLoading = true
+        error = nil
+
+        do {
+            let now = Date()
+            let oneHourAgo = Calendar.current.date(byAdding: .hour, value: -1, to: now)!
+
+            // First try: last hour
+            var foundFrames = try await coordinator.getFrames(
+                from: oneHourAgo,
+                to: now,
+                limit: 100
+            )
+
+            var rangeStart = oneHourAgo
+            var rangeEnd = now
+
+            // If no frames in last hour, find where data actually exists
+            if foundFrames.isEmpty {
+                if let latestTimestamp = try await coordinator.getMostRecentFrameTimestamp() {
+                    // Load an hour of data ending at the most recent frame
+                    rangeEnd = latestTimestamp
+                    rangeStart = Calendar.current.date(byAdding: .hour, value: -1, to: latestTimestamp)!
+
+                    foundFrames = try await coordinator.getFrames(
+                        from: rangeStart,
+                        to: rangeEnd,
+                        limit: 100
+                    )
+                }
+                // If still empty, latestTimestamp was nil - no data exists anywhere
+            }
+
+            frames = foundFrames
+
+            // Set date range for infinite scroll
+            oldestLoadedDate = rangeStart
+            newestLoadedDate = rangeEnd
+            hasMoreDataBackward = true
+
+            // Load sessions for the searched range
+            sessions = try await loadSessions(in: DateRange(start: rangeStart, end: rangeEnd))
+
+            // Select the most recent frame (last in the array, sorted by timestamp)
+            if let mostRecent = frames.last {
+                await selectFrame(mostRecent)
+                currentDate = mostRecent.timestamp
+            }
+
+            isLoading = false
+        } catch {
+            self.error = "Failed to load recent frames: \(error.localizedDescription)"
+            isLoading = false
+        }
+    }
+
+    /// Handle scrubbing gesture from timeline bar
+    /// - Parameter delta: Normalized delta (-1 to 1, negative = go back in time)
+    public func handleScrub(delta: Double) async {
+        guard !frames.isEmpty else { return }
+
+        // Calculate time delta based on current zoom level
+        // Trackpad sends many events per gesture (50+ events per swipe)
+        // so keep this value low for smooth, controllable scrubbing
+        let secondsPerUnit: Double
+        switch zoomLevel {
+        case .hour:
+            secondsPerUnit = 0.0005 // 0.5 seconds per scroll event
+        case .day:
+            secondsPerUnit = 0.0005 // 0.5 seconds per scroll event
+        case .week:
+            secondsPerUnit = 0.0005 // 0.5 seconds per scroll event
+        }
+
+        let timeOffset = delta * secondsPerUnit
+        let newDate = currentDate.addingTimeInterval(timeOffset)
+
+        Log.debug("[TimelineViewModel] handleScrub - delta: \(delta), secondsPerUnit: \(secondsPerUnit), timeOffset: \(timeOffset)s", category: .app)
+
+        // Always update currentDate to accumulate scroll position
+        // This ensures subsequent scrolls build on each other
+        currentDate = newDate
+
+        // Find the closest frame
+        let closest = frames.min { frame1, frame2 in
+            abs(frame1.timestamp.timeIntervalSince(newDate)) <
+            abs(frame2.timestamp.timeIntervalSince(newDate))
+        }
+
+        if let closest = closest, closest.id != currentFrame?.id {
+            // Update current frame (this updates playhead and timestamp display)
+            Log.debug("[TimelineViewModel] handleScrub - updating to frame at \(closest.timestamp)", category: .app)
+            currentFrame = closest
+            Log.debug("[TimelineViewModel] handleScrub - currentFrame updated", category: .app)
+            // Load image in same task to ensure UI updates
+            await loadFrameImage(closest)
+        }
+
+        // Check if we need to load more frames
+        if let oldestFrame = frames.first,
+           newDate < oldestFrame.timestamp {
+            await loadMoreFramesBackward()
+        }
     }
 
     // MARK: - Playback
@@ -203,19 +388,40 @@ public class TimelineViewModel: ObservableObject {
     // MARK: - Image Loading
 
     private func loadFrameImage(_ frame: FrameReference) async {
+        Log.debug("[TimelineViewModel] loadFrameImage - frame source: \(frame.source), timestamp: \(frame.timestamp)", category: .app)
         do {
-            let imageData = try await coordinator.getFrameImage(
+            // Try to get video info first (for Rewind frames)
+            Log.debug("[TimelineViewModel] Attempting to get video info for frame", category: .app)
+            if let videoInfo = try await coordinator.getFrameVideoInfo(
                 segmentID: frame.segmentID,
-                timestamp: frame.timestamp
-            )
-
-            if let image = NSImage(data: imageData) {
-                currentFrameImage = image
+                timestamp: frame.timestamp,
+                source: frame.source
+            ) {
+                // Video-based frame (Rewind)
+                Log.debug("[TimelineViewModel] Got video info: \(videoInfo.videoPath), frame \(videoInfo.frameIndex)", category: .app)
+                currentFrameVideoInfo = videoInfo
+                currentFrameImage = nil
+                Log.debug("[TimelineViewModel] Set currentFrameVideoInfo, cleared currentFrameImage", category: .app)
             } else {
-                error = "Failed to decode frame image"
+                // Image-based frame (Retrace)
+                Log.debug("[TimelineViewModel] No video info, loading as image", category: .app)
+                let imageData = try await coordinator.getFrameImage(
+                    segmentID: frame.segmentID,
+                    timestamp: frame.timestamp
+                )
+
+                if let image = NSImage(data: imageData) {
+                    currentFrameImage = image
+                    currentFrameVideoInfo = nil
+                    Log.debug("[TimelineViewModel] Loaded image successfully", category: .app)
+                } else {
+                    error = "Failed to decode frame image"
+                    Log.error("[TimelineViewModel] Failed to decode frame image", category: .app)
+                }
             }
         } catch {
-            self.error = "Failed to load frame image: \(error.localizedDescription)"
+            self.error = "Failed to load frame: \(error.localizedDescription)"
+            Log.error("[TimelineViewModel] Failed to load frame: \(error)", category: .app)
         }
     }
 

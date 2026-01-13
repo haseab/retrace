@@ -2,24 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Disable App Sandbox to allow full system access -->
-    <key>com.apple.security.app-sandbox</key>
-    <false/>
-
-    <!-- Screen Recording Permission -->
-    <key>com.apple.security.device.screen-recording</key>
-    <true/>
-
-    <!-- Apple Events (for Accessibility) -->
-    <key>com.apple.security.automation.apple-events</key>
-    <true/>
-
-    <!-- Allow network access (for future features) -->
-    <key>com.apple.security.network.client</key>
-    <true/>
-
-    <!-- File access (to Application Support folder) -->
-    <key>com.apple.security.files.user-selected.read-write</key>
-    <true/>
+	<key>com.apple.security.device.screen-recording</key>
+	<true/>
 </dict>
 </plist>

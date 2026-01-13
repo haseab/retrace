@@ -1,15 +1,14 @@
 import SwiftUI
 import App
-import Inject
 
 /// Root content view with navigation between main views
 public struct ContentView: View {
 
     // MARK: - Properties
 
-    @ObserveInjection var inject
     @State private var selectedView: MainView = .dashboard
     @State private var showOnboarding: Bool? = nil  // nil = loading, true = show onboarding, false = show main app
+    @State private var showFeedbackSheet = false
     @StateObject private var deeplinkHandler = DeeplinkHandler()
     @StateObject private var menuBarManager: MenuBarManager
 
@@ -19,7 +18,10 @@ public struct ContentView: View {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
-        _menuBarManager = StateObject(wrappedValue: MenuBarManager(coordinator: coordinator))
+        _menuBarManager = StateObject(wrappedValue: MenuBarManager(
+            coordinator: coordinator,
+            onboardingManager: coordinator.onboardingManager
+        ))
     }
 
     // MARK: - Body
@@ -38,16 +40,11 @@ public struct ContentView: View {
                     }
                 } else {
                     // Main content based on selected view
+                    // Note: Timeline and Search are now fullscreen overlays, not tabs
                     Group {
                         switch selectedView {
                         case .dashboard:
                             DashboardView(coordinator: coordinator)
-
-                        case .timeline:
-                            TimelineView(coordinator: coordinator)
-
-                        case .search:
-                            SearchView(coordinator: coordinator)
 
                         case .settings:
                             SettingsView()
@@ -98,33 +95,38 @@ public struct ContentView: View {
         .onChange(of: deeplinkHandler.activeRoute) { route in
             handleDeeplink(route)
         }
+        .sheet(isPresented: $showFeedbackSheet) {
+            FeedbackFormView()
+        }
     }
 
     // MARK: - Notifications
 
     private func setupNotifications() {
-        NotificationCenter.default.addObserver(
-            forName: .openTimeline,
-            object: nil,
-            queue: .main
-        ) { _ in
-            selectedView = .timeline
-        }
-
-        NotificationCenter.default.addObserver(
-            forName: .openSearch,
-            object: nil,
-            queue: .main
-        ) { _ in
-            selectedView = .search
-        }
+        // Note: Timeline and Search notifications are now handled by MenuBarManager
+        // They open the fullscreen overlay instead of switching tabs
 
         NotificationCenter.default.addObserver(
             forName: .openDashboard,
             object: nil,
             queue: .main
         ) { _ in
-            selectedView = .dashboard
+            // Toggle dashboard visibility
+            let mainWindow = NSApp.windows.first { window in
+                window.level.rawValue == 0 && window.isVisible
+            }
+
+            if let window = mainWindow, window.isKeyWindow {
+                // Window is already visible and focused - hide it
+                window.orderOut(nil)
+            } else {
+                // Window is hidden or not focused - show and activate
+                NSApp.activate(ignoringOtherApps: true)
+                for window in NSApp.windows where window.level.rawValue == 0 {
+                    window.makeKeyAndOrderFront(nil)
+                    window.orderFrontRegardless()
+                }
+            }
         }
 
         NotificationCenter.default.addObserver(
@@ -133,6 +135,30 @@ public struct ContentView: View {
             queue: .main
         ) { _ in
             selectedView = .settings
+            bringWindowToFront()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .openFeedback,
+            object: nil,
+            queue: .main
+        ) { _ in
+            showFeedbackSheet = true
+            bringWindowToFront()
+        }
+    }
+
+    private func bringWindowToFront() {
+        // Activate the app
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Bring main window to front
+        for window in NSApp.windows {
+            // Skip menu bar windows (level > 0 means floating/status bar)
+            guard window.level.rawValue == 0 else { continue }
+
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
         }
     }
 
@@ -143,12 +169,12 @@ public struct ContentView: View {
 
         switch route {
         case .search:
-            selectedView = .search
-            // TODO: Pass query/timestamp/app to SearchView
+            // Open fullscreen timeline with search
+            TimelineWindowController.shared.show()
 
         case .timeline:
-            selectedView = .timeline
-            // TODO: Pass timestamp to TimelineView
+            // Open fullscreen timeline
+            TimelineWindowController.shared.show()
         }
     }
 
@@ -166,9 +192,8 @@ public struct ContentView: View {
 
 enum MainView {
     case dashboard
-    case timeline
-    case search
     case settings
+    // Note: timeline and search are now fullscreen overlays handled by TimelineWindowController
 }
 
 // MARK: - Preview
