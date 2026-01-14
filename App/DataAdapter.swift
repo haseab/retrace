@@ -174,6 +174,99 @@ public actor DataAdapter {
         return result
     }
 
+    /// Get frames before a timestamp (for infinite scroll - loading older frames)
+    /// Returns frames sorted by timestamp descending (newest first of the older batch)
+    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getFramesBefore called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        Log.info("[DataAdapter] getFramesBefore: \(dateFormatter.string(from: timestamp)), limit=\(limit)", category: .app)
+
+        var allFrames: [FrameReference] = []
+
+        // Check secondary sources for data before timestamp
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+
+            // For sources with cutoffs, only query if timestamp is within their range
+            if let cutoff = await source.cutoffDate {
+                let effectiveTimestamp = min(timestamp, cutoff)
+                Log.info("[DataAdapter] Querying \(sourceType.displayName) for frames before \(dateFormatter.string(from: effectiveTimestamp))", category: .app)
+                let frames = try await source.getFramesBefore(timestamp: effectiveTimestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
+            } else {
+                let frames = try await source.getFramesBefore(timestamp: timestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
+            }
+        }
+
+        // Get frames from primary source
+        Log.info("[DataAdapter] Querying primary source for frames before \(dateFormatter.string(from: timestamp))", category: .app)
+        let primaryFrames = try await primarySource.getFramesBefore(timestamp: timestamp, limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
+
+        // Sort all frames by timestamp descending (newest first) and take top N
+        allFrames.sort { $0.timestamp > $1.timestamp }
+        let result = Array(allFrames.prefix(limit))
+
+        Log.info("[DataAdapter] Returning \(result.count) frames before timestamp", category: .app)
+        return result
+    }
+
+    /// Get frames after a timestamp (for infinite scroll - loading newer frames)
+    /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
+    public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getFramesAfter called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        Log.info("[DataAdapter] getFramesAfter: \(dateFormatter.string(from: timestamp)), limit=\(limit)", category: .app)
+
+        var allFrames: [FrameReference] = []
+
+        // Check secondary sources for data after timestamp (respecting cutoffs)
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+
+            if let cutoff = await source.cutoffDate {
+                // Only query if timestamp is before cutoff
+                if timestamp < cutoff {
+                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for frames after \(dateFormatter.string(from: timestamp))", category: .app)
+                    let frames = try await source.getFramesAfter(timestamp: timestamp, limit: limit)
+                    allFrames.append(contentsOf: frames)
+                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
+                }
+            } else {
+                let frames = try await source.getFramesAfter(timestamp: timestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
+            }
+        }
+
+        // Get frames from primary source
+        Log.info("[DataAdapter] Querying primary source for frames after \(dateFormatter.string(from: timestamp))", category: .app)
+        let primaryFrames = try await primarySource.getFramesAfter(timestamp: timestamp, limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
+
+        // Sort all frames by timestamp ascending (oldest first) and take top N
+        allFrames.sort { $0.timestamp < $1.timestamp }
+        let result = Array(allFrames.prefix(limit))
+
+        Log.info("[DataAdapter] Returning \(result.count) frames after timestamp", category: .app)
+        return result
+    }
+
     /// Get the timestamp of the most recent frame across all sources
     /// Used to find where data actually exists when recent queries return empty
     public func getMostRecentFrameTimestamp() async throws -> Date? {
@@ -228,7 +321,7 @@ public actor DataAdapter {
         }
 
         // Check if any secondary source should handle this timestamp
-        for (sourceType, source) in secondarySources {
+        for (_, source) in secondarySources {
             guard await source.isConnected else { continue }
 
             if let cutoff = await source.cutoffDate, timestamp < cutoff {

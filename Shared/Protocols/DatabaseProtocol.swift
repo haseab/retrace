@@ -27,6 +27,14 @@ public protocol DatabaseProtocol: Actor {
     /// Get frames in a time range
     func getFrames(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameReference]
 
+    /// Get frames before a timestamp (for infinite scroll - loading older frames)
+    /// Returns frames in descending order (newest of the older batch first)
+    func getFramesBefore(timestamp: Date, limit: Int) async throws -> [FrameReference]
+
+    /// Get frames after a timestamp (for infinite scroll - loading newer frames)
+    /// Returns frames in ascending order (oldest of the newer batch first)
+    func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference]
+
     /// Get frames for a specific app
     func getFrames(appBundleID: String, limit: Int, offset: Int) async throws -> [FrameReference]
 

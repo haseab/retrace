@@ -259,6 +259,110 @@ public actor RewindDataSource: DataSourceProtocol {
         return frames
     }
 
+    public func getFramesBefore(timestamp: Date, limit: Int) async throws -> [FrameReference] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        // Only return frames before cutoff date
+        let effectiveTimestamp = min(timestamp, _cutoffDate)
+
+        // Query frames BEFORE the timestamp, ordered DESC (newest first of the older batch)
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                WHERE createdAt < ?
+                ORDER BY createdAt DESC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            ORDER BY f.createdAt DESC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        // Convert timestamp to ISO format for query
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let timestampISO = dateFormatter.string(from: effectiveTimestamp)
+
+        sqlite3_bind_text(statement, 1, (timestampISO as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frame = try? parseRewindFrame(statement: statement!) {
+                frames.append(frame)
+            }
+        }
+
+        Log.debug("[RewindDataSource] getFramesBefore: fetched \(frames.count) frames before \(timestampISO)", category: .app)
+        return frames
+    }
+
+    public func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        // Don't return frames after cutoff date
+        guard timestamp < _cutoffDate else {
+            return []
+        }
+
+        // Query frames AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                WHERE createdAt > ? AND createdAt < ?
+                ORDER BY createdAt ASC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            ORDER BY f.createdAt ASC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        // Convert timestamps to ISO format for query
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let timestampISO = dateFormatter.string(from: timestamp)
+        let cutoffISO = dateFormatter.string(from: _cutoffDate)
+
+        sqlite3_bind_text(statement, 1, (timestampISO as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, (cutoffISO as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 3, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frame = try? parseRewindFrame(statement: statement!) {
+                frames.append(frame)
+            }
+        }
+
+        Log.debug("[RewindDataSource] getFramesAfter: fetched \(frames.count) frames after \(timestampISO)", category: .app)
+        return frames
+    }
+
     public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
         // Create cache key from segmentID and timestamp
         let cacheKey = "\(segmentID.stringValue)_\(timestamp.timeIntervalSince1970)" as NSString

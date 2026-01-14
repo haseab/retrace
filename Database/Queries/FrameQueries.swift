@@ -121,6 +121,89 @@ enum FrameQueries {
         return frames
     }
 
+    // MARK: - Select Before Timestamp (for infinite scroll - older frames)
+
+    static func getFramesBefore(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int
+    ) throws -> [FrameReference] {
+        // Get frames BEFORE the timestamp, ordered DESC (newest first of the older batch)
+        // This returns frames in descending order, caller should reverse if needed
+        let sql = """
+            SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
+                   app_bundle_id, app_name, window_title, browser_url, source
+            FROM frames
+            WHERE timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(timestamp))
+        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frame = try parseFrameRow(statement: statement!)
+            frames.append(frame)
+        }
+
+        return frames
+    }
+
+    // MARK: - Select After Timestamp (for infinite scroll - newer frames)
+
+    static func getFramesAfter(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int
+    ) throws -> [FrameReference] {
+        // Get frames AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        let sql = """
+            SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
+                   app_bundle_id, app_name, window_title, browser_url, source
+            FROM frames
+            WHERE timestamp > ?
+            ORDER BY timestamp ASC
+            LIMIT ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(timestamp))
+        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frame = try parseFrameRow(statement: statement!)
+            frames.append(frame)
+        }
+
+        return frames
+    }
+
     // MARK: - Select Most Recent
 
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {

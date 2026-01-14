@@ -219,6 +219,20 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getByTimeRange(db: db, from: startDate, to: endDate, limit: limit)
     }
 
+    public func getFramesBefore(timestamp: Date, limit: Int) async throws -> [FrameReference] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getFramesBefore(db: db, timestamp: timestamp, limit: limit)
+    }
+
+    public func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getFramesAfter(db: db, timestamp: timestamp, limit: limit)
+    }
+
     public func getMostRecentFrames(limit: Int) async throws -> [FrameReference] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")

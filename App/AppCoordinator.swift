@@ -380,6 +380,28 @@ public actor AppCoordinator {
         return try await adapter.getMostRecentFrames(limit: limit)
     }
 
+    /// Get frames before a timestamp (for infinite scroll - loading older frames)
+    /// Returns frames sorted by timestamp descending (newest first of the older batch)
+    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database
+            return try await services.database.getFramesBefore(timestamp: timestamp, limit: limit)
+        }
+
+        return try await adapter.getFramesBefore(timestamp: timestamp, limit: limit)
+    }
+
+    /// Get frames after a timestamp (for infinite scroll - loading newer frames)
+    /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
+    public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database
+            return try await services.database.getFramesAfter(timestamp: timestamp, limit: limit)
+        }
+
+        return try await adapter.getFramesAfter(timestamp: timestamp, limit: limit)
+    }
+
     /// Get the timestamp of the most recent frame across all sources
     /// Returns nil if no frames exist in any source
     public func getMostRecentFrameTimestamp() async throws -> Date? {

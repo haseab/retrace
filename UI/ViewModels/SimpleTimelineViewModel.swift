@@ -9,6 +9,13 @@ public enum TimelineConfig {
     public static let pixelsPerFrame: CGFloat = 45.0
 }
 
+/// Configuration for infinite scroll rolling window
+private enum WindowConfig {
+    static let maxFrames = 2000          // Maximum frames in memory
+    static let loadThreshold = 100       // Start loading when within N frames of edge
+    static let loadBatchSize = 300       // Frames to load per batch
+}
+
 /// A frame paired with its preloaded video info for instant access
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
@@ -128,6 +135,26 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Cache for Retrace images (loaded on demand since they're from disk)
     private var imageCache: [FrameID: NSImage] = [:]
 
+    // MARK: - Infinite Scroll Window State
+
+    /// Timestamp of the oldest loaded frame (for loading older frames)
+    private var oldestLoadedTimestamp: Date?
+
+    /// Timestamp of the newest loaded frame (for loading newer frames)
+    private var newestLoadedTimestamp: Date?
+
+    /// Flag to prevent concurrent loads in the "older" direction
+    private var isLoadingOlder = false
+
+    /// Flag to prevent concurrent loads in the "newer" direction
+    private var isLoadingNewer = false
+
+    /// Whether there's more data available in the older direction
+    private var hasMoreOlder = true
+
+    /// Whether there's more data available in the newer direction
+    private var hasMoreNewer = true
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -170,6 +197,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // This matches the timeline UI which displays left-to-right as past-to-future
             frames = timelineFrames.reversed()
 
+            // Initialize window boundary timestamps for infinite scroll
+            updateWindowBoundaries()
+
             // Log the first and last few frames to verify ordering
             print("[SimpleTimelineViewModel] Loaded \(frames.count) frames")
             if frames.count > 0 {
@@ -211,6 +241,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load image if this is an image-based frame
         loadImageIfNeeded()
+
+        // Check if we need to load more frames (infinite scroll)
+        checkAndLoadMoreFrames()
     }
 
     /// Load image for image-based frames (Retrace) if needed
@@ -367,6 +400,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             frames = timelineFrames
+
+            // Reset infinite scroll state for new window
+            updateWindowBoundaries()
+            hasMoreOlder = true
+            hasMoreNewer = true
 
             // Find the frame closest to the target date in our centered set
             let closestIndex = findClosestFrameIndex(to: targetDate)
@@ -560,5 +598,185 @@ public class SimpleTimelineViewModel: ObservableObject {
         ))
 
         return blocks
+    }
+
+    // MARK: - Infinite Scroll
+
+    /// Update window boundary timestamps from current frames
+    private func updateWindowBoundaries() {
+        oldestLoadedTimestamp = frames.first?.frame.timestamp
+        newestLoadedTimestamp = frames.last?.frame.timestamp
+
+        if let oldest = oldestLoadedTimestamp, let newest = newestLoadedTimestamp {
+            print("[InfiniteScroll] Window boundaries: \(oldest) to \(newest)")
+        }
+    }
+
+    /// Check if we need to load more frames based on current position
+    private func checkAndLoadMoreFrames() {
+        // Check if at the oldest frame (first frame, index 0)
+        if currentIndex == 0 && hasMoreOlder && !isLoadingOlder {
+            Task {
+                await loadOlderFrames()
+            }
+        }
+
+        // Check if at the newest frame (last frame)
+        if currentIndex == frames.count - 1 && hasMoreNewer && !isLoadingNewer {
+            Task {
+                await loadNewerFrames()
+            }
+        }
+    }
+
+    /// Load older frames (before the oldest loaded timestamp)
+    private func loadOlderFrames() async {
+        guard let oldestTimestamp = oldestLoadedTimestamp else { return }
+        guard !isLoadingOlder else { return }
+
+        isLoadingOlder = true
+        print("[InfiniteScroll] Loading older frames before \(oldestTimestamp)...")
+
+        do {
+            // Query frames before the oldest timestamp
+            let rawFrames = try await coordinator.getFramesBefore(
+                timestamp: oldestTimestamp,
+                limit: WindowConfig.loadBatchSize
+            )
+
+            guard !rawFrames.isEmpty else {
+                print("[InfiniteScroll] No more older frames available")
+                hasMoreOlder = false
+                isLoadingOlder = false
+                return
+            }
+
+            print("[InfiniteScroll] Got \(rawFrames.count) older frames")
+
+            // Preload video info for the new frames
+            var newTimelineFrames: [TimelineFrame] = []
+            for frame in rawFrames {
+                let videoInfo = try? await coordinator.getFrameVideoInfo(
+                    segmentID: frame.segmentID,
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                newTimelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            }
+
+            // rawFrames are returned DESC (newest first), reverse to get ASC (oldest first)
+            newTimelineFrames.reverse()
+
+            // Prepend to existing frames
+            frames = newTimelineFrames + frames
+
+            // Adjust currentIndex to maintain position
+            currentIndex += newTimelineFrames.count
+
+            print("[InfiniteScroll] Prepended \(newTimelineFrames.count) frames, total now \(frames.count), currentIndex adjusted to \(currentIndex)")
+
+            // Update window boundaries
+            updateWindowBoundaries()
+
+            // Trim if we've exceeded max frames
+            trimWindowIfNeeded(preserveDirection: .older)
+
+            isLoadingOlder = false
+
+        } catch {
+            print("[InfiniteScroll] Error loading older frames: \(error)")
+            isLoadingOlder = false
+        }
+    }
+
+    /// Load newer frames (after the newest loaded timestamp)
+    private func loadNewerFrames() async {
+        guard let newestTimestamp = newestLoadedTimestamp else { return }
+        guard !isLoadingNewer else { return }
+
+        isLoadingNewer = true
+        print("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...")
+
+        do {
+            // Query frames after the newest timestamp
+            let rawFrames = try await coordinator.getFramesAfter(
+                timestamp: newestTimestamp,
+                limit: WindowConfig.loadBatchSize
+            )
+
+            guard !rawFrames.isEmpty else {
+                print("[InfiniteScroll] No more newer frames available")
+                hasMoreNewer = false
+                isLoadingNewer = false
+                return
+            }
+
+            print("[InfiniteScroll] Got \(rawFrames.count) newer frames")
+
+            // Preload video info for the new frames
+            var newTimelineFrames: [TimelineFrame] = []
+            for frame in rawFrames {
+                let videoInfo = try? await coordinator.getFrameVideoInfo(
+                    segmentID: frame.segmentID,
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                newTimelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            }
+
+            // rawFrames are returned ASC (oldest first), which is correct for appending
+
+            // Append to existing frames
+            frames = frames + newTimelineFrames
+
+            print("[InfiniteScroll] Appended \(newTimelineFrames.count) frames, total now \(frames.count)")
+
+            // Update window boundaries
+            updateWindowBoundaries()
+
+            // Trim if we've exceeded max frames
+            trimWindowIfNeeded(preserveDirection: .newer)
+
+            isLoadingNewer = false
+
+        } catch {
+            print("[InfiniteScroll] Error loading newer frames: \(error)")
+            isLoadingNewer = false
+        }
+    }
+
+    /// Direction to preserve when trimming
+    private enum TrimDirection {
+        case older  // Preserve older frames, trim newer
+        case newer  // Preserve newer frames, trim older
+    }
+
+    /// Trim the window if it exceeds max frames
+    private func trimWindowIfNeeded(preserveDirection: TrimDirection) {
+        guard frames.count > WindowConfig.maxFrames else { return }
+
+        let excessCount = frames.count - WindowConfig.maxFrames
+
+        switch preserveDirection {
+        case .older:
+            // User is scrolling toward older, trim newer frames from end
+            print("[InfiniteScroll] Trimming \(excessCount) newer frames from end")
+            frames = Array(frames.dropLast(excessCount))
+            // Mark that there might be more newer frames now
+            hasMoreNewer = true
+
+        case .newer:
+            // User is scrolling toward newer, trim older frames from start
+            print("[InfiniteScroll] Trimming \(excessCount) older frames from start")
+            frames = Array(frames.dropFirst(excessCount))
+            // Adjust currentIndex
+            currentIndex = max(0, currentIndex - excessCount)
+            // Mark that there might be more older frames now
+            hasMoreOlder = true
+        }
+
+        // Update boundaries after trimming
+        updateWindowBoundaries()
+        print("[InfiniteScroll] After trim: \(frames.count) frames, currentIndex=\(currentIndex)")
     }
 }
