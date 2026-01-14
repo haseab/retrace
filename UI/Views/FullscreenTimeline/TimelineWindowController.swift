@@ -109,14 +109,16 @@ public class TimelineWindowController: NSObject {
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            window.orderOut(nil)
-            self?.window = nil
-            self?.timelineViewModel = nil
-            self?.isVisible = false
-            self?.onClose?()
+            Task { @MainActor in
+                window.orderOut(nil)
+                self?.window = nil
+                self?.timelineViewModel = nil
+                self?.isVisible = false
+                self?.onClose?()
 
-            // Post notification so menu bar can restore recording indicator
-            NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+                // Post notification so menu bar can restore recording indicator
+                NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+            }
         })
     }
 
@@ -132,7 +134,8 @@ public class TimelineWindowController: NSObject {
     // MARK: - Window Creation
 
     private func createWindow(for screen: NSScreen) -> NSWindow {
-        let window = NSWindow(
+        // Use custom window subclass that can become key even when borderless
+        let window = KeyableWindow(
             contentRect: screen.frame,
             styleMask: [.borderless],
             backing: .buffered,
@@ -175,6 +178,15 @@ public class TimelineWindowController: NSObject {
         // Also monitor local events (when our window is key)
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
             if event.type == .keyDown {
+                // Check if a text field is currently active - if so, don't intercept keyboard events
+                if let window = self?.window,
+                   let firstResponder = window.firstResponder {
+                    // If the first responder is a text view (field editor) or text field, let the event through
+                    if firstResponder is NSTextView || firstResponder is NSTextField {
+                        return event // Let the text field handle it
+                    }
+                }
+
                 if self?.handleKeyEvent(event) == true {
                     return nil // Consume the event
                 }
@@ -212,6 +224,14 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
+        // Cmd+G to open date search panel ("Go to" date)
+        if event.keyCode == 5 && modifiers == [.command] { // G key with Command
+            if let viewModel = timelineViewModel {
+                viewModel.isDateSearchActive = true
+            }
+            return true
+        }
+
         return false
     }
 
@@ -224,7 +244,7 @@ public class TimelineWindowController: NSObject {
         // Use horizontal scrolling primarily, fall back to vertical
         let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
 
-        print("[TimelineWindowController] [\(source)] scroll: deltaX=\(deltaX), deltaY=\(deltaY), computed=\(delta)")
+        // print("[TimelineWindowController] [\(source)] scroll: deltaX=\(deltaX), deltaY=\(deltaY), computed=\(delta)")
 
         if abs(delta) > 0.1 {
             onScroll?(delta)
@@ -241,4 +261,13 @@ public class TimelineWindowController: NSObject {
 extension Notification.Name {
     static let timelineDidOpen = Notification.Name("timelineDidOpen")
     static let timelineDidClose = Notification.Name("timelineDidClose")
+}
+
+// MARK: - Custom Window for Text Input Support
+
+/// Custom NSWindow subclass that can become key window even when borderless
+/// This is required for text fields to receive keyboard input properly
+class KeyableWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }

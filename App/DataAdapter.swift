@@ -138,6 +138,42 @@ public actor DataAdapter {
         return result
     }
 
+    /// Get the most recent frames across all sources
+    /// Returns frames sorted by timestamp descending (newest first)
+    public func getMostRecentFrames(limit: Int = 250) async throws -> [FrameReference] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getMostRecentFrames called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        Log.info("[DataAdapter] getMostRecentFrames: fetching \(limit) most recent frames", category: .app)
+
+        var allFrames: [FrameReference] = []
+
+        // Get most recent frames from primary source
+        Log.info("[DataAdapter] Querying primary source...", category: .app)
+        let primaryFrames = try await primarySource.getMostRecentFrames(limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
+
+        // Get most recent frames from secondary sources
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+
+            Log.info("[DataAdapter] Querying \(sourceType.displayName)...", category: .app)
+            let sourceFrames = try await source.getMostRecentFrames(limit: limit)
+            allFrames.append(contentsOf: sourceFrames)
+            Log.info("[DataAdapter] ✓ Got \(sourceFrames.count) frames from \(sourceType.displayName)", category: .app)
+        }
+
+        // Sort all frames by timestamp descending (newest first) and take top N
+        allFrames.sort { $0.timestamp > $1.timestamp }
+        let result = Array(allFrames.prefix(limit))
+
+        Log.info("[DataAdapter] Returning \(result.count) most recent frames", category: .app)
+        return result
+    }
+
     /// Get the timestamp of the most recent frame across all sources
     /// Used to find where data actually exists when recent queries return empty
     public func getMostRecentFrameTimestamp() async throws -> Date? {
@@ -148,73 +184,17 @@ public actor DataAdapter {
 
         Log.info("[DataAdapter] getMostRecentFrameTimestamp: searching for latest frame", category: .app)
 
-        var latestTimestamp: Date? = nil
-        let now = Date()
+        // Just get 1 frame from each source and compare
+        let frames = try await getMostRecentFrames(limit: 1)
 
-        // Check primary source first (most likely to have recent data)
-        Log.info("[DataAdapter] Querying primary source for most recent frame...", category: .app)
-        latestTimestamp = try await findMostRecentInSource(primarySource, endDate: now, sourceName: "Primary")
-
-        // Check secondary sources
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            Log.info("[DataAdapter] Querying \(sourceType.displayName) for most recent frame...", category: .app)
-            let queryEnd = await source.cutoffDate ?? now
-
-            if let sourceLatest = try await findMostRecentInSource(source, endDate: queryEnd, sourceName: sourceType.displayName) {
-                if latestTimestamp == nil || sourceLatest > latestTimestamp! {
-                    latestTimestamp = sourceLatest
-                }
-            }
-        }
-
-        if let latest = latestTimestamp {
+        if let mostRecent = frames.first {
             let dateFormatter = DateFormatter()
             dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-            Log.info("[DataAdapter] Most recent frame across all sources: \(dateFormatter.string(from: latest))", category: .app)
-        } else {
-            Log.info("[DataAdapter] No frames found in any source", category: .app)
+            Log.info("[DataAdapter] Most recent frame: \(dateFormatter.string(from: mostRecent.timestamp))", category: .app)
+            return mostRecent.timestamp
         }
 
-        return latestTimestamp
-    }
-
-    /// Binary search to find the most recent frame in a source efficiently
-    /// Uses progressively narrowing windows to avoid loading too many frames
-    private func findMostRecentInSource(_ source: any DataSourceProtocol, endDate: Date, sourceName: String) async throws -> Date? {
-        // Start with a 1-day window from the end, progressively expand if empty
-        let calendar = Calendar.current
-        var windowDays = 1
-        let maxWindowDays = 365 * 5 // 5 years max
-
-        while windowDays <= maxWindowDays {
-            let windowStart = calendar.date(byAdding: .day, value: -windowDays, to: endDate)!
-            let frames = try await source.getFrames(from: windowStart, to: endDate, limit: 500)
-
-            if !frames.isEmpty {
-                // Frames are sorted ASC, so the last one is the most recent
-                if let mostRecent = frames.last {
-                    Log.info("[DataAdapter] \(sourceName) latest: \(mostRecent.timestamp) (found in \(windowDays)-day window)", category: .app)
-                    return mostRecent.timestamp
-                }
-            }
-
-            // Expand window exponentially: 1, 7, 30, 90, 365, 1825
-            if windowDays == 1 {
-                windowDays = 7
-            } else if windowDays == 7 {
-                windowDays = 30
-            } else if windowDays == 30 {
-                windowDays = 90
-            } else if windowDays == 90 {
-                windowDays = 365
-            } else {
-                windowDays = maxWindowDays + 1 // Exit loop
-            }
-        }
-
-        Log.info("[DataAdapter] \(sourceName) has no frames", category: .app)
+        Log.info("[DataAdapter] No frames found in any source", category: .app)
         return nil
     }
 

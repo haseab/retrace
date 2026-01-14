@@ -66,6 +66,23 @@ public actor RetraceDataSource: DataSourceProtocol {
         }
     }
 
+    public func getMostRecentFrames(limit: Int) async throws -> [FrameReference] {
+        guard _isConnected else {
+            throw DataSourceError.notConnected
+        }
+
+        do {
+            return try await database.getMostRecentFrames(limit: limit)
+        } catch {
+            let errorString = String(describing: error)
+            if errorString.contains("no such table") {
+                Log.info("RetraceDataSource: frames table doesn't exist yet, returning empty array", category: .app)
+                return []
+            }
+            throw error
+        }
+    }
+
     public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
         guard _isConnected else {
             throw DataSourceError.notConnected

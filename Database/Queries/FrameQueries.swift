@@ -121,6 +121,40 @@ enum FrameQueries {
         return frames
     }
 
+    // MARK: - Select Most Recent
+
+    static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
+        let sql = """
+            SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
+                   app_bundle_id, app_name, window_title, browser_url, source
+            FROM frames
+            ORDER BY timestamp DESC
+            LIMIT ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int(statement, 1, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frame = try parseFrameRow(statement: statement!)
+            frames.append(frame)
+        }
+
+        return frames
+    }
+
     // MARK: - Select by App
 
     static func getByApp(

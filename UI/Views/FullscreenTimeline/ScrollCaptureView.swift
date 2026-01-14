@@ -60,11 +60,11 @@ struct ScrollCaptureView: NSViewRepresentable {
             // Use horizontal scrolling primarily, fall back to vertical if no horizontal movement
             let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
 
-            print("[ScrollCaptureView] [\(source)] RAW deltaX: \(deltaX), deltaY: \(deltaY), computed delta: \(delta)")
+            // print("[ScrollCaptureView] [\(source)] RAW deltaX: \(deltaX), deltaY: \(deltaY), computed delta: \(delta)")
 
             // Only process if there's meaningful movement
             if abs(delta) > 0.1 {
-                print("[ScrollCaptureView] [\(source)] Calling onScroll with delta: \(delta)")
+                // print("[ScrollCaptureView] [\(source)] Calling onScroll with delta: \(delta)")
                 self.onScroll(delta)
             }
         }

@@ -51,6 +51,11 @@ public protocol DataSourceProtocol: Actor {
     /// - Returns: Array of frame references sorted by timestamp descending
     func getFrames(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameReference]
 
+    /// Get the most recent frames from this source
+    /// - Parameter limit: Maximum number of frames to return
+    /// - Returns: Array of frame references sorted by timestamp descending (newest first)
+    func getMostRecentFrames(limit: Int) async throws -> [FrameReference]
+
     /// Get image data for a specific frame
     /// - Parameters:
     ///   - segmentID: The segment containing the frame

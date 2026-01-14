@@ -369,14 +369,23 @@ public actor AppCoordinator {
         return try await adapter.getFrames(from: startDate, to: endDate, limit: limit)
     }
 
+    /// Get the most recent frames across all sources
+    /// Returns frames sorted by timestamp descending (newest first)
+    public func getMostRecentFrames(limit: Int = 500) async throws -> [FrameReference] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database
+            return try await services.database.getMostRecentFrames(limit: limit)
+        }
+
+        return try await adapter.getMostRecentFrames(limit: limit)
+    }
+
     /// Get the timestamp of the most recent frame across all sources
     /// Returns nil if no frames exist in any source
     public func getMostRecentFrameTimestamp() async throws -> Date? {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database - get most recent frame
-            let now = Date()
-            let farPast = Calendar.current.date(byAdding: .year, value: -5, to: now)!
-            let frames = try await services.database.getFrames(from: farPast, to: now, limit: 1)
+            let frames = try await services.database.getMostRecentFrames(limit: 1)
             return frames.first?.timestamp
         }
 

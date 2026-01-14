@@ -330,6 +330,22 @@ public struct DashboardView: View {
             }
             .buttonStyle(.plain)
 
+            Text("·")
+                .font(.retraceCaption)
+                .foregroundColor(.retraceSecondary)
+                .padding(.horizontal, .spacingS)
+
+            Link(destination: URL(string: "https://buymeacoffee.com/haseab")!) {
+                HStack(spacing: 4) {
+                    Image(systemName: "cup.and.saucer.fill")
+                        .font(.system(size: 12))
+                    Text("Buy me a coffee")
+                        .font(.retraceCaption)
+                }
+                .foregroundColor(.retraceAccent)
+            }
+            .buttonStyle(.plain)
+
             Spacer()
         }
         .padding(.spacingL)

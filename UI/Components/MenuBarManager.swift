@@ -142,32 +142,53 @@ public class MenuBarManager: ObservableObject {
         button.image?.isTemplate = true
     }
 
-    /// Create a custom status icon with two circles
-    /// Left circle: Screen recording status
-    /// Right circle: Could be used for audio/other features
+    /// Create a custom status icon with two triangles (Retrace logo)
+    /// Left triangle: Points left, filled when recording, outlined otherwise
+    /// Right triangle: Points right, always outlined
     private func createStatusIcon(recording: Bool) -> NSImage {
-        let size = NSSize(width: 24, height: 18)
+        let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size)
 
         image.lockFocus()
 
-        // Left circle - Screen recording indicator
-        let leftCircle = NSBezierPath(ovalIn: NSRect(x: 2, y: 4, width: 10, height: 10))
+        // Triangle dimensions (matching logo proportions)
+        let triangleHeight: CGFloat = 12
+        let triangleWidth: CGFloat = 8
+        let verticalCenter: CGFloat = size.height / 2
+        let gap: CGFloat = 3.0 // Gap between triangles
+
+        // Left triangle - Points left ◁ (recording indicator)
+        let leftTriangle = NSBezierPath()
+        let leftTip: CGFloat = 2
+        let leftBase: CGFloat = leftTip + triangleWidth
+        leftTriangle.move(to: NSPoint(x: leftTip, y: verticalCenter)) // Left tip
+        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter - triangleHeight / 2)) // Top right
+        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter + triangleHeight / 2)) // Bottom right
+        leftTriangle.close()
+
         if recording {
+            // Filled when recording
             NSColor.white.setFill()
-            leftCircle.fill()
+            leftTriangle.fill()
         } else {
+            // Outlined when not recording
             NSColor.white.setStroke()
-            leftCircle.lineWidth = 1.5
-            leftCircle.stroke()
+            leftTriangle.lineWidth = 1.2
+            leftTriangle.stroke()
         }
 
-        // Right circle - Placeholder for future features (audio, etc.)
-        // For now, just show outline
-        let rightCircle = NSBezierPath(ovalIn: NSRect(x: 14, y: 4, width: 8, height: 8))
-        NSColor.white.withAlphaComponent(0.5).setStroke()
-        rightCircle.lineWidth = 1.0
-        rightCircle.stroke()
+        // Right triangle - Points right ▷ (always outlined)
+        let rightTriangle = NSBezierPath()
+        let rightBase: CGFloat = leftBase + gap
+        let rightTip: CGFloat = rightBase + triangleWidth
+        rightTriangle.move(to: NSPoint(x: rightTip, y: verticalCenter)) // Right tip
+        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter - triangleHeight / 2)) // Top left
+        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter + triangleHeight / 2)) // Bottom left
+        rightTriangle.close()
+
+        NSColor.white.setStroke()
+        rightTriangle.lineWidth = 1.2
+        rightTriangle.stroke()
 
         image.unlockFocus()
         return image

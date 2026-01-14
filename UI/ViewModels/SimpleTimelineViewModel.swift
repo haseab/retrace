@@ -4,6 +4,11 @@ import AVFoundation
 import Shared
 import App
 
+/// Shared timeline configuration
+public enum TimelineConfig {
+    public static let pixelsPerFrame: CGFloat = 45.0
+}
+
 /// A frame paired with its preloaded video info for instant access
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
@@ -26,7 +31,7 @@ public struct AppBlock: Identifiable {
     public let frameCount: Int
 
     public var width: CGFloat {
-        CGFloat(frameCount) * 14.0 // 8px per frame
+        CGFloat(frameCount) * TimelineConfig.pixelsPerFrame
     }
 }
 
@@ -66,6 +71,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Error message if something goes wrong
     @Published public var error: String?
+
+    /// Whether the date search input is shown
+    @Published public var isDateSearchActive = false
+
+    /// Date search text input
+    @Published public var dateSearchText = ""
 
     // MARK: - Derived Properties (computed from currentIndex)
 
@@ -135,21 +146,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         error = nil
 
         do {
-            // Get the most recent frame timestamp from any source
-            guard let mostRecentTimestamp = try await coordinator.getMostRecentFrameTimestamp() else {
-                error = "No frames found in any database"
-                isLoading = false
-                return
-            }
-
-            // Load frames around the most recent timestamp
-            let endDate = mostRecentTimestamp
-            let startDate = Calendar.current.date(byAdding: .hour, value: -1, to: endDate)!
-
-            let rawFrames = try await coordinator.getFrames(from: startDate, to: endDate, limit: 500)
+            // Get the most recent frames directly (no need for timestamp + window query)
+            let rawFrames = try await coordinator.getMostRecentFrames(limit: 500)
 
             guard !rawFrames.isEmpty else {
-                error = "No frames found in time range"
+                error = "No frames found in any database"
                 isLoading = false
                 return
             }
@@ -165,9 +166,26 @@ public class SimpleTimelineViewModel: ObservableObject {
                 timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
             }
 
-            frames = timelineFrames
+            // Reverse so oldest is first (index 0), newest is last
+            // This matches the timeline UI which displays left-to-right as past-to-future
+            frames = timelineFrames.reversed()
 
-            // Start at the most recent frame (last in array since sorted ascending)
+            // Log the first and last few frames to verify ordering
+            print("[SimpleTimelineViewModel] Loaded \(frames.count) frames")
+            if frames.count > 0 {
+                print("[SimpleTimelineViewModel] First 3 frames (should be oldest):")
+                for i in 0..<min(3, frames.count) {
+                    let f = frames[i].frame
+                    print("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")")
+                }
+                print("[SimpleTimelineViewModel] Last 3 frames (should be newest):")
+                for i in max(0, frames.count - 3)..<frames.count {
+                    let f = frames[i].frame
+                    print("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")")
+                }
+            }
+
+            // Start at the most recent frame (last in array since sorted ascending, oldest first)
             currentIndex = frames.count - 1
 
             // Load image if needed for current frame
@@ -236,7 +254,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Handle scroll delta to navigate frames
     public func handleScroll(delta: CGFloat) async {
         guard !frames.isEmpty else {
-            print("[SimpleTimelineViewModel] handleScroll: frames is empty, ignoring")
+            // print("[SimpleTimelineViewModel] handleScroll: frames is empty, ignoring")
             return
         }
 
@@ -248,14 +266,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         let sensitivity: CGFloat = 0.05
         let frameStep = Int(scrollAccumulator * sensitivity)
 
-        print("[SimpleTimelineViewModel] handleScroll: delta=\(delta), accumulator=\(scrollAccumulator), frameStep=\(frameStep)")
+        // print("[SimpleTimelineViewModel] handleScroll: delta=\(delta), accumulator=\(scrollAccumulator), frameStep=\(frameStep)")
 
         guard frameStep != 0 else { return }
 
         // Reset accumulator after navigating
         scrollAccumulator = 0
 
-        print("[SimpleTimelineViewModel] Navigating from \(currentIndex) to \(currentIndex + frameStep)")
+        // print("[SimpleTimelineViewModel] Navigating from \(currentIndex) to \(currentIndex + frameStep)")
 
         // Navigate
         navigateToFrame(currentIndex + frameStep)
@@ -284,7 +302,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let timestamp = currentTimestamp else { return "" }
 
         let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy"
+        formatter.dateFormat = "MMM d"
         formatter.timeZone = .current
         return formatter.string(from: timestamp)
     }
@@ -292,6 +310,213 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Total number of frames (for tape view)
     public var frameCount: Int {
         frames.count
+    }
+
+    // MARK: - Date Search
+
+    /// Search for frames around a natural language date string
+    public func searchForDate(_ searchText: String) async {
+        guard !searchText.isEmpty else { return }
+
+        isLoading = true
+        error = nil
+
+        do {
+            // Parse natural language date
+            guard let targetDate = parseNaturalLanguageDate(searchText) else {
+                error = "Could not understand date: \(searchText)"
+                isLoading = false
+                return
+            }
+
+            // Load frames around the target date (±10 minutes window)
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
+
+            // Debug logging
+            let df = DateFormatter()
+            df.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+            df.timeZone = .current
+            print("[DateSearch] Input: '\(searchText)'")
+            print("[DateSearch] Parsed targetDate (local): \(df.string(from: targetDate))")
+            df.timeZone = TimeZone(identifier: "UTC")
+            print("[DateSearch] Parsed targetDate (UTC): \(df.string(from: targetDate))")
+            df.timeZone = .current
+            print("[DateSearch] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))")
+
+            // Fetch all frames in the 20-minute window
+            let rawFrames = try await coordinator.getFrames(from: startDate, to: endDate, limit: 1000)
+            print("[DateSearch] Got \(rawFrames.count) frames")
+
+            guard !rawFrames.isEmpty else {
+                error = "No frames found around \(targetDate)"
+                isLoading = false
+                return
+            }
+
+            // Preload video info for all frames
+            var timelineFrames: [TimelineFrame] = []
+            for frame in rawFrames {
+                let videoInfo = try? await coordinator.getFrameVideoInfo(
+                    segmentID: frame.segmentID,
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            }
+
+            frames = timelineFrames
+
+            // Find the frame closest to the target date in our centered set
+            let closestIndex = findClosestFrameIndex(to: targetDate)
+            currentIndex = closestIndex
+
+            // Load image if needed
+            loadImageIfNeeded()
+
+            isLoading = false
+            isDateSearchActive = false
+            dateSearchText = ""
+
+        } catch {
+            self.error = "Failed to search for date: \(error.localizedDescription)"
+            isLoading = false
+        }
+    }
+
+    /// Parse natural language date strings
+    private func parseNaturalLanguageDate(_ text: String) -> Date? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let calendar = Calendar.current
+        let now = Date()
+
+        // === RELATIVE DATES ===
+
+        if trimmed == "now" || trimmed == "today" {
+            return now
+        }
+        if trimmed == "yesterday" {
+            return calendar.date(byAdding: .day, value: -1, to: now)
+        }
+        if trimmed == "last week" {
+            return calendar.date(byAdding: .day, value: -7, to: now)
+        }
+        if trimmed == "last month" {
+            return calendar.date(byAdding: .month, value: -1, to: now)
+        }
+
+        // "X hours ago", "X hour ago", "an hour ago"
+        if trimmed.contains("hour") {
+            if let hours = extractNumber(from: trimmed) {
+                return calendar.date(byAdding: .hour, value: -hours, to: now)
+            }
+            return calendar.date(byAdding: .hour, value: -1, to: now)
+        }
+
+        // "X minutes ago", "X min ago", "30 min ago"
+        if trimmed.contains("minute") || trimmed.contains("min") {
+            if let minutes = extractNumber(from: trimmed) {
+                return calendar.date(byAdding: .minute, value: -minutes, to: now)
+            }
+            return calendar.date(byAdding: .minute, value: -1, to: now)
+        }
+
+        // "X days ago"
+        if trimmed.contains("day") && trimmed.contains("ago") {
+            if let days = extractNumber(from: trimmed) {
+                return calendar.date(byAdding: .day, value: -days, to: now)
+            }
+        }
+
+        // "X weeks ago"
+        if trimmed.contains("week") {
+            if let weeks = extractNumber(from: trimmed) {
+                return calendar.date(byAdding: .day, value: -weeks * 7, to: now)
+            }
+            return calendar.date(byAdding: .day, value: -7, to: now)
+        }
+
+        // === ABSOLUTE DATES ===
+
+        // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
+        if let detector = detector {
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = detector.firstMatch(in: text, options: [], range: range),
+               let date = match.date {
+                return date
+            }
+        }
+
+        // Try various explicit date formatters as fallback
+        let formatStrings = [
+            "MMM d yyyy h:mm a",      // "Dec 16 2024 6:05 PM"
+            "MMM d yyyy h:mma",       // "Dec 16 2024 6:05PM"
+            "MMM d yyyy ha",          // "Dec 16 2024 6PM"
+            "MMM d h:mm a",           // "Dec 16 6:05 PM"
+            "MMM d h:mma",            // "Dec 16 6:05PM"
+            "MMM d ha",               // "Dec 16 6PM"
+            "MMM d h a",              // "Dec 16 6 PM"
+            "MM/dd/yyyy h:mm a",      // "12/16/2024 6:05 PM"
+            "MM/dd h:mm a",           // "12/16 6:05 PM"
+            "yyyy-MM-dd HH:mm",       // "2024-12-16 18:05"
+            "yyyy-MM-dd'T'HH:mm:ss",  // ISO 8601
+            "MMM d",                  // "Dec 16" (assumes current year, noon)
+            "MMMM d",                 // "December 16"
+        ]
+
+        for formatString in formatStrings {
+            let df = DateFormatter()
+            df.dateFormat = formatString
+            df.timeZone = .current
+            df.defaultDate = now  // Use current date for missing components
+
+            // Try original text first
+            if let date = df.date(from: text) {
+                return date
+            }
+            // Try lowercased
+            if let date = df.date(from: trimmed) {
+                return date
+            }
+            // Try with first letter capitalized (for month names)
+            let capitalized = trimmed.prefix(1).uppercased() + trimmed.dropFirst()
+            if let date = df.date(from: capitalized) {
+                return date
+            }
+        }
+
+        return nil
+    }
+
+    /// Extract first number from a string
+    private func extractNumber(from text: String) -> Int? {
+        let pattern = "\\d+"
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+           let range = Range(match.range, in: text) {
+            return Int(text[range])
+        }
+        return nil
+    }
+
+    /// Find the frame index closest to a target date
+    private func findClosestFrameIndex(to targetDate: Date) -> Int {
+        guard !frames.isEmpty else { return 0 }
+
+        var closestIndex = 0
+        var smallestDiff = abs(frames[0].frame.timestamp.timeIntervalSince(targetDate))
+
+        for (index, timelineFrame) in frames.enumerated() {
+            let diff = abs(timelineFrame.frame.timestamp.timeIntervalSince(targetDate))
+            if diff < smallestDiff {
+                smallestDiff = diff
+                closestIndex = index
+            }
+        }
+
+        return closestIndex
     }
 
     // MARK: - Private Helpers

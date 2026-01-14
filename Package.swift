@@ -29,6 +29,8 @@ let package = Package(
         .library(name: "Migration", targets: ["Migration"]),
         .library(name: "App", targets: ["App"]),
         .executable(name: "Retrace", targets: ["Retrace"]),
+        .executable(name: "TestMostRecentFrame", targets: ["TestMostRecentFrame"]),
+        .executable(name: "QueryRewindApps", targets: ["QueryRewindApps"]),
     ],
     dependencies: [
         // NOTE: Dependencies are bundled locally in Vendors/ or will be downloaded at runtime
@@ -185,7 +187,8 @@ let package = Package(
                 "Capture",
                 "Processing",
                 "Search",
-                "Migration"
+                "Migration",
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
             ],
             path: "App",
             exclude: [
@@ -224,6 +227,25 @@ let package = Package(
                 "AGENTS.md"
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+        ),
+
+        // MARK: - Test executable for getMostRecentFrameTimestamp
+        .executableTarget(
+            name: "TestMostRecentFrame",
+            dependencies: [
+                "Shared",
+                "App"
+            ],
+            path: "Sources/TestMostRecentFrame"
+        ),
+
+        // MARK: - Query Rewind apps utility
+        .executableTarget(
+            name: "QueryRewindApps",
+            dependencies: [
+                .product(name: "SQLCipher", package: "swift-sqlcipher")
+            ],
+            path: "Sources/QueryRewindApps"
         ),
         .testTarget(
             name: "RetraceTests",

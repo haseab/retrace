@@ -44,7 +44,7 @@ public actor RewindDataSource: DataSourceProtocol {
 
     public init(
         password: String,
-        cutoffDate: Date = Date(timeIntervalSince1970: 1766131200) // Dec 19, 2025 00:00:00 UTC
+        cutoffDate: Date = Date(timeIntervalSince1970: 1766217600) // Dec 20, 2025 00:00:00 UTC
     ) throws {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
         self.rewindDBPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
@@ -215,6 +215,47 @@ public actor RewindDataSource: DataSourceProtocol {
         }
 
         Log.debug("Fetched \(frames.count) frames from Rewind database", category: .app)
+        return frames
+    }
+
+    public func getMostRecentFrames(limit: Int) async throws -> [FrameReference] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        // Optimized query: subquery first to get limited frame IDs, then join for segment data
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                ORDER BY createdAt DESC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            ORDER BY f.createdAt DESC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int(statement, 1, Int32(limit))
+
+        var frames: [FrameReference] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frame = try? parseRewindFrame(statement: statement!) {
+                frames.append(frame)
+            }
+        }
+
+        Log.debug("[RewindDataSource] getMostRecentFrames: fetched \(frames.count) frames", category: .app)
         return frames
     }
 
