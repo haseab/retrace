@@ -214,8 +214,23 @@ public class TimelineWindowController: NSObject {
 
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
-        // Escape key closes the timeline
+        // Don't handle escape if a modal panel (save panel, etc.) is open
+        if NSApp.modalWindow != nil {
+            return false
+        }
+
+        // Don't handle escape if our window is not the key window (e.g., save panel is open)
+        if let keyWindow = NSApp.keyWindow, keyWindow != window {
+            return false
+        }
+
+        // Escape key closes the timeline (unless delete dialog is showing)
         if event.keyCode == 53 { // Escape
+            // If delete confirmation is showing, cancel it instead of closing timeline
+            if let viewModel = timelineViewModel, viewModel.showDeleteConfirmation {
+                viewModel.cancelDelete()
+                return true
+            }
             hide()
             return true
         }
@@ -227,12 +242,38 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Cmd+G to open date search panel ("Go to" date)
+        // Cmd+G to toggle date search panel ("Go to" date)
         if event.keyCode == 5 && modifiers == [.command] { // G key with Command
             if let viewModel = timelineViewModel {
-                viewModel.isDateSearchActive = true
+                viewModel.isDateSearchActive.toggle()
+                // Clear text when closing
+                if !viewModel.isDateSearchActive {
+                    viewModel.dateSearchText = ""
+                }
             }
             return true
+        }
+
+        // Delete or Backspace key to delete selected frame
+        if (event.keyCode == 51 || event.keyCode == 117) && modifiers.isEmpty { // Backspace (51) or Delete (117)
+            if let viewModel = timelineViewModel, viewModel.selectedFrameIndex != nil {
+                viewModel.requestDeleteSelectedFrame()
+                return true
+            }
+        }
+
+        // Handle delete confirmation dialog keyboard shortcuts
+        if let viewModel = timelineViewModel, viewModel.showDeleteConfirmation {
+            // Enter/Return confirms deletion
+            if event.keyCode == 36 || event.keyCode == 76 { // Return (36) or Enter (76)
+                viewModel.confirmDeleteSelectedFrame()
+                return true
+            }
+            // Escape cancels (handled above, but also catch it here for the dialog)
+            if event.keyCode == 53 { // Escape
+                viewModel.cancelDelete()
+                return true
+            }
         }
 
         return false

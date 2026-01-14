@@ -20,17 +20,15 @@ public struct SettingsView: View {
     @AppStorage("excludeCursor") private var excludeCursor = false
 
     // Storage settings
-    // Hidden for now - defaults to forever/unlimited
-    // @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
-    // @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
+    @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
+    @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
     @AppStorage("compressionQuality") private var compressionQuality: CompressionQuality = .high
 
     // Privacy settings
-    // Hidden for now - not implemented yet, default to allow everything
-    // @AppStorage("excludedApps") private var excludedAppsString = ""
-    // @AppStorage("excludePrivateWindows") private var excludePrivateWindows = true
-    // @AppStorage("excludeSafariPrivate") private var excludeSafariPrivate = true
-    // @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
+    @AppStorage("excludedApps") private var excludedAppsString = ""
+    @AppStorage("excludePrivateWindows") private var excludePrivateWindows = true
+    @AppStorage("excludeSafariPrivate") private var excludeSafariPrivate = true
+    @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
     @AppStorage("encryptionEnabled") private var encryptionEnabled = true
 
     // MARK: - Body
@@ -214,32 +212,30 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: .spacingL) {
             settingsHeader(title: "Storage Settings")
 
-            // Hidden for now - retention set to forever by default
-            // settingsGroup(title: "Retention Policy") {
-            //     VStack(alignment: .leading, spacing: .spacingS) {
-            //         Picker("Keep recordings for", selection: $retentionDays) {
-            //             Text("Forever").tag(0)
-            //             Text("Last 30 days").tag(30)
-            //             Text("Last 90 days").tag(90)
-            //             Text("Last 180 days").tag(180)
-            //             Text("Last year").tag(365)
-            //         }
-            //     }
-            // }
+            settingsGroup(title: "Retention Policy") {
+                VStack(alignment: .leading, spacing: .spacingS) {
+                    Picker("Keep recordings for", selection: $retentionDays) {
+                        Text("Forever").tag(0)
+                        Text("Last 30 days").tag(30)
+                        Text("Last 90 days").tag(90)
+                        Text("Last 180 days").tag(180)
+                        Text("Last year").tag(365)
+                    }
+                }
+            }
 
-            // Hidden for now - storage unlimited by default
-            // settingsGroup(title: "Storage Limit") {
-            //     VStack(alignment: .leading, spacing: .spacingS) {
-            //         HStack {
-            //             Text("Maximum storage:")
-            //             Spacer()
-            //             Text(String(format: "%.0f GB", maxStorageGB))
-            //                 .foregroundColor(.retraceSecondary)
-            //         }
-            //
-            //         Slider(value: $maxStorageGB, in: 10...500, step: 10)
-            //     }
-            // }
+            settingsGroup(title: "Storage Limit") {
+                VStack(alignment: .leading, spacing: .spacingS) {
+                    HStack {
+                        Text("Maximum storage:")
+                        Spacer()
+                        Text(String(format: "%.0f GB", maxStorageGB))
+                            .foregroundColor(.retraceSecondary)
+                    }
+
+                    Slider(value: $maxStorageGB, in: 10...500, step: 10)
+                }
+            }
 
             settingsGroup(title: "Compression") {
                 Picker("Quality", selection: $compressionQuality) {
@@ -283,46 +279,44 @@ public struct SettingsView: View {
                 }
             }
 
-            // Hidden for now - not implemented yet, default to capture everything
-            // settingsGroup(title: "Excluded Apps") {
-            //     Text("Apps that will not be recorded")
-            //         .font(.retraceCaption)
-            //         .foregroundColor(.retraceSecondary)
-            //
-            //     // TODO: Implement app picker
-            //     Text("1Password, Bitwarden, Keychain Access")
-            //         .font(.retraceBody)
-            //         .foregroundColor(.retracePrimary)
-            //         .padding(.spacingS)
-            //         .frame(maxWidth: .infinity, alignment: .leading)
-            //         .background(Color.retraceCard)
-            //         .cornerRadius(.cornerRadiusS)
-            //
-            //     Button("Add App...") {
-            //         // TODO: Show app picker
-            //     }
-            //     .buttonStyle(RetraceSecondaryButtonStyle())
-            // }
+            settingsGroup(title: "Excluded Apps") {
+                Text("Apps that will not be recorded")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
 
-            // Hidden for now - not implemented yet, default to capture everything
-            // settingsGroup(title: "Excluded Windows") {
-            //     Toggle("Exclude Private/Incognito Windows", isOn: $excludePrivateWindows)
-            //         .help("Automatically exclude private browsing windows from all browsers")
-            //
-            //     if excludePrivateWindows {
-            //         VStack(alignment: .leading, spacing: .spacingS) {
-            //             Toggle("Safari Private Browsing", isOn: $excludeSafariPrivate)
-            //                 .disabled(true) // Always on when excludePrivateWindows is enabled
-            //             Toggle("Chrome/Edge Incognito", isOn: $excludeChromeIncognito)
-            //                 .disabled(true) // Always on when excludePrivateWindows is enabled
-            //
-            //             Text("Detects: Safari (Private), Chrome (Incognito), Edge (InPrivate), Firefox (Private Browsing), Brave (Private Window)")
-            //                 .font(.retraceCaption)
-            //                 .foregroundColor(.retraceSecondary)
-            //                 .padding(.leading, 24)
-            //         }
-            //     }
-            // }
+                // TODO: Implement app picker
+                Text("1Password, Bitwarden, Keychain Access")
+                    .font(.retraceBody)
+                    .foregroundColor(.retracePrimary)
+                    .padding(.spacingS)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.retraceCard)
+                    .cornerRadius(.cornerRadiusS)
+
+                Button("Add App...") {
+                    // TODO: Show app picker
+                }
+                .buttonStyle(RetraceSecondaryButtonStyle())
+            }
+
+            settingsGroup(title: "Excluded Windows") {
+                Toggle("Exclude Private/Incognito Windows", isOn: $excludePrivateWindows)
+                    .help("Automatically exclude private browsing windows from all browsers")
+
+                if excludePrivateWindows {
+                    VStack(alignment: .leading, spacing: .spacingS) {
+                        Toggle("Safari Private Browsing", isOn: $excludeSafariPrivate)
+                            .disabled(true) // Always on when excludePrivateWindows is enabled
+                        Toggle("Chrome/Edge Incognito", isOn: $excludeChromeIncognito)
+                            .disabled(true) // Always on when excludePrivateWindows is enabled
+
+                        Text("Detects: Safari (Private), Chrome (Incognito), Edge (InPrivate), Firefox (Private Browsing), Brave (Private Window)")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                            .padding(.leading, 24)
+                    }
+                }
+            }
 
             settingsGroup(title: "Quick Delete") {
                 HStack(spacing: .spacingM) {

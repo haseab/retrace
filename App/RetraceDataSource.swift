@@ -66,6 +66,12 @@ public actor RetraceDataSource: DataSourceProtocol {
         }
     }
 
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        // Retrace uses images, not video - wrap frames with nil video info
+        let frames = try await getFrames(from: startDate, to: endDate, limit: limit)
+        return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+    }
+
     public func getMostRecentFrames(limit: Int) async throws -> [FrameReference] {
         guard _isConnected else {
             throw DataSourceError.notConnected
@@ -81,6 +87,12 @@ public actor RetraceDataSource: DataSourceProtocol {
             }
             throw error
         }
+    }
+
+    public func getMostRecentFramesWithVideoInfo(limit: Int) async throws -> [FrameWithVideoInfo] {
+        // Retrace uses images, not video - wrap frames with nil video info
+        let frames = try await getMostRecentFrames(limit: limit)
+        return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
     }
 
     public func getFramesBefore(timestamp: Date, limit: Int) async throws -> [FrameReference] {
@@ -100,6 +112,12 @@ public actor RetraceDataSource: DataSourceProtocol {
         }
     }
 
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        // Retrace uses images, not video - wrap frames with nil video info
+        let frames = try await getFramesBefore(timestamp: timestamp, limit: limit)
+        return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+    }
+
     public func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference] {
         guard _isConnected else {
             throw DataSourceError.notConnected
@@ -117,6 +135,12 @@ public actor RetraceDataSource: DataSourceProtocol {
         }
     }
 
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        // Retrace uses images, not video - wrap frames with nil video info
+        let frames = try await getFramesAfter(timestamp: timestamp, limit: limit)
+        return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+    }
+
     public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
         guard _isConnected else {
             throw DataSourceError.notConnected
@@ -128,5 +152,44 @@ public actor RetraceDataSource: DataSourceProtocol {
     public func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date) async throws -> FrameVideoInfo? {
         // Retrace stores individual JPEG files, not video
         return nil
+    }
+
+    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+        guard _isConnected else {
+            throw DataSourceError.notConnected
+        }
+
+        do {
+            return try await database.getSessions(from: startDate, to: endDate)
+        } catch {
+            let errorString = String(describing: error)
+            if errorString.contains("no such table") {
+                Log.info("RetraceDataSource: app_sessions table doesn't exist yet, returning empty array", category: .app)
+                return []
+            }
+            throw error
+        }
+    }
+
+    // MARK: - Deletion
+
+    public func deleteFrame(frameID: FrameID) async throws {
+        guard _isConnected else {
+            throw DataSourceError.notConnected
+        }
+
+        try await database.deleteFrame(id: frameID)
+        Log.info("[RetraceDataSource] Deleted frame \(frameID.stringValue)", category: .app)
+    }
+
+    public func deleteFrames(frameIDs: [FrameID]) async throws {
+        guard _isConnected else {
+            throw DataSourceError.notConnected
+        }
+
+        for frameID in frameIDs {
+            try await database.deleteFrame(id: frameID)
+        }
+        Log.info("[RetraceDataSource] Deleted \(frameIDs.count) frames", category: .app)
     }
 }

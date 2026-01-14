@@ -254,6 +254,13 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.deleteOlderThan(db: db, date: date)
     }
 
+    public func deleteFrame(id: FrameID) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try FrameQueries.delete(db: db, id: id)
+    }
+
     public func getFrameCount() async throws -> Int {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")

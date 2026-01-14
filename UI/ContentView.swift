@@ -111,21 +111,22 @@ public struct ContentView: View {
             object: nil,
             queue: .main
         ) { _ in
-            // Toggle dashboard visibility
-            let mainWindow = NSApp.windows.first { window in
-                window.level.rawValue == 0 && window.isVisible
-            }
+            // Switch to dashboard view and show window
+            selectedView = .dashboard
+            bringWindowToFront()
+        }
 
-            if let window = mainWindow, window.isKeyWindow {
-                // Window is already visible and focused - hide it
-                window.orderOut(nil)
+        NotificationCenter.default.addObserver(
+            forName: .toggleDashboard,
+            object: nil,
+            queue: .main
+        ) { _ in
+            // Toggle dashboard visibility - hide if visible and frontmost, show otherwise
+            if isDashboardWindowFrontmost() {
+                hideMainWindow()
             } else {
-                // Window is hidden or not focused - show and activate
-                NSApp.activate(ignoringOtherApps: true)
-                for window in NSApp.windows where window.level.rawValue == 0 {
-                    window.makeKeyAndOrderFront(nil)
-                    window.orderFrontRegardless()
-                }
+                selectedView = .dashboard
+                bringWindowToFront()
             }
         }
 
@@ -160,6 +161,32 @@ public struct ContentView: View {
             window.makeKeyAndOrderFront(nil)
             window.orderFrontRegardless()
         }
+    }
+
+    /// Check if the dashboard window is currently frontmost and visible
+    private func isDashboardWindowFrontmost() -> Bool {
+        // Check if our app is active
+        guard NSApp.isActive else { return false }
+
+        // Check if the main window (level 0) is key and visible
+        for window in NSApp.windows {
+            guard window.level.rawValue == 0 else { continue }
+            if window.isKeyWindow && window.isVisible {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Hide the main window
+    private func hideMainWindow() {
+        for window in NSApp.windows {
+            // Skip menu bar windows
+            guard window.level.rawValue == 0 else { continue }
+            window.orderOut(nil)
+        }
+        // Optionally hide the app from dock focus
+        NSApp.hide(nil)
     }
 
     // MARK: - Deeplink Handling

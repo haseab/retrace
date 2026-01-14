@@ -1,6 +1,8 @@
 import SwiftUI
 import Shared
 import App
+import UniformTypeIdentifiers
+import AVFoundation
 
 /// Timeline tape view that scrolls horizontally with a fixed center playhead
 /// Groups consecutive frames by app and displays app icons
@@ -12,7 +14,7 @@ public struct TimelineTapeView: View {
     let width: CGFloat
 
     // Tape dimensions
-    private let tapeHeight: CGFloat = 40
+    private let tapeHeight: CGFloat = 30
     private let blockSpacing: CGFloat = 2
     private var pixelsPerFrame: CGFloat { viewModel.pixelsPerFrame }
 
@@ -20,9 +22,13 @@ public struct TimelineTapeView: View {
 
     public var body: some View {
         ZStack {
-            // Background
+            // Background (tap to clear selection)
             Rectangle()
                 .fill(Color.black.opacity(0.85))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    viewModel.clearSelection()
+                }
 
             // Scrollable tape content
             tapeContent
@@ -59,6 +65,7 @@ public struct TimelineTapeView: View {
 
     private func appBlockView(block: AppBlock) -> some View {
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
+        let isSelectedBlock = viewModel.selectedFrameIndex.map { $0 >= block.startIndex && $0 <= block.endIndex } ?? false
         let color = blockColor(for: block)
         let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
 
@@ -66,19 +73,55 @@ public struct TimelineTapeView: View {
             // Background block
             RoundedRectangle(cornerRadius: 4)
                 .fill(color)
-                .frame(width: blockWidth, height: 30)
+                .frame(width: blockWidth, height: tapeHeight)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
-                        .stroke(isCurrentBlock ? Color.white : Color.clear, lineWidth: 1.5)
+                        .stroke(isSelectedBlock ? Color.retraceAccent : (isCurrentBlock ? Color.white : Color.clear), lineWidth: isSelectedBlock ? 2 : 1.5)
                 )
-                .opacity(isCurrentBlock ? 1.0 : 0.7)
+                .opacity(isCurrentBlock || isSelectedBlock ? 1.0 : 0.7)
+
+            // Individual frame segments (clickable)
+            HStack(spacing: 0) {
+                ForEach(block.startIndex...block.endIndex, id: \.self) { frameIndex in
+                    frameSegment(at: frameIndex, in: block)
+                }
+            }
+            .frame(width: blockWidth, height: tapeHeight)
 
             // App icon (only show if block is wide enough)
             if blockWidth > 40, let bundleID = block.bundleID {
                 appIcon(for: bundleID)
                     .frame(width: 22, height: 22)
+                    .allowsHitTesting(false) // Allow clicks to pass through to frame segments
             }
         }
+    }
+
+    // MARK: - Frame Segment View
+
+    private func frameSegment(at frameIndex: Int, in block: AppBlock) -> some View {
+        let isSelected = viewModel.selectedFrameIndex == frameIndex
+
+        return Rectangle()
+            .fill(Color.clear)
+            .frame(width: pixelsPerFrame, height: tapeHeight)
+            .overlay(
+                // Selection highlight
+                isSelected ? RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.retraceAccent.opacity(0.4))
+                    .padding(2) : nil
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                viewModel.selectFrame(at: frameIndex)
+            }
+            .onHover { isHovering in
+                if isHovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
     }
 
     // MARK: - Helper Functions
@@ -168,7 +211,6 @@ public struct TimelineTapeView: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .opacity(viewModel.isDateSearchActive ? 0.3 : 1.0)
                 .onHover { isHovering in
                     if isHovering {
                         NSCursor.pointingHand.push()
@@ -177,11 +219,13 @@ public struct TimelineTapeView: View {
                     }
                 }
                 .position(x: centerX, y: -55)
-                .animation(.easeOut(duration: 0.2), value: viewModel.isDateSearchActive)
 
-                // Zoom control (pinned to right side)
-                ZoomControl(viewModel: viewModel)
-                    .position(x: geometry.size.width - 100, y: -55)
+                // Right side controls (zoom + more options)
+                HStack(spacing: 12) {
+                    ZoomControl(viewModel: viewModel)
+                    MoreOptionsMenu(viewModel: viewModel)
+                }
+                .position(x: geometry.size.width - 70, y: -55)
 
                 // Playhead vertical line (fixed at center)
                 Rectangle()
@@ -203,7 +247,7 @@ public struct TimelineTapeView: View {
                             viewModel.dateSearchText = ""
                         }
                     )
-                    .position(x: centerX, y: -140)
+                    .position(x: centerX, y: -175)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
                         removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
@@ -291,6 +335,228 @@ struct ZoomControl: View {
     }
 }
 
+// MARK: - More Options Menu
+
+/// Three-dot menu button with dropdown options using SwiftUI popover
+struct MoreOptionsMenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+    @State private var showMenu = false
+
+    var body: some View {
+        Button(action: { showMenu.toggle() }) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(isHovering || showMenu ? .white : .white.opacity(0.6))
+                .frame(width: 32, height: 32)
+                .background(
+                    Circle()
+                        .fill(showMenu ? Color.white.opacity(0.15) : Color.black.opacity(0.5))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .popover(isPresented: $showMenu, attachmentAnchor: .point(.top), arrowEdge: .bottom) {
+            MoreOptionsPopoverContent(viewModel: viewModel, showMenu: $showMenu)
+        }
+    }
+}
+
+// MARK: - More Options Popover Content
+
+/// Custom styled popover content for more options menu
+struct MoreOptionsPopoverContent: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @Binding var showMenu: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            MenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+                showMenu = false
+                saveImage()
+            }
+
+            MenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
+                showMenu = false
+                copyImageToClipboard()
+            }
+
+            MenuRow(title: "Moment Deeplink", icon: "link") {
+                showMenu = false
+                // TODO: Implement moment deeplink
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.vertical, 4)
+
+            MenuRow(title: "Dashboard", icon: "square.grid.2x2") {
+                showMenu = false
+                openDashboard()
+            }
+
+            MenuRow(title: "Settings", icon: "gear") {
+                showMenu = false
+                openSettings()
+            }
+        }
+        .padding(8)
+        .background(Color.black.opacity(0.9))
+    }
+
+    // MARK: - Actions
+
+    private func saveImage() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
+                    }
+                }
+            }
+        }
+    }
+
+    private func copyImageToClipboard() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
+        }
+    }
+
+    private func openDashboard() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openDashboard, object: nil)
+        }
+    }
+
+    private func openSettings() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openSettings, object: nil)
+        }
+    }
+
+    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        if let image = viewModel.currentImage {
+            completion(image)
+            return
+        }
+
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
+        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+        if !FileManager.default.fileExists(atPath: symlinkPath) {
+            do {
+                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
+            } catch {
+                completion(nil)
+                return
+            }
+        }
+
+        let url = URL(fileURLWithPath: symlinkPath)
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    private func formattedTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    }
+}
+
+// MARK: - Menu Row
+
+/// Styled menu row for the popover
+struct MenuRow: View {
+    let title: String
+    let icon: String
+    var shortcut: String? = nil
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 13))
+                    .foregroundColor(.white.opacity(0.7))
+                    .frame(width: 18)
+
+                Text(title)
+                    .font(.system(size: 13))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if let shortcut = shortcut {
+                    Text(shortcut)
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+    }
+}
+
 // MARK: - Zoom Slider
 
 /// Custom slider for zoom control with Rewind-style appearance
@@ -350,6 +616,9 @@ struct FloatingDateSearchPanel: View {
     let onCancel: () -> Void
 
     @State private var isHovering = false
+    /// Accumulated position from completed drags
+    @GestureState private var dragOffset: CGSize = .zero
+    @State private var panelPosition: CGSize = .zero
 
     private let suggestions = [
         ("30 min ago", "clock.arrow.circlepath"),
@@ -359,8 +628,13 @@ struct FloatingDateSearchPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header with title and close button
+            // Header with title and close button - this is the drag handle
             HStack {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white.opacity(0.25))
+                    .padding(.trailing, 4)
+
                 Text("Jump to")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
@@ -384,13 +658,24 @@ struct FloatingDateSearchPanel: View {
             .padding(.horizontal, 20)
             .padding(.top, 16)
             .padding(.bottom, 12)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($dragOffset) { value, state, _ in
+                        state = value.translation
+                    }
+                    .onEnded { value in
+                        panelPosition.width += value.translation.width
+                        panelPosition.height += value.translation.height
+                    }
+            )
+            .onHover { hovering in
+                if hovering { NSCursor.openHand.push() }
+                else { NSCursor.pop() }
+            }
 
             // Search input field
             HStack(spacing: 14) {
-                Image(systemName: "clock")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundColor(.retraceAccent)
-
                 DateSearchField(
                     text: $text,
                     onSubmit: onSubmit,
@@ -445,18 +730,17 @@ struct FloatingDateSearchPanel: View {
         .frame(width: 380)
         .background(
             ZStack {
-                // Blur background
+                // Dark solid background
                 RoundedRectangle(cornerRadius: 20)
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
+                    .fill(Color(white: 0.08))
 
-                // Glass overlay
+                // Subtle glass overlay
                 RoundedRectangle(cornerRadius: 20)
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.12),
-                                Color.white.opacity(0.06)
+                                Color.white.opacity(0.08),
+                                Color.white.opacity(0.02)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -468,8 +752,8 @@ struct FloatingDateSearchPanel: View {
                     .stroke(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(0.2),
-                                Color.white.opacity(0.05)
+                                Color.white.opacity(0.15),
+                                Color.white.opacity(0.03)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -480,6 +764,10 @@ struct FloatingDateSearchPanel: View {
         )
         .shadow(color: .black.opacity(0.4), radius: 40, y: 20)
         .shadow(color: .retraceAccent.opacity(0.1), radius: 60, y: 30)
+        .offset(
+            x: panelPosition.width + dragOffset.width,
+            y: panelPosition.height + dragOffset.height
+        )
     }
 }
 
@@ -556,6 +844,9 @@ struct DateSearchField: NSViewRepresentable {
         textField.isEditable = true
         textField.isSelectable = true
 
+        // Wire up Cmd+G to close the panel
+        textField.onCancelCallback = onCancel
+
         return textField
     }
 
@@ -617,8 +908,22 @@ struct DateSearchField: NSViewRepresentable {
 // MARK: - Focusable TextField
 
 /// Custom NSTextField that properly accepts first responder in borderless windows
+/// Also intercepts Cmd+G to close the panel
 class FocusableTextField: NSTextField {
     override var acceptsFirstResponder: Bool { true }
+
+    /// Callback to cancel/close the panel
+    var onCancelCallback: (() -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Check for Cmd+G to close the panel
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        if event.keyCode == 5 && modifiers == [.command] { // G key with Command
+            onCancelCallback?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 // MARK: - Preview

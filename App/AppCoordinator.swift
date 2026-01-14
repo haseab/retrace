@@ -369,6 +369,18 @@ public actor AppCoordinator {
         return try await adapter.getFrames(from: startDate, to: endDate, limit: limit)
     }
 
+    /// Get frames with video info in a time range (optimized - single query with JOINs)
+    /// This is the preferred method for timeline views to avoid N+1 queries
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database (no video info for native)
+            let frames = try await services.database.getFrames(from: startDate, to: endDate, limit: limit)
+            return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+        }
+
+        return try await adapter.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
+    }
+
     /// Get the most recent frames across all sources
     /// Returns frames sorted by timestamp descending (newest first)
     public func getMostRecentFrames(limit: Int = 500) async throws -> [FrameReference] {
@@ -378,6 +390,17 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getMostRecentFrames(limit: limit)
+    }
+
+    /// Get the most recent frames with video info (optimized - single query with JOINs)
+    public func getMostRecentFramesWithVideoInfo(limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database (no video info for native)
+            let frames = try await services.database.getMostRecentFrames(limit: limit)
+            return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+        }
+
+        return try await adapter.getMostRecentFramesWithVideoInfo(limit: limit)
     }
 
     /// Get frames before a timestamp (for infinite scroll - loading older frames)
@@ -391,6 +414,17 @@ public actor AppCoordinator {
         return try await adapter.getFramesBefore(timestamp: timestamp, limit: limit)
     }
 
+    /// Get frames with video info before a timestamp (optimized - single query with JOINs)
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database (no video info for native)
+            let frames = try await services.database.getFramesBefore(timestamp: timestamp, limit: limit)
+            return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+        }
+
+        return try await adapter.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+    }
+
     /// Get frames after a timestamp (for infinite scroll - loading newer frames)
     /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
     public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
@@ -400,6 +434,17 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getFramesAfter(timestamp: timestamp, limit: limit)
+    }
+
+    /// Get frames with video info after a timestamp (optimized - single query with JOINs)
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database (no video info for native)
+            let frames = try await services.database.getFramesAfter(timestamp: timestamp, limit: limit)
+            return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
+        }
+
+        return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
     }
 
     /// Get the timestamp of the most recent frame across all sources
@@ -417,8 +462,14 @@ public actor AppCoordinator {
     // MARK: - Session Retrieval
 
     /// Get sessions in a time range
+    /// Seamlessly blends data from all sources via DataAdapter
     public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
-        try await services.database.getSessions(from: startDate, to: endDate)
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database if adapter not available
+            return try await services.database.getSessions(from: startDate, to: endDate)
+        }
+
+        return try await adapter.getSessions(from: startDate, to: endDate)
     }
 
     /// Get the currently active session
@@ -436,6 +487,49 @@ public actor AppCoordinator {
     /// Get text regions for a frame (OCR bounding boxes)
     public func getTextRegions(frameID: FrameID) async throws -> [TextRegion] {
         try await services.database.getTextRegions(frameID: frameID)
+    }
+
+    // MARK: - Frame Deletion
+
+    /// Delete a single frame from the database
+    /// Note: For Rewind data, this only removes the database entry. Video files remain on disk.
+    public func deleteFrame(frameID: FrameID, timestamp: Date, source: FrameSource) async throws {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to direct database deletion for native frames
+            if source == .native {
+                try await services.database.deleteFrame(id: frameID)
+                Log.info("[AppCoordinator] Deleted native frame \(frameID.stringValue)", category: .app)
+                return
+            }
+            throw AppError.notInitialized
+        }
+
+        // For Rewind frames, use timestamp-based deletion (more reliable than synthetic UUIDs)
+        if source == .rewind {
+            try await adapter.deleteFrameByTimestamp(timestamp, source: source)
+        } else {
+            try await adapter.deleteFrame(frameID: frameID, source: source)
+        }
+
+        Log.info("[AppCoordinator] Deleted frame from \(source.displayName)", category: .app)
+    }
+
+    /// Delete multiple frames from the database
+    /// Groups by source and uses appropriate deletion method for each
+    public func deleteFrames(_ frames: [FrameReference]) async throws {
+        guard !frames.isEmpty else { return }
+
+        // For Rewind frames, delete by timestamp (more reliable)
+        // For native frames, delete by ID
+        for frame in frames {
+            try await deleteFrame(
+                frameID: frame.id,
+                timestamp: frame.timestamp,
+                source: frame.source
+            )
+        }
+
+        Log.info("[AppCoordinator] Deleted \(frames.count) frames", category: .app)
     }
 
     // MARK: - Migration

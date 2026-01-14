@@ -36,7 +36,7 @@ public enum Log {
     // MARK: - Configuration
 
     /// Subsystem for os.log
-    private static let subsystem = AppPaths.logSubsystem
+    private static let subsystem = "io.retrace.app"
 
     /// Whether to also print to console (always true in DEBUG, configurable in release)
     #if DEBUG

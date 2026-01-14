@@ -115,9 +115,9 @@ public class MenuBarManager: ObservableObject {
         }
     }
 
-    /// Toggle the dashboard window
+    /// Toggle the dashboard window (show if hidden, hide if visible)
     private func toggleDashboard() {
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
+        NotificationCenter.default.post(name: .toggleDashboard, object: nil)
     }
 
     /// Hide recording indicator (called when timeline opens)
@@ -377,6 +377,7 @@ extension Notification.Name {
     static let openTimeline = Notification.Name("openTimeline")
     static let openSearch = Notification.Name("openSearch")
     static let openDashboard = Notification.Name("openDashboard")
+    static let toggleDashboard = Notification.Name("toggleDashboard")
     static let openSettings = Notification.Name("openSettings")
     static let openFeedback = Notification.Name("openFeedback")
 }

@@ -97,6 +97,14 @@ public struct DashboardView: View {
                     .font(.system(size: 18))
             }
             .buttonStyle(RetraceSecondaryButtonStyle())
+
+            Button(action: {
+                NotificationCenter.default.post(name: .openSettings, object: nil)
+            }) {
+                Image(systemName: "gear")
+                    .font(.system(size: 18))
+            }
+            .buttonStyle(RetraceSecondaryButtonStyle())
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()

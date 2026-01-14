@@ -282,6 +282,31 @@ enum FrameQueries {
 
     // MARK: - Delete
 
+    static func delete(db: OpaquePointer, id: FrameID) throws {
+        let sql = "DELETE FROM frames WHERE id = ?;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, id.stringValue, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
     static func deleteOlderThan(db: OpaquePointer, date: Date) throws -> Int {
         let sql = "DELETE FROM frames WHERE timestamp < ?;"
 

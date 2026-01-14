@@ -40,6 +40,7 @@ public struct SimpleTimelineView: View {
                         viewModel: viewModel,
                         width: geometry.size.width
                     )
+                    .padding(.bottom, 20)
                 }
 
                 // Close button (top-right)
@@ -70,6 +71,22 @@ public struct SimpleTimelineView: View {
                 // Error overlay
                 if let error = viewModel.error {
                     errorOverlay(error)
+                }
+
+                // Delete confirmation dialog
+                if viewModel.showDeleteConfirmation {
+                    DeleteConfirmationDialog(
+                        segmentFrameCount: viewModel.selectedSegmentFrameCount,
+                        onDeleteFrame: {
+                            viewModel.confirmDeleteSelectedFrame()
+                        },
+                        onDeleteSegment: {
+                            viewModel.confirmDeleteSegment()
+                        },
+                        onCancel: {
+                            viewModel.cancelDelete()
+                        }
+                    )
                 }
             }
             .background(Color.black)
@@ -290,6 +307,139 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         deinit {
             observers.forEach { $0.invalidate() }
         }
+    }
+}
+
+// MARK: - Delete Confirmation Dialog
+
+/// Modal dialog for confirming frame or segment deletion
+struct DeleteConfirmationDialog: View {
+    let segmentFrameCount: Int
+    let onDeleteFrame: () -> Void
+    let onDeleteSegment: () -> Void
+    let onCancel: () -> Void
+
+    @State private var isHoveringDeleteFrame = false
+    @State private var isHoveringDeleteSegment = false
+    @State private var isHoveringCancel = false
+
+    var body: some View {
+        ZStack {
+            // Dimmed background
+            Color.black.opacity(0.6)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    onCancel()
+                }
+
+            // Dialog card
+            VStack(spacing: 20) {
+                // Icon
+                Image(systemName: "trash.fill")
+                    .font(.system(size: 32))
+                    .foregroundColor(.red.opacity(0.8))
+
+                // Title
+                Text("Delete Frame?")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.white)
+
+                // Description
+                VStack(spacing: 8) {
+                    Text("Choose to delete this frame or the entire segment.")
+                        .font(.system(size: 14))
+                        .foregroundColor(.white.opacity(0.6))
+
+                    Text("Note: Removes from database only. Video files remain on disk.")
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.4))
+                        .italic()
+                }
+                .multilineTextAlignment(.center)
+
+                // Buttons
+                VStack(spacing: 10) {
+                    // Delete Frame button
+                    Button(action: onDeleteFrame) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "square")
+                                .font(.system(size: 14))
+                            Text("Delete Frame")
+                                .font(.system(size: 14, weight: .medium))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 240, height: 40)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(isHoveringDeleteFrame ? Color.red.opacity(0.7) : Color.red.opacity(0.5))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isHoveringDeleteFrame = hovering
+                        if hovering { NSCursor.pointingHand.push() }
+                        else { NSCursor.pop() }
+                    }
+
+                    // Delete Segment button
+                    Button(action: onDeleteSegment) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "rectangle.stack")
+                                .font(.system(size: 14))
+                            Text("Delete Segment (\(segmentFrameCount) frames)")
+                                .font(.system(size: 14, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 240, height: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(isHoveringDeleteSegment ? Color.red.opacity(0.9) : Color.red.opacity(0.7))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isHoveringDeleteSegment = hovering
+                        if hovering { NSCursor.pointingHand.push() }
+                        else { NSCursor.pop() }
+                    }
+
+                    // Cancel button
+                    Button(action: onCancel) {
+                        Text("Cancel")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(.white.opacity(0.8))
+                            .frame(width: 240, height: 40)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(isHoveringCancel ? Color.white.opacity(0.15) : Color.white.opacity(0.08))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.white.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isHoveringCancel = hovering
+                        if hovering { NSCursor.pointingHand.push() }
+                        else { NSCursor.pop() }
+                    }
+                }
+                .padding(.top, 8)
+            }
+            .padding(32)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(white: 0.15))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    )
+            )
+            .shadow(color: .black.opacity(0.5), radius: 30, y: 10)
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: true)
     }
 }
 

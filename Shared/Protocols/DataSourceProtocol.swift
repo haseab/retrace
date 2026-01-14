@@ -3,7 +3,7 @@ import Foundation
 // MARK: - Frame Video Info
 
 /// Video playback information for displaying a frame from a video source
-public struct FrameVideoInfo: Sendable, Equatable {
+public struct FrameVideoInfo: Sendable, Equatable, Codable {
     /// Full path to the video file
     public let videoPath: String
 
@@ -22,6 +22,23 @@ public struct FrameVideoInfo: Sendable, Equatable {
         self.videoPath = videoPath
         self.frameIndex = frameIndex
         self.frameRate = frameRate
+    }
+}
+
+// MARK: - Frame With Video Info
+
+/// A frame reference combined with its video info (if applicable)
+/// Used to return all frame data in a single query with JOINs instead of N+1 queries
+public struct FrameWithVideoInfo: Sendable, Equatable, Codable {
+    /// The frame reference with metadata
+    public let frame: FrameReference
+
+    /// Video playback info (nil for image-based sources like native Retrace)
+    public let videoInfo: FrameVideoInfo?
+
+    public init(frame: FrameReference, videoInfo: FrameVideoInfo?) {
+        self.frame = frame
+        self.videoInfo = videoInfo
     }
 }
 
@@ -70,6 +87,36 @@ public protocol DataSourceProtocol: Actor {
     /// - Returns: Array of frame references sorted by timestamp ascending (oldest first of the newer batch)
     func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference]
 
+    // MARK: - Optimized Frame + Video Info Methods (Single Query with JOINs)
+
+    /// Get frames with video info in a time range (single query with JOINs)
+    /// This is more efficient than getFrames + N calls to getFrameVideoInfo
+    /// - Parameters:
+    ///   - startDate: Start of the time range
+    ///   - endDate: End of the time range
+    ///   - limit: Maximum number of frames to return
+    /// - Returns: Array of frames with video info, sorted by timestamp ascending
+    func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameWithVideoInfo]
+
+    /// Get the most recent frames with video info (single query with JOINs)
+    /// - Parameter limit: Maximum number of frames to return
+    /// - Returns: Array of frames with video info, sorted by timestamp descending (newest first)
+    func getMostRecentFramesWithVideoInfo(limit: Int) async throws -> [FrameWithVideoInfo]
+
+    /// Get frames with video info before a timestamp (single query with JOINs)
+    /// - Parameters:
+    ///   - timestamp: Get frames before this timestamp
+    ///   - limit: Maximum number of frames to return
+    /// - Returns: Array of frames with video info, sorted by timestamp descending
+    func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo]
+
+    /// Get frames with video info after a timestamp (single query with JOINs)
+    /// - Parameters:
+    ///   - timestamp: Get frames after this timestamp
+    ///   - limit: Maximum number of frames to return
+    /// - Returns: Array of frames with video info, sorted by timestamp ascending
+    func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo]
+
     /// Get image data for a specific frame
     /// - Parameters:
     ///   - segmentID: The segment containing the frame
@@ -87,6 +134,25 @@ public protocol DataSourceProtocol: Actor {
     /// The cutoff date for this source (data is only available before this date)
     /// Returns nil if the source has no cutoff (e.g., native Retrace data)
     var cutoffDate: Date? { get }
+
+    /// Get sessions within a time range (for analytics/dashboard)
+    /// - Parameters:
+    ///   - startDate: Start of the time range
+    ///   - endDate: End of the time range
+    /// - Returns: Array of app sessions within the time range
+    func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession]
+
+    // MARK: - Deletion
+
+    /// Delete a single frame and all associated data (nodes, FTS entries)
+    /// Note: Video files are NOT deleted, only database entries
+    /// - Parameter frameID: The frame to delete
+    func deleteFrame(frameID: FrameID) async throws
+
+    /// Delete multiple frames and all associated data
+    /// Note: Video files are NOT deleted, only database entries
+    /// - Parameter frameIDs: The frames to delete
+    func deleteFrames(frameIDs: [FrameID]) async throws
 }
 
 // MARK: - Data Source Error

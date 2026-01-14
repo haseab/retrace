@@ -17,6 +17,26 @@ public actor DataAdapter {
     /// Whether the adapter is initialized and ready
     private var isInitialized = false
 
+    // MARK: - Session Cache
+
+    /// Cache key for session queries (date range hash)
+    private struct SessionCacheKey: Hashable {
+        let startDate: Date
+        let endDate: Date
+    }
+
+    /// Cached session results with expiry
+    private struct SessionCacheEntry {
+        let sessions: [AppSession]
+        let timestamp: Date
+    }
+
+    /// Session query cache - keyed by date range
+    private var sessionCache: [SessionCacheKey: SessionCacheEntry] = [:]
+
+    /// How long cached sessions remain valid (5 minutes)
+    private let sessionCacheTTL: TimeInterval = 300
+
     // MARK: - Initialization
 
     public init(primarySource: any DataSourceProtocol) {
@@ -64,6 +84,62 @@ public actor DataAdapter {
     }
 
     // MARK: - Frame Retrieval
+
+    /// Get frames with video info in a time range (optimized - single query with JOINs)
+    /// This is the preferred method for timeline views to avoid N+1 queries
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getFramesWithVideoInfo called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+
+        Log.info("[DataAdapter] getFramesWithVideoInfo: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate)), limit=\(limit)", category: .app)
+
+        var allFrames: [FrameWithVideoInfo] = []
+
+        // Check secondary sources
+        for (sourceType, source) in secondarySources {
+            let isConnected = await source.isConnected
+            guard isConnected else { continue }
+
+            if let cutoff = await source.cutoffDate {
+                if startDate < cutoff {
+                    let effectiveEnd = min(endDate, cutoff)
+                    let frames = try await source.getFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit)
+                    allFrames.append(contentsOf: frames)
+                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
+                }
+            } else {
+                let frames = try await source.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
+                allFrames.append(contentsOf: frames)
+                Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
+            }
+        }
+
+        // Get frames from primary source
+        var primaryStartDate = startDate
+        for (_, source) in secondarySources {
+            if let cutoff = await source.cutoffDate, await source.isConnected {
+                primaryStartDate = max(primaryStartDate, cutoff)
+            }
+        }
+
+        if primaryStartDate < endDate {
+            let primaryFrames = try await primarySource.getFramesWithVideoInfo(from: primaryStartDate, to: endDate, limit: limit)
+            allFrames.append(contentsOf: primaryFrames)
+            Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames with video info from primary source", category: .app)
+        }
+
+        // Sort by timestamp ascending (oldest first)
+        allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
+
+        let result = Array(allFrames.prefix(limit))
+        Log.info("[DataAdapter] Returning \(result.count) frames with video info", category: .app)
+        return result
+    }
 
     /// Get frames in a time range, blending data from all available sources
     /// Automatically routes to appropriate source based on timestamps and cutoff dates
@@ -138,6 +214,39 @@ public actor DataAdapter {
         return result
     }
 
+    /// Get the most recent frames with video info (optimized - single query with JOINs)
+    /// This is the preferred method for timeline views to avoid N+1 queries
+    public func getMostRecentFramesWithVideoInfo(limit: Int = 250) async throws -> [FrameWithVideoInfo] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getMostRecentFramesWithVideoInfo called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        Log.info("[DataAdapter] getMostRecentFramesWithVideoInfo: fetching \(limit) most recent frames", category: .app)
+
+        var allFrames: [FrameWithVideoInfo] = []
+
+        // Get most recent frames from primary source
+        let primaryFrames = try await primarySource.getMostRecentFramesWithVideoInfo(limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames with video info from primary source", category: .app)
+
+        // Get most recent frames from secondary sources
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+            let sourceFrames = try await source.getMostRecentFramesWithVideoInfo(limit: limit)
+            allFrames.append(contentsOf: sourceFrames)
+            Log.info("[DataAdapter] ✓ Got \(sourceFrames.count) frames with video info from \(sourceType.displayName)", category: .app)
+        }
+
+        // Sort by timestamp descending (newest first) and take top N
+        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        let result = Array(allFrames.prefix(limit))
+
+        Log.info("[DataAdapter] Returning \(result.count) most recent frames with video info", category: .app)
+        return result
+    }
+
     /// Get the most recent frames across all sources
     /// Returns frames sorted by timestamp descending (newest first)
     public func getMostRecentFrames(limit: Int = 250) async throws -> [FrameReference] {
@@ -172,6 +281,73 @@ public actor DataAdapter {
 
         Log.info("[DataAdapter] Returning \(result.count) most recent frames", category: .app)
         return result
+    }
+
+    /// Get frames with video info before a timestamp (optimized - single query with JOINs)
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getFramesWithVideoInfoBefore called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        var allFrames: [FrameWithVideoInfo] = []
+
+        // Check secondary sources
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+
+            if let cutoff = await source.cutoffDate {
+                let effectiveTimestamp = min(timestamp, cutoff)
+                let frames = try await source.getFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+                Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
+            } else {
+                let frames = try await source.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+            }
+        }
+
+        // Get frames from primary source
+        let primaryFrames = try await primarySource.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+
+        // Sort by timestamp descending (newest first) and take top N
+        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        return Array(allFrames.prefix(limit))
+    }
+
+    /// Get frames with video info after a timestamp (optimized - single query with JOINs)
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getFramesWithVideoInfoAfter called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        var allFrames: [FrameWithVideoInfo] = []
+
+        // Check secondary sources (respecting cutoffs)
+        for (sourceType, source) in secondarySources {
+            guard await source.isConnected else { continue }
+
+            if let cutoff = await source.cutoffDate {
+                if timestamp < cutoff {
+                    let frames = try await source.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+                    allFrames.append(contentsOf: frames)
+                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
+                }
+            } else {
+                let frames = try await source.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+                allFrames.append(contentsOf: frames)
+            }
+        }
+
+        // Get frames from primary source
+        let primaryFrames = try await primarySource.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+        allFrames.append(contentsOf: primaryFrames)
+
+        // Sort by timestamp ascending (oldest first) and take top N
+        allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
+        return Array(allFrames.prefix(limit))
     }
 
     /// Get frames before a timestamp (for infinite scroll - loading older frames)
@@ -353,6 +529,90 @@ public actor DataAdapter {
         return nil
     }
 
+    // MARK: - Session Retrieval
+
+    /// Get sessions in a time range, blending data from all available sources
+    /// Results are cached for 5 minutes to avoid repeated queries
+    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getSessions called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        let cacheKey = SessionCacheKey(startDate: startDate, endDate: endDate)
+
+        // Check cache first
+        if let cached = sessionCache[cacheKey] {
+            let age = Date().timeIntervalSince(cached.timestamp)
+            if age < sessionCacheTTL {
+                Log.info("[DataAdapter] getSessions: cache hit (\(cached.sessions.count) sessions, age: \(Int(age))s)", category: .app)
+                return cached.sessions
+            } else {
+                // Expired - remove from cache
+                sessionCache.removeValue(forKey: cacheKey)
+            }
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+
+        Log.info("[DataAdapter] getSessions: cache miss, querying \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate))", category: .app)
+
+        var allSessions: [AppSession] = []
+
+        // Check if any secondary source can provide data for this range
+        for (sourceType, source) in secondarySources {
+            let isConnected = await source.isConnected
+            guard isConnected else { continue }
+
+            if let cutoff = await source.cutoffDate {
+                // Source only has data before cutoff
+                if startDate < cutoff {
+                    let effectiveEnd = min(endDate, cutoff)
+                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for sessions: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: effectiveEnd))", category: .app)
+                    let sessions = try await source.getSessions(from: startDate, to: effectiveEnd)
+                    allSessions.append(contentsOf: sessions)
+                    Log.info("[DataAdapter] ✓ Got \(sessions.count) sessions from \(sourceType.displayName)", category: .app)
+                }
+            } else {
+                // Source has no cutoff - can provide data for any range
+                let sessions = try await source.getSessions(from: startDate, to: endDate)
+                allSessions.append(contentsOf: sessions)
+                Log.info("[DataAdapter] ✓ Got \(sessions.count) sessions from \(sourceType.displayName)", category: .app)
+            }
+        }
+
+        // Get sessions from primary source (native Retrace)
+        // If secondary sources have cutoffs, only query primary for dates after the latest cutoff
+        var primaryStartDate = startDate
+        for (_, source) in secondarySources {
+            if let cutoff = await source.cutoffDate, await source.isConnected {
+                primaryStartDate = max(primaryStartDate, cutoff)
+            }
+        }
+
+        if primaryStartDate < endDate {
+            let primarySessions = try await primarySource.getSessions(from: primaryStartDate, to: endDate)
+            allSessions.append(contentsOf: primarySessions)
+            Log.info("[DataAdapter] ✓ Got \(primarySessions.count) sessions from primary source", category: .app)
+        }
+
+        // Sort all sessions by start time (ascending - oldest first)
+        allSessions.sort { $0.startTime < $1.startTime }
+
+        // Cache the results
+        sessionCache[cacheKey] = SessionCacheEntry(sessions: allSessions, timestamp: Date())
+
+        Log.info("[DataAdapter] Total sessions after merge & sort: \(allSessions.count) (cached)", category: .app)
+        return allSessions
+    }
+
+    /// Invalidate the session cache (call when new data is recorded)
+    public func invalidateSessionCache() {
+        sessionCache.removeAll()
+        Log.info("[DataAdapter] Session cache invalidated", category: .app)
+    }
+
     // MARK: - Source Information
 
     /// Get all registered sources
@@ -373,6 +633,80 @@ public actor DataAdapter {
             return false
         }
         return await secondarySource.isConnected
+    }
+
+    // MARK: - Deletion
+
+    /// Delete a frame from the appropriate data source
+    /// Routes to the correct source based on the frame's source property
+    public func deleteFrame(frameID: FrameID, source frameSource: FrameSource) async throws {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if frameSource == .native {
+            try await primarySource.deleteFrame(frameID: frameID)
+            Log.info("[DataAdapter] Deleted frame from primary source", category: .app)
+            return
+        }
+
+        // Check secondary sources
+        if let source = secondarySources[frameSource], await source.isConnected {
+            try await source.deleteFrame(frameID: frameID)
+            Log.info("[DataAdapter] Deleted frame from \(frameSource.displayName)", category: .app)
+            return
+        }
+
+        throw DataAdapterError.sourceNotAvailable(frameSource)
+    }
+
+    /// Delete multiple frames from their respective data sources
+    /// Groups frames by source and deletes in batches
+    public func deleteFrames(_ frames: [(frameID: FrameID, source: FrameSource)]) async throws {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Group frames by source
+        var framesBySource: [FrameSource: [FrameID]] = [:]
+        for (frameID, source) in frames {
+            framesBySource[source, default: []].append(frameID)
+        }
+
+        // Delete from each source
+        for (frameSource, frameIDs) in framesBySource {
+            if frameSource == .native {
+                try await primarySource.deleteFrames(frameIDs: frameIDs)
+                Log.info("[DataAdapter] Deleted \(frameIDs.count) frames from primary source", category: .app)
+            } else if let source = secondarySources[frameSource], await source.isConnected {
+                try await source.deleteFrames(frameIDs: frameIDs)
+                Log.info("[DataAdapter] Deleted \(frameIDs.count) frames from \(frameSource.displayName)", category: .app)
+            } else {
+                Log.warning("[DataAdapter] Source \(frameSource.displayName) not available for deletion", category: .app)
+            }
+        }
+    }
+
+    /// Delete a frame by timestamp (more reliable for Rewind data where UUIDs are synthetic)
+    public func deleteFrameByTimestamp(_ timestamp: Date, source frameSource: FrameSource) async throws {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // For Rewind source, use the timestamp-based deletion method
+        if frameSource == .rewind {
+            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+                try await rewindSource.deleteFrameByTimestamp(timestamp)
+                Log.info("[DataAdapter] Deleted Rewind frame by timestamp", category: .app)
+                return
+            }
+            throw DataAdapterError.sourceNotAvailable(frameSource)
+        }
+
+        // For native source, we need to find the frame by timestamp first
+        // This is a fallback - prefer using deleteFrame with frameID for native data
+        Log.warning("[DataAdapter] deleteFrameByTimestamp called for native source - this is inefficient", category: .app)
+        throw DataSourceError.unsupportedOperation
     }
 }
 

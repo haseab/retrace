@@ -16,9 +16,32 @@ public enum TimelineConfig {
 
 /// Configuration for infinite scroll rolling window
 private enum WindowConfig {
-    static let maxFrames = 2000          // Maximum frames in memory
+    static let maxFrames = 500           // Maximum frames in memory
     static let loadThreshold = 100       // Start loading when within N frames of edge
-    static let loadBatchSize = 300       // Frames to load per batch
+    static let loadBatchSize = 200       // Frames to load per batch
+}
+
+/// Memory tracking for debugging frame accumulation issues
+private enum MemoryTracker {
+    /// Log memory state for debugging
+    static func logMemoryState(
+        context: String,
+        frameCount: Int,
+        imageCacheCount: Int,
+        oldestTimestamp: Date?,
+        newestTimestamp: Date?
+    ) {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "HH:mm:ss"
+
+        let oldest = oldestTimestamp.map { dateFormatter.string(from: $0) } ?? "nil"
+        let newest = newestTimestamp.map { dateFormatter.string(from: $0) } ?? "nil"
+
+        Log.debug(
+            "[Memory] \(context) | frames=\(frameCount)/\(WindowConfig.maxFrames) | imageCache=\(imageCacheCount) | window=[\(oldest) → \(newest)]",
+            category: .ui
+        )
+    }
 }
 
 /// A frame paired with its preloaded video info for instant access
@@ -96,6 +119,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether the zoom slider is expanded/visible
     @Published public var isZoomSliderExpanded = false
+
+    /// Currently selected frame index (for deletion, etc.) - nil means no selection
+    @Published public var selectedFrameIndex: Int? = nil
+
+    /// Whether the delete confirmation dialog is shown
+    @Published public var showDeleteConfirmation = false
+
+    /// Whether we're deleting a single frame or an entire segment
+    @Published public var isDeleteSegmentMode = false
+
+    /// Frames that have been "deleted" (optimistically removed from UI)
+    @Published public var deletedFrameIDs: Set<FrameID> = []
 
     // MARK: - Zoom Computed Properties
 
@@ -180,7 +215,18 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var scrollAccumulator: CGFloat = 0
 
     /// Cache for Retrace images (loaded on demand since they're from disk)
-    private var imageCache: [FrameID: NSImage] = [:]
+    private var imageCache: [FrameID: NSImage] = [:] {
+        didSet {
+            let oldCount = oldValue.count
+            let newCount = imageCache.count
+            if oldCount != newCount {
+                Log.debug("[Memory] imageCache changed: \(oldCount) → \(newCount) images", category: .ui)
+            }
+        }
+    }
+
+    /// Maximum images to keep in cache (prevents unbounded memory growth)
+    private static let maxImageCacheSize = 50
 
     // MARK: - Infinite Scroll Window State
 
@@ -202,14 +248,26 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether there's more data available in the newer direction
     private var hasMoreNewer = true
 
+    /// Counter for periodic memory logging (log every N navigations)
+    private var navigationCounter: Int = 0
+    private static let memoryLogInterval = 50  // Log memory state every 50 navigations
+
     // MARK: - Position Cache (for restoring position on reopen)
 
     /// Key for storing cached position timestamp in UserDefaults
     private static let cachedPositionTimestampKey = "timeline.cachedPositionTimestamp"
     /// Key for storing when the cache was saved
     private static let cachedPositionSavedAtKey = "timeline.cachedPositionSavedAt"
+    /// Key for storing the cached current index
+    private static let cachedCurrentIndexKey = "timeline.cachedCurrentIndex"
     /// How long the cached position remains valid (2 minutes)
     private static let cacheExpirationSeconds: TimeInterval = 120
+
+    /// File path for cached frames data
+    private static nonisolated var cachedFramesPath: URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return cacheDir.appendingPathComponent("timeline_frames_cache.json")
+    }
 
     // MARK: - Dependencies
 
@@ -221,18 +279,231 @@ public class SimpleTimelineViewModel: ObservableObject {
         self.coordinator = coordinator
     }
 
-    // MARK: - Position Cache Methods
+    // MARK: - Frame Selection & Deletion
 
-    /// Save the current playhead position to cache
-    public func savePosition() {
-        guard let timestamp = currentTimestamp else { return }
+    /// Select a frame at the given index and move the playhead there
+    public func selectFrame(at index: Int) {
+        guard index >= 0 && index < frames.count else { return }
 
-        UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
-        print("[PositionCache] Saved position: \(timestamp)")
+        // Move playhead to the selected frame
+        navigateToFrame(index)
+
+        // Set selection
+        selectedFrameIndex = index
     }
 
-    /// Get the cached position if it exists and hasn't expired
+    /// Clear the current selection
+    public func clearSelection() {
+        selectedFrameIndex = nil
+    }
+
+    /// Request deletion of the selected frame (shows confirmation dialog)
+    public func requestDeleteSelectedFrame() {
+        guard selectedFrameIndex != nil else { return }
+        showDeleteConfirmation = true
+    }
+
+    /// Perform optimistic deletion of the selected frame and persist to database
+    public func confirmDeleteSelectedFrame() {
+        guard let index = selectedFrameIndex, index >= 0 && index < frames.count else {
+            showDeleteConfirmation = false
+            return
+        }
+
+        let frameToDelete = frames[index]
+        let frameID = frameToDelete.frame.id
+        let frameRef = frameToDelete.frame
+
+        // Add to deleted set for potential undo
+        deletedFrameIDs.insert(frameID)
+
+        // Remove from frames array (optimistic deletion)
+        frames.remove(at: index)
+
+        // Clear cached blocks since frames changed
+        _cachedAppBlocks = nil
+
+        // Adjust current index if needed
+        if currentIndex >= frames.count {
+            currentIndex = max(0, frames.count - 1)
+        } else if currentIndex > index {
+            currentIndex -= 1
+        }
+
+        // Clear selection
+        selectedFrameIndex = nil
+        showDeleteConfirmation = false
+
+        // Load image if needed for new current frame
+        loadImageIfNeeded()
+
+        print("[Delete] Frame \(frameID) removed from UI (optimistic deletion)")
+
+        // Persist deletion to database in background
+        Task {
+            do {
+                try await coordinator.deleteFrame(
+                    frameID: frameRef.id,
+                    timestamp: frameRef.timestamp,
+                    source: frameRef.source
+                )
+                print("[Delete] Frame \(frameID) deleted from database")
+            } catch {
+                // Log error but don't restore UI - user already saw it deleted
+                Log.error("[Delete] Failed to delete frame from database: \(error)", category: .app)
+                print("[Delete] ERROR: Failed to delete frame from database: \(error)")
+            }
+        }
+    }
+
+    /// Cancel deletion
+    public func cancelDelete() {
+        showDeleteConfirmation = false
+        isDeleteSegmentMode = false
+    }
+
+    /// Get the selected frame (if any)
+    public var selectedFrame: TimelineFrame? {
+        guard let index = selectedFrameIndex, index >= 0 && index < frames.count else { return nil }
+        return frames[index]
+    }
+
+    /// Get the app block containing the selected frame
+    public var selectedBlock: AppBlock? {
+        guard let index = selectedFrameIndex else { return nil }
+        return appBlocks.first { index >= $0.startIndex && index <= $0.endIndex }
+    }
+
+    /// Get the number of frames in the selected segment
+    public var selectedSegmentFrameCount: Int {
+        selectedBlock?.frameCount ?? 0
+    }
+
+    /// Perform optimistic deletion of the entire segment containing the selected frame and persist to database
+    public func confirmDeleteSegment() {
+        guard let block = selectedBlock else {
+            showDeleteConfirmation = false
+            isDeleteSegmentMode = false
+            return
+        }
+
+        // Collect all frames to delete (need full FrameReference for database deletion)
+        var framesToDelete: [FrameReference] = []
+        for index in block.startIndex...block.endIndex {
+            if index < frames.count {
+                let frameRef = frames[index].frame
+                deletedFrameIDs.insert(frameRef.id)
+                framesToDelete.append(frameRef)
+            }
+        }
+
+        let deleteCount = block.frameCount
+        let startIndex = block.startIndex
+
+        // Remove frames from array (in reverse to maintain indices)
+        frames.removeSubrange(block.startIndex...min(block.endIndex, frames.count - 1))
+
+        // Clear cached blocks since frames changed
+        _cachedAppBlocks = nil
+
+        // Adjust current index
+        if currentIndex >= startIndex + deleteCount {
+            // Current was after deleted segment
+            currentIndex -= deleteCount
+        } else if currentIndex >= startIndex {
+            // Current was within deleted segment - move to start of where segment was
+            currentIndex = max(0, min(startIndex, frames.count - 1))
+        }
+
+        // Clear selection
+        selectedFrameIndex = nil
+        showDeleteConfirmation = false
+        isDeleteSegmentMode = false
+
+        // Load image if needed for new current frame
+        loadImageIfNeeded()
+
+        print("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)")
+
+        // Persist deletion to database in background
+        Task {
+            do {
+                try await coordinator.deleteFrames(framesToDelete)
+                print("[Delete] Segment with \(deleteCount) frames deleted from database")
+            } catch {
+                // Log error but don't restore UI - user already saw it deleted
+                Log.error("[Delete] Failed to delete segment from database: \(error)", category: .app)
+                print("[Delete] ERROR: Failed to delete segment from database: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Position Cache Methods
+
+    /// Save the current playhead position AND frames to cache for instant restore
+    public func savePosition() {
+        guard let timestamp = currentTimestamp else { return }
+        guard !frames.isEmpty else { return }
+
+        // Save timestamp and index to UserDefaults
+        UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
+        UserDefaults.standard.set(currentIndex, forKey: Self.cachedCurrentIndexKey)
+
+        // Save frames to disk (JSON file) - do this async to not block the main thread
+        Task.detached(priority: .utility) { [frames] in
+            do {
+                // Convert TimelineFrame to FrameWithVideoInfo for encoding
+                let framesWithVideoInfo = frames.map { FrameWithVideoInfo(frame: $0.frame, videoInfo: $0.videoInfo) }
+                let data = try JSONEncoder().encode(framesWithVideoInfo)
+                try data.write(to: Self.cachedFramesPath)
+                print("[PositionCache] Saved \(frames.count) frames to cache (\(data.count / 1024)KB)")
+            } catch {
+                print("[PositionCache] Failed to save frames: \(error)")
+            }
+        }
+
+        print("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)")
+    }
+
+    /// Get the cached frames if they exist and haven't expired
+    private func getCachedFrames() -> (frames: [TimelineFrame], currentIndex: Int)? {
+        let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
+        guard savedAt > 0 else { return nil }
+
+        let savedAtDate = Date(timeIntervalSince1970: savedAt)
+        let elapsed = Date().timeIntervalSince(savedAtDate)
+
+        // Check if cache has expired
+        if elapsed > Self.cacheExpirationSeconds {
+            print("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)")
+            clearCachedPosition()
+            return nil
+        }
+
+        // Load cached current index
+        let cachedIndex = UserDefaults.standard.integer(forKey: Self.cachedCurrentIndexKey)
+
+        // Load cached frames from disk
+        do {
+            let data = try Data(contentsOf: Self.cachedFramesPath)
+            let framesWithVideoInfo = try JSONDecoder().decode([FrameWithVideoInfo].self, from: data)
+
+            guard !framesWithVideoInfo.isEmpty else { return nil }
+
+            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            let validIndex = max(0, min(cachedIndex, timelineFrames.count - 1))
+
+            print("[PositionCache] Loaded \(timelineFrames.count) cached frames (saved \(Int(elapsed))s ago)")
+            return (frames: timelineFrames, currentIndex: validIndex)
+        } catch {
+            print("[PositionCache] Failed to load cached frames: \(error)")
+            return nil
+        }
+    }
+
+    /// Get the cached position (timestamp only) if it exists and hasn't expired
+    /// This is the fallback if frame cache is not available
     private func getCachedPosition() -> Date? {
         let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
         guard savedAt > 0 else { return nil }
@@ -255,49 +526,115 @@ public class SimpleTimelineViewModel: ObservableObject {
         return position
     }
 
-    /// Clear the cached position
+    /// Clear the cached position and frames
     private func clearCachedPosition() {
         UserDefaults.standard.removeObject(forKey: Self.cachedPositionTimestampKey)
         UserDefaults.standard.removeObject(forKey: Self.cachedPositionSavedAtKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedCurrentIndexKey)
+
+        // Remove cached frames file
+        try? FileManager.default.removeItem(at: Self.cachedFramesPath)
     }
 
     // MARK: - Initial Load
 
-    /// Load the most recent frame on startup
+    /// Load the most recent frame on startup, or restore to cached position if available
     public func loadMostRecentFrame() async {
         isLoading = true
         error = nil
 
-        do {
-            // Get the most recent frames directly (no need for timestamp + window query)
-            let rawFrames = try await coordinator.getMostRecentFrames(limit: 500)
+        // FIRST: Try to restore from cached frames (instant restore - no database query!)
+        if let cached = getCachedFrames() {
+            print("[PositionCache] INSTANT RESTORE: Using \(cached.frames.count) cached frames, index: \(cached.currentIndex)")
 
-            guard !rawFrames.isEmpty else {
+            frames = cached.frames
+            currentIndex = cached.currentIndex
+
+            // Initialize window boundary timestamps for infinite scroll
+            updateWindowBoundaries()
+            hasMoreOlder = true
+            hasMoreNewer = true
+
+            // Clear the cache after restoring
+            clearCachedPosition()
+
+            // Load image if needed for current frame
+            loadImageIfNeeded()
+
+            isLoading = false
+            return
+        }
+
+        do {
+            // SECOND: Try cached position (timestamp only) - requires database query
+            if let cachedPosition = getCachedPosition() {
+                print("[PositionCache] Found cached position: \(cachedPosition), loading frames around it")
+
+                // Load frames around the cached position (±10 minutes window, like date search)
+                // Uses optimized query that JOINs on video table - no N+1 queries!
+                let calendar = Calendar.current
+                let startDate = calendar.date(byAdding: .minute, value: -10, to: cachedPosition) ?? cachedPosition
+                let endDate = calendar.date(byAdding: .minute, value: 10, to: cachedPosition) ?? cachedPosition
+
+                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+
+                if !framesWithVideoInfo.isEmpty {
+                    // Convert to TimelineFrame - video info is already included from the JOIN
+                    frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+
+                    // Initialize window boundary timestamps for infinite scroll
+                    updateWindowBoundaries()
+                    hasMoreOlder = true
+                    hasMoreNewer = true
+
+                    // Find the frame closest to the cached position
+                    let closestIndex = findClosestFrameIndex(to: cachedPosition)
+                    currentIndex = closestIndex
+                    print("[PositionCache] Restored to cached position, index: \(closestIndex), frame count: \(frames.count)")
+
+                    // Clear the cache after restoring
+                    clearCachedPosition()
+
+                    // Load image if needed for current frame
+                    loadImageIfNeeded()
+
+                    isLoading = false
+                    return
+                } else {
+                    print("[PositionCache] No frames found around cached position, falling back to most recent")
+                    clearCachedPosition()
+                }
+            }
+
+            // No cached position (or cache was empty) - load most recent frames
+            // Uses optimized query that JOINs on video table - no N+1 queries!
+            let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500)
+
+            guard !framesWithVideoInfo.isEmpty else {
                 error = "No frames found in any database"
                 isLoading = false
                 return
             }
 
-            // Preload video info for ALL frames upfront
-            var timelineFrames: [TimelineFrame] = []
-            for frame in rawFrames {
-                let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.segmentID,
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
-            }
-
+            // Convert to TimelineFrame - video info is already included from the JOIN
             // Reverse so oldest is first (index 0), newest is last
             // This matches the timeline UI which displays left-to-right as past-to-future
-            frames = timelineFrames.reversed()
+            frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Initialize window boundary timestamps for infinite scroll
             updateWindowBoundaries()
 
             // Log the first and last few frames to verify ordering
             print("[SimpleTimelineViewModel] Loaded \(frames.count) frames")
+
+            // Log initial memory state
+            MemoryTracker.logMemoryState(
+                context: "INITIAL LOAD",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
             if frames.count > 0 {
                 print("[SimpleTimelineViewModel] First 3 frames (should be oldest):")
                 for i in 0..<min(3, frames.count) {
@@ -311,18 +648,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
-            // Check for cached position first, otherwise start at most recent
-            if let cachedPosition = getCachedPosition() {
-                // Find the frame closest to the cached position
-                let closestIndex = findClosestFrameIndex(to: cachedPosition)
-                currentIndex = closestIndex
-                print("[PositionCache] Restored to cached position, index: \(closestIndex)")
-                // Clear the cache after restoring
-                clearCachedPosition()
-            } else {
-                // Start at the most recent frame (last in array since sorted ascending, oldest first)
-                currentIndex = frames.count - 1
-            }
+            // Start at the most recent frame (last in array since sorted ascending, oldest first)
+            currentIndex = frames.count - 1
 
             // Load image if needed for current frame
             loadImageIfNeeded()
@@ -350,6 +677,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if we need to load more frames (infinite scroll)
         checkAndLoadMoreFrames()
+
+        // Periodic memory state logging
+        navigationCounter += 1
+        if navigationCounter % Self.memoryLogInterval == 0 {
+            MemoryTracker.logMemoryState(
+                context: "PERIODIC (nav #\(navigationCounter))",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
+        }
     }
 
     /// Load image for image-based frames (Retrace) if needed
@@ -378,6 +717,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     timestamp: frame.timestamp
                 )
                 if let image = NSImage(data: imageData) {
+                    // Prune cache if it's getting too large
+                    pruneImageCacheIfNeeded()
+
                     imageCache[frame.id] = image
                     // Only update if we're still on the same frame
                     if currentTimelineFrame?.frame.id == frame.id {
@@ -387,6 +729,31 @@ public class SimpleTimelineViewModel: ObservableObject {
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
             }
+        }
+    }
+
+    /// Prune image cache if it exceeds maximum size
+    private func pruneImageCacheIfNeeded() {
+        guard imageCache.count >= Self.maxImageCacheSize else { return }
+
+        // Get valid frame IDs (frames currently in the window)
+        let validFrameIDs = Set(frames.map { $0.frame.id })
+
+        // Remove images for frames that are no longer in the window
+        let oldCount = imageCache.count
+        imageCache = imageCache.filter { validFrameIDs.contains($0.key) }
+
+        let removedCount = oldCount - imageCache.count
+        if removedCount > 0 {
+            Log.info("[Memory] Pruned \(removedCount) images from cache (frames no longer in window)", category: .ui)
+        }
+
+        // If still too large, remove oldest entries (keep half)
+        if imageCache.count >= Self.maxImageCacheSize {
+            let toRemove = imageCache.count - (Self.maxImageCacheSize / 2)
+            let keysToRemove = Array(imageCache.keys.prefix(toRemove))
+            keysToRemove.forEach { imageCache.removeValue(forKey: $0) }
+            Log.info("[Memory] Force-pruned \(toRemove) images from cache (cache overflow)", category: .ui)
         }
     }
 
@@ -487,27 +854,25 @@ public class SimpleTimelineViewModel: ObservableObject {
             print("[DateSearch] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))")
 
             // Fetch all frames in the 20-minute window
-            let rawFrames = try await coordinator.getFrames(from: startDate, to: endDate, limit: 1000)
-            print("[DateSearch] Got \(rawFrames.count) frames")
+            // Uses optimized query that JOINs on video table - no N+1 queries!
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            print("[DateSearch] Got \(framesWithVideoInfo.count) frames")
 
-            guard !rawFrames.isEmpty else {
+            guard !framesWithVideoInfo.isEmpty else {
                 error = "No frames found around \(targetDate)"
                 isLoading = false
                 return
             }
 
-            // Preload video info for all frames
-            var timelineFrames: [TimelineFrame] = []
-            for frame in rawFrames {
-                let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.segmentID,
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            // Clear old image cache since we're jumping to a new time window
+            let oldCacheCount = imageCache.count
+            imageCache.removeAll()
+            if oldCacheCount > 0 {
+                Log.info("[Memory] Cleared image cache on date search (\(oldCacheCount) images removed)", category: .ui)
             }
 
-            frames = timelineFrames
+            // Convert to TimelineFrame - video info is already included from the JOIN
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Reset infinite scroll state for new window
             updateWindowBoundaries()
@@ -520,6 +885,15 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Load image if needed
             loadImageIfNeeded()
+
+            // Log memory state after date search
+            MemoryTracker.logMemoryState(
+                context: "DATE SEARCH COMPLETE",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
 
             isLoading = false
             isDateSearchActive = false
@@ -747,41 +1121,40 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             // Query frames before the oldest timestamp
-            let rawFrames = try await coordinator.getFramesBefore(
+            // Uses optimized query that JOINs on video table - no N+1 queries!
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
                 timestamp: oldestTimestamp,
                 limit: WindowConfig.loadBatchSize
             )
 
-            guard !rawFrames.isEmpty else {
+            guard !framesWithVideoInfo.isEmpty else {
                 print("[InfiniteScroll] No more older frames available")
                 hasMoreOlder = false
                 isLoadingOlder = false
                 return
             }
 
-            print("[InfiniteScroll] Got \(rawFrames.count) older frames")
+            print("[InfiniteScroll] Got \(framesWithVideoInfo.count) older frames")
 
-            // Preload video info for the new frames
-            var newTimelineFrames: [TimelineFrame] = []
-            for frame in rawFrames {
-                let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.segmentID,
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                newTimelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
-            }
-
-            // rawFrames are returned DESC (newest first), reverse to get ASC (oldest first)
-            newTimelineFrames.reverse()
+            // Convert to TimelineFrame - video info is already included from the JOIN
+            // framesWithVideoInfo are returned DESC (newest first), reverse to get ASC (oldest first)
+            let newTimelineFrames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Prepend to existing frames
+            let beforeCount = frames.count
             frames = newTimelineFrames + frames
 
             // Adjust currentIndex to maintain position
             currentIndex += newTimelineFrames.count
 
-            print("[InfiniteScroll] Prepended \(newTimelineFrames.count) frames, total now \(frames.count), currentIndex adjusted to \(currentIndex)")
+            Log.info("[Memory] LOADED OLDER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count)), index adjusted to \(currentIndex)", category: .ui)
+            MemoryTracker.logMemoryState(
+                context: "AFTER LOAD OLDER",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
 
             // Update window boundaries
             updateWindowBoundaries()
@@ -807,37 +1180,37 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             // Query frames after the newest timestamp
-            let rawFrames = try await coordinator.getFramesAfter(
+            // Uses optimized query that JOINs on video table - no N+1 queries!
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
                 timestamp: newestTimestamp,
                 limit: WindowConfig.loadBatchSize
             )
 
-            guard !rawFrames.isEmpty else {
+            guard !framesWithVideoInfo.isEmpty else {
                 print("[InfiniteScroll] No more newer frames available")
                 hasMoreNewer = false
                 isLoadingNewer = false
                 return
             }
 
-            print("[InfiniteScroll] Got \(rawFrames.count) newer frames")
+            print("[InfiniteScroll] Got \(framesWithVideoInfo.count) newer frames")
 
-            // Preload video info for the new frames
-            var newTimelineFrames: [TimelineFrame] = []
-            for frame in rawFrames {
-                let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.segmentID,
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                newTimelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
-            }
-
-            // rawFrames are returned ASC (oldest first), which is correct for appending
+            // Convert to TimelineFrame - video info is already included from the JOIN
+            // framesWithVideoInfo are returned ASC (oldest first), which is correct for appending
+            let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Append to existing frames
+            let beforeCount = frames.count
             frames = frames + newTimelineFrames
 
-            print("[InfiniteScroll] Appended \(newTimelineFrames.count) frames, total now \(frames.count)")
+            Log.info("[Memory] LOADED NEWER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count))", category: .ui)
+            MemoryTracker.logMemoryState(
+                context: "AFTER LOAD NEWER",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
 
             // Update window boundaries
             updateWindowBoundaries()
@@ -864,18 +1237,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard frames.count > WindowConfig.maxFrames else { return }
 
         let excessCount = frames.count - WindowConfig.maxFrames
+        let beforeCount = frames.count
 
         switch preserveDirection {
         case .older:
             // User is scrolling toward older, trim newer frames from end
-            print("[InfiniteScroll] Trimming \(excessCount) newer frames from end")
+            Log.info("[Memory] TRIMMING \(excessCount) newer frames from END (preserving older)", category: .ui)
             frames = Array(frames.dropLast(excessCount))
             // Mark that there might be more newer frames now
             hasMoreNewer = true
 
         case .newer:
             // User is scrolling toward newer, trim older frames from start
-            print("[InfiniteScroll] Trimming \(excessCount) older frames from start")
+            Log.info("[Memory] TRIMMING \(excessCount) older frames from START (preserving newer)", category: .ui)
             frames = Array(frames.dropFirst(excessCount))
             // Adjust currentIndex
             currentIndex = max(0, currentIndex - excessCount)
@@ -885,6 +1259,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Update boundaries after trimming
         updateWindowBoundaries()
-        print("[InfiniteScroll] After trim: \(frames.count) frames, currentIndex=\(currentIndex)")
+
+        // Log the memory state after trimming
+        MemoryTracker.logMemoryState(
+            context: "AFTER TRIM (\(beforeCount)→\(frames.count))",
+            frameCount: frames.count,
+            imageCacheCount: imageCache.count,
+            oldestTimestamp: oldestLoadedTimestamp,
+            newestTimestamp: newestLoadedTimestamp
+        )
     }
 }
