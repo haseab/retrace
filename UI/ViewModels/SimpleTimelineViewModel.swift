@@ -614,15 +614,15 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Check if we need to load more frames based on current position
     private func checkAndLoadMoreFrames() {
-        // Check if at the oldest frame (first frame, index 0)
-        if currentIndex == 0 && hasMoreOlder && !isLoadingOlder {
+        // Check if approaching the older end (left side of timeline)
+        if currentIndex < WindowConfig.loadThreshold && hasMoreOlder && !isLoadingOlder {
             Task {
                 await loadOlderFrames()
             }
         }
 
-        // Check if at the newest frame (last frame)
-        if currentIndex == frames.count - 1 && hasMoreNewer && !isLoadingNewer {
+        // Check if approaching the newer end (right side of timeline)
+        if currentIndex > frames.count - WindowConfig.loadThreshold && hasMoreNewer && !isLoadingNewer {
             Task {
                 await loadNewerFrames()
             }
