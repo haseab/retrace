@@ -6,7 +6,12 @@ import App
 
 /// Shared timeline configuration
 public enum TimelineConfig {
-    public static let pixelsPerFrame: CGFloat = 45.0
+    /// Base pixels per frame at 100% zoom (max detail)
+    public static let basePixelsPerFrame: CGFloat = 75.0
+    /// Minimum pixels per frame at 0% zoom (most zoomed out)
+    public static let minPixelsPerFrame: CGFloat = 8.0
+    /// Default zoom level (0.0 to 1.0, where 1.0 is max detail)
+    public static let defaultZoomLevel: CGFloat = 0.6
 }
 
 /// Configuration for infinite scroll rolling window
@@ -37,8 +42,9 @@ public struct AppBlock: Identifiable {
     public let endIndex: Int
     public let frameCount: Int
 
-    public var width: CGFloat {
-        CGFloat(frameCount) * TimelineConfig.pixelsPerFrame
+    /// Calculate width based on current pixels per frame
+    public func width(pixelsPerFrame: CGFloat) -> CGFloat {
+        CGFloat(frameCount) * pixelsPerFrame
     }
 }
 
@@ -84,6 +90,47 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Date search text input
     @Published public var dateSearchText = ""
+
+    /// Zoom level (0.0 to 1.0, where 1.0 is max detail/zoomed in)
+    @Published public var zoomLevel: CGFloat = TimelineConfig.defaultZoomLevel
+
+    /// Whether the zoom slider is expanded/visible
+    @Published public var isZoomSliderExpanded = false
+
+    // MARK: - Zoom Computed Properties
+
+    /// Current pixels per frame based on zoom level
+    public var pixelsPerFrame: CGFloat {
+        let range = TimelineConfig.basePixelsPerFrame - TimelineConfig.minPixelsPerFrame
+        return TimelineConfig.minPixelsPerFrame + (range * zoomLevel)
+    }
+
+    /// Frame skip factor - how many frames to skip when displaying
+    /// At 50%+ zoom, show all frames (skip = 1)
+    /// Below 50%, progressively skip more frames
+    public var frameSkipFactor: Int {
+        if zoomLevel >= 0.5 {
+            return 1 // Show all frames
+        }
+        // Below 50% zoom, calculate skip factor
+        // At 0% zoom: skip factor of ~5
+        // At 25% zoom: skip factor of ~3
+        // At 50% zoom: skip factor of 1
+        let skipRange = zoomLevel / 0.5 // 0.0 to 1.0 within the 0-50% range
+        let maxSkip = 5
+        let skip = Int(round(CGFloat(maxSkip) - (skipRange * CGFloat(maxSkip - 1))))
+        return max(1, skip)
+    }
+
+    /// Visible frames accounting for skip factor
+    public var visibleFrameIndices: [Int] {
+        let skip = frameSkipFactor
+        if skip == 1 {
+            return Array(0..<frames.count)
+        }
+        // Return every Nth frame index
+        return stride(from: 0, to: frames.count, by: skip).map { $0 }
+    }
 
     // MARK: - Derived Properties (computed from currentIndex)
 
@@ -155,6 +202,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether there's more data available in the newer direction
     private var hasMoreNewer = true
 
+    // MARK: - Position Cache (for restoring position on reopen)
+
+    /// Key for storing cached position timestamp in UserDefaults
+    private static let cachedPositionTimestampKey = "timeline.cachedPositionTimestamp"
+    /// Key for storing when the cache was saved
+    private static let cachedPositionSavedAtKey = "timeline.cachedPositionSavedAt"
+    /// How long the cached position remains valid (2 minutes)
+    private static let cacheExpirationSeconds: TimeInterval = 120
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -163,6 +219,46 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+    }
+
+    // MARK: - Position Cache Methods
+
+    /// Save the current playhead position to cache
+    public func savePosition() {
+        guard let timestamp = currentTimestamp else { return }
+
+        UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
+        print("[PositionCache] Saved position: \(timestamp)")
+    }
+
+    /// Get the cached position if it exists and hasn't expired
+    private func getCachedPosition() -> Date? {
+        let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
+        guard savedAt > 0 else { return nil }
+
+        let savedAtDate = Date(timeIntervalSince1970: savedAt)
+        let elapsed = Date().timeIntervalSince(savedAtDate)
+
+        // Check if cache has expired
+        if elapsed > Self.cacheExpirationSeconds {
+            print("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)")
+            clearCachedPosition()
+            return nil
+        }
+
+        let cachedTimestamp = UserDefaults.standard.double(forKey: Self.cachedPositionTimestampKey)
+        guard cachedTimestamp > 0 else { return nil }
+
+        let position = Date(timeIntervalSince1970: cachedTimestamp)
+        print("[PositionCache] Found valid cached position: \(position) (saved \(Int(elapsed))s ago)")
+        return position
+    }
+
+    /// Clear the cached position
+    private func clearCachedPosition() {
+        UserDefaults.standard.removeObject(forKey: Self.cachedPositionTimestampKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedPositionSavedAtKey)
     }
 
     // MARK: - Initial Load
@@ -215,8 +311,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
-            // Start at the most recent frame (last in array since sorted ascending, oldest first)
-            currentIndex = frames.count - 1
+            // Check for cached position first, otherwise start at most recent
+            if let cachedPosition = getCachedPosition() {
+                // Find the frame closest to the cached position
+                let closestIndex = findClosestFrameIndex(to: cachedPosition)
+                currentIndex = closestIndex
+                print("[PositionCache] Restored to cached position, index: \(closestIndex)")
+                // Clear the cache after restoring
+                clearCachedPosition()
+            } else {
+                // Start at the most recent frame (last in array since sorted ascending, oldest first)
+                currentIndex = frames.count - 1
+            }
 
             // Load image if needed for current frame
             loadImageIfNeeded()
@@ -295,18 +401,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         scrollAccumulator += delta
 
         // Convert to frame steps
-        // With sensitivity 0.1: need ~10 units of scroll to move 1 frame
-        let sensitivity: CGFloat = 0.05
-        let frameStep = Int(scrollAccumulator * sensitivity)
+        // Base sensitivity at default zoom level (60%)
+        // Scale sensitivity inversely with pixelsPerFrame to maintain consistent visual scroll speed
+        // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
+        // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
+        let baseSensitivity: CGFloat = 0.05
+        let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
+        let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
 
-        // print("[SimpleTimelineViewModel] handleScroll: delta=\(delta), accumulator=\(scrollAccumulator), frameStep=\(frameStep)")
+        let frameStep = Int(scrollAccumulator * zoomAdjustedSensitivity)
 
         guard frameStep != 0 else { return }
 
         // Reset accumulator after navigating
         scrollAccumulator = 0
-
-        // print("[SimpleTimelineViewModel] Navigating from \(currentIndex) to \(currentIndex + frameStep)")
 
         // Navigate
         navigateToFrame(currentIndex + frameStep)

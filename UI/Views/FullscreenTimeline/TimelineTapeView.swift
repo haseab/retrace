@@ -14,7 +14,7 @@ public struct TimelineTapeView: View {
     // Tape dimensions
     private let tapeHeight: CGFloat = 40
     private let blockSpacing: CGFloat = 2
-    private var pixelsPerFrame: CGFloat { TimelineConfig.pixelsPerFrame }
+    private var pixelsPerFrame: CGFloat { viewModel.pixelsPerFrame }
 
     // MARK: - Body
 
@@ -43,7 +43,6 @@ public struct TimelineTapeView: View {
             // Calculate offset to center current frame
             let currentFrameOffset = offsetForFrame(viewModel.currentIndex, in: blocks)
             let tapeOffset = centerX - currentFrameOffset
-            let _ = print("[Tape] currentIndex=\(viewModel.currentIndex), offset=\(tapeOffset), blocks=\(blocks.count)")
 
             HStack(spacing: blockSpacing) {
                 ForEach(blocks) { block in
@@ -52,6 +51,7 @@ public struct TimelineTapeView: View {
             }
             .offset(x: tapeOffset)
             .animation(.interactiveSpring(response: 0.3, dampingFraction: 0.8), value: viewModel.currentIndex)
+            .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }
 
@@ -60,12 +60,13 @@ public struct TimelineTapeView: View {
     private func appBlockView(block: AppBlock) -> some View {
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
         let color = blockColor(for: block)
+        let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
 
         return ZStack {
             // Background block
             RoundedRectangle(cornerRadius: 4)
                 .fill(color)
-                .frame(width: block.width, height: 30)
+                .frame(width: blockWidth, height: 30)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
                         .stroke(isCurrentBlock ? Color.white : Color.clear, lineWidth: 1.5)
@@ -73,7 +74,7 @@ public struct TimelineTapeView: View {
                 .opacity(isCurrentBlock ? 1.0 : 0.7)
 
             // App icon (only show if block is wide enough)
-            if block.width > 40, let bundleID = block.bundleID {
+            if blockWidth > 40, let bundleID = block.bundleID {
                 appIcon(for: bundleID)
                     .frame(width: 22, height: 22)
             }
@@ -98,7 +99,7 @@ public struct TimelineTapeView: View {
                 break
             } else {
                 // Add full block width (spacing handled separately)
-                offset += block.width
+                offset += block.width(pixelsPerFrame: pixelsPerFrame)
                 blockCount += 1
             }
         }
@@ -136,56 +137,57 @@ public struct TimelineTapeView: View {
             let centerX = geometry.size.width / 2
 
             ZStack {
-                // Playhead indicator (fixed at center) - Rewind style
-                VStack(spacing: 0) {
-                    // Normal date/time display - clickable button with Rewind-style rounded borders
-                    Button(action: {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            viewModel.isDateSearchActive = true
-                        }
-                    }) {
-                        HStack(spacing: 8) {
-                            Text(viewModel.currentDateString)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundColor(.white.opacity(0.7))
-
-                            Text(viewModel.currentTimeString)
-                                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.white)
-
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.white.opacity(0.4))
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(
-                            Capsule()
-                                .fill(Color.black.opacity(0.75))
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                        )
+                // Datetime button (truly centered)
+                Button(action: {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        viewModel.isDateSearchActive = true
                     }
-                    .buttonStyle(.plain)
-                    .offset(y: -12)
-                    .opacity(viewModel.isDateSearchActive ? 0.3 : 1.0)
-                    .onHover { isHovering in
-                        if isHovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
-                    }
+                }) {
+                    HStack(spacing: 8) {
+                        Text(viewModel.currentDateString)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(.white.opacity(0.7))
 
-                    // Simple white vertical line (thicker and taller)
-                    Rectangle()
-                        .fill(Color.white)
-                        .frame(width: 3, height: tapeHeight * 2.5)
+                        Text(viewModel.currentTimeString)
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white)
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.75))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                    )
                 }
-                .position(x: centerX, y: tapeHeight / 2)
+                .buttonStyle(.plain)
+                .opacity(viewModel.isDateSearchActive ? 0.3 : 1.0)
+                .onHover { isHovering in
+                    if isHovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+                .position(x: centerX, y: -55)
                 .animation(.easeOut(duration: 0.2), value: viewModel.isDateSearchActive)
+
+                // Zoom control (pinned to right side)
+                ZoomControl(viewModel: viewModel)
+                    .position(x: geometry.size.width - 100, y: -55)
+
+                // Playhead vertical line (fixed at center)
+                Rectangle()
+                    .fill(Color.white)
+                    .frame(width: 3, height: tapeHeight * 2.5)
+                    .position(x: centerX, y: tapeHeight / 2)
 
                 // Floating search input (appears above the datetime button when active)
                 if viewModel.isDateSearchActive {
@@ -211,6 +213,132 @@ public struct TimelineTapeView: View {
         }
     }
 
+}
+
+// MARK: - Zoom Control
+
+/// Zoom control that expands from a magnifier button to a slider
+struct ZoomControl: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Zoom out icon (when expanded)
+            if viewModel.isZoomSliderExpanded {
+                Image(systemName: "minus.magnifyingglass")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+                    .transition(.opacity.combined(with: .scale))
+            }
+
+            // Slider (when expanded)
+            if viewModel.isZoomSliderExpanded {
+                ZoomSlider(value: $viewModel.zoomLevel)
+                    .frame(width: 100)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .trailing)))
+            }
+
+            // Zoom in icon (when expanded)
+            if viewModel.isZoomSliderExpanded {
+                Image(systemName: "plus.magnifyingglass")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+                    .transition(.opacity.combined(with: .scale))
+            }
+
+            // Magnifier button (always visible)
+            Button(action: {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    viewModel.isZoomSliderExpanded.toggle()
+                }
+            }) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
+                    .frame(width: 32, height: 32)
+                    .background(
+                        Circle()
+                            .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color.black.opacity(0.5))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
+        }
+        .padding(.horizontal, viewModel.isZoomSliderExpanded ? 12 : 0)
+        .padding(.vertical, viewModel.isZoomSliderExpanded ? 8 : 0)
+        .background(
+            Group {
+                if viewModel.isZoomSliderExpanded {
+                    Capsule()
+                        .fill(Color.black.opacity(0.75))
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                        )
+                }
+            }
+        )
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isZoomSliderExpanded)
+    }
+}
+
+// MARK: - Zoom Slider
+
+/// Custom slider for zoom control with Rewind-style appearance
+struct ZoomSlider: View {
+    @Binding var value: CGFloat
+
+    @State private var isDragging = false
+
+    var body: some View {
+        GeometryReader { geometry in
+            let trackWidth = geometry.size.width
+            let thumbX = value * trackWidth
+
+            ZStack(alignment: .leading) {
+                // Track background
+                Capsule()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 4)
+
+                // Filled portion
+                Capsule()
+                    .fill(Color.retraceAccent.opacity(0.8))
+                    .frame(width: thumbX, height: 4)
+
+                // Thumb
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: isDragging ? 14 : 10, height: isDragging ? 14 : 10)
+                    .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+                    .offset(x: thumbX - (isDragging ? 7 : 5))
+                    .animation(.spring(response: 0.2, dampingFraction: 0.7), value: isDragging)
+            }
+            .frame(height: geometry.size.height)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        isDragging = true
+                        let newValue = gesture.location.x / trackWidth
+                        value = max(0, min(1, newValue))
+                    }
+                    .onEnded { _ in
+                        isDragging = false
+                    }
+            )
+        }
+        .frame(height: 20)
+    }
 }
 
 // MARK: - Floating Date Search Panel

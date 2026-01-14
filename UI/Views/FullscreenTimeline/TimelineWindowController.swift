@@ -100,6 +100,9 @@ public class TimelineWindowController: NSObject {
     public func hide() {
         guard isVisible, let window = window else { return }
 
+        // Save the current playhead position before closing
+        timelineViewModel?.savePosition()
+
         // Remove event monitors
         removeEventMonitors()
 
@@ -243,8 +246,6 @@ public class TimelineWindowController: NSObject {
 
         // Use horizontal scrolling primarily, fall back to vertical
         let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
-
-        // print("[TimelineWindowController] [\(source)] scroll: deltaX=\(deltaX), deltaY=\(deltaY), computed=\(delta)")
 
         if abs(delta) > 0.1 {
             onScroll?(delta)
