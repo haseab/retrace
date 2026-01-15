@@ -13,6 +13,7 @@ public class SearchViewModel: ObservableObject {
     @Published public var searchQuery: String = ""
     @Published public var results: SearchResults?
     @Published public var isSearching = false
+    @Published public var isLoadingMore = false
     @Published public var error: String?
 
     // Filters
@@ -24,6 +25,9 @@ public class SearchViewModel: ObservableObject {
     // Selected result
     @Published public var selectedResult: SearchResult?
     @Published public var showingFrameViewer = false
+
+    // Scroll position - persists across overlay open/close
+    public var savedScrollPosition: CGFloat = 0
 
     // MARK: - Dependencies
 
@@ -45,13 +49,13 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Setup
 
     private func setupBindings() {
-        // Debounce search query
+        // NOTE: Auto-search on typing is disabled - search is triggered manually on Enter
+        // Clear results when query is cleared
         $searchQuery
-            .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
             .removeDuplicates()
             .sink { [weak self] query in
-                Task {
-                    await self?.performSearch(query: query)
+                if query.isEmpty {
+                    self?.results = nil
                 }
             }
             .store(in: &cancellables)
@@ -75,28 +79,49 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Search
 
+    /// Trigger search with current query (called on Enter key)
+    public func submitSearch() {
+        Task {
+            await performSearch(query: searchQuery)
+        }
+    }
+
     public func performSearch(query: String) async {
         guard !query.isEmpty else {
+            Log.debug("[SearchViewModel] Empty query, clearing results", category: .ui)
             results = nil
             return
         }
 
+        Log.info("[SearchViewModel] Performing search for: '\(query)'", category: .ui)
         isSearching = true
         error = nil
 
         do {
             let searchQuery = buildSearchQuery(query)
+            Log.debug("[SearchViewModel] Built search query: text='\(searchQuery.text)', limit=\(searchQuery.limit), offset=\(searchQuery.offset)", category: .ui)
+
+            let startTime = Date()
             let searchResults = try await coordinator.search(query: searchQuery)
+            let elapsed = Date().timeIntervalSince(startTime) * 1000
+
+            Log.info("[SearchViewModel] Search completed in \(Int(elapsed))ms: \(searchResults.results.count) results (total: \(searchResults.totalCount))", category: .ui)
+
+            if !searchResults.results.isEmpty {
+                let firstResult = searchResults.results[0]
+                Log.debug("[SearchViewModel] First result: frameID=\(firstResult.frameID.stringValue), timestamp=\(firstResult.timestamp), snippet='\(firstResult.snippet.prefix(50))...'", category: .ui)
+            }
 
             results = searchResults
             isSearching = false
         } catch {
+            Log.error("[SearchViewModel] Search failed: \(error.localizedDescription)", category: .ui)
             self.error = "Search failed: \(error.localizedDescription)"
             isSearching = false
         }
     }
 
-    private func buildSearchQuery(_ text: String) -> SearchQuery {
+    private func buildSearchQuery(_ text: String, offset: Int = 0) -> SearchQuery {
         let filters = SearchFilters(
             startDate: startDate,
             endDate: endDate,
@@ -108,8 +133,45 @@ public class SearchViewModel: ObservableObject {
             text: text,
             filters: filters,
             limit: defaultResultLimit,
-            offset: 0
+            offset: offset
         )
+    }
+
+    // MARK: - Load More (Infinite Scroll)
+
+    /// Whether more results can be loaded
+    public var canLoadMore: Bool {
+        guard let results = results else { return false }
+        return results.hasMore && !isLoadingMore && !isSearching
+    }
+
+    /// Load more results for infinite scroll
+    public func loadMore() async {
+        guard canLoadMore, let currentResults = results else { return }
+
+        Log.info("[SearchViewModel] Loading more results, current count: \(currentResults.results.count)", category: .ui)
+        isLoadingMore = true
+
+        do {
+            let query = buildSearchQuery(searchQuery, offset: currentResults.results.count)
+            let moreResults = try await coordinator.search(query: query)
+
+            Log.info("[SearchViewModel] Loaded \(moreResults.results.count) more results", category: .ui)
+
+            // Append new results to existing
+            let combinedResults = currentResults.results + moreResults.results
+            results = SearchResults(
+                query: moreResults.query,
+                results: combinedResults,
+                totalCount: moreResults.totalCount,
+                searchTimeMs: moreResults.searchTimeMs
+            )
+
+            isLoadingMore = false
+        } catch {
+            Log.error("[SearchViewModel] Load more failed: \(error.localizedDescription)", category: .ui)
+            isLoadingMore = false
+        }
     }
 
     // MARK: - Result Selection

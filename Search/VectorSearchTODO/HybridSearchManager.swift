@@ -283,7 +283,7 @@ public actor HybridSearchManager: SearchProtocol {
                         metadata: FrameMetadata(
                             appBundleID: nil,
                             appName: document?.appName,
-                            windowTitle: document?.windowTitle,
+                            windowName: document?.windowName,
                             browserURL: document?.browserURL
                         ),
                         segmentID: frame.segmentID,

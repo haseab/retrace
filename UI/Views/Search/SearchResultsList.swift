@@ -53,7 +53,7 @@ struct SearchResultsList_Previews: PreviewProvider {
                 metadata: FrameMetadata(
                     appBundleID: "com.google.Chrome",
                     appName: "Chrome",
-                    windowTitle: "GitHub",
+                    windowName: "GitHub",
                     browserURL: "https://github.com",
                     displayID: 0
                 ),
@@ -69,7 +69,7 @@ struct SearchResultsList_Previews: PreviewProvider {
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.dt.Xcode",
                     appName: "Xcode",
-                    windowTitle: "AppDelegate.swift",
+                    windowName: "AppDelegate.swift",
                     browserURL: nil,
                     displayID: 0
                 ),
@@ -85,7 +85,7 @@ struct SearchResultsList_Previews: PreviewProvider {
                 metadata: FrameMetadata(
                     appBundleID: "com.apple.Terminal",
                     appName: "Terminal",
-                    windowTitle: nil,
+                    windowName: nil,
                     browserURL: nil,
                     displayID: 0
                 ),

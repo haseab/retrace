@@ -122,7 +122,7 @@ struct TimelineSegment_Previews: PreviewProvider {
                     id: AppSessionID(value: UUID()),
                     appBundleID: "com.google.Chrome",
                     appName: "Google Chrome",
-                    windowTitle: "GitHub",
+                    windowName: "GitHub",
                     startTime: Date().addingTimeInterval(-3600),
                     endTime: Date().addingTimeInterval(-1800)
                 ),
@@ -138,7 +138,7 @@ struct TimelineSegment_Previews: PreviewProvider {
                     id: AppSessionID(value: UUID()),
                     appBundleID: "com.apple.dt.Xcode",
                     appName: "Xcode",
-                    windowTitle: "Project.swift",
+                    windowName: "Project.swift",
                     startTime: Date().addingTimeInterval(-1800),
                     endTime: Date()
                 ),

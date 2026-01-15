@@ -10,7 +10,7 @@ enum DocumentQueries {
     static func insert(db: OpaquePointer, document: IndexedDocument) throws -> Int64 {
         let sql = """
             INSERT INTO documents (
-                frame_id, content, app_name, window_title, browser_url, timestamp
+                frame_id, content, app_name, window_name, browser_url, timestamp
             ) VALUES (?, ?, ?, ?, ?, ?);
             """
 
@@ -30,7 +30,7 @@ enum DocumentQueries {
         sqlite3_bind_text(statement, 1, document.frameID.stringValue, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 2, document.content, -1, SQLITE_TRANSIENT)
         bindTextOrNull(statement, 3, document.appName)
-        bindTextOrNull(statement, 4, document.windowTitle)
+        bindTextOrNull(statement, 4, document.windowName)
         bindTextOrNull(statement, 5, document.browserURL)
         sqlite3_bind_int64(statement, 6, Schema.dateToTimestamp(document.timestamp))
 
@@ -104,7 +104,7 @@ enum DocumentQueries {
 
     static func getByFrameID(db: OpaquePointer, frameID: FrameID) throws -> IndexedDocument? {
         let sql = """
-            SELECT id, frame_id, content, app_name, window_title, browser_url, timestamp
+            SELECT id, frame_id, content, app_name, window_name, browser_url, timestamp
             FROM documents
             WHERE frame_id = ?;
             """
@@ -176,7 +176,7 @@ enum DocumentQueries {
 
         // Columns 3-5: nullable metadata
         let appName = getTextOrNil(statement, 3)
-        let windowTitle = getTextOrNil(statement, 4)
+        let windowName = getTextOrNil(statement, 4)
         let browserURL = getTextOrNil(statement, 5)
 
         // Column 6: timestamp
@@ -189,7 +189,7 @@ enum DocumentQueries {
             timestamp: timestamp,
             content: content,
             appName: appName,
-            windowTitle: windowTitle,
+            windowName: windowName,
             browserURL: browserURL
         )
     }

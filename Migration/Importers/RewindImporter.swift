@@ -430,7 +430,7 @@ public actor RewindImporter: MigrationProtocol {
                     timestamp: frameTimestamp,
                     content: extractedText.fullText,
                     appName: extractedText.metadata.appName,
-                    windowTitle: extractedText.metadata.windowTitle,
+                    windowName: extractedText.metadata.windowName,
                     browserURL: extractedText.metadata.browserURL
                 )
                 _ = try await database.insertDocument(document)

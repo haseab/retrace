@@ -34,7 +34,7 @@ struct AppInfoProvider: Sendable {
         let appName = frontApp.localizedName
 
         // Get window title via Accessibility API
-        let windowTitle = getWindowTitle(for: frontApp.processIdentifier)
+        let windowName = getWindowTitle(for: frontApp.processIdentifier)
 
         // Get browser URL if applicable
         var browserURL: String? = nil
@@ -48,7 +48,7 @@ struct AppInfoProvider: Sendable {
         return FrameMetadata(
             appBundleID: bundleID,
             appName: appName,
-            windowTitle: windowTitle,
+            windowName: windowName,
             browserURL: browserURL,
             displayID: CGMainDisplayID()
         )

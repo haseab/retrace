@@ -110,7 +110,7 @@ public struct ResultRanker {
         var boost: Double = 0
 
         // Check window title
-        if let title = result.metadata.windowTitle {
+        if let title = result.metadata.windowName {
             let titleLower = title.lowercased()
             let matchCount = queryTerms.filter { titleLower.contains($0) }.count
             boost += Double(matchCount) * 0.3

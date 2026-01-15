@@ -225,7 +225,7 @@ public struct TimelineTapeView: View {
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
-                .position(x: geometry.size.width - 70, y: -55)
+                .position(x: geometry.size.width - 120, y: -55)
 
                 // Playhead vertical line (fixed at center)
                 Rectangle()
@@ -291,13 +291,13 @@ struct ZoomControl: View {
                     .transition(.opacity.combined(with: .scale))
             }
 
-            // Magnifier button (always visible)
+            // Zoom button (always visible)
             Button(action: {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                     viewModel.isZoomSliderExpanded.toggle()
                 }
             }) {
-                Image(systemName: "magnifyingglass")
+                Image(systemName: "plus.magnifyingglass")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
                     .frame(width: 32, height: 32)

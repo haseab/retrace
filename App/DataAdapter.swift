@@ -750,6 +750,29 @@ public actor DataAdapter {
         // Native source doesn't have this capability yet
         return []
     }
+
+    // MARK: - Full-Text Search
+
+    /// Search across all data sources
+    /// Prioritizes Rewind data source if available (since it has the most OCR data)
+    public func search(query: SearchQuery) async throws -> SearchResults {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        Log.info("[DataAdapter] Search request: '\(query.text)'", category: .app)
+
+        // Try Rewind data source first (if available and connected)
+        if let rewindSource = secondarySources[.rewind] as? RewindDataSource,
+           await rewindSource.isConnected {
+            Log.debug("[DataAdapter] Routing search to RewindDataSource", category: .app)
+            return try await rewindSource.search(query: query)
+        }
+
+        // Fallback to error if no searchable source available
+        Log.warning("[DataAdapter] No searchable data source available", category: .app)
+        throw DataAdapterError.sourceNotAvailable(.rewind)
+    }
 }
 
 // MARK: - Errors

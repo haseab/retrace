@@ -78,7 +78,7 @@ public actor ProcessingManager: ProcessingProtocol {
             metadata = FrameMetadata(
                 appBundleID: axResult.appInfo.bundleID,
                 appName: axResult.appInfo.name,
-                windowTitle: axResult.appInfo.windowTitle,
+                windowName: axResult.appInfo.windowName,
                 browserURL: axResult.appInfo.browserURL ?? frame.metadata.browserURL,
                 displayID: frame.metadata.displayID
             )

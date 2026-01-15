@@ -282,20 +282,20 @@ public actor AppCoordinator {
 
         // Check if app or window changed
         let appChanged = currentSession?.appBundleID != metadata.appBundleID
-        let windowChanged = currentSession?.windowTitle != metadata.windowTitle
+        let windowChanged = currentSession?.windowName != metadata.windowName
 
         if appChanged || windowChanged || currentSession == nil {
             // Close previous session
             if let session = currentSession {
                 try await services.database.updateSessionEndTime(id: session.id, endTime: frame.timestamp)
-                Log.debug("Closed session: \(session.appBundleID) - \(session.windowTitle ?? "nil")", category: .app)
+                Log.debug("Closed session: \(session.appBundleID) - \(session.windowName ?? "nil")", category: .app)
             }
 
             // Create new session
             let newSession = AppSession(
                 appBundleID: metadata.appBundleID ?? "unknown",
                 appName: metadata.appName,
-                windowTitle: metadata.windowTitle,
+                windowName: metadata.windowName,
                 browserURL: metadata.browserURL,
                 displayID: metadata.displayID,
                 startTime: frame.timestamp,
@@ -304,7 +304,7 @@ public actor AppCoordinator {
 
             try await services.database.insertSession(newSession)
             currentSession = newSession
-            Log.debug("Started session: \(newSession.appBundleID) - \(newSession.windowTitle ?? "nil")", category: .app)
+            Log.debug("Started session: \(newSession.appBundleID) - \(newSession.windowName ?? "nil")", category: .app)
         }
     }
 
@@ -326,12 +326,24 @@ public actor AppCoordinator {
 
     /// Search for text across all captured frames
     public func search(query: String, limit: Int = 50) async throws -> SearchResults {
-        try await services.search.search(text: query, limit: limit)
+        let searchQuery = SearchQuery(text: query, filters: .none, limit: limit, offset: 0)
+        return try await search(query: searchQuery)
     }
 
     /// Advanced search with filters
+    /// Routes to DataAdapter which prioritizes Rewind data source
     public func search(query: SearchQuery) async throws -> SearchResults {
-        try await services.search.search(query: query)
+        // Try DataAdapter first (routes to Rewind if available)
+        if let adapter = await services.dataAdapter {
+            do {
+                return try await adapter.search(query: query)
+            } catch {
+                Log.warning("[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)", category: .app)
+            }
+        }
+
+        // Fallback to native FTS search
+        return try await services.search.search(query: query)
     }
 
     // MARK: - Frame Retrieval
@@ -445,6 +457,28 @@ public actor AppCoordinator {
         }
 
         return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+    }
+
+    /// Get frames around a timestamp (before and after, centered on the timestamp)
+    /// Useful for navigating to a specific point in time from search results
+    public func getFramesAround(timestamp: Date, count: Int = 200) async throws -> [FrameReference] {
+        let halfCount = count / 2
+
+        // Get frames before and after the timestamp
+        async let framesBefore = getFramesBefore(timestamp: timestamp, limit: halfCount)
+        async let framesAfter = getFramesAfter(timestamp: timestamp, limit: halfCount)
+
+        let before = try await framesBefore
+        let after = try await framesAfter
+
+        // Combine: older frames first (reversed to chronological), then newer frames
+        // before is already in descending order (newest first), so reverse it
+        var combined = before.reversed() + after
+
+        // Sort by timestamp to ensure proper order
+        combined.sort { $0.timestamp < $1.timestamp }
+
+        return Array(combined)
     }
 
     /// Get the timestamp of the most recent frame across all sources

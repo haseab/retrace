@@ -311,7 +311,7 @@ struct FrameViewer_Previews: PreviewProvider {
                 metadata: FrameMetadata(
                     appBundleID: "com.google.Chrome",
                     appName: "Chrome",
-                    windowTitle: "GitHub",
+                    windowName: "GitHub",
                     browserURL: "https://github.com",
                     displayID: 0
                 ),

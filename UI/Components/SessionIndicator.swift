@@ -120,9 +120,9 @@ public struct SessionIndicator: View {
             }
 
             // Window title (if available)
-            if let windowTitle = session.windowTitle, !windowTitle.isEmpty {
+            if let windowName = session.windowName, !windowName.isEmpty {
                 Divider()
-                DetailRow(label: "Window", value: windowTitle)
+                DetailRow(label: "Window", value: windowName)
             }
 
             // URL (if browser)
@@ -214,7 +214,7 @@ struct SessionIndicator_Previews: PreviewProvider {
                     id: AppSessionID(value: UUID()),
                     appBundleID: "com.google.Chrome",
                     appName: "Chrome",
-                    windowTitle: "GitHub - retrace/main",
+                    windowName: "GitHub - retrace/main",
                     browserURL: "https://github.com/haseab/retrace",
                     displayID: nil,
                     startTime: Date().addingTimeInterval(-3600),
@@ -230,7 +230,7 @@ struct SessionIndicator_Previews: PreviewProvider {
                     id: AppSessionID(value: UUID()),
                     appBundleID: "com.apple.dt.Xcode",
                     appName: "Xcode",
-                    windowTitle: nil,
+                    windowName: nil,
                     browserURL: nil,
                     displayID: nil,
                     startTime: Date().addingTimeInterval(-1800),
@@ -246,7 +246,7 @@ struct SessionIndicator_Previews: PreviewProvider {
                     id: AppSessionID(value: UUID()),
                     appBundleID: "com.tinyspeck.slackmacgap",
                     appName: "Slack",
-                    windowTitle: nil,
+                    windowName: nil,
                     browserURL: nil,
                     displayID: nil,
                     startTime: Date().addingTimeInterval(-300),

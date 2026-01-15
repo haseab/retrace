@@ -42,16 +42,21 @@ public struct SimpleTimelineView: View {
                     )
                     .padding(.bottom, 20)
                 }
+                .offset(y: viewModel.areControlsHidden ? 150 : 0)
+                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
-                // Close button (top-right)
+                // Search and Close buttons (top-right)
                 VStack {
                     HStack {
                         Spacer()
+                        searchButton
                         closeButton
                     }
                     Spacer()
                 }
                 .padding(.spacingL)
+                .offset(y: viewModel.areControlsHidden ? -100 : 0)
+                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 // App info overlay (top-left) - timestamp now on playhead
                 VStack {
@@ -62,6 +67,8 @@ public struct SimpleTimelineView: View {
                     Spacer()
                 }
                 .padding(.spacingL)
+                .offset(y: viewModel.areControlsHidden ? -100 : 0)
+                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 // Loading overlay
                 if viewModel.isLoading {
@@ -88,6 +95,42 @@ public struct SimpleTimelineView: View {
                         }
                     )
                 }
+
+                // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
+                if viewModel.isSearchOverlayVisible {
+                    SpotlightSearchOverlay(
+                        coordinator: coordinator,
+                        viewModel: viewModel.searchViewModel,
+                        onResultSelected: { result, query in
+                            Task {
+                                await viewModel.navigateToSearchResult(
+                                    timestamp: result.timestamp,
+                                    highlightQuery: query
+                                )
+                            }
+                        },
+                        onDismiss: {
+                            viewModel.isSearchOverlayVisible = false
+                        }
+                    )
+                }
+
+                // Search highlight overlay
+                if viewModel.isShowingSearchHighlight {
+                    SearchHighlightOverlay(viewModel: viewModel, containerSize: geometry.size)
+                }
+
+                // Controls toggle button (bottom-right, always visible unless dragging zoom region)
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        controlsToggleButton
+                    }
+                }
+                .padding(.spacingL)
+                .padding(.bottom, viewModel.areControlsHidden ? 0 : 60)
+                .opacity(viewModel.isDraggingZoomRegion ? 0 : 1)
             }
             .background(Color.black)
             .ignoresSafeArea()
@@ -99,7 +142,7 @@ public struct SimpleTimelineView: View {
                     }
                 }
             }
-            // Note: Scroll events are now captured by TimelineWindowController
+            // Note: Keyboard shortcuts (Cmd+K, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
     }
@@ -133,6 +176,21 @@ public struct SimpleTimelineView: View {
         }
     }
 
+    // MARK: - Search Button
+
+    private var searchButton: some View {
+        Button(action: {
+            viewModel.clearSearchHighlight()
+            viewModel.isSearchOverlayVisible = true
+        }) {
+            Image(systemName: "magnifyingglass.circle.fill")
+                .font(.system(size: 28))
+                .foregroundColor(.white.opacity(0.6))
+        }
+        .buttonStyle(.plain)
+        .help("Search (Cmd+K)")
+    }
+
     // MARK: - Close Button
 
     private var closeButton: some View {
@@ -142,6 +200,29 @@ public struct SimpleTimelineView: View {
                 .foregroundColor(.white.opacity(0.6))
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: - Controls Toggle Button
+
+    private var controlsToggleButton: some View {
+        Button(action: {
+            viewModel.toggleControlsVisibility()
+        }) {
+            Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
+                .font(.system(size: 20))
+                .foregroundColor(.white.opacity(0.6))
+                .frame(width: 36, height: 36)
+                .background(
+                    Circle()
+                        .fill(Color.black.opacity(0.5))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(viewModel.areControlsHidden ? "Show Controls (Cmd+.)" : "Hide Controls (Cmd+.)")
     }
 
     // MARK: - App Info Overlay
@@ -803,6 +884,7 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
         view.onDragUpdate = { point in viewModel.updateDragSelection(to: point) }
         view.onDragEnd = { viewModel.endDragSelection() }
         view.onClearSelection = { viewModel.clearTextSelection() }
+        view.onCopyImage = { [weak viewModel] in viewModel?.copyZoomedRegionImage() }
         return view
     }
 
@@ -908,6 +990,7 @@ class ZoomedSelectionView: NSView {
     var onDragUpdate: ((CGPoint) -> Void)?
     var onDragEnd: (() -> Void)?
     var onClearSelection: (() -> Void)?
+    var onCopyImage: (() -> Void)?
 
     private var isDragging = false
     private var hasMoved = false
@@ -963,6 +1046,20 @@ class ZoomedSelectionView: NSView {
             onDragEnd?()
         }
         needsDisplay = true
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let menu = NSMenu()
+
+        let copyItem = NSMenuItem(title: "Copy Image", action: #selector(copyImageAction), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
+
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func copyImageAction() {
+        onCopyImage?()
     }
 
     /// Convert screen coordinates within the zoomed view to original frame coordinates
@@ -1519,6 +1616,72 @@ struct DeleteConfirmationDialog: View {
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: true)
+    }
+}
+
+// MARK: - Search Highlight Overlay
+
+/// Overlay that highlights search matches on the current frame
+/// Darkens everything except the matched lines for a spotlight effect
+struct SearchHighlightOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let containerSize: CGSize
+
+    @State private var highlightScale: CGFloat = 0.3
+
+    // Cache the highlight nodes on appear to prevent re-renders from changing them
+    @State private var cachedNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] = []
+
+    var body: some View {
+        ZStack {
+            // Dark overlay
+            Color.black.opacity(0.25)
+
+            // Cutout holes for highlights - use compositingGroup for blend mode to work
+            ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
+                let node = match.node
+                let screenX = node.x * containerSize.width
+                let screenY = node.y * containerSize.height
+                let screenWidth = node.width * containerSize.width
+                let screenHeight = node.height * containerSize.height
+
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.white)
+                    .frame(width: screenWidth, height: screenHeight)
+                    .scaleEffect(highlightScale)
+                    .position(x: screenX + screenWidth / 2, y: screenY + screenHeight / 2)
+                    .blendMode(.destinationOut)
+            }
+        }
+        .compositingGroup()
+        // Yellow borders drawn on top (outside the compositing group)
+        .overlay(
+            ZStack {
+                ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
+                    let node = match.node
+                    let screenX = node.x * containerSize.width
+                    let screenY = node.y * containerSize.height
+                    let screenWidth = node.width * containerSize.width
+                    let screenHeight = node.height * containerSize.height
+
+                    RoundedRectangle(cornerRadius: 3)
+                        .stroke(Color.yellow.opacity(0.9), lineWidth: 2)
+                        .frame(width: screenWidth, height: screenHeight)
+                        .scaleEffect(highlightScale)
+                        .position(x: screenX + screenWidth / 2, y: screenY + screenHeight / 2)
+                }
+            }
+        )
+        .allowsHitTesting(false)
+        .onAppear {
+            // Cache the nodes immediately to prevent re-render issues
+            cachedNodes = viewModel.searchHighlightNodes
+
+            // Animate the scale from 0.3 to 1.0 with spring
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.7, blendDuration: 0)) {
+                highlightScale = 1.0
+            }
+        }
     }
 }
 

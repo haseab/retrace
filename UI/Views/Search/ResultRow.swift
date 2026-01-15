@@ -65,13 +65,13 @@ public struct ResultRow: View {
                 snippetView
 
                 // Metadata (if available)
-                if let windowTitle = result.windowTitle, !windowTitle.isEmpty {
+                if let windowName = result.windowName, !windowName.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "macwindow")
                             .font(.system(size: 10))
                             .foregroundColor(.retraceSecondary)
 
-                        Text(windowTitle)
+                        Text(windowName)
                             .font(.retraceCaption)
                             .foregroundColor(.retraceSecondary)
                             .lineLimit(1)
@@ -221,7 +221,7 @@ struct ResultRow_Previews: PreviewProvider {
                     metadata: FrameMetadata(
                         appBundleID: "com.google.Chrome",
                         appName: "Chrome",
-                        windowTitle: "GitHub - retrace/main",
+                        windowName: "GitHub - retrace/main",
                         browserURL: "https://github.com",
                         displayID: 0
                     ),
@@ -241,7 +241,7 @@ struct ResultRow_Previews: PreviewProvider {
                     metadata: FrameMetadata(
                         appBundleID: "com.apple.dt.Xcode",
                         appName: "Xcode",
-                        windowTitle: "AppDelegate.swift",
+                        windowName: "AppDelegate.swift",
                         browserURL: nil,
                         displayID: 0
                     ),
@@ -261,7 +261,7 @@ struct ResultRow_Previews: PreviewProvider {
                     metadata: FrameMetadata(
                         appBundleID: "com.apple.Terminal",
                         appName: "Terminal",
-                        windowTitle: nil,
+                        windowName: nil,
                         browserURL: nil,
                         displayID: 0
                     ),

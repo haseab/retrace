@@ -113,7 +113,7 @@ public actor SearchManager: SearchProtocol {
                     metadata: FrameMetadata(
                         appBundleID: nil,
                         appName: match.appName,
-                        windowTitle: match.windowTitle,
+                        windowName: match.windowName,
                         browserURL: nil
                     ),
                     segmentID: frame.segmentID,
@@ -223,7 +223,7 @@ public actor SearchManager: SearchProtocol {
             timestamp: text.timestamp,
             content: text.fullText,
             appName: text.metadata.appName,
-            windowTitle: text.metadata.windowTitle,
+            windowName: text.metadata.windowName,
             browserURL: text.metadata.browserURL
         )
 

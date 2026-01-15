@@ -139,18 +139,18 @@ public struct AccessibilityTextElement: Sendable {
 public struct AppInfo: Sendable, Equatable {
     public let bundleID: String
     public let name: String
-    public let windowTitle: String?
+    public let windowName: String?
     public let browserURL: String?  // If app is a browser
 
     public init(
         bundleID: String,
         name: String,
-        windowTitle: String? = nil,
+        windowName: String? = nil,
         browserURL: String? = nil
     ) {
         self.bundleID = bundleID
         self.name = name
-        self.windowTitle = windowTitle
+        self.windowName = windowName
         self.browserURL = browserURL
     }
 

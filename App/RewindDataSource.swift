@@ -522,7 +522,7 @@ public actor RewindDataSource: DataSourceProtocol {
             throw RewindDataSourceError.videoFileNotFound(path: fullVideoPath)
         }
 
-        Log.debug("[RewindDataSource] Video info: \(fullVideoPath), frame \(videoFrameIndex), fps \(frameRate)", category: .app)
+        // Log.debug("[RewindDataSource] Video info: \(fullVideoPath), frame \(videoFrameIndex), fps \(frameRate)", category: .app)
 
         return FrameVideoInfo(
             videoPath: fullVideoPath,
@@ -606,7 +606,7 @@ public actor RewindDataSource: DataSourceProtocol {
                 id: sessionID,
                 appBundleID: bundleID,
                 appName: nil, // Rewind doesn't store app name separately
-                windowTitle: windowName,
+                windowName: windowName,
                 browserURL: browserUrl,
                 displayID: nil,
                 startTime: sessionStartDate,
@@ -710,7 +710,7 @@ public actor RewindDataSource: DataSourceProtocol {
         let metadata = FrameMetadata(
             appBundleID: bundleID,
             appName: nil, // Rewind doesn't store appName separately
-            windowTitle: windowName,
+            windowName: windowName,
             browserURL: browserUrl
         )
 
@@ -774,7 +774,7 @@ public actor RewindDataSource: DataSourceProtocol {
         let metadata = FrameMetadata(
             appBundleID: bundleID,
             appName: nil,
-            windowTitle: windowName,
+            windowName: windowName,
             browserURL: browserUrl
         )
 
@@ -1392,6 +1392,212 @@ public actor RewindDataSource: DataSourceProtocol {
         }
 
         return components.filter { !$0.isEmpty }
+    }
+
+    // MARK: - Full-Text Search
+
+    /// Search Rewind's OCR text using the searchRanking FTS5 table
+    /// Returns search results matching the query
+    public func search(query: SearchQuery) async throws -> SearchResults {
+        guard _isConnected, let database = db else {
+            throw DataSourceError.notConnected
+        }
+
+        let startTime = Date()
+        Log.info("[RewindSearch] Searching for: '\(query.text)'", category: .app)
+
+        // Build FTS5 query - escape special characters and add wildcard for prefix matching
+        let ftsQuery = buildFTSQuery(query.text)
+        Log.debug("[RewindSearch] FTS query: '\(ftsQuery)'", category: .app)
+
+        // Format cutoff date for SQL
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let cutoffISO = dateFormatter.string(from: _cutoffDate)
+        Log.debug("[RewindSearch] Cutoff date: \(cutoffISO)", category: .app)
+
+        // Query searchRanking FTS5 table joined with frame/segment for metadata
+        // Note: Rewind's segment table has bundleID and windowName (not appName/windowName)
+        // Filter by cutoff date to only return results within the valid date range
+        let sql = """
+            SELECT
+                f.id as frame_id,
+                f.createdAt as timestamp,
+                s.id as segment_id,
+                s.bundleID as app_bundle_id,
+                s.windowName as window_title,
+                snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                bm25(searchRanking) as rank
+            FROM searchRanking
+            JOIN doc_segment ds ON ds.docid = searchRanking.rowid
+            JOIN frame f ON ds.frameId = f.id
+            JOIN segment s ON f.segmentId = s.id
+            WHERE searchRanking MATCH ?
+            AND f.createdAt < ?
+            ORDER BY f.createdAt DESC
+            LIMIT ? OFFSET ?
+        """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            let error = String(cString: sqlite3_errmsg(database))
+            Log.error("[RewindSearch] Failed to prepare statement: \(error)", category: .app)
+            throw DataSourceError.queryFailed(underlying: error)
+        }
+
+        // SQLITE_TRANSIENT tells SQLite to make its own copy of the string
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        sqlite3_bind_text(statement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 2, cutoffISO, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(statement, 3, Int32(query.limit))
+        sqlite3_bind_int(statement, 4, Int32(query.offset))
+
+        var results: [SearchResult] = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frameId = sqlite3_column_int64(statement, 0)
+            let timestampStr = String(cString: sqlite3_column_text(statement, 1))
+            let segmentId = sqlite3_column_int64(statement, 2)
+
+            let appBundleID = sqlite3_column_text(statement, 3).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 4).map { String(cString: $0) }
+            let snippet = sqlite3_column_text(statement, 5).map { String(cString: $0) } ?? ""
+            let rank = sqlite3_column_double(statement, 6)
+
+            // Derive app name from bundle ID (e.g., "com.apple.Safari" -> "Safari")
+            let appName = appBundleID?.components(separatedBy: ".").last
+
+            // Parse timestamp (Rewind uses ISO8601 format)
+            let parsedTimestamp = parseRewindTimestamp(timestampStr)
+            if parsedTimestamp == nil {
+                Log.error("[RewindSearch] FAILED to parse timestamp: '\(timestampStr)' - using current date as fallback!", category: .app)
+            } else {
+                Log.debug("[RewindSearch] Raw timestamp from DB: '\(timestampStr)' -> parsed: \(parsedTimestamp!.description) (epoch: \(parsedTimestamp!.timeIntervalSince1970))", category: .app)
+            }
+            let timestamp = parsedTimestamp ?? Date()
+
+            // Create FrameID from Rewind's integer ID using deterministic UUID
+            let frameID = FrameID(value: syntheticUUID(from: frameId, namespace: "frame"))
+            let segmentID = SegmentID(value: syntheticUUID(from: segmentId, namespace: "segment"))
+
+            // Clean up snippet (remove HTML tags if needed)
+            let cleanSnippet = snippet
+                .replacingOccurrences(of: "<mark>", with: "")
+                .replacingOccurrences(of: "</mark>", with: "")
+
+            let result = SearchResult(
+                id: frameID,
+                timestamp: timestamp,
+                snippet: cleanSnippet,
+                matchedText: query.text,
+                relevanceScore: abs(rank), // BM25 returns negative scores, lower is better
+                metadata: FrameMetadata(
+                    appBundleID: appBundleID,
+                    appName: appName,
+                    windowName: windowName,
+                    browserURL: nil,
+                    displayID: 0
+                ),
+                segmentID: segmentID,
+                frameIndex: 0
+            )
+
+            results.append(result)
+        }
+
+        let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+        Log.info("[RewindSearch] Found \(results.count) results in \(elapsed)ms", category: .app)
+
+        // Get total count (without limit, but with cutoff)
+        let totalCount = getSearchTotalCount(query: ftsQuery, cutoffISO: cutoffISO, db: database)
+
+        return SearchResults(
+            query: query,
+            results: results,
+            totalCount: totalCount,
+            searchTimeMs: elapsed
+        )
+    }
+
+    /// Build FTS5 query from user input
+    private func buildFTSQuery(_ text: String) -> String {
+        // Split into words and create FTS5 query
+        let words = text.components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .map { word -> String in
+                // Escape special FTS5 characters
+                let escaped = word
+                    .replacingOccurrences(of: "\"", with: "\"\"")
+                    .replacingOccurrences(of: "*", with: "")
+                    .replacingOccurrences(of: ":", with: "")
+                // Add prefix wildcard for partial matching
+                return "\"\(escaped)\"*"
+            }
+
+        return words.joined(separator: " ")
+    }
+
+    /// Get total count of search results (without limit, but with cutoff)
+    private func getSearchTotalCount(query: String, cutoffISO: String, db: OpaquePointer) -> Int {
+        let countSQL = """
+            SELECT COUNT(*)
+            FROM searchRanking
+            JOIN doc_segment ds ON ds.docid = searchRanking.rowid
+            JOIN frame f ON ds.frameId = f.id
+            WHERE searchRanking MATCH ?
+            AND f.createdAt < ?
+        """
+
+        var countStmt: OpaquePointer?
+        defer { sqlite3_finalize(countStmt) }
+
+        guard sqlite3_prepare_v2(db, countSQL, -1, &countStmt, nil) == SQLITE_OK else {
+            return 0
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(countStmt, 1, query, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(countStmt, 2, cutoffISO, -1, SQLITE_TRANSIENT)
+
+        if sqlite3_step(countStmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int(countStmt, 0))
+        }
+
+        return 0
+    }
+
+    /// Parse Rewind's timestamp format
+    private func parseRewindTimestamp(_ str: String) -> Date? {
+        // Rewind uses ISO8601 format, but sometimes without 'Z' suffix
+        // Examples: "2025-12-18T23:37:42.000Z" or "2025-05-01T01:16:16.345"
+
+        // First try with ISO8601DateFormatter (handles 'Z' suffix)
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = isoFormatter.date(from: str) {
+            return date
+        }
+        // Try without fractional seconds
+        isoFormatter.formatOptions = [.withInternetDateTime]
+        if let date = isoFormatter.date(from: str) {
+            return date
+        }
+
+        // Fall back to DateFormatter for timestamps without 'Z' suffix
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")
+        if let date = dateFormatter.date(from: str) {
+            return date
+        }
+
+        // Try without fractional seconds
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return dateFormatter.date(from: str)
     }
 }
 

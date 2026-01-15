@@ -197,6 +197,29 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Blur opacity during transition (0.0 = no blur, 1.0 = full blur)
     @Published public var zoomTransitionBlurOpacity: CGFloat = 0
 
+    // MARK: - Search State
+
+    /// Whether the search overlay is visible
+    @Published public var isSearchOverlayVisible: Bool = false
+
+    /// Persistent SearchViewModel that survives overlay open/close
+    /// This allows search results to be preserved when clicking on a result
+    public lazy var searchViewModel: SearchViewModel = {
+        SearchViewModel(coordinator: coordinator)
+    }()
+
+    /// Whether the timeline controls (tape, playhead, buttons) are hidden
+    @Published public var areControlsHidden: Bool = false
+
+    /// The search query to highlight on the current frame (set when navigating from search)
+    @Published public var searchHighlightQuery: String?
+
+    /// Whether search highlight is currently being displayed
+    @Published public var isShowingSearchHighlight: Bool = false
+
+    /// Timer to auto-dismiss search highlight
+    private var searchHighlightTimer: Timer?
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level
@@ -756,6 +779,190 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Navigate to a specific timestamp and highlight the search query
+    /// Used when selecting a search result
+    public func navigateToSearchResult(timestamp: Date, highlightQuery: String) async {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        df.timeZone = .current
+        Log.info("[SearchNavigation] Navigating to search result: timestamp=\(df.string(from: timestamp)) (epoch: \(timestamp.timeIntervalSince1970)), query='\(highlightQuery)'", category: .ui)
+
+        // Log current frames window for debugging
+        if let first = frames.first, let last = frames.last {
+            Log.debug("[SearchNavigation] Current frames window: \(df.string(from: first.frame.timestamp)) to \(df.string(from: last.frame.timestamp)) (\(frames.count) frames)", category: .ui)
+        } else {
+            Log.debug("[SearchNavigation] Current frames window: EMPTY", category: .ui)
+        }
+
+        // First, try to find a frame with this timestamp in our current data
+        if let index = frames.firstIndex(where: { $0.frame.timestamp == timestamp }) {
+            Log.debug("[SearchNavigation] Found frame in current data at index \(index)", category: .ui)
+            navigateToFrame(index)
+            showSearchHighlight(query: highlightQuery)
+            return
+        }
+
+        // Also try to find a frame within 1 second of the timestamp (timestamps might have slight differences)
+        let tolerance: TimeInterval = 1.0
+        if let index = frames.firstIndex(where: { abs($0.frame.timestamp.timeIntervalSince(timestamp)) < tolerance }) {
+            let foundFrame = frames[index]
+            Log.debug("[SearchNavigation] Found frame within \(tolerance)s tolerance at index \(index), frame timestamp: \(df.string(from: foundFrame.frame.timestamp))", category: .ui)
+            navigateToFrame(index)
+            showSearchHighlight(query: highlightQuery)
+            return
+        }
+
+        Log.debug("[SearchNavigation] Frame not in current data (even with \(tolerance)s tolerance), loading frames around timestamp...", category: .ui)
+
+        // If not found, need to load frames around this timestamp
+        do {
+            isLoading = true
+
+            // Load frames around the target timestamp
+            let loadedFrames = try await coordinator.getFramesAround(timestamp: timestamp, count: WindowConfig.loadBatchSize)
+            Log.debug("[SearchNavigation] Loaded \(loadedFrames.count) frames around timestamp", category: .ui)
+
+            guard !loadedFrames.isEmpty else {
+                Log.warning("[SearchNavigation] No frames found around timestamp", category: .ui)
+                isLoading = false
+                return
+            }
+
+            // Convert to TimelineFrames with video info
+            var timelineFrames: [TimelineFrame] = []
+            for frame in loadedFrames {
+                let videoInfo = try? await coordinator.getFrameVideoInfo(
+                    segmentID: frame.segmentID,
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            }
+            Log.debug("[SearchNavigation] Converted to \(timelineFrames.count) timeline frames", category: .ui)
+
+            // Replace current frames with new window
+            frames = timelineFrames
+
+            // Update window boundaries
+            if let firstFrame = frames.first, let lastFrame = frames.last {
+                oldestLoadedTimestamp = firstFrame.frame.timestamp
+                newestLoadedTimestamp = lastFrame.frame.timestamp
+                Log.debug("[SearchNavigation] Window: \(oldestLoadedTimestamp!) to \(newestLoadedTimestamp!)", category: .ui)
+            }
+
+            // Find and navigate to the target frame
+            if let index = frames.firstIndex(where: { $0.frame.timestamp == timestamp }) {
+                Log.debug("[SearchNavigation] Found exact timestamp match at index \(index)", category: .ui)
+                currentIndex = index
+            } else {
+                // Find closest frame
+                let closest = frames.enumerated().min(by: {
+                    abs($0.element.frame.timestamp.timeIntervalSince(timestamp)) <
+                    abs($1.element.frame.timestamp.timeIntervalSince(timestamp))
+                })
+                currentIndex = closest?.offset ?? 0
+                if let closestFrame = closest {
+                    let diff = abs(closestFrame.element.frame.timestamp.timeIntervalSince(timestamp))
+                    Log.debug("[SearchNavigation] Using closest frame at index \(closestFrame.offset), \(diff)s from target", category: .ui)
+                }
+            }
+
+            loadImageIfNeeded()
+            // Wait for OCR nodes to load before showing highlight
+            // (loadImageIfNeeded calls loadOCRNodes but doesn't await it)
+            await loadOCRNodesAsync()
+            showSearchHighlight(query: highlightQuery)
+            isLoading = false
+            Log.info("[SearchNavigation] Navigation complete, now at index \(currentIndex)", category: .ui)
+
+        } catch {
+            Log.error("[SearchNavigation] Failed to navigate to search result: \(error)", category: .ui)
+            isLoading = false
+        }
+    }
+
+    /// Show search highlight for the given query after a 0.5-second delay
+    public func showSearchHighlight(query: String) {
+        Log.debug("[SearchHighlight] Will show highlight for query: '\(query)' after delay", category: .ui)
+
+        // Clear any existing highlight first (so the view is removed and onAppear will fire again)
+        isShowingSearchHighlight = false
+        searchHighlightQuery = query
+
+        // Show highlight after 0.5 second delay
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self else { return }
+            // Only show if the query hasn't changed
+            if self.searchHighlightQuery == query {
+                self.isShowingSearchHighlight = true
+                Log.debug("[SearchHighlight] Now showing highlight, OCR nodes available: \(self.ocrNodes.count)", category: .ui)
+            }
+        }
+    }
+
+    /// Clear the search highlight
+    public func clearSearchHighlight() {
+        Log.debug("[SearchHighlight] Clearing search highlight", category: .ui)
+        searchHighlightTimer?.invalidate()
+        searchHighlightTimer = nil
+
+        withAnimation(.easeOut(duration: 0.3)) {
+            isShowingSearchHighlight = false
+        }
+
+        // Clear the query after animation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.searchHighlightQuery = nil
+        }
+    }
+
+    /// Toggle visibility of timeline controls (tape, playhead, buttons)
+    public func toggleControlsVisibility() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            areControlsHidden.toggle()
+        }
+    }
+
+    /// Get OCR nodes that match the search query (for highlighting)
+    public var searchHighlightNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] {
+        guard let query = searchHighlightQuery, !query.isEmpty, isShowingSearchHighlight else {
+            return []
+        }
+
+        let lowercaseQuery = query.lowercased()
+        var matchingNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] = []
+
+        for node in ocrNodes {
+            let nodeText = node.text.lowercased()
+            var ranges: [Range<String.Index>] = []
+            var searchStartIndex = nodeText.startIndex
+
+            // Find all occurrences of the query in this node
+            while let range = nodeText.range(of: lowercaseQuery, range: searchStartIndex..<nodeText.endIndex) {
+                ranges.append(range)
+                searchStartIndex = range.upperBound
+            }
+
+            if !ranges.isEmpty {
+                matchingNodes.append((node: node, ranges: ranges))
+                Log.debug("[SearchHighlight] MATCH: node.id=\(node.id), text='\(node.text.prefix(50))', x=\(node.x), y=\(node.y), w=\(node.width), h=\(node.height)", category: .ui)
+            }
+        }
+
+        if !matchingNodes.isEmpty {
+            let totalMatches = matchingNodes.reduce(0) { $0 + $1.ranges.count }
+            Log.debug("[SearchHighlight] Found \(totalMatches) matches in \(matchingNodes.count) nodes for '\(query)'", category: .ui)
+        } else {
+            Log.debug("[SearchHighlight] NO MATCHES for '\(query)' in \(ocrNodes.count) nodes", category: .ui)
+            // Log first few nodes to see what text they contain
+            for (i, node) in ocrNodes.prefix(10).enumerated() {
+                Log.debug("[SearchHighlight] Node[\(i)] id=\(node.id), text='\(node.text.prefix(30))', y=\(node.y)", category: .ui)
+            }
+        }
+
+        return matchingNodes
+    }
+
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
         guard let timelineFrame = currentTimelineFrame else { return }
@@ -864,19 +1071,31 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load OCR nodes asynchronously
         Task {
-            do {
-                let nodes = try await coordinator.getAllOCRNodes(
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                // Only update if we're still on the same frame
-                if currentTimelineFrame?.frame.id == frame.id {
-                    ocrNodes = nodes
-                }
-            } catch {
-                Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
-                ocrNodes = []
+            await loadOCRNodesAsync()
+        }
+    }
+
+    /// Load OCR nodes and wait for completion (used when we need to await the result)
+    private func loadOCRNodesAsync() async {
+        guard let timelineFrame = currentTimelineFrame else {
+            ocrNodes = []
+            return
+        }
+
+        let frame = timelineFrame.frame
+
+        do {
+            let nodes = try await coordinator.getAllOCRNodes(
+                timestamp: frame.timestamp,
+                source: frame.source
+            )
+            // Only update if we're still on the same frame
+            if currentTimelineFrame?.frame.id == frame.id {
+                ocrNodes = nodes
             }
+        } catch {
+            Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
+            ocrNodes = []
         }
     }
 
@@ -1025,6 +1244,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         zoomRegionDragEnd = nil
         // Also clear text selection
         clearTextSelection()
+    }
+
+    /// Cancel an in-progress zoom region drag (e.g., when user presses Escape while dragging)
+    public func cancelZoomRegionDrag() {
+        isDraggingZoomRegion = false
+        zoomRegionDragStart = nil
+        zoomRegionDragEnd = nil
     }
 
     /// Get OCR nodes filtered to zoom region (for Cmd+A within zoom)
@@ -1282,6 +1508,83 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Copy the zoomed region as an image to clipboard
+    public func copyZoomedRegionImage() {
+        guard let region = zoomRegion, isZoomRegionActive else { return }
+
+        // Get the current frame image (either from cache or from video)
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+
+            let imageSize = image.size
+
+            // Calculate crop rect based on zoom region (normalized 0-1 coordinates)
+            // Both zoom region and CGImage use Y=0 at top, so no flip needed
+            let cropRect = CGRect(
+                x: region.origin.x * imageSize.width,
+                y: region.origin.y * imageSize.height,
+                width: region.width * imageSize.width,
+                height: region.height * imageSize.height
+            )
+
+            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let croppedCGImage = cgImage.cropping(to: cropRect) else { return }
+
+            let croppedImage = NSImage(cgImage: croppedCGImage, size: NSSize(width: croppedCGImage.width, height: croppedCGImage.height))
+
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([croppedImage])
+        }
+    }
+
+    /// Get the current frame as an image (handles both static images and video frames)
+    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        // Try static image first
+        if let image = currentImage {
+            completion(image)
+            return
+        }
+
+        // Fall back to extracting from video
+        guard let videoInfo = currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
+        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+        if !FileManager.default.fileExists(atPath: symlinkPath) {
+            do {
+                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
+            } catch {
+                completion(nil)
+                return
+            }
+        }
+
+        let url = URL(fileURLWithPath: symlinkPath)
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
     }
 
     /// Prune image cache if it exceeds maximum size

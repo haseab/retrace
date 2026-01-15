@@ -246,7 +246,7 @@ public actor FTSManager: FTSProtocol {
     private func buildSearchQuery(filters: SearchFilters) -> String {
         var sql = """
             SELECT
-                d.id, d.frame_id, d.timestamp, d.app_name, d.window_title,
+                d.id, d.frame_id, d.timestamp, d.app_name, d.window_name,
                 snippet(documents_fts, 0, '<mark>', '</mark>', '...', 32) as snippet,
                 bm25(documents_fts) as rank
             FROM documents_fts
@@ -347,10 +347,10 @@ public actor FTSManager: FTSProtocol {
             appName = String(cString: appNameText)
         }
 
-        // Column 4: window_title (nullable)
-        var windowTitle: String?
-        if let windowTitleText = sqlite3_column_text(statement, 4) {
-            windowTitle = String(cString: windowTitleText)
+        // Column 4: window_name (nullable)
+        var windowName: String?
+        if let windowNameText = sqlite3_column_text(statement, 4) {
+            windowName = String(cString: windowNameText)
         }
 
         // Column 5: snippet
@@ -369,7 +369,7 @@ public actor FTSManager: FTSProtocol {
             snippet: snippet,
             rank: rank,
             appName: appName,
-            windowTitle: windowTitle
+            windowName: windowName
         )
     }
 }

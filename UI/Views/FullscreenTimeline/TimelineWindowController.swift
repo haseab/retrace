@@ -194,6 +194,11 @@ public class TimelineWindowController: NSObject {
                     return nil // Consume the event
                 }
             } else if event.type == .scrollWheel {
+                // Don't intercept scroll events when search overlay is visible
+                // Let SwiftUI ScrollView handle them for scrolling through results
+                if let viewModel = self?.timelineViewModel, viewModel.isSearchOverlayVisible {
+                    return event // Let the ScrollView handle it
+                }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
             }
@@ -227,6 +232,21 @@ public class TimelineWindowController: NSObject {
         // Escape key - cascading behavior based on current state
         if event.keyCode == 53 { // Escape
             if let viewModel = timelineViewModel {
+                // If currently dragging to create zoom region, cancel the drag
+                if viewModel.isDraggingZoomRegion {
+                    viewModel.cancelZoomRegionDrag()
+                    return true
+                }
+                // If search overlay is showing, close it
+                if viewModel.isSearchOverlayVisible {
+                    viewModel.isSearchOverlayVisible = false
+                    return true
+                }
+                // If search highlight is showing, clear it
+                if viewModel.isShowingSearchHighlight {
+                    viewModel.clearSearchHighlight()
+                    return true
+                }
                 // If delete confirmation is showing, cancel it
                 if viewModel.showDeleteConfirmation {
                     viewModel.cancelDelete()
@@ -267,6 +287,18 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
+        // Cmd+K to toggle search overlay
+        if event.keyCode == 40 && modifiers == [.command] { // K key with Command
+            if let viewModel = timelineViewModel {
+                // Clear search highlight when opening search overlay
+                if !viewModel.isSearchOverlayVisible {
+                    viewModel.clearSearchHighlight()
+                }
+                viewModel.isSearchOverlayVisible.toggle()
+            }
+            return true
+        }
+
         // Delete or Backspace key to delete selected frame
         if (event.keyCode == 51 || event.keyCode == 117) && modifiers.isEmpty { // Backspace (51) or Delete (117)
             if let viewModel = timelineViewModel, viewModel.selectedFrameIndex != nil {
@@ -301,6 +333,14 @@ public class TimelineWindowController: NSObject {
         if event.keyCode == 8 && modifiers == [.command] { // C key with Command
             if let viewModel = timelineViewModel, viewModel.hasSelection {
                 viewModel.copySelectedText()
+                return true
+            }
+        }
+
+        // Cmd+. (period) to toggle timeline controls visibility
+        if event.keyCode == 47 && modifiers == [.command] { // Period key with Command
+            if let viewModel = timelineViewModel {
+                viewModel.toggleControlsVisibility()
                 return true
             }
         }

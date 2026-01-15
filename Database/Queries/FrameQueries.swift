@@ -11,7 +11,7 @@ enum FrameQueries {
         let sql = """
             INSERT INTO frames (
                 id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                app_bundle_id, app_name, window_title, browser_url, source
+                app_bundle_id, app_name, window_name, browser_url, source
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
 
@@ -36,7 +36,7 @@ enum FrameQueries {
         sqlite3_bind_text(statement, 6, frame.encodingStatus.rawValue, -1, SQLITE_TRANSIENT)
         bindTextOrNull(statement, 7, frame.metadata.appBundleID)
         bindTextOrNull(statement, 8, frame.metadata.appName)
-        bindTextOrNull(statement, 9, frame.metadata.windowTitle)
+        bindTextOrNull(statement, 9, frame.metadata.windowName)
         bindTextOrNull(statement, 10, frame.metadata.browserURL)
         sqlite3_bind_text(statement, 11, frame.source.rawValue, -1, SQLITE_TRANSIENT)
 
@@ -53,7 +53,7 @@ enum FrameQueries {
     static func getByID(db: OpaquePointer, id: FrameID) throws -> FrameReference? {
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             WHERE id = ?;
             """
@@ -89,7 +89,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             WHERE timestamp >= ? AND timestamp <= ?
             ORDER BY timestamp ASC
@@ -132,7 +132,7 @@ enum FrameQueries {
         // This returns frames in descending order, caller should reverse if needed
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             WHERE timestamp < ?
             ORDER BY timestamp DESC
@@ -173,7 +173,7 @@ enum FrameQueries {
         // Get frames AFTER the timestamp, ordered ASC (oldest first of the newer batch)
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             WHERE timestamp > ?
             ORDER BY timestamp ASC
@@ -209,7 +209,7 @@ enum FrameQueries {
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             ORDER BY timestamp DESC
             LIMIT ?;
@@ -248,7 +248,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
-                   app_bundle_id, app_name, window_title, browser_url, source
+                   app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
             WHERE app_bundle_id = ?
             ORDER BY timestamp ASC
@@ -400,7 +400,7 @@ enum FrameQueries {
         // Columns 6-9: metadata (nullable)
         let appBundleID = getTextOrNil(statement, 6)
         let appName = getTextOrNil(statement, 7)
-        let windowTitle = getTextOrNil(statement, 8)
+        let windowName = getTextOrNil(statement, 8)
         let browserURL = getTextOrNil(statement, 9)
 
         // Column 10: source
@@ -410,7 +410,7 @@ enum FrameQueries {
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
             appName: appName,
-            windowTitle: windowTitle,
+            windowName: windowName,
             browserURL: browserURL
         )
 

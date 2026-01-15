@@ -158,7 +158,7 @@ public struct FTSMatch: Sendable {
     public let snippet: String      // Highlighted snippet from FTS
     public let rank: Double         // FTS relevance rank
     public let appName: String?
-    public let windowTitle: String?
+    public let windowName: String?
 
     public init(
         documentID: Int64,
@@ -167,7 +167,7 @@ public struct FTSMatch: Sendable {
         snippet: String,
         rank: Double,
         appName: String? = nil,
-        windowTitle: String? = nil
+        windowName: String? = nil
     ) {
         self.documentID = documentID
         self.frameID = frameID
@@ -175,7 +175,7 @@ public struct FTSMatch: Sendable {
         self.snippet = snippet
         self.rank = rank
         self.appName = appName
-        self.windowTitle = windowTitle
+        self.windowName = windowName
     }
 }
 

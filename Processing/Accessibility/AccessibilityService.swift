@@ -60,7 +60,7 @@ public actor AccessibilityService: AccessibilityProtocol {
         let appInfo = AppInfo(
             bundleID: bundleID,
             name: app.localizedName ?? bundleID,
-            windowTitle: getWindowTitle(from: appRef),
+            windowName: getWindowTitle(from: appRef),
             browserURL: nil  // TODO: Extract URL if browser
         )
 
@@ -82,7 +82,7 @@ public actor AccessibilityService: AccessibilityProtocol {
         return AppInfo(
             bundleID: bundleID,
             name: frontApp.localizedName ?? bundleID,
-            windowTitle: getWindowTitle(from: appRef),
+            windowName: getWindowTitle(from: appRef),
             browserURL: nil
         )
     }

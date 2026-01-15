@@ -22,8 +22,8 @@ extension SearchResult {
     }
 
     /// Convenience access to window title from metadata
-    public var windowTitle: String? {
-        metadata.windowTitle
+    public var windowName: String? {
+        metadata.windowName
     }
 
     /// Convenience access to browser URL from metadata

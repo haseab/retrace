@@ -13,7 +13,7 @@ enum SessionQueries {
     static func insert(db: OpaquePointer, session: AppSession) throws {
         let sql = """
             INSERT INTO app_sessions (
-                id, app_bundle_id, app_name, window_title, browser_url,
+                id, app_bundle_id, app_name, window_name, browser_url,
                 display_id, start_time, end_time
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """
@@ -33,7 +33,7 @@ enum SessionQueries {
         sqlite3_bind_text(statement, 1, session.id.stringValue, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 2, session.appBundleID, -1, SQLITE_TRANSIENT)
         bindTextOrNull(statement, 3, session.appName)
-        bindTextOrNull(statement, 4, session.windowTitle)
+        bindTextOrNull(statement, 4, session.windowName)
         bindTextOrNull(statement, 5, session.browserURL)
         if let displayID = session.displayID {
             sqlite3_bind_int64(statement, 6, Int64(displayID))
@@ -91,7 +91,7 @@ enum SessionQueries {
 
     static func getByID(db: OpaquePointer, id: AppSessionID) throws -> AppSession? {
         let sql = """
-            SELECT id, app_bundle_id, app_name, window_title, browser_url,
+            SELECT id, app_bundle_id, app_name, window_name, browser_url,
                    display_id, start_time, end_time
             FROM app_sessions
             WHERE id = ?
@@ -120,7 +120,7 @@ enum SessionQueries {
 
     static func getByTimeRange(db: OpaquePointer, from startDate: Date, to endDate: Date) throws -> [AppSession] {
         let sql = """
-            SELECT id, app_bundle_id, app_name, window_title, browser_url,
+            SELECT id, app_bundle_id, app_name, window_name, browser_url,
                    display_id, start_time, end_time
             FROM app_sessions
             WHERE start_time <= ? AND (end_time >= ? OR end_time IS NULL)
@@ -151,7 +151,7 @@ enum SessionQueries {
 
     static func getActive(db: OpaquePointer) throws -> AppSession? {
         let sql = """
-            SELECT id, app_bundle_id, app_name, window_title, browser_url,
+            SELECT id, app_bundle_id, app_name, window_name, browser_url,
                    display_id, start_time, end_time
             FROM app_sessions
             WHERE end_time IS NULL
@@ -180,7 +180,7 @@ enum SessionQueries {
 
     static func getByApp(db: OpaquePointer, appBundleID: String, limit: Int) throws -> [AppSession] {
         let sql = """
-            SELECT id, app_bundle_id, app_name, window_title, browser_url,
+            SELECT id, app_bundle_id, app_name, window_name, browser_url,
                    display_id, start_time, end_time
             FROM app_sessions
             WHERE app_bundle_id = ?
@@ -245,7 +245,7 @@ enum SessionQueries {
         let appName = sqlite3_column_type(statement, 2) != SQLITE_NULL
             ? String(cString: sqlite3_column_text(statement, 2))
             : nil
-        let windowTitle = sqlite3_column_type(statement, 3) != SQLITE_NULL
+        let windowName = sqlite3_column_type(statement, 3) != SQLITE_NULL
             ? String(cString: sqlite3_column_text(statement, 3))
             : nil
         let browserURL = sqlite3_column_type(statement, 4) != SQLITE_NULL
@@ -263,7 +263,7 @@ enum SessionQueries {
             id: id,
             appBundleID: appBundleID,
             appName: appName,
-            windowTitle: windowTitle,
+            windowName: windowName,
             browserURL: browserURL,
             displayID: displayID,
             startTime: startTime,
