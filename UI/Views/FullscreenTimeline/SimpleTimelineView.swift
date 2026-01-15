@@ -108,16 +108,18 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
-        let _ = print("[View] frameDisplay evaluated, currentIndex=\(viewModel.currentIndex)")
         if let videoInfo = viewModel.currentVideoInfo {
-            // Video-based frame (Rewind)
-            let _ = print("[View] Creating SimpleVideoFrameView with frameIndex=\(videoInfo.frameIndex)")
-            SimpleVideoFrameView(videoInfo: videoInfo)
+            // Video-based frame (Rewind) with URL overlay
+            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                SimpleVideoFrameView(videoInfo: videoInfo)
+            }
         } else if let image = viewModel.currentImage {
-            // Static image (Retrace)
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+            // Static image (Retrace) with URL overlay
+            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
         } else if !viewModel.isLoading {
             // Empty state
             VStack(spacing: .spacingM) {
@@ -306,6 +308,360 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         deinit {
             observers.forEach { $0.invalidate() }
+        }
+    }
+}
+
+// MARK: - Frame With URL Overlay
+
+/// Wraps a frame display with an interactive URL bounding box overlay
+/// Shows a dotted rectangle when hovering over a detected URL, with click-to-open functionality
+struct FrameWithURLOverlay<Content: View>: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let onURLClicked: () -> Void
+    let content: () -> Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                // The actual frame content
+                content()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // Text selection overlay (always present for drag selection)
+                if !viewModel.ocrNodes.isEmpty {
+                    TextSelectionOverlay(
+                        nodes: viewModel.ocrNodes,
+                        selectedNodeIDs: viewModel.selectedNodeIDs,
+                        containerSize: geometry.size,
+                        dragStartPoint: viewModel.dragStartPoint,
+                        dragEndPoint: viewModel.dragEndPoint,
+                        onDragStart: { point in
+                            viewModel.startDragSelection(at: point)
+                        },
+                        onDragUpdate: { point in
+                            viewModel.updateDragSelection(to: point)
+                        },
+                        onDragEnd: {
+                            viewModel.endDragSelection()
+                        },
+                        onClearSelection: {
+                            viewModel.clearTextSelection()
+                        }
+                    )
+                }
+
+                // URL bounding box overlay (if URL detected)
+                if let box = viewModel.urlBoundingBox {
+                    URLBoundingBoxOverlay(
+                        boundingBox: box,
+                        containerSize: geometry.size,
+                        isHovering: viewModel.isHoveringURL,
+                        onHoverChanged: { hovering in
+                            viewModel.isHoveringURL = hovering
+                        },
+                        onClick: {
+                            viewModel.openURLInBrowser()
+                            // Close the timeline view after opening URL
+                            onURLClicked()
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - URL Bounding Box Overlay
+
+/// Interactive overlay that shows a dotted rectangle around a detected URL
+/// Changes cursor to pointer on hover and opens URL on click
+struct URLBoundingBoxOverlay: NSViewRepresentable {
+    let boundingBox: RewindDataSource.URLBoundingBox
+    let containerSize: CGSize
+    let isHovering: Bool
+    let onHoverChanged: (Bool) -> Void
+    let onClick: () -> Void
+
+    func makeNSView(context: Context) -> URLOverlayView {
+        let view = URLOverlayView()
+        view.onHoverChanged = onHoverChanged
+        view.onClick = onClick
+        return view
+    }
+
+    func updateNSView(_ nsView: URLOverlayView, context: Context) {
+        // Calculate the actual frame rect from normalized coordinates
+        // Note: The bounding box coordinates are normalized (0.0-1.0)
+        let rect = NSRect(
+            x: boundingBox.x * containerSize.width,
+            y: (1.0 - boundingBox.y - boundingBox.height) * containerSize.height, // Flip Y (AppKit origin is bottom-left)
+            width: boundingBox.width * containerSize.width,
+            height: boundingBox.height * containerSize.height
+        )
+
+        nsView.boundingRect = rect
+        nsView.isHoveringURL = isHovering
+        nsView.url = boundingBox.url
+        nsView.needsDisplay = true
+    }
+}
+
+/// Custom NSView for URL overlay with mouse tracking
+/// Only intercepts mouse events inside the bounding rect, passes through events outside
+class URLOverlayView: NSView {
+    var boundingRect: NSRect = .zero
+    var isHoveringURL: Bool = false
+    var url: String = ""
+    var onHoverChanged: ((Bool) -> Void)?
+    var onClick: (() -> Void)?
+
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        // Remove old tracking area
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+
+        // Add new tracking area for the bounding box
+        guard !boundingRect.isEmpty else { return }
+
+        let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInKeyWindow, .mouseMoved]
+        trackingArea = NSTrackingArea(rect: boundingRect, options: options, owner: self, userInfo: nil)
+        addTrackingArea(trackingArea!)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onHoverChanged?(true)
+        NSCursor.pointingHand.push()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoverChanged?(false)
+        NSCursor.pop()
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        if boundingRect.contains(location) {
+            onClick?()
+        } else {
+            // Pass event to next responder (TextSelectionView)
+            super.mouseDown(with: event)
+        }
+    }
+
+    /// Only accept events inside the bounding rect - pass through elsewhere
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if boundingRect.contains(point) {
+            return super.hitTest(point)
+        }
+        // Return nil to let the event pass through to views below
+        return nil
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Only draw when hovering and we have a valid bounding rect
+        guard isHoveringURL, !boundingRect.isEmpty else { return }
+
+        // Draw dotted rectangle around URL
+        let path = NSBezierPath(roundedRect: boundingRect, xRadius: 4, yRadius: 4)
+        path.lineWidth = 2.0
+
+        // Set up dotted line pattern
+        let dashPattern: [CGFloat] = [6, 4]
+        path.setLineDash(dashPattern, count: 2, phase: 0)
+
+        // Green highlight when hovering
+        NSColor(red: 0.4, green: 0.9, blue: 0.4, alpha: 0.9).setStroke()
+        NSColor(red: 0.4, green: 0.9, blue: 0.4, alpha: 0.15).setFill()
+        path.stroke()
+        path.fill()
+    }
+}
+
+// MARK: - Text Selection Overlay
+
+/// Overlay for selecting text from OCR nodes via click-drag or Cmd+A
+/// Highlights selected text in light purple
+struct TextSelectionOverlay: NSViewRepresentable {
+    let nodes: [RewindDataSource.OCRNode]
+    let selectedNodeIDs: Set<Int>
+    let containerSize: CGSize
+    let dragStartPoint: CGPoint?
+    let dragEndPoint: CGPoint?
+    let onDragStart: (CGPoint) -> Void
+    let onDragUpdate: (CGPoint) -> Void
+    let onDragEnd: () -> Void
+    let onClearSelection: () -> Void
+
+    func makeNSView(context: Context) -> TextSelectionView {
+        let view = TextSelectionView()
+        view.onDragStart = onDragStart
+        view.onDragUpdate = onDragUpdate
+        view.onDragEnd = onDragEnd
+        view.onClearSelection = onClearSelection
+        return view
+    }
+
+    func updateNSView(_ nsView: TextSelectionView, context: Context) {
+        // Convert normalized node coordinates to screen coordinates
+        nsView.nodeRects = nodes.map { node in
+            let rect = NSRect(
+                x: node.x * containerSize.width,
+                y: (1.0 - node.y - node.height) * containerSize.height, // Flip Y
+                width: node.width * containerSize.width,
+                height: node.height * containerSize.height
+            )
+            return (node.id, rect)
+        }
+
+        nsView.selectedNodeIDs = selectedNodeIDs
+        nsView.containerSize = containerSize
+
+        // Convert drag rect if present
+        if let start = dragStartPoint, let end = dragEndPoint {
+            let minX = min(start.x, end.x) * containerSize.width
+            let maxX = max(start.x, end.x) * containerSize.width
+            let minY = (1.0 - max(start.y, end.y)) * containerSize.height // Flip Y
+            let maxY = (1.0 - min(start.y, end.y)) * containerSize.height // Flip Y
+
+            nsView.dragRect = NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        } else {
+            nsView.dragRect = nil
+        }
+
+        nsView.needsDisplay = true
+    }
+}
+
+/// Custom NSView for text selection with mouse tracking
+class TextSelectionView: NSView {
+    /// Array of (nodeID, rect) tuples for all OCR nodes
+    var nodeRects: [(Int, NSRect)] = []
+    var selectedNodeIDs: Set<Int> = []
+    var containerSize: CGSize = .zero
+    var dragRect: NSRect?
+
+    var onDragStart: ((CGPoint) -> Void)?
+    var onDragUpdate: ((CGPoint) -> Void)?
+    var onDragEnd: (() -> Void)?
+    var onClearSelection: (() -> Void)?
+
+    private var isDragging = false
+    private var hasMoved = false  // Track if mouse moved during drag
+    private var mouseDownPoint: CGPoint = .zero
+    private var trackingArea: NSTrackingArea?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+
+        let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited]
+        trackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(trackingArea!)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        mouseDownPoint = location
+        hasMoved = false
+
+        // Convert to normalized coordinates
+        guard containerSize.width > 0 && containerSize.height > 0 else { return }
+        let normalizedPoint = CGPoint(
+            x: location.x / containerSize.width,
+            y: 1.0 - (location.y / containerSize.height) // Flip Y back
+        )
+
+        isDragging = true
+        onDragStart?(normalizedPoint)
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard isDragging else { return }
+
+        let location = convert(event.locationInWindow, from: nil)
+
+        // Check if mouse actually moved (more than 3 pixels to avoid micro-movements)
+        let distance = hypot(location.x - mouseDownPoint.x, location.y - mouseDownPoint.y)
+        if distance > 3 {
+            hasMoved = true
+        }
+
+        // Clamp to bounds
+        let clampedX = max(0, min(bounds.width, location.x))
+        let clampedY = max(0, min(bounds.height, location.y))
+
+        // Convert to normalized coordinates
+        guard containerSize.width > 0 && containerSize.height > 0 else { return }
+        let normalizedPoint = CGPoint(
+            x: clampedX / containerSize.width,
+            y: 1.0 - (clampedY / containerSize.height) // Flip Y back
+        )
+
+        onDragUpdate?(normalizedPoint)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard isDragging else { return }
+
+        isDragging = false
+
+        // If mouse didn't move, this was a click - clear selection
+        if !hasMoved {
+            onClearSelection?()
+        } else {
+            onDragEnd?()
+        }
+
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Light purple color for selection highlight
+        let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)
+        let selectionStrokeColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.8)
+
+        // Draw selected nodes
+        for (nodeID, rect) in nodeRects {
+            if selectedNodeIDs.contains(nodeID) {
+                selectionColor.setFill()
+                let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
+                path.fill()
+
+                selectionStrokeColor.setStroke()
+                path.lineWidth = 1.0
+                path.stroke()
+            }
+        }
+
+        // Draw drag selection rectangle (if dragging)
+        if let dragRect = dragRect, isDragging {
+            // Semi-transparent blue for drag rectangle
+            NSColor(red: 0.3, green: 0.5, blue: 0.9, alpha: 0.2).setFill()
+            NSColor(red: 0.3, green: 0.5, blue: 0.9, alpha: 0.6).setStroke()
+
+            let path = NSBezierPath(rect: dragRect)
+            path.fill()
+            path.lineWidth = 1.0
+            path.stroke()
         }
     }
 }

@@ -708,6 +708,48 @@ public actor DataAdapter {
         Log.warning("[DataAdapter] deleteFrameByTimestamp called for native source - this is inefficient", category: .app)
         throw DataSourceError.unsupportedOperation
     }
+
+    // MARK: - URL Bounding Box Detection
+
+    /// Get the bounding box of a browser URL on screen for a given frame
+    /// Returns the bounding box if the URL text is found in the OCR nodes
+    /// Currently only supported for Rewind data source
+    public func getURLBoundingBox(timestamp: Date, source frameSource: FrameSource) async throws -> RewindDataSource.URLBoundingBox? {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Only Rewind source has OCR node data with bounding boxes
+        if frameSource == .rewind {
+            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+                return try await rewindSource.getURLBoundingBox(timestamp: timestamp)
+            }
+        }
+
+        // Native source doesn't have this capability yet
+        return nil
+    }
+
+    // MARK: - OCR Node Detection (for text selection)
+
+    /// Get all OCR nodes for a given frame
+    /// Returns array of nodes with bounding boxes and text content
+    /// Currently only supported for Rewind data source
+    public func getAllOCRNodes(timestamp: Date, source frameSource: FrameSource) async throws -> [RewindDataSource.OCRNode] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Only Rewind source has OCR node data
+        if frameSource == .rewind {
+            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+                return try await rewindSource.getAllOCRNodes(timestamp: timestamp)
+            }
+        }
+
+        // Native source doesn't have this capability yet
+        return []
+    }
 }
 
 // MARK: - Errors

@@ -532,6 +532,32 @@ public actor AppCoordinator {
         Log.info("[AppCoordinator] Deleted \(frames.count) frames", category: .app)
     }
 
+    // MARK: - URL Bounding Box Detection
+
+    /// Get the bounding box of a browser URL on screen for a given frame
+    /// Returns the bounding box with normalized coordinates (0.0-1.0) if found
+    /// Use this to highlight clickable URLs in the timeline view
+    public func getURLBoundingBox(timestamp: Date, source: FrameSource) async throws -> RewindDataSource.URLBoundingBox? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+
+        return try await adapter.getURLBoundingBox(timestamp: timestamp, source: source)
+    }
+
+    // MARK: - OCR Node Detection (for text selection)
+
+    /// Get all OCR nodes for a given frame
+    /// Returns array of nodes with normalized bounding boxes (0.0-1.0) and text content
+    /// Use this to enable text selection highlighting in the timeline view
+    public func getAllOCRNodes(timestamp: Date, source: FrameSource) async throws -> [RewindDataSource.OCRNode] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+
+        return try await adapter.getAllOCRNodes(timestamp: timestamp, source: source)
+    }
+
     // MARK: - Migration
 
     /// Import data from Rewind AI

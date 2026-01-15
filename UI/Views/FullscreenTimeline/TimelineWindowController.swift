@@ -276,6 +276,36 @@ public class TimelineWindowController: NSObject {
             }
         }
 
+        // Cmd+A to select all text on the frame
+        if event.keyCode == 0 && modifiers == [.command] { // A key with Command
+            if let viewModel = timelineViewModel {
+                viewModel.selectAllText()
+                return true
+            }
+        }
+
+        // Cmd+C to copy selected text
+        if event.keyCode == 8 && modifiers == [.command] { // C key with Command
+            if let viewModel = timelineViewModel, !viewModel.selectedNodeIDs.isEmpty {
+                viewModel.copySelectedText()
+                return true
+            }
+        }
+
+        // Any other key (not a modifier) clears text selection
+        if let viewModel = timelineViewModel,
+           !viewModel.selectedNodeIDs.isEmpty,
+           !event.modifierFlags.contains(.command),
+           !event.modifierFlags.contains(.option),
+           !event.modifierFlags.contains(.control),
+           event.keyCode != 53 { // Don't clear on Escape (handled above)
+            // Only clear for non-navigation keys
+            let navigationKeys: Set<UInt16> = [123, 124, 125, 126] // Arrow keys
+            if !navigationKeys.contains(event.keyCode) {
+                viewModel.clearTextSelection()
+            }
+        }
+
         return false
     }
 

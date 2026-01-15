@@ -722,7 +722,8 @@ public actor RewindDataSource: DataSourceProtocol {
             frameIndexInSegment: videoFrameIndex,
             encodingStatus: encodingStatus,
             metadata: metadata,
-            source: .rewind
+            source: .rewind,
+            rewindFrameId: rewindFrameId
         )
     }
 
@@ -785,7 +786,8 @@ public actor RewindDataSource: DataSourceProtocol {
             frameIndexInSegment: videoFrameIndex,
             encodingStatus: encodingStatus,
             metadata: metadata,
-            source: .rewind
+            source: .rewind,
+            rewindFrameId: rewindFrameId
         )
 
         // Build video info if we have a video path
@@ -932,8 +934,8 @@ public actor RewindDataSource: DataSourceProtocol {
         }
 
         do {
-            // 1. Get the frame ID first
-            let getFrameSQL = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1"
+            // 1. Get the frame ID and segment ID first
+            let getFrameSQL = "SELECT id, segmentId FROM frame WHERE createdAt = ? LIMIT 1"
             var getStmt: OpaquePointer?
             defer { sqlite3_finalize(getStmt) }
 
@@ -948,6 +950,7 @@ public actor RewindDataSource: DataSourceProtocol {
             }
 
             let rewindFrameId = sqlite3_column_int64(getStmt!, 0)
+            let segmentId = sqlite3_column_int64(getStmt!, 1)
 
             // 2. Delete nodes associated with this frame
             let deleteNodesSQL = "DELETE FROM node WHERE frameId = ?"
@@ -985,6 +988,35 @@ public actor RewindDataSource: DataSourceProtocol {
             sqlite3_bind_int64(deleteFrameStmt, 1, rewindFrameId)
             sqlite3_step(deleteFrameStmt)
 
+            // 5. Check if this segment now has no frames left
+            let countFramesSQL = "SELECT COUNT(*) FROM frame WHERE segmentId = ?"
+            var countStmt: OpaquePointer?
+            defer { sqlite3_finalize(countStmt) }
+
+            guard sqlite3_prepare_v2(db, countFramesSQL, -1, &countStmt, nil) == SQLITE_OK else {
+                throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+            }
+            sqlite3_bind_int64(countStmt, 1, segmentId)
+
+            var segmentDeleted = false
+            if sqlite3_step(countStmt) == SQLITE_ROW {
+                let remainingFrames = sqlite3_column_int64(countStmt!, 0)
+                if remainingFrames == 0 {
+                    // No frames left in this segment, delete the segment too
+                    let deleteSegmentSQL = "DELETE FROM segment WHERE id = ?"
+                    var deleteSegmentStmt: OpaquePointer?
+                    defer { sqlite3_finalize(deleteSegmentStmt) }
+
+                    guard sqlite3_prepare_v2(db, deleteSegmentSQL, -1, &deleteSegmentStmt, nil) == SQLITE_OK else {
+                        throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+                    sqlite3_bind_int64(deleteSegmentStmt, 1, segmentId)
+                    sqlite3_step(deleteSegmentStmt)
+                    segmentDeleted = true
+                    Log.info("[RewindDataSource] Deleted empty segment \(segmentId)", category: .app)
+                }
+            }
+
             // Commit transaction
             guard sqlite3_exec(db, "COMMIT", nil, nil, &errorPtr) == SQLITE_OK else {
                 let error = errorPtr.map { String(cString: $0) } ?? "Unknown error"
@@ -992,13 +1024,374 @@ public actor RewindDataSource: DataSourceProtocol {
                 throw DataSourceError.queryFailed(underlying: "Failed to commit transaction: \(error)")
             }
 
-            Log.info("[RewindDataSource] Successfully deleted frame \(rewindFrameId) and \(nodesDeleted) nodes", category: .app)
+            if segmentDeleted {
+                Log.info("[RewindDataSource] Successfully deleted frame \(rewindFrameId), \(nodesDeleted) nodes, and segment \(segmentId)", category: .app)
+            } else {
+                Log.info("[RewindDataSource] Successfully deleted frame \(rewindFrameId) and \(nodesDeleted) nodes", category: .app)
+            }
 
         } catch {
             // Rollback on error
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
             throw error
         }
+    }
+
+    // MARK: - URL Bounding Box Detection
+
+    /// Represents a bounding box for a URL found on screen
+    public struct URLBoundingBox {
+        /// Normalized X coordinate (0.0-1.0)
+        public let x: CGFloat
+        /// Normalized Y coordinate (0.0-1.0)
+        public let y: CGFloat
+        /// Normalized width (0.0-1.0)
+        public let width: CGFloat
+        /// Normalized height (0.0-1.0)
+        public let height: CGFloat
+        /// The URL string
+        public let url: String
+    }
+
+    /// Find the bounding box of a URL on screen for a given frame timestamp
+    /// Returns the bounding box if the URL text is found in the OCR nodes
+    public func getURLBoundingBox(timestamp: Date) async throws -> URLBoundingBox? {
+        guard _isConnected, let db = db else {
+            print("[URLBoundingBox] ERROR: Database not connected")
+            throw DataSourceError.notConnected
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let timestampISO = dateFormatter.string(from: timestamp)
+
+        print("[URLBoundingBox] Looking up frame for timestamp: \(timestampISO)")
+
+        // 1. Get frameId and browserUrl from frame + segment join
+        let frameSQL = """
+            SELECT f.id, s.browserUrl
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            WHERE f.createdAt = ?
+            LIMIT 1;
+            """
+
+        var frameStmt: OpaquePointer?
+        defer { sqlite3_finalize(frameStmt) }
+
+        guard sqlite3_prepare_v2(db, frameSQL, -1, &frameStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_text(frameStmt, 1, (timestampISO as NSString).utf8String, -1, nil)
+
+        guard sqlite3_step(frameStmt) == SQLITE_ROW else {
+            print("[URLBoundingBox] Frame not found for timestamp")
+            return nil // Frame not found
+        }
+
+        let frameId = sqlite3_column_int64(frameStmt!, 0)
+        guard let browserUrlPtr = sqlite3_column_text(frameStmt!, 1) else {
+            return nil // No browser URL for this segment
+        }
+        let browserUrl = String(cString: browserUrlPtr)
+
+        // Skip empty URLs
+        guard !browserUrl.isEmpty else {
+            return nil
+        }
+
+        // 2. Get the FTS content text for this frame to find URL position
+        // Note: c0 and c1 usage varies across frames - sometimes c0 has main OCR, sometimes c1
+        // We need to use whichever column has the content that matches the node offsets
+        let ftsSQL = """
+            SELECT src.c0, src.c1
+            FROM doc_segment ds
+            JOIN searchRanking_content src ON ds.docid = src.id
+            WHERE ds.frameId = ?
+            LIMIT 1;
+            """
+
+        var ftsStmt: OpaquePointer?
+        defer { sqlite3_finalize(ftsStmt) }
+
+        guard sqlite3_prepare_v2(db, ftsSQL, -1, &ftsStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(ftsStmt, 1, frameId)
+
+        guard sqlite3_step(ftsStmt) == SQLITE_ROW else {
+            return nil // No FTS content
+        }
+
+        // Get both columns and CONCATENATE them
+        // Node textOffset values index into the concatenated string: c0 || c1
+        // c0 typically contains the browser URL, c1 contains the OCR text
+        // Offsets 0 to len(c0)-1 reference c0, offsets len(c0)+ reference c1
+        let c0Text = sqlite3_column_text(ftsStmt!, 0).map { String(cString: $0) } ?? ""
+        let c1Text = sqlite3_column_text(ftsStmt!, 1).map { String(cString: $0) } ?? ""
+        let ocrText = c0Text + c1Text
+
+        // 3. Extract domain/host from URL for matching (browsers often show just the domain)
+        let urlComponents = extractURLComponents(browserUrl)
+
+        // 4. Get all nodes for this frame
+        let nodesSQL = """
+            SELECT nodeOrder, textOffset, textLength, leftX, topY, width, height
+            FROM node
+            WHERE frameId = ?
+            ORDER BY nodeOrder ASC;
+            """
+
+        var nodesStmt: OpaquePointer?
+        defer { sqlite3_finalize(nodesStmt) }
+
+        guard sqlite3_prepare_v2(db, nodesSQL, -1, &nodesStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(nodesStmt, 1, frameId)
+
+        // 5. Find the node that contains the URL in the address bar
+        var bestMatch: (x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, score: Int)?
+
+        // Extract just the domain for matching
+        let domain = URL(string: browserUrl)?.host ?? browserUrl
+
+        while sqlite3_step(nodesStmt) == SQLITE_ROW {
+            let textOffset = Int(sqlite3_column_int(nodesStmt!, 1))
+            let textLength = Int(sqlite3_column_int(nodesStmt!, 2))
+            let leftX = CGFloat(sqlite3_column_double(nodesStmt!, 3))
+            let topY = CGFloat(sqlite3_column_double(nodesStmt!, 4))
+            let width = CGFloat(sqlite3_column_double(nodesStmt!, 5))
+            let height = CGFloat(sqlite3_column_double(nodesStmt!, 6))
+
+            // Extract the text for this node from the FTS content
+            let startIndex = ocrText.index(ocrText.startIndex, offsetBy: min(textOffset, ocrText.count), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+            let endIndex = ocrText.index(startIndex, offsetBy: min(textLength, ocrText.count - textOffset), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+
+            guard startIndex < endIndex else { continue }
+
+            let nodeText = String(ocrText[startIndex..<endIndex])
+
+            // Check if this node contains the domain
+            guard nodeText.lowercased().contains(domain.lowercased()) else { continue }
+
+            // Score based on how much the node looks like a URL bar vs page content
+            var score = 0
+
+            // The address bar typically contains JUST the URL or domain+path
+            // Tab titles contain the domain + page title (extra words)
+            // Prefer nodes where URL/domain is a larger portion of the text
+            let urlRatio = Double(domain.count) / Double(nodeText.count)
+            if urlRatio > 0.6 {
+                score += 100  // Very URL-like (e.g., "f.inc/smash" -> f.inc is 62% of text)
+            } else if urlRatio > 0.3 {
+                score += 50   // Somewhat URL-like
+            } else {
+                score += 10   // Probably page title or content (e.g., "f.inc Smash Leaderboard")
+            }
+
+            // Address bar is typically around y=0.08-0.12 (below tabs at ~0.05)
+            // Tabs are at y=0.05, address bar is lower
+            if topY > 0.07 && topY < 0.15 {
+                score += 50   // In address bar region
+            } else if topY < 0.07 {
+                score += 20   // Might be tab title
+            }
+
+            // Prefer nodes that look like URLs (contain / or .)
+            if nodeText.contains("/") && !nodeText.contains(" ") {
+                score += 30   // Looks like a URL path with no spaces
+            }
+
+            if let current = bestMatch {
+                if score > current.score {
+                    bestMatch = (x: leftX, y: topY, width: width, height: height, score: score)
+                }
+            } else {
+                bestMatch = (x: leftX, y: topY, width: width, height: height, score: score)
+            }
+        }
+
+        guard let bounds = bestMatch else {
+            return nil // URL text not found in OCR
+        }
+
+        return URLBoundingBox(
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+            url: browserUrl
+        )
+    }
+
+    // MARK: - OCR Node Detection (for text selection)
+
+    /// Represents an OCR text node with its bounding box and text content
+    public struct OCRNode: Identifiable, Equatable {
+        public let id: Int  // nodeOrder from database
+        /// Normalized X coordinate (0.0-1.0)
+        public let x: CGFloat
+        /// Normalized Y coordinate (0.0-1.0)
+        public let y: CGFloat
+        /// Normalized width (0.0-1.0)
+        public let width: CGFloat
+        /// Normalized height (0.0-1.0)
+        public let height: CGFloat
+        /// The text content of this node
+        public let text: String
+    }
+
+    /// Get all OCR nodes for a given frame timestamp
+    /// Returns array of nodes with their bounding boxes and text content
+    /// Used for text selection highlighting feature
+    public func getAllOCRNodes(timestamp: Date) async throws -> [OCRNode] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let timestampISO = dateFormatter.string(from: timestamp)
+
+        // 1. Get frameId from frame table
+        let frameSQL = """
+            SELECT f.id
+            FROM frame f
+            WHERE f.createdAt = ?
+            LIMIT 1;
+            """
+
+        var frameStmt: OpaquePointer?
+        defer { sqlite3_finalize(frameStmt) }
+
+        guard sqlite3_prepare_v2(db, frameSQL, -1, &frameStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_text(frameStmt, 1, (timestampISO as NSString).utf8String, -1, nil)
+
+        guard sqlite3_step(frameStmt) == SQLITE_ROW else {
+            return [] // Frame not found
+        }
+
+        let frameId = sqlite3_column_int64(frameStmt!, 0)
+
+        // 2. Get the FTS content text for this frame (concatenate c0 and c1)
+        let ftsSQL = """
+            SELECT src.c0, src.c1
+            FROM doc_segment ds
+            JOIN searchRanking_content src ON ds.docid = src.id
+            WHERE ds.frameId = ?
+            LIMIT 1;
+            """
+
+        var ftsStmt: OpaquePointer?
+        defer { sqlite3_finalize(ftsStmt) }
+
+        guard sqlite3_prepare_v2(db, ftsSQL, -1, &ftsStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(ftsStmt, 1, frameId)
+
+        guard sqlite3_step(ftsStmt) == SQLITE_ROW else {
+            return [] // No FTS content
+        }
+
+        // Concatenate c0 and c1 - node textOffset indexes into this combined string
+        let c0Text = sqlite3_column_text(ftsStmt!, 0).map { String(cString: $0) } ?? ""
+        let c1Text = sqlite3_column_text(ftsStmt!, 1).map { String(cString: $0) } ?? ""
+        let ocrText = c0Text + c1Text
+
+        // 3. Get all nodes for this frame
+        let nodesSQL = """
+            SELECT nodeOrder, textOffset, textLength, leftX, topY, width, height
+            FROM node
+            WHERE frameId = ?
+            ORDER BY nodeOrder ASC;
+            """
+
+        var nodesStmt: OpaquePointer?
+        defer { sqlite3_finalize(nodesStmt) }
+
+        guard sqlite3_prepare_v2(db, nodesSQL, -1, &nodesStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(nodesStmt, 1, frameId)
+
+        // 4. Extract all nodes with their text
+        var nodes: [OCRNode] = []
+
+        while sqlite3_step(nodesStmt) == SQLITE_ROW {
+            let nodeOrder = Int(sqlite3_column_int(nodesStmt!, 0))
+            let textOffset = Int(sqlite3_column_int(nodesStmt!, 1))
+            let textLength = Int(sqlite3_column_int(nodesStmt!, 2))
+            let leftX = CGFloat(sqlite3_column_double(nodesStmt!, 3))
+            let topY = CGFloat(sqlite3_column_double(nodesStmt!, 4))
+            let width = CGFloat(sqlite3_column_double(nodesStmt!, 5))
+            let height = CGFloat(sqlite3_column_double(nodesStmt!, 6))
+
+            // Extract the text for this node from the FTS content
+            let startIndex = ocrText.index(ocrText.startIndex, offsetBy: min(textOffset, ocrText.count), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+            let endIndex = ocrText.index(startIndex, offsetBy: min(textLength, ocrText.count - textOffset), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+
+            guard startIndex < endIndex else { continue }
+
+            let nodeText = String(ocrText[startIndex..<endIndex])
+
+            // Skip empty text nodes
+            guard !nodeText.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+
+            nodes.append(OCRNode(
+                id: nodeOrder,
+                x: leftX,
+                y: topY,
+                width: width,
+                height: height,
+                text: nodeText
+            ))
+        }
+
+        return nodes
+    }
+
+    /// Extract searchable components from a URL (domain, path segments)
+    private func extractURLComponents(_ url: String) -> [String] {
+        var components: [String] = []
+
+        // Add full URL
+        components.append(url)
+
+        // Try to parse as URL
+        if let parsed = URL(string: url) {
+            // Add host/domain
+            if let host = parsed.host {
+                components.append(host)
+                // Add domain without www
+                if host.hasPrefix("www.") {
+                    components.append(String(host.dropFirst(4)))
+                }
+            }
+
+            // Add path if meaningful
+            let path = parsed.path
+            if !path.isEmpty && path != "/" {
+                components.append(path)
+                // Add last path component
+                if let lastComponent = path.split(separator: "/").last {
+                    components.append(String(lastComponent))
+                }
+            }
+        }
+
+        return components.filter { !$0.isEmpty }
     }
 }
 

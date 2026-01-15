@@ -132,6 +132,31 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Frames that have been "deleted" (optimistically removed from UI)
     @Published public var deletedFrameIDs: Set<FrameID> = []
 
+    // MARK: - URL Bounding Box State
+
+    /// Bounding box for a clickable URL found in the current frame (normalized 0.0-1.0 coordinates)
+    @Published public var urlBoundingBox: RewindDataSource.URLBoundingBox?
+
+    /// Whether the mouse is currently hovering over the URL bounding box
+    @Published public var isHoveringURL: Bool = false
+
+    // MARK: - Text Selection State
+
+    /// All OCR nodes for the current frame (used for text selection)
+    @Published public var ocrNodes: [RewindDataSource.OCRNode] = []
+
+    /// Set of selected node IDs (for highlighting)
+    @Published public var selectedNodeIDs: Set<Int> = []
+
+    /// Whether all text is selected (via Cmd+A)
+    @Published public var isAllTextSelected: Bool = false
+
+    /// Drag selection start point (in normalized coordinates 0.0-1.0)
+    @Published public var dragStartPoint: CGPoint?
+
+    /// Drag selection end point (in normalized coordinates 0.0-1.0)
+    @Published public var dragEndPoint: CGPoint?
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level
@@ -695,6 +720,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func loadImageIfNeeded() {
         guard let timelineFrame = currentTimelineFrame else { return }
 
+        // Also load URL bounding box for the current frame
+        loadURLBoundingBox()
+
+        // Also load OCR nodes for text selection
+        loadOCRNodes()
+
         // Only load image if this is NOT a video-based frame
         guard timelineFrame.videoInfo == nil else {
             currentImage = nil
@@ -730,6 +761,170 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
             }
         }
+    }
+
+    /// Load URL bounding box for the current frame (if it's a browser URL)
+    private func loadURLBoundingBox() {
+        guard let timelineFrame = currentTimelineFrame else {
+            urlBoundingBox = nil
+            return
+        }
+
+        let frame = timelineFrame.frame
+
+        // Reset hover state when frame changes
+        isHoveringURL = false
+
+        // Load URL bounding box asynchronously
+        Task {
+            do {
+                let boundingBox = try await coordinator.getURLBoundingBox(
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                // Only update if we're still on the same frame
+                if currentTimelineFrame?.frame.id == frame.id {
+                    urlBoundingBox = boundingBox
+                    if let box = boundingBox {
+                        print("[URLBoundingBox] Found URL '\(box.url)' at (\(box.x), \(box.y), \(box.width), \(box.height))")
+                    }
+                }
+            } catch {
+                Log.error("[SimpleTimelineViewModel] Failed to load URL bounding box: \(error)", category: .app)
+                urlBoundingBox = nil
+            }
+        }
+    }
+
+    /// Open the URL in the default browser
+    public func openURLInBrowser() {
+        guard let box = urlBoundingBox,
+              let url = URL(string: box.url) else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+        print("[URLBoundingBox] Opened URL in browser: \(box.url)")
+    }
+
+    // MARK: - OCR Node Loading and Text Selection
+
+    /// Load all OCR nodes for the current frame
+    private func loadOCRNodes() {
+        guard let timelineFrame = currentTimelineFrame else {
+            ocrNodes = []
+            clearTextSelection()
+            return
+        }
+
+        let frame = timelineFrame.frame
+
+        // Clear previous selection when frame changes
+        clearTextSelection()
+
+        // Load OCR nodes asynchronously
+        Task {
+            do {
+                let nodes = try await coordinator.getAllOCRNodes(
+                    timestamp: frame.timestamp,
+                    source: frame.source
+                )
+                // Only update if we're still on the same frame
+                if currentTimelineFrame?.frame.id == frame.id {
+                    ocrNodes = nodes
+                }
+            } catch {
+                Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
+                ocrNodes = []
+            }
+        }
+    }
+
+    /// Select all text (Cmd+A)
+    public func selectAllText() {
+        guard !ocrNodes.isEmpty else { return }
+        selectedNodeIDs = Set(ocrNodes.map { $0.id })
+        isAllTextSelected = true
+    }
+
+    /// Clear text selection
+    public func clearTextSelection() {
+        selectedNodeIDs.removeAll()
+        isAllTextSelected = false
+        dragStartPoint = nil
+        dragEndPoint = nil
+    }
+
+    /// Start drag selection at a point (normalized coordinates)
+    public func startDragSelection(at point: CGPoint) {
+        dragStartPoint = point
+        dragEndPoint = point
+        selectedNodeIDs.removeAll()
+        isAllTextSelected = false
+    }
+
+    /// Update drag selection to a point (normalized coordinates)
+    public func updateDragSelection(to point: CGPoint) {
+        dragEndPoint = point
+        updateSelectedNodesFromDrag()
+    }
+
+    /// End drag selection
+    public func endDragSelection() {
+        updateSelectedNodesFromDrag()
+        dragStartPoint = nil
+        dragEndPoint = nil
+    }
+
+    /// Update selected nodes based on current drag rectangle
+    private func updateSelectedNodesFromDrag() {
+        guard let start = dragStartPoint, let end = dragEndPoint else { return }
+
+        // Calculate drag rectangle (handle any direction of drag)
+        let minX = min(start.x, end.x)
+        let maxX = max(start.x, end.x)
+        let minY = min(start.y, end.y)
+        let maxY = max(start.y, end.y)
+
+        // Find all nodes that intersect with the drag rectangle
+        var selected = Set<Int>()
+        for node in ocrNodes {
+            // Check if node bounding box intersects with drag rectangle
+            let nodeMinX = node.x
+            let nodeMaxX = node.x + node.width
+            let nodeMinY = node.y
+            let nodeMaxY = node.y + node.height
+
+            // Rectangle intersection test
+            let intersects = !(nodeMaxX < minX || nodeMinX > maxX || nodeMaxY < minY || nodeMinY > maxY)
+
+            if intersects {
+                selected.insert(node.id)
+            }
+        }
+
+        selectedNodeIDs = selected
+    }
+
+    /// Get the selected text (concatenated from selected nodes)
+    public var selectedText: String {
+        guard !selectedNodeIDs.isEmpty else { return "" }
+
+        // Get nodes in order (by ID/nodeOrder)
+        let selectedNodes = ocrNodes
+            .filter { selectedNodeIDs.contains($0.id) }
+            .sorted { $0.id < $1.id }
+
+        return selectedNodes.map { $0.text }.joined(separator: " ")
+    }
+
+    /// Copy selected text to clipboard
+    public func copySelectedText() {
+        let text = selectedText
+        guard !text.isEmpty else { return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// Prune image cache if it exceeds maximum size
