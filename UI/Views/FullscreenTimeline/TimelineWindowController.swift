@@ -286,7 +286,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+C to copy selected text
         if event.keyCode == 8 && modifiers == [.command] { // C key with Command
-            if let viewModel = timelineViewModel, !viewModel.selectedNodeIDs.isEmpty {
+            if let viewModel = timelineViewModel, viewModel.hasSelection {
                 viewModel.copySelectedText()
                 return true
             }
@@ -294,7 +294,7 @@ public class TimelineWindowController: NSObject {
 
         // Any other key (not a modifier) clears text selection
         if let viewModel = timelineViewModel,
-           !viewModel.selectedNodeIDs.isEmpty,
+           viewModel.hasSelection,
            !event.modifierFlags.contains(.command),
            !event.modifierFlags.contains(.option),
            !event.modifierFlags.contains(.control),

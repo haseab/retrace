@@ -145,8 +145,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// All OCR nodes for the current frame (used for text selection)
     @Published public var ocrNodes: [RewindDataSource.OCRNode] = []
 
-    /// Set of selected node IDs (for highlighting)
-    @Published public var selectedNodeIDs: Set<Int> = []
+    /// Character-level selection: start position (node ID, character index within node)
+    @Published public var selectionStart: (nodeID: Int, charIndex: Int)?
+
+    /// Character-level selection: end position (node ID, character index within node)
+    @Published public var selectionEnd: (nodeID: Int, charIndex: Int)?
 
     /// Whether all text is selected (via Cmd+A)
     @Published public var isAllTextSelected: Bool = false
@@ -156,6 +159,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Drag selection end point (in normalized coordinates 0.0-1.0)
     @Published public var dragEndPoint: CGPoint?
+
+    /// Whether we have any text selected
+    public var hasSelection: Bool {
+        isAllTextSelected || (selectionStart != nil && selectionEnd != nil)
+    }
 
     // MARK: - Zoom Computed Properties
 
@@ -843,13 +851,25 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Select all text (Cmd+A)
     public func selectAllText() {
         guard !ocrNodes.isEmpty else { return }
-        selectedNodeIDs = Set(ocrNodes.map { $0.id })
         isAllTextSelected = true
+        // Set selection to span all nodes - use same sorting as getSelectionRange (reading order)
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+        if let first = sortedNodes.first, let last = sortedNodes.last {
+            selectionStart = (nodeID: first.id, charIndex: 0)
+            selectionEnd = (nodeID: last.id, charIndex: last.text.count)
+        }
     }
 
     /// Clear text selection
     public func clearTextSelection() {
-        selectedNodeIDs.removeAll()
+        selectionStart = nil
+        selectionEnd = nil
         isAllTextSelected = false
         dragStartPoint = nil
         dragEndPoint = nil
@@ -859,63 +879,166 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func startDragSelection(at point: CGPoint) {
         dragStartPoint = point
         dragEndPoint = point
-        selectedNodeIDs.removeAll()
         isAllTextSelected = false
+
+        // Find the character position at this point
+        if let position = findCharacterPosition(at: point) {
+            selectionStart = position
+            selectionEnd = position
+        } else {
+            selectionStart = nil
+            selectionEnd = nil
+        }
     }
 
     /// Update drag selection to a point (normalized coordinates)
     public func updateDragSelection(to point: CGPoint) {
         dragEndPoint = point
-        updateSelectedNodesFromDrag()
+
+        // Find the character position at the current point
+        if let position = findCharacterPosition(at: point) {
+            selectionEnd = position
+        }
     }
 
     /// End drag selection
     public func endDragSelection() {
-        updateSelectedNodesFromDrag()
+        // Keep selection but clear drag points
         dragStartPoint = nil
         dragEndPoint = nil
     }
 
-    /// Update selected nodes based on current drag rectangle
-    private func updateSelectedNodesFromDrag() {
-        guard let start = dragStartPoint, let end = dragEndPoint else { return }
+    /// Find the character position (node ID, char index) closest to a normalized point
+    private func findCharacterPosition(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
+        // Sort nodes by reading order (top to bottom, left to right)
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            // Primary sort by Y (top to bottom), with tolerance for same-line text
+            let yTolerance: CGFloat = 0.02  // ~2% of screen height
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            // Secondary sort by X (left to right)
+            return node1.x < node2.x
+        }
 
-        // Calculate drag rectangle (handle any direction of drag)
-        let minX = min(start.x, end.x)
-        let maxX = max(start.x, end.x)
-        let minY = min(start.y, end.y)
-        let maxY = max(start.y, end.y)
+        // Find which node contains the point, or the closest node
+        var bestNode: RewindDataSource.OCRNode?
+        var bestDistance: CGFloat = .infinity
 
-        // Find all nodes that intersect with the drag rectangle
-        var selected = Set<Int>()
-        for node in ocrNodes {
-            // Check if node bounding box intersects with drag rectangle
-            let nodeMinX = node.x
-            let nodeMaxX = node.x + node.width
-            let nodeMinY = node.y
-            let nodeMaxY = node.y + node.height
+        for node in sortedNodes {
+            // Check if point is inside the node
+            if point.x >= node.x && point.x <= node.x + node.width &&
+               point.y >= node.y && point.y <= node.y + node.height {
+                bestNode = node
+                break
+            }
 
-            // Rectangle intersection test
-            let intersects = !(nodeMaxX < minX || nodeMinX > maxX || nodeMaxY < minY || nodeMinY > maxY)
+            // Calculate distance to node center
+            let centerX = node.x + node.width / 2
+            let centerY = node.y + node.height / 2
+            let distance = hypot(point.x - centerX, point.y - centerY)
 
-            if intersects {
-                selected.insert(node.id)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestNode = node
             }
         }
 
-        selectedNodeIDs = selected
+        guard let node = bestNode else { return nil }
+
+        // Calculate which character within the node
+        let relativeX = (point.x - node.x) / node.width
+        let charIndex = Int(relativeX * CGFloat(node.text.count))
+        let clampedIndex = max(0, min(node.text.count, charIndex))
+
+        return (nodeID: node.id, charIndex: clampedIndex)
     }
 
-    /// Get the selected text (concatenated from selected nodes)
+    /// Get the selection range for a specific node (returns nil if node not in selection)
+    public func getSelectionRange(for nodeID: Int) -> (start: Int, end: Int)? {
+        guard let start = selectionStart, let end = selectionEnd else { return nil }
+
+        // Sort nodes to determine order
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        // Find indices of start and end nodes in sorted order
+        guard let startNodeIndex = sortedNodes.firstIndex(where: { $0.id == start.nodeID }),
+              let endNodeIndex = sortedNodes.firstIndex(where: { $0.id == end.nodeID }),
+              let thisNodeIndex = sortedNodes.firstIndex(where: { $0.id == nodeID }) else {
+            return nil
+        }
+
+        // Normalize so startIndex <= endIndex
+        let (normalizedStartNodeIndex, normalizedEndNodeIndex, normalizedStartChar, normalizedEndChar): (Int, Int, Int, Int)
+        if startNodeIndex <= endNodeIndex {
+            normalizedStartNodeIndex = startNodeIndex
+            normalizedEndNodeIndex = endNodeIndex
+            normalizedStartChar = start.charIndex
+            normalizedEndChar = end.charIndex
+        } else {
+            normalizedStartNodeIndex = endNodeIndex
+            normalizedEndNodeIndex = startNodeIndex
+            normalizedStartChar = end.charIndex
+            normalizedEndChar = start.charIndex
+        }
+
+        // Check if this node is within the selection range
+        guard thisNodeIndex >= normalizedStartNodeIndex && thisNodeIndex <= normalizedEndNodeIndex else {
+            return nil
+        }
+
+        let node = sortedNodes[thisNodeIndex]
+        let textLength = node.text.count
+
+        if thisNodeIndex == normalizedStartNodeIndex && thisNodeIndex == normalizedEndNodeIndex {
+            // Selection is entirely within this node
+            let rangeStart = min(normalizedStartChar, normalizedEndChar)
+            let rangeEnd = max(normalizedStartChar, normalizedEndChar)
+            return (start: rangeStart, end: rangeEnd)
+        } else if thisNodeIndex == normalizedStartNodeIndex {
+            // This is the start node - select from start char to end
+            return (start: normalizedStartChar, end: textLength)
+        } else if thisNodeIndex == normalizedEndNodeIndex {
+            // This is the end node - select from beginning to end char
+            return (start: 0, end: normalizedEndChar)
+        } else {
+            // This node is in the middle - select entire node
+            return (start: 0, end: textLength)
+        }
+    }
+
+    /// Get the selected text (character-level)
     public var selectedText: String {
-        guard !selectedNodeIDs.isEmpty else { return "" }
+        guard selectionStart != nil && selectionEnd != nil else { return "" }
 
-        // Get nodes in order (by ID/nodeOrder)
-        let selectedNodes = ocrNodes
-            .filter { selectedNodeIDs.contains($0.id) }
-            .sorted { $0.id < $1.id }
+        var result = ""
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
 
-        return selectedNodes.map { $0.text }.joined(separator: " ")
+        for node in sortedNodes {
+            if let range = getSelectionRange(for: node.id) {
+                let text = node.text
+                let startIdx = text.index(text.startIndex, offsetBy: min(range.start, text.count))
+                let endIdx = text.index(text.startIndex, offsetBy: min(range.end, text.count))
+                if startIdx < endIdx {
+                    result += String(text[startIdx..<endIdx])
+                    result += " "  // Add space between nodes
+                }
+            }
+        }
+
+        return result.trimmingCharacters(in: .whitespaces)
     }
 
     /// Copy selected text to clipboard

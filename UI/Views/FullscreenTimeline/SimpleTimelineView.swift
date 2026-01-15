@@ -331,11 +331,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                 // Text selection overlay (always present for drag selection)
                 if !viewModel.ocrNodes.isEmpty {
                     TextSelectionOverlay(
-                        nodes: viewModel.ocrNodes,
-                        selectedNodeIDs: viewModel.selectedNodeIDs,
+                        viewModel: viewModel,
                         containerSize: geometry.size,
-                        dragStartPoint: viewModel.dragStartPoint,
-                        dragEndPoint: viewModel.dragEndPoint,
                         onDragStart: { point in
                             viewModel.startDragSelection(at: point)
                         },
@@ -490,13 +487,10 @@ class URLOverlayView: NSView {
 // MARK: - Text Selection Overlay
 
 /// Overlay for selecting text from OCR nodes via click-drag or Cmd+A
-/// Highlights selected text in light purple
+/// Highlights selected text character-by-character in light purple
 struct TextSelectionOverlay: NSViewRepresentable {
-    let nodes: [RewindDataSource.OCRNode]
-    let selectedNodeIDs: Set<Int>
+    @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
-    let dragStartPoint: CGPoint?
-    let dragEndPoint: CGPoint?
     let onDragStart: (CGPoint) -> Void
     let onDragUpdate: (CGPoint) -> Void
     let onDragEnd: () -> Void
@@ -512,43 +506,42 @@ struct TextSelectionOverlay: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: TextSelectionView, context: Context) {
-        // Convert normalized node coordinates to screen coordinates
-        nsView.nodeRects = nodes.map { node in
+        // Build node data with selection ranges
+        nsView.nodeData = viewModel.ocrNodes.map { node in
             let rect = NSRect(
                 x: node.x * containerSize.width,
                 y: (1.0 - node.y - node.height) * containerSize.height, // Flip Y
                 width: node.width * containerSize.width,
                 height: node.height * containerSize.height
             )
-            return (node.id, rect)
+            let selectionRange = viewModel.getSelectionRange(for: node.id)
+            return TextSelectionView.NodeData(
+                id: node.id,
+                rect: rect,
+                text: node.text,
+                selectionRange: selectionRange
+            )
         }
 
-        nsView.selectedNodeIDs = selectedNodeIDs
         nsView.containerSize = containerSize
-
-        // Convert drag rect if present
-        if let start = dragStartPoint, let end = dragEndPoint {
-            let minX = min(start.x, end.x) * containerSize.width
-            let maxX = max(start.x, end.x) * containerSize.width
-            let minY = (1.0 - max(start.y, end.y)) * containerSize.height // Flip Y
-            let maxY = (1.0 - min(start.y, end.y)) * containerSize.height // Flip Y
-
-            nsView.dragRect = NSRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
-        } else {
-            nsView.dragRect = nil
-        }
-
+        nsView.isDraggingSelection = viewModel.dragStartPoint != nil
         nsView.needsDisplay = true
     }
 }
 
 /// Custom NSView for text selection with mouse tracking
 class TextSelectionView: NSView {
-    /// Array of (nodeID, rect) tuples for all OCR nodes
-    var nodeRects: [(Int, NSRect)] = []
-    var selectedNodeIDs: Set<Int> = []
+    /// Data for each OCR node including selection state
+    struct NodeData {
+        let id: Int
+        let rect: NSRect
+        let text: String
+        let selectionRange: (start: Int, end: Int)?  // Character range selected within this node
+    }
+
+    var nodeData: [NodeData] = []
     var containerSize: CGSize = .zero
-    var dragRect: NSRect?
+    var isDraggingSelection: Bool = false
 
     var onDragStart: ((CGPoint) -> Void)?
     var onDragUpdate: ((CGPoint) -> Void)?
@@ -637,31 +630,28 @@ class TextSelectionView: NSView {
 
         // Light purple color for selection highlight
         let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)
-        let selectionStrokeColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.8)
 
-        // Draw selected nodes
-        for (nodeID, rect) in nodeRects {
-            if selectedNodeIDs.contains(nodeID) {
-                selectionColor.setFill()
-                let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
-                path.fill()
+        // Draw character-level selections
+        for node in nodeData {
+            guard let range = node.selectionRange, range.end > range.start else { continue }
 
-                selectionStrokeColor.setStroke()
-                path.lineWidth = 1.0
-                path.stroke()
-            }
-        }
+            let textLength = node.text.count
+            guard textLength > 0 else { continue }
 
-        // Draw drag selection rectangle (if dragging)
-        if let dragRect = dragRect, isDragging {
-            // Semi-transparent blue for drag rectangle
-            NSColor(red: 0.3, green: 0.5, blue: 0.9, alpha: 0.2).setFill()
-            NSColor(red: 0.3, green: 0.5, blue: 0.9, alpha: 0.6).setStroke()
+            // Calculate the portion of the node rect to highlight
+            let startFraction = CGFloat(range.start) / CGFloat(textLength)
+            let endFraction = CGFloat(range.end) / CGFloat(textLength)
 
-            let path = NSBezierPath(rect: dragRect)
+            let highlightRect = NSRect(
+                x: node.rect.origin.x + node.rect.width * startFraction,
+                y: node.rect.origin.y,
+                width: node.rect.width * (endFraction - startFraction),
+                height: node.rect.height
+            )
+
+            selectionColor.setFill()
+            let path = NSBezierPath(roundedRect: highlightRect, xRadius: 2, yRadius: 2)
             path.fill()
-            path.lineWidth = 1.0
-            path.stroke()
         }
     }
 }
