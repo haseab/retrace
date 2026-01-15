@@ -316,6 +316,7 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
 /// Wraps a frame display with an interactive URL bounding box overlay
 /// Shows a dotted rectangle when hovering over a detected URL, with click-to-open functionality
+/// When zoom region is active, shows enlarged region centered with darkened/blurred background
 struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onURLClicked: () -> Void
@@ -323,49 +324,747 @@ struct FrameWithURLOverlay<Content: View>: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let showFinal = viewModel.isZoomRegionActive && viewModel.zoomRegion != nil
+            let showTransition = viewModel.isZoomTransitioning && viewModel.zoomRegion != nil
+            let showNormal = !viewModel.isZoomRegionActive && !viewModel.isZoomTransitioning
+
             ZStack {
-                // The actual frame content
+                // The actual frame content (always present as base layer)
                 content()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                // Text selection overlay (always present for drag selection)
-                if !viewModel.ocrNodes.isEmpty {
-                    TextSelectionOverlay(
+                // Unified zoom overlay - handles BOTH transition AND final state
+                // Uses the same view instance throughout to avoid VideoView reload flicker
+                if (showFinal || showTransition), let region = viewModel.zoomRegion {
+                    ZoomUnifiedOverlay(
                         viewModel: viewModel,
+                        zoomRegion: region,
                         containerSize: geometry.size,
-                        onDragStart: { point in
-                            viewModel.startDragSelection(at: point)
-                        },
-                        onDragUpdate: { point in
-                            viewModel.updateDragSelection(to: point)
-                        },
-                        onDragEnd: {
-                            viewModel.endDragSelection()
-                        },
-                        onClearSelection: {
-                            viewModel.clearTextSelection()
-                        }
-                    )
+                        isTransitioning: showTransition
+                    ) {
+                        content()
+                    }
                 }
 
-                // URL bounding box overlay (if URL detected)
-                if let box = viewModel.urlBoundingBox {
-                    URLBoundingBoxOverlay(
-                        boundingBox: box,
-                        containerSize: geometry.size,
-                        isHovering: viewModel.isHoveringURL,
-                        onHoverChanged: { hovering in
-                            viewModel.isHoveringURL = hovering
-                        },
-                        onClick: {
-                            viewModel.openURLInBrowser()
-                            // Close the timeline view after opening URL
-                            onURLClicked()
-                        }
-                    )
+                // Normal mode overlays (when not zooming or transitioning)
+                if showNormal {
+                    // Normal mode overlays
+
+                    // Zoom region drag preview (shown while Shift+dragging)
+                    if viewModel.isDraggingZoomRegion,
+                       let start = viewModel.zoomRegionDragStart,
+                       let end = viewModel.zoomRegionDragEnd {
+                        ZoomRegionDragPreview(
+                            start: start,
+                            end: end,
+                            containerSize: geometry.size
+                        )
+                    }
+
+                    // Text selection overlay (for drag selection and zoom region creation)
+                    if !viewModel.ocrNodes.isEmpty {
+                        TextSelectionOverlay(
+                            viewModel: viewModel,
+                            containerSize: geometry.size,
+                            onDragStart: { point in
+                                viewModel.startDragSelection(at: point)
+                            },
+                            onDragUpdate: { point in
+                                viewModel.updateDragSelection(to: point)
+                            },
+                            onDragEnd: {
+                                viewModel.endDragSelection()
+                            },
+                            onClearSelection: {
+                                viewModel.clearTextSelection()
+                            },
+                            onZoomRegionStart: { point in
+                                viewModel.startZoomRegion(at: point)
+                            },
+                            onZoomRegionUpdate: { point in
+                                viewModel.updateZoomRegion(to: point)
+                            },
+                            onZoomRegionEnd: {
+                                viewModel.endZoomRegion()
+                            }
+                        )
+                    }
+
+                    // URL bounding box overlay (if URL detected)
+                    if let box = viewModel.urlBoundingBox {
+                        URLBoundingBoxOverlay(
+                            boundingBox: box,
+                            containerSize: geometry.size,
+                            isHovering: viewModel.isHoveringURL,
+                            onHoverChanged: { hovering in
+                                viewModel.isHoveringURL = hovering
+                            },
+                            onClick: {
+                                viewModel.openURLInBrowser()
+                                // Close the timeline view after opening URL
+                                onURLClicked()
+                            }
+                        )
+                    }
                 }
             }
         }
+    }
+}
+
+// MARK: - Zoom Transition Overlay
+
+/// Animated overlay that transitions from the drag rectangle to the centered zoomed view
+/// Shows the rectangle moving from its original position to the center while blur fades in
+struct ZoomTransitionOverlay<Content: View>: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let containerSize: CGSize
+    let content: () -> Content
+
+    var body: some View {
+        let progress = viewModel.zoomTransitionProgress
+        let blurOpacity = viewModel.zoomTransitionBlurOpacity
+
+        // Calculate start position (original drag rectangle)
+        let startRect = CGRect(
+            x: zoomRegion.origin.x * containerSize.width,
+            y: zoomRegion.origin.y * containerSize.height,
+            width: zoomRegion.width * containerSize.width,
+            height: zoomRegion.height * containerSize.height
+        )
+
+        // Calculate end position (centered enlarged rectangle)
+        let maxWidth = containerSize.width * 0.75
+        let maxHeight = containerSize.height * 0.75
+        let regionWidth = zoomRegion.width * containerSize.width
+        let regionHeight = zoomRegion.height * containerSize.height
+        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+        let enlargedWidth = regionWidth * scaleToFit
+        let enlargedHeight = regionHeight * scaleToFit
+        let endRect = CGRect(
+            x: (containerSize.width - enlargedWidth) / 2,
+            y: (containerSize.height - enlargedHeight) / 2,
+            width: enlargedWidth,
+            height: enlargedHeight
+        )
+
+        // Interpolate between start and end
+        let currentRect = CGRect(
+            x: lerp(startRect.origin.x, endRect.origin.x, progress),
+            y: lerp(startRect.origin.y, endRect.origin.y, progress),
+            width: lerp(startRect.width, endRect.width, progress),
+            height: lerp(startRect.height, endRect.height, progress)
+        )
+
+        // Current scale factor (1.0 at start, scaleToFit at end)
+        let currentScale = lerp(1.0, scaleToFit, progress)
+
+        // Center of zoom region in original content
+        let zoomCenterX = (zoomRegion.origin.x + zoomRegion.width / 2) * containerSize.width
+        let zoomCenterY = (zoomRegion.origin.y + zoomRegion.height / 2) * containerSize.height
+
+        ZStack {
+            // Blur overlay that fades in
+            if blurOpacity > 0 {
+                ZoomBackgroundOverlay()
+                    .opacity(blurOpacity)
+            }
+
+            // Darkened area outside the rectangle (darken fades in with blur)
+            Color.black.opacity(0.6 * blurOpacity)
+                .reverseMask {
+                    Rectangle()
+                        .frame(width: currentRect.width, height: currentRect.height)
+                        .position(x: currentRect.midX, y: currentRect.midY)
+                }
+
+            // The zoomed content that animates from original position to center
+            content()
+                .frame(width: containerSize.width, height: containerSize.height)
+                .scaleEffect(currentScale, anchor: .center)
+                .offset(
+                    x: lerp(0, (containerSize.width / 2 - zoomCenterX) * scaleToFit, progress),
+                    y: lerp(0, (containerSize.height / 2 - zoomCenterY) * scaleToFit, progress)
+                )
+                .frame(width: currentRect.width, height: currentRect.height)
+                .clipped()
+                .position(x: currentRect.midX, y: currentRect.midY)
+
+            // White border around the rectangle
+            RoundedRectangle(cornerRadius: lerp(0, 8, progress))
+                .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
+                .frame(width: currentRect.width, height: currentRect.height)
+                .position(x: currentRect.midX, y: currentRect.midY)
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Linear interpolation helper
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * t
+    }
+}
+
+// MARK: - Zoom Unified Overlay
+
+/// Unified overlay that handles BOTH the transition animation AND the final zoom state
+/// Uses a single view instance throughout to avoid VideoView reload flicker during handoff
+/// When isTransitioning=true, animates based on progress; when false, shows final state with text selection
+struct ZoomUnifiedOverlay<Content: View>: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let containerSize: CGSize
+    let isTransitioning: Bool
+    let content: () -> Content
+
+    var body: some View {
+        // Use progress for animation, or 1.0 for final state
+        let progress = isTransitioning ? viewModel.zoomTransitionProgress : 1.0
+        let blurOpacity = isTransitioning ? viewModel.zoomTransitionBlurOpacity : 1.0
+
+        // Calculate start position (original drag rectangle)
+        let startRect = CGRect(
+            x: zoomRegion.origin.x * containerSize.width,
+            y: zoomRegion.origin.y * containerSize.height,
+            width: zoomRegion.width * containerSize.width,
+            height: zoomRegion.height * containerSize.height
+        )
+
+        // Calculate end position (centered enlarged rectangle)
+        let maxWidth = containerSize.width * 0.75
+        let maxHeight = containerSize.height * 0.75
+        let regionWidth = zoomRegion.width * containerSize.width
+        let regionHeight = zoomRegion.height * containerSize.height
+        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+        let enlargedWidth = regionWidth * scaleToFit
+        let enlargedHeight = regionHeight * scaleToFit
+        let endRect = CGRect(
+            x: (containerSize.width - enlargedWidth) / 2,
+            y: (containerSize.height - enlargedHeight) / 2,
+            width: enlargedWidth,
+            height: enlargedHeight
+        )
+
+        // Interpolate between start and end (or use end values directly if not transitioning)
+        let currentRect = CGRect(
+            x: lerp(startRect.origin.x, endRect.origin.x, progress),
+            y: lerp(startRect.origin.y, endRect.origin.y, progress),
+            width: lerp(startRect.width, endRect.width, progress),
+            height: lerp(startRect.height, endRect.height, progress)
+        )
+
+        // Current scale factor (1.0 at start, scaleToFit at end)
+        let currentScale = lerp(1.0, scaleToFit, progress)
+
+        // Center of zoom region in original content
+        let zoomCenterX = (zoomRegion.origin.x + zoomRegion.width / 2) * containerSize.width
+        let zoomCenterY = (zoomRegion.origin.y + zoomRegion.height / 2) * containerSize.height
+
+        ZStack {
+            // Blur overlay that fades in
+            if blurOpacity > 0 {
+                ZoomBackgroundOverlay()
+                    .opacity(blurOpacity)
+            }
+
+            // Darkened area outside the rectangle (darken fades in with blur)
+            Color.black.opacity(0.6 * blurOpacity)
+                .reverseMask {
+                    Rectangle()
+                        .frame(width: currentRect.width, height: currentRect.height)
+                        .position(x: currentRect.midX, y: currentRect.midY)
+                }
+
+            // The zoomed content that animates from original position to center
+            content()
+                .frame(width: containerSize.width, height: containerSize.height)
+                .scaleEffect(currentScale, anchor: .center)
+                .offset(
+                    x: lerp(0, (containerSize.width / 2 - zoomCenterX) * scaleToFit, progress),
+                    y: lerp(0, (containerSize.height / 2 - zoomCenterY) * scaleToFit, progress)
+                )
+                .frame(width: currentRect.width, height: currentRect.height)
+                .clipped()
+                .position(x: currentRect.midX, y: currentRect.midY)
+
+            // White border around the rectangle
+            RoundedRectangle(cornerRadius: lerp(0, 8, progress))
+                .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
+                .frame(width: currentRect.width, height: currentRect.height)
+                .position(x: currentRect.midX, y: currentRect.midY)
+
+            // Text selection overlay - only show when NOT transitioning (final state)
+            if !isTransitioning && !viewModel.ocrNodes.isEmpty {
+                ZoomedTextSelectionOverlay(
+                    viewModel: viewModel,
+                    zoomRegion: zoomRegion,
+                    containerSize: containerSize
+                )
+            }
+        }
+        .allowsHitTesting(!isTransitioning) // Only allow interaction in final state
+    }
+
+    /// Linear interpolation helper
+    private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
+        a + (b - a) * t
+    }
+}
+
+// MARK: - Zoom Background Overlay
+
+/// Darkened and blurred overlay for the background when zoom is active
+struct ZoomBackgroundOverlay: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let blurView = NSVisualEffectView()
+        blurView.blendingMode = .withinWindow
+        blurView.material = .hudWindow
+        blurView.state = .active
+        blurView.wantsLayer = true
+
+        // Add dark tint on top of blur
+        let darkLayer = CALayer()
+        darkLayer.backgroundColor = NSColor.black.withAlphaComponent(0.5).cgColor
+        blurView.layer?.addSublayer(darkLayer)
+
+        return blurView
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        // Update dark layer frame
+        if let darkLayer = nsView.layer?.sublayers?.first {
+            darkLayer.frame = nsView.bounds
+        }
+    }
+}
+
+// MARK: - Zoom Final State Overlay
+
+/// Final state overlay that exactly matches the transition's end state
+/// Uses the same reverseMask approach for visual consistency during handoff
+struct ZoomFinalStateOverlay<Content: View>: View {
+    let zoomRegion: CGRect
+    let containerSize: CGSize
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let content: () -> Content
+
+    var body: some View {
+        // Calculate end position (centered enlarged rectangle) - same as transition
+        let maxWidth = containerSize.width * 0.75
+        let maxHeight = containerSize.height * 0.75
+        let regionWidth = zoomRegion.width * containerSize.width
+        let regionHeight = zoomRegion.height * containerSize.height
+        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+        let enlargedWidth = regionWidth * scaleToFit
+        let enlargedHeight = regionHeight * scaleToFit
+        let finalRect = CGRect(
+            x: (containerSize.width - enlargedWidth) / 2,
+            y: (containerSize.height - enlargedHeight) / 2,
+            width: enlargedWidth,
+            height: enlargedHeight
+        )
+
+        // Center of zoom region in original content
+        let zoomCenterX = (zoomRegion.origin.x + zoomRegion.width / 2) * containerSize.width
+        let zoomCenterY = (zoomRegion.origin.y + zoomRegion.height / 2) * containerSize.height
+
+        ZStack {
+            // Blur overlay (same as transition end state)
+            ZoomBackgroundOverlay()
+
+            // Darkened area outside the rectangle using reverseMask (same as transition)
+            Color.black.opacity(0.6)
+                .reverseMask {
+                    Rectangle()
+                        .frame(width: finalRect.width, height: finalRect.height)
+                        .position(x: finalRect.midX, y: finalRect.midY)
+                }
+
+            // The zoomed content at final position (same as transition end state)
+            content()
+                .frame(width: containerSize.width, height: containerSize.height)
+                .scaleEffect(scaleToFit, anchor: .center)
+                .offset(
+                    x: (containerSize.width / 2 - zoomCenterX) * scaleToFit,
+                    y: (containerSize.height / 2 - zoomCenterY) * scaleToFit
+                )
+                .frame(width: finalRect.width, height: finalRect.height)
+                .clipped()
+                .position(x: finalRect.midX, y: finalRect.midY)
+
+            // White border around the rectangle (same as transition end state)
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.9), lineWidth: 3)
+                .frame(width: finalRect.width, height: finalRect.height)
+                .position(x: finalRect.midX, y: finalRect.midY)
+
+            // Text selection overlay ON TOP of the zoomed region
+            if !viewModel.ocrNodes.isEmpty {
+                ZoomedTextSelectionOverlay(
+                    viewModel: viewModel,
+                    zoomRegion: zoomRegion,
+                    containerSize: containerSize
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Zoomed Region View
+
+/// Displays the selected region enlarged and centered on screen
+/// The region is scaled up and positioned in the center with a border
+struct ZoomedRegionView<Content: View>: View {
+    let zoomRegion: CGRect
+    let containerSize: CGSize
+    let content: () -> Content
+
+    var body: some View {
+        // Calculate the enlarged size - scale up to ~70% of screen while maintaining aspect ratio
+        let maxWidth = containerSize.width * 0.75
+        let maxHeight = containerSize.height * 0.75
+
+        let regionWidth = zoomRegion.width * containerSize.width
+        let regionHeight = zoomRegion.height * containerSize.height
+
+        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+        let enlargedWidth = regionWidth * scaleToFit
+        let enlargedHeight = regionHeight * scaleToFit
+
+        // Scale factor from original content to enlarged view
+        let contentScale = scaleToFit
+
+        // The center of the zoom region in the original content
+        let zoomCenterX = (zoomRegion.origin.x + zoomRegion.width / 2) * containerSize.width
+        let zoomCenterY = (zoomRegion.origin.y + zoomRegion.height / 2) * containerSize.height
+
+        ZStack {
+            // Clipped and scaled content showing only the zoom region
+            content()
+                .frame(width: containerSize.width, height: containerSize.height)
+                .scaleEffect(contentScale, anchor: .center)
+                .offset(
+                    x: (containerSize.width / 2 - zoomCenterX) * contentScale,
+                    y: (containerSize.height / 2 - zoomCenterY) * contentScale
+                )
+                .frame(width: enlargedWidth, height: enlargedHeight)
+                .clipped()
+
+            // White border around the zoomed region
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.9), lineWidth: 3)
+                .frame(width: enlargedWidth, height: enlargedHeight)
+        }
+    }
+}
+
+// MARK: - Zoomed Text Selection Overlay
+
+/// Text selection overlay that appears on top of the zoomed region
+/// Handles mouse events and transforms coordinates appropriately
+struct ZoomedTextSelectionOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let containerSize: CGSize
+
+    var body: some View {
+        // Calculate the same dimensions as ZoomedRegionView
+        let maxWidth = containerSize.width * 0.75
+        let maxHeight = containerSize.height * 0.75
+
+        let regionWidth = zoomRegion.width * containerSize.width
+        let regionHeight = zoomRegion.height * containerSize.height
+
+        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+        let enlargedWidth = regionWidth * scaleToFit
+        let enlargedHeight = regionHeight * scaleToFit
+
+        ZoomedTextSelectionNSView(
+            viewModel: viewModel,
+            zoomRegion: zoomRegion,
+            enlargedSize: CGSize(width: enlargedWidth, height: enlargedHeight),
+            containerSize: containerSize
+        )
+        .frame(width: enlargedWidth, height: enlargedHeight)
+    }
+}
+
+/// NSViewRepresentable for handling text selection in zoomed view
+struct ZoomedTextSelectionNSView: NSViewRepresentable {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let enlargedSize: CGSize
+    let containerSize: CGSize
+
+    func makeNSView(context: Context) -> ZoomedSelectionView {
+        let view = ZoomedSelectionView()
+        view.onDragStart = { point in viewModel.startDragSelection(at: point) }
+        view.onDragUpdate = { point in viewModel.updateDragSelection(to: point) }
+        view.onDragEnd = { viewModel.endDragSelection() }
+        view.onClearSelection = { viewModel.clearTextSelection() }
+        return view
+    }
+
+    func updateNSView(_ nsView: ZoomedSelectionView, context: Context) {
+        nsView.zoomRegion = zoomRegion
+        nsView.enlargedSize = enlargedSize
+
+        // Transform OCR nodes to zoomed view coordinates
+        // IMPORTANT: Clip nodes to zoom region boundaries so only visible text is selectable
+        nsView.nodeData = viewModel.ocrNodes.compactMap { node -> ZoomedSelectionView.NodeData? in
+            // Check if node is within zoom region
+            let nodeRight = node.x + node.width
+            let nodeBottom = node.y + node.height
+            let regionRight = zoomRegion.origin.x + zoomRegion.width
+            let regionBottom = zoomRegion.origin.y + zoomRegion.height
+
+            // Skip nodes completely outside the zoom region
+            if nodeRight < zoomRegion.origin.x || node.x > regionRight ||
+               nodeBottom < zoomRegion.origin.y || node.y > regionBottom {
+                return nil
+            }
+
+            // Clip node to zoom region boundaries
+            let clippedX = max(node.x, zoomRegion.origin.x)
+            let clippedY = max(node.y, zoomRegion.origin.y)
+            let clippedRight = min(nodeRight, regionRight)
+            let clippedBottom = min(nodeBottom, regionBottom)
+            let clippedWidth = clippedRight - clippedX
+            let clippedHeight = clippedBottom - clippedY
+
+            // Calculate which portion of the text is visible (for horizontal clipping)
+            // Text flows left-to-right, so we calculate character range based on X clipping
+            let textLength = node.text.count
+            let visibleStartFraction = (clippedX - node.x) / node.width
+            let visibleEndFraction = (clippedRight - node.x) / node.width
+            let visibleStartChar = Int(visibleStartFraction * CGFloat(textLength))
+            let visibleEndChar = Int(visibleEndFraction * CGFloat(textLength))
+
+            // Extract only the visible portion of text
+            let visibleText: String
+            if visibleStartChar < visibleEndChar && visibleStartChar >= 0 && visibleEndChar <= textLength {
+                let startIdx = node.text.index(node.text.startIndex, offsetBy: visibleStartChar)
+                let endIdx = node.text.index(node.text.startIndex, offsetBy: visibleEndChar)
+                visibleText = String(node.text[startIdx..<endIdx])
+            } else {
+                visibleText = node.text
+            }
+
+            // Transform CLIPPED coordinates to zoomed coordinate space (0-1 within the enlarged view)
+            let transformedX = (clippedX - zoomRegion.origin.x) / zoomRegion.width
+            let transformedY = (clippedY - zoomRegion.origin.y) / zoomRegion.height
+            let transformedW = clippedWidth / zoomRegion.width
+            let transformedH = clippedHeight / zoomRegion.height
+
+            // Convert to screen coordinates within the enlarged view
+            let rect = NSRect(
+                x: transformedX * enlargedSize.width,
+                y: (1.0 - transformedY - transformedH) * enlargedSize.height,
+                width: transformedW * enlargedSize.width,
+                height: transformedH * enlargedSize.height
+            )
+
+            // Get selection range and adjust for clipped text
+            var adjustedSelectionRange: (start: Int, end: Int)? = nil
+            if let selectionRange = viewModel.getSelectionRange(for: node.id) {
+                // Adjust selection range to account for clipped characters
+                let adjustedStart = max(0, selectionRange.start - visibleStartChar)
+                let adjustedEnd = min(visibleText.count, selectionRange.end - visibleStartChar)
+                if adjustedEnd > adjustedStart {
+                    adjustedSelectionRange = (start: adjustedStart, end: adjustedEnd)
+                }
+            }
+
+            return ZoomedSelectionView.NodeData(
+                id: node.id,
+                rect: rect,
+                text: visibleText,
+                selectionRange: adjustedSelectionRange,
+                visibleCharOffset: visibleStartChar
+            )
+        }
+
+        nsView.needsDisplay = true
+    }
+}
+
+/// Custom NSView for text selection within the zoomed region
+class ZoomedSelectionView: NSView {
+    struct NodeData {
+        let id: Int
+        let rect: NSRect
+        let text: String
+        let selectionRange: (start: Int, end: Int)?
+        /// Offset of the first visible character (for clipped nodes)
+        let visibleCharOffset: Int
+    }
+
+    var nodeData: [NodeData] = []
+    var zoomRegion: CGRect = .zero
+    var enlargedSize: CGSize = .zero
+
+    var onDragStart: ((CGPoint) -> Void)?
+    var onDragUpdate: ((CGPoint) -> Void)?
+    var onDragEnd: (() -> Void)?
+    var onClearSelection: (() -> Void)?
+
+    private var isDragging = false
+    private var hasMoved = false
+    private var mouseDownPoint: CGPoint = .zero
+    private var trackingArea: NSTrackingArea?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingArea {
+            removeTrackingArea(existing)
+        }
+        let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited]
+        trackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(trackingArea!)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        mouseDownPoint = location
+        hasMoved = false
+        isDragging = true
+
+        // Convert to original frame coordinates
+        let normalizedPoint = screenToOriginalCoords(location)
+        onDragStart?(normalizedPoint)
+        needsDisplay = true
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+
+        let distance = hypot(location.x - mouseDownPoint.x, location.y - mouseDownPoint.y)
+        if distance > 3 {
+            hasMoved = true
+        }
+
+        // Clamp to bounds
+        let clampedX = max(0, min(bounds.width, location.x))
+        let clampedY = max(0, min(bounds.height, location.y))
+
+        let normalizedPoint = screenToOriginalCoords(CGPoint(x: clampedX, y: clampedY))
+        onDragUpdate?(normalizedPoint)
+        needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        isDragging = false
+        if !hasMoved {
+            onClearSelection?()
+        } else {
+            onDragEnd?()
+        }
+        needsDisplay = true
+    }
+
+    /// Convert screen coordinates within the zoomed view to original frame coordinates
+    private func screenToOriginalCoords(_ point: CGPoint) -> CGPoint {
+        guard enlargedSize.width > 0, enlargedSize.height > 0 else { return .zero }
+
+        // Convert to 0-1 within the zoomed view
+        let normalizedInZoom = CGPoint(
+            x: point.x / enlargedSize.width,
+            y: 1.0 - (point.y / enlargedSize.height)  // Flip Y
+        )
+
+        // Transform back to original frame coordinates
+        return CGPoint(
+            x: normalizedInZoom.x * zoomRegion.width + zoomRegion.origin.x,
+            y: normalizedInZoom.y * zoomRegion.height + zoomRegion.origin.y
+        )
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        // Light purple color for selection highlight
+        let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)
+
+        // Draw character-level selections
+        for node in nodeData {
+            guard let range = node.selectionRange, range.end > range.start else { continue }
+
+            let textLength = node.text.count
+            guard textLength > 0 else { continue }
+
+            let startFraction = CGFloat(range.start) / CGFloat(textLength)
+            let endFraction = CGFloat(range.end) / CGFloat(textLength)
+
+            let highlightRect = NSRect(
+                x: node.rect.origin.x + node.rect.width * startFraction,
+                y: node.rect.origin.y,
+                width: node.rect.width * (endFraction - startFraction),
+                height: node.rect.height
+            )
+
+            selectionColor.setFill()
+            let path = NSBezierPath(roundedRect: highlightRect, xRadius: 2, yRadius: 2)
+            path.fill()
+        }
+    }
+}
+
+// MARK: - Zoom Region Drag Preview
+
+/// Shows a preview rectangle while Shift+dragging to create a zoom region
+/// Darkens the area outside the selection
+struct ZoomRegionDragPreview: View {
+    let start: CGPoint
+    let end: CGPoint
+    let containerSize: CGSize
+
+    var body: some View {
+        let minX = min(start.x, end.x)
+        let maxX = max(start.x, end.x)
+        let minY = min(start.y, end.y)
+        let maxY = max(start.y, end.y)
+
+        let rect = CGRect(
+            x: minX * containerSize.width,
+            y: minY * containerSize.height,
+            width: (maxX - minX) * containerSize.width,
+            height: (maxY - minY) * containerSize.height
+        )
+
+        ZStack {
+            // Darken outside the selection
+            Color.black.opacity(0.6)
+                .reverseMask {
+                    Rectangle()
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                }
+
+            // White border around selection
+            Rectangle()
+                .stroke(Color.white.opacity(0.9), lineWidth: 2)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: rect.midX, y: rect.midY)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// View modifier extension for reverse masking
+extension View {
+    @ViewBuilder
+    func reverseMask<Mask: View>(@ViewBuilder _ mask: () -> Mask) -> some View {
+        self.mask(
+            ZStack {
+                Rectangle()
+                mask()
+                    .blendMode(.destinationOut)
+            }
+            .compositingGroup()
+        )
     }
 }
 
@@ -487,6 +1186,7 @@ class URLOverlayView: NSView {
 // MARK: - Text Selection Overlay
 
 /// Overlay for selecting text from OCR nodes via click-drag or Cmd+A
+/// Also handles Shift+Drag for zoom region creation
 /// Highlights selected text character-by-character in light purple
 struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
@@ -495,6 +1195,10 @@ struct TextSelectionOverlay: NSViewRepresentable {
     let onDragUpdate: (CGPoint) -> Void
     let onDragEnd: () -> Void
     let onClearSelection: () -> Void
+    // Zoom region callbacks
+    let onZoomRegionStart: (CGPoint) -> Void
+    let onZoomRegionUpdate: (CGPoint) -> Void
+    let onZoomRegionEnd: () -> Void
 
     func makeNSView(context: Context) -> TextSelectionView {
         let view = TextSelectionView()
@@ -502,11 +1206,14 @@ struct TextSelectionOverlay: NSViewRepresentable {
         view.onDragUpdate = onDragUpdate
         view.onDragEnd = onDragEnd
         view.onClearSelection = onClearSelection
+        view.onZoomRegionStart = onZoomRegionStart
+        view.onZoomRegionUpdate = onZoomRegionUpdate
+        view.onZoomRegionEnd = onZoomRegionEnd
         return view
     }
 
     func updateNSView(_ nsView: TextSelectionView, context: Context) {
-        // Build node data with selection ranges
+        // Build node data with selection ranges (normal mode - no zoom transformation)
         nsView.nodeData = viewModel.ocrNodes.map { node in
             let rect = NSRect(
                 x: node.x * containerSize.width,
@@ -525,11 +1232,14 @@ struct TextSelectionOverlay: NSViewRepresentable {
 
         nsView.containerSize = containerSize
         nsView.isDraggingSelection = viewModel.dragStartPoint != nil
+        nsView.isDraggingZoomRegion = viewModel.isDraggingZoomRegion
+
         nsView.needsDisplay = true
     }
 }
 
 /// Custom NSView for text selection with mouse tracking
+/// Supports both text selection (normal drag) and zoom region (Shift+Drag)
 class TextSelectionView: NSView {
     /// Data for each OCR node including selection state
     struct NodeData {
@@ -542,13 +1252,21 @@ class TextSelectionView: NSView {
     var nodeData: [NodeData] = []
     var containerSize: CGSize = .zero
     var isDraggingSelection: Bool = false
+    var isDraggingZoomRegion: Bool = false
 
+    // Text selection callbacks
     var onDragStart: ((CGPoint) -> Void)?
     var onDragUpdate: ((CGPoint) -> Void)?
     var onDragEnd: (() -> Void)?
     var onClearSelection: (() -> Void)?
 
+    // Zoom region callbacks
+    var onZoomRegionStart: ((CGPoint) -> Void)?
+    var onZoomRegionUpdate: ((CGPoint) -> Void)?
+    var onZoomRegionEnd: (() -> Void)?
+
     private var isDragging = false
+    private var isZoomDragging = false  // Shift+Drag mode
     private var hasMoved = false  // Track if mouse moved during drag
     private var mouseDownPoint: CGPoint = .zero
     private var trackingArea: NSTrackingArea?
@@ -579,14 +1297,20 @@ class TextSelectionView: NSView {
             y: 1.0 - (location.y / containerSize.height) // Flip Y back
         )
 
-        isDragging = true
-        onDragStart?(normalizedPoint)
+        // Check if Shift is held - start zoom region mode
+        if event.modifierFlags.contains(.shift) {
+            isZoomDragging = true
+            isDragging = false
+            onZoomRegionStart?(normalizedPoint)
+        } else {
+            isDragging = true
+            isZoomDragging = false
+            onDragStart?(normalizedPoint)
+        }
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard isDragging else { return }
-
         let location = convert(event.locationInWindow, from: nil)
 
         // Check if mouse actually moved (more than 3 pixels to avoid micro-movements)
@@ -606,27 +1330,36 @@ class TextSelectionView: NSView {
             y: 1.0 - (clampedY / containerSize.height) // Flip Y back
         )
 
-        onDragUpdate?(normalizedPoint)
+        if isZoomDragging {
+            onZoomRegionUpdate?(normalizedPoint)
+        } else if isDragging {
+            onDragUpdate?(normalizedPoint)
+        }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard isDragging else { return }
-
-        isDragging = false
-
-        // If mouse didn't move, this was a click - clear selection
-        if !hasMoved {
-            onClearSelection?()
-        } else {
-            onDragEnd?()
+        if isZoomDragging {
+            isZoomDragging = false
+            if hasMoved {
+                onZoomRegionEnd?()
+            }
+        } else if isDragging {
+            isDragging = false
+            // If mouse didn't move, this was a click - clear selection
+            if !hasMoved {
+                onClearSelection?()
+            } else {
+                onDragEnd?()
+            }
         }
-
         needsDisplay = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+
+        // Note: Zoom region drag preview is now handled by ZoomRegionDragPreview in SwiftUI
 
         // Light purple color for selection highlight
         let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)

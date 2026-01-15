@@ -165,6 +165,38 @@ public class SimpleTimelineViewModel: ObservableObject {
         isAllTextSelected || (selectionStart != nil && selectionEnd != nil)
     }
 
+    // MARK: - Zoom Region State (Shift+Drag focus rectangle)
+
+    /// Whether zoom region mode is active
+    @Published public var isZoomRegionActive: Bool = false
+
+    /// Zoom region rectangle in normalized coordinates (0.0-1.0)
+    /// nil when not zooming, set when Shift+Drag creates a focus region
+    @Published public var zoomRegion: CGRect?
+
+    /// Whether currently dragging to create a zoom region
+    @Published public var isDraggingZoomRegion: Bool = false
+
+    /// Start point of zoom region drag (normalized coordinates)
+    @Published public var zoomRegionDragStart: CGPoint?
+
+    /// Current end point of zoom region drag (normalized coordinates)
+    @Published public var zoomRegionDragEnd: CGPoint?
+
+    // MARK: - Zoom Transition Animation State
+
+    /// Whether we're currently animating the zoom transition
+    @Published public var isZoomTransitioning: Bool = false
+
+    /// The original rect where the drag ended (for animation start)
+    @Published public var zoomTransitionStartRect: CGRect?
+
+    /// Animation progress (0.0 = drag position, 1.0 = centered position)
+    @Published public var zoomTransitionProgress: CGFloat = 0
+
+    /// Blur opacity during transition (0.0 = no blur, 1.0 = full blur)
+    @Published public var zoomTransitionBlurOpacity: CGFloat = 0
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level
@@ -848,12 +880,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    /// Select all text (Cmd+A)
+    /// Select all text (Cmd+A) - respects zoom region if active
     public func selectAllText() {
-        guard !ocrNodes.isEmpty else { return }
+        // Use nodes in zoom region if active, otherwise all nodes
+        let nodesToSelect = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
+        guard !nodesToSelect.isEmpty else { return }
+
         isAllTextSelected = true
         // Set selection to span all nodes - use same sorting as getSelectionRange (reading order)
-        let sortedNodes = ocrNodes.sorted { node1, node2 in
+        let sortedNodes = nodesToSelect.sorted { node1, node2 in
             let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
                 return node1.y < node2.y
@@ -906,6 +941,185 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Keep selection but clear drag points
         dragStartPoint = nil
         dragEndPoint = nil
+    }
+
+    // MARK: - Zoom Region Methods (Shift+Drag)
+
+    /// Start creating a zoom region (Shift+Drag)
+    public func startZoomRegion(at point: CGPoint) {
+        isDraggingZoomRegion = true
+        zoomRegionDragStart = point
+        zoomRegionDragEnd = point
+        // Clear any existing text selection when starting zoom
+        clearTextSelection()
+    }
+
+    /// Update zoom region drag
+    public func updateZoomRegion(to point: CGPoint) {
+        zoomRegionDragEnd = point
+    }
+
+    /// Finalize zoom region from drag - triggers animation to centered view
+    public func endZoomRegion() {
+        guard let start = zoomRegionDragStart, let end = zoomRegionDragEnd else {
+            isDraggingZoomRegion = false
+            return
+        }
+
+        // Calculate the rectangle from drag points
+        let minX = min(start.x, end.x)
+        let minY = min(start.y, end.y)
+        let maxX = max(start.x, end.x)
+        let maxY = max(start.y, end.y)
+
+        let width = maxX - minX
+        let height = maxY - minY
+
+        // Only create zoom region if it's large enough (at least 5% of screen)
+        guard width > 0.05 && height > 0.05 else {
+            isDraggingZoomRegion = false
+            zoomRegionDragStart = nil
+            zoomRegionDragEnd = nil
+            return
+        }
+
+        let finalRect = CGRect(x: minX, y: minY, width: width, height: height)
+
+        // Store the starting rect for animation
+        zoomTransitionStartRect = finalRect
+        zoomRegion = finalRect
+
+        // Clear drag state
+        isDraggingZoomRegion = false
+        zoomRegionDragStart = nil
+        zoomRegionDragEnd = nil
+
+        // Start the transition animation
+        isZoomTransitioning = true
+        zoomTransitionProgress = 0
+        zoomTransitionBlurOpacity = 0
+
+        // Animate to final state
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+            zoomTransitionProgress = 1.0
+            zoomTransitionBlurOpacity = 1.0
+        }
+
+        // After animation completes, switch to final zoom state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.isZoomRegionActive = true
+            self?.zoomTransitionStartRect = nil
+            // Disable transition on next run loop to ensure smooth handoff
+            DispatchQueue.main.async {
+                self?.isZoomTransitioning = false
+            }
+        }
+    }
+
+    /// Exit zoom region mode
+    public func exitZoomRegion() {
+        isZoomRegionActive = false
+        zoomRegion = nil
+        isDraggingZoomRegion = false
+        zoomRegionDragStart = nil
+        zoomRegionDragEnd = nil
+        // Also clear text selection
+        clearTextSelection()
+    }
+
+    /// Get OCR nodes filtered to zoom region (for Cmd+A within zoom)
+    public var ocrNodesInZoomRegion: [RewindDataSource.OCRNode] {
+        guard let region = zoomRegion, isZoomRegionActive else {
+            return ocrNodes
+        }
+
+        return ocrNodes.filter { node in
+            // Check if node overlaps with the zoom region (at least partially visible)
+            let nodeRight = node.x + node.width
+            let nodeBottom = node.y + node.height
+            let regionRight = region.origin.x + region.width
+            let regionBottom = region.origin.y + region.height
+
+            return !(nodeRight < region.origin.x || node.x > regionRight ||
+                     nodeBottom < region.origin.y || node.y > regionBottom)
+        }
+    }
+
+    /// Get the visible character range for a node within the current zoom region
+    /// Returns the start and end character indices that are visible, or nil if fully visible
+    public func getVisibleCharacterRange(for node: RewindDataSource.OCRNode) -> (start: Int, end: Int)? {
+        guard let region = zoomRegion, isZoomRegionActive else {
+            return nil // No clipping needed
+        }
+
+        let nodeRight = node.x + node.width
+        let regionRight = region.origin.x + region.width
+
+        // Check if node needs horizontal clipping
+        let needsLeftClip = node.x < region.origin.x
+        let needsRightClip = nodeRight > regionRight
+
+        guard needsLeftClip || needsRightClip else {
+            return nil // Fully visible
+        }
+
+        let textLength = node.text.count
+        guard textLength > 0, node.width > 0 else { return nil }
+
+        // Calculate visible portion based on horizontal clipping
+        let clippedX = max(node.x, region.origin.x)
+        let clippedRight = min(nodeRight, regionRight)
+
+        let visibleStartFraction = (clippedX - node.x) / node.width
+        let visibleEndFraction = (clippedRight - node.x) / node.width
+
+        let visibleStartChar = Int(visibleStartFraction * CGFloat(textLength))
+        let visibleEndChar = Int(visibleEndFraction * CGFloat(textLength))
+
+        return (start: max(0, visibleStartChar), end: min(textLength, visibleEndChar))
+    }
+
+    /// Find the character position within zoom region only
+    private func findCharacterPositionInZoomRegion(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
+        let nodesInRegion = ocrNodesInZoomRegion
+
+        // Sort nodes by reading order (top to bottom, left to right)
+        let sortedNodes = nodesInRegion.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        // Find which node contains the point, or the closest node
+        var bestNode: RewindDataSource.OCRNode?
+        var bestDistance: CGFloat = .infinity
+
+        for node in sortedNodes {
+            if point.x >= node.x && point.x <= node.x + node.width &&
+               point.y >= node.y && point.y <= node.y + node.height {
+                bestNode = node
+                break
+            }
+
+            let centerX = node.x + node.width / 2
+            let centerY = node.y + node.height / 2
+            let distance = hypot(point.x - centerX, point.y - centerY)
+
+            if distance < bestDistance {
+                bestDistance = distance
+                bestNode = node
+            }
+        }
+
+        guard let node = bestNode else { return nil }
+
+        let relativeX = (point.x - node.x) / node.width
+        let charIndex = Int(relativeX * CGFloat(node.text.count))
+        let clampedIndex = max(0, min(node.text.count, charIndex))
+
+        return (nodeID: node.id, charIndex: clampedIndex)
     }
 
     /// Find the character position (node ID, char index) closest to a normalized point
@@ -996,29 +1210,49 @@ public class SimpleTimelineViewModel: ObservableObject {
         let node = sortedNodes[thisNodeIndex]
         let textLength = node.text.count
 
+        var rangeStart: Int
+        var rangeEnd: Int
+
         if thisNodeIndex == normalizedStartNodeIndex && thisNodeIndex == normalizedEndNodeIndex {
             // Selection is entirely within this node
-            let rangeStart = min(normalizedStartChar, normalizedEndChar)
-            let rangeEnd = max(normalizedStartChar, normalizedEndChar)
-            return (start: rangeStart, end: rangeEnd)
+            rangeStart = min(normalizedStartChar, normalizedEndChar)
+            rangeEnd = max(normalizedStartChar, normalizedEndChar)
         } else if thisNodeIndex == normalizedStartNodeIndex {
             // This is the start node - select from start char to end
-            return (start: normalizedStartChar, end: textLength)
+            rangeStart = normalizedStartChar
+            rangeEnd = textLength
         } else if thisNodeIndex == normalizedEndNodeIndex {
             // This is the end node - select from beginning to end char
-            return (start: 0, end: normalizedEndChar)
+            rangeStart = 0
+            rangeEnd = normalizedEndChar
         } else {
             // This node is in the middle - select entire node
-            return (start: 0, end: textLength)
+            rangeStart = 0
+            rangeEnd = textLength
         }
+
+        // When zoom region is active, constrain selection to visible characters only
+        if let visibleRange = getVisibleCharacterRange(for: node) {
+            rangeStart = max(rangeStart, visibleRange.start)
+            rangeEnd = min(rangeEnd, visibleRange.end)
+            // Return nil if there's no overlap between selection and visible range
+            if rangeEnd <= rangeStart {
+                return nil
+            }
+        }
+
+        return (start: rangeStart, end: rangeEnd)
     }
 
     /// Get the selected text (character-level)
+    /// When zoom region is active, only includes text visible within the region
     public var selectedText: String {
         guard selectionStart != nil && selectionEnd != nil else { return "" }
 
         var result = ""
-        let sortedNodes = ocrNodes.sorted { node1, node2 in
+        // Use nodes in zoom region if active, otherwise all nodes
+        let nodesToCheck = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
+        let sortedNodes = nodesToCheck.sorted { node1, node2 in
             let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
                 return node1.y < node2.y

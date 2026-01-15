@@ -224,13 +224,26 @@ public class TimelineWindowController: NSObject {
             return false
         }
 
-        // Escape key closes the timeline (unless delete dialog is showing)
+        // Escape key - cascading behavior based on current state
         if event.keyCode == 53 { // Escape
-            // If delete confirmation is showing, cancel it instead of closing timeline
-            if let viewModel = timelineViewModel, viewModel.showDeleteConfirmation {
-                viewModel.cancelDelete()
-                return true
+            if let viewModel = timelineViewModel {
+                // If delete confirmation is showing, cancel it
+                if viewModel.showDeleteConfirmation {
+                    viewModel.cancelDelete()
+                    return true
+                }
+                // If zoom region is active, exit zoom mode
+                if viewModel.isZoomRegionActive {
+                    viewModel.exitZoomRegion()
+                    return true
+                }
+                // If text selection is active, clear it
+                if viewModel.hasSelection {
+                    viewModel.clearTextSelection()
+                    return true
+                }
             }
+            // Otherwise close the timeline
             hide()
             return true
         }
