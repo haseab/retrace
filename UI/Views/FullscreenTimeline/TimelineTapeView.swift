@@ -220,12 +220,13 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: centerX, y: -55)
 
-                // Right side controls (zoom + more options)
+                // Right side controls (search + zoom + more options)
                 HStack(spacing: 12) {
+                    SearchButton(viewModel: viewModel)
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
-                .position(x: geometry.size.width - 120, y: -55)
+                .position(x: geometry.size.width - 180, y: -55)
 
                 // Playhead vertical line (fixed at center)
                 Rectangle()
@@ -332,6 +333,74 @@ struct ZoomControl: View {
             }
         )
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isZoomSliderExpanded)
+    }
+}
+
+// MARK: - Search Button
+
+/// Search button styled as an input field that opens the spotlight search overlay
+struct SearchButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    /// Display text: shows the search query if present, otherwise "Search"
+    private var displayText: String {
+        let query = viewModel.searchViewModel.searchQuery
+        return query.isEmpty ? "Search" : query
+    }
+
+    /// Whether there's an active search query
+    private var hasSearchQuery: Bool {
+        !viewModel.searchViewModel.searchQuery.isEmpty
+    }
+
+    var body: some View {
+        Button(action: {
+            viewModel.clearSearchHighlight()
+            viewModel.isSearchOverlayVisible = true
+        }) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.9) : .white.opacity(0.5)))
+
+                Text(displayText)
+                    .font(.system(size: 13))
+                    .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.8) : .white.opacity(0.4)))
+                    .lineLimit(1)
+
+                Spacer()
+
+                // Keyboard shortcut hint
+                Text("⌘K")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(isHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.1))
+                    )
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(width: 160)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(0.5))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .help("Search (Cmd+K)")
     }
 }
 

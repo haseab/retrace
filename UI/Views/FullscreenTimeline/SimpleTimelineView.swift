@@ -45,11 +45,10 @@ public struct SimpleTimelineView: View {
                 .offset(y: viewModel.areControlsHidden ? 150 : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
-                // Search and Close buttons (top-right)
+                // Close button (top-right)
                 VStack {
                     HStack {
                         Spacer()
-                        searchButton
                         closeButton
                     }
                     Spacer()
@@ -104,6 +103,7 @@ public struct SimpleTimelineView: View {
                         onResultSelected: { result, query in
                             Task {
                                 await viewModel.navigateToSearchResult(
+                                    frameID: result.id,
                                     timestamp: result.timestamp,
                                     highlightQuery: query
                                 )
@@ -120,12 +120,12 @@ public struct SimpleTimelineView: View {
                     SearchHighlightOverlay(viewModel: viewModel, containerSize: geometry.size)
                 }
 
-                // Controls toggle button (bottom-right, always visible unless dragging zoom region)
+                // Controls toggle button (bottom-left, always visible unless dragging zoom region)
                 VStack {
                     Spacer()
                     HStack {
-                        Spacer()
                         controlsToggleButton
+                        Spacer()
                     }
                 }
                 .padding(.spacingL)
@@ -174,21 +174,6 @@ public struct SimpleTimelineView: View {
                     .foregroundColor(.white.opacity(0.5))
             }
         }
-    }
-
-    // MARK: - Search Button
-
-    private var searchButton: some View {
-        Button(action: {
-            viewModel.clearSearchHighlight()
-            viewModel.isSearchOverlayVisible = true
-        }) {
-            Image(systemName: "magnifyingglass.circle.fill")
-                .font(.system(size: 28))
-                .foregroundColor(.white.opacity(0.6))
-        }
-        .buttonStyle(.plain)
-        .help("Search (Cmd+K)")
     }
 
     // MARK: - Close Button
@@ -467,6 +452,12 @@ struct FrameWithURLOverlay<Content: View>: View {
                             },
                             onZoomRegionEnd: {
                                 viewModel.endZoomRegion()
+                            },
+                            onDoubleClick: { point in
+                                viewModel.selectWordAt(point: point)
+                            },
+                            onTripleClick: { point in
+                                viewModel.selectNodeAt(point: point)
                             }
                         )
                     }
@@ -885,6 +876,8 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
         view.onDragEnd = { viewModel.endDragSelection() }
         view.onClearSelection = { viewModel.clearTextSelection() }
         view.onCopyImage = { [weak viewModel] in viewModel?.copyZoomedRegionImage() }
+        view.onDoubleClick = { point in viewModel.selectWordAt(point: point) }
+        view.onTripleClick = { point in viewModel.selectNodeAt(point: point) }
         return view
     }
 
@@ -991,6 +984,8 @@ class ZoomedSelectionView: NSView {
     var onDragEnd: (() -> Void)?
     var onClearSelection: (() -> Void)?
     var onCopyImage: (() -> Void)?
+    var onDoubleClick: ((CGPoint) -> Void)?
+    var onTripleClick: ((CGPoint) -> Void)?
 
     private var isDragging = false
     private var hasMoved = false
@@ -1013,11 +1008,22 @@ class ZoomedSelectionView: NSView {
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
-        isDragging = true
 
         // Convert to original frame coordinates
         let normalizedPoint = screenToOriginalCoords(location)
-        onDragStart?(normalizedPoint)
+
+        // Handle multi-click (double-click = word, triple-click = line)
+        let clickCount = event.clickCount
+        if clickCount == 2 {
+            onDoubleClick?(normalizedPoint)
+            isDragging = false
+        } else if clickCount >= 3 {
+            onTripleClick?(normalizedPoint)
+            isDragging = false
+        } else {
+            isDragging = true
+            onDragStart?(normalizedPoint)
+        }
         needsDisplay = true
     }
 
@@ -1296,6 +1302,9 @@ struct TextSelectionOverlay: NSViewRepresentable {
     let onZoomRegionStart: (CGPoint) -> Void
     let onZoomRegionUpdate: (CGPoint) -> Void
     let onZoomRegionEnd: () -> Void
+    // Multi-click callbacks
+    let onDoubleClick: (CGPoint) -> Void
+    let onTripleClick: (CGPoint) -> Void
 
     func makeNSView(context: Context) -> TextSelectionView {
         let view = TextSelectionView()
@@ -1306,6 +1315,8 @@ struct TextSelectionOverlay: NSViewRepresentable {
         view.onZoomRegionStart = onZoomRegionStart
         view.onZoomRegionUpdate = onZoomRegionUpdate
         view.onZoomRegionEnd = onZoomRegionEnd
+        view.onDoubleClick = onDoubleClick
+        view.onTripleClick = onTripleClick
         return view
     }
 
@@ -1362,6 +1373,10 @@ class TextSelectionView: NSView {
     var onZoomRegionUpdate: ((CGPoint) -> Void)?
     var onZoomRegionEnd: (() -> Void)?
 
+    // Multi-click callbacks
+    var onDoubleClick: ((CGPoint) -> Void)?
+    var onTripleClick: ((CGPoint) -> Void)?
+
     private var isDragging = false
     private var isZoomDragging = false  // Shift+Drag mode
     private var hasMoved = false  // Track if mouse moved during drag
@@ -1400,9 +1415,21 @@ class TextSelectionView: NSView {
             isDragging = false
             onZoomRegionStart?(normalizedPoint)
         } else {
-            isDragging = true
-            isZoomDragging = false
-            onDragStart?(normalizedPoint)
+            // Handle multi-click (double-click = word, triple-click = line)
+            let clickCount = event.clickCount
+            if clickCount == 2 {
+                onDoubleClick?(normalizedPoint)
+                isDragging = false
+                isZoomDragging = false
+            } else if clickCount >= 3 {
+                onTripleClick?(normalizedPoint)
+                isDragging = false
+                isZoomDragging = false
+            } else {
+                isDragging = true
+                isZoomDragging = false
+                onDragStart?(normalizedPoint)
+            }
         }
         needsDisplay = true
     }

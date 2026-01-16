@@ -170,12 +170,13 @@ enum FrameQueries {
         timestamp: Date,
         limit: Int
     ) throws -> [FrameReference] {
-        // Get frames AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        // Get frames AT OR AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        // Note: Using >= to include the exact timestamp frame (important for search navigation)
         let sql = """
             SELECT id, segment_id, session_id, timestamp, frame_index, encoding_status,
                    app_bundle_id, app_name, window_name, browser_url, source
             FROM frames
-            WHERE timestamp > ?
+            WHERE timestamp >= ?
             ORDER BY timestamp ASC
             LIMIT ?;
             """

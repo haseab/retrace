@@ -779,13 +779,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    /// Navigate to a specific timestamp and highlight the search query
+    /// Navigate to a specific frame by ID and highlight the search query
     /// Used when selecting a search result
-    public func navigateToSearchResult(timestamp: Date, highlightQuery: String) async {
+    public func navigateToSearchResult(frameID: FrameID, timestamp: Date, highlightQuery: String) async {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current
-        Log.info("[SearchNavigation] Navigating to search result: timestamp=\(df.string(from: timestamp)) (epoch: \(timestamp.timeIntervalSince1970)), query='\(highlightQuery)'", category: .ui)
+        Log.info("[SearchNavigation] Navigating to search result: frameID=\(frameID.stringValue), timestamp=\(df.string(from: timestamp)) (epoch: \(timestamp.timeIntervalSince1970)), query='\(highlightQuery)'", category: .ui)
 
         // Log current frames window for debugging
         if let first = frames.first, let last = frames.last {
@@ -794,25 +794,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[SearchNavigation] Current frames window: EMPTY", category: .ui)
         }
 
-        // First, try to find a frame with this timestamp in our current data
-        if let index = frames.firstIndex(where: { $0.frame.timestamp == timestamp }) {
-            Log.debug("[SearchNavigation] Found frame in current data at index \(index)", category: .ui)
+        // First, try to find a frame with this ID in our current data
+        if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
+            Log.debug("[SearchNavigation] Found frame by ID in current data at index \(index)", category: .ui)
             navigateToFrame(index)
             showSearchHighlight(query: highlightQuery)
             return
         }
 
-        // Also try to find a frame within 1 second of the timestamp (timestamps might have slight differences)
-        let tolerance: TimeInterval = 1.0
-        if let index = frames.firstIndex(where: { abs($0.frame.timestamp.timeIntervalSince(timestamp)) < tolerance }) {
-            let foundFrame = frames[index]
-            Log.debug("[SearchNavigation] Found frame within \(tolerance)s tolerance at index \(index), frame timestamp: \(df.string(from: foundFrame.frame.timestamp))", category: .ui)
-            navigateToFrame(index)
-            showSearchHighlight(query: highlightQuery)
-            return
-        }
-
-        Log.debug("[SearchNavigation] Frame not in current data (even with \(tolerance)s tolerance), loading frames around timestamp...", category: .ui)
+        Log.debug("[SearchNavigation] Frame not in current data by ID, loading frames around timestamp...", category: .ui)
 
         // If not found, need to load frames around this timestamp
         do {
@@ -821,6 +811,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Load frames around the target timestamp
             let loadedFrames = try await coordinator.getFramesAround(timestamp: timestamp, count: WindowConfig.loadBatchSize)
             Log.debug("[SearchNavigation] Loaded \(loadedFrames.count) frames around timestamp", category: .ui)
+
+            // Log first few frames to see what timestamps we got
+            for (i, frame) in loadedFrames.prefix(5).enumerated() {
+                let diff = frame.timestamp.timeIntervalSince(timestamp)
+                Log.debug("[SearchNavigation] Frame[\(i)]: timestamp=\(df.string(from: frame.timestamp)) (epoch: \(frame.timestamp.timeIntervalSince1970)), diff=\(String(format: "%.3f", diff))s from target", category: .ui)
+            }
 
             guard !loadedFrames.isEmpty else {
                 Log.warning("[SearchNavigation] No frames found around timestamp", category: .ui)
@@ -850,12 +846,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.debug("[SearchNavigation] Window: \(oldestLoadedTimestamp!) to \(newestLoadedTimestamp!)", category: .ui)
             }
 
-            // Find and navigate to the target frame
-            if let index = frames.firstIndex(where: { $0.frame.timestamp == timestamp }) {
-                Log.debug("[SearchNavigation] Found exact timestamp match at index \(index)", category: .ui)
+            // Find and navigate to the target frame by ID
+            if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
+                Log.debug("[SearchNavigation] Found frame by ID at index \(index)", category: .ui)
                 currentIndex = index
             } else {
-                // Find closest frame
+                // Fallback: find closest frame by timestamp if ID not found
                 let closest = frames.enumerated().min(by: {
                     abs($0.element.frame.timestamp.timeIntervalSince(timestamp)) <
                     abs($1.element.frame.timestamp.timeIntervalSince(timestamp))
@@ -863,7 +859,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 currentIndex = closest?.offset ?? 0
                 if let closestFrame = closest {
                     let diff = abs(closestFrame.element.frame.timestamp.timeIntervalSince(timestamp))
-                    Log.debug("[SearchNavigation] Using closest frame at index \(closestFrame.offset), \(diff)s from target", category: .ui)
+                    Log.warning("[SearchNavigation] Frame ID not found in loaded frames, using closest by timestamp at index \(closestFrame.offset), \(diff)s from target", category: .ui)
                 }
             }
 
@@ -924,12 +920,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Get OCR nodes that match the search query (for highlighting)
+    /// Supports exact matches and stem-based matches for nominalized words (e.g., "calling" matches "call")
     public var searchHighlightNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] {
         guard let query = searchHighlightQuery, !query.isEmpty, isShowingSearchHighlight else {
             return []
         }
 
         let lowercaseQuery = query.lowercased()
+        let queryStem = getWordStem(lowercaseQuery)
         var matchingNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] = []
 
         for node in ocrNodes {
@@ -937,10 +935,26 @@ public class SimpleTimelineViewModel: ObservableObject {
             var ranges: [Range<String.Index>] = []
             var searchStartIndex = nodeText.startIndex
 
-            // Find all occurrences of the query in this node
+            // Find all exact occurrences of the query in this node
             while let range = nodeText.range(of: lowercaseQuery, range: searchStartIndex..<nodeText.endIndex) {
                 ranges.append(range)
                 searchStartIndex = range.upperBound
+            }
+
+            // If no exact matches, try stem-based matching for nominalized words
+            if ranges.isEmpty && queryStem.count >= 3 {
+                // Find words that share the same stem as the query
+                let words = nodeText.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
+                for word in words {
+                    let wordStem = getWordStem(word)
+                    // Match if stems are equal, or one is prefix of the other
+                    if wordStem == queryStem || word.hasPrefix(queryStem) || queryStem.hasPrefix(word) {
+                        // Find the range of this word in the node text
+                        if let wordRange = nodeText.range(of: word) {
+                            ranges.append(wordRange)
+                        }
+                    }
+                }
             }
 
             if !ranges.isEmpty {
@@ -961,6 +975,20 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         return matchingNodes
+    }
+
+    /// Get a simple word stem by removing common suffixes
+    /// This mimics basic porter stemmer behavior for common English suffixes
+    private func getWordStem(_ word: String) -> String {
+        let suffixes = ["ing", "ed", "er", "est", "ly", "tion", "sion", "ness", "ment", "able", "ible", "ful", "less", "ous", "ive", "al", "s"]
+        var stem = word
+        for suffix in suffixes {
+            if stem.hasSuffix(suffix) && stem.count > suffix.count + 2 {
+                stem = String(stem.dropLast(suffix.count))
+                break
+            }
+        }
+        return stem
     }
 
     /// Load image for image-based frames (Retrace) if needed
@@ -1160,6 +1188,68 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Keep selection but clear drag points
         dragStartPoint = nil
         dragEndPoint = nil
+    }
+
+    /// Select the word at the given point (for double-click)
+    public func selectWordAt(point: CGPoint) {
+        guard let (nodeID, charIndex) = findCharacterPosition(at: point) else { return }
+        guard let node = ocrNodes.first(where: { $0.id == nodeID }) else { return }
+
+        let text = node.text
+        guard !text.isEmpty else { return }
+
+        // Clamp charIndex to valid range
+        let clampedIndex = max(0, min(charIndex, text.count - 1))
+
+        // Find word boundaries
+        let (wordStart, wordEnd) = findWordBoundaries(in: text, around: clampedIndex)
+
+        isAllTextSelected = false
+        selectionStart = (nodeID: nodeID, charIndex: wordStart)
+        selectionEnd = (nodeID: nodeID, charIndex: wordEnd)
+    }
+
+    /// Select all text in the node at the given point (for triple-click)
+    public func selectNodeAt(point: CGPoint) {
+        guard let (nodeID, _) = findCharacterPosition(at: point) else { return }
+        guard let node = ocrNodes.first(where: { $0.id == nodeID }) else { return }
+
+        // Select the entire node's text
+        isAllTextSelected = false
+        selectionStart = (nodeID: nodeID, charIndex: 0)
+        selectionEnd = (nodeID: nodeID, charIndex: node.text.count)
+    }
+
+    /// Find word boundaries around a character index
+    private func findWordBoundaries(in text: String, around index: Int) -> (start: Int, end: Int) {
+        guard !text.isEmpty else { return (0, 0) }
+
+        let chars = Array(text)
+        let clampedIndex = max(0, min(index, chars.count - 1))
+
+        // Define word characters (alphanumeric and some punctuation that's part of words)
+        func isWordChar(_ char: Character) -> Bool {
+            char.isLetter || char.isNumber || char == "_" || char == "-"
+        }
+
+        // Find start of word (scan backwards)
+        var wordStart = clampedIndex
+        while wordStart > 0 && isWordChar(chars[wordStart - 1]) {
+            wordStart -= 1
+        }
+
+        // Find end of word (scan forwards)
+        var wordEnd = clampedIndex
+        while wordEnd < chars.count && isWordChar(chars[wordEnd]) {
+            wordEnd += 1
+        }
+
+        // If we didn't find a word (clicked on whitespace/punctuation), select just that character
+        if wordStart == wordEnd {
+            wordEnd = min(wordStart + 1, chars.count)
+        }
+
+        return (start: wordStart, end: wordEnd)
     }
 
     // MARK: - Zoom Region Methods (Shift+Drag)
@@ -1640,6 +1730,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Navigate
         navigateToFrame(currentIndex + frameStep)
+
+        // Clear search highlight when user manually scrolls
+        if isShowingSearchHighlight {
+            clearSearchHighlight()
+        }
     }
 
     // MARK: - Computed Properties

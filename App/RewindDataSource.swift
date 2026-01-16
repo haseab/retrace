@@ -333,7 +333,8 @@ public actor RewindDataSource: DataSourceProtocol {
             return []
         }
 
-        // Query frames AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        // Query frames AT OR AFTER the timestamp, ordered ASC (oldest first of the newer batch)
+        // Note: Using >= to include the exact timestamp frame (important for search navigation)
         // JOIN on segment AND video
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
@@ -342,7 +343,7 @@ public actor RewindDataSource: DataSourceProtocol {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
-                WHERE createdAt > ? AND createdAt < ?
+                WHERE createdAt >= ? AND createdAt < ?
                 ORDER BY createdAt ASC
                 LIMIT ?
             ) f
@@ -622,7 +623,25 @@ public actor RewindDataSource: DataSourceProtocol {
     // MARK: - Private Helpers
 
     private func extractFrameFromVideo(videoPath: String, frameIndex: Int, frameRate: Double) throws -> Data {
-        let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
+        // Rewind video files don't have extensions, but AVAssetImageGenerator needs .mp4 extension
+        // to properly identify the file type. Create a temporary symlink with .mp4 extension.
+        let originalURL = URL(fileURLWithPath: videoPath)
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempURL = tempDir.appendingPathComponent(UUID().uuidString + ".mp4")
+
+        defer {
+            // Clean up the temporary symlink
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+
+        do {
+            try FileManager.default.createSymbolicLink(at: tempURL, withDestinationURL: originalURL)
+        } catch {
+            Log.error("[RewindDataSource] Failed to create temp symlink: \(error)", category: .app)
+            throw RewindDataSourceError.frameExtractionFailed(underlying: "Failed to create temp symlink: \(error.localizedDescription)")
+        }
+
+        let asset = AVAsset(url: tempURL)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
@@ -1397,94 +1416,175 @@ public actor RewindDataSource: DataSourceProtocol {
     // MARK: - Full-Text Search
 
     /// Search Rewind's OCR text using the searchRanking FTS5 table
-    /// Returns search results matching the query
+    /// Supports two modes:
+    /// - .relevant: Top 200 by BM25 relevance, then sorted by date (fast, best matches)
+    /// - .all: All matches sorted by date using subquery (slower, chronological)
     public func search(query: SearchQuery) async throws -> SearchResults {
         guard _isConnected, let database = db else {
             throw DataSourceError.notConnected
         }
 
-        let startTime = Date()
-        Log.info("[RewindSearch] Searching for: '\(query.text)'", category: .app)
+        switch query.mode {
+        case .relevant:
+            return try await searchRelevant(query: query, database: database)
+        case .all:
+            return try await searchAll(query: query, database: database)
+        }
+    }
 
-        // Build FTS5 query - escape special characters and add wildcard for prefix matching
+    /// Relevant search: Top N by BM25, then sorted by date
+    /// Two-phase approach for speed
+    private func searchRelevant(query: SearchQuery, database: OpaquePointer) async throws -> SearchResults {
+        let startTime = Date()
+        Log.info("[RewindSearch] Relevant search for: '\(query.text)' with filters: app=\(query.filters.appBundleIDs?.first ?? "all"), dates=\(query.filters.startDate != nil ? "yes" : "no")", category: .app)
+
         let ftsQuery = buildFTSQuery(query.text)
         Log.debug("[RewindSearch] FTS query: '\(ftsQuery)'", category: .app)
 
-        // Format cutoff date for SQL
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Phase 1: Pure FTS search - get top 50 by relevance
+        let phase1Start = Date()
+        let relevanceLimit = 50  // Cap relevant results
+        let ftsSQL = """
+            SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
+            FROM searchRanking
+            WHERE searchRanking MATCH ?
+            ORDER BY bm25(searchRanking)
+            LIMIT ?
+        """
+
+        var ftsStatement: OpaquePointer?
+        defer { sqlite3_finalize(ftsStatement) }
+
+        guard sqlite3_prepare_v2(database, ftsSQL, -1, &ftsStatement, nil) == SQLITE_OK else {
+            let error = String(cString: sqlite3_errmsg(database))
+            Log.error("[RewindSearch] Failed to prepare FTS statement: \(error)", category: .app)
+            throw DataSourceError.queryFailed(underlying: error)
+        }
+
+        sqlite3_bind_text(ftsStatement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(ftsStatement, 2, Int32(relevanceLimit))
+
+        var ftsResults: [(rowid: Int64, snippet: String, rank: Double)] = []
+        while sqlite3_step(ftsStatement) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(ftsStatement, 0)
+            let snippet = sqlite3_column_text(ftsStatement, 1).map { String(cString: $0) } ?? ""
+            let rank = sqlite3_column_double(ftsStatement, 2)
+            ftsResults.append((rowid: rowid, snippet: snippet, rank: rank))
+        }
+
+        let phase1Elapsed = Int(Date().timeIntervalSince(phase1Start) * 1000)
+        Log.info("[RewindSearch] Phase 1 (FTS): Found \(ftsResults.count) matches in \(phase1Elapsed)ms", category: .app)
+
+        guard !ftsResults.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: elapsed)
+        }
+
+        // Phase 2: Join to get metadata, sorted by date, with pagination and filters
+        let phase2Start = Date()
+        let rowids = ftsResults.map { $0.rowid }
+        let rowidPlaceholders = rowids.map { _ in "?" }.joined(separator: ", ")
+
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
         dateFormatter.timeZone = TimeZone(identifier: "UTC")!
         let cutoffISO = dateFormatter.string(from: _cutoffDate)
-        Log.debug("[RewindSearch] Cutoff date: \(cutoffISO)", category: .app)
 
-        // Query searchRanking FTS5 table joined with frame/segment for metadata
-        // Note: Rewind's segment table has bundleID and windowName (not appName/windowName)
-        // Filter by cutoff date to only return results within the valid date range
-        let sql = """
+        // Build dynamic WHERE clause based on filters
+        var whereConditions = ["ds.docid IN (\(rowidPlaceholders))", "f.createdAt < ?"]
+        var extraBindValues: [Any] = [cutoffISO]
+
+        // Date range filters
+        if let startDate = query.filters.startDate {
+            let startISO = dateFormatter.string(from: startDate)
+            whereConditions.append("f.createdAt >= ?")
+            extraBindValues.append(startISO)
+        }
+        if let endDate = query.filters.endDate {
+            let endISO = dateFormatter.string(from: endDate)
+            whereConditions.append("f.createdAt <= ?")
+            extraBindValues.append(endISO)
+        }
+
+        // App filter
+        if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
+            let appPlaceholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("s.bundleID IN (\(appPlaceholders))")
+            extraBindValues.append(contentsOf: appBundleIDs)
+        }
+
+        let whereClause = whereConditions.joined(separator: " AND ")
+
+        let metadataSQL = """
             SELECT
+                ds.docid,
                 f.id as frame_id,
                 f.createdAt as timestamp,
                 s.id as segment_id,
                 s.bundleID as app_bundle_id,
-                s.windowName as window_title,
-                snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
-                bm25(searchRanking) as rank
-            FROM searchRanking
-            JOIN doc_segment ds ON ds.docid = searchRanking.rowid
+                s.windowName as window_title
+            FROM doc_segment ds
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
-            WHERE searchRanking MATCH ?
-            AND f.createdAt < ?
+            WHERE \(whereClause)
             ORDER BY f.createdAt DESC
             LIMIT ? OFFSET ?
         """
 
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
+        var metaStatement: OpaquePointer?
+        defer { sqlite3_finalize(metaStatement) }
 
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(database, metadataSQL, -1, &metaStatement, nil) == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(database))
-            Log.error("[RewindSearch] Failed to prepare statement: \(error)", category: .app)
+            Log.error("[RewindSearch] Failed to prepare metadata statement: \(error)", category: .app)
             throw DataSourceError.queryFailed(underlying: error)
         }
 
-        // SQLITE_TRANSIENT tells SQLite to make its own copy of the string
-        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        // Bind rowids first
+        var bindIndex: Int32 = 1
+        for rowid in rowids {
+            sqlite3_bind_int64(metaStatement, bindIndex, rowid)
+            bindIndex += 1
+        }
 
-        sqlite3_bind_text(statement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(statement, 2, cutoffISO, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(statement, 3, Int32(query.limit))
-        sqlite3_bind_int(statement, 4, Int32(query.offset))
+        // Bind extra values (cutoff date, filter dates, app bundle IDs)
+        for value in extraBindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(metaStatement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            }
+            bindIndex += 1
+        }
+
+        // Bind limit and offset
+        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.limit))
+        bindIndex += 1
+        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.offset))
+
+        let ftsLookup = Dictionary(uniqueKeysWithValues: ftsResults.map { ($0.rowid, (snippet: $0.snippet, rank: $0.rank)) })
 
         var results: [SearchResult] = []
 
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let frameId = sqlite3_column_int64(statement, 0)
-            let timestampStr = String(cString: sqlite3_column_text(statement, 1))
-            let segmentId = sqlite3_column_int64(statement, 2)
+        while sqlite3_step(metaStatement) == SQLITE_ROW {
+            let docid = sqlite3_column_int64(metaStatement, 0)
+            let frameId = sqlite3_column_int64(metaStatement, 1)
+            let timestampStr = String(cString: sqlite3_column_text(metaStatement, 2))
+            let segmentId = sqlite3_column_int64(metaStatement, 3)
+            let appBundleID = sqlite3_column_text(metaStatement, 4).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(metaStatement, 5).map { String(cString: $0) }
 
-            let appBundleID = sqlite3_column_text(statement, 3).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(statement, 4).map { String(cString: $0) }
-            let snippet = sqlite3_column_text(statement, 5).map { String(cString: $0) } ?? ""
-            let rank = sqlite3_column_double(statement, 6)
+            guard let ftsData = ftsLookup[docid] else { continue }
+            let snippet = ftsData.snippet
+            let rank = ftsData.rank
 
-            // Derive app name from bundle ID (e.g., "com.apple.Safari" -> "Safari")
             let appName = appBundleID?.components(separatedBy: ".").last
-
-            // Parse timestamp (Rewind uses ISO8601 format)
             let parsedTimestamp = parseRewindTimestamp(timestampStr)
-            if parsedTimestamp == nil {
-                Log.error("[RewindSearch] FAILED to parse timestamp: '\(timestampStr)' - using current date as fallback!", category: .app)
-            } else {
-                Log.debug("[RewindSearch] Raw timestamp from DB: '\(timestampStr)' -> parsed: \(parsedTimestamp!.description) (epoch: \(parsedTimestamp!.timeIntervalSince1970))", category: .app)
-            }
             let timestamp = parsedTimestamp ?? Date()
 
-            // Create FrameID from Rewind's integer ID using deterministic UUID
             let frameID = FrameID(value: syntheticUUID(from: frameId, namespace: "frame"))
             let segmentID = SegmentID(value: syntheticUUID(from: segmentId, namespace: "segment"))
 
-            // Clean up snippet (remove HTML tags if needed)
             let cleanSnippet = snippet
                 .replacingOccurrences(of: "<mark>", with: "")
                 .replacingOccurrences(of: "</mark>", with: "")
@@ -1494,7 +1594,195 @@ public actor RewindDataSource: DataSourceProtocol {
                 timestamp: timestamp,
                 snippet: cleanSnippet,
                 matchedText: query.text,
-                relevanceScore: abs(rank), // BM25 returns negative scores, lower is better
+                relevanceScore: abs(rank) / (1.0 + abs(rank)),
+                metadata: FrameMetadata(
+                    appBundleID: appBundleID,
+                    appName: appName,
+                    windowName: windowName,
+                    browserURL: nil,
+                    displayID: 0
+                ),
+                segmentID: segmentID,
+                frameIndex: 0
+            )
+
+            results.append(result)
+        }
+
+        let phase2Elapsed = Int(Date().timeIntervalSince(phase2Start) * 1000)
+        let totalElapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+        Log.info("[RewindSearch] Relevant search: \(results.count) results in \(totalElapsed)ms (phase1=\(phase1Elapsed)ms, phase2=\(phase2Elapsed)ms)", category: .app)
+
+        // Total count is capped at relevanceLimit for this mode
+        let totalCount = min(ftsResults.count, relevanceLimit)
+
+        return SearchResults(
+            query: query,
+            results: results,
+            totalCount: totalCount,
+            searchTimeMs: totalElapsed
+        )
+    }
+
+    /// All search: Chronological results using subquery for efficiency
+    /// FTS filters first, then minimal joins for date sorting
+    private func searchAll(query: SearchQuery, database: OpaquePointer) async throws -> SearchResults {
+        let startTime = Date()
+        Log.info("[RewindSearch] All search for: '\(query.text)' with filters: app=\(query.filters.appBundleIDs?.first ?? "all"), dates=\(query.filters.startDate != nil ? "yes" : "no")", category: .app)
+
+        let ftsQuery = buildFTSQuery(query.text)
+        Log.debug("[RewindSearch] FTS query: '\(ftsQuery)'", category: .app)
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")!
+        let cutoffISO = dateFormatter.string(from: _cutoffDate)
+
+        // Build dynamic WHERE clause based on filters
+        var whereConditions = ["f.createdAt < ?"]
+        var bindValues: [Any] = [cutoffISO]
+
+        // Date range filters
+        if let startDate = query.filters.startDate {
+            let startISO = dateFormatter.string(from: startDate)
+            whereConditions.append("f.createdAt >= ?")
+            bindValues.append(startISO)
+        }
+        if let endDate = query.filters.endDate {
+            let endISO = dateFormatter.string(from: endDate)
+            whereConditions.append("f.createdAt <= ?")
+            bindValues.append(endISO)
+        }
+
+        // App filter - need to join segment table
+        let needsSegmentJoin = query.filters.appBundleIDs != nil
+        var appFilterClause = ""
+        if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
+            let placeholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            appFilterClause = "AND s.bundleID IN (\(placeholders))"
+            bindValues.append(contentsOf: appBundleIDs)
+        }
+
+        let whereClause = whereConditions.joined(separator: " AND ")
+
+        // Subquery: FTS filters first, then join only for date sorting
+        let sql: String
+        if needsSegmentJoin {
+            sql = """
+                SELECT
+                    sr.rowid as docid,
+                    sr.snippet,
+                    sr.rank,
+                    f.id as frame_id,
+                    f.createdAt as timestamp,
+                    f.segmentId as segment_id
+                FROM (
+                    SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
+                    FROM searchRanking
+                    WHERE searchRanking MATCH ?
+                ) sr
+                JOIN doc_segment ds ON ds.docid = sr.rowid
+                JOIN frame f ON ds.frameId = f.id
+                JOIN segment s ON f.segmentId = s.id
+                WHERE \(whereClause) \(appFilterClause)
+                ORDER BY f.createdAt DESC
+                LIMIT ? OFFSET ?
+            """
+        } else {
+            sql = """
+                SELECT
+                    sr.rowid as docid,
+                    sr.snippet,
+                    sr.rank,
+                    f.id as frame_id,
+                    f.createdAt as timestamp,
+                    f.segmentId as segment_id
+                FROM (
+                    SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
+                    FROM searchRanking
+                    WHERE searchRanking MATCH ?
+                ) sr
+                JOIN doc_segment ds ON ds.docid = sr.rowid
+                JOIN frame f ON ds.frameId = f.id
+                WHERE \(whereClause)
+                ORDER BY f.createdAt DESC
+                LIMIT ? OFFSET ?
+            """
+        }
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            let error = String(cString: sqlite3_errmsg(database))
+            Log.error("[RewindSearch] Failed to prepare all-search statement: \(error)", category: .app)
+            throw DataSourceError.queryFailed(underlying: error)
+        }
+
+        // Bind parameters
+        var bindIndex: Int32 = 1
+        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        for value in bindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            }
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, bindIndex, Int32(query.limit))
+        bindIndex += 1
+        sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
+
+        // Collect frame results (without segment metadata yet)
+        var frameResults: [(docid: Int64, snippet: String, rank: Double, frameId: Int64, timestamp: Date, segmentId: Int64)] = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let docid = sqlite3_column_int64(statement, 0)
+            let snippet = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
+            let rank = sqlite3_column_double(statement, 2)
+            let frameId = sqlite3_column_int64(statement, 3)
+            let timestampStr = String(cString: sqlite3_column_text(statement, 4))
+            let segmentId = sqlite3_column_int64(statement, 5)
+
+            let timestamp = parseRewindTimestamp(timestampStr) ?? Date()
+            frameResults.append((docid: docid, snippet: snippet, rank: rank, frameId: frameId, timestamp: timestamp, segmentId: segmentId))
+        }
+
+        guard !frameResults.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            let totalCount = getSearchTotalCount(query: ftsQuery, db: database)
+            return SearchResults(query: query, results: [], totalCount: totalCount, searchTimeMs: elapsed)
+        }
+
+        // Fetch segment metadata for just these results
+        let segmentIds = Array(Set(frameResults.map { $0.segmentId }))
+        let segmentMetadata = try await fetchSegmentMetadata(segmentIds: segmentIds, database: database)
+
+        var results: [SearchResult] = []
+
+        for frame in frameResults {
+            let segmentMeta = segmentMetadata[frame.segmentId]
+            let appBundleID = segmentMeta?.bundleID
+            let windowName = segmentMeta?.windowName
+            let appName = appBundleID?.components(separatedBy: ".").last
+
+            let frameID = FrameID(value: syntheticUUID(from: frame.frameId, namespace: "frame"))
+            let segmentID = SegmentID(value: syntheticUUID(from: frame.segmentId, namespace: "segment"))
+
+            let cleanSnippet = frame.snippet
+                .replacingOccurrences(of: "<mark>", with: "")
+                .replacingOccurrences(of: "</mark>", with: "")
+
+            let result = SearchResult(
+                id: frameID,
+                timestamp: frame.timestamp,
+                snippet: cleanSnippet,
+                matchedText: query.text,
+                relevanceScore: abs(frame.rank) / (1.0 + abs(frame.rank)),
                 metadata: FrameMetadata(
                     appBundleID: appBundleID,
                     appName: appName,
@@ -1510,10 +1798,9 @@ public actor RewindDataSource: DataSourceProtocol {
         }
 
         let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-        Log.info("[RewindSearch] Found \(results.count) results in \(elapsed)ms", category: .app)
+        Log.info("[RewindSearch] All search: \(results.count) results in \(elapsed)ms", category: .app)
 
-        // Get total count (without limit, but with cutoff)
-        let totalCount = getSearchTotalCount(query: ftsQuery, cutoffISO: cutoffISO, db: database)
+        let totalCount = getSearchTotalCount(query: ftsQuery, db: database)
 
         return SearchResults(
             query: query,
@@ -1521,6 +1808,36 @@ public actor RewindDataSource: DataSourceProtocol {
             totalCount: totalCount,
             searchTimeMs: elapsed
         )
+    }
+
+    /// Fetch segment metadata for a batch of segment IDs
+    private func fetchSegmentMetadata(segmentIds: [Int64], database: OpaquePointer) async throws -> [Int64: (bundleID: String?, windowName: String?)] {
+        guard !segmentIds.isEmpty else { return [:] }
+
+        let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")
+        let sql = "SELECT id, bundleID, windowName FROM segment WHERE id IN (\(placeholders))"
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
+            return [:]
+        }
+
+        for (index, segmentId) in segmentIds.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 1), segmentId)
+        }
+
+        var metadata: [Int64: (bundleID: String?, windowName: String?)] = [:]
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            let bundleID = sqlite3_column_text(statement, 1).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+            metadata[id] = (bundleID: bundleID, windowName: windowName)
+        }
+
+        return metadata
     }
 
     /// Build FTS5 query from user input
@@ -1541,15 +1858,12 @@ public actor RewindDataSource: DataSourceProtocol {
         return words.joined(separator: " ")
     }
 
-    /// Get total count of search results (without limit, but with cutoff)
-    private func getSearchTotalCount(query: String, cutoffISO: String, db: OpaquePointer) -> Int {
+    /// Get total count of search results (FTS-only, no joins for speed)
+    private func getSearchTotalCount(query: String, db: OpaquePointer) -> Int {
         let countSQL = """
             SELECT COUNT(*)
             FROM searchRanking
-            JOIN doc_segment ds ON ds.docid = searchRanking.rowid
-            JOIN frame f ON ds.frameId = f.id
             WHERE searchRanking MATCH ?
-            AND f.createdAt < ?
         """
 
         var countStmt: OpaquePointer?
@@ -1561,13 +1875,123 @@ public actor RewindDataSource: DataSourceProtocol {
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         sqlite3_bind_text(countStmt, 1, query, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(countStmt, 2, cutoffISO, -1, SQLITE_TRANSIENT)
 
         if sqlite3_step(countStmt) == SQLITE_ROW {
             return Int(sqlite3_column_int(countStmt, 0))
         }
 
         return 0
+    }
+
+    // MARK: - App Discovery
+
+    /// Represents an app found in the database
+    public struct AppInfo: Identifiable, Hashable, Sendable {
+        public let id: String  // bundleID
+        public let bundleID: String
+        public let name: String  // Resolved app name
+
+        public init(bundleID: String, name: String) {
+            self.id = bundleID
+            self.bundleID = bundleID
+            self.name = name
+        }
+    }
+
+    /// Get all distinct apps from the database
+    /// Returns apps sorted by usage frequency (most used first)
+    /// Resolves actual app names from the system (including Chrome/Safari web apps)
+    public func getDistinctApps() async throws -> [AppInfo] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        // Query distinct bundleIDs with count for sorting by usage
+        let sql = """
+            SELECT bundleID, COUNT(*) as usage_count
+            FROM segment
+            WHERE bundleID IS NOT NULL AND bundleID != ''
+            GROUP BY bundleID
+            ORDER BY usage_count DESC
+            LIMIT 100;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var bundleIDs: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let bundleIDPtr = sqlite3_column_text(statement, 0) else { continue }
+            let bundleID = String(cString: bundleIDPtr)
+            bundleIDs.append(bundleID)
+        }
+
+        // Resolve app names on main thread (NSWorkspace requires it)
+        let apps = await MainActor.run {
+            bundleIDs.compactMap { bundleID -> AppInfo? in
+                let name = Self.resolveAppName(bundleID: bundleID)
+                return AppInfo(bundleID: bundleID, name: name)
+            }
+        }
+
+        Log.debug("[RewindDataSource] Found \(apps.count) distinct apps", category: .app)
+        return apps
+    }
+
+    /// Resolve the actual app name from a bundle ID
+    /// Handles regular apps, Chrome apps, Safari web apps, etc.
+    @MainActor
+    private static func resolveAppName(bundleID: String) -> String {
+        // Try to get the app URL from the bundle ID
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            // Read the app's Info.plist to get the display name
+            let infoPlistURL = appURL.appendingPathComponent("Contents/Info.plist")
+            if let plist = NSDictionary(contentsOf: infoPlistURL) {
+                // Try CFBundleDisplayName first (user-facing name)
+                if let displayName = plist["CFBundleDisplayName"] as? String, !displayName.isEmpty {
+                    return displayName
+                }
+                // Fall back to CFBundleName
+                if let bundleName = plist["CFBundleName"] as? String, !bundleName.isEmpty {
+                    return bundleName
+                }
+            }
+
+            // Fall back to the file name without extension
+            let fileName = appURL.deletingPathExtension().lastPathComponent
+            if !fileName.isEmpty {
+                return fileName
+            }
+        }
+
+        // For Chrome apps that might not be in Applications, check Chrome Apps folder
+        let chromeAppsPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications/Chrome Apps")
+        if FileManager.default.fileExists(atPath: chromeAppsPath.path) {
+            if let apps = try? FileManager.default.contentsOfDirectory(at: chromeAppsPath, includingPropertiesForKeys: nil) {
+                for appURL in apps where appURL.pathExtension == "app" {
+                    let infoPlistURL = appURL.appendingPathComponent("Contents/Info.plist")
+                    if let plist = NSDictionary(contentsOf: infoPlistURL),
+                       let appBundleID = plist["CFBundleIdentifier"] as? String,
+                       appBundleID == bundleID {
+                        if let displayName = plist["CFBundleDisplayName"] as? String, !displayName.isEmpty {
+                            return displayName
+                        }
+                        if let bundleName = plist["CFBundleName"] as? String, !bundleName.isEmpty {
+                            return bundleName
+                        }
+                        return appURL.deletingPathExtension().lastPathComponent
+                    }
+                }
+            }
+        }
+
+        // Last resort: derive from bundle ID (e.g., "com.apple.Safari" -> "Safari")
+        return bundleID.components(separatedBy: ".").last ?? bundleID
     }
 
     /// Parse Rewind's timestamp format

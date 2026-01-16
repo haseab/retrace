@@ -751,6 +751,26 @@ public actor DataAdapter {
         return []
     }
 
+    // MARK: - App Discovery
+
+    /// Get all distinct apps from all data sources
+    /// Returns apps sorted by usage frequency (most used first)
+    public func getDistinctApps() async throws -> [RewindDataSource.AppInfo] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Try Rewind data source first (it has the most historical data)
+        if let rewindSource = secondarySources[.rewind] as? RewindDataSource,
+           await rewindSource.isConnected {
+            return try await rewindSource.getDistinctApps()
+        }
+
+        // Fallback to empty if no source available
+        Log.warning("[DataAdapter] No data source available for app discovery", category: .app)
+        return []
+    }
+
     // MARK: - Full-Text Search
 
     /// Search across all data sources

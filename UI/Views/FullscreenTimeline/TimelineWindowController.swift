@@ -181,13 +181,26 @@ public class TimelineWindowController: NSObject {
         // Also monitor local events (when our window is key)
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
             if event.type == .keyDown {
-                // Check if a text field is currently active - if so, don't intercept keyboard events
+                // Check if a text field is currently active
+                let isTextFieldActive: Bool
                 if let window = self?.window,
                    let firstResponder = window.firstResponder {
-                    // If the first responder is a text view (field editor) or text field, let the event through
-                    if firstResponder is NSTextView || firstResponder is NSTextField {
-                        return event // Let the text field handle it
+                    isTextFieldActive = firstResponder is NSTextView || firstResponder is NSTextField
+                } else {
+                    isTextFieldActive = false
+                }
+
+                // Always handle Cmd+K to toggle search overlay, even when text field is active
+                let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
                     }
+                }
+
+                // For other keys, let text field handle them if it's active
+                if isTextFieldActive {
+                    return event // Let the text field handle it
                 }
 
                 if self?.handleKeyEvent(event) == true {

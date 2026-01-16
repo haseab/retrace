@@ -324,6 +324,15 @@ public actor AppCoordinator {
 
     // MARK: - Search Interface
 
+    /// Get all distinct apps from the database for filter UI
+    /// Returns apps sorted by usage frequency (most used first)
+    public func getDistinctApps() async throws -> [RewindDataSource.AppInfo] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+        return try await adapter.getDistinctApps()
+    }
+
     /// Search for text across all captured frames
     public func search(query: String, limit: Int = 50) async throws -> SearchResults {
         let searchQuery = SearchQuery(text: query, filters: .none, limit: limit, offset: 0)

@@ -22,12 +22,27 @@ public class SearchViewModel: ObservableObject {
     @Published public var endDate: Date?
     @Published public var contentType: ContentType = .all
 
+    // Search mode (tabs)
+    @Published public var searchMode: SearchMode = .relevant
+
+    // Available apps for filter dropdown
+    @Published public var availableApps: [RewindDataSource.AppInfo] = []
+    @Published public var isLoadingApps = false
+
     // Selected result
     @Published public var selectedResult: SearchResult?
     @Published public var showingFrameViewer = false
 
     // Scroll position - persists across overlay open/close
     public var savedScrollPosition: CGFloat = 0
+
+    // Thumbnail cache - persists across overlay open/close, cleared on new search
+    @Published public var thumbnailCache: [String: NSImage] = [:]
+    @Published public var loadingThumbnails: Set<String> = []
+    @Published public var appIconCache: [String: NSImage] = [:]
+
+    // Search generation counter - incremented on each new search to invalidate in-flight loads
+    @Published public var searchGeneration: Int = 0
 
     // MARK: - Dependencies
 
@@ -96,6 +111,11 @@ public class SearchViewModel: ObservableObject {
         Log.info("[SearchViewModel] Performing search for: '\(query)'", category: .ui)
         isSearching = true
         error = nil
+        results = nil  // Clear old results immediately to prevent stale thumbnail loads
+        savedScrollPosition = 0  // Reset scroll position for new search
+        thumbnailCache.removeAll()  // Clear thumbnail cache for new search
+        loadingThumbnails.removeAll()  // Clear loading state for new search
+        searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
 
         do {
             let searchQuery = buildSearchQuery(query)
@@ -133,8 +153,21 @@ public class SearchViewModel: ObservableObject {
             text: text,
             filters: filters,
             limit: defaultResultLimit,
-            offset: offset
+            offset: offset,
+            mode: searchMode
         )
+    }
+
+    /// Switch search mode and re-run search
+    public func setSearchMode(_ mode: SearchMode) {
+        guard mode != searchMode else { return }
+        searchMode = mode
+        // Clear results and re-search with new mode
+        if !searchQuery.isEmpty {
+            Task {
+                await performSearch(query: searchQuery)
+            }
+        }
     }
 
     // MARK: - Load More (Infinite Scroll)
@@ -188,6 +221,21 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Filters
 
+    /// Load available apps for the filter dropdown
+    public func loadAvailableApps() async {
+        guard !isLoadingApps else { return }
+
+        isLoadingApps = true
+        do {
+            let apps = try await coordinator.getDistinctApps()
+            availableApps = apps
+            Log.info("[SearchViewModel] Loaded \(apps.count) apps for filter", category: .ui)
+        } catch {
+            Log.error("[SearchViewModel] Failed to load apps: \(error)", category: .ui)
+        }
+        isLoadingApps = false
+    }
+
     public func setAppFilter(_ appBundleID: String?) {
         selectedAppFilter = appBundleID
     }
@@ -206,6 +254,17 @@ public class SearchViewModel: ObservableObject {
         startDate = nil
         endDate = nil
         contentType = .all
+    }
+
+    /// Check if any filters are active
+    public var hasActiveFilters: Bool {
+        selectedAppFilter != nil || startDate != nil || endDate != nil
+    }
+
+    /// Get the display name for the selected app filter
+    public var selectedAppName: String? {
+        guard let bundleID = selectedAppFilter else { return nil }
+        return availableApps.first(where: { $0.bundleID == bundleID })?.name ?? bundleID.components(separatedBy: ".").last
     }
 
     // MARK: - Navigation
