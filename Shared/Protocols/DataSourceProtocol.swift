@@ -13,15 +13,23 @@ public struct FrameVideoInfo: Sendable, Equatable, Codable {
     /// Video frame rate (frames per second)
     public let frameRate: Double
 
+    /// Video width in pixels (optional - for aspect ratio calculation)
+    public let width: Int?
+
+    /// Video height in pixels (optional - for aspect ratio calculation)
+    public let height: Int?
+
     /// Calculated time in seconds for this frame
     public var timeInSeconds: Double {
         Double(frameIndex) / (frameRate > 0 ? frameRate : 30.0)
     }
 
-    public init(videoPath: String, frameIndex: Int, frameRate: Double) {
+    public init(videoPath: String, frameIndex: Int, frameRate: Double, width: Int? = nil, height: Int? = nil) {
         self.videoPath = videoPath
         self.frameIndex = frameIndex
         self.frameRate = frameRate
+        self.width = width
+        self.height = height
     }
 }
 

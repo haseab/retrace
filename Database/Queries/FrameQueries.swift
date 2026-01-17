@@ -539,7 +539,9 @@ enum FrameQueries {
                 s.bundleID,
                 s.windowName,
                 v.path,
-                v.frameRate
+                v.frameRate,
+                v.width,
+                v.height
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -587,7 +589,7 @@ enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName,
-                   v.path, v.frameRate
+                   v.path, v.frameRate, v.width, v.height
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
@@ -630,7 +632,7 @@ enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName,
-                   v.path, v.frameRate
+                   v.path, v.frameRate, v.width, v.height
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
@@ -670,7 +672,7 @@ enum FrameQueries {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName,
-                   v.path, v.frameRate
+                   v.path, v.frameRate, v.width, v.height
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
@@ -746,7 +748,7 @@ enum FrameQueries {
             source: .native
         )
 
-        // Parse video info (columns 8-9: v.path, v.frameRate)
+        // Parse video info (columns 8-11: v.path, v.frameRate, v.width, v.height)
         var videoInfo: FrameVideoInfo? = nil
         let videoPath = getTextOrNil(statement, 8)
         Log.debug("[FrameQueries]   videoPath=\(videoPath ?? "nil"), videoID.value=\(videoID.value)", category: .database)
@@ -754,6 +756,12 @@ enum FrameQueries {
         if let videoPath = videoPath,
            videoID.value > 0 {
             let frameRate = sqlite3_column_double(statement, 9)
+            let width = sqlite3_column_type(statement, 10) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 10))
+                : nil
+            let height = sqlite3_column_type(statement, 11) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 11))
+                : nil
 
             // Convert relative path to full path (must use expandedStorageRoot to resolve ~)
             let storageRoot = AppPaths.expandedStorageRoot
@@ -762,9 +770,11 @@ enum FrameQueries {
             videoInfo = FrameVideoInfo(
                 videoPath: fullPath,
                 frameIndex: frameIndexInSegment,
-                frameRate: frameRate
+                frameRate: frameRate,
+                width: width,
+                height: height
             )
-            Log.debug("[FrameQueries]   ✓ Created videoInfo: path=\(fullPath), frameIndex=\(frameIndexInSegment), frameRate=\(frameRate)", category: .database)
+            Log.debug("[FrameQueries]   ✓ Created videoInfo: path=\(fullPath), frameIndex=\(frameIndexInSegment), frameRate=\(frameRate), dimensions=\(width ?? 0)x\(height ?? 0)", category: .database)
         } else {
             Log.warning("[FrameQueries]   ⚠️ videoInfo is nil (videoPath=\(videoPath ?? "nil"), videoID=\(videoID.value))", category: .database)
         }

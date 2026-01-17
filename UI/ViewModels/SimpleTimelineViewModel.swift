@@ -140,7 +140,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - URL Bounding Box State
 
     /// Bounding box for a clickable URL found in the current frame (normalized 0.0-1.0 coordinates)
-    @Published public var urlBoundingBox: RewindDataSource.URLBoundingBox?
+    @Published public var urlBoundingBox: URLBoundingBox?
 
     /// Whether the mouse is currently hovering over the URL bounding box
     @Published public var isHoveringURL: Bool = false
@@ -275,11 +275,19 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
-        guard let info = currentTimelineFrame?.videoInfo,
-              info.frameIndex >= 0 else {
-            // No valid video info - return nil so UI shows placeholder
+        guard let timelineFrame = currentTimelineFrame else {
+            print("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)")
             return nil
         }
+        guard let info = timelineFrame.videoInfo else {
+            print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source)")
+            return nil
+        }
+        guard info.frameIndex >= 0 else {
+            print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)")
+            return nil
+        }
+        print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex)")
         return info
     }
 
@@ -1163,16 +1171,26 @@ public class SimpleTimelineViewModel: ObservableObject {
                 timestamp: frame.timestamp,
                 source: frame.source
             )
+            Log.debug("[SimpleTimelineViewModel] Loaded \(nodes.count) OCR nodes for frame \(frame.id.value) source=\(frame.source)", category: .ui)
+
             // Only update if we're still on the same frame
             if currentTimelineFrame?.frame.id == frame.id {
                 // Filter out nodes with invalid coordinates (multi-monitor captures)
                 // Valid normalized coordinates should be in range [0.0, 1.0]
-                ocrNodes = nodes.filter { node in
+                let filteredNodes = nodes.filter { node in
                     node.x >= 0.0 && node.x <= 1.0 &&
                     node.y >= 0.0 && node.y <= 1.0 &&
                     (node.x + node.width) <= 1.0 &&
                     (node.y + node.height) <= 1.0
                 }
+
+                let filteredOut = nodes.count - filteredNodes.count
+                if filteredOut > 0 {
+                    Log.debug("[SimpleTimelineViewModel] Filtered out \(filteredOut) nodes with invalid coordinates", category: .ui)
+                }
+
+                ocrNodes = filteredNodes
+                Log.debug("[SimpleTimelineViewModel] Set ocrNodes to \(ocrNodes.count) nodes", category: .ui)
             }
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)

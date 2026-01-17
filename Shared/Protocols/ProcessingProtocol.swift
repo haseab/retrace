@@ -136,7 +136,8 @@ public struct AccessibilityTextElement: Sendable {
 }
 
 /// Information about an application
-public struct AppInfo: Sendable, Equatable {
+public struct AppInfo: Identifiable, Hashable, Sendable {
+    public let id: String
     public let bundleID: String
     public let name: String
     public let windowName: String?
@@ -148,6 +149,7 @@ public struct AppInfo: Sendable, Equatable {
         windowName: String? = nil,
         browserURL: String? = nil
     ) {
+        self.id = bundleID
         self.bundleID = bundleID
         self.name = name
         self.windowName = windowName

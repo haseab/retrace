@@ -161,7 +161,7 @@ private struct AppsFilterPopover: View {
     @Binding var isPresented: Bool
     @State private var searchText = ""
 
-    private var filteredApps: [RewindDataSource.AppInfo] {
+    private var filteredApps: [AppInfo] {
         if searchText.isEmpty {
             return viewModel.availableApps
         }

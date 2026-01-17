@@ -161,10 +161,13 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
+        let _ = print("[SimpleTimelineView] frameDisplay: videoInfo=\(viewModel.currentVideoInfo != nil), currentImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), framesCount=\(viewModel.frames.count)")
         if let videoInfo = viewModel.currentVideoInfo {
             // Video-based frame (Rewind) with URL overlay
             // Only show if video file exists
-            if FileManager.default.fileExists(atPath: videoInfo.videoPath) {
+            let fileExists = FileManager.default.fileExists(atPath: videoInfo.videoPath)
+            let _ = print("[SimpleTimelineView] Video path: \(videoInfo.videoPath), exists: \(fileExists)")
+            if fileExists {
                 FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                     SimpleVideoFrameView(videoInfo: videoInfo)
                 }
@@ -177,6 +180,7 @@ public struct SimpleTimelineView: View {
             }
         } else if let image = viewModel.currentImage {
             // Static image (Retrace) with URL overlay
+            let _ = print("[SimpleTimelineView] Showing static image")
             FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                 Image(nsImage: image)
                     .resizable()
@@ -184,6 +188,7 @@ public struct SimpleTimelineView: View {
             }
         } else if !viewModel.isLoading {
             // Empty state - no video or image available
+            let _ = print("[SimpleTimelineView] Empty state - no video or image, frames.isEmpty=\(viewModel.frames.isEmpty)")
             VStack(spacing: .spacingM) {
                 Image(systemName: "photo.on.rectangle.angled")
                     .font(.system(size: 48))
@@ -273,16 +278,16 @@ public struct SimpleTimelineView: View {
 
     /// Calculate the actual displayed frame rect within the container for the main view
     private func calculateActualDisplayedFrameRectForView(containerSize: CGSize) -> CGRect {
-        // Get the actual frame dimensions
+        // Get the actual frame dimensions from videoInfo (database)
+        // Don't use NSImage.size as that requires extracting the frame from video first
         let frameSize: CGSize
-        if let image = viewModel.currentImage {
-            frameSize = image.size
-        } else if let videoInfo = viewModel.currentVideoInfo {
-            // For video, use standard macOS screen dimensions as fallback
-            frameSize = CGSize(width: 1920, height: 1080)
+        if let videoInfo = viewModel.currentVideoInfo,
+           let width = videoInfo.width,
+           let height = videoInfo.height {
+            frameSize = CGSize(width: width, height: height)
         } else {
-            // No frame available, return full container
-            return CGRect(origin: .zero, size: containerSize)
+            // Fallback to standard macOS screen dimensions (should rarely be needed)
+            frameSize = CGSize(width: 1920, height: 1080)
         }
 
         // Calculate aspect-fit dimensions
@@ -566,16 +571,16 @@ struct FrameWithURLOverlay<Content: View>: View {
     /// Calculate the actual displayed frame rect within the container
     /// Takes into account aspect ratio fitting
     private func calculateActualDisplayedFrameRect(containerSize: CGSize, viewModel: SimpleTimelineViewModel) -> CGRect {
-        // Get the actual frame dimensions
+        // Get the actual frame dimensions from videoInfo (database)
+        // Don't use NSImage.size as that requires extracting the frame from video first
         let frameSize: CGSize
-        if let image = viewModel.currentImage {
-            frameSize = image.size
-        } else if let videoInfo = viewModel.currentVideoInfo {
-            // For video, use standard macOS screen dimensions as fallback
-            frameSize = CGSize(width: 1920, height: 1080)
+        if let videoInfo = viewModel.currentVideoInfo,
+           let width = videoInfo.width,
+           let height = videoInfo.height {
+            frameSize = CGSize(width: width, height: height)
         } else {
-            // No frame available, return full container
-            return CGRect(origin: .zero, size: containerSize)
+            // Fallback to standard macOS screen dimensions (should rarely be needed)
+            frameSize = CGSize(width: 1920, height: 1080)
         }
 
         // Calculate aspect-fit dimensions
@@ -1303,7 +1308,7 @@ extension View {
 /// Interactive overlay that shows a dotted rectangle around a detected URL
 /// Changes cursor to pointer on hover and opens URL on click
 struct URLBoundingBoxOverlay: NSViewRepresentable {
-    let boundingBox: RewindDataSource.URLBoundingBox
+    let boundingBox: URLBoundingBox
     let containerSize: CGSize
     let actualFrameRect: CGRect
     let isHovering: Bool
@@ -1804,7 +1809,7 @@ struct SearchHighlightOverlay: View {
     @State private var highlightScale: CGFloat = 0.3
 
     // Cache the highlight nodes on appear to prevent re-renders from changing them
-    @State private var cachedNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] = []
+    @State private var cachedNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
 
     var body: some View {
         ZStack {

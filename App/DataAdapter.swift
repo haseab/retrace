@@ -714,10 +714,15 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        // For Rewind source, use the timestamp-based deletion method
+        // For Rewind source, find the frame by timestamp and delete by ID
         if frameSource == .rewind {
             if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                try await rewindSource.deleteFrameByTimestamp(timestamp)
+                // Get frames at this exact timestamp to find the frame ID
+                let frames = try await rewindSource.getFrames(from: timestamp, to: timestamp, limit: 1)
+                guard let frame = frames.first else {
+                    throw DataSourceError.frameNotFound
+                }
+                try await rewindSource.deleteFrame(frameID: frame.id)
                 Log.info("[DataAdapter] Deleted Rewind frame by timestamp", category: .app)
                 return
             }
@@ -734,20 +739,22 @@ public actor DataAdapter {
 
     /// Get the bounding box of a browser URL on screen for a given frame
     /// Returns the bounding box if the URL text is found in the OCR nodes
-    /// Currently only supported for Rewind data source
-    public func getURLBoundingBox(timestamp: Date, source frameSource: FrameSource) async throws -> RewindDataSource.URLBoundingBox? {
+    public func getURLBoundingBox(timestamp: Date, source frameSource: FrameSource) async throws -> URLBoundingBox? {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // Only Rewind source has OCR node data with bounding boxes
+        // Both sources now support URL bounding box detection
         if frameSource == .rewind {
             if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
                 return try await rewindSource.getURLBoundingBox(timestamp: timestamp)
             }
+        } else if frameSource == .native {
+            if let retraceSource = primarySource as? RetraceDataSource {
+                return try await retraceSource.getURLBoundingBox(timestamp: timestamp)
+            }
         }
 
-        // Native source doesn't have this capability yet
         return nil
     }
 
@@ -802,7 +809,7 @@ public actor DataAdapter {
 
     /// Get all distinct apps from all data sources
     /// Returns apps sorted by usage frequency (most used first)
-    public func getDistinctApps() async throws -> [RewindDataSource.AppInfo] {
+    public func getDistinctApps() async throws -> [AppInfo] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
@@ -811,6 +818,11 @@ public actor DataAdapter {
         if let rewindSource = secondarySources[.rewind] as? RewindDataSource,
            await rewindSource.isConnected {
             return try await rewindSource.getDistinctApps()
+        }
+
+        // Try native source as fallback
+        if let retraceSource = primarySource as? RetraceDataSource {
+            return try await retraceSource.getDistinctApps()
         }
 
         // Fallback to empty if no source available

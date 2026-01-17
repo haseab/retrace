@@ -379,7 +379,7 @@ public actor AppCoordinator {
 
     /// Get all distinct apps from the database for filter UI
     /// Returns apps sorted by usage frequency (most used first)
-    public func getDistinctApps() async throws -> [RewindDataSource.AppInfo] {
+    public func getDistinctApps() async throws -> [AppInfo] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
@@ -672,7 +672,7 @@ public actor AppCoordinator {
     /// Get the bounding box of a browser URL on screen for a given frame
     /// Returns the bounding box with normalized coordinates (0.0-1.0) if found
     /// Use this to highlight clickable URLs in the timeline view
-    public func getURLBoundingBox(timestamp: Date, source: FrameSource) async throws -> RewindDataSource.URLBoundingBox? {
+    public func getURLBoundingBox(timestamp: Date, source: FrameSource) async throws -> URLBoundingBox? {
         guard let adapter = await services.dataAdapter else {
             return nil
         }

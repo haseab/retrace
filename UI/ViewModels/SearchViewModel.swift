@@ -26,7 +26,7 @@ public class SearchViewModel: ObservableObject {
     @Published public var searchMode: SearchMode = .relevant
 
     // Available apps for filter dropdown
-    @Published public var availableApps: [RewindDataSource.AppInfo] = []
+    @Published public var availableApps: [AppInfo] = []
     @Published public var isLoadingApps = false
 
     // Selected result

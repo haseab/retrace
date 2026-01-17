@@ -249,7 +249,7 @@ public actor ServiceContainer {
         Log.info("✓ Migration ready", category: .app)
 
         // 9. Initialize DataAdapter with primary and secondary sources
-        let retraceSource = RetraceDataSource(database: database, storage: storage, searchManager: search)
+        let retraceSource = RetraceDataSource(database: database, storage: storage)
         let adapter = DataAdapter(primarySource: retraceSource)
 
         // Register Rewind source if user opted in
