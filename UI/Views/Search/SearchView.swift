@@ -89,7 +89,8 @@ public struct SearchView: View {
             // Results list
             SearchResultsList(
                 results: results,
-                searchQuery: viewModel.searchQuery
+                searchQuery: viewModel.searchQuery,
+                coordinator: viewModel.coordinator
             ) { result in
                 viewModel.selectResult(result)
             }

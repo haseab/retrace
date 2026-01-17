@@ -209,7 +209,7 @@ public actor FTSManager: FTSProtocol {
         }
 
         // Rebuild the FTS index from scratch
-        let sql = "INSERT INTO documents_fts(documents_fts) VALUES('rebuild');"
+        let sql = "INSERT INTO searchRanking(searchRanking) VALUES('rebuild');"
 
         var errorMessage: UnsafeMutablePointer<CChar>?
         defer {
@@ -228,7 +228,7 @@ public actor FTSManager: FTSProtocol {
         }
 
         // Optimize the FTS index (merge segments)
-        let sql = "INSERT INTO documents_fts(documents_fts) VALUES('optimize');"
+        let sql = "INSERT INTO searchRanking(searchRanking) VALUES('optimize');"
 
         var errorMessage: UnsafeMutablePointer<CChar>?
         defer {
@@ -244,42 +244,38 @@ public actor FTSManager: FTSProtocol {
     // MARK: - Private Helpers
 
     private func buildSearchQuery(filters: SearchFilters) -> String {
+        // Rewind schema join pattern: searchRanking → searchRanking_content → doc_segment → frame → segment
         var sql = """
             SELECT
-                d.id, d.frame_id, d.timestamp, d.app_name, d.window_name,
-                snippet(documents_fts, 0, '<mark>', '</mark>', '...', 32) as snippet,
-                bm25(documents_fts) as rank
-            FROM documents_fts
-            JOIN documents d ON documents_fts.rowid = d.id
+                c.id, ds.frameId, f.createdAt, s.bundleID, s.windowName,
+                snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                bm25(searchRanking) as rank,
+                f.videoId, f.videoFrameIndex
+            FROM searchRanking
+            JOIN searchRanking_content c ON searchRanking.rowid = c.id
+            JOIN doc_segment ds ON c.id = ds.docid
+            JOIN frame f ON ds.frameId = f.id
+            JOIN segment s ON f.segmentId = s.id
+            WHERE searchRanking MATCH ?
             """
 
-        // Join with frames table if we need app_bundle_id filtering
-        let needsFrameJoin = filters.appBundleIDs != nil || filters.excludedAppBundleIDs != nil
-        if needsFrameJoin {
-            sql += "\n            JOIN frames f ON d.frame_id = f.id"
-        }
-
-        sql += "\n            WHERE documents_fts MATCH ?"
-
-        // Add time filters
+        // Add time filters (using frame.createdAt)
         if filters.startDate != nil {
-            sql += " AND d.timestamp >= ?"
+            sql += " AND f.createdAt >= ?"
         }
 
         if filters.endDate != nil {
-            sql += " AND d.timestamp <= ?"
+            sql += " AND f.createdAt <= ?"
         }
 
-        // Add app filtering
+        // Add app filtering (using segment.bundleID and segment.windowName)
         if let appBundleIDs = filters.appBundleIDs, !appBundleIDs.isEmpty {
-            // Support filtering by app name (from documents) OR bundle ID (from frames)
-            // This handles both "Chrome" and "com.google.Chrome" style filters
-            let placeholders = appBundleIDs.map { _ in "(d.app_name LIKE ? OR f.app_bundle_id LIKE ?)" }.joined(separator: " OR ")
+            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR s.windowName LIKE ?)" }.joined(separator: " OR ")
             sql += " AND (\(placeholders))"
         }
 
         if let excludedAppBundleIDs = filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
-            let placeholders = excludedAppBundleIDs.map { _ in "(d.app_name NOT LIKE ? AND f.app_bundle_id NOT LIKE ?)" }.joined(separator: " AND ")
+            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND s.windowName NOT LIKE ?)" }.joined(separator: " AND ")
             sql += " AND (\(placeholders))"
         }
 
@@ -289,36 +285,32 @@ public actor FTSManager: FTSProtocol {
     }
 
     private func buildCountQuery(filters: SearchFilters) -> String {
+        // Same join pattern as buildSearchQuery
         var sql = """
             SELECT COUNT(*)
-            FROM documents_fts
-            JOIN documents d ON documents_fts.rowid = d.id
+            FROM searchRanking
+            JOIN searchRanking_content c ON searchRanking.rowid = c.id
+            JOIN doc_segment ds ON c.id = ds.docid
+            JOIN frame f ON ds.frameId = f.id
+            JOIN segment s ON f.segmentId = s.id
+            WHERE searchRanking MATCH ?
             """
 
-        // Join with frames table if we need app_bundle_id filtering
-        let needsFrameJoin = filters.appBundleIDs != nil || filters.excludedAppBundleIDs != nil
-        if needsFrameJoin {
-            sql += "\n            JOIN frames f ON d.frame_id = f.id"
-        }
-
-        sql += "\n            WHERE documents_fts MATCH ?"
-
         if filters.startDate != nil {
-            sql += " AND d.timestamp >= ?"
+            sql += " AND f.createdAt >= ?"
         }
 
         if filters.endDate != nil {
-            sql += " AND d.timestamp <= ?"
+            sql += " AND f.createdAt <= ?"
         }
 
-        // Add app filtering (same logic as buildSearchQuery)
         if let appBundleIDs = filters.appBundleIDs, !appBundleIDs.isEmpty {
-            let placeholders = appBundleIDs.map { _ in "(d.app_name LIKE ? OR f.app_bundle_id LIKE ?)" }.joined(separator: " OR ")
+            let placeholders = appBundleIDs.map { _ in "(s.bundleID LIKE ? OR s.windowName LIKE ?)" }.joined(separator: " OR ")
             sql += " AND (\(placeholders))"
         }
 
         if let excludedAppBundleIDs = filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
-            let placeholders = excludedAppBundleIDs.map { _ in "(d.app_name NOT LIKE ? AND f.app_bundle_id NOT LIKE ?)" }.joined(separator: " AND ")
+            let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND s.windowName NOT LIKE ?)" }.joined(separator: " AND ")
             sql += " AND (\(placeholders))"
         }
 
@@ -326,28 +318,27 @@ public actor FTSManager: FTSProtocol {
     }
 
     private func parseSearchResult(statement: OpaquePointer) throws -> FTSMatch {
-        // Column 0: document id
+        // New column order from Rewind schema:
+        // c.id, ds.frameId, f.createdAt, s.bundleID, s.windowName, snippet, rank, f.videoId, f.videoFrameIndex
+
+        // Column 0: document id (searchRanking_content.id)
         let documentID = sqlite3_column_int64(statement, 0)
 
-        // Column 1: frame_id
-        guard let frameIDString = sqlite3_column_text(statement, 1) else {
-            throw DatabaseError.queryFailed(query: "parseSearchResult", underlying: "Missing frame ID")
-        }
-        guard let frameID = FrameID(string: String(cString: frameIDString)) else {
-            throw DatabaseError.queryFailed(query: "parseSearchResult", underlying: "Invalid frame ID")
-        }
+        // Column 1: frame_id (INTEGER from doc_segment.frameId)
+        let frameIDValue = sqlite3_column_int64(statement, 1)
+        let frameID = FrameID(value: frameIDValue)
 
-        // Column 2: timestamp
+        // Column 2: timestamp (frame.createdAt)
         let timestampMs = sqlite3_column_int64(statement, 2)
         let timestamp = Schema.timestampToDate(timestampMs)
 
-        // Column 3: app_name (nullable)
+        // Column 3: bundleID (segment.bundleID) - use as appName
         var appName: String?
-        if let appNameText = sqlite3_column_text(statement, 3) {
-            appName = String(cString: appNameText)
+        if let bundleIDText = sqlite3_column_text(statement, 3) {
+            appName = String(cString: bundleIDText)
         }
 
-        // Column 4: window_name (nullable)
+        // Column 4: windowName (segment.windowName)
         var windowName: String?
         if let windowNameText = sqlite3_column_text(statement, 4) {
             windowName = String(cString: windowNameText)
@@ -362,6 +353,15 @@ public actor FTSManager: FTSProtocol {
         // Column 6: rank (BM25 score - negative, lower is better)
         let rank = sqlite3_column_double(statement, 6)
 
+        // Column 7: videoId (INTEGER from frame.videoId)
+        let videoIDValue = sqlite3_column_int64(statement, 7)
+        let videoID = VideoSegmentID(value: videoIDValue)
+
+        // Column 8: videoFrameIndex (INTEGER from frame.videoFrameIndex)
+        let frameIndex = Int(sqlite3_column_int(statement, 8))
+
+        Log.debug("[FTSManager] Parsed FTS result: frameID=\(frameID.value), videoID=\(videoIDValue), frameIndex=\(frameIndex), snippet='\(snippet.prefix(50))...'", category: .database)
+
         return FTSMatch(
             documentID: documentID,
             frameID: frameID,
@@ -369,7 +369,9 @@ public actor FTSManager: FTSProtocol {
             snippet: snippet,
             rank: rank,
             appName: appName,
-            windowName: windowName
+            windowName: windowName,
+            videoID: videoID,
+            frameIndex: frameIndex
         )
     }
 }

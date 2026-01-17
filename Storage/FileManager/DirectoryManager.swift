@@ -15,29 +15,30 @@ actor DirectoryManager {
     }
 
     func ensureBaseDirectories() throws {
-        let segments = storageRoot.appendingPathComponent("segments", isDirectory: true)
+        let chunks = storageRoot.appendingPathComponent("chunks", isDirectory: true)
         let temp = storageRoot.appendingPathComponent("temp", isDirectory: true)
         try createDirIfNeeded(storageRoot)
-        try createDirIfNeeded(segments)
+        try createDirIfNeeded(chunks)
         try createDirIfNeeded(temp)
     }
 
-    func segmentURL(for id: SegmentID, date: Date) throws -> URL {
+    func segmentURL(for id: VideoSegmentID, date: Date) throws -> URL {
         let calendar = Calendar.current
         let year = calendar.component(.year, from: date)
         let month = calendar.component(.month, from: date)
-        let day = calendar.component(.day, from: date)
+
+        // Rewind format: chunks/YYYYMM/videoID
+        let yearMonth = String(format: "%04d%02d", year, month)
 
         let dir = storageRoot
-            .appendingPathComponent("segments", isDirectory: true)
-            .appendingPathComponent(String(format: "%04d", year), isDirectory: true)
-            .appendingPathComponent(String(format: "%02d", month), isDirectory: true)
-            .appendingPathComponent(String(format: "%02d", day), isDirectory: true)
+            .appendingPathComponent("chunks", isDirectory: true)
+            .appendingPathComponent(yearMonth, isDirectory: true)
 
         try createDirIfNeeded(dir)
         // No extension - security through obscurity (files are actually MP4)
         // Database is encrypted with SQLCipher instead
-        return dir.appendingPathComponent("segment_\(id.stringValue)")
+        // Use actual ID instead of placeholder
+        return dir.appendingPathComponent("\(id.stringValue)")
     }
 
     func relativePath(from url: URL) -> String {
@@ -52,10 +53,10 @@ actor DirectoryManager {
     }
 
     func listAllSegmentFiles() throws -> [URL] {
-        let segmentsRoot = storageRoot.appendingPathComponent("segments", isDirectory: true)
-        guard fileManager.fileExists(atPath: segmentsRoot.path) else { return [] }
+        let chunksRoot = storageRoot.appendingPathComponent("chunks", isDirectory: true)
+        guard fileManager.fileExists(atPath: chunksRoot.path) else { return [] }
         let enumerator = fileManager.enumerator(
-            at: segmentsRoot,
+            at: chunksRoot,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         )

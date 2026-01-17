@@ -303,7 +303,7 @@ struct FrameViewer_Previews: PreviewProvider {
 
         FrameViewer(
             result: SearchResult(
-                id: FrameID(value: UUID()),
+                id: FrameID(value: 1),
                 timestamp: Date(),
                 snippet: "Error: Cannot read property 'user' of undefined",
                 matchedText: "error",
@@ -315,7 +315,7 @@ struct FrameViewer_Previews: PreviewProvider {
                     browserURL: "https://github.com",
                     displayID: 0
                 ),
-                segmentID: SegmentID(value: UUID()),
+                segmentID: AppSegmentID(value: 1),
                 frameIndex: 42
             ),
             searchQuery: "error",

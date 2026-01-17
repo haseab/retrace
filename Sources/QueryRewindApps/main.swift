@@ -7,7 +7,7 @@ let dbPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault
 let password = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
 
 // Output file path
-let outputPath = "\(homeDir)/Desktop/rewind_app_sessions.txt"
+let outputPath = "\(homeDir)/Desktop/rewind_segments.txt"
 
 print("Opening Rewind database at: \(dbPath)")
 
@@ -72,15 +72,15 @@ let tableCount = sqlite3_column_int(testStmt, 0)
 sqlite3_finalize(testStmt)
 print("✓ Encryption verified (\(tableCount) objects in schema)")
 
-print("\nQuerying app sessions...")
+print("\nQuerying segments...")
 
 // Query distinct bundle IDs with counts
 let query = """
-    SELECT bundleId, COUNT(*) as session_count
+    SELECT bundleId, COUNT(*) as segment_count
     FROM segment
     WHERE bundleId IS NOT NULL AND bundleId != ''
     GROUP BY bundleId
-    ORDER BY session_count DESC
+    ORDER BY segment_count DESC
     """
 
 var stmt: OpaquePointer?
@@ -92,12 +92,12 @@ guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
 }
 
 var results: [String] = []
-results.append("Rewind App Sessions")
+results.append("Rewind Segments")
 results.append(String(repeating: "=", count: 80))
-results.append("Bundle ID".padding(toLength: 60, withPad: " ", startingAt: 0) + "Sessions")
+results.append("Bundle ID".padding(toLength: 60, withPad: " ", startingAt: 0) + "Segments")
 results.append(String(repeating: "-", count: 80))
 
-var totalSessions = 0
+var totalSegments = 0
 var appCount = 0
 
 while sqlite3_step(stmt) == SQLITE_ROW {
@@ -106,7 +106,7 @@ while sqlite3_step(stmt) == SQLITE_ROW {
         let count = sqlite3_column_int(stmt, 1)
         let line = bundleId.padding(toLength: 60, withPad: " ", startingAt: 0) + "\(count)"
         results.append(line)
-        totalSessions += Int(count)
+        totalSegments += Int(count)
         appCount += 1
     }
 }
@@ -115,7 +115,7 @@ sqlite3_finalize(stmt)
 sqlite3_close(db)
 
 results.append(String(repeating: "-", count: 80))
-results.append("Total: \(appCount) apps, \(totalSessions) sessions")
+results.append("Total: \(appCount) apps, \(totalSegments) segments")
 
 // Write to file
 let output = results.joined(separator: "\n")

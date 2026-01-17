@@ -58,7 +58,10 @@ public struct TimelineFrame: Identifiable, Equatable {
 
 /// Represents a block of consecutive frames from the same app
 public struct AppBlock: Identifiable {
-    public let id = UUID()
+    // Use stable ID based on content to prevent unnecessary view recreation during infinite scroll
+    public var id: String {
+        "\(bundleID ?? "nil")_\(startIndex)_\(endIndex)"
+    }
     public let bundleID: String?
     public let appName: String?
     public let startIndex: Int
@@ -82,6 +85,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var frames: [TimelineFrame] = [] {
         didSet {
             // Clear cached blocks when frames change
+            // Note: This is necessary because blocks depend on frame ranges
+            // The slight performance hit is acceptable for correctness
             _cachedAppBlocks = nil
         }
     }
@@ -143,7 +148,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Text Selection State
 
     /// All OCR nodes for the current frame (used for text selection)
-    @Published public var ocrNodes: [RewindDataSource.OCRNode] = []
+    @Published public var ocrNodes: [OCRNodeWithText] = []
 
     /// Character-level selection: start position (node ID, character index within node)
     @Published public var selectionStart: (nodeID: Int, charIndex: Int)?
@@ -270,9 +275,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
-        let info = currentTimelineFrame?.videoInfo
-        // Log every time this is accessed to see what SwiftUI is getting
-        print("[VM] currentVideoInfo accessed: index=\(currentIndex), videoFrameIndex=\(info?.frameIndex ?? -999), path=\(info?.videoPath.suffix(20) ?? "nil")")
+        guard let info = currentTimelineFrame?.videoInfo,
+              info.frameIndex >= 0 else {
+            // No valid video info - return nil so UI shows placeholder
+            return nil
+        }
         return info
     }
 
@@ -336,6 +343,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether there's more data available in the newer direction
     private var hasMoreNewer = true
 
+    /// Whether we've hit the absolute end of available data (no more frames exist in DB)
+    private var hasReachedAbsoluteEnd = false
+
+    /// Whether we've hit the absolute start of available data (no more frames exist in DB)
+    private var hasReachedAbsoluteStart = false
+
     /// Counter for periodic memory logging (log every N navigations)
     private var navigationCounter: Int = 0
     private static let memoryLogInterval = 50  // Log memory state every 50 navigations
@@ -348,6 +361,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let cachedPositionSavedAtKey = "timeline.cachedPositionSavedAt"
     /// Key for storing the cached current index
     private static let cachedCurrentIndexKey = "timeline.cachedCurrentIndex"
+    /// Cache version - increment when data structure changes to invalidate old caches
+    private static let cacheVersion = 2  // v2: Added optimized frame queries with video info
+    private static let cacheVersionKey = "timeline.cacheVersion"
     /// How long the cached position remains valid (2 minutes)
     private static let cacheExpirationSeconds: TimeInterval = 120
 
@@ -533,10 +549,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let timestamp = currentTimestamp else { return }
         guard !frames.isEmpty else { return }
 
-        // Save timestamp and index to UserDefaults
+        // Save timestamp, index, and version to UserDefaults
         UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
         UserDefaults.standard.set(currentIndex, forKey: Self.cachedCurrentIndexKey)
+        UserDefaults.standard.set(Self.cacheVersion, forKey: Self.cacheVersionKey)
 
         // Save frames to disk (JSON file) - do this async to not block the main thread
         Task.detached(priority: .utility) { [frames] in
@@ -556,6 +573,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Get the cached frames if they exist and haven't expired
     private func getCachedFrames() -> (frames: [TimelineFrame], currentIndex: Int)? {
+        // Check cache version first - invalidate if version mismatch
+        let cachedVersion = UserDefaults.standard.integer(forKey: Self.cacheVersionKey)
+        if cachedVersion != Self.cacheVersion {
+            print("[PositionCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.cacheVersion)) - invalidating")
+            clearCachedPosition()
+            return nil
+        }
+
         let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
         guard savedAt > 0 else { return nil }
 
@@ -828,7 +853,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             var timelineFrames: [TimelineFrame] = []
             for frame in loadedFrames {
                 let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.segmentID,
+                    segmentID: frame.videoID,
                     timestamp: frame.timestamp,
                     source: frame.source
                 )
@@ -921,14 +946,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Get OCR nodes that match the search query (for highlighting)
     /// Supports exact matches and stem-based matches for nominalized words (e.g., "calling" matches "call")
-    public var searchHighlightNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] {
+    public var searchHighlightNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
         guard let query = searchHighlightQuery, !query.isEmpty, isShowingSearchHighlight else {
             return []
         }
 
         let lowercaseQuery = query.lowercased()
         let queryStem = getWordStem(lowercaseQuery)
-        var matchingNodes: [(node: RewindDataSource.OCRNode, ranges: [Range<String.Index>])] = []
+        var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
 
         for node in ocrNodes {
             let nodeText = node.text.lowercased()
@@ -1001,12 +1026,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Also load OCR nodes for text selection
         loadOCRNodes()
 
-        // Only load image if this is NOT a video-based frame
-        guard timelineFrame.videoInfo == nil else {
-            currentImage = nil
-            return
-        }
-
         let frame = timelineFrame.frame
 
         // Check cache first
@@ -1018,10 +1037,33 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load from disk
         Task {
             do {
-                let imageData = try await coordinator.getFrameImage(
-                    segmentID: frame.segmentID,
-                    timestamp: frame.timestamp
-                )
+                let imageData: Data
+
+                // If we have videoInfo (optimized JOIN query result), use it directly
+                // This avoids expensive database lookups for video path resolution
+                if let videoInfo = timelineFrame.videoInfo {
+                    // Extract filename from full path (e.g., "/path/chunks/202601/1768624554519" -> "1768624554519")
+                    let videoPath = videoInfo.videoPath
+                    let filename = (videoPath as NSString).lastPathComponent
+                    guard let filenameID = Int64(filename) else {
+                        throw NSError(domain: "SimpleTimelineViewModel", code: 400,
+                                    userInfo: [NSLocalizedDescriptionKey: "Invalid video path format: \(videoPath)"])
+                    }
+
+                    // Use optimized direct read (NO database lookups!)
+                    imageData = try await coordinator.getFrameImageDirect(
+                        filenameID: filenameID,
+                        frameIndex: videoInfo.frameIndex
+                    )
+                } else {
+                    // Fallback: use timestamp-based lookup (does database query)
+                    // This path is only for frames without videoInfo (shouldn't happen for native frames)
+                    imageData = try await coordinator.getFrameImage(
+                        segmentID: frame.videoID,
+                        timestamp: frame.timestamp
+                    )
+                }
+
                 if let image = NSImage(data: imageData) {
                     // Prune cache if it's getting too large
                     pruneImageCacheIfNeeded()
@@ -1034,6 +1076,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
+                // Clear the image so we don't show the previous frame
+                if currentTimelineFrame?.frame.id == frame.id {
+                    currentImage = nil
+                }
             }
         }
     }
@@ -1119,7 +1165,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
             // Only update if we're still on the same frame
             if currentTimelineFrame?.frame.id == frame.id {
-                ocrNodes = nodes
+                // Filter out nodes with invalid coordinates (multi-monitor captures)
+                // Valid normalized coordinates should be in range [0.0, 1.0]
+                ocrNodes = nodes.filter { node in
+                    node.x >= 0.0 && node.x <= 1.0 &&
+                    node.y >= 0.0 && node.y <= 1.0 &&
+                    (node.x + node.width) <= 1.0 &&
+                    (node.y + node.height) <= 1.0
+                }
             }
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
@@ -1344,7 +1397,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Get OCR nodes filtered to zoom region (for Cmd+A within zoom)
-    public var ocrNodesInZoomRegion: [RewindDataSource.OCRNode] {
+    public var ocrNodesInZoomRegion: [OCRNodeWithText] {
         guard let region = zoomRegion, isZoomRegionActive else {
             return ocrNodes
         }
@@ -1363,7 +1416,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Get the visible character range for a node within the current zoom region
     /// Returns the start and end character indices that are visible, or nil if fully visible
-    public func getVisibleCharacterRange(for node: RewindDataSource.OCRNode) -> (start: Int, end: Int)? {
+    public func getVisibleCharacterRange(for node: OCRNodeWithText) -> (start: Int, end: Int)? {
         guard let region = zoomRegion, isZoomRegionActive else {
             return nil // No clipping needed
         }
@@ -1409,7 +1462,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Find which node contains the point, or the closest node
-        var bestNode: RewindDataSource.OCRNode?
+        var bestNode: OCRNodeWithText?
         var bestDistance: CGFloat = .infinity
 
         for node in sortedNodes {
@@ -1452,7 +1505,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Find which node contains the point, or the closest node
-        var bestNode: RewindDataSource.OCRNode?
+        var bestNode: OCRNodeWithText?
         var bestDistance: CGFloat = .infinity
 
         for node in sortedNodes {
@@ -2078,8 +2131,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             guard !framesWithVideoInfo.isEmpty else {
-                print("[InfiniteScroll] No more older frames available")
+                print("[InfiniteScroll] No more older frames available - reached absolute start")
                 hasMoreOlder = false
+                hasReachedAbsoluteStart = true  // Mark that we've hit the absolute start
                 isLoadingOlder = false
                 return
             }
@@ -2091,8 +2145,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let newTimelineFrames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Prepend to existing frames
+            // Use insert(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
-            frames = newTimelineFrames + frames
+            frames.insert(contentsOf: newTimelineFrames, at: 0)
 
             // Adjust currentIndex to maintain position
             currentIndex += newTimelineFrames.count
@@ -2137,8 +2192,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             guard !framesWithVideoInfo.isEmpty else {
-                print("[InfiniteScroll] No more newer frames available")
+                print("[InfiniteScroll] No more newer frames available - reached absolute end")
                 hasMoreNewer = false
+                hasReachedAbsoluteEnd = true  // Mark that we've hit the absolute end
                 isLoadingNewer = false
                 return
             }
@@ -2150,8 +2206,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
 
             // Append to existing frames
+            // Use append(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
-            frames = frames + newTimelineFrames
+            frames.append(contentsOf: newTimelineFrames)
 
             Log.info("[Memory] LOADED NEWER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count))", category: .ui)
             MemoryTracker.logMemoryState(
@@ -2194,8 +2251,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             // User is scrolling toward older, trim newer frames from end
             Log.info("[Memory] TRIMMING \(excessCount) newer frames from END (preserving older)", category: .ui)
             frames = Array(frames.dropLast(excessCount))
-            // Mark that there might be more newer frames now
-            hasMoreNewer = true
+            // Only mark that there might be more newer frames if we haven't hit the absolute end
+            if !hasReachedAbsoluteEnd {
+                hasMoreNewer = true
+            }
 
         case .newer:
             // User is scrolling toward newer, trim older frames from start
@@ -2203,8 +2262,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             frames = Array(frames.dropFirst(excessCount))
             // Adjust currentIndex
             currentIndex = max(0, currentIndex - excessCount)
-            // Mark that there might be more older frames now
-            hasMoreOlder = true
+            // Only mark that there might be more older frames if we haven't hit the absolute start
+            if !hasReachedAbsoluteStart {
+                hasMoreOlder = true
+            }
         }
 
         // Update boundaries after trimming

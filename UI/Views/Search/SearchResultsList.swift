@@ -1,5 +1,6 @@
 import SwiftUI
 import Shared
+import App
 
 /// Scrollable list of search results
 public struct SearchResultsList: View {
@@ -8,6 +9,7 @@ public struct SearchResultsList: View {
 
     let results: [SearchResult]
     let searchQuery: String
+    let coordinator: AppCoordinator
     let onSelectResult: (SearchResult) -> Void
 
     @State private var selectedResultID: FrameID?
@@ -20,7 +22,8 @@ public struct SearchResultsList: View {
                 ForEach(results, id: \.frameID) { result in
                     ResultRow(
                         result: result,
-                        searchQuery: searchQuery
+                        searchQuery: searchQuery,
+                        coordinator: coordinator
                     ) {
                         selectedResultID = result.frameID
                         onSelectResult(result)
@@ -45,7 +48,7 @@ struct SearchResultsList_Previews: PreviewProvider {
     static var previews: some View {
         let sampleResults = [
             SearchResult(
-                id: FrameID(value: UUID()),
+                id: FrameID(value: 1),
                 timestamp: Date(),
                 snippet: "Error: Cannot read property 'user' of undefined",
                 matchedText: "Error",
@@ -57,11 +60,11 @@ struct SearchResultsList_Previews: PreviewProvider {
                     browserURL: "https://github.com",
                     displayID: 0
                 ),
-                segmentID: SegmentID(value: UUID()),
+                segmentID: AppSegmentID(value: 1),
                 frameIndex: 0
             ),
             SearchResult(
-                id: FrameID(value: UUID()),
+                id: FrameID(value: 1),
                 timestamp: Date().addingTimeInterval(-300),
                 snippet: "TODO: Fix error handling",
                 matchedText: "error",
@@ -73,11 +76,11 @@ struct SearchResultsList_Previews: PreviewProvider {
                     browserURL: nil,
                     displayID: 0
                 ),
-                segmentID: SegmentID(value: UUID()),
+                segmentID: AppSegmentID(value: 1),
                 frameIndex: 0
             ),
             SearchResult(
-                id: FrameID(value: UUID()),
+                id: FrameID(value: 1),
                 timestamp: Date().addingTimeInterval(-600),
                 snippet: "Debug: Login error occurred",
                 matchedText: "Login",
@@ -89,14 +92,15 @@ struct SearchResultsList_Previews: PreviewProvider {
                     browserURL: nil,
                     displayID: 0
                 ),
-                segmentID: SegmentID(value: UUID()),
+                segmentID: AppSegmentID(value: 1),
                 frameIndex: 0
             )
         ]
 
         SearchResultsList(
             results: sampleResults,
-            searchQuery: "error"
+            searchQuery: "error",
+            coordinator: AppCoordinator()
         ) { result in
             print("Selected: \(result.snippet)")
         }

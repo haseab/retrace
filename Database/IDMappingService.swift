@@ -24,9 +24,6 @@ public actor IDMappingService {
     private var segmentUUIDToInt: [UUID: Int64] = [:]
     private var segmentIntToUUID: [Int64: UUID] = [:]
 
-    private var sessionUUIDToInt: [UUID: Int64] = [:]
-    private var sessionIntToUUID: [Int64: UUID] = [:]
-
     // MARK: - Initialization
 
     public init(db: OpaquePointer) {
@@ -38,8 +35,7 @@ public actor IDMappingService {
         print("[IDMappingService] Loading UUID mappings into cache...")
         try loadMappings(entityType: "frame", uuidToInt: &frameUUIDToInt, intToUUID: &frameIntToUUID)
         try loadMappings(entityType: "segment", uuidToInt: &segmentUUIDToInt, intToUUID: &segmentIntToUUID)
-        try loadMappings(entityType: "session", uuidToInt: &sessionUUIDToInt, intToUUID: &sessionIntToUUID)
-        print("[IDMappingService] Loaded \(frameUUIDToInt.count) frame, \(segmentUUIDToInt.count) segment, \(sessionUUIDToInt.count) session mappings")
+        print("[IDMappingService] Loaded \(frameUUIDToInt.count) frame, \(segmentUUIDToInt.count) segment mappings")
     }
 
     // MARK: - Frame Mappings
@@ -80,25 +76,6 @@ public actor IDMappingService {
         segmentIntToUUID[dbID]
     }
 
-    // MARK: - Session Mappings
-
-    /// Register a new session UUID → INTEGER mapping
-    public func registerSession(uuid: UUID, dbID: Int64) throws {
-        sessionUUIDToInt[uuid] = dbID
-        sessionIntToUUID[dbID] = uuid
-        try persistMapping(entityType: "session", uuid: uuid, dbID: dbID)
-    }
-
-    /// Get database ID for a session UUID
-    public func getSessionDBID(for uuid: UUID) -> Int64? {
-        sessionUUIDToInt[uuid]
-    }
-
-    /// Get UUID for a session database ID
-    public func getSessionUUID(for dbID: Int64) -> UUID? {
-        sessionIntToUUID[dbID]
-    }
-
     // MARK: - Bulk Operations
 
     /// Remove old mappings for cleanup
@@ -131,8 +108,8 @@ public actor IDMappingService {
     }
 
     /// Get statistics about mapping cache
-    public func getStatistics() -> (frames: Int, segments: Int, sessions: Int) {
-        (frameUUIDToInt.count, segmentUUIDToInt.count, sessionUUIDToInt.count)
+    public func getStatistics() -> (frames: Int, segments: Int) {
+        (frameUUIDToInt.count, segmentUUIDToInt.count)
     }
 
     // MARK: - Private Helpers
@@ -210,33 +187,26 @@ public actor IDMappingService {
 
 extension IDMappingService {
 
-    /// Register frame using FrameID type
+    /// NOTE: These convenience methods are now deprecated since FrameID/SegmentID already contain Int64 values
+    /// They are kept for backward compatibility but just return the ID value directly
+
+    /// Register frame using FrameID type (deprecated - ID already contains database ID)
     public func registerFrame(id: FrameID, dbID: Int64) throws {
-        try registerFrame(uuid: id.value, dbID: dbID)
+        // No-op: FrameID.value already IS the database ID
     }
 
-    /// Get database ID using FrameID type
+    /// Get database ID using FrameID type (deprecated - ID already contains database ID)
     public func getFrameDBID(for id: FrameID) -> Int64? {
-        getFrameDBID(for: id.value)
+        return id.value
     }
 
-    /// Register segment using SegmentID type
+    /// Register segment using SegmentID type (deprecated - ID already contains database ID)
     public func registerSegment(id: SegmentID, dbID: Int64) throws {
-        try registerSegment(uuid: id.value, dbID: dbID)
+        // No-op: SegmentID.value already IS the database ID
     }
 
-    /// Get database ID using SegmentID type
+    /// Get database ID using SegmentID type (deprecated - ID already contains database ID)
     public func getSegmentDBID(for id: SegmentID) -> Int64? {
-        getSegmentDBID(for: id.value)
-    }
-
-    /// Register session using AppSessionID type
-    public func registerSession(id: AppSessionID, dbID: Int64) throws {
-        try registerSession(uuid: id.value, dbID: dbID)
-    }
-
-    /// Get database ID using AppSessionID type
-    public func getSessionDBID(for id: AppSessionID) -> Int64? {
-        getSessionDBID(for: id.value)
+        return id.value
     }
 }

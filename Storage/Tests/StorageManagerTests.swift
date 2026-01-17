@@ -50,7 +50,7 @@ final class StorageManagerTests: XCTestCase {
         )
     }
 
-    private func createFakeSegmentFile(root: URL, id: SegmentID, date: Date, ext: String, size: Int, modDate: Date) throws -> URL {
+    private func createFakeSegmentFile(root: URL, id: VideoSegmentID, date: Date, ext: String, size: Int, modDate: Date) throws -> URL {
         let calendar = Calendar.current
         let year = calendar.component(.year, from: date)
         let month = calendar.component(.month, from: date)
@@ -99,7 +99,7 @@ final class StorageManagerTests: XCTestCase {
         let storage = StorageManager(storageRoot: root)
         try await storage.initialize(config: makeStorageConfig(root: root))
 
-        let id = SegmentID()
+        let id = VideoSegmentID(value: 0)
         let now = Date()
         let url = try createFakeSegmentFile(
             root: root,
@@ -129,8 +129,8 @@ final class StorageManagerTests: XCTestCase {
         let oldDate = Date(timeIntervalSinceNow: -7 * 24 * 3600)
         let cutoff = Date(timeIntervalSinceNow: -24 * 3600)
 
-        let id1 = SegmentID()
-        let id2 = SegmentID()
+        let id1 = VideoSegmentID(value: 0)
+        let id2 = VideoSegmentID(value: 0)
         _ = try createFakeSegmentFile(root: root, id: id1, date: oldDate, ext: "hevc", size: 10, modDate: oldDate)
         _ = try createFakeSegmentFile(root: root, id: id2, date: oldDate, ext: "hevc", size: 20, modDate: oldDate)
 
@@ -154,8 +154,8 @@ final class StorageManagerTests: XCTestCase {
         try await storage.initialize(config: makeStorageConfig(root: root))
 
         let now = Date()
-        let id1 = SegmentID()
-        let id2 = SegmentID()
+        let id1 = VideoSegmentID(value: 0)
+        let id2 = VideoSegmentID(value: 0)
         _ = try createFakeSegmentFile(root: root, id: id1, date: now, ext: "hevc", size: 123, modDate: now)
         _ = try createFakeSegmentFile(root: root, id: id2, date: now, ext: "hevc", size: 456, modDate: now)
 
@@ -174,9 +174,9 @@ final class StorageManagerTests: XCTestCase {
         let storage = StorageManager(storageRoot: root)
         try await storage.initialize(config: makeStorageConfig(root: root))
 
-        let missingID = SegmentID()
+        let missingID = VideoSegmentID(value: 0)
         await XCTAssertThrowsErrorAsync {
-            _ = try await storage.readFrame(segmentID: missingID, timestamp: Date())
+            _ = try await storage.readFrame(segmentID: missingID, frameIndex: 0)
         }
 
         try? FileManager.default.removeItem(at: root)

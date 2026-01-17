@@ -57,16 +57,22 @@ public struct VisionOCR: OCRProtocol {
                     // Get bounding box (normalized coordinates, origin bottom-left)
                     let box = observation.boundingBox
 
-                    // Convert normalized coordinates to pixel coordinates
+                    // CRITICAL: Flip Y coordinate from Vision's bottom-left origin to top-left origin
+                    // Vision: y=0 at bottom, y=1 at top
+                    // Rewind/Screen: y=0 at top, y=1 at bottom
+                    // Formula: flippedY = 1.0 - visionY - visionHeight
+                    let flippedY = 1.0 - box.origin.y - box.height
+
+                    // Convert normalized coordinates to pixel coordinates (with flipped Y)
                     let pixelBox = CGRect(
                         x: box.origin.x * CGFloat(width),
-                        y: box.origin.y * CGFloat(height),
+                        y: flippedY * CGFloat(height),
                         width: box.width * CGFloat(width),
                         height: box.height * CGFloat(height)
                     )
 
                     return TextRegion(
-                        frameID: FrameID(), // Placeholder - will be updated by caller
+                        frameID: FrameID(value: 0), // Placeholder - will be updated by caller
                         text: text,
                         bounds: pixelBox,
                         confidence: Double(observation.confidence)

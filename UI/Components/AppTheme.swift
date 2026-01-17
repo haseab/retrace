@@ -255,9 +255,9 @@ extension Color {
     public static let retraceSuccess = Color(red: 34/255, green: 197/255, blue: 94/255)
     public static let retraceWarning = Color(red: 251/255, green: 146/255, blue: 60/255)
 
-    // MARK: Session Colors (extracted from app icon)
-    public static func sessionColor(for appBundleID: String) -> Color {
-        AppIconColorCache.shared.color(for: appBundleID)
+    // MARK: Segment Colors (extracted from app icon)
+    public static func segmentColor(for bundleID: String) -> Color {
+        AppIconColorCache.shared.color(for: bundleID)
     }
 
     // MARK: Semantic Colors (adaptive to system light/dark mode)

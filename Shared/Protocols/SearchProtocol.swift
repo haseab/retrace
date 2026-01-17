@@ -25,8 +25,16 @@ public protocol SearchProtocol: Actor {
 
     // MARK: - Indexing
 
-    /// Index extracted text from a frame
-    func index(text: ExtractedText) async throws
+    /// Index extracted text from a frame (Rewind-compatible)
+    /// Inserts into searchRanking_content and doc_segment tables
+    /// Returns the docid (searchRanking_content.id) for linking nodes
+    ///
+    /// - Parameters:
+    ///   - text: The extracted text from OCR
+    ///   - segmentId: The segment ID (app focus session) for doc_segment junction
+    ///   - frameId: The frame ID for doc_segment junction
+    /// - Returns: The docid for reference by nodes
+    func index(text: ExtractedText, segmentId: Int64, frameId: Int64) async throws -> Int64
 
     /// Remove a frame from the index
     func removeFromIndex(frameID: FrameID) async throws

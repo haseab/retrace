@@ -104,6 +104,8 @@ public actor SearchManager: SearchProtocol {
                 // ⚠️ RELEASE 2 ONLY - Use simple matched text extraction for Release 1
                 let matchedText = match.snippet.components(separatedBy: " ").prefix(5).joined(separator: " ")
 
+                Log.debug("[SearchManager] Creating SearchResult: frameID=\(match.frameID.value), videoID=\(match.videoID.value), frameIndex=\(match.frameIndex), snippet='\(match.snippet.prefix(50))...'", category: .search)
+
                 let result = SearchResult(
                     id: match.frameID,
                     timestamp: match.timestamp,
@@ -117,7 +119,8 @@ public actor SearchManager: SearchProtocol {
                         browserURL: nil
                     ),
                     segmentID: frame.segmentID,
-                    frameIndex: frame.frameIndexInSegment
+                    videoID: match.videoID,
+                    frameIndex: match.frameIndex
                 )
                 results.append(result)
             }
@@ -206,39 +209,38 @@ public actor SearchManager: SearchProtocol {
 
     // MARK: - SearchProtocol: Indexing
 
-    public func index(text: ExtractedText) async throws {
+    public func index(text: ExtractedText, segmentId: Int64, frameId: Int64) async throws -> Int64 {
         guard isInitialized else {
             throw SearchError.indexNotReady
         }
 
         // Skip empty text
         guard !text.isEmpty else {
-            return
+            // Return 0 for empty text (no docid assigned)
+            return 0
         }
 
-        // Create indexed document
-        let document = IndexedDocument(
-            id: 0,  // Will be assigned by database
-            frameID: text.frameID,
-            timestamp: text.timestamp,
-            content: text.fullText,
-            appName: text.metadata.appName,
-            windowName: text.metadata.windowName,
-            browserURL: text.metadata.browserURL
+        // Use Rewind-compatible FTS insertion:
+        // 1. INSERT INTO searchRanking_content (c0, c1, c2) → get docid
+        // 2. INSERT INTO doc_segment (docid, segmentId, frameId)
+        // chromeText is now populated from UI chrome separation (menu bar, dock, status bar)
+        let docid = try await database.indexFrameText(
+            mainText: text.fullText,                       // c0: Main OCR text (excluding chrome)
+            chromeText: text.chromeText.isEmpty ? nil : text.chromeText, // c1: UI chrome text
+            windowTitle: text.metadata.windowName,         // c2: Window title
+            segmentId: segmentId,
+            frameId: frameId
         )
 
-        // Insert into database (which updates FTS index)
-        let _ = try await database.insertDocument(document)
+        Log.debug("Indexed FTS content \(docid) for frame \(frameId)", category: .search)
 
-        Log.debug("Indexed document for frame \(text.frameID.stringValue.prefix(8))", category: .search)
+        return docid
     }
 
     public func removeFromIndex(frameID: FrameID) async throws {
-        // Get document to delete
-        if let doc = try await database.getDocument(frameID: frameID) {
-            try await database.deleteDocument(id: doc.id)
-            Log.debug("Removed document for frame \(frameID.stringValue.prefix(8))", category: .search)
-        }
+        // Delete FTS content and doc_segment for this frame
+        try await database.deleteFTSContent(frameId: frameID.value)
+        Log.debug("Removed FTS content for frame \(frameID.value)", category: .search)
     }
 
     public func rebuildIndex() async throws {

@@ -132,12 +132,18 @@ public class SearchViewModel: ObservableObject {
                 Log.debug("[SearchViewModel] First result: frameID=\(firstResult.frameID.stringValue), timestamp=\(firstResult.timestamp), snippet='\(firstResult.snippet.prefix(50))...'", category: .ui)
             }
 
-            results = searchResults
-            isSearching = false
+            // Ensure UI updates happen on main actor
+            await MainActor.run {
+                results = searchResults
+                isSearching = false
+            }
         } catch {
             Log.error("[SearchViewModel] Search failed: \(error.localizedDescription)", category: .ui)
-            self.error = "Search failed: \(error.localizedDescription)"
-            isSearching = false
+            // Ensure UI updates happen on main actor
+            await MainActor.run {
+                self.error = "Search failed: \(error.localizedDescription)"
+                isSearching = false
+            }
         }
     }
 

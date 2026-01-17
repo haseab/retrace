@@ -90,28 +90,24 @@ public class DashboardViewModel: ObservableObject {
             weekDateRange = "\(formatter.string(from: weekStart)) - \(formatter.string(from: weekEnd))"
 
             // Load app sessions from database for this week
-            let sessions = try await coordinator.getSessions(from: weekStart, to: weekEnd)
+            let sessions = try await coordinator.getSegments(from: weekStart, to: weekEnd)
 
             // Aggregate by app
             var appDurations: [String: (appName: String, duration: TimeInterval, sessionCount: Int)] = [:]
 
             for session in sessions {
-                let duration: TimeInterval
-                if let endTime = session.endTime {
-                    duration = endTime.timeIntervalSince(session.startTime)
-                } else {
-                    // Session still active - use current time
-                    duration = now.timeIntervalSince(session.startTime)
-                }
+                // Calculate session duration
+                let duration = session.endDate.timeIntervalSince(session.startDate)
 
-                let appName = session.appName ?? session.appBundleID
+                // Derive app name from bundle ID (e.g., "com.google.Chrome" -> "Chrome")
+                let appName = session.bundleID.components(separatedBy: ".").last ?? session.bundleID
 
-                if var existing = appDurations[session.appBundleID] {
+                if var existing = appDurations[session.bundleID] {
                     existing.duration += duration
                     existing.sessionCount += 1
-                    appDurations[session.appBundleID] = existing
+                    appDurations[session.bundleID] = existing
                 } else {
-                    appDurations[session.appBundleID] = (appName: appName, duration: duration, sessionCount: 1)
+                    appDurations[session.bundleID] = (appName: appName, duration: duration, sessionCount: 1)
                 }
             }
 

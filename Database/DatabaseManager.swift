@@ -81,6 +81,11 @@ public actor DatabaseManager: DatabaseProtocol {
         try await migrationRunner.runMigrations()
         print("[DEBUG] Migrations complete")
 
+        // Offset AUTOINCREMENT to avoid collision with Rewind's frozen data
+        print("[DEBUG] Setting AUTOINCREMENT offset...")
+        try await offsetAutoincrementFromRewind()
+        print("[DEBUG] AUTOINCREMENT offset complete")
+
         isInitialized = true
         print("Database initialized at: \(expandedPath)")
     }
@@ -198,11 +203,11 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Frame Operations
 
-    public func insertFrame(_ frame: FrameReference) async throws {
+    public func insertFrame(_ frame: FrameReference) async throws -> Int64 {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try FrameQueries.insert(db: db, frame: frame)
+        return try FrameQueries.insert(db: db, frame: frame)
     }
 
     public func getFrame(id: FrameID) async throws -> FrameReference? {
@@ -240,6 +245,36 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getMostRecent(db: db, limit: limit)
     }
 
+    // MARK: - Optimized Frame Queries with Video Info (Rewind-inspired)
+
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getByTimeRangeWithVideoInfo(db: db, from: startDate, to: endDate, limit: limit)
+    }
+
+    public func getMostRecentFramesWithVideoInfo(limit: Int) async throws -> [FrameWithVideoInfo] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getMostRecentWithVideoInfo(db: db, limit: limit)
+    }
+
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getBeforeWithVideoInfo(db: db, timestamp: timestamp, limit: limit)
+    }
+
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getAfterWithVideoInfo(db: db, timestamp: timestamp, limit: limit)
+    }
+
     public func getFrames(appBundleID: String, limit: Int, offset: Int) async throws -> [FrameReference] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -268,37 +303,125 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getCount(db: db)
     }
 
-    // MARK: - Segment Operations
-
-    public func insertSegment(_ segment: VideoSegment) async throws {
+    public func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try SegmentQueries.insert(db: db, segment: segment)
+        try FrameQueries.updateVideoLink(db: db, frameId: frameID.value, videoId: videoID.value, videoFrameIndex: frameIndex)
     }
 
-    public func getSegment(id: SegmentID) async throws -> VideoSegment? {
+    // MARK: - OCR Node Operations
+
+    /// Get all OCR nodes with their text for a specific frame
+    /// Returns nodes with normalized coordinates (0.0-1.0) and extracted text
+    public func getOCRNodesWithText(frameID: FrameID) async throws -> [OCRNodeWithText] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Query nodes with text directly - keep coordinates normalized (0-1)
+        let sql = """
+            SELECT
+                n.id,
+                n.nodeOrder,
+                n.textOffset,
+                n.textLength,
+                n.leftX,
+                n.topY,
+                n.width,
+                n.height,
+                sc.c0
+            FROM node n
+            JOIN doc_segment ds ON n.frameId = ds.frameId
+            JOIN searchRanking_content sc ON ds.docid = sc.id
+            WHERE n.frameId = ?
+            ORDER BY n.nodeOrder ASC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameID.value)
+
+        var results: [OCRNodeWithText] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = Int(sqlite3_column_int64(statement, 0))
+            let textOffset = Int(sqlite3_column_int(statement, 2))
+            let textLength = Int(sqlite3_column_int(statement, 3))
+            let leftX = sqlite3_column_double(statement, 4)
+            let topY = sqlite3_column_double(statement, 5)
+            let width = sqlite3_column_double(statement, 6)
+            let height = sqlite3_column_double(statement, 7)
+
+            // Extract text substring
+            guard let fullTextCStr = sqlite3_column_text(statement, 8) else { continue }
+            let fullText = String(cString: fullTextCStr)
+
+            let startIndex = fullText.index(
+                fullText.startIndex,
+                offsetBy: textOffset,
+                limitedBy: fullText.endIndex
+            ) ?? fullText.endIndex
+
+            let endIndex = fullText.index(
+                startIndex,
+                offsetBy: textLength,
+                limitedBy: fullText.endIndex
+            ) ?? fullText.endIndex
+
+            let text = String(fullText[startIndex..<endIndex])
+
+            results.append(OCRNodeWithText(
+                id: id,
+                x: leftX,
+                y: topY,
+                width: width,
+                height: height,
+                text: text
+            ))
+        }
+
+        return results
+    }
+
+    // MARK: - Video Segment Operations (Video Files)
+
+    public func insertVideoSegment(_ segment: VideoSegment) async throws -> Int64 {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.insert(db: db, segment: segment)
+    }
+
+    public func getVideoSegment(id: VideoSegmentID) async throws -> VideoSegment? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getByID(db: db, id: id)
     }
 
-    public func getSegment(containingTimestamp date: Date) async throws -> VideoSegment? {
+    public func getVideoSegment(containingTimestamp date: Date) async throws -> VideoSegment? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getByTimestamp(db: db, timestamp: date)
     }
 
-    public func getSegments(from startDate: Date, to endDate: Date) async throws -> [VideoSegment] {
+    public func getVideoSegments(from startDate: Date, to endDate: Date) async throws -> [VideoSegment] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getByTimeRange(db: db, from: startDate, to: endDate)
     }
 
-    public func deleteSegment(id: SegmentID) async throws {
+    public func deleteVideoSegment(id: VideoSegmentID) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
@@ -342,86 +465,173 @@ public actor DatabaseManager: DatabaseProtocol {
         return try DocumentQueries.getByFrameID(db: db, frameID: frameID)
     }
 
-    // MARK: - App Session Operations
+    // MARK: - Segment Operations (App Focus Sessions - Rewind Compatible)
 
-    public func insertSession(_ session: AppSession) async throws {
+    public func insertSegment(
+        bundleID: String,
+        startDate: Date,
+        endDate: Date,
+        windowName: String?,
+        browserUrl: String?,
+        type: Int
+    ) async throws -> Int64 {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try SessionQueries.insert(db: db, session: session)
+        return try AppSegmentQueries.insert(
+            db: db,
+            bundleID: bundleID,
+            startDate: startDate,
+            endDate: endDate,
+            windowName: windowName,
+            browserUrl: browserUrl,
+            type: type
+        )
     }
 
-    public func updateSessionEndTime(id: AppSessionID, endTime: Date) async throws {
+    public func updateSegmentEndDate(id: Int64, endDate: Date) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try SessionQueries.updateEndTime(db: db, id: id, endTime: endTime)
+        try AppSegmentQueries.updateEndDate(db: db, id: id, endDate: endDate)
     }
 
-    public func getSession(id: AppSessionID) async throws -> AppSession? {
+    /// Update segment's browserURL if currently null
+    /// Used to backfill URLs extracted from OCR
+    public func updateSegmentBrowserURL(id: Int64, browserURL: String) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try SessionQueries.getByID(db: db, id: id)
+        try AppSegmentQueries.updateBrowserURL(db: db, id: id, browserURL: browserURL)
     }
 
-    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+    public func getSegment(id: Int64) async throws -> Segment? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try SessionQueries.getByTimeRange(db: db, from: startDate, to: endDate)
+        return try AppSegmentQueries.getByID(db: db, id: id)
     }
 
-    public func getActiveSession() async throws -> AppSession? {
+    public func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try SessionQueries.getActive(db: db)
+        return try AppSegmentQueries.getByTimeRange(db: db, from: startDate, to: endDate)
     }
 
-    public func getSessions(appBundleID: String, limit: Int) async throws -> [AppSession] {
+    public func getMostRecentSegment() async throws -> Segment? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try SessionQueries.getByApp(db: db, appBundleID: appBundleID, limit: limit)
+        return try AppSegmentQueries.getMostRecent(db: db)
     }
 
-    public func deleteSession(id: AppSessionID) async throws {
+    public func getSegments(bundleID: String, limit: Int) async throws -> [Segment] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try SessionQueries.delete(db: db, id: id)
+        return try AppSegmentQueries.getByBundleID(db: db, bundleID: bundleID, limit: limit)
     }
 
-    // MARK: - Text Region Operations
-
-    public func insertTextRegion(_ region: TextRegion) async throws {
+    public func deleteSegment(id: Int64) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try TextRegionQueries.insert(db: db, region: region)
+        try AppSegmentQueries.delete(db: db, id: id)
     }
 
-    public func getTextRegions(frameID: FrameID) async throws -> [TextRegion] {
+    // MARK: - OCR Node Operations (Rewind-compatible)
+
+    public func insertNodes(
+        frameID: FrameID,
+        nodes: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
+        frameWidth: Int,
+        frameHeight: Int
+    ) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try TextRegionQueries.getByFrameID(db: db, frameID: frameID)
+        try NodeQueries.insertBatch(
+            db: db,
+            frameID: frameID,
+            nodes: nodes,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        )
     }
 
-    public func getTextRegions(frameID: FrameID, inRect rect: CGRect) async throws -> [TextRegion] {
-        // Get all regions for the frame, then filter by intersection
-        let allRegions = try await getTextRegions(frameID: frameID)
-        return allRegions.filter { region in
-            region.bounds.intersects(rect)
-        }
-    }
-
-    public func deleteTextRegions(frameID: FrameID) async throws {
+    public func getNodes(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [OCRNode] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        try TextRegionQueries.deleteByFrameID(db: db, frameID: frameID)
+        return try NodeQueries.getByFrameID(
+            db: db,
+            frameID: frameID,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        )
+    }
+
+    public func getNodesWithText(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [(node: OCRNode, text: String)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try NodeQueries.getNodesWithText(
+            db: db,
+            frameID: frameID,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight
+        )
+    }
+
+    public func deleteNodes(frameID: FrameID) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try NodeQueries.deleteByFrameID(db: db, frameID: frameID)
+    }
+
+    // MARK: - FTS Content Operations (Rewind-compatible)
+
+    public func indexFrameText(
+        mainText: String,
+        chromeText: String?,
+        windowTitle: String?,
+        segmentId: Int64,
+        frameId: Int64
+    ) async throws -> Int64 {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FTSQueries.indexFrame(
+            db: db,
+            mainText: mainText,
+            chromeText: chromeText,
+            windowTitle: windowTitle,
+            segmentId: segmentId,
+            frameId: frameId
+        )
+    }
+
+    public func getDocidForFrame(frameId: Int64) async throws -> Int64? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FTSQueries.getDocidForFrame(db: db, frameId: frameId)
+    }
+
+    public func getFTSContent(docid: Int64) async throws -> (mainText: String, chromeText: String?, windowTitle: String?)? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FTSQueries.getContent(db: db, docid: docid)
+    }
+
+    public func deleteFTSContent(frameId: Int64) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try FTSQueries.deleteForFrame(db: db, frameId: frameId)
     }
 
     // MARK: - Statistics
@@ -524,6 +734,111 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     // MARK: - Private Helpers
+
+    /// Offset Retrace's AUTOINCREMENT to avoid ID collisions with Rewind's frozen data
+    /// Queries Rewind's database for max IDs and sets Retrace's sequences to start after them
+    private func offsetAutoincrementFromRewind() async throws {
+        // Check if offset has already been applied (check sqlite_sequence table)
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Check if we've already set the offset (look for our marker)
+        let checkSQL = "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'frame';"
+        var checkStmt: OpaquePointer?
+        defer { sqlite3_finalize(checkStmt) }
+
+        guard sqlite3_prepare_v2(db, checkSQL, -1, &checkStmt, nil) == SQLITE_OK else { return }
+
+        // If we already have entries in sqlite_sequence, we've already inserted data - don't offset
+        if sqlite3_step(checkStmt) == SQLITE_ROW {
+            let count = sqlite3_column_int(checkStmt, 0)
+            if count > 0 {
+                print("[DatabaseManager] AUTOINCREMENT already initialized, skipping offset")
+                return
+            }
+        }
+
+        // Query Rewind's database for max IDs
+        let rewindDBPath = "~/Library/Application Support/com.memoryvault.MemoryVault/rewind.db"
+        let expandedRewindPath = NSString(string: rewindDBPath).expandingTildeInPath
+
+        // Check if Rewind database exists
+        guard FileManager.default.fileExists(atPath: expandedRewindPath) else {
+            print("[DatabaseManager] Rewind database not found, skipping AUTOINCREMENT offset")
+            return
+        }
+
+        var rewindDB: OpaquePointer?
+        defer {
+            if let rewindDB = rewindDB {
+                sqlite3_close(rewindDB)
+            }
+        }
+
+        // Open Rewind database (read-only)
+        guard sqlite3_open_v2(expandedRewindPath, &rewindDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+            print("[DatabaseManager] Failed to open Rewind database, skipping AUTOINCREMENT offset")
+            return
+        }
+
+        // Get max frame ID from Rewind
+        let maxFrameSQL = "SELECT COALESCE(MAX(id), 0) FROM frame;"
+        var maxFrameStmt: OpaquePointer?
+        defer { sqlite3_finalize(maxFrameStmt) }
+
+        var maxFrameID: Int64 = 0
+        if sqlite3_prepare_v2(rewindDB, maxFrameSQL, -1, &maxFrameStmt, nil) == SQLITE_OK,
+           sqlite3_step(maxFrameStmt) == SQLITE_ROW {
+            maxFrameID = sqlite3_column_int64(maxFrameStmt, 0)
+        }
+
+        // Get max video ID from Rewind
+        let maxVideoSQL = "SELECT COALESCE(MAX(id), 0) FROM video;"
+        var maxVideoStmt: OpaquePointer?
+        defer { sqlite3_finalize(maxVideoStmt) }
+
+        var maxVideoID: Int64 = 0
+        if sqlite3_prepare_v2(rewindDB, maxVideoSQL, -1, &maxVideoStmt, nil) == SQLITE_OK,
+           sqlite3_step(maxVideoStmt) == SQLITE_ROW {
+            maxVideoID = sqlite3_column_int64(maxVideoStmt, 0)
+        }
+
+        print("[DatabaseManager] Rewind max IDs - frame: \(maxFrameID), video: \(maxVideoID)")
+
+        // Set Retrace's AUTOINCREMENT to start after Rewind's max IDs
+        // We do this by inserting/updating the sqlite_sequence table
+
+        if maxFrameID > 0 {
+            let updateFrameSeq = """
+                INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('frame', ?);
+                """
+            var updateFrameStmt: OpaquePointer?
+            defer { sqlite3_finalize(updateFrameStmt) }
+
+            if sqlite3_prepare_v2(db, updateFrameSeq, -1, &updateFrameStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(updateFrameStmt, 1, maxFrameID)
+                if sqlite3_step(updateFrameStmt) == SQLITE_DONE {
+                    print("[DatabaseManager] Set frame AUTOINCREMENT to start at \(maxFrameID + 1)")
+                }
+            }
+        }
+
+        if maxVideoID > 0 {
+            let updateVideoSeq = """
+                INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('video', ?);
+                """
+            var updateVideoStmt: OpaquePointer?
+            defer { sqlite3_finalize(updateVideoStmt) }
+
+            if sqlite3_prepare_v2(db, updateVideoSeq, -1, &updateVideoStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(updateVideoStmt, 1, maxVideoID)
+                if sqlite3_step(updateVideoStmt) == SQLITE_DONE {
+                    print("[DatabaseManager] Set video AUTOINCREMENT to start at \(maxVideoID + 1)")
+                }
+            }
+        }
+    }
 
     private func executePragmas() throws {
         guard let db = db else {

@@ -1,13 +1,13 @@
 import SwiftUI
 import Shared
 
-/// Visual representation of an app session in the timeline bar
+/// Visual representation of an app segment in the timeline bar
 /// Shows a colored rectangle with app icon on hover
 public struct TimelineSegment: View {
 
     // MARK: - Properties
 
-    let session: AppSession
+    let segment: Segment
     let totalWidth: CGFloat
     let segmentHeight: CGFloat
     let timeRange: (start: Date, end: Date)
@@ -21,15 +21,19 @@ public struct TimelineSegment: View {
         let totalDuration = timeRange.end.timeIntervalSince(timeRange.start)
         guard totalDuration > 0 else { return 50 }
 
-        let sessionEnd = session.endTime ?? Date()
-        let sessionDuration = sessionEnd.timeIntervalSince(session.startTime)
-        let width = CGFloat(sessionDuration / totalDuration) * totalWidth
+        let segmentEnd = segment.endDate ?? Date()
+        let segmentDuration = segmentEnd.timeIntervalSince(segment.startDate)
+        let width = CGFloat(segmentDuration / totalDuration) * totalWidth
 
         return max(4, width) // Minimum width of 4 pixels
     }
 
     private var segmentColor: Color {
-        Color.sessionColor(for: session.appBundleID)
+        Color.segmentColor(for: segment.bundleID)
+    }
+
+    private var appName: String {
+        segment.bundleID.components(separatedBy: ".").last ?? segment.bundleID
     }
 
     // MARK: - Body
@@ -62,14 +66,14 @@ public struct TimelineSegment: View {
                         .fill(Color.white.opacity(0.3))
                         .frame(width: 16, height: 16)
                         .overlay(
-                            Text(String(session.appName?.prefix(1) ?? "?"))
+                            Text(String(appName.prefix(1)))
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(.white)
                         )
 
                     // App name (if space allows)
                     if segmentWidth > 80 {
-                        Text(session.appName ?? "Unknown")
+                        Text(appName)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundColor(.white)
                             .lineLimit(1)
@@ -90,8 +94,7 @@ public struct TimelineSegment: View {
     // MARK: - Tooltip
 
     private var tooltipText: String {
-        let appName = session.appName ?? "Unknown App"
-        let duration = formatDuration(session.duration ?? 0)
+        let duration = formatDuration(segment.duration)
         return "\(appName)\n\(duration)"
     }
 
@@ -116,15 +119,16 @@ public struct TimelineSegment: View {
 struct TimelineSegment_Previews: PreviewProvider {
     static var previews: some View {
         HStack(spacing: 2) {
-            // Chrome session
+            // Chrome segment
             TimelineSegment(
-                session: AppSession(
-                    id: AppSessionID(value: UUID()),
-                    appBundleID: "com.google.Chrome",
-                    appName: "Google Chrome",
+                segment: Segment(
+                    id: SegmentID(value: 1),
+                    bundleID: "com.google.Chrome",
+                    startDate: Date().addingTimeInterval(-3600),
+                    endDate: Date().addingTimeInterval(-1800),
                     windowName: "GitHub",
-                    startTime: Date().addingTimeInterval(-3600),
-                    endTime: Date().addingTimeInterval(-1800)
+                    browserUrl: "https://github.com",
+                    type: 1
                 ),
                 totalWidth: 600,
                 segmentHeight: 40,
@@ -132,15 +136,16 @@ struct TimelineSegment_Previews: PreviewProvider {
                 isSelected: false
             )
 
-            // Xcode session (selected)
+            // Xcode segment (selected)
             TimelineSegment(
-                session: AppSession(
-                    id: AppSessionID(value: UUID()),
-                    appBundleID: "com.apple.dt.Xcode",
-                    appName: "Xcode",
+                segment: Segment(
+                    id: SegmentID(value: 2),
+                    bundleID: "com.apple.dt.Xcode",
+                    startDate: Date().addingTimeInterval(-1800),
+                    endDate: Date(),
                     windowName: "Project.swift",
-                    startTime: Date().addingTimeInterval(-1800),
-                    endTime: Date()
+                    browserUrl: nil,
+                    type: 1
                 ),
                 totalWidth: 600,
                 segmentHeight: 40,

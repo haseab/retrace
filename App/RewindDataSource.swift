@@ -381,7 +381,7 @@ public actor RewindDataSource: DataSourceProtocol {
         return frames
     }
 
-    public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
+    public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date) async throws -> Data {
         // Create cache key from segmentID and timestamp
         let cacheKey = "\(segmentID.stringValue)_\(timestamp.timeIntervalSince1970)" as NSString
 
@@ -477,7 +477,77 @@ public actor RewindDataSource: DataSourceProtocol {
         return imageData
     }
 
-    public func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date) async throws -> FrameVideoInfo? {
+    /// Get frame image by exact videoID and frameIndex (more reliable than timestamp matching)
+    public func getFrameImageByIndex(videoID: VideoSegmentID, frameIndex: Int) async throws -> Data {
+        // Create cache key from videoID and frameIndex
+        let cacheKey = "\(videoID.stringValue)_\(frameIndex)" as NSString
+
+        // Check cache first
+        if let cachedData = imageCache.object(forKey: cacheKey) {
+            Log.debug("[RewindDataSource] Cache hit for frame \(cacheKey)", category: .app)
+            return cachedData as Data
+        }
+
+        Log.debug("[RewindDataSource] Cache miss - extracting frame \(frameIndex) from video \(videoID.stringValue)", category: .app)
+
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        // Query video info by videoID (exact match, no timestamp issues)
+        let sql = """
+            SELECT v.path, v.frameRate
+            FROM video v
+            WHERE v.id = ?
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            Log.error("[RewindDataSource] Video not found for videoID: \(videoID.stringValue)", category: .app)
+            throw DataSourceError.frameNotFound
+        }
+
+        guard let pathPtr = sqlite3_column_text(statement, 0) else {
+            throw RewindDataSourceError.videoFileNotFound(path: "No video path for videoID \(videoID.stringValue)")
+        }
+        let videoPath = String(cString: pathPtr)
+        let frameRate = sqlite3_column_double(statement, 1)
+
+        // Construct full path (video.path is relative to chunks directory)
+        let fullVideoPath = "\(rewindChunksPath)/\(videoPath)"
+
+        Log.debug("[RewindDataSource] Video path: \(fullVideoPath), frameIndex: \(frameIndex), frameRate: \(frameRate)", category: .app)
+
+        guard FileManager.default.fileExists(atPath: fullVideoPath) else {
+            Log.error("[RewindDataSource] Video file not found at: \(fullVideoPath)", category: .app)
+            throw RewindDataSourceError.videoFileNotFound(path: fullVideoPath)
+        }
+
+        // Extract frame from video
+        Log.debug("[RewindDataSource] Extracting frame \(frameIndex) from video", category: .app)
+        let imageData = try extractFrameFromVideo(
+            videoPath: fullVideoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+
+        // Cache the extracted image
+        imageCache.setObject(imageData as NSData, forKey: cacheKey)
+        Log.debug("[RewindDataSource] Cached frame \(cacheKey)", category: .app)
+
+        return imageData
+    }
+
+    public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date) async throws -> FrameVideoInfo? {
         guard _isConnected, let db = db else {
             throw DataSourceError.notConnected
         }
@@ -532,22 +602,22 @@ public actor RewindDataSource: DataSourceProtocol {
         )
     }
 
-    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+    public func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment] {
         guard _isConnected, let db = db else {
             throw DataSourceError.notConnected
         }
 
-        // Only return sessions before cutoff date
+        // Only return segments before cutoff date
         let effectiveEndDate = min(endDate, _cutoffDate)
         guard startDate < effectiveEndDate else {
             return []
         }
 
-        // Rewind's segment table stores session-like data:
+        // Rewind's segment table stores app focus session data:
         // id, bundleID, startDate, endDate, windowName, browserUrl, type
         // startDate/endDate are ISO 8601 TEXT format in UTC
         let sql = """
-            SELECT id, bundleID, startDate, endDate, windowName, browserUrl
+            SELECT id, bundleID, startDate, endDate, windowName, browserUrl, type
             FROM segment
             WHERE startDate >= ? AND startDate <= ?
             ORDER BY startDate ASC;
@@ -570,7 +640,7 @@ public actor RewindDataSource: DataSourceProtocol {
         sqlite3_bind_text(statement, 1, (startISO as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 2, (endISO as NSString).utf8String, -1, nil)
 
-        var sessions: [AppSession] = []
+        var segments: [Segment] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             guard let stmt = statement else { continue }
 
@@ -582,16 +652,14 @@ public actor RewindDataSource: DataSourceProtocol {
 
             // Column 2: startDate (TEXT ISO 8601)
             guard let startDateText = getTextOrNil(stmt, 2),
-                  let sessionStartDate = dateFormatter.date(from: startDateText) else {
+                  let segmentStartDate = dateFormatter.date(from: startDateText) else {
                 continue
             }
 
-            // Column 3: endDate (TEXT ISO 8601, nullable)
-            let sessionEndDate: Date?
-            if let endDateText = getTextOrNil(stmt, 3) {
-                sessionEndDate = dateFormatter.date(from: endDateText)
-            } else {
-                sessionEndDate = nil
+            // Column 3: endDate (TEXT ISO 8601)
+            guard let endDateText = getTextOrNil(stmt, 3),
+                  let segmentEndDate = dateFormatter.date(from: endDateText) else {
+                continue
             }
 
             // Column 4: windowName (TEXT, nullable)
@@ -600,24 +668,23 @@ public actor RewindDataSource: DataSourceProtocol {
             // Column 5: browserUrl (TEXT, nullable)
             let browserUrl = getTextOrNil(stmt, 5)
 
-            // Create synthetic session ID from Rewind's integer ID
-            let sessionID = AppSessionID(value: syntheticUUID(from: rewindSegmentId, namespace: "session"))
+            // Column 6: type (INTEGER)
+            let type = Int(sqlite3_column_int(stmt, 6))
 
-            let session = AppSession(
-                id: sessionID,
-                appBundleID: bundleID,
-                appName: nil, // Rewind doesn't store app name separately
+            let segment = Segment(
+                id: SegmentID(value: rewindSegmentId),
+                bundleID: bundleID,
+                startDate: segmentStartDate,
+                endDate: segmentEndDate,
                 windowName: windowName,
-                browserURL: browserUrl,
-                displayID: nil,
-                startTime: sessionStartDate,
-                endTime: sessionEndDate
+                browserUrl: browserUrl,
+                type: type
             )
-            sessions.append(session)
+            segments.append(segment)
         }
 
-        Log.debug("[RewindDataSource] getSessions: fetched \(sessions.count) sessions from \(startISO) to \(endISO)", category: .app)
-        return sessions
+        Log.debug("[RewindDataSource] getSegments: fetched \(segments.count) segments from \(startISO) to \(endISO)", category: .app)
+        return segments
     }
 
     // MARK: - Private Helpers
@@ -672,10 +739,10 @@ public actor RewindDataSource: DataSourceProtocol {
     }
 
     /// Parse a frame row from Rewind database into FrameReference
-    /// Rewind uses INTEGER ids, we need to create synthetic UUIDs for compatibility
+    /// Now uses Int64 IDs directly from Rewind - no UUID conversion needed!
     private func parseRewindFrame(statement: OpaquePointer) throws -> FrameReference {
         // Column 0: f.id (INTEGER)
-        let rewindFrameId = sqlite3_column_int64(statement, 0)
+        let frameId = sqlite3_column_int64(statement, 0)
 
         // Column 1: f.createdAt (TEXT in ISO 8601 format)
         guard let createdAtText = getTextOrNil(statement, 1) else {
@@ -690,13 +757,13 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.queryFailed(underlying: "Invalid timestamp format: \(createdAtText)")
         }
 
-        // Column 2: f.segmentId (INTEGER)
-        let rewindSegmentId = sqlite3_column_int64(statement, 2)
+        // Column 2: f.segmentId (INTEGER) - Rewind's app segment (session)
+        let segmentId = sqlite3_column_int64(statement, 2)
+        let appSegmentID = AppSegmentID(value: segmentId)
 
-        // Column 3: f.videoId (INTEGER, nullable)
-        _ = sqlite3_column_type(statement, 3) != SQLITE_NULL
-            ? sqlite3_column_int64(statement, 3)
-            : nil
+        // Column 3: f.videoId (INTEGER) - Rewind's video.id (video chunk)
+        let videoId = sqlite3_column_int64(statement, 3)
+        let videoSegmentID = VideoSegmentID(value: videoId)
 
         // Column 4: f.videoFrameIndex (INTEGER)
         let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
@@ -713,10 +780,8 @@ public actor RewindDataSource: DataSourceProtocol {
         // Column 8: s.browserUrl (TEXT, nullable)
         let browserUrl = getTextOrNil(statement, 8)
 
-        // Create synthetic UUIDs from Rewind's integer IDs
-        // Using a deterministic namespace so the same Rewind ID always maps to the same UUID
-        let frameID = FrameID(value: syntheticUUID(from: rewindFrameId, namespace: "frame"))
-        let segmentID = SegmentID(value: syntheticUUID(from: rewindSegmentId, namespace: "segment"))
+        // Use Rewind's INTEGER frame ID directly (1:1 schema match!)
+        let frameID = FrameID(value: frameId)
 
         // Map encoding status
         let encodingStatus: EncodingStatus = switch encodingStatusText {
@@ -736,13 +801,12 @@ public actor RewindDataSource: DataSourceProtocol {
         return FrameReference(
             id: frameID,
             timestamp: timestamp,
-            segmentID: segmentID,
-            sessionID: nil,
+            segmentID: appSegmentID,  // Link to app session (segment table)
+            videoID: videoSegmentID,  // Link to video chunk (video table)
             frameIndexInSegment: videoFrameIndex,
             encodingStatus: encodingStatus,
             metadata: metadata,
-            source: .rewind,
-            rewindFrameId: rewindFrameId
+            source: .rewind
         )
     }
 
@@ -753,7 +817,7 @@ public actor RewindDataSource: DataSourceProtocol {
     ///   9: v.path, 10: v.frameRate
     private func parseRewindFrameWithVideoInfo(statement: OpaquePointer) throws -> FrameWithVideoInfo {
         // Columns 0-8: Same as parseRewindFrame
-        let rewindFrameId = sqlite3_column_int64(statement, 0)
+        let frameId = sqlite3_column_int64(statement, 0)
 
         guard let createdAtText = getTextOrNil(statement, 1) else {
             throw DataSourceError.queryFailed(underlying: "Missing createdAt timestamp")
@@ -766,7 +830,14 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.queryFailed(underlying: "Invalid timestamp format: \(createdAtText)")
         }
 
-        let rewindSegmentId = sqlite3_column_int64(statement, 2)
+        // Column 2: segmentId (INTEGER) - Rewind's app segment (session)
+        let segmentId = sqlite3_column_int64(statement, 2)
+        let appSegmentID = AppSegmentID(value: segmentId)
+
+        // Column 3: videoId (INTEGER) - Rewind's video.id (video chunk)
+        let videoId = sqlite3_column_int64(statement, 3)
+        let videoSegmentID = VideoSegmentID(value: videoId)
+
         let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
         let encodingStatusText = getTextOrNil(statement, 5)
         let bundleID = getTextOrNil(statement, 6)
@@ -779,9 +850,8 @@ public actor RewindDataSource: DataSourceProtocol {
         // Column 10: v.frameRate (REAL)
         let frameRate = sqlite3_column_double(statement, 10)
 
-        // Create synthetic UUIDs
-        let frameID = FrameID(value: syntheticUUID(from: rewindFrameId, namespace: "frame"))
-        let segmentID = SegmentID(value: syntheticUUID(from: rewindSegmentId, namespace: "segment"))
+        // Use Int64 frame ID directly
+        let frameID = FrameID(value: frameId)
 
         let encodingStatus: EncodingStatus = switch encodingStatusText {
         case "encoded", "success": .success
@@ -800,13 +870,12 @@ public actor RewindDataSource: DataSourceProtocol {
         let frame = FrameReference(
             id: frameID,
             timestamp: timestamp,
-            segmentID: segmentID,
-            sessionID: nil,
+            segmentID: appSegmentID,  // Link to app session (segment table)
+            videoID: videoSegmentID,  // Link to video chunk (video table)
             frameIndexInSegment: videoFrameIndex,
             encodingStatus: encodingStatus,
             metadata: metadata,
-            source: .rewind,
-            rewindFrameId: rewindFrameId
+            source: .rewind
         )
 
         // Build video info if we have a video path
@@ -885,16 +954,7 @@ public actor RewindDataSource: DataSourceProtocol {
 
         guard !frameIDs.isEmpty else { return }
 
-        // We need to convert synthetic UUIDs back to Rewind integer IDs
-        // This is tricky because our synthetic UUIDs are one-way hashes
-        // Instead, we'll delete by timestamp which we can query
-
-        // For now, we need to find the frames by querying all and matching
-        // This is a limitation of the synthetic UUID approach
-
-        // Alternative: Store a mapping table or delete by timestamp
-        // For MVP, we'll use a transaction to delete related data
-
+        // Now that we use Int64 IDs directly, deletion is straightforward!
         Log.info("[RewindDataSource] Deleting \(frameIDs.count) frames from database", category: .app)
 
         // Start transaction
@@ -907,12 +967,62 @@ public actor RewindDataSource: DataSourceProtocol {
 
         do {
             for frameID in frameIDs {
-                // Since we can't reverse the UUID, we need to find the frame by other means
-                // For Rewind data, the frame.id in the UUID contains encoded info
-                // We'll need to query by the frame data we have
+                let rewindFrameId = frameID.value
 
-                // For now, log that deletion requires timestamp-based lookup
-                Log.warning("[RewindDataSource] Frame deletion by UUID not fully implemented - requires timestamp lookup", category: .app)
+                // 1. Get the segment ID first
+                let getSegmentSQL = "SELECT segmentId FROM frame WHERE id = ? LIMIT 1"
+                var getStmt: OpaquePointer?
+                defer { sqlite3_finalize(getStmt) }
+
+                guard sqlite3_prepare_v2(db, getSegmentSQL, -1, &getStmt, nil) == SQLITE_OK else {
+                    throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+                }
+
+                sqlite3_bind_int64(getStmt, 1, rewindFrameId)
+
+                guard sqlite3_step(getStmt) == SQLITE_ROW else {
+                    Log.warning("[RewindDataSource] Frame \(rewindFrameId) not found, skipping", category: .app)
+                    continue
+                }
+
+                let segmentId = sqlite3_column_int64(getStmt!, 0)
+
+                // 2. Delete nodes associated with this frame
+                let deleteNodesSQL = "DELETE FROM node WHERE frameId = ?"
+                var deleteNodesStmt: OpaquePointer?
+                defer { sqlite3_finalize(deleteNodesStmt) }
+
+                guard sqlite3_prepare_v2(db, deleteNodesSQL, -1, &deleteNodesStmt, nil) == SQLITE_OK else {
+                    throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                sqlite3_bind_int64(deleteNodesStmt, 1, rewindFrameId)
+                sqlite3_step(deleteNodesStmt)
+
+                let nodesDeleted = sqlite3_changes(db)
+
+                // 3. Delete from doc_segment (FTS junction table)
+                let deleteDocSegmentSQL = "DELETE FROM doc_segment WHERE frameId = ?"
+                var deleteDocStmt: OpaquePointer?
+                defer { sqlite3_finalize(deleteDocStmt) }
+
+                guard sqlite3_prepare_v2(db, deleteDocSegmentSQL, -1, &deleteDocStmt, nil) == SQLITE_OK else {
+                    throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                sqlite3_bind_int64(deleteDocStmt, 1, rewindFrameId)
+                sqlite3_step(deleteDocStmt)
+
+                // 4. Delete the frame itself
+                let deleteFrameSQL = "DELETE FROM frame WHERE id = ?"
+                var deleteFrameStmt: OpaquePointer?
+                defer { sqlite3_finalize(deleteFrameStmt) }
+
+                guard sqlite3_prepare_v2(db, deleteFrameSQL, -1, &deleteFrameStmt, nil) == SQLITE_OK else {
+                    throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+                }
+                sqlite3_bind_int64(deleteFrameStmt, 1, rewindFrameId)
+                sqlite3_step(deleteFrameStmt)
+
+                Log.info("[RewindDataSource] Deleted frame \(rewindFrameId) and \(nodesDeleted) nodes", category: .app)
             }
 
             // Commit transaction
@@ -922,7 +1032,7 @@ public actor RewindDataSource: DataSourceProtocol {
                 throw DataSourceError.queryFailed(underlying: "Failed to commit transaction: \(error)")
             }
 
-            Log.info("[RewindDataSource] Successfully deleted frames from database", category: .app)
+            Log.info("[RewindDataSource] Successfully deleted \(frameIDs.count) frames from database", category: .app)
 
         } catch {
             // Rollback on error
@@ -1250,20 +1360,8 @@ public actor RewindDataSource: DataSourceProtocol {
 
     // MARK: - OCR Node Detection (for text selection)
 
-    /// Represents an OCR text node with its bounding box and text content
-    public struct OCRNode: Identifiable, Equatable {
-        public let id: Int  // nodeOrder from database
-        /// Normalized X coordinate (0.0-1.0)
-        public let x: CGFloat
-        /// Normalized Y coordinate (0.0-1.0)
-        public let y: CGFloat
-        /// Normalized width (0.0-1.0)
-        public let width: CGFloat
-        /// Normalized height (0.0-1.0)
-        public let height: CGFloat
-        /// The text content of this node
-        public let text: String
-    }
+    /// Legacy type alias - now uses shared OCRNodeWithText from Shared module
+    public typealias OCRNode = OCRNodeWithText
 
     /// Get all OCR nodes for a given frame timestamp
     /// Returns array of nodes with their bounding boxes and text content
@@ -1346,6 +1444,95 @@ public actor RewindDataSource: DataSourceProtocol {
         sqlite3_bind_int64(nodesStmt, 1, frameId)
 
         // 4. Extract all nodes with their text
+        var nodes: [OCRNode] = []
+
+        while sqlite3_step(nodesStmt) == SQLITE_ROW {
+            let nodeOrder = Int(sqlite3_column_int(nodesStmt!, 0))
+            let textOffset = Int(sqlite3_column_int(nodesStmt!, 1))
+            let textLength = Int(sqlite3_column_int(nodesStmt!, 2))
+            let leftX = CGFloat(sqlite3_column_double(nodesStmt!, 3))
+            let topY = CGFloat(sqlite3_column_double(nodesStmt!, 4))
+            let width = CGFloat(sqlite3_column_double(nodesStmt!, 5))
+            let height = CGFloat(sqlite3_column_double(nodesStmt!, 6))
+
+            // Extract the text for this node from the FTS content
+            let startIndex = ocrText.index(ocrText.startIndex, offsetBy: min(textOffset, ocrText.count), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+            let endIndex = ocrText.index(startIndex, offsetBy: min(textLength, ocrText.count - textOffset), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+
+            guard startIndex < endIndex else { continue }
+
+            let nodeText = String(ocrText[startIndex..<endIndex])
+
+            // Skip empty text nodes
+            guard !nodeText.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+
+            nodes.append(OCRNode(
+                id: nodeOrder,
+                x: leftX,
+                y: topY,
+                width: width,
+                height: height,
+                text: nodeText
+            ))
+        }
+
+        return nodes
+    }
+
+    /// Get all OCR nodes for a given frame by frameID (more reliable than timestamp)
+    /// Returns array of nodes with their bounding boxes and text content
+    public func getAllOCRNodes(frameID: FrameID) async throws -> [OCRNode] {
+        guard _isConnected, let db = db else {
+            throw DataSourceError.notConnected
+        }
+
+        let frameId = frameID.value
+
+        // 1. Get the FTS content text for this frame (concatenate c0 and c1)
+        let ftsSQL = """
+            SELECT src.c0, src.c1
+            FROM doc_segment ds
+            JOIN searchRanking_content src ON ds.docid = src.id
+            WHERE ds.frameId = ?
+            LIMIT 1;
+            """
+
+        var ftsStmt: OpaquePointer?
+        defer { sqlite3_finalize(ftsStmt) }
+
+        guard sqlite3_prepare_v2(db, ftsSQL, -1, &ftsStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(ftsStmt, 1, frameId)
+
+        guard sqlite3_step(ftsStmt) == SQLITE_ROW else {
+            return [] // No FTS content
+        }
+
+        // Concatenate c0 and c1 - node textOffset indexes into this combined string
+        let c0Text = sqlite3_column_text(ftsStmt!, 0).map { String(cString: $0) } ?? ""
+        let c1Text = sqlite3_column_text(ftsStmt!, 1).map { String(cString: $0) } ?? ""
+        let ocrText = c0Text + c1Text
+
+        // 2. Get all nodes for this frame
+        let nodesSQL = """
+            SELECT nodeOrder, textOffset, textLength, leftX, topY, width, height
+            FROM node
+            WHERE frameId = ?
+            ORDER BY nodeOrder ASC;
+            """
+
+        var nodesStmt: OpaquePointer?
+        defer { sqlite3_finalize(nodesStmt) }
+
+        guard sqlite3_prepare_v2(db, nodesSQL, -1, &nodesStmt, nil) == SQLITE_OK else {
+            throw DataSourceError.queryFailed(underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(nodesStmt, 1, frameId)
+
+        // 3. Extract all nodes with their text
         var nodes: [OCRNode] = []
 
         while sqlite3_step(nodesStmt) == SQLITE_ROW {
@@ -1524,7 +1711,9 @@ public actor RewindDataSource: DataSourceProtocol {
                 f.createdAt as timestamp,
                 s.id as segment_id,
                 s.bundleID as app_bundle_id,
-                s.windowName as window_title
+                s.windowName as window_title,
+                f.videoId as video_id,
+                f.videoFrameIndex as frame_index
             FROM doc_segment ds
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
@@ -1573,6 +1762,8 @@ public actor RewindDataSource: DataSourceProtocol {
             let segmentId = sqlite3_column_int64(metaStatement, 3)
             let appBundleID = sqlite3_column_text(metaStatement, 4).map { String(cString: $0) }
             let windowName = sqlite3_column_text(metaStatement, 5).map { String(cString: $0) }
+            let videoId = sqlite3_column_int64(metaStatement, 6)
+            let frameIndex = Int(sqlite3_column_int(metaStatement, 7))
 
             guard let ftsData = ftsLookup[docid] else { continue }
             let snippet = ftsData.snippet
@@ -1582,8 +1773,8 @@ public actor RewindDataSource: DataSourceProtocol {
             let parsedTimestamp = parseRewindTimestamp(timestampStr)
             let timestamp = parsedTimestamp ?? Date()
 
-            let frameID = FrameID(value: syntheticUUID(from: frameId, namespace: "frame"))
-            let segmentID = SegmentID(value: syntheticUUID(from: segmentId, namespace: "segment"))
+            // Use Int64 frame ID directly
+            let frameID = FrameID(value: frameId)
 
             let cleanSnippet = snippet
                 .replacingOccurrences(of: "<mark>", with: "")
@@ -1602,8 +1793,9 @@ public actor RewindDataSource: DataSourceProtocol {
                     browserURL: nil,
                     displayID: 0
                 ),
-                segmentID: segmentID,
-                frameIndex: 0
+                segmentID: AppSegmentID(value: segmentId),
+                videoID: VideoSegmentID(value: videoId),
+                frameIndex: frameIndex
             )
 
             results.append(result)
@@ -1667,47 +1859,58 @@ public actor RewindDataSource: DataSourceProtocol {
 
         let whereClause = whereConditions.joined(separator: " AND ")
 
-        // Subquery: FTS filters first, then join only for date sorting
+        // OPTIMIZED: Get recent frames FIRST (limited set), THEN join with FTS
+        // This avoids sorting all 200k+ FTS matches by limiting to recent 10k frames first
+        let recentFramesLimit = 10000  // Only search within most recent 10k frames
+
         let sql: String
         if needsSegmentJoin {
             sql = """
                 SELECT
-                    sr.rowid as docid,
-                    sr.snippet,
-                    sr.rank,
-                    f.id as frame_id,
-                    f.createdAt as timestamp,
-                    f.segmentId as segment_id
+                    ds.docid as docid,
+                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                    bm25(searchRanking) as rank,
+                    recent_frames.frame_id,
+                    recent_frames.timestamp,
+                    recent_frames.segment_id,
+                    recent_frames.video_id,
+                    recent_frames.frame_index
                 FROM (
-                    SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
-                    FROM searchRanking
-                    WHERE searchRanking MATCH ?
-                ) sr
-                JOIN doc_segment ds ON ds.docid = sr.rowid
-                JOIN frame f ON ds.frameId = f.id
-                JOIN segment s ON f.segmentId = s.id
-                WHERE \(whereClause) \(appFilterClause)
-                ORDER BY f.createdAt DESC
+                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
+                    FROM frame f
+                    JOIN segment s ON f.segmentId = s.id
+                    WHERE \(whereClause) \(appFilterClause)
+                    ORDER BY f.createdAt DESC
+                    LIMIT \(recentFramesLimit)
+                ) recent_frames
+                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
+                JOIN searchRanking ON searchRanking.rowid = ds.docid
+                WHERE searchRanking MATCH ?
+                ORDER BY recent_frames.timestamp DESC
                 LIMIT ? OFFSET ?
             """
         } else {
             sql = """
                 SELECT
-                    sr.rowid as docid,
-                    sr.snippet,
-                    sr.rank,
-                    f.id as frame_id,
-                    f.createdAt as timestamp,
-                    f.segmentId as segment_id
+                    ds.docid as docid,
+                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                    bm25(searchRanking) as rank,
+                    recent_frames.frame_id,
+                    recent_frames.timestamp,
+                    recent_frames.segment_id,
+                    recent_frames.video_id,
+                    recent_frames.frame_index
                 FROM (
-                    SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
-                    FROM searchRanking
-                    WHERE searchRanking MATCH ?
-                ) sr
-                JOIN doc_segment ds ON ds.docid = sr.rowid
-                JOIN frame f ON ds.frameId = f.id
-                WHERE \(whereClause)
-                ORDER BY f.createdAt DESC
+                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
+                    FROM frame f
+                    WHERE \(whereClause)
+                    ORDER BY f.createdAt DESC
+                    LIMIT \(recentFramesLimit)
+                ) recent_frames
+                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
+                JOIN searchRanking ON searchRanking.rowid = ds.docid
+                WHERE searchRanking MATCH ?
+                ORDER BY recent_frames.timestamp DESC
                 LIMIT ? OFFSET ?
             """
         }
@@ -1721,11 +1924,10 @@ public actor RewindDataSource: DataSourceProtocol {
             throw DataSourceError.queryFailed(underlying: error)
         }
 
-        // Bind parameters
+        // Bind parameters (order changed: date filters first, then FTS query)
         var bindIndex: Int32 = 1
-        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
-        bindIndex += 1
 
+        // First: bind date/app filters for the recent_frames subquery
         for value in bindValues {
             if let stringValue = value as? String {
                 sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
@@ -1733,12 +1935,19 @@ public actor RewindDataSource: DataSourceProtocol {
             bindIndex += 1
         }
 
+        // Then: bind FTS query
+        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        // Finally: bind limit and offset
         sqlite3_bind_int(statement, bindIndex, Int32(query.limit))
         bindIndex += 1
         sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
 
+        Log.debug("[RewindSearch] Executing SQL query...", category: .app)
+
         // Collect frame results (without segment metadata yet)
-        var frameResults: [(docid: Int64, snippet: String, rank: Double, frameId: Int64, timestamp: Date, segmentId: Int64)] = []
+        var frameResults: [(docid: Int64, snippet: String, rank: Double, frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int)] = []
 
         while sqlite3_step(statement) == SQLITE_ROW {
             let docid = sqlite3_column_int64(statement, 0)
@@ -1747,20 +1956,27 @@ public actor RewindDataSource: DataSourceProtocol {
             let frameId = sqlite3_column_int64(statement, 3)
             let timestampStr = String(cString: sqlite3_column_text(statement, 4))
             let segmentId = sqlite3_column_int64(statement, 5)
+            let videoId = sqlite3_column_int64(statement, 6)
+            let frameIndex = Int(sqlite3_column_int(statement, 7))
 
             let timestamp = parseRewindTimestamp(timestampStr) ?? Date()
-            frameResults.append((docid: docid, snippet: snippet, rank: rank, frameId: frameId, timestamp: timestamp, segmentId: segmentId))
+            frameResults.append((docid: docid, snippet: snippet, rank: rank, frameId: frameId, timestamp: timestamp, segmentId: segmentId, videoId: videoId, frameIndex: frameIndex))
         }
 
         guard !frameResults.isEmpty else {
             let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
             let totalCount = getSearchTotalCount(query: ftsQuery, db: database)
+            Log.info("[RewindSearch] All search: 0 results in \(elapsed)ms", category: .app)
             return SearchResults(query: query, results: [], totalCount: totalCount, searchTimeMs: elapsed)
         }
 
+        Log.debug("[RewindSearch] Found \(frameResults.count) frame results, fetching segment metadata...", category: .app)
+
         // Fetch segment metadata for just these results
         let segmentIds = Array(Set(frameResults.map { $0.segmentId }))
-        let segmentMetadata = try await fetchSegmentMetadata(segmentIds: segmentIds, database: database)
+        Log.debug("[RewindSearch] Fetching metadata for \(segmentIds.count) unique segments", category: .app)
+        let segmentMetadata = try fetchSegmentMetadata(segmentIds: segmentIds, database: database)
+        Log.debug("[RewindSearch] Segment metadata fetched, building results...", category: .app)
 
         var results: [SearchResult] = []
 
@@ -1770,8 +1986,8 @@ public actor RewindDataSource: DataSourceProtocol {
             let windowName = segmentMeta?.windowName
             let appName = appBundleID?.components(separatedBy: ".").last
 
-            let frameID = FrameID(value: syntheticUUID(from: frame.frameId, namespace: "frame"))
-            let segmentID = SegmentID(value: syntheticUUID(from: frame.segmentId, namespace: "segment"))
+            // Use Int64 frame ID directly
+            let frameID = FrameID(value: frame.frameId)
 
             let cleanSnippet = frame.snippet
                 .replacingOccurrences(of: "<mark>", with: "")
@@ -1790,8 +2006,9 @@ public actor RewindDataSource: DataSourceProtocol {
                     browserURL: nil,
                     displayID: 0
                 ),
-                segmentID: segmentID,
-                frameIndex: 0
+                segmentID: AppSegmentID(value: frame.segmentId),
+                videoID: VideoSegmentID(value: frame.videoId),
+                frameIndex: frame.frameIndex
             )
 
             results.append(result)
@@ -1811,7 +2028,7 @@ public actor RewindDataSource: DataSourceProtocol {
     }
 
     /// Fetch segment metadata for a batch of segment IDs
-    private func fetchSegmentMetadata(segmentIds: [Int64], database: OpaquePointer) async throws -> [Int64: (bundleID: String?, windowName: String?)] {
+    private func fetchSegmentMetadata(segmentIds: [Int64], database: OpaquePointer) throws -> [Int64: (bundleID: String?, windowName: String?)] {
         guard !segmentIds.isEmpty else { return [:] }
 
         let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")

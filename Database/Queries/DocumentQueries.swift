@@ -133,7 +133,8 @@ enum DocumentQueries {
     // MARK: - Count
 
     static func getCount(db: OpaquePointer) throws -> Int {
-        let sql = "SELECT COUNT(*) FROM documents;"
+        // Use Rewind-compatible table name
+        let sql = "SELECT COUNT(*) FROM searchRanking_content;"
 
         var statement: OpaquePointer?
         defer {

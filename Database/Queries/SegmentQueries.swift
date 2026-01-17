@@ -2,16 +2,20 @@ import Foundation
 import SQLCipher
 import Shared
 
-/// CRUD operations for segments table
+/// CRUD operations for video table (Rewind-compatible)
+/// Handles video segment metadata for 150-frame video chunks
 enum SegmentQueries {
 
     // MARK: - Insert
 
-    static func insert(db: OpaquePointer, segment: VideoSegment) throws {
+    /// Insert a new video segment and return the auto-generated ID
+    static func insert(db: OpaquePointer, segment: VideoSegment) throws -> Int64 {
+        // Note: path field in Rewind is just the relative path (e.g., "202505/31/d0tva3el9vhg5fjg178g")
+        // We use relativePath for the same purpose
         let sql = """
-            INSERT INTO segments (
-                id, start_time, end_time, frame_count, file_size_bytes, relative_path, width, height, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO video (
+                height, width, path, fileSize, frameRate, processingState
+            ) VALUES (?, ?, ?, ?, ?, ?);
             """
 
         var statement: OpaquePointer?
@@ -26,16 +30,15 @@ enum SegmentQueries {
             )
         }
 
-        // Bind parameters
-        sqlite3_bind_text(statement, 1, segment.id.stringValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(segment.startTime))
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(segment.endTime))
-        sqlite3_bind_int(statement, 4, Int32(segment.frameCount))
-        sqlite3_bind_int64(statement, 5, segment.fileSizeBytes)
-        sqlite3_bind_text(statement, 6, segment.relativePath, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(statement, 7, Int32(segment.width))
-        sqlite3_bind_int(statement, 8, Int32(segment.height))
-        sqlite3_bind_text(statement, 9, segment.source.rawValue, -1, SQLITE_TRANSIENT)
+        // Bind parameters (no id - let database AUTOINCREMENT)
+        sqlite3_bind_int(statement, 1, Int32(segment.height))
+        sqlite3_bind_int(statement, 2, Int32(segment.width))
+        sqlite3_bind_text(statement, 3, segment.relativePath, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 4, segment.fileSizeBytes)
+        // Frame rate: Retrace uses 30 FPS like Rewind
+        sqlite3_bind_double(statement, 5, 30.0)
+        // processingState: 0 = completed (like Rewind)
+        sqlite3_bind_int(statement, 6, 0)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -43,14 +46,16 @@ enum SegmentQueries {
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
+
+        return sqlite3_last_insert_rowid(db)
     }
 
     // MARK: - Select by ID
 
-    static func getByID(db: OpaquePointer, id: SegmentID) throws -> VideoSegment? {
+    static func getByID(db: OpaquePointer, id: VideoSegmentID) throws -> VideoSegment? {
         let sql = """
-            SELECT id, start_time, end_time, frame_count, file_size_bytes, relative_path, width, height, source
-            FROM segments
+            SELECT id, height, width, path, fileSize, frameRate
+            FROM video
             WHERE id = ?;
             """
 
@@ -66,22 +71,25 @@ enum SegmentQueries {
             )
         }
 
-        sqlite3_bind_text(statement, 1, id.stringValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 1, id.value)
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             return nil
         }
 
-        return try parseSegmentRow(statement: statement!)
+        return try parseVideoRow(statement: statement!)
     }
 
     // MARK: - Select by Timestamp
 
+    /// Find video containing a frame at the given timestamp
     static func getByTimestamp(db: OpaquePointer, timestamp: Date) throws -> VideoSegment? {
+        // Query through frames to find the video
         let sql = """
-            SELECT id, start_time, end_time, frame_count, file_size_bytes, relative_path, width, height, source
-            FROM segments
-            WHERE start_time <= ? AND end_time >= ?
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            FROM video v
+            INNER JOIN frame f ON f.videoId = v.id
+            WHERE f.createdAt = ?
             LIMIT 1;
             """
 
@@ -99,27 +107,28 @@ enum SegmentQueries {
 
         let timestampMs = Schema.dateToTimestamp(timestamp)
         sqlite3_bind_int64(statement, 1, timestampMs)
-        sqlite3_bind_int64(statement, 2, timestampMs)
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             return nil
         }
 
-        return try parseSegmentRow(statement: statement!)
+        return try parseVideoRow(statement: statement!)
     }
 
     // MARK: - Select by Time Range
 
+    /// Get all videos that have frames within the time range
     static func getByTimeRange(
         db: OpaquePointer,
         from startDate: Date,
         to endDate: Date
     ) throws -> [VideoSegment] {
         let sql = """
-            SELECT id, start_time, end_time, frame_count, file_size_bytes, relative_path, width, height, source
-            FROM segments
-            WHERE start_time <= ? AND end_time >= ?
-            ORDER BY start_time ASC;
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            FROM video v
+            INNER JOIN frame f ON f.videoId = v.id
+            WHERE f.createdAt >= ? AND f.createdAt <= ?
+            ORDER BY v.id ASC;
             """
 
         var statement: OpaquePointer?
@@ -134,12 +143,12 @@ enum SegmentQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var segments: [VideoSegment] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let segment = try parseSegmentRow(statement: statement!)
+            let segment = try parseVideoRow(statement: statement!)
             segments.append(segment)
         }
 
@@ -148,8 +157,8 @@ enum SegmentQueries {
 
     // MARK: - Delete
 
-    static func delete(db: OpaquePointer, id: SegmentID) throws {
-        let sql = "DELETE FROM segments WHERE id = ?;"
+    static func delete(db: OpaquePointer, id: VideoSegmentID) throws {
+        let sql = "DELETE FROM video WHERE id = ?;"
 
         var statement: OpaquePointer?
         defer {
@@ -163,7 +172,7 @@ enum SegmentQueries {
             )
         }
 
-        sqlite3_bind_text(statement, 1, id.stringValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 1, id.value)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -176,7 +185,7 @@ enum SegmentQueries {
     // MARK: - Statistics
 
     static func getTotalStorageBytes(db: OpaquePointer) throws -> Int64 {
-        let sql = "SELECT COALESCE(SUM(file_size_bytes), 0) FROM segments;"
+        let sql = "SELECT COALESCE(SUM(fileSize), 0) FROM video;"
 
         var statement: OpaquePointer?
         defer {
@@ -198,7 +207,7 @@ enum SegmentQueries {
     }
 
     static func getCount(db: OpaquePointer) throws -> Int {
-        let sql = "SELECT COUNT(*) FROM segments;"
+        let sql = "SELECT COUNT(*) FROM video;"
 
         var statement: OpaquePointer?
         defer {
@@ -221,45 +230,37 @@ enum SegmentQueries {
 
     // MARK: - Helpers
 
-    private static func parseSegmentRow(statement: OpaquePointer) throws -> VideoSegment {
-        // Column 0: id
-        guard let idString = sqlite3_column_text(statement, 0) else {
-            throw DatabaseError.queryFailed(query: "parseSegmentRow", underlying: "Missing segment ID")
-        }
-        guard let uuid = UUID(uuidString: String(cString: idString)) else {
-            throw DatabaseError.queryFailed(query: "parseSegmentRow", underlying: "Invalid segment ID")
-        }
-        let id = SegmentID(value: uuid)
+    /// Parse a video row from the video table
+    /// Expected columns: id, height, width, path, fileSize, frameRate
+    private static func parseVideoRow(statement: OpaquePointer) throws -> VideoSegment {
+        // Column 0: id (INTEGER)
+        let videoId = sqlite3_column_int64(statement, 0)
+        let id = VideoSegmentID(value: videoId)
 
-        // Column 1: start_time
-        let startTimeMs = sqlite3_column_int64(statement, 1)
-        let startTime = Schema.timestampToDate(startTimeMs)
+        // Column 1: height
+        let height = Int(sqlite3_column_int(statement, 1))
 
-        // Column 2: end_time
-        let endTimeMs = sqlite3_column_int64(statement, 2)
-        let endTime = Schema.timestampToDate(endTimeMs)
+        // Column 2: width
+        let width = Int(sqlite3_column_int(statement, 2))
 
-        // Column 3: frame_count
-        let frameCount = Int(sqlite3_column_int(statement, 3))
-
-        // Column 4: file_size_bytes
-        let fileSizeBytes = sqlite3_column_int64(statement, 4)
-
-        // Column 5: relative_path
-        guard let pathText = sqlite3_column_text(statement, 5) else {
-            throw DatabaseError.queryFailed(query: "parseSegmentRow", underlying: "Missing relative path")
+        // Column 3: path (relative path like "202505/31/d0tva3el9vhg5fjg178g")
+        guard let pathText = sqlite3_column_text(statement, 3) else {
+            throw DatabaseError.queryFailed(query: "parseVideoRow", underlying: "Missing path")
         }
         let relativePath = String(cString: pathText)
 
-        // Column 6: width
-        let width = Int(sqlite3_column_int(statement, 6))
+        // Column 4: fileSize (nullable)
+        let fileSizeBytes = sqlite3_column_int64(statement, 4)
 
-        // Column 7: height
-        let height = Int(sqlite3_column_int(statement, 7))
+        // Column 5: frameRate
+        let frameRate = sqlite3_column_double(statement, 5)
 
-        // Column 8: source
-        let sourceString = sqlite3_column_text(statement, 8).map { String(cString: $0) } ?? "native"
-        let source = FrameSource(rawValue: sourceString) ?? .native
+        // Note: The video table doesn't have startTime/endTime/frameCount
+        // Those need to be queried from the frames table if needed
+        // For now, use placeholder values (will be computed from frames when needed)
+        let startTime = Date(timeIntervalSince1970: 0)
+        let endTime = Date(timeIntervalSince1970: 0)
+        let frameCount = 150 // Standard 150 frames per video (5 seconds @ 30 FPS)
 
         return VideoSegment(
             id: id,
@@ -270,7 +271,7 @@ enum SegmentQueries {
             relativePath: relativePath,
             width: width,
             height: height,
-            source: source
+            source: .native  // Retrace creates native videos
         )
     }
 }

@@ -343,14 +343,15 @@ public struct SpotlightSearchOverlay: View {
 
         Task {
             do {
-                // 1. Fetch frame image
+                // 1. Fetch frame image using frameIndex (more reliable than timestamp matching)
                 let fetchStart = Date()
-                let imageData = try await coordinator.getFrameImage(
-                    segmentID: result.segmentID,
-                    timestamp: result.timestamp
+                let imageData = try await coordinator.getFrameImageByIndex(
+                    videoID: result.videoID,
+                    frameIndex: result.frameIndex,
+                    source: result.source
                 )
                 let fetchDuration = Date().timeIntervalSince(fetchStart) * 1000
-                Log.debug("\(searchLog) Image data fetched in \(Int(fetchDuration))ms, size=\(imageData.count) bytes", category: .ui)
+                Log.debug("\(searchLog) Image data fetched in \(Int(fetchDuration))ms, size=\(imageData.count) bytes, source=\(result.source)", category: .ui)
 
                 // Check if search generation changed (user started a new search)
                 guard viewModel.searchGeneration == currentGeneration else {
@@ -364,14 +365,14 @@ public struct SpotlightSearchOverlay: View {
                     return
                 }
 
-                // 2. Get OCR nodes for this frame (currently only Rewind source has OCR nodes)
+                // 2. Get OCR nodes for this frame (use frameID for exact match)
                 let ocrStart = Date()
                 let ocrNodes = try await coordinator.getAllOCRNodes(
-                    timestamp: result.timestamp,
-                    source: .rewind  // TODO: Determine source from result when native OCR is available
+                    frameID: result.frameID,
+                    source: result.source
                 )
                 let ocrDuration = Date().timeIntervalSince(ocrStart) * 1000
-                Log.debug("\(searchLog) OCR nodes fetched in \(Int(ocrDuration))ms, count=\(ocrNodes.count)", category: .ui)
+                Log.debug("\(searchLog) OCR nodes fetched in \(Int(ocrDuration))ms, count=\(ocrNodes.count), source=\(result.source)", category: .ui)
 
                 // Check if search generation changed again
                 guard viewModel.searchGeneration == currentGeneration else {
@@ -458,7 +459,7 @@ public struct SpotlightSearchOverlay: View {
 
     /// Find the OCR node that best matches the search query
     /// Prioritizes exact word matches, then prefix matches (for stemmed/nominalized words)
-    private func findMatchingOCRNode(query: String, nodes: [RewindDataSource.OCRNode]) -> RewindDataSource.OCRNode? {
+    private func findMatchingOCRNode(query: String, nodes: [OCRNodeWithText]) -> OCRNodeWithText? {
         let lowercaseQuery = query.lowercased()
 
         // First pass: find exact word boundary match (e.g., "@glean" or "glean," or " glean ")
@@ -517,7 +518,7 @@ public struct SpotlightSearchOverlay: View {
     /// Create a thumbnail cropped around the matching OCR node with a yellow highlight
     private func createHighlightedThumbnail(
         from image: NSImage,
-        matchingNode: RewindDataSource.OCRNode,
+        matchingNode: OCRNodeWithText,
         size: CGSize
     ) -> NSImage {
         let imageSize = image.size
@@ -683,17 +684,30 @@ private struct GalleryResultCard: View {
                             .frame(width: 20, height: 20)
                     } else {
                         Circle()
-                            .fill(Color.sessionColor(for: result.appBundleID ?? ""))
+                            .fill(Color.segmentColor(for: result.appBundleID ?? ""))
                             .frame(width: 20, height: 20)
                     }
 
                     // Title and timestamp
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(displayTitle)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
+                        // Title with source badge
+                        HStack(spacing: 6) {
+                            Text(displayTitle)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
 
+                            // Source badge
+                            Text(result.source == .native ? "Retrace" : "Rewind")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(result.source == .native ? .blue : .purple)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(result.source == .native ? Color.blue.opacity(0.2) : Color.purple.opacity(0.2))
+                                .cornerRadius(3)
+                        }
+
+                        // Timestamp and relevance
                         HStack(spacing: 6) {
                             Text(formatTimestamp(result.timestamp))
                                 .font(.system(size: 10))

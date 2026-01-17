@@ -50,12 +50,11 @@ final class DirectoryManagerTests: XCTestCase {
 
     func testSegmentURLLayout() async throws {
         let date = Calendar.current.date(from: DateComponents(year: 2025, month: 1, day: 2, hour: 12))!
-        let uuid = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
-        let id = SegmentID(value: uuid)
+        let id = VideoSegmentID(value: 123456)
 
         let url = try await directoryManager.segmentURL(for: id, date: date)
         XCTAssertTrue(url.path.contains("segments/2025/01/02"))
-        XCTAssertEqual(url.lastPathComponent, "segment_\(uuid.uuidString)")
+        XCTAssertEqual(url.lastPathComponent, "segment_\(id.stringValue)")
     }
 
     func testRelativePathFromRoot() async throws {

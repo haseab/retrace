@@ -54,6 +54,31 @@ public actor ProcessingManager: ProcessingProtocol {
             config: config
         )
 
+        // Separate UI chrome from main content
+        // Chrome = top 5% (menu bar/status bar) + bottom 5% (dock)
+        // Coordinates are now in pixel space with Y flipped (0 = top)
+        let frameHeight = CGFloat(frame.height)
+        let topChromeThreshold = frameHeight * 0.05    // Top 5%
+        let bottomChromeThreshold = frameHeight * 0.95 // Bottom 5%
+
+        var mainRegions: [TextRegion] = []
+        var chromeRegions: [TextRegion] = []
+
+        for region in ocrRegions {
+            let regionTopY = region.bounds.origin.y
+            let regionBottomY = region.bounds.origin.y + region.bounds.height
+
+            // Check if region is in UI chrome areas
+            let isTopChrome = regionBottomY <= topChromeThreshold
+            let isBottomChrome = regionTopY >= bottomChromeThreshold
+
+            if isTopChrome || isBottomChrome {
+                chromeRegions.append(region)
+            } else {
+                mainRegions.append(region)
+            }
+        }
+
         // Extract accessibility text (if enabled and permitted)
         var axResult: AccessibilityResult? = nil
         var axText: String? = nil
@@ -65,8 +90,9 @@ public actor ProcessingManager: ProcessingProtocol {
             }
         }
 
-        // Build OCR text
-        let ocrText = ocrRegions.map(\.text).joined(separator: " ")
+        // Build OCR text from main regions only (chrome text stored separately)
+        let ocrText = mainRegions.map(\.text).joined(separator: " ")
+        let chromeText = chromeRegions.map(\.text).joined(separator: " ")
 
         // Merge OCR and accessibility text
         let fullText = merger.mergeText(ocrText: ocrText, accessibilityText: axText)
@@ -84,12 +110,30 @@ public actor ProcessingManager: ProcessingProtocol {
             )
         }
 
-        // Create ExtractedText
+        // Extract browser URL from OCR if not already available from Accessibility API
+        // This handles browsers that don't expose URL via AX API (Firefox, Opera, Vivaldi, etc.)
+        // Only searches chrome text (top 5% - address bar area)
+        if metadata.browserURL == nil {
+            if let extractedURL = URLExtractor.extractURL(chromeText: chromeText) {
+                metadata = FrameMetadata(
+                    appBundleID: metadata.appBundleID,
+                    appName: metadata.appName,
+                    windowName: metadata.windowName,
+                    browserURL: extractedURL,
+                    displayID: metadata.displayID
+                )
+            }
+        }
+
+        // Create ExtractedText with separated main/chrome regions
+        // Note: CapturedFrame doesn't have an ID yet (assigned by database on insert)
         let extractedText = ExtractedText(
-            frameID: frame.id,
+            frameID: FrameID(value: 0), // Placeholder - will be updated by caller after DB insert
             timestamp: frame.timestamp,
-            regions: ocrRegions,  // Use OCR regions with their spatial data
-            fullText: fullText,    // Merged text from both sources
+            regions: mainRegions,        // Main content regions (c0)
+            chromeRegions: chromeRegions, // UI chrome regions (c1)
+            fullText: fullText,          // Main content text
+            chromeText: chromeText,      // UI chrome text
             metadata: metadata
         )
 
@@ -125,7 +169,7 @@ public actor ProcessingManager: ProcessingProtocol {
 
         // Convert accessibility text elements to TextRegions
         // Note: We use a dummy FrameID since AX text is not tied to a specific frame
-        let dummyFrameID = FrameID()
+        let dummyFrameID = FrameID(value: 0)
         return result.textElements.map { element in
             TextRegion(
                 frameID: dummyFrameID,

@@ -217,7 +217,7 @@ public struct FloatingSearchPanel: View {
             HStack(spacing: .spacingM) {
                 // App color indicator
                 Circle()
-                    .fill(Color.sessionColor(for: result.appBundleID ?? ""))
+                    .fill(Color.segmentColor(for: result.appBundleID ?? ""))
                     .frame(width: 8, height: 8)
 
                 VStack(alignment: .leading, spacing: 2) {

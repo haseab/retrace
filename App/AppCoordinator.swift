@@ -25,8 +25,8 @@ public actor AppCoordinator {
     private var totalFramesProcessed = 0
     private var totalErrors = 0
 
-    // Session tracking
-    private var currentSession: AppSession?
+    // Segment tracking (app focus sessions - Rewind compatible)
+    private var currentSegmentID: Int64?
 
     // MARK: - Initialization
 
@@ -201,8 +201,8 @@ public actor AppCoordinator {
                     // Finalize previous segment
                     if let writer = currentWriter {
                         let segment = try await writer.finalize()
-                        try await services.database.insertSegment(segment)
-                        Log.debug("Segment finalized: \(segment.id.stringValue)", category: .app)
+                        let dbSegmentID = try await services.database.insertVideoSegment(segment)
+                        Log.debug("Video segment finalized with DB ID: \(dbSegmentID)", category: .app)
                     }
 
                     // Create new segment
@@ -221,25 +221,62 @@ public actor AppCoordinator {
                 let extractedText = try await services.processing.extractText(from: frame)
 
                 // STEP 4: Store frame reference in database
-                let segmentID = await currentWriter!.segmentID
+                // Rewind-compatible: segmentID = app session, videoID = video chunk
+                let videoSegmentID = await currentWriter!.segmentID
+                guard let appSegmentID = currentSegmentID else {
+                    Log.warning("No current app segment ID for frame insertion", category: .app)
+                    continue
+                }
                 let frameRef = FrameReference(
-                    id: frame.id,
+                    id: FrameID(value: 0), // Placeholder - will be replaced by database AUTOINCREMENT
                     timestamp: frame.timestamp,  // Real capture timestamp (source of truth)
-                    segmentID: segmentID,
-                    sessionID: currentSession?.id,  // Link to current session
+                    segmentID: AppSegmentID(value: appSegmentID),  // Link to app session (segment table)
+                    videoID: videoSegmentID,  // Link to video chunk (video table)
                     frameIndexInSegment: frameCount - 1,  // Position in video file (NOT for timestamp calculation!)
                     metadata: extractedText.metadata,  // Use updated metadata from processing
                     source: .native
                 )
-                try await services.database.insertFrame(frameRef)
+                let frameID = try await services.database.insertFrame(frameRef)
 
-                // STEP 5: Store text regions (OCR bounding boxes)
-                for region in extractedText.regions {
-                    try await services.database.insertTextRegion(region)
+                // STEP 5: Index text for search (Rewind-compatible FTS)
+                // Inserts into searchRanking_content and doc_segment tables
+                // This returns the docid that nodes will reference
+                let docid = try await services.search.index(
+                    text: extractedText,
+                    segmentId: appSegmentID,
+                    frameId: frameID
+                )
+
+                // STEP 6: Calculate text offsets and insert OCR nodes (Rewind-compatible)
+                // Each node references a substring of the fullText via textOffset/textLength
+                if docid > 0 && !extractedText.regions.isEmpty {
+                    var currentOffset = 0
+                    var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
+
+                    // Calculate textOffset for each region based on concatenation order
+                    // ExtractedText.fullText is created by joining region texts with " " separator
+                    for region in extractedText.regions {
+                        let textLength = region.text.count
+
+                        nodeData.append((
+                            textOffset: currentOffset,
+                            textLength: textLength,
+                            bounds: region.bounds,
+                            windowIndex: nil  // Single window for now
+                        ))
+
+                        // Move offset forward: text + space separator
+                        currentOffset += textLength + 1  // +1 for space separator
+                    }
+
+                    // Insert all nodes for this frame
+                    try await services.database.insertNodes(
+                        frameID: FrameID(value: frameID),
+                        nodes: nodeData,
+                        frameWidth: frame.width,
+                        frameHeight: frame.height
+                    )
                 }
-
-                // STEP 6: Index text for search
-                try await services.search.index(text: extractedText)
 
                 totalFramesProcessed += 1
 
@@ -260,51 +297,55 @@ public actor AppCoordinator {
         if let writer = currentWriter {
             do {
                 let segment = try await writer.finalize()
-                try await services.database.insertSegment(segment)
-                Log.info("Final segment finalized: \(segment.id.stringValue)", category: .app)
+                let dbSegmentID = try await services.database.insertVideoSegment(segment)
+                Log.info("Final video segment finalized with DB ID: \(dbSegmentID)", category: .app)
             } catch {
                 Log.error("Failed to finalize last segment: \(error)", category: .app)
             }
         }
 
-        // Close final session
-        if let session = currentSession {
-            try? await services.database.updateSessionEndTime(id: session.id, endTime: Date())
-            currentSession = nil
+        // Close final segment
+        if let segmentID = currentSegmentID {
+            try? await services.database.updateSegmentEndDate(id: segmentID, endDate: Date())
+            currentSegmentID = nil
         }
 
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
     }
 
-    /// Track app/window changes and create/close sessions accordingly
+    /// Track app/window changes and create/close segments accordingly
     private func trackSessionChange(frame: CapturedFrame) async throws {
         let metadata = frame.metadata
 
-        // Check if app or window changed
-        let appChanged = currentSession?.appBundleID != metadata.appBundleID
-        let windowChanged = currentSession?.windowName != metadata.windowName
+        // Get current segment if exists
+        var currentSegment: Segment? = nil
+        if let segID = currentSegmentID {
+            currentSegment = try await services.database.getSegment(id: segID)
+        }
 
-        if appChanged || windowChanged || currentSession == nil {
-            // Close previous session
-            if let session = currentSession {
-                try await services.database.updateSessionEndTime(id: session.id, endTime: frame.timestamp)
-                Log.debug("Closed session: \(session.appBundleID) - \(session.windowName ?? "nil")", category: .app)
+        // Check if app or window changed
+        let appChanged = currentSegment?.bundleID != metadata.appBundleID
+        let windowChanged = currentSegment?.windowName != metadata.windowName
+
+        if appChanged || windowChanged || currentSegment == nil {
+            // Close previous segment
+            if let segID = currentSegmentID {
+                try await services.database.updateSegmentEndDate(id: segID, endDate: frame.timestamp)
+                Log.debug("Closed segment: \(currentSegment?.bundleID ?? "unknown") - \(currentSegment?.windowName ?? "nil")", category: .app)
             }
 
-            // Create new session
-            let newSession = AppSession(
-                appBundleID: metadata.appBundleID ?? "unknown",
-                appName: metadata.appName,
+            // Create new segment
+            let newSegmentID = try await services.database.insertSegment(
+                bundleID: metadata.appBundleID ?? "unknown",
+                startDate: frame.timestamp,
+                endDate: frame.timestamp,  // Will be updated as frames are captured
                 windowName: metadata.windowName,
-                browserURL: metadata.browserURL,
-                displayID: metadata.displayID,
-                startTime: frame.timestamp,
-                endTime: nil  // Active session
+                browserUrl: metadata.browserURL,
+                type: 0  // 0 = screen capture
             )
 
-            try await services.database.insertSession(newSession)
-            currentSession = newSession
-            Log.debug("Started session: \(newSession.appBundleID) - \(newSession.windowName ?? "nil")", category: .app)
+            currentSegmentID = newSegmentID
+            Log.debug("Started segment: \(metadata.appBundleID ?? "unknown") - \(metadata.windowName ?? "nil")", category: .app)
         }
     }
 
@@ -360,10 +401,14 @@ public actor AppCoordinator {
     /// Get a specific frame image by timestamp
     /// Uses real timestamps for accurate seeking (works correctly with deduplication)
     /// Automatically routes to appropriate source via DataAdapter
-    public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
+    public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date) async throws -> Data {
         guard let adapter = await services.dataAdapter else {
-            // Fallback to storage if adapter not available
-            return try await services.storage.readFrame(segmentID: segmentID, timestamp: timestamp)
+            // Fallback to storage if adapter not available - need to query frame index from database
+            let frames = try await services.database.getFrames(from: timestamp, to: timestamp, limit: 1)
+            guard let frame = frames.first else {
+                throw NSError(domain: "AppCoordinator", code: 404, userInfo: [NSLocalizedDescriptionKey: "Frame not found"])
+            }
+            return try await services.storage.readFrame(segmentID: segmentID, frameIndex: frame.frameIndexInSegment)
         }
 
         return try await adapter.getFrameImage(segmentID: segmentID, timestamp: timestamp)
@@ -371,12 +416,33 @@ public actor AppCoordinator {
 
     /// Get video info for a frame (returns nil if not video-based)
     /// For Rewind frames, returns path/index to display video directly
-    public func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date, source: FrameSource) async throws -> FrameVideoInfo? {
+    public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source: FrameSource) async throws -> FrameVideoInfo? {
         guard let adapter = await services.dataAdapter else {
             return nil
         }
 
         return try await adapter.getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, source: source)
+    }
+
+    /// Get frame image by exact videoID and frameIndex (more reliable than timestamp matching)
+    public func getFrameImageByIndex(videoID: VideoSegmentID, frameIndex: Int, source: FrameSource) async throws -> Data {
+        guard let adapter = await services.dataAdapter else {
+            throw NSError(domain: "AppCoordinator", code: 500, userInfo: [NSLocalizedDescriptionKey: "DataAdapter not initialized"])
+        }
+
+        return try await adapter.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex, source: source)
+    }
+
+    /// Get frame image directly using filename-based videoID (optimized, no database lookup)
+    /// Use this when you already have the video filename from a JOIN query (e.g., FrameVideoInfo)
+    /// - Parameters:
+    ///   - filenameID: The Int64 filename (e.g., 1768624554519) extracted from the video path
+    ///   - frameIndex: The frame index within the video segment
+    /// - Returns: JPEG image data for the frame
+    public func getFrameImageDirect(filenameID: Int64, frameIndex: Int) async throws -> Data {
+        // Call storage directly with the filename-based ID - no database lookup needed!
+        let videoSegmentID = VideoSegmentID(value: filenameID)
+        return try await services.storage.readFrame(segmentID: videoSegmentID, frameIndex: frameIndex)
     }
 
     /// Get frames in a time range
@@ -502,34 +568,48 @@ public actor AppCoordinator {
         return try await adapter.getMostRecentFrameTimestamp()
     }
 
-    // MARK: - Session Retrieval
+    // MARK: - Segment Retrieval
 
-    /// Get sessions in a time range
+    /// Get segments in a time range
     /// Seamlessly blends data from all sources via DataAdapter
-    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+    public func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database if adapter not available
-            return try await services.database.getSessions(from: startDate, to: endDate)
+            return try await services.database.getSegments(from: startDate, to: endDate)
         }
 
-        return try await adapter.getSessions(from: startDate, to: endDate)
+        return try await adapter.getSegments(from: startDate, to: endDate)
     }
 
-    /// Get the currently active session
-    public func getActiveSession() async throws -> AppSession? {
-        try await services.database.getActiveSession()
+    /// Get the most recent segment
+    public func getMostRecentSegment() async throws -> Segment? {
+        try await services.database.getMostRecentSegment()
     }
 
-    /// Get sessions for a specific app
-    public func getSessions(appBundleID: String, limit: Int = 100) async throws -> [AppSession] {
-        try await services.database.getSessions(appBundleID: appBundleID, limit: limit)
+    /// Get segments for a specific app
+    public func getSegments(bundleID: String, limit: Int = 100) async throws -> [Segment] {
+        try await services.database.getSegments(bundleID: bundleID, limit: limit)
     }
 
     // MARK: - Text Region Retrieval
 
     /// Get text regions for a frame (OCR bounding boxes)
     public func getTextRegions(frameID: FrameID) async throws -> [TextRegion] {
-        try await services.database.getTextRegions(frameID: frameID)
+        // Get frame dimensions first
+        // For now, use default dimensions - this should be improved to get actual frame size
+        let nodes = try await services.database.getNodes(frameID: frameID, frameWidth: 1920, frameHeight: 1080)
+
+        // Convert OCRNode to TextRegion
+        return nodes.map { node in
+            TextRegion(
+                id: node.id,
+                frameID: frameID,
+                text: "", // Text not available from getNodes, use getNodesWithText if needed
+                bounds: node.bounds,
+                confidence: nil,
+                createdAt: Date() // Not stored in node
+            )
+        }
     }
 
     // MARK: - Frame Deletion
@@ -590,15 +670,26 @@ public actor AppCoordinator {
 
     // MARK: - OCR Node Detection (for text selection)
 
-    /// Get all OCR nodes for a given frame
+    /// Get all OCR nodes for a given frame by timestamp
     /// Returns array of nodes with normalized bounding boxes (0.0-1.0) and text content
     /// Use this to enable text selection highlighting in the timeline view
-    public func getAllOCRNodes(timestamp: Date, source: FrameSource) async throws -> [RewindDataSource.OCRNode] {
+    public func getAllOCRNodes(timestamp: Date, source: FrameSource) async throws -> [OCRNodeWithText] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
 
         return try await adapter.getAllOCRNodes(timestamp: timestamp, source: source)
+    }
+
+    /// Get all OCR nodes for a given frame by frameID (more reliable than timestamp)
+    /// Returns array of nodes with normalized bounding boxes (0.0-1.0) and text content
+    /// Use this for search results where you have the exact frameID
+    public func getAllOCRNodes(frameID: FrameID, source: FrameSource) async throws -> [OCRNodeWithText] {
+        guard let adapter = await services.dataAdapter else {
+            return []
+        }
+
+        return try await adapter.getAllOCRNodes(frameID: frameID, source: source)
     }
 
     // MARK: - Migration
@@ -682,7 +773,7 @@ public actor AppCoordinator {
 
         // Delete corresponding segments from database
         for segmentID in deletedSegmentIDs {
-            try await services.database.deleteSegment(id: segmentID)
+            try await services.database.deleteVideoSegment(id: segmentID)
         }
 
         // Vacuum database to reclaim space

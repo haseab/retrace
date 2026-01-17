@@ -1,13 +1,13 @@
 import SwiftUI
 import Shared
 
-/// Visual indicator for an app session in the timeline
+/// Visual indicator for an app segment in the timeline
 /// Shows app icon, name, and duration with consistent color coding
 public struct SessionIndicator: View {
 
     // MARK: - Properties
 
-    let session: AppSession
+    let segment: Segment
     let width: CGFloat
     let isSelected: Bool
     let onTap: () -> Void
@@ -17,12 +17,12 @@ public struct SessionIndicator: View {
     // MARK: - Initialization
 
     public init(
-        session: AppSession,
+        segment: Segment,
         width: CGFloat,
         isSelected: Bool = false,
         onTap: @escaping () -> Void = {}
     ) {
-        self.session = session
+        self.segment = segment
         self.width = width
         self.isSelected = isSelected
         self.onTap = onTap
@@ -34,7 +34,7 @@ public struct SessionIndicator: View {
         VStack(spacing: 0) {
             // Session bar
             Rectangle()
-                .fill(sessionColor)
+                .fill(segmentColor)
                 .frame(width: width, height: 24)
                 .overlay(
                     HStack(spacing: 4) {
@@ -47,7 +47,7 @@ public struct SessionIndicator: View {
 
                         // App name
                         if width > 60 {
-                            Text(session.appName ?? session.appBundleID)
+                            Text(segment.bundleID)
                                 .font(.retraceCaption2)
                                 .foregroundColor(.white)
                                 .lineLimit(1)
@@ -67,7 +67,7 @@ public struct SessionIndicator: View {
                         )
                 )
                 .shadow(
-                    color: isSelected ? sessionColor.opacity(0.5) : .clear,
+                    color: isSelected ? segmentColor.opacity(0.5) : .clear,
                     radius: 4,
                     x: 0,
                     y: 2
@@ -80,13 +80,13 @@ public struct SessionIndicator: View {
             onTap()
         }
         .popover(isPresented: .constant(isHovered && !isSelected)) {
-            sessionTooltip
+            segmentTooltip
         }
     }
 
     // MARK: - Tooltip
 
-    private var sessionTooltip: some View {
+    private var segmentTooltip: some View {
         VStack(alignment: .leading, spacing: .spacingS) {
             // App name and icon
             HStack(spacing: .spacingS) {
@@ -97,11 +97,11 @@ public struct SessionIndicator: View {
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(session.appName ?? session.appBundleID)
+                    Text(segment.bundleID)
                         .font(.retraceHeadline)
                         .foregroundColor(.retracePrimary)
 
-                    Text(session.appBundleID)
+                    Text(segment.bundleID)
                         .font(.retraceCaption)
                         .foregroundColor(.retraceSecondary)
                         .lineLimit(1)
@@ -111,22 +111,18 @@ public struct SessionIndicator: View {
             Divider()
 
             // Session details
-            DetailRow(label: "Start", value: formatTime(session.startTime))
-            if let endTime = session.endTime {
-                DetailRow(label: "End", value: formatTime(endTime))
-            }
-            if let duration = session.duration {
-                DetailRow(label: "Duration", value: formatDuration(duration))
-            }
+            DetailRow(label: "Start", value: formatTime(segment.startDate))
+            DetailRow(label: "End", value: formatTime(segment.endDate))
+            DetailRow(label: "Duration", value: formatDuration(segment.duration))
 
             // Window title (if available)
-            if let windowName = session.windowName, !windowName.isEmpty {
+            if let windowName = segment.windowName, !windowName.isEmpty {
                 Divider()
                 DetailRow(label: "Window", value: windowName)
             }
 
             // URL (if browser)
-            if let url = session.browserURL, !url.isEmpty {
+            if let url = segment.browserUrl, !url.isEmpty {
                 DetailRow(label: "URL", value: url)
             }
         }
@@ -136,8 +132,8 @@ public struct SessionIndicator: View {
 
     // MARK: - Helpers
 
-    private var sessionColor: Color {
-        Color.sessionColor(for: session.appBundleID)
+    private var segmentColor: Color {
+        Color.segmentColor(for: segment.bundleID)
     }
 
     private var borderColor: Color {
@@ -151,7 +147,7 @@ public struct SessionIndicator: View {
     }
 
     private var appIcon: NSImage? {
-        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: session.appBundleID) else {
+        guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: segment.bundleID) else {
             return nil
         }
         return NSWorkspace.shared.icon(forFile: appURL.path)
@@ -208,49 +204,43 @@ private struct DetailRow: View {
 struct SessionIndicator_Previews: PreviewProvider {
     static var previews: some View {
         VStack(spacing: .spacingM) {
-            // Normal session
+            // Normal segment
             SessionIndicator(
-                session: AppSession(
-                    id: AppSessionID(value: UUID()),
-                    appBundleID: "com.google.Chrome",
-                    appName: "Chrome",
+                segment: Segment(
+                    id: SegmentID(value: 1),
+                    bundleID: "com.google.Chrome",
+                    startDate: Date().addingTimeInterval(-3600),
+                    endDate: Date().addingTimeInterval(-1800),
                     windowName: "GitHub - retrace/main",
-                    browserURL: "https://github.com/haseab/retrace",
-                    displayID: nil,
-                    startTime: Date().addingTimeInterval(-3600),
-                    endTime: Date().addingTimeInterval(-1800)
+                    browserUrl: "https://github.com/haseab/retrace"
                 ),
                 width: 150,
                 isSelected: false
             )
 
-            // Selected session
+            // Selected segment
             SessionIndicator(
-                session: AppSession(
-                    id: AppSessionID(value: UUID()),
-                    appBundleID: "com.apple.dt.Xcode",
-                    appName: "Xcode",
+                segment: Segment(
+                    id: SegmentID(value: 1),
+                    bundleID: "com.apple.dt.Xcode",
+                    startDate: Date().addingTimeInterval(-1800),
+                    endDate: Date(),
                     windowName: nil,
-                    browserURL: nil,
-                    displayID: nil,
-                    startTime: Date().addingTimeInterval(-1800),
-                    endTime: Date()
+                    browserUrl: nil
                 ),
                 width: 200,
                 isSelected: true
             )
 
-            // Short session
+            // Short segment
             SessionIndicator(
-                session: AppSession(
-                    id: AppSessionID(value: UUID()),
-                    appBundleID: "com.tinyspeck.slackmacgap",
-                    appName: "Slack",
+                segment: Segment(
+                    id: SegmentID(value: 1),
+                    bundleID: "com.tinyspeck.slackmacgap",
+                    startDate: Date().addingTimeInterval(-300),
+                    endDate: Date(),
                     windowName: nil,
-                    browserURL: nil,
-                    displayID: nil,
-                    startTime: Date().addingTimeInterval(-300),
-                    endTime: Date()
+                    browserUrl: nil
                 ),
                 width: 50,
                 isSelected: false

@@ -2,13 +2,23 @@ import Foundation
 import CoreGraphics
 import Shared
 
+// Note: If ScreenCaptureKit import fails on older macOS, conditionally import
+#if canImport(ScreenCaptureKit)
+import ScreenCaptureKit
+#endif
+
 /// Main coordinator for screen capture
 /// Implements CaptureProtocol from Shared/Protocols
 public actor CaptureManager: CaptureProtocol {
 
     // MARK: - Properties
 
-    private let screenCapture: ScreenCaptureService
+    // Toggle between ScreenCaptureKit and CGWindowList
+    // Set to false to use CGWindowList (no purple indicator)
+    private let useScreenCaptureKit: Bool
+
+    private let screenCapture: ScreenCaptureService?
+    private let cgWindowListCapture: CGWindowListCapture?
     private let displayMonitor: DisplayMonitor
     private let displaySwitchMonitor: DisplaySwitchMonitor
     private let deduplicator: FrameDeduplicator
@@ -43,9 +53,18 @@ public actor CaptureManager: CaptureProtocol {
 
     // MARK: - Initialization
 
-    public init(config: CaptureConfig = .default) {
+    public init(config: CaptureConfig = .default, useScreenCaptureKit: Bool = false) {
         self.currentConfig = config
-        self.screenCapture = ScreenCaptureService()
+        self.useScreenCaptureKit = useScreenCaptureKit
+
+        if useScreenCaptureKit {
+            self.screenCapture = ScreenCaptureService()
+            self.cgWindowListCapture = nil
+        } else {
+            self.screenCapture = nil
+            self.cgWindowListCapture = CGWindowListCapture()
+        }
+
         self.displayMonitor = DisplayMonitor()
         self.displaySwitchMonitor = DisplaySwitchMonitor(displayMonitor: DisplayMonitor())
         self.deduplicator = FrameDeduplicator()
@@ -81,17 +100,26 @@ public actor CaptureManager: CaptureProtocol {
         self.dedupedFrameContinuation = dedupedContinuation
         self._frameStream = dedupedStream
 
-        // Set up callback for when stream stops unexpectedly (e.g., user clicks "Stop sharing")
-        screenCapture.onStreamStopped = { [weak self] in
-            guard let self = self else { return }
-            await self.handleStreamStopped()
-        }
+        // Start screen capture with appropriate backend
+        if useScreenCaptureKit {
+            // Set up callback for when stream stops unexpectedly (e.g., user clicks "Stop sharing")
+            screenCapture?.onStreamStopped = { [weak self] in
+                guard let self = self else { return }
+                await self.handleStreamStopped()
+            }
 
-        // Start screen capture
-        try await screenCapture.startCapture(
-            config: config,
-            frameContinuation: rawContinuation
-        )
+            // Start ScreenCaptureKit capture
+            try await screenCapture?.startCapture(
+                config: config,
+                frameContinuation: rawContinuation
+            )
+        } else {
+            // Start CGWindowList capture
+            try await cgWindowListCapture?.startCapture(
+                config: config,
+                frameContinuation: rawContinuation
+            )
+        }
 
         _isCapturing = true
         stats = CaptureStatistics(
@@ -118,7 +146,12 @@ public actor CaptureManager: CaptureProtocol {
         // Stop display switch monitoring
         await displaySwitchMonitor.stopMonitoring()
 
-        try await screenCapture.stopCapture()
+        // Stop capture with appropriate backend
+        if useScreenCaptureKit {
+            try await screenCapture?.stopCapture()
+        } else {
+            try await cgWindowListCapture?.stopCapture()
+        }
 
         _isCapturing = false
         rawFrameContinuation?.finish()
@@ -153,7 +186,11 @@ public actor CaptureManager: CaptureProtocol {
         self.currentConfig = config
 
         if _isCapturing {
-            try await screenCapture.updateConfig(config)
+            if useScreenCaptureKit {
+                try await screenCapture?.updateConfig(config)
+            } else {
+                try await cgWindowListCapture?.updateConfig(config)
+            }
         }
     }
 
@@ -193,7 +230,7 @@ public actor CaptureManager: CaptureProtocol {
         }
 
         // Set up callback for private window detection AX permission denial
-        screenCapture.onAccessibilityPermissionDenied = {
+        screenCapture?.onAccessibilityPermissionDenied = {
             await self.handleAccessibilityPermissionDenied()
         }
 
@@ -207,17 +244,28 @@ public actor CaptureManager: CaptureProtocol {
         // logger.info("Switching capture from display \(oldDisplayID) to \(newDisplayID)")
 
         do {
-            // Stop current capture
-            try await screenCapture.stopCapture()
-
             // Recreate raw frame continuation with same stream
             guard let continuation = rawFrameContinuation else { return }
 
-            // Start capture on new display
-            try await screenCapture.startCapture(
-                config: currentConfig,
-                frameContinuation: continuation
-            )
+            if useScreenCaptureKit {
+                // Stop current capture
+                try await screenCapture?.stopCapture()
+
+                // Start capture on new display
+                try await screenCapture?.startCapture(
+                    config: currentConfig,
+                    frameContinuation: continuation
+                )
+            } else {
+                // Stop current capture
+                try await cgWindowListCapture?.stopCapture()
+
+                // Start capture on new display
+                try await cgWindowListCapture?.startCapture(
+                    config: currentConfig,
+                    frameContinuation: continuation
+                )
+            }
 
             // logger.info("Successfully switched to display \(newDisplayID)")
         } catch {
@@ -332,7 +380,6 @@ public actor CaptureManager: CaptureProtocol {
 
         // Create new frame with enriched metadata
         return CapturedFrame(
-            id: frame.id,
             timestamp: frame.timestamp,
             imageData: frame.imageData,
             width: frame.width,

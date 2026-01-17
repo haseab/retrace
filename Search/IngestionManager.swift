@@ -16,11 +16,6 @@ public actor IngestionManager {
     private var config: IngestionConfig
     private var isInitialized = false
 
-    // MARK: - Ingestion Queue
-
-    private var ingestionQueue: [ExtractedText] = []
-    private var isProcessingQueue = false
-
     // MARK: - Statistics
 
     private var documentsIndexed = 0
@@ -53,35 +48,53 @@ public actor IngestionManager {
     }
 
     /// Ingest extracted text (FTS only)
-    public func ingest(_ text: ExtractedText) async throws {
+    /// - Parameters:
+    ///   - text: The extracted text from OCR
+    ///   - segmentId: The segment ID (app focus session) for doc_segment junction
+    ///   - frameId: The frame ID for doc_segment junction
+    public func ingest(_ text: ExtractedText, segmentId: Int64, frameId: Int64) async throws {
         guard isInitialized else {
             throw SearchError.indexNotReady
         }
 
         let startTime = Date()
 
-        // Index in FTS
-        try await searchManager.index(text: text)
+        // Index in FTS (Rewind-compatible)
+        _ = try await searchManager.index(text: text, segmentId: segmentId, frameId: frameId)
         documentsIndexed += 1
+
+        // Update segment's browserURL if OCR extracted one and segment doesn't have it yet
+        // This handles browsers that don't expose URL via Accessibility API
+        // TODO: Implement updateSegmentBrowserURL in DatabaseProtocol
+        /*
+        if let browserURL = text.metadata.browserURL, !browserURL.isEmpty {
+            do {
+                try await database.updateSegmentBrowserURL(id: segmentId, browserURL: browserURL)
+            } catch {
+                // Log but don't fail ingestion if URL update fails
+                Log.warning("Failed to update segment browserURL from OCR: \(error)", category: .search)
+            }
+        }
+        */
 
         let indexTime = Date().timeIntervalSince(startTime) * 1000
         totalIndexTimeMs += indexTime
     }
 
     /// Queue text for background ingestion
+    /// Note: This is legacy API - prefer using ingest() with segmentId/frameId directly
+    @available(*, deprecated, message: "Use ingest(_:segmentId:frameId:) instead")
     public func queueForIngestion(_ text: ExtractedText) async {
-        ingestionQueue.append(text)
-
-        // Start processing queue if not already running
-        if !isProcessingQueue {
-            await processQueue()
-        }
+        // Cannot queue without segmentId/frameId - log warning
+        Log.warning("queueForIngestion called without segmentId/frameId - text will not be indexed", category: .search)
     }
 
     /// Batch ingest multiple texts
-    public func ingestBatch(_ texts: [ExtractedText]) async throws {
-        for text in texts {
-            try await ingest(text)
+    /// - Parameters:
+    ///   - items: Array of (text, segmentId, frameId) tuples
+    public func ingestBatch(_ items: [(text: ExtractedText, segmentId: Int64, frameId: Int64)]) async throws {
+        for item in items {
+            try await ingest(item.text, segmentId: item.segmentId, frameId: item.frameId)
         }
     }
 
@@ -104,38 +117,16 @@ public actor IngestionManager {
         return IngestionStatistics(
             documentsIndexed: documentsIndexed,
             averageIndexTimeMs: avgIndexTime,
-            queuedItems: ingestionQueue.count,
+            queuedItems: 0,  // Queue no longer used
             errorCount: errorCount
         )
     }
 
     /// Wait for ingestion queue to drain
+    /// Note: Deprecated - queue-based ingestion is no longer supported
+    @available(*, deprecated, message: "Queue-based ingestion no longer supported")
     public func waitForQueueDrain() async {
-        while !ingestionQueue.isEmpty || isProcessingQueue {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-        }
-    }
-
-    // MARK: - Background Processing
-
-    private func processQueue() async {
-        isProcessingQueue = true
-
-        while !ingestionQueue.isEmpty {
-            let text = ingestionQueue.removeFirst()
-
-            do {
-                try await ingest(text)
-            } catch {
-                Log.error(
-                    "Failed to ingest frame \(text.frameID.stringValue.prefix(8)): \(error.localizedDescription)",
-                    category: .search
-                )
-                errorCount += 1
-            }
-        }
-
-        isProcessingQueue = false
+        // No-op - queue is no longer used
     }
 }
 

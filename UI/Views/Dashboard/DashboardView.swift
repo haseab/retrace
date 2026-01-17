@@ -262,7 +262,7 @@ public struct DashboardView: View {
         HStack(spacing: .spacingM) {
             // App color indicator
             RoundedRectangle(cornerRadius: 4)
-                .fill(Color.sessionColor(for: app.appBundleID))
+                .fill(Color.segmentColor(for: app.appBundleID))
                 .frame(width: 4, height: 40)
 
             // App name
@@ -283,7 +283,7 @@ public struct DashboardView: View {
                 HStack(spacing: 0) {
                     Spacer()
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.sessionColor(for: app.appBundleID).opacity(0.3))
+                        .fill(Color.segmentColor(for: app.appBundleID).opacity(0.3))
                         .frame(width: max(geometry.size.width * app.percentage, 20))
                 }
             }

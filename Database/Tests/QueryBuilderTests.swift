@@ -39,7 +39,7 @@ final class QueryBuilderTests: XCTestCase {
     // MARK: - Helper to create VideoSegment with required fields
 
     private func makeSegment(
-        id: SegmentID = SegmentID(),
+        id: VideoSegmentID = VideoSegmentID(value: 0),
         startTime: Date = Date(),
         endTime: Date? = nil,
         frameCount: Int = 100,
@@ -59,9 +59,10 @@ final class QueryBuilderTests: XCTestCase {
     }
 
     private func makeFrame(
-        id: FrameID = FrameID(),
+        id: FrameID = FrameID(value: 0),
         timestamp: Date = Date(),
-        segmentID: SegmentID,
+        segmentID: AppSegmentID,
+        videoID: VideoSegmentID = VideoSegmentID(value: 0),
         frameIndex: Int = 0,
         metadata: FrameMetadata = .empty
     ) -> FrameReference {
@@ -69,6 +70,7 @@ final class QueryBuilderTests: XCTestCase {
             id: id,
             timestamp: timestamp,
             segmentID: segmentID,
+            videoID: videoID,
             frameIndexInSegment: frameIndex,
             metadata: metadata
         )
@@ -87,32 +89,26 @@ final class QueryBuilderTests: XCTestCase {
             relativePath: "segments/2024/01/test.mp4"
         )
 
-        try SegmentQueries.insert(db: db!, segment: segment)
+        let insertedID = try SegmentQueries.insert(db: db!, segment: segment)
 
-        // Verify with raw SQL
-        let sql = "SELECT * FROM segments WHERE id = ?"
+        // Verify with raw SQL - query the video table (not segments)
+        let sql = "SELECT * FROM video WHERE id = ?"
         var statement: OpaquePointer?
         sqlite3_prepare_v2(db, sql, -1, &statement, nil)
-        sqlite3_bind_text(statement, 1, segment.id.stringValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 1, insertedID)
 
         XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
 
-        // Check fields
-        let startTime = sqlite3_column_int64(statement, 1)
-        let endTime = sqlite3_column_int64(statement, 2)
-        let frameCount = sqlite3_column_int(statement, 3)
+        // Check fields - video table has: id, height, width, path, fileSize, frameRate, processingState
+        let height = sqlite3_column_int(statement, 1)
+        let width = sqlite3_column_int(statement, 2)
+        let path = String(cString: sqlite3_column_text(statement, 3))
         let fileSize = sqlite3_column_int64(statement, 4)
-        let path = String(cString: sqlite3_column_text(statement, 5))
-        let width = sqlite3_column_int(statement, 6)
-        let height = sqlite3_column_int(statement, 7)
 
-        XCTAssertEqual(startTime, 1702406400000)  // Milliseconds
-        XCTAssertEqual(endTime, 1702406700000)
-        XCTAssertEqual(frameCount, 150)
-        XCTAssertEqual(fileSize, 52428800)
-        XCTAssertEqual(path, "segments/2024/01/test.mp4")
-        XCTAssertEqual(width, 1920)
         XCTAssertEqual(height, 1080)
+        XCTAssertEqual(width, 1920)
+        XCTAssertEqual(path, "segments/2024/01/test.mp4")
+        XCTAssertEqual(fileSize, 52428800)
 
         sqlite3_finalize(statement)
     }
@@ -132,7 +128,7 @@ final class QueryBuilderTests: XCTestCase {
     }
 
     func testSegmentQueries_GetByID_ReturnsNilForMissingID() throws {
-        let result = try SegmentQueries.getByID(db: db!, id: SegmentID())
+        let result = try SegmentQueries.getByID(db: db!, id: VideoSegmentID(value: 99999))
         XCTAssertNil(result)
     }
 
@@ -236,13 +232,25 @@ final class QueryBuilderTests: XCTestCase {
     // ║                       FRAME QUERIES TESTS                               ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
 
-    private func createTestSegment() throws -> SegmentID {
-        let segment = makeSegment(
+    private func createTestSegment() throws -> AppSegmentID {
+        // Create video segment first
+        let videoSegment = makeSegment(
             startTime: Date().addingTimeInterval(-3600),
             endTime: Date().addingTimeInterval(3600)
         )
-        try SegmentQueries.insert(db: db!, segment: segment)
-        return segment.id
+        try SegmentQueries.insert(db: db!, segment: videoSegment)
+
+        // Create app segment
+        let appSegmentID = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.app",
+            startDate: Date().addingTimeInterval(-3600),
+            endDate: Date().addingTimeInterval(3600),
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+        return AppSegmentID(value: appSegmentID)
     }
 
     func testFrameQueries_Insert_StoresAllFields() throws {
@@ -254,7 +262,7 @@ final class QueryBuilderTests: XCTestCase {
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
-                windowTitle: "GitHub - retrace",
+                windowName: "GitHub - retrace",
                 browserURL: "https://github.com/retrace"
             )
         )
@@ -266,7 +274,7 @@ final class QueryBuilderTests: XCTestCase {
         XCTAssertEqual(retrieved?.frameIndexInSegment, 42)
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.apple.Safari")
         XCTAssertEqual(retrieved?.metadata.appName, "Safari")
-        XCTAssertEqual(retrieved?.metadata.windowTitle, "GitHub - retrace")
+        XCTAssertEqual(retrieved?.metadata.windowName, "GitHub - retrace")
         XCTAssertEqual(retrieved?.metadata.browserURL, "https://github.com/retrace")
     }
 
@@ -279,7 +287,7 @@ final class QueryBuilderTests: XCTestCase {
         let retrieved = try FrameQueries.getByID(db: db!, id: frame.id)
         XCTAssertNil(retrieved?.metadata.appBundleID)
         XCTAssertNil(retrieved?.metadata.appName)
-        XCTAssertNil(retrieved?.metadata.windowTitle)
+        XCTAssertNil(retrieved?.metadata.windowName)
         XCTAssertNil(retrieved?.metadata.browserURL)
     }
 
@@ -433,7 +441,7 @@ final class QueryBuilderTests: XCTestCase {
             timestamp: Date(timeIntervalSince1970: 1702406400),
             content: "Full document content here",
             appName: "Safari",
-            windowTitle: "GitHub Page",
+            windowName: "GitHub Page",
             browserURL: "https://github.com"
         )
 
@@ -443,7 +451,7 @@ final class QueryBuilderTests: XCTestCase {
         XCTAssertNotNil(retrieved)
         XCTAssertEqual(retrieved?.content, "Full document content here")
         XCTAssertEqual(retrieved?.appName, "Safari")
-        XCTAssertEqual(retrieved?.windowTitle, "GitHub Page")
+        XCTAssertEqual(retrieved?.windowName, "GitHub Page")
         XCTAssertEqual(retrieved?.browserURL, "https://github.com")
     }
 

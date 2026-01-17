@@ -16,18 +16,18 @@ public protocol StorageProtocol: Actor {
     /// Create a new video segment writer
     func createSegmentWriter() async throws -> SegmentWriter
 
-    /// Read a frame from a video segment at a specific timestamp
-    /// Seeks to exact timestamp in video file (accurate even with deduplication)
-    func readFrame(segmentID: SegmentID, timestamp: Date) async throws -> Data
+    /// Read a frame from a video segment using frame index
+    /// Frame index is the position in the video (0-based), encoded at fixed 30 FPS
+    func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data
 
     /// Get the file path for a segment
-    func getSegmentPath(id: SegmentID) async throws -> URL
+    func getSegmentPath(id: VideoSegmentID) async throws -> URL
 
     /// Delete a video segment file
-    func deleteSegment(id: SegmentID) async throws
+    func deleteSegment(id: VideoSegmentID) async throws
 
     /// Check if a segment file exists
-    func segmentExists(id: SegmentID) async throws -> Bool
+    func segmentExists(id: VideoSegmentID) async throws -> Bool
 
     // MARK: - Storage Management
 
@@ -38,7 +38,7 @@ public protocol StorageProtocol: Actor {
     func getAvailableDiskSpace() async throws -> Int64
 
     /// Clean up old segments based on retention policy
-    func cleanupOldSegments(olderThan date: Date) async throws -> [SegmentID]
+    func cleanupOldSegments(olderThan date: Date) async throws -> [VideoSegmentID]
 
     /// Get storage directory URL
     func getStorageDirectory() -> URL
@@ -51,7 +51,7 @@ public protocol StorageProtocol: Actor {
 public protocol SegmentWriter: Actor {
 
     /// The segment ID being written
-    var segmentID: SegmentID { get }
+    var segmentID: VideoSegmentID { get }
 
     /// Number of frames written so far
     var frameCount: Int { get }

@@ -20,22 +20,22 @@ public actor DataAdapter {
     // MARK: - Session Cache
 
     /// Cache key for session queries (date range hash)
-    private struct SessionCacheKey: Hashable {
+    private struct SegmentCacheKey: Hashable {
         let startDate: Date
         let endDate: Date
     }
 
     /// Cached session results with expiry
-    private struct SessionCacheEntry {
-        let sessions: [AppSession]
+    private struct SegmentCacheEntry {
+        let segments: [Segment]
         let timestamp: Date
     }
 
     /// Session query cache - keyed by date range
-    private var sessionCache: [SessionCacheKey: SessionCacheEntry] = [:]
+    private var segmentCache: [SegmentCacheKey: SegmentCacheEntry] = [:]
 
-    /// How long cached sessions remain valid (5 minutes)
-    private let sessionCacheTTL: TimeInterval = 300
+    /// How long cached segments remain valid (5 minutes)
+    private let segmentCacheTTL: TimeInterval = 300
 
     // MARK: - Initialization
 
@@ -469,7 +469,7 @@ public actor DataAdapter {
 
     /// Get image data for a specific frame
     /// Routes to appropriate source based on frame's source property
-    public func getFrameImage(segmentID: SegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> Data {
+    public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> Data {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
@@ -491,7 +491,7 @@ public actor DataAdapter {
 
     /// Convenience method that determines source from timestamp
     /// Uses cutoff dates to route appropriately
-    public func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data {
+    public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date) async throws -> Data {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
@@ -510,7 +510,7 @@ public actor DataAdapter {
     }
 
     /// Get video info for a frame (if source is video-based)
-    public func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
+    public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
@@ -529,36 +529,57 @@ public actor DataAdapter {
         return nil
     }
 
-    // MARK: - Session Retrieval
-
-    /// Get sessions in a time range, blending data from all available sources
-    /// Results are cached for 5 minutes to avoid repeated queries
-    public func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession] {
+    /// Get frame image by exact videoID and frameIndex (more reliable than timestamp matching)
+    public func getFrameImageByIndex(videoID: VideoSegmentID, frameIndex: Int, source frameSource: FrameSource) async throws -> Data {
         guard isInitialized else {
-            Log.error("[DataAdapter] getSessions called but not initialized", category: .app)
             throw DataAdapterError.notInitialized
         }
 
-        let cacheKey = SessionCacheKey(startDate: startDate, endDate: endDate)
+        // Route to appropriate data source based on frame source
+        if frameSource == .native {
+            // Native data uses storage system (direct frame extraction)
+            if let retraceSource = primarySource as? RetraceDataSource {
+                return try await retraceSource.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex)
+            }
+        } else if frameSource == .rewind {
+            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+                return try await rewindSource.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex)
+            }
+        }
+
+        throw DataAdapterError.notInitialized
+    }
+
+    // MARK: - Session Retrieval
+
+    /// Get segments in a time range, blending data from all available sources
+    /// Results are cached for 5 minutes to avoid repeated queries
+    public func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment] {
+        guard isInitialized else {
+            Log.error("[DataAdapter] getSegments called but not initialized", category: .app)
+            throw DataAdapterError.notInitialized
+        }
+
+        let cacheKey = SegmentCacheKey(startDate: startDate, endDate: endDate)
 
         // Check cache first
-        if let cached = sessionCache[cacheKey] {
+        if let cached = segmentCache[cacheKey] {
             let age = Date().timeIntervalSince(cached.timestamp)
-            if age < sessionCacheTTL {
-                Log.info("[DataAdapter] getSessions: cache hit (\(cached.sessions.count) sessions, age: \(Int(age))s)", category: .app)
-                return cached.sessions
+            if age < segmentCacheTTL {
+                Log.info("[DataAdapter] getSegments: cache hit (\(cached.segments.count) segments, age: \(Int(age))s)", category: .app)
+                return cached.segments
             } else {
                 // Expired - remove from cache
-                sessionCache.removeValue(forKey: cacheKey)
+                segmentCache.removeValue(forKey: cacheKey)
             }
         }
 
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
 
-        Log.info("[DataAdapter] getSessions: cache miss, querying \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate))", category: .app)
+        Log.info("[DataAdapter] getSegments: cache miss, querying \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate))", category: .app)
 
-        var allSessions: [AppSession] = []
+        var allSessions: [Segment] = []
 
         // Check if any secondary source can provide data for this range
         for (sourceType, source) in secondarySources {
@@ -569,20 +590,20 @@ public actor DataAdapter {
                 // Source only has data before cutoff
                 if startDate < cutoff {
                     let effectiveEnd = min(endDate, cutoff)
-                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for sessions: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: effectiveEnd))", category: .app)
-                    let sessions = try await source.getSessions(from: startDate, to: effectiveEnd)
-                    allSessions.append(contentsOf: sessions)
-                    Log.info("[DataAdapter] ✓ Got \(sessions.count) sessions from \(sourceType.displayName)", category: .app)
+                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for segments: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: effectiveEnd))", category: .app)
+                    let segments = try await source.getSegments(from: startDate, to: effectiveEnd)
+                    allSessions.append(contentsOf: segments)
+                    Log.info("[DataAdapter] ✓ Got \(segments.count) segments from \(sourceType.displayName)", category: .app)
                 }
             } else {
                 // Source has no cutoff - can provide data for any range
-                let sessions = try await source.getSessions(from: startDate, to: endDate)
-                allSessions.append(contentsOf: sessions)
-                Log.info("[DataAdapter] ✓ Got \(sessions.count) sessions from \(sourceType.displayName)", category: .app)
+                let segments = try await source.getSegments(from: startDate, to: endDate)
+                allSessions.append(contentsOf: segments)
+                Log.info("[DataAdapter] ✓ Got \(segments.count) segments from \(sourceType.displayName)", category: .app)
             }
         }
 
-        // Get sessions from primary source (native Retrace)
+        // Get segments from primary source (native Retrace)
         // If secondary sources have cutoffs, only query primary for dates after the latest cutoff
         var primaryStartDate = startDate
         for (_, source) in secondarySources {
@@ -592,24 +613,24 @@ public actor DataAdapter {
         }
 
         if primaryStartDate < endDate {
-            let primarySessions = try await primarySource.getSessions(from: primaryStartDate, to: endDate)
+            let primarySessions = try await primarySource.getSegments(from: primaryStartDate, to: endDate)
             allSessions.append(contentsOf: primarySessions)
-            Log.info("[DataAdapter] ✓ Got \(primarySessions.count) sessions from primary source", category: .app)
+            Log.info("[DataAdapter] ✓ Got \(primarySessions.count) segments from primary source", category: .app)
         }
 
-        // Sort all sessions by start time (ascending - oldest first)
-        allSessions.sort { $0.startTime < $1.startTime }
+        // Sort all segments by start time (ascending - oldest first)
+        allSessions.sort { (a: Segment, b: Segment) -> Bool in a.startDate < b.startDate }
 
         // Cache the results
-        sessionCache[cacheKey] = SessionCacheEntry(sessions: allSessions, timestamp: Date())
+        segmentCache[cacheKey] = SegmentCacheEntry(segments: allSessions, timestamp: Date())
 
-        Log.info("[DataAdapter] Total sessions after merge & sort: \(allSessions.count) (cached)", category: .app)
+        Log.info("[DataAdapter] Total segments after merge & sort: \(allSessions.count) (cached)", category: .app)
         return allSessions
     }
 
     /// Invalidate the session cache (call when new data is recorded)
     public func invalidateSessionCache() {
-        sessionCache.removeAll()
+        segmentCache.removeAll()
         Log.info("[DataAdapter] Session cache invalidated", category: .app)
     }
 
@@ -732,22 +753,48 @@ public actor DataAdapter {
 
     // MARK: - OCR Node Detection (for text selection)
 
-    /// Get all OCR nodes for a given frame
+    /// Get all OCR nodes for a given frame by timestamp
     /// Returns array of nodes with bounding boxes and text content
     /// Currently only supported for Rewind data source
-    public func getAllOCRNodes(timestamp: Date, source frameSource: FrameSource) async throws -> [RewindDataSource.OCRNode] {
+    public func getAllOCRNodes(timestamp: Date, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // Only Rewind source has OCR node data
+        // Both Rewind and native sources now have identical OCR node data (same DB schema)
         if frameSource == .rewind {
             if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
                 return try await rewindSource.getAllOCRNodes(timestamp: timestamp)
             }
+        } else if frameSource == .native {
+            // Native Retrace source - use primary source
+            if let retraceSource = primarySource as? RetraceDataSource {
+                return try await retraceSource.getAllOCRNodes(timestamp: timestamp)
+            }
         }
 
-        // Native source doesn't have this capability yet
+        return []
+    }
+
+    /// Get all OCR nodes for a given frame by frameID (more reliable than timestamp)
+    /// Returns array of nodes with bounding boxes and text content
+    public func getAllOCRNodes(frameID: FrameID, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Both Rewind and native sources now have identical OCR node data (same DB schema)
+        if frameSource == .rewind {
+            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+                return try await rewindSource.getAllOCRNodes(frameID: frameID)
+            }
+        } else if frameSource == .native {
+            // Native Retrace source - use primary source
+            if let retraceSource = primarySource as? RetraceDataSource {
+                return try await retraceSource.getAllOCRNodes(frameID: frameID)
+            }
+        }
+
         return []
     }
 
@@ -773,8 +820,8 @@ public actor DataAdapter {
 
     // MARK: - Full-Text Search
 
-    /// Search across all data sources
-    /// Prioritizes Rewind data source if available (since it has the most OCR data)
+    /// Search across all data sources and consolidate results
+    /// Searches both Retrace (native) and Rewind databases, merging results by relevance
     public func search(query: SearchQuery) async throws -> SearchResults {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
@@ -782,16 +829,72 @@ public actor DataAdapter {
 
         Log.info("[DataAdapter] Search request: '\(query.text)'", category: .app)
 
-        // Try Rewind data source first (if available and connected)
-        if let rewindSource = secondarySources[.rewind] as? RewindDataSource,
-           await rewindSource.isConnected {
-            Log.debug("[DataAdapter] Routing search to RewindDataSource", category: .app)
-            return try await rewindSource.search(query: query)
+        let startTime = Date()
+        var allResults: [SearchResult] = []
+        var totalCount = 0
+
+        // Search primary source (native Retrace)
+        if let retraceSource = primarySource as? RetraceDataSource {
+            do {
+                let retraceResults = try await retraceSource.search(query: query)
+                allResults.append(contentsOf: retraceResults.results)
+                totalCount += retraceResults.totalCount
+                Log.info("[DataAdapter] ✓ Found \(retraceResults.results.count) results from Retrace (total: \(retraceResults.totalCount))", category: .app)
+            } catch {
+                Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
+            }
         }
 
-        // Fallback to error if no searchable source available
-        Log.warning("[DataAdapter] No searchable data source available", category: .app)
-        throw DataAdapterError.sourceNotAvailable(.rewind)
+        // Search Rewind data source (if available and connected)
+        if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
+            let isRewindConnected = await rewindSource.isConnected
+            Log.debug("[DataAdapter] Rewind source found, isConnected: \(isRewindConnected)", category: .app)
+
+            if isRewindConnected {
+                do {
+                    Log.debug("[DataAdapter] Starting Rewind search...", category: .app)
+                    var rewindResults = try await rewindSource.search(query: query)
+                    Log.debug("[DataAdapter] Rewind search completed with \(rewindResults.results.count) results, tagging...", category: .app)
+                    // Tag results with Rewind source
+                    rewindResults.results = rewindResults.results.map { result in
+                        var modifiedResult = result
+                        modifiedResult.source = .rewind
+                        return modifiedResult
+                    }
+                    allResults.append(contentsOf: rewindResults.results)
+                    totalCount += rewindResults.totalCount
+                    Log.info("[DataAdapter] ✓ Found \(rewindResults.results.count) results from Rewind (total: \(rewindResults.totalCount))", category: .app)
+                } catch {
+                    Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
+                }
+            }
+        } else {
+            Log.debug("[DataAdapter] No Rewind source available", category: .app)
+        }
+
+        // Sort consolidated results based on search mode
+        switch query.mode {
+        case .relevant:
+            // Sort by relevance score (highest first)
+            allResults.sort { $0.relevanceScore > $1.relevanceScore }
+        case .all:
+            // Sort chronologically (most recent first)
+            allResults.sort { $0.timestamp > $1.timestamp }
+        }
+
+        // Apply limit
+        let limitedResults = Array(allResults.prefix(query.limit))
+
+        let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+
+        Log.info("[DataAdapter] Consolidated \(allResults.count) results from all sources (returned: \(limitedResults.count), total: \(totalCount)) in \(searchTimeMs)ms", category: .app)
+
+        return SearchResults(
+            query: query,
+            results: limitedResults,
+            totalCount: totalCount,
+            searchTimeMs: searchTimeMs
+        )
     }
 }
 

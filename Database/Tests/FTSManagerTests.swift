@@ -50,15 +50,15 @@ final class FTSManagerTests: XCTestCase {
     // │ HELPER METHODS                                                          │
     // └─────────────────────────────────────────────────────────────────────────┘
 
-    private func createTestData() async throws -> (SegmentID, FrameID, FrameID, FrameID) {
+    private func createTestData() async throws -> (VideoSegmentID, FrameID, FrameID, FrameID) {
         let baseTime = Date()
         let frame1Time = baseTime.addingTimeInterval(-200)
         let frame2Time = baseTime.addingTimeInterval(-100)
         let frame3Time = baseTime.addingTimeInterval(-10)
 
-        // Create a segment
-        let segment = VideoSegment(
-            id: SegmentID(),
+        // Create app segment and video segment
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
             startTime: frame1Time,
             endTime: frame3Time,
             frameCount: 3,
@@ -68,37 +68,47 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertSegment(segment)
+        try await database.insertVideoSegment(videoSegment)
+
+        // Create app segment
+        let segmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: frame1Time,
+            endDate: frame3Time,
+            windowName: "Test Window",
+            browserUrl: nil,
+            type: 0
+        )
 
         // Create frames
         let frame1 = FrameReference(
-            id: FrameID(),
+            id: FrameID(value: 0),
             timestamp: frame1Time,
-            segmentID: segment.id,
-            sessionID: nil,
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: videoSegment.id,
             frameIndexInSegment: 0,
             encodingStatus: .success,
-            metadata: FrameMetadata(appName: "Safari", windowTitle: "GitHub")
+            metadata: FrameMetadata(appName: "Safari", windowName: "GitHub")
         )
 
         let frame2 = FrameReference(
-            id: FrameID(),
+            id: FrameID(value: 0),
             timestamp: frame2Time,
-            segmentID: segment.id,
-            sessionID: nil,
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: videoSegment.id,
             frameIndexInSegment: 1,
             encodingStatus: .success,
-            metadata: FrameMetadata(appName: "Xcode", windowTitle: "Retrace Project")
+            metadata: FrameMetadata(appName: "Xcode", windowName: "Retrace Project")
         )
 
         let frame3 = FrameReference(
-            id: FrameID(),
+            id: FrameID(value: 0),
             timestamp: frame3Time,
-            segmentID: segment.id,
-            sessionID: nil,
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: videoSegment.id,
             frameIndexInSegment: 2,
             encodingStatus: .success,
-            metadata: FrameMetadata(appName: "Terminal", windowTitle: "bash")
+            metadata: FrameMetadata(appName: "Terminal", windowName: "bash")
         )
 
         try await database.insertFrame(frame1)
@@ -112,7 +122,7 @@ final class FTSManagerTests: XCTestCase {
             timestamp: frame1Time,
             content: "Swift programming language documentation for macOS development",
             appName: "Safari",
-            windowTitle: "GitHub"
+            windowName: "GitHub"
         )
 
         let doc2 = IndexedDocument(
@@ -121,7 +131,7 @@ final class FTSManagerTests: XCTestCase {
             timestamp: frame2Time,
             content: "Retrace screen recording and search application source code",
             appName: "Xcode",
-            windowTitle: "Retrace Project"
+            windowName: "Retrace Project"
         )
 
         let doc3 = IndexedDocument(
@@ -130,14 +140,14 @@ final class FTSManagerTests: XCTestCase {
             timestamp: frame3Time,
             content: "Terminal commands for git commit and push operations",
             appName: "Terminal",
-            windowTitle: "bash"
+            windowName: "bash"
         )
 
         _ = try await database.insertDocument(doc1)
         _ = try await database.insertDocument(doc2)
         _ = try await database.insertDocument(doc3)
 
-        return (segment.id, frame1.id, frame2.id, frame3.id)
+        return (videoSegment.id, frame1.id, frame2.id, frame3.id)
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────┐
@@ -280,8 +290,8 @@ final class FTSManagerTests: XCTestCase {
     func testSearchWithAppBundleIDFilter() async throws {
         // Create test data with bundle IDs
         let baseTime = Date()
-        let segment = VideoSegment(
-            id: SegmentID(),
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
             startTime: baseTime,
             endTime: baseTime.addingTimeInterval(100),
             frameCount: 2,
@@ -291,33 +301,51 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertSegment(segment)
+        try await database.insertVideoSegment(videoSegment)
+
+        let segmentID1 = try await database.insertSegment(
+            bundleID: "com.google.Chrome",
+            startDate: baseTime,
+            endDate: baseTime.addingTimeInterval(50),
+            windowName: "Test",
+            browserUrl: nil,
+            type: 0
+        )
+
+        let segmentID2 = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: baseTime.addingTimeInterval(50),
+            endDate: baseTime.addingTimeInterval(100),
+            windowName: "Test",
+            browserUrl: nil,
+            type: 0
+        )
 
         let frame1 = FrameReference(
-            id: FrameID(),
+            id: FrameID(value: 0),
             timestamp: baseTime,
-            segmentID: segment.id,
-            sessionID: nil,
+            segmentID: AppSegmentID(value: segmentID1),
+            videoID: videoSegment.id,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.google.Chrome",
                 appName: "Chrome",
-                windowTitle: "Test"
+                windowName: "Test"
             )
         )
 
         let frame2 = FrameReference(
-            id: FrameID(),
+            id: FrameID(value: 0),
             timestamp: baseTime.addingTimeInterval(50),
-            segmentID: segment.id,
-            sessionID: nil,
+            segmentID: AppSegmentID(value: segmentID2),
+            videoID: videoSegment.id,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: FrameMetadata(
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
-                windowTitle: "Test"
+                windowName: "Test"
             )
         )
 
@@ -330,7 +358,7 @@ final class FTSManagerTests: XCTestCase {
             timestamp: baseTime,
             content: "Chrome browser testing",
             appName: "Chrome",
-            windowTitle: "Test"
+            windowName: "Test"
         )
 
         let doc2 = IndexedDocument(
@@ -339,7 +367,7 @@ final class FTSManagerTests: XCTestCase {
             timestamp: baseTime.addingTimeInterval(50),
             content: "Safari browser testing",
             appName: "Safari",
-            windowTitle: "Test"
+            windowName: "Test"
         )
 
         _ = try await database.insertDocument(doc1)
@@ -460,10 +488,11 @@ final class FTSManagerTests: XCTestCase {
 
     func testSearchPagination() async throws {
         // Create more test data for pagination
-        let segment = VideoSegment(
-            id: SegmentID(),
-            startTime: Date(),
-            endTime: Date().addingTimeInterval(600),
+        let startTime = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: startTime,
+            endTime: startTime.addingTimeInterval(600),
             frameCount: 5,
             fileSizeBytes: 1024,
             relativePath: "segments/test.mp4",
@@ -471,14 +500,24 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertSegment(segment)
+        try await database.insertVideoSegment(videoSegment)
+
+        let segmentID = try await database.insertSegment(
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: startTime.addingTimeInterval(600),
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
 
         // Create 5 frames with similar content
         for i in 0..<5 {
             let frame = FrameReference(
-                id: FrameID(),
-                timestamp: Date().addingTimeInterval(Double(i * 10)),
-                segmentID: segment.id,
+                id: FrameID(value: 0),
+                timestamp: startTime.addingTimeInterval(Double(i * 10)),
+                segmentID: AppSegmentID(value: segmentID),
+                videoID: videoSegment.id,
                 frameIndexInSegment: i,
                 metadata: .empty
             )
@@ -516,10 +555,11 @@ final class FTSManagerTests: XCTestCase {
     // └─────────────────────────────────────────────────────────────────────────┘
 
     func testSearchRanking() async throws {
-        let segment = VideoSegment(
-            id: SegmentID(),
-            startTime: Date(),
-            endTime: Date().addingTimeInterval(600),
+        let startTime = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: startTime,
+            endTime: startTime.addingTimeInterval(600),
             frameCount: 3,
             fileSizeBytes: 1024,
             relativePath: "segments/test.mp4",
@@ -527,24 +567,33 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertSegment(segment)
+        try await database.insertVideoSegment(videoSegment)
+
+        let segmentID = try await database.insertSegment(
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: startTime.addingTimeInterval(600),
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
 
         // Create documents with varying relevance
         let frame1 = FrameReference(
-            id: FrameID(),
-            timestamp: Date(),
-            segmentID: segment.id,
-            sessionID: nil,
+            id: FrameID(value: 0),
+            timestamp: startTime,
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: videoSegment.id,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty
         )
 
         let frame2 = FrameReference(
-            id: FrameID(),
-            timestamp: Date().addingTimeInterval(10),
-            segmentID: segment.id,
-            sessionID: nil,
+            id: FrameID(value: 0),
+            timestamp: startTime.addingTimeInterval(10),
+            segmentID: AppSegmentID(value: segmentID),
+            videoID: videoSegment.id,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: .empty

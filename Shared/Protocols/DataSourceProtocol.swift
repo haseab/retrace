@@ -119,28 +119,28 @@ public protocol DataSourceProtocol: Actor {
 
     /// Get image data for a specific frame
     /// - Parameters:
-    ///   - segmentID: The segment containing the frame
+    ///   - segmentID: The video segment containing the frame
     ///   - timestamp: The frame's timestamp
     /// - Returns: JPEG image data
-    func getFrameImage(segmentID: SegmentID, timestamp: Date) async throws -> Data
+    func getFrameImage(segmentID: VideoSegmentID, timestamp: Date) async throws -> Data
 
     /// Get video source info for a specific frame (for video-based sources like Rewind)
     /// - Parameters:
-    ///   - segmentID: The segment containing the frame
+    ///   - segmentID: The video segment containing the frame
     ///   - timestamp: The frame's timestamp
     /// - Returns: Video playback info, or nil if this source doesn't use video
-    func getFrameVideoInfo(segmentID: SegmentID, timestamp: Date) async throws -> FrameVideoInfo?
+    func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date) async throws -> FrameVideoInfo?
 
     /// The cutoff date for this source (data is only available before this date)
     /// Returns nil if the source has no cutoff (e.g., native Retrace data)
     var cutoffDate: Date? { get }
 
-    /// Get sessions within a time range (for analytics/dashboard)
+    /// Get segments within a time range (for analytics/dashboard)
     /// - Parameters:
     ///   - startDate: Start of the time range
     ///   - endDate: End of the time range
-    /// - Returns: Array of app sessions within the time range
-    func getSessions(from startDate: Date, to endDate: Date) async throws -> [AppSession]
+    /// - Returns: Array of app segments within the time range
+    func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment]
 
     // MARK: - Deletion
 
@@ -164,6 +164,8 @@ public enum DataSourceError: Error, LocalizedError {
     case frameNotFound
     case imageNotFound
     case unsupportedOperation
+    case videoNotFound(id: Int64)
+    case invalidVideoPath(path: String)
 
     public var errorDescription: String? {
         switch self {
@@ -179,6 +181,10 @@ public enum DataSourceError: Error, LocalizedError {
             return "Frame image not found"
         case .unsupportedOperation:
             return "Operation not supported by this data source"
+        case .videoNotFound(let id):
+            return "Video segment not found: \(id)"
+        case .invalidVideoPath(let path):
+            return "Invalid video path format: \(path)"
         }
     }
 }

@@ -5,7 +5,7 @@ import Shared
 /// Concrete SegmentWriter that encodes frames to MP4 container using AVAssetWriter.
 /// This ensures frames can be read reliably with AVAsset/AVAssetImageGenerator.
 public actor SegmentWriterImpl: SegmentWriter {
-    public let segmentID: SegmentID
+    public let segmentID: VideoSegmentID
     public private(set) var frameCount: Int = 0
     public let startTime: Date
 
@@ -20,7 +20,7 @@ public actor SegmentWriterImpl: SegmentWriter {
     private var frameHeight: Int = 0
 
     init(
-        segmentID: SegmentID,
+        segmentID: VideoSegmentID,
         fileURL: URL,
         relativePath: String,
         encoderConfig: VideoEncoderConfig = .default
@@ -59,10 +59,11 @@ public actor SegmentWriterImpl: SegmentWriter {
         }
 
         let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
-        // Use REAL timestamp relative to segment start (not frame count!)
-        // This ensures correct seeking even when frames are deduplicated or intervals change
-        let elapsedSeconds = frame.timestamp.timeIntervalSince(startTime)
-        let timestamp = CMTime(seconds: elapsedSeconds, preferredTimescale: 600)
+        // Encode at fixed 30 FPS regardless of actual capture intervals
+        // Frame N is at time N/30.0 seconds (so frame 0 = 0s, frame 1 = 0.033s, etc.)
+        // This creates a smooth video that can be seeked frame-by-frame
+        let frameTime = Double(frameCount) / 30.0
+        let timestamp = CMTime(seconds: frameTime, preferredTimescale: 600)
 
         try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
 

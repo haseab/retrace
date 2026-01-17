@@ -32,71 +32,74 @@ public actor StorageManager: StorageProtocol {
             throw StorageError.directoryCreationFailed(path: "Storage not initialized")
         }
 
-        let segmentID = SegmentID()
+        // Generate a unique temporary ID based on current time (milliseconds since epoch)
+        // This will be replaced with the real database ID after finalization
         let now = Date()
-        let fileURL = try await directoryManager.segmentURL(for: segmentID, date: now)
+        let tempID = VideoSegmentID(value: Int64(now.timeIntervalSince1970 * 1000))
+        let fileURL = try await directoryManager.segmentURL(for: tempID, date: now)
         let relative = await directoryManager.relativePath(from: fileURL)
 
         return try SegmentWriterImpl(
-            segmentID: segmentID,
+            segmentID: tempID,
             fileURL: fileURL,
             relativePath: relative,
             encoderConfig: encoderConfig
         )
     }
 
-    public func readFrame(segmentID: SegmentID, timestamp: Date) async throws -> Data {
+    public func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
+        Log.debug("[StorageManager] readFrame called: segmentID=\(segmentID.value), frameIndex=\(frameIndex)", category: .storage)
+
         // Get segment path - files are MP4 without extension (no decryption needed)
         let segmentURL = try await getSegmentPath(id: segmentID)
-        let asset = AVAsset(url: segmentURL)
+
+        // Create temporary symlink with .mp4 extension so AVFoundation can identify the file format
+        // (Rewind-compatible storage: files don't have extensions)
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = segmentURL.lastPathComponent
+        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+
+        // Create symlink if it doesn't exist
+        if !FileManager.default.fileExists(atPath: symlinkPath.path) {
+            do {
+                try FileManager.default.createSymbolicLink(
+                    atPath: symlinkPath.path,
+                    withDestinationPath: segmentURL.path
+                )
+            } catch {
+                throw StorageError.fileReadFailed(
+                    path: segmentURL.path,
+                    underlying: "Failed to create symlink: \(error.localizedDescription)"
+                )
+            }
+        }
+
+        // Load asset from symlink (with .mp4 extension for format detection)
+        let asset = AVAsset(url: symlinkPath)
 
         // Verify video track exists
         guard try await !asset.loadTracks(withMediaType: .video).isEmpty else {
             throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "No video track")
         }
 
-        // Get segment start time from metadata (embedded during encoding)
-        let metadata = try await asset.load(.metadata)
-        var segmentStart: Date?
+        // Videos are encoded at fixed 30 FPS
+        // Frame N is at time N/30.0 seconds (frame 0 = 0s, frame 1 = 0.033s, etc.)
+        let frameTimeSeconds = Double(frameIndex) / 30.0
+        let time = CMTime(seconds: frameTimeSeconds, preferredTimescale: 600)
 
-        for item in metadata {
-            if item.identifier == .quickTimeMetadataCreationDate,
-               let value = try await item.load(.value) as? String {
-                // Parse ISO 8601 date string
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                segmentStart = formatter.date(from: value)
-                break
-            }
-        }
-
-        // Fallback: try common metadata if custom metadata not found
-        if segmentStart == nil {
-            if let creationDateItem = try await asset.load(.creationDate),
-               let date = try await creationDateItem.load(.dateValue) {
-                segmentStart = date
-            }
-        }
-
-        guard let segmentStart else {
-            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "No creation date metadata found")
-        }
-
-        // Calculate time relative to segment start
-        let relativeSeconds = timestamp.timeIntervalSince(segmentStart)
-
-        // Ensure we're not seeking before the start or after the end
-        guard relativeSeconds >= 0 else {
-            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Requested timestamp before segment start")
-        }
+        Log.debug("[StorageManager] Extracting frame at time=\(frameTimeSeconds)s (frameIndex=\(frameIndex)) from \(segmentURL.lastPathComponent)", category: .storage)
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        let time = CMTime(seconds: relativeSeconds, preferredTimescale: 600)
-        let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
+        var actualTime: CMTime = .zero
+        let cgImage = try generator.copyCGImage(at: time, actualTime: &actualTime)
+
+        // Calculate what frame we actually got vs what we requested
+        let actualSeconds = actualTime.seconds
+        let actualFrameIndex = Int(round(actualSeconds * 30.0))
 
         let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let tiffData = nsImage.tiffRepresentation,
@@ -105,18 +108,22 @@ public actor StorageManager: StorageProtocol {
             throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Failed to convert frame")
         }
 
+        Log.debug("[StorageManager] ✅ Extracted frame: requested=\(frameIndex), actual=\(actualFrameIndex) (time=\(String(format: "%.3f", actualSeconds))s), size=\(cgImage.width)x\(cgImage.height), jpegSize=\(jpegData.count) bytes", category: .storage)
+
         return jpegData
     }
 
-    public func getSegmentPath(id: SegmentID) async throws -> URL {
+    public func getSegmentPath(id: VideoSegmentID) async throws -> URL {
         let files = try await directoryManager.listAllSegmentFiles()
-        if let match = files.first(where: { $0.lastPathComponent.contains(id.stringValue) }) {
+        // CRITICAL: Use exact match, not substring! Files are named with Int64 ID (e.g., "1768624554519")
+        // .contains() would match "8" in "1768624603374" - must use == for exact match
+        if let match = files.first(where: { $0.lastPathComponent == id.stringValue }) {
             return match
         }
         throw StorageError.fileNotFound(path: id.stringValue)
     }
 
-    public func deleteSegment(id: SegmentID) async throws {
+    public func deleteSegment(id: VideoSegmentID) async throws {
         let url = try await getSegmentPath(id: id)
         do {
             try FileManager.default.removeItem(at: url)
@@ -125,7 +132,7 @@ public actor StorageManager: StorageProtocol {
         }
     }
 
-    public func segmentExists(id: SegmentID) async throws -> Bool {
+    public func segmentExists(id: VideoSegmentID) async throws -> Bool {
         (try? await getSegmentPath(id: id)) != nil
     }
 
@@ -145,9 +152,9 @@ public actor StorageManager: StorageProtocol {
         try DiskSpaceMonitor.availableBytes(at: storageRootURL)
     }
 
-    public func cleanupOldSegments(olderThan date: Date) async throws -> [SegmentID] {
+    public func cleanupOldSegments(olderThan date: Date) async throws -> [VideoSegmentID] {
         let files = try await directoryManager.listAllSegmentFiles()
-        var deleted: [SegmentID] = []
+        var deleted: [VideoSegmentID] = []
 
         for url in files {
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
@@ -169,12 +176,10 @@ public actor StorageManager: StorageProtocol {
 
     // MARK: - Private helpers
 
-    private func parseSegmentID(from url: URL) -> SegmentID? {
-        // No extension to delete - files are stored without extensions
+    private func parseSegmentID(from url: URL) -> VideoSegmentID? {
+        // Files are named with just the Int64 ID (e.g., "12345")
         let name = url.lastPathComponent
-        guard name.hasPrefix("segment_") else { return nil }
-        let uuidString = name.replacingOccurrences(of: "segment_", with: "")
-        guard let uuid = UUID(uuidString: uuidString) else { return nil }
-        return SegmentID(value: uuid)
+        guard let int64Value = Int64(name) else { return nil }
+        return VideoSegmentID(value: int64Value)
     }
 }

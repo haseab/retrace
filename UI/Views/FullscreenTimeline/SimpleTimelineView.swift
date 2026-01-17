@@ -28,6 +28,11 @@ public struct SimpleTimelineView: View {
 
     public var body: some View {
         GeometryReader { geometry in
+            // Calculate actual frame rect for coordinate transformations
+            let actualFrameRect = calculateActualDisplayedFrameRectForView(
+                containerSize: geometry.size
+            )
+
             ZStack {
                 // Full screen frame display
                 frameDisplay
@@ -117,14 +122,19 @@ public struct SimpleTimelineView: View {
 
                 // Search highlight overlay
                 if viewModel.isShowingSearchHighlight {
-                    SearchHighlightOverlay(viewModel: viewModel, containerSize: geometry.size)
+                    SearchHighlightOverlay(
+                        viewModel: viewModel,
+                        containerSize: geometry.size,
+                        actualFrameRect: actualFrameRect
+                    )
                 }
 
-                // Controls toggle button (bottom-left, always visible unless dragging zoom region)
+                // Controls toggle button and search bar (bottom-left, always visible unless dragging zoom region)
                 VStack {
                     Spacer()
-                    HStack {
+                    HStack(spacing: 12) {
                         controlsToggleButton
+                        SearchButton(viewModel: viewModel)
                         Spacer()
                     }
                 }
@@ -153,8 +163,17 @@ public struct SimpleTimelineView: View {
     private var frameDisplay: some View {
         if let videoInfo = viewModel.currentVideoInfo {
             // Video-based frame (Rewind) with URL overlay
-            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                SimpleVideoFrameView(videoInfo: videoInfo)
+            // Only show if video file exists
+            if FileManager.default.fileExists(atPath: videoInfo.videoPath) {
+                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                    SimpleVideoFrameView(videoInfo: videoInfo)
+                }
+            } else {
+                // Video file missing - show black screen
+                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                    Rectangle()
+                        .fill(Color.black)
+                }
             }
         } else if let image = viewModel.currentImage {
             // Static image (Retrace) with URL overlay
@@ -164,14 +183,19 @@ public struct SimpleTimelineView: View {
                     .aspectRatio(contentMode: .fit)
             }
         } else if !viewModel.isLoading {
-            // Empty state
+            // Empty state - no video or image available
             VStack(spacing: .spacingM) {
                 Image(systemName: "photo.on.rectangle.angled")
                     .font(.system(size: 48))
                     .foregroundColor(.white.opacity(0.3))
-                Text("No frames recorded")
+                Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not available")
                     .font(.retraceBody)
                     .foregroundColor(.white.opacity(0.5))
+                if !viewModel.frames.isEmpty {
+                    Text("Video segment missing")
+                        .font(.system(size: 13))
+                        .foregroundColor(.white.opacity(0.3))
+                }
             }
         }
     }
@@ -199,7 +223,7 @@ public struct SimpleTimelineView: View {
                 .frame(width: 36, height: 36)
                 .background(
                     Circle()
-                        .fill(Color.black.opacity(0.5))
+                        .fill(Color(white: 0.15))
                 )
                 .overlay(
                     Circle()
@@ -217,7 +241,7 @@ public struct SimpleTimelineView: View {
             if let frame = viewModel.currentFrame, let appName = frame.metadata.appName {
                 HStack(spacing: .spacingS) {
                     Circle()
-                        .fill(Color.sessionColor(for: frame.metadata.appBundleID ?? ""))
+                        .fill(Color.segmentColor(for: frame.metadata.appBundleID ?? ""))
                         .frame(width: 10, height: 10)
                     Text(appName)
                         .font(.system(size: 14, weight: .medium))
@@ -243,6 +267,54 @@ public struct SimpleTimelineView: View {
                 .font(.retraceBody)
                 .foregroundColor(.white.opacity(0.7))
         }
+    }
+
+    // MARK: - Helper Methods
+
+    /// Calculate the actual displayed frame rect within the container for the main view
+    private func calculateActualDisplayedFrameRectForView(containerSize: CGSize) -> CGRect {
+        // Get the actual frame dimensions
+        let frameSize: CGSize
+        if let image = viewModel.currentImage {
+            frameSize = image.size
+        } else if let videoInfo = viewModel.currentVideoInfo {
+            // For video, use standard macOS screen dimensions as fallback
+            frameSize = CGSize(width: 1920, height: 1080)
+        } else {
+            // No frame available, return full container
+            return CGRect(origin: .zero, size: containerSize)
+        }
+
+        // Calculate aspect-fit dimensions
+        let containerAspect = containerSize.width / containerSize.height
+        let frameAspect = frameSize.width / frameSize.height
+
+        let displayedSize: CGSize
+        let offset: CGPoint
+
+        if frameAspect > containerAspect {
+            // Frame is wider - fit to width, letterbox top/bottom
+            displayedSize = CGSize(
+                width: containerSize.width,
+                height: containerSize.width / frameAspect
+            )
+            offset = CGPoint(
+                x: 0,
+                y: (containerSize.height - displayedSize.height) / 2
+            )
+        } else {
+            // Frame is taller - fit to height, pillarbox left/right
+            displayedSize = CGSize(
+                width: containerSize.height * frameAspect,
+                height: containerSize.height
+            )
+            offset = CGPoint(
+                x: (containerSize.width - displayedSize.width) / 2,
+                y: 0
+            )
+        }
+
+        return CGRect(origin: offset, size: displayedSize)
     }
 
     // MARK: - Error Overlay
@@ -394,6 +466,12 @@ struct FrameWithURLOverlay<Content: View>: View {
             let showTransition = viewModel.isZoomTransitioning && viewModel.zoomRegion != nil
             let showNormal = !viewModel.isZoomRegionActive && !viewModel.isZoomTransitioning
 
+            // Calculate actual frame rect for coordinate transformations
+            let actualFrameRect = calculateActualDisplayedFrameRect(
+                containerSize: geometry.size,
+                viewModel: viewModel
+            )
+
             ZStack {
                 // The actual frame content (always present as base layer)
                 content()
@@ -432,6 +510,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                         TextSelectionOverlay(
                             viewModel: viewModel,
                             containerSize: geometry.size,
+                            actualFrameRect: actualFrameRect,
                             onDragStart: { point in
                                 viewModel.startDragSelection(at: point)
                             },
@@ -467,6 +546,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                         URLBoundingBoxOverlay(
                             boundingBox: box,
                             containerSize: geometry.size,
+                            actualFrameRect: actualFrameRect,
                             isHovering: viewModel.isHoveringURL,
                             onHoverChanged: { hovering in
                                 viewModel.isHoveringURL = hovering
@@ -481,6 +561,53 @@ struct FrameWithURLOverlay<Content: View>: View {
                 }
             }
         }
+    }
+
+    /// Calculate the actual displayed frame rect within the container
+    /// Takes into account aspect ratio fitting
+    private func calculateActualDisplayedFrameRect(containerSize: CGSize, viewModel: SimpleTimelineViewModel) -> CGRect {
+        // Get the actual frame dimensions
+        let frameSize: CGSize
+        if let image = viewModel.currentImage {
+            frameSize = image.size
+        } else if let videoInfo = viewModel.currentVideoInfo {
+            // For video, use standard macOS screen dimensions as fallback
+            frameSize = CGSize(width: 1920, height: 1080)
+        } else {
+            // No frame available, return full container
+            return CGRect(origin: .zero, size: containerSize)
+        }
+
+        // Calculate aspect-fit dimensions
+        let containerAspect = containerSize.width / containerSize.height
+        let frameAspect = frameSize.width / frameSize.height
+
+        let displayedSize: CGSize
+        let offset: CGPoint
+
+        if frameAspect > containerAspect {
+            // Frame is wider - fit to width, letterbox top/bottom
+            displayedSize = CGSize(
+                width: containerSize.width,
+                height: containerSize.width / frameAspect
+            )
+            offset = CGPoint(
+                x: 0,
+                y: (containerSize.height - displayedSize.height) / 2
+            )
+        } else {
+            // Frame is taller - fit to height, pillarbox left/right
+            displayedSize = CGSize(
+                width: containerSize.height * frameAspect,
+                height: containerSize.height
+            )
+            offset = CGPoint(
+                x: (containerSize.width - displayedSize.width) / 2,
+                y: 0
+            )
+        }
+
+        return CGRect(origin: offset, size: displayedSize)
     }
 }
 
@@ -1178,6 +1305,7 @@ extension View {
 struct URLBoundingBoxOverlay: NSViewRepresentable {
     let boundingBox: RewindDataSource.URLBoundingBox
     let containerSize: CGSize
+    let actualFrameRect: CGRect
     let isHovering: Bool
     let onHoverChanged: (Bool) -> Void
     let onClick: () -> Void
@@ -1193,10 +1321,10 @@ struct URLBoundingBoxOverlay: NSViewRepresentable {
         // Calculate the actual frame rect from normalized coordinates
         // Note: The bounding box coordinates are normalized (0.0-1.0)
         let rect = NSRect(
-            x: boundingBox.x * containerSize.width,
-            y: (1.0 - boundingBox.y - boundingBox.height) * containerSize.height, // Flip Y (AppKit origin is bottom-left)
-            width: boundingBox.width * containerSize.width,
-            height: boundingBox.height * containerSize.height
+            x: actualFrameRect.origin.x + (boundingBox.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((1.0 - boundingBox.y - boundingBox.height) * actualFrameRect.height), // Flip Y
+            width: boundingBox.width * actualFrameRect.width,
+            height: boundingBox.height * actualFrameRect.height
         )
 
         nsView.boundingRect = rect
@@ -1294,6 +1422,7 @@ class URLOverlayView: NSView {
 struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
+    let actualFrameRect: CGRect
     let onDragStart: (CGPoint) -> Void
     let onDragUpdate: (CGPoint) -> Void
     let onDragEnd: () -> Void
@@ -1324,10 +1453,10 @@ struct TextSelectionOverlay: NSViewRepresentable {
         // Build node data with selection ranges (normal mode - no zoom transformation)
         nsView.nodeData = viewModel.ocrNodes.map { node in
             let rect = NSRect(
-                x: node.x * containerSize.width,
-                y: (1.0 - node.y - node.height) * containerSize.height, // Flip Y
-                width: node.width * containerSize.width,
-                height: node.height * containerSize.height
+                x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+                y: actualFrameRect.origin.y + ((1.0 - node.y - node.height) * actualFrameRect.height), // Flip Y
+                width: node.width * actualFrameRect.width,
+                height: node.height * actualFrameRect.height
             )
             let selectionRange = viewModel.getSelectionRange(for: node.id)
             return TextSelectionView.NodeData(
@@ -1339,6 +1468,7 @@ struct TextSelectionOverlay: NSViewRepresentable {
         }
 
         nsView.containerSize = containerSize
+        nsView.actualFrameRect = actualFrameRect
         nsView.isDraggingSelection = viewModel.dragStartPoint != nil
         nsView.isDraggingZoomRegion = viewModel.isDraggingZoomRegion
 
@@ -1359,6 +1489,7 @@ class TextSelectionView: NSView {
 
     var nodeData: [NodeData] = []
     var containerSize: CGSize = .zero
+    var actualFrameRect: CGRect = .zero
     var isDraggingSelection: Bool = false
     var isDraggingZoomRegion: Bool = false
 
@@ -1402,12 +1533,8 @@ class TextSelectionView: NSView {
         mouseDownPoint = location
         hasMoved = false
 
-        // Convert to normalized coordinates
-        guard containerSize.width > 0 && containerSize.height > 0 else { return }
-        let normalizedPoint = CGPoint(
-            x: location.x / containerSize.width,
-            y: 1.0 - (location.y / containerSize.height) // Flip Y back
-        )
+        // Convert screen coordinates to normalized frame coordinates
+        let normalizedPoint = screenToNormalizedCoords(location)
 
         // Check if Shift is held - start zoom region mode
         if event.modifierFlags.contains(.shift) {
@@ -1447,12 +1574,8 @@ class TextSelectionView: NSView {
         let clampedX = max(0, min(bounds.width, location.x))
         let clampedY = max(0, min(bounds.height, location.y))
 
-        // Convert to normalized coordinates
-        guard containerSize.width > 0 && containerSize.height > 0 else { return }
-        let normalizedPoint = CGPoint(
-            x: clampedX / containerSize.width,
-            y: 1.0 - (clampedY / containerSize.height) // Flip Y back
-        )
+        // Convert screen coordinates to normalized frame coordinates
+        let normalizedPoint = screenToNormalizedCoords(CGPoint(x: clampedX, y: clampedY))
 
         if isZoomDragging {
             onZoomRegionUpdate?(normalizedPoint)
@@ -1478,6 +1601,29 @@ class TextSelectionView: NSView {
             }
         }
         needsDisplay = true
+    }
+
+    /// Convert screen coordinates to normalized frame coordinates (0.0-1.0)
+    /// Takes into account the actual displayed frame rect (aspect ratio fitting)
+    private func screenToNormalizedCoords(_ screenPoint: CGPoint) -> CGPoint {
+        guard actualFrameRect.width > 0 && actualFrameRect.height > 0 else {
+            // Fallback to old behavior if actualFrameRect not set
+            guard containerSize.width > 0 && containerSize.height > 0 else { return .zero }
+            return CGPoint(
+                x: screenPoint.x / containerSize.width,
+                y: 1.0 - (screenPoint.y / containerSize.height)
+            )
+        }
+
+        // Convert from screen coordinates to frame-relative coordinates
+        let frameRelativeX = screenPoint.x - actualFrameRect.origin.x
+        let frameRelativeY = screenPoint.y - actualFrameRect.origin.y
+
+        // Normalize to 0.0-1.0 range
+        let normalizedX = frameRelativeX / actualFrameRect.width
+        let normalizedY = 1.0 - (frameRelativeY / actualFrameRect.height) // Flip Y
+
+        return CGPoint(x: normalizedX, y: normalizedY)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1653,6 +1799,7 @@ struct DeleteConfirmationDialog: View {
 struct SearchHighlightOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
+    let actualFrameRect: CGRect
 
     @State private var highlightScale: CGFloat = 0.3
 
@@ -1667,10 +1814,10 @@ struct SearchHighlightOverlay: View {
             // Cutout holes for highlights - use compositingGroup for blend mode to work
             ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
                 let node = match.node
-                let screenX = node.x * containerSize.width
-                let screenY = node.y * containerSize.height
-                let screenWidth = node.width * containerSize.width
-                let screenHeight = node.height * containerSize.height
+                let screenX = actualFrameRect.origin.x + (node.x * actualFrameRect.width)
+                let screenY = actualFrameRect.origin.y + (node.y * actualFrameRect.height)
+                let screenWidth = node.width * actualFrameRect.width
+                let screenHeight = node.height * actualFrameRect.height
 
                 RoundedRectangle(cornerRadius: 3)
                     .fill(Color.white)
@@ -1686,10 +1833,10 @@ struct SearchHighlightOverlay: View {
             ZStack {
                 ForEach(Array(cachedNodes.enumerated()), id: \.offset) { _, match in
                     let node = match.node
-                    let screenX = node.x * containerSize.width
-                    let screenY = node.y * containerSize.height
-                    let screenWidth = node.width * containerSize.width
-                    let screenHeight = node.height * containerSize.height
+                    let screenX = actualFrameRect.origin.x + (node.x * actualFrameRect.width)
+                    let screenY = actualFrameRect.origin.y + (node.y * actualFrameRect.height)
+                    let screenWidth = node.width * actualFrameRect.width
+                    let screenHeight = node.height * actualFrameRect.height
 
                     RoundedRectangle(cornerRadius: 3)
                         .stroke(Color.yellow.opacity(0.9), lineWidth: 2)

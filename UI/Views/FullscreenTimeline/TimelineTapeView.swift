@@ -48,7 +48,18 @@ public struct TimelineTapeView: View {
 
             // Calculate offset to center current frame
             let currentFrameOffset = offsetForFrame(viewModel.currentIndex, in: blocks)
-            let tapeOffset = centerX - currentFrameOffset
+            let unclampedTapeOffset = centerX - currentFrameOffset
+
+            // Calculate total tape width
+            let totalTapeWidth = calculateTotalTapeWidth(blocks: blocks)
+
+            // Clamp tape offset to prevent scrolling past content
+            // - At the start: tape's left edge shouldn't go past centerX
+            // - At the end: tape's right edge shouldn't go past centerX
+            let maxOffset = centerX // Start of tape at center (for first frame)
+            let minOffset = centerX - totalTapeWidth // End of tape at center (for last frame)
+
+            let tapeOffset = max(minOffset, min(maxOffset, unclampedTapeOffset))
 
             HStack(spacing: blockSpacing) {
                 ForEach(blocks) { block in
@@ -126,6 +137,17 @@ public struct TimelineTapeView: View {
 
     // MARK: - Helper Functions
 
+    /// Calculate the total width of the timeline tape
+    private func calculateTotalTapeWidth(blocks: [AppBlock]) -> CGFloat {
+        guard !blocks.isEmpty else { return 0 }
+
+        // Sum all block widths plus spacing between blocks
+        let blocksWidth = blocks.reduce(0) { $0 + $1.width(pixelsPerFrame: pixelsPerFrame) }
+        let totalSpacing = CGFloat(blocks.count - 1) * blockSpacing
+
+        return blocksWidth + totalSpacing
+    }
+
     /// Calculate the horizontal offset for a given frame index
     private func offsetForFrame(_ frameIndex: Int, in blocks: [AppBlock]) -> CGFloat {
         var offset: CGFloat = 0
@@ -152,7 +174,7 @@ public struct TimelineTapeView: View {
 
     private func blockColor(for block: AppBlock) -> Color {
         if let bundleID = block.bundleID {
-            return Color.sessionColor(for: bundleID)
+            return Color.segmentColor(for: bundleID)
         }
         return Color.gray.opacity(0.5)
     }
@@ -203,7 +225,7 @@ public struct TimelineTapeView: View {
                     .padding(.vertical, 10)
                     .background(
                         Capsule()
-                            .fill(Color.black.opacity(0.75))
+                            .fill(Color(white: 0.15))
                     )
                     .overlay(
                         Capsule()
@@ -220,13 +242,12 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: centerX, y: -55)
 
-                // Right side controls (search + zoom + more options)
+                // Right side controls (zoom + more options)
                 HStack(spacing: 12) {
-                    SearchButton(viewModel: viewModel)
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
-                .position(x: geometry.size.width - 180, y: -55)
+                .position(x: geometry.size.width - 100, y: -55)
 
                 // Playhead vertical line (fixed at center)
                 Rectangle()
@@ -304,7 +325,7 @@ struct ZoomControl: View {
                     .frame(width: 32, height: 32)
                     .background(
                         Circle()
-                            .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color.black.opacity(0.5))
+                            .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color(white: 0.15))
                     )
                     .overlay(
                         Circle()
@@ -324,7 +345,7 @@ struct ZoomControl: View {
             Group {
                 if viewModel.isZoomSliderExpanded {
                     Capsule()
-                        .fill(Color.black.opacity(0.75))
+                        .fill(Color(white: 0.15))
                         .overlay(
                             Capsule()
                                 .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
@@ -387,7 +408,7 @@ struct SearchButton: View {
             .frame(width: 160)
             .background(
                 Capsule()
-                    .fill(Color.black.opacity(0.5))
+                    .fill(Color(white: 0.15))
             )
             .overlay(
                 Capsule()
@@ -420,7 +441,7 @@ struct MoreOptionsMenu: View {
                 .frame(width: 32, height: 32)
                 .background(
                     Circle()
-                        .fill(showMenu ? Color.white.opacity(0.15) : Color.black.opacity(0.5))
+                        .fill(showMenu ? Color.white.opacity(0.15) : Color(white: 0.15))
                 )
                 .overlay(
                     Circle()

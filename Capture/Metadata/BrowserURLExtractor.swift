@@ -13,15 +13,19 @@ struct BrowserURLExtractor: Sendable {
     ///   - bundleID: Browser bundle identifier
     ///   - pid: Process ID of the browser
     /// - Returns: Current URL if available
+    ///
+    /// Note: Only Safari uses deep hierarchy traversal.
+    /// Chrome/Chromium browsers use AXDocument attribute.
+    /// All other browsers return nil (rely on OCR to extract URL).
     static func getURL(bundleID: String, pid: pid_t) -> String? {
         switch bundleID {
         case "com.apple.Safari":
             return getSafariURL(pid: pid)
         case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser":
             return getChromiumURL(pid: pid)
-        case "org.mozilla.firefox":
-            return getFirefoxURL(pid: pid)
         default:
+            // For all other browsers (Firefox, Opera, Vivaldi, etc.),
+            // rely on OCR to extract URL from the screen
             return nil
         }
     }
@@ -95,7 +99,12 @@ struct BrowserURLExtractor: Sendable {
 
     // MARK: - Chromium-based Browsers
 
-    /// Extract URL from Chrome/Edge/Brave using Accessibility API
+    /// Extract URL from Chrome/Edge/Brave using AXDocument attribute
+    /// - Parameter pid: Process ID of the browser
+    /// - Returns: Current URL if available
+    ///
+    /// Chrome and Chromium-based browsers expose the URL via the AXDocument attribute
+    /// on the focused window. This is more reliable than hierarchy traversal.
     private static func getChromiumURL(pid: pid_t) -> String? {
         let appRef = AXUIElementCreateApplication(pid)
 
@@ -110,123 +119,19 @@ struct BrowserURLExtractor: Sendable {
             return nil
         }
 
-        // Chromium browsers expose URL in the address bar
-        // The address bar is typically a text field with subrole "AXAddressField"
-        if let url = findAddressFieldURL(in: window as! AXUIElement) {
-            return url
-        }
-
-        // Fallback: try to get it from window title
-        // Many browsers show URL in the title
-        var titleValue: CFTypeRef?
+        // Try to get URL from AXDocument attribute
+        var documentValue: CFTypeRef?
         if AXUIElementCopyAttributeValue(
             window as! AXUIElement,
-            kAXTitleAttribute as CFString,
-            &titleValue
+            kAXDocumentAttribute as CFString,
+            &documentValue
         ) == .success,
-           let title = titleValue as? String {
-            // Extract URL from title if present
-            return extractURLFromTitle(title)
-        }
-
-        return nil
-    }
-
-    // MARK: - Firefox
-
-    /// Extract URL from Firefox using Accessibility API
-    private static func getFirefoxURL(pid: pid_t) -> String? {
-        let appRef = AXUIElementCreateApplication(pid)
-
-        // Get focused window
-        var windowValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            appRef,
-            kAXFocusedWindowAttribute as CFString,
-            &windowValue
-        ) == .success,
-              let window = windowValue else {
-            return nil
-        }
-
-        // Try to find address bar
-        if let url = findAddressFieldURL(in: window as! AXUIElement) {
+           let url = documentValue as? String,
+           !url.isEmpty {
             return url
         }
 
         return nil
     }
 
-    // MARK: - Helper Methods
-
-    /// Recursively search for address field in UI element hierarchy
-    private static func findAddressFieldURL(in element: AXUIElement, depth: Int = 0) -> String? {
-        // Limit recursion depth to prevent infinite loops
-        guard depth < 10 else { return nil }
-
-        // Check if this element is an address field
-        var subroleValue: CFTypeRef?
-        if AXUIElementCopyAttributeValue(
-            element,
-            kAXSubroleAttribute as CFString,
-            &subroleValue
-        ) == .success,
-           let subrole = subroleValue as? String,
-           subrole.contains("Address") {
-
-            // Get value
-            var urlValue: CFTypeRef?
-            if AXUIElementCopyAttributeValue(
-                element,
-                kAXValueAttribute as CFString,
-                &urlValue
-            ) == .success,
-               let url = urlValue as? String,
-               !url.isEmpty {
-                return url
-            }
-        }
-
-        // Search children
-        var childrenValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXChildrenAttribute as CFString,
-            &childrenValue
-        ) == .success,
-              let children = childrenValue as? [AXUIElement] else {
-            return nil
-        }
-
-        for child in children {
-            if let url = findAddressFieldURL(in: child, depth: depth + 1) {
-                return url
-            }
-        }
-
-        return nil
-    }
-
-    /// Extract URL from window title
-    /// Some browsers include URL in the title like "Page Title - URL"
-    private static func extractURLFromTitle(_ title: String) -> String? {
-        // Simple heuristic: look for http:// or https:// in title
-        let patterns = ["https://", "http://"]
-
-        for pattern in patterns {
-            if let range = title.range(of: pattern) {
-                let urlStart = range.lowerBound
-                let remainingString = String(title[urlStart...])
-
-                // Extract until whitespace or end
-                if let endIndex = remainingString.firstIndex(where: { $0.isWhitespace }) {
-                    return String(remainingString[..<endIndex])
-                } else {
-                    return remainingString
-                }
-            }
-        }
-
-        return nil
-    }
 }
