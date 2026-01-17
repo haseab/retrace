@@ -27,6 +27,7 @@ public actor ServiceContainer {
     public let modelManager: ModelManager
     nonisolated public let onboardingManager: OnboardingManager
     public var dataAdapter: DataAdapter?
+    public var processingQueue: FrameProcessingQueue?
 
     // MARK: - Configuration
 
@@ -232,10 +233,22 @@ public actor ServiceContainer {
         try await search.initialize(config: searchConfig)
         Log.info("✓ Search initialized", category: .app)
 
-        // 7. Migration doesn't need explicit initialization
+        // 7. Initialize processing queue and start workers
+        let queue = FrameProcessingQueue(
+            database: database,
+            storage: storage,
+            processing: processing,
+            search: search,
+            config: .default
+        )
+        await queue.startWorkers()
+        self.processingQueue = queue
+        Log.info("✓ Processing queue initialized with \(ProcessingQueueConfig.default.workerCount) workers", category: .app)
+
+        // 8. Migration doesn't need explicit initialization
         Log.info("✓ Migration ready", category: .app)
 
-        // 8. Initialize DataAdapter with primary and secondary sources
+        // 9. Initialize DataAdapter with primary and secondary sources
         let retraceSource = RetraceDataSource(database: database, storage: storage, searchManager: search)
         let adapter = DataAdapter(primarySource: retraceSource)
 
@@ -327,7 +340,11 @@ public actor ServiceContainer {
         //     Log.info("✓ Audio capture stopped", category: .app)
         // }
 
-        // Wait for processing queue to drain
+        // Stop processing queue workers
+        await processingQueue?.stopWorkers()
+        Log.info("✓ Processing queue workers stopped", category: .app)
+
+        // Wait for processing queue to drain (legacy OCR queue)
         await processing.waitForQueueDrain()
         Log.info("✓ Processing queue drained", category: .app)
 

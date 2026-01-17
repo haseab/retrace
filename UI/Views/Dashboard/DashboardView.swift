@@ -114,7 +114,7 @@ public struct DashboardView: View {
     // MARK: - Recording Indicator
 
     private var recordingIndicator: some View {
-        HStack(spacing: .spacingS) {
+        HStack(spacing: .spacingM) {
             // Pulsating dot (red when not recording, green when recording)
             ZStack {
                 // Pulse layer (animated ring)
@@ -141,6 +141,18 @@ public struct DashboardView: View {
             Text(viewModel.isRecording ? "Recording" : "Not Recording")
                 .font(.retraceCaption)
                 .foregroundColor(viewModel.isRecording ? .white : .white.opacity(0.9))
+
+            // Toggle switch
+            Toggle("", isOn: Binding(
+                get: { viewModel.isRecording },
+                set: { newValue in
+                    Task {
+                        await viewModel.toggleRecording(to: newValue)
+                    }
+                }
+            ))
+            .labelsHidden()
+            .toggleStyle(SwitchToggleStyle(tint: .green))
         }
         .padding(.horizontal, .spacingM)
         .padding(.vertical, .spacingS)

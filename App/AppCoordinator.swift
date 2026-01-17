@@ -6,6 +6,7 @@ import Capture
 import Processing
 import Search
 import Migration
+import CoreGraphics
 
 /// Main coordinator that wires all modules together
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
@@ -57,7 +58,51 @@ public actor AppCoordinator {
     public func initialize() async throws {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
+
+        // Run crash recovery from WAL
+        try await recoverFromCrash()
+
         Log.info("AppCoordinator initialized successfully", category: .app)
+    }
+
+    /// Recover frames from write-ahead log (WAL) after a crash
+    private func recoverFromCrash() async throws {
+        Log.info("Checking for crash recovery...", category: .app)
+
+        // Cast to concrete StorageManager to access WAL
+        guard let storageManager = services.storage as? StorageManager else {
+            Log.warning("Storage not using WAL-enabled StorageManager, skipping recovery", category: .app)
+            return
+        }
+
+        let walManager = await storageManager.getWALManager()
+        let recoveryManager = RecoveryManager(
+            walManager: walManager,
+            storage: services.storage,
+            database: services.database,
+            processing: services.processing,
+            search: services.search
+        )
+
+        // Set callback for enqueueing recovered frames
+        if let queue = await services.processingQueue {
+            await recoveryManager.setFrameEnqueueCallback { frameIDs in
+                try await queue.enqueueBatch(frameIDs: frameIDs)
+            }
+        }
+
+        let result = try await recoveryManager.recoverAll()
+
+        // Re-enqueue frames that were processing during crash
+        if let queue = await services.processingQueue {
+            try await queue.requeueCrashedFrames()
+        }
+
+        if result.sessionsRecovered > 0 {
+            Log.warning("Crash recovery completed: \(result.sessionsRecovered) sessions, \(result.framesRecovered) frames recovered", category: .app)
+        } else {
+            Log.info("No crash recovery needed", category: .app)
+        }
     }
 
     /// Register Rewind data source if enabled
@@ -217,10 +262,7 @@ public actor AppCoordinator {
                 // STEP 2: Track app session changes
                 try await trackSessionChange(frame: frame)
 
-                // STEP 3: Extract text via OCR and Accessibility
-                let extractedText = try await services.processing.extractText(from: frame)
-
-                // STEP 4: Store frame reference in database
+                // STEP 3: Store frame reference in database with pending status
                 // Rewind-compatible: segmentID = app session, videoID = video chunk
                 let videoSegmentID = await currentWriter!.segmentID
                 guard let appSegmentID = currentSegmentID else {
@@ -233,50 +275,20 @@ public actor AppCoordinator {
                     segmentID: AppSegmentID(value: appSegmentID),  // Link to app session (segment table)
                     videoID: videoSegmentID,  // Link to video chunk (video table)
                     frameIndexInSegment: frameCount - 1,  // Position in video file (NOT for timestamp calculation!)
-                    metadata: extractedText.metadata,  // Use updated metadata from processing
+                    metadata: frame.metadata,  // Use original metadata from capture
                     source: .native
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
 
-                // STEP 5: Index text for search (Rewind-compatible FTS)
-                // Inserts into searchRanking_content and doc_segment tables
-                // This returns the docid that nodes will reference
-                let docid = try await services.search.index(
-                    text: extractedText,
-                    segmentId: appSegmentID,
-                    frameId: frameID
-                )
-
-                // STEP 6: Calculate text offsets and insert OCR nodes (Rewind-compatible)
-                // Each node references a substring of the fullText via textOffset/textLength
-                if docid > 0 && !extractedText.regions.isEmpty {
-                    var currentOffset = 0
-                    var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
-
-                    // Calculate textOffset for each region based on concatenation order
-                    // ExtractedText.fullText is created by joining region texts with " " separator
-                    for region in extractedText.regions {
-                        let textLength = region.text.count
-
-                        nodeData.append((
-                            textOffset: currentOffset,
-                            textLength: textLength,
-                            bounds: region.bounds,
-                            windowIndex: nil  // Single window for now
-                        ))
-
-                        // Move offset forward: text + space separator
-                        currentOffset += textLength + 1  // +1 for space separator
-                    }
-
-                    // Insert all nodes for this frame
-                    try await services.database.insertNodes(
-                        frameID: FrameID(value: frameID),
-                        nodes: nodeData,
-                        frameWidth: frame.width,
-                        frameHeight: frame.height
-                    )
+                // STEP 4: Enqueue for async OCR processing
+                // OCR, FTS indexing, and node insertion happen in background workers
+                guard let processingQueue = await services.processingQueue else {
+                    Log.error("Processing queue not initialized", category: .app)
+                    continue
                 }
+                try await processingQueue.enqueue(frameID: frameID)
+
+                Log.debug("Frame \(frameID) enqueued for async processing", category: .app)
 
                 totalFramesProcessed += 1
 

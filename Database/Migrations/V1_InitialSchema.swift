@@ -72,12 +72,13 @@ struct V1_InitialSchema: Migration {
                 videoFrameIndex INTEGER,
                 isStarred       INTEGER NOT NULL DEFAULT 0,
                 encodingStatus  TEXT,
+                processingStatus INTEGER DEFAULT 0,
                 FOREIGN KEY (segmentId) REFERENCES segment(id) ON DELETE CASCADE,
                 FOREIGN KEY (videoId) REFERENCES video(id) ON DELETE SET NULL
             );
             """
         try execute(db: db, sql: sql)
-        Log.debug("✓ Created frame table")
+        Log.debug("✓ Created frame table with processingStatus column")
     }
 
     private func createNodeTable(db: OpaquePointer) throws {
@@ -263,6 +264,21 @@ struct V1_InitialSchema: Migration {
             """
         try execute(db: db, sql: purgeSQL)
         Log.debug("✓ Created purge table")
+
+        // processing_queue: Async frame processing queue (NEW)
+        let processingQueueSQL = """
+            CREATE TABLE IF NOT EXISTS processing_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frameId INTEGER NOT NULL,
+                enqueuedAt REAL NOT NULL,
+                priority INTEGER DEFAULT 0,
+                retryCount INTEGER DEFAULT 0,
+                lastError TEXT,
+                FOREIGN KEY(frameId) REFERENCES frame(id) ON DELETE CASCADE
+            );
+            """
+        try execute(db: db, sql: processingQueueSQL)
+        Log.debug("✓ Created processing_queue table")
     }
 
     // MARK: - Indexes
@@ -309,7 +325,14 @@ struct V1_InitialSchema: Migration {
         // audio indexes (1)
         try execute(db: db, sql: "CREATE INDEX IF NOT EXISTS index_audio_on_starttime ON audio(startTime);")
 
-        Log.debug("✓ Created all 21 indexes (Rewind-compatible naming)")
+        // processing_queue indexes (2)
+        try execute(db: db, sql: "CREATE INDEX IF NOT EXISTS idx_processing_queue_enqueued ON processing_queue(enqueuedAt);")
+        try execute(db: db, sql: "CREATE INDEX IF NOT EXISTS idx_processing_queue_priority ON processing_queue(priority DESC, enqueuedAt ASC);")
+
+        // frame processingStatus index (1)
+        try execute(db: db, sql: "CREATE INDEX IF NOT EXISTS idx_frame_processing_status ON frame(processingStatus);")
+
+        Log.debug("✓ Created all 24 indexes (21 Rewind-compatible + 3 new for async processing)")
     }
 
     // MARK: - Helper

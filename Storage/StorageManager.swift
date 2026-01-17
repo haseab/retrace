@@ -9,6 +9,7 @@ public actor StorageManager: StorageProtocol {
     private var storageRootURL: URL
     private let directoryManager: DirectoryManager
     private let encoderConfig: VideoEncoderConfig
+    private let walManager: WALManager
 
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
@@ -17,6 +18,10 @@ public actor StorageManager: StorageProtocol {
         self.storageRootURL = storageRoot
         self.directoryManager = DirectoryManager(storageRoot: storageRoot)
         self.encoderConfig = encoderConfig
+
+        // Initialize WAL manager in wal/ subdirectory
+        let walRoot = storageRoot.appendingPathComponent("wal", isDirectory: true)
+        self.walManager = WALManager(walRoot: walRoot)
     }
 
     public func initialize(config: StorageConfig) async throws {
@@ -25,6 +30,9 @@ public actor StorageManager: StorageProtocol {
         storageRootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
         await directoryManager.updateRoot(storageRootURL)
         try await directoryManager.ensureBaseDirectories()
+
+        // Initialize WAL
+        try await walManager.initialize()
     }
 
     public func createSegmentWriter() async throws -> SegmentWriter {
@@ -39,12 +47,19 @@ public actor StorageManager: StorageProtocol {
         let fileURL = try await directoryManager.segmentURL(for: tempID, date: now)
         let relative = await directoryManager.relativePath(from: fileURL)
 
-        return try SegmentWriterImpl(
+        // Use IncrementalSegmentWriter with WAL support
+        return try IncrementalSegmentWriter(
             segmentID: tempID,
             fileURL: fileURL,
             relativePath: relative,
+            walManager: walManager,
             encoderConfig: encoderConfig
         )
+    }
+
+    /// Get WAL manager for recovery operations
+    public func getWALManager() -> WALManager {
+        return walManager
     }
 
     public func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
@@ -136,6 +151,24 @@ public actor StorageManager: StorageProtocol {
         (try? await getSegmentPath(id: id)) != nil
     }
 
+    /// Rename a video segment file (used when temporary ID is replaced with database ID)
+    public func renameSegment(from oldID: VideoSegmentID, to newID: VideoSegmentID, date: Date) async throws {
+        // Find old file
+        guard let oldURL = try? await getSegmentPath(id: oldID) else {
+            throw StorageError.fileNotFound(path: oldID.stringValue)
+        }
+
+        // Generate new path with same date structure
+        let newURL = try await directoryManager.segmentURL(for: newID, date: date)
+
+        // Rename file
+        do {
+            try FileManager.default.moveItem(at: oldURL, to: newURL)
+            Log.debug("[StorageManager] Renamed video segment: \(oldID.stringValue) -> \(newID.stringValue)", category: .storage)
+        } catch {
+            throw StorageError.fileWriteFailed(path: newURL.path, underlying: error.localizedDescription)
+        }
+    }
 
     public func getTotalStorageUsed() async throws -> Int64 {
         let files = try await directoryManager.listAllSegmentFiles()

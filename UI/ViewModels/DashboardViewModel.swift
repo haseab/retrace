@@ -54,6 +54,22 @@ public class DashboardViewModel: ObservableObject {
         isRecording = await coordinator.isCapturing()
     }
 
+    public func toggleRecording(to newValue: Bool) async {
+        do {
+            if newValue {
+                try await coordinator.startPipeline()
+            } else {
+                try await coordinator.stopPipeline()
+            }
+            // Update recording status immediately
+            await updateRecordingStatus()
+        } catch {
+            print("Failed to toggle recording: \(error)")
+            // Revert to actual state on error
+            await updateRecordingStatus()
+        }
+    }
+
     private func setupAccessibilityWarningCallback() {
         Task {
             await coordinator.setupAccessibilityWarningCallback { [weak self] in

@@ -26,13 +26,16 @@ actor DirectoryManager {
         let calendar = Calendar.current
         let year = calendar.component(.year, from: date)
         let month = calendar.component(.month, from: date)
+        let day = calendar.component(.day, from: date)
 
-        // Rewind format: chunks/YYYYMM/videoID
+        // Format: chunks/YYYYMM/DD/videoID
         let yearMonth = String(format: "%04d%02d", year, month)
+        let dayStr = String(format: "%02d", day)
 
         let dir = storageRoot
             .appendingPathComponent("chunks", isDirectory: true)
             .appendingPathComponent(yearMonth, isDirectory: true)
+            .appendingPathComponent(dayStr, isDirectory: true)
 
         try createDirIfNeeded(dir)
         // No extension - security through obscurity (files are actually MP4)

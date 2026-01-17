@@ -860,8 +860,8 @@ public actor DatabaseManager: DatabaseProtocol {
 
     private func getFrameDateRange(db: OpaquePointer) throws -> (oldest: Date?, newest: Date?) {
         let sql = """
-            SELECT MIN(timestamp), MAX(timestamp)
-            FROM frames;
+            SELECT MIN(createdAt), MAX(createdAt)
+            FROM frame;
             """
 
         var statement: OpaquePointer?
