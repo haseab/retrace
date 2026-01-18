@@ -862,38 +862,39 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        Log.debug("[SearchNavigation] Frame not in current data by ID, loading frames around timestamp...", category: .ui)
+        Log.debug("[SearchNavigation] Frame not in current data by ID, loading frames in ±10 min window...", category: .ui)
 
-        // If not found, need to load frames around this timestamp
+        // If not found, load frames in a ±10 minute window around the target timestamp
+        // This approach (same as Cmd+G date search) guarantees the target frame is included
         do {
             isLoading = true
 
-            // Load frames around the target timestamp
-            let loadedFrames = try await coordinator.getFramesAround(timestamp: timestamp, count: WindowConfig.loadBatchSize)
-            Log.debug("[SearchNavigation] Loaded \(loadedFrames.count) frames around timestamp", category: .ui)
+            // Calculate ±10 minute window around target timestamp
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: timestamp) ?? timestamp
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: timestamp) ?? timestamp
 
-            // Log first few frames to see what timestamps we got
-            for (i, frame) in loadedFrames.prefix(5).enumerated() {
-                let diff = frame.timestamp.timeIntervalSince(timestamp)
-                Log.debug("[SearchNavigation] Frame[\(i)]: timestamp=\(df.string(from: frame.timestamp)) (epoch: \(frame.timestamp.timeIntervalSince1970)), diff=\(String(format: "%.3f", diff))s from target", category: .ui)
-            }
+            Log.debug("[SearchNavigation] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))", category: .ui)
 
-            guard !loadedFrames.isEmpty else {
-                Log.warning("[SearchNavigation] No frames found around timestamp", category: .ui)
+            // Fetch all frames in the 20-minute window with video info (single optimized query)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            Log.debug("[SearchNavigation] Loaded \(framesWithVideoInfo.count) frames in time range", category: .ui)
+
+            guard !framesWithVideoInfo.isEmpty else {
+                Log.warning("[SearchNavigation] No frames found in time range", category: .ui)
                 isLoading = false
                 return
             }
 
-            // Convert to TimelineFrames with video info
-            var timelineFrames: [TimelineFrame] = []
-            for frame in loadedFrames {
-                let videoInfo = try? await coordinator.getFrameVideoInfo(
-                    segmentID: frame.videoID,
-                    timestamp: frame.timestamp,
-                    source: frame.source
-                )
-                timelineFrames.append(TimelineFrame(frame: frame, videoInfo: videoInfo))
+            // Clear old image cache since we're jumping to a new time window
+            let oldCacheCount = imageCache.count
+            imageCache.removeAll()
+            if oldCacheCount > 0 {
+                Log.debug("[SearchNavigation] Cleared image cache (\(oldCacheCount) images removed)", category: .ui)
             }
+
+            // Convert to TimelineFrame - video info is already included from the JOIN
+            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
             Log.debug("[SearchNavigation] Converted to \(timelineFrames.count) timeline frames", category: .ui)
 
             // Replace current frames with new window

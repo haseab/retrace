@@ -65,15 +65,9 @@ public struct DashboardView: View {
                 retraceLogo
                     .frame(width: 40, height: 40)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Dashboard")
-                        .font(.retraceTitle)
-                        .foregroundColor(.retracePrimary)
-
-                    Text("Your screen history at a glance")
-                        .font(.retraceBody)
-                        .foregroundColor(.retraceSecondary)
-                }
+                Text("Dashboard")
+                    .font(.retraceTitle)
+                    .foregroundColor(.retracePrimary)
             }
 
             Spacer()
