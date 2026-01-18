@@ -39,7 +39,7 @@ public struct OnboardingView: View {
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
     // Encryption
-    @State private var encryptionEnabled: Bool? = true
+    @State private var encryptionEnabled: Bool? = false
 
     let coordinator: AppCoordinator
     let onComplete: () -> Void
@@ -50,9 +50,51 @@ public struct OnboardingView: View {
 
     public var body: some View {
         ZStack {
-            // Background
-            Color.retraceBackground
-                .ignoresSafeArea()
+            // Background with gradient orbs
+            ZStack {
+                Color.retraceBackground
+
+                // Subtle gradient orbs for depth
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color.retraceAccent.opacity(0.08), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 350
+                        )
+                    )
+                    .frame(width: 700, height: 700)
+                    .offset(x: -250, y: -150)
+                    .blur(radius: 70)
+
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color(red: 139/255, green: 92/255, blue: 246/255).opacity(0.06), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 300
+                        )
+                    )
+                    .frame(width: 600, height: 600)
+                    .offset(x: 300, y: 250)
+                    .blur(radius: 60)
+
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color.retraceSuccess.opacity(0.04), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 200
+                        )
+                    )
+                    .frame(width: 400, height: 400)
+                    .offset(x: 100, y: -300)
+                    .blur(radius: 50)
+            }
+            .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 // Progress indicator
@@ -142,10 +184,14 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
 
         case 3:
-            // Permissions - requires both permissions, moves to indicator step
+            // Permissions - requires both permissions, skips indicator step (step 4) and goes to encryption
             Button(action: {
                 stopPermissionMonitoring()
-                withAnimation { currentStep = 4 }
+                // Start recording pipeline here (was previously in step 4)
+                Task {
+                    try? await coordinator.startPipeline()
+                }
+                withAnimation { currentStep = 5 }  // Skip step 4 (indicator step)
             }) {
                 Text("Continue")
                     .font(.retraceHeadline)
@@ -158,23 +204,23 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
             .disabled(!hasScreenRecordingPermission || !hasAccessibilityPermission)
 
-        case 4:
-            // Screen Recording Indicator - starts recording when user continues
-            Button(action: {
-                Task {
-                    try? await coordinator.startPipeline()
-                }
-                withAnimation { currentStep = 5 }
-            }) {
-                Text("Continue")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, .spacingL)
-                    .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
-                    .cornerRadius(.cornerRadiusM)
-            }
-            .buttonStyle(.plain)
+        // case 4: - COMMENTED OUT - Screen Recording Indicator step not needed for now
+        //     // Screen Recording Indicator - starts recording when user continues
+        //     Button(action: {
+        //         Task {
+        //             try? await coordinator.startPipeline()
+        //         }
+        //         withAnimation { currentStep = 5 }
+        //     }) {
+        //         Text("Continue")
+        //             .font(.retraceHeadline)
+        //             .foregroundColor(.white)
+        //             .padding(.horizontal, .spacingL)
+        //             .padding(.vertical, .spacingM)
+        //             .background(Color.retraceAccent)
+        //             .cornerRadius(.cornerRadiusM)
+        //     }
+        //     .buttonStyle(.plain)
 
         case 5:
             // Encryption - requires selection
@@ -320,8 +366,8 @@ public struct OnboardingView: View {
             creatorFeaturesStep
         case 3:
             permissionsStep
-        case 4:
-            screenRecordingIndicatorStep
+        // case 4: - COMMENTED OUT - Screen Recording Indicator step not needed for now
+        //     screenRecordingIndicatorStep
         case 5:
             encryptionStep
         case 6:

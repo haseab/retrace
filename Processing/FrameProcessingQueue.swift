@@ -253,9 +253,21 @@ public actor FrameProcessingQueue {
             throw DatabaseError.queryFailed(query: "getFrame", underlying: "Frame \(frameID) not found")
         }
 
-        // Load frame image from video
+        // Get video segment to find the actual file path
+        guard let videoSegment = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
+            throw DatabaseError.queryFailed(query: "getVideoSegment", underlying: "Video segment \(frameRef.videoID) not found")
+        }
+
+        // Extract the actual segment ID from the path (last path component is the timestamp-based ID)
+        let pathComponents = videoSegment.relativePath.split(separator: "/")
+        guard let lastComponent = pathComponents.last,
+              let actualSegmentID = Int64(lastComponent) else {
+            throw ProcessingError.invalidVideoPath(path: videoSegment.relativePath)
+        }
+
+        // Load frame image from video using the actual segment ID from the filename
         let frameData = try await storage.readFrame(
-            segmentID: frameRef.videoID,
+            segmentID: VideoSegmentID(value: actualSegmentID),
             frameIndex: frameRef.frameIndexInSegment
         )
 
@@ -290,20 +302,13 @@ public actor FrameProcessingQueue {
                 currentOffset += textLength + 1
             }
 
-            // Get frame dimensions from video segment
-            let videoSegments = try await databaseManager.getVideoSegments(
-                from: frameRef.timestamp.addingTimeInterval(-1),
-                to: frameRef.timestamp.addingTimeInterval(1)
+            // Use videoSegment we already fetched above (no redundant query)
+            try await databaseManager.insertNodes(
+                frameID: FrameID(value: frameID),
+                nodes: nodeData,
+                frameWidth: videoSegment.width,
+                frameHeight: videoSegment.height
             )
-
-            if let videoSegment = videoSegments.first(where: { $0.id == frameRef.videoID }) {
-                try await databaseManager.insertNodes(
-                    frameID: FrameID(value: frameID),
-                    nodes: nodeData,
-                    frameWidth: videoSegment.width,
-                    frameHeight: videoSegment.height
-                )
-            }
         }
 
         // Mark as completed

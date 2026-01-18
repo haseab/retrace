@@ -223,8 +223,8 @@ public actor WALManager {
         var frames: [CapturedFrame] = []
 
         while true {
-            // Read header
-            let headerSize = 34 // 8+4+4+4+4+4+2+2+2+2
+            // Read header: 8+4+4+4+4+4+2+2+2+2 = 36 bytes
+            let headerSize = 36
             guard let headerData = try? fileHandle.read(upToCount: headerSize),
                   headerData.count == headerSize else {
                 break // End of file
@@ -295,25 +295,42 @@ public actor WALManager {
     }
 
     private func parseFrameHeader(from data: Data) throws -> WALFrameHeader {
+        // Header size: 8+4+4+4+4+4+2+2+2+2 = 36 bytes
+        let expectedHeaderSize = 36
+        guard data.count >= expectedHeaderSize else {
+            throw StorageError.fileReadFailed(
+                path: "WAL header",
+                underlying: "Incomplete header: expected \(expectedHeaderSize) bytes, got \(data.count)"
+            )
+        }
+
         var offset = 0
 
-        func read<T>(_ type: T.Type) -> T {
+        func read<T>(_ type: T.Type) throws -> T {
+            let size = MemoryLayout<T>.size
+            // Bounds check to prevent crash on corrupted data
+            guard offset + size <= data.count else {
+                throw StorageError.fileReadFailed(
+                    path: "WAL header",
+                    underlying: "Out of bounds read at offset \(offset) for \(size) bytes (data size: \(data.count))"
+                )
+            }
             let value = data.withUnsafeBytes { $0.load(fromByteOffset: offset, as: type) }
-            offset += MemoryLayout<T>.size
+            offset += size
             return value
         }
 
         return WALFrameHeader(
-            timestamp: read(Double.self),
-            width: read(UInt32.self),
-            height: read(UInt32.self),
-            bytesPerRow: read(UInt32.self),
-            dataSize: read(UInt32.self),
-            displayID: read(UInt32.self),
-            appBundleIDLength: read(UInt16.self),
-            appNameLength: read(UInt16.self),
-            windowNameLength: read(UInt16.self),
-            browserURLLength: read(UInt16.self)
+            timestamp: try read(Double.self),
+            width: try read(UInt32.self),
+            height: try read(UInt32.self),
+            bytesPerRow: try read(UInt32.self),
+            dataSize: try read(UInt32.self),
+            displayID: try read(UInt32.self),
+            appBundleIDLength: try read(UInt16.self),
+            appNameLength: try read(UInt16.self),
+            windowNameLength: try read(UInt16.self),
+            browserURLLength: try read(UInt16.self)
         )
     }
 }
@@ -352,7 +369,7 @@ public struct WALMetadata: Codable, Sendable {
     }
 }
 
-/// Frame header in WAL binary format (34 bytes fixed size + variable metadata strings)
+/// Frame header in WAL binary format (36 bytes fixed size + variable metadata strings)
 private struct WALFrameHeader {
     let timestamp: Double           // 8 bytes - Unix timestamp
     let width: UInt32              // 4 bytes
@@ -364,7 +381,7 @@ private struct WALFrameHeader {
     let appNameLength: UInt16      // 2 bytes
     let windowNameLength: UInt16   // 2 bytes
     let browserURLLength: UInt16   // 2 bytes
-    // Total: 34 bytes
+    // Total: 36 bytes (8+20+8)
     // Followed by: appBundleID, appName, windowName, browserURL (UTF-8 strings)
     // Followed by: pixel data (dataSize bytes)
 }

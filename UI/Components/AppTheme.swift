@@ -345,6 +345,101 @@ extension View {
     public func retraceShadowHeavy() -> some View {
         self.shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
     }
+
+    public func retraceGlow(color: Color = .retraceAccent, radius: CGFloat = 20) -> some View {
+        self.shadow(color: color.opacity(0.3), radius: radius, x: 0, y: 0)
+    }
+}
+
+// MARK: - Glassmorphism Style
+
+public struct GlassmorphismModifier: ViewModifier {
+    var cornerRadius: CGFloat
+    var opacity: Double
+
+    public init(cornerRadius: CGFloat = 16, opacity: Double = 0.1) {
+        self.cornerRadius = cornerRadius
+        self.opacity = opacity
+    }
+
+    public func body(content: Content) -> some View {
+        content
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .fill(Color.white.opacity(opacity))
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .fill(.ultraThinMaterial.opacity(0.3))
+                    RoundedRectangle(cornerRadius: cornerRadius)
+                        .stroke(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.2),
+                                    Color.white.opacity(0.05)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                }
+            )
+    }
+}
+
+extension View {
+    public func glassmorphism(cornerRadius: CGFloat = 16, opacity: Double = 0.1) -> some View {
+        self.modifier(GlassmorphismModifier(cornerRadius: cornerRadius, opacity: opacity))
+    }
+}
+
+// MARK: - Gradient Backgrounds
+
+extension LinearGradient {
+    public static let retraceAccentGradient = LinearGradient(
+        colors: [
+            Color(red: 74/255, green: 144/255, blue: 226/255),
+            Color(red: 139/255, green: 92/255, blue: 246/255)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    public static let retracePurpleGradient = LinearGradient(
+        colors: [
+            Color(red: 139/255, green: 92/255, blue: 246/255),
+            Color(red: 217/255, green: 70/255, blue: 239/255)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    public static let retraceGreenGradient = LinearGradient(
+        colors: [
+            Color(red: 34/255, green: 197/255, blue: 94/255),
+            Color(red: 16/255, green: 185/255, blue: 129/255)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    public static let retraceOrangeGradient = LinearGradient(
+        colors: [
+            Color(red: 251/255, green: 146/255, blue: 60/255),
+            Color(red: 251/255, green: 191/255, blue: 36/255)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
+
+    public static let retraceSubtleGradient = LinearGradient(
+        colors: [
+            Color.white.opacity(0.05),
+            Color.white.opacity(0.02)
+        ],
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+    )
 }
 
 // MARK: - Button Styles
