@@ -50,9 +50,14 @@ public struct SimpleTimelineView: View {
                 .offset(y: viewModel.areControlsHidden ? 150 : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
-                // Close button (top-right)
+                // Close button (top-right) and debug frame ID (top-left)
                 VStack {
                     HStack {
+                        // Debug frame ID badge (top-left)
+                        if viewModel.showFrameIDs {
+                            DebugFrameIDBadge(viewModel: viewModel)
+                        }
+
                         Spacer()
                         closeButton
                     }
@@ -62,17 +67,6 @@ public struct SimpleTimelineView: View {
                 .offset(y: viewModel.areControlsHidden ? -100 : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
-                // App info overlay (top-left) - timestamp now on playhead
-                VStack {
-                    HStack {
-                        appInfoOverlay
-                        Spacer()
-                    }
-                    Spacer()
-                }
-                .padding(.spacingL)
-                .offset(y: viewModel.areControlsHidden ? -100 : 0)
-                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 // Loading overlay
                 if viewModel.isLoading {
@@ -237,28 +231,6 @@ public struct SimpleTimelineView: View {
         }
         .buttonStyle(.plain)
         .help(viewModel.areControlsHidden ? "Show Controls (Cmd+.)" : "Hide Controls (Cmd+.)")
-    }
-
-    // MARK: - App Info Overlay
-
-    private var appInfoOverlay: some View {
-        Group {
-            if let frame = viewModel.currentFrame, let appName = frame.metadata.appName {
-                HStack(spacing: .spacingS) {
-                    Circle()
-                        .fill(Color.segmentColor(for: frame.metadata.appBundleID ?? ""))
-                        .frame(width: 10, height: 10)
-                    Text(appName)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(.white.opacity(0.8))
-                }
-                .padding(.spacingM)
-                .background(
-                    RoundedRectangle(cornerRadius: .cornerRadiusM)
-                        .fill(Color.black.opacity(0.5))
-                )
-            }
-        }
     }
 
     // MARK: - Loading Overlay
@@ -1861,6 +1833,70 @@ struct SearchHighlightOverlay: View {
                 highlightScale = 1.0
             }
         }
+    }
+}
+
+// MARK: - Debug Frame ID Badge
+
+/// Debug badge showing the current frame ID with click-to-copy functionality
+/// Only visible when "Show frame IDs in UI" is enabled in Settings > Advanced
+struct DebugFrameIDBadge: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var showCopiedFeedback = false
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.copyCurrentFrameID()
+            showCopiedFeedback = true
+
+            // Reset feedback after 1.5 seconds
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                showCopiedFeedback = false
+            }
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(showCopiedFeedback ? .green : .white.opacity(0.7))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Frame ID")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+
+                    if let frame = viewModel.currentFrame {
+                        Text(showCopiedFeedback ? "Copied!" : String(frame.id.value))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(showCopiedFeedback ? .green : .white)
+                    } else {
+                        Text("--")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(white: 0.15).opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .help("Click to copy frame ID")
     }
 }
 

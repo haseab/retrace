@@ -216,6 +216,19 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the timeline controls (tape, playhead, buttons) are hidden
     @Published public var areControlsHidden: Bool = false
 
+    /// Whether to show frame IDs in debug mode (read from UserDefaults)
+    public var showFrameIDs: Bool {
+        UserDefaults.standard.bool(forKey: "showFrameIDs")
+    }
+
+    /// Copy the current frame ID to clipboard
+    public func copyCurrentFrameID() {
+        guard let frame = currentFrame else { return }
+        let frameIDString = String(frame.id.value)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(frameIDString, forType: .string)
+    }
+
     /// The search query to highlight on the current frame (set when navigating from search)
     @Published public var searchHighlightQuery: String?
 

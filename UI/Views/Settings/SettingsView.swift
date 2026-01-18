@@ -31,6 +31,9 @@ public struct SettingsView: View {
     @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
     @AppStorage("encryptionEnabled") private var encryptionEnabled = true
 
+    // Developer settings
+    @AppStorage("showFrameIDs") private var showFrameIDs = false
+
     // MARK: - Body
 
     public var body: some View {
@@ -420,7 +423,8 @@ public struct SettingsView: View {
             }
 
             settingsGroup(title: "Developer") {
-                Toggle("Show frame IDs in UI", isOn: .constant(false))
+                Toggle("Show frame IDs in UI", isOn: $showFrameIDs)
+                    .help("When enabled, shows the current frame ID in the timeline. Click to copy.")
 
                 Button("Export Database Schema") {}
                     .buttonStyle(RetraceSecondaryButtonStyle())

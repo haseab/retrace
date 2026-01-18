@@ -1,912 +1,1552 @@
 import Foundation
 import Shared
+import Database
+import Storage
+import SQLCipher
 
-/// Unified data adapter that routes queries to appropriate data sources
-/// Seamlessly blends data from multiple sources (Rewind, Retrace, etc.)
-/// based on timestamps and source availability
+/// Unified data adapter that owns connections directly and runs SQL
+/// Seamlessly blends data from Retrace (native) and Rewind (encrypted) databases
 public actor DataAdapter {
 
-    // MARK: - Properties
+    // MARK: - Connections
 
-    /// Primary data source (native Retrace)
-    private let primarySource: any DataSourceProtocol
+    private let retraceConnection: DatabaseConnection
+    private let retraceConfig: DatabaseConfig
 
-    /// Secondary sources (Rewind, etc.) keyed by FrameSource
-    private var secondarySources: [FrameSource: any DataSourceProtocol] = [:]
+    private var rewindConnection: DatabaseConnection?
+    private var rewindConfig: DatabaseConfig?
+    private var cutoffDate: Date?
 
-    /// Whether the adapter is initialized and ready
-    private var isInitialized = false
+    // MARK: - Image Extractors
 
-    // MARK: - Session Cache
+    private let retraceImageExtractor: ImageExtractor
+    private var rewindImageExtractor: ImageExtractor?
 
-    /// Cache key for session queries (date range hash)
+    // MARK: - Database Reference (for legacy APIs)
+
+    private let database: DatabaseManager
+
+    // MARK: - Cache
+
     private struct SegmentCacheKey: Hashable {
         let startDate: Date
         let endDate: Date
     }
 
-    /// Cached session results with expiry
     private struct SegmentCacheEntry {
         let segments: [Segment]
         let timestamp: Date
     }
 
-    /// Session query cache - keyed by date range
     private var segmentCache: [SegmentCacheKey: SegmentCacheEntry] = [:]
-
-    /// How long cached segments remain valid (5 minutes)
     private let segmentCacheTTL: TimeInterval = 300
+
+    // MARK: - State
+
+    private var isInitialized = false
 
     // MARK: - Initialization
 
-    public init(primarySource: any DataSourceProtocol) {
-        self.primarySource = primarySource
+    public init(
+        retraceConnection: DatabaseConnection,
+        retraceConfig: DatabaseConfig,
+        retraceImageExtractor: ImageExtractor,
+        database: DatabaseManager
+    ) {
+        self.retraceConnection = retraceConnection
+        self.retraceConfig = retraceConfig
+        self.retraceImageExtractor = retraceImageExtractor
+        self.database = database
     }
 
-    /// Register a secondary data source (e.g., Rewind)
-    public func registerSource(_ source: any DataSourceProtocol) async {
-        secondarySources[await source.source] = source
-        Log.info("Registered data source: \(await source.source.displayName)", category: .app)
+    /// Configure Rewind data source (encrypted SQLCipher database)
+    public func configureRewind(
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        imageExtractor: ImageExtractor,
+        cutoffDate: Date
+    ) {
+        self.rewindConnection = connection
+        self.rewindConfig = config
+        self.rewindImageExtractor = imageExtractor
+        self.cutoffDate = cutoffDate
+        Log.info("[DataAdapter] Rewind source configured with cutoff \(cutoffDate)", category: .app)
     }
 
-    /// Initialize all data sources
+    /// Initialize the adapter
     public func initialize() async throws {
-        // Connect primary source
-        try await primarySource.connect()
-
-        // Connect all secondary sources
-        for (sourceType, source) in secondarySources {
-            do {
-                try await source.connect()
-                Log.info("✓ Connected to \(sourceType.displayName) data source", category: .app)
-            } catch {
-                Log.warning("Failed to connect to \(sourceType.displayName): \(error)", category: .app)
-                // Remove failed source
-                secondarySources.removeValue(forKey: sourceType)
-            }
-        }
-
         isInitialized = true
-        Log.info("DataAdapter initialized with \(secondarySources.count + 1) source(s)", category: .app)
+        Log.info("[DataAdapter] Initialized with \(rewindConnection != nil ? "2" : "1") connection(s)", category: .app)
     }
 
-    /// Shutdown all data sources
+    /// Shutdown the adapter
     public func shutdown() async {
-        await primarySource.disconnect()
-
-        for (_, source) in secondarySources {
-            await source.disconnect()
-        }
-
-        secondarySources.removeAll()
         isInitialized = false
-        Log.info("DataAdapter shutdown complete", category: .app)
+        Log.info("[DataAdapter] Shutdown complete", category: .app)
+    }
+
+    // MARK: - Connection Selection
+
+    private func connectionForTimestamp(_ timestamp: Date) -> (DatabaseConnection, DatabaseConfig) {
+        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
+            return (rewind, config)
+        }
+        return (retraceConnection, retraceConfig)
     }
 
     // MARK: - Frame Retrieval
 
     /// Get frames with video info in a time range (optimized - single query with JOINs)
-    /// This is the preferred method for timeline views to avoid N+1 queries
     public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
-            Log.error("[DataAdapter] getFramesWithVideoInfo called but not initialized", category: .app)
             throw DataAdapterError.notInitialized
         }
 
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-
-        Log.info("[DataAdapter] getFramesWithVideoInfo: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate)), limit=\(limit)", category: .app)
-
         var allFrames: [FrameWithVideoInfo] = []
 
-        // Check secondary sources
-        for (sourceType, source) in secondarySources {
-            let isConnected = await source.isConnected
-            guard isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate {
-                if startDate < cutoff {
-                    let effectiveEnd = min(endDate, cutoff)
-                    let frames = try await source.getFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit)
-                    allFrames.append(contentsOf: frames)
-                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
-                }
-            } else {
-                let frames = try await source.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
-            }
+        // Query Rewind if timestamp is before cutoff
+        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
+            let effectiveEnd = min(endDate, cutoff)
+            let frames = try queryFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit, connection: rewind, config: config)
+            allFrames.append(contentsOf: frames)
         }
 
-        // Get frames from primary source
-        var primaryStartDate = startDate
-        for (_, source) in secondarySources {
-            if let cutoff = await source.cutoffDate, await source.isConnected {
-                primaryStartDate = max(primaryStartDate, cutoff)
-            }
+        // Query Retrace
+        var retraceStart = startDate
+        if let cutoff = cutoffDate {
+            retraceStart = max(startDate, cutoff)
         }
-
-        if primaryStartDate < endDate {
-            let primaryFrames = try await primarySource.getFramesWithVideoInfo(from: primaryStartDate, to: endDate, limit: limit)
-            allFrames.append(contentsOf: primaryFrames)
-            Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames with video info from primary source", category: .app)
+        if retraceStart < endDate {
+            let frames = try queryFramesWithVideoInfo(from: retraceStart, to: endDate, limit: limit, connection: retraceConnection, config: retraceConfig)
+            allFrames.append(contentsOf: frames)
         }
 
         // Sort by timestamp ascending (oldest first)
         allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
-
-        let result = Array(allFrames.prefix(limit))
-        Log.info("[DataAdapter] Returning \(result.count) frames with video info", category: .app)
-        return result
+        return Array(allFrames.prefix(limit))
     }
 
-    /// Get frames in a time range, blending data from all available sources
-    /// Automatically routes to appropriate source based on timestamps and cutoff dates
+    /// Get frames in a time range
     public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameReference] {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getFrames called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-
-        Log.info("[DataAdapter] getFrames: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate)), limit=\(limit)", category: .app)
-        Log.info("[DataAdapter] Secondary sources registered: \(secondarySources.count) [\(secondarySources.keys.map { $0.displayName }.joined(separator: ", "))]", category: .app)
-
-        var allFrames: [FrameReference] = []
-
-        // Check if any secondary source can provide data for this range
-        for (sourceType, source) in secondarySources {
-            let isConnected = await source.isConnected
-            Log.info("[DataAdapter] Checking \(sourceType.displayName): connected=\(isConnected)", category: .app)
-            guard isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate {
-                Log.info("[DataAdapter] \(sourceType.displayName) cutoff: \(dateFormatter.string(from: cutoff))", category: .app)
-                // Source only has data before cutoff
-                if startDate < cutoff {
-                    let effectiveEnd = min(endDate, cutoff)
-                    Log.info("[DataAdapter] Querying \(sourceType.displayName): \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: effectiveEnd))", category: .app)
-                    let frames = try await source.getFrames(from: startDate, to: effectiveEnd, limit: limit)
-                    allFrames.append(contentsOf: frames)
-                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-                } else {
-                    Log.info("[DataAdapter] Skipping \(sourceType.displayName): startDate >= cutoff", category: .app)
-                }
-            } else {
-                // Source has no cutoff - can provide data for any range
-                Log.info("[DataAdapter] \(sourceType.displayName) has no cutoff, querying full range", category: .app)
-                let frames = try await source.getFrames(from: startDate, to: endDate, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-            }
-        }
-
-        // Get frames from primary source (native Retrace)
-        // If secondary sources have cutoffs, only query primary for dates after the latest cutoff
-        var primaryStartDate = startDate
-        for (_, source) in secondarySources {
-            if let cutoff = await source.cutoffDate, await source.isConnected {
-                primaryStartDate = max(primaryStartDate, cutoff)
-            }
-        }
-
-        Log.info("[DataAdapter] Primary source query: \(dateFormatter.string(from: primaryStartDate)) → \(dateFormatter.string(from: endDate))", category: .app)
-
-        if primaryStartDate < endDate {
-            let primaryFrames = try await primarySource.getFrames(from: primaryStartDate, to: endDate, limit: limit)
-            allFrames.append(contentsOf: primaryFrames)
-            Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
-        } else {
-            Log.info("[DataAdapter] Skipping primary source: primaryStartDate >= endDate", category: .app)
-        }
-
-        // Sort all frames by timestamp (ascending - oldest first, chronological order)
-        allFrames.sort { $0.timestamp < $1.timestamp }
-
-        Log.info("[DataAdapter] Total frames after merge & sort: \(allFrames.count)", category: .app)
-
-        // Return up to limit
-        let result = Array(allFrames.prefix(limit))
-        Log.info("[DataAdapter] Returning \(result.count) frames", category: .app)
-        return result
+        let framesWithVideo = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
+        return framesWithVideo.map { $0.frame }
     }
 
-    /// Get the most recent frames with video info (optimized - single query with JOINs)
-    /// This is the preferred method for timeline views to avoid N+1 queries
+    /// Get most recent frames with video info
     public func getMostRecentFramesWithVideoInfo(limit: Int = 250) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
-            Log.error("[DataAdapter] getMostRecentFramesWithVideoInfo called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        Log.info("[DataAdapter] getMostRecentFramesWithVideoInfo: fetching \(limit) most recent frames", category: .app)
-
-        var allFrames: [FrameWithVideoInfo] = []
-
-        // Get most recent frames from primary source
-        let primaryFrames = try await primarySource.getMostRecentFramesWithVideoInfo(limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
-        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames with video info from primary source", category: .app)
-
-        // Get most recent frames from secondary sources
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-            let sourceFrames = try await source.getMostRecentFramesWithVideoInfo(limit: limit)
-            allFrames.append(contentsOf: sourceFrames)
-            Log.info("[DataAdapter] ✓ Got \(sourceFrames.count) frames with video info from \(sourceType.displayName)", category: .app)
-        }
-
-        // Sort by timestamp descending (newest first) and take top N
-        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
-        let result = Array(allFrames.prefix(limit))
-
-        Log.info("[DataAdapter] Returning \(result.count) most recent frames with video info", category: .app)
-        return result
-    }
-
-    /// Get the most recent frames across all sources
-    /// Returns frames sorted by timestamp descending (newest first)
-    public func getMostRecentFrames(limit: Int = 250) async throws -> [FrameReference] {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getMostRecentFrames called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        Log.info("[DataAdapter] getMostRecentFrames: fetching \(limit) most recent frames", category: .app)
-
-        var allFrames: [FrameReference] = []
-
-        // Get most recent frames from primary source
-        Log.info("[DataAdapter] Querying primary source...", category: .app)
-        let primaryFrames = try await primarySource.getMostRecentFrames(limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
-        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
-
-        // Get most recent frames from secondary sources
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            Log.info("[DataAdapter] Querying \(sourceType.displayName)...", category: .app)
-            let sourceFrames = try await source.getMostRecentFrames(limit: limit)
-            allFrames.append(contentsOf: sourceFrames)
-            Log.info("[DataAdapter] ✓ Got \(sourceFrames.count) frames from \(sourceType.displayName)", category: .app)
-        }
-
-        // Sort all frames by timestamp descending (newest first) and take top N
-        allFrames.sort { $0.timestamp > $1.timestamp }
-        let result = Array(allFrames.prefix(limit))
-
-        Log.info("[DataAdapter] Returning \(result.count) most recent frames", category: .app)
-        return result
-    }
-
-    /// Get frames with video info before a timestamp (optimized - single query with JOINs)
-    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getFramesWithVideoInfoBefore called but not initialized", category: .app)
             throw DataAdapterError.notInitialized
         }
 
         var allFrames: [FrameWithVideoInfo] = []
 
-        // Check secondary sources
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
+        // Query Retrace
+        let retraceFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: retraceConnection, config: retraceConfig)
+        allFrames.append(contentsOf: retraceFrames)
 
-            if let cutoff = await source.cutoffDate {
-                let effectiveTimestamp = min(timestamp, cutoff)
-                let frames = try await source.getFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
-            } else {
-                let frames = try await source.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-            }
+        // Query Rewind
+        if let rewind = rewindConnection, let config = rewindConfig {
+            let rewindFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: rewind, config: config)
+            allFrames.append(contentsOf: rewindFrames)
         }
-
-        // Get frames from primary source
-        let primaryFrames = try await primarySource.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
 
         // Sort by timestamp descending (newest first) and take top N
         allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
         return Array(allFrames.prefix(limit))
     }
 
-    /// Get frames with video info after a timestamp (optimized - single query with JOINs)
-    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+    /// Get most recent frames
+    public func getMostRecentFrames(limit: Int = 250) async throws -> [FrameReference] {
+        let framesWithVideo = try await getMostRecentFramesWithVideoInfo(limit: limit)
+        return framesWithVideo.map { $0.frame }
+    }
+
+    /// Get frames with video info before a timestamp
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
-            Log.error("[DataAdapter] getFramesWithVideoInfoAfter called but not initialized", category: .app)
             throw DataAdapterError.notInitialized
         }
 
         var allFrames: [FrameWithVideoInfo] = []
 
-        // Check secondary sources (respecting cutoffs)
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate {
-                if timestamp < cutoff {
-                    let frames = try await source.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
-                    allFrames.append(contentsOf: frames)
-                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames with video info from \(sourceType.displayName)", category: .app)
-                }
-            } else {
-                let frames = try await source.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-            }
+        // Query Rewind
+        if let rewind = rewindConnection, let config = rewindConfig {
+            let effectiveTimestamp = cutoffDate != nil ? min(timestamp, cutoffDate!) : timestamp
+            let frames = try queryFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit, connection: rewind, config: config)
+            allFrames.append(contentsOf: frames)
         }
 
-        // Get frames from primary source
-        let primaryFrames = try await primarySource.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
+        // Query Retrace
+        let retraceFrames = try queryFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig)
+        allFrames.append(contentsOf: retraceFrames)
+
+        // Sort by timestamp descending (newest first) and take top N
+        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        return Array(allFrames.prefix(limit))
+    }
+
+    /// Get frames before a timestamp
+    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+        let framesWithVideo = try await getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+        return framesWithVideo.map { $0.frame }
+    }
+
+    /// Get frames with video info after a timestamp
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        var allFrames: [FrameWithVideoInfo] = []
+
+        // Query Rewind (respecting cutoff)
+        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
+            let frames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: rewind, config: config)
+            allFrames.append(contentsOf: frames)
+        }
+
+        // Query Retrace
+        let retraceFrames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig)
+        allFrames.append(contentsOf: retraceFrames)
 
         // Sort by timestamp ascending (oldest first) and take top N
         allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
         return Array(allFrames.prefix(limit))
     }
 
-    /// Get frames before a timestamp (for infinite scroll - loading older frames)
-    /// Returns frames sorted by timestamp descending (newest first of the older batch)
-    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getFramesBefore called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        Log.info("[DataAdapter] getFramesBefore: \(dateFormatter.string(from: timestamp)), limit=\(limit)", category: .app)
-
-        var allFrames: [FrameReference] = []
-
-        // Check secondary sources for data before timestamp
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            // For sources with cutoffs, only query if timestamp is within their range
-            if let cutoff = await source.cutoffDate {
-                let effectiveTimestamp = min(timestamp, cutoff)
-                Log.info("[DataAdapter] Querying \(sourceType.displayName) for frames before \(dateFormatter.string(from: effectiveTimestamp))", category: .app)
-                let frames = try await source.getFramesBefore(timestamp: effectiveTimestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-            } else {
-                let frames = try await source.getFramesBefore(timestamp: timestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-            }
-        }
-
-        // Get frames from primary source
-        Log.info("[DataAdapter] Querying primary source for frames before \(dateFormatter.string(from: timestamp))", category: .app)
-        let primaryFrames = try await primarySource.getFramesBefore(timestamp: timestamp, limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
-        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
-
-        // Sort all frames by timestamp descending (newest first) and take top N
-        allFrames.sort { $0.timestamp > $1.timestamp }
-        let result = Array(allFrames.prefix(limit))
-
-        Log.info("[DataAdapter] Returning \(result.count) frames before timestamp", category: .app)
-        return result
-    }
-
-    /// Get frames after a timestamp (for infinite scroll - loading newer frames)
-    /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
+    /// Get frames after a timestamp
     public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getFramesAfter called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        Log.info("[DataAdapter] getFramesAfter: \(dateFormatter.string(from: timestamp)), limit=\(limit)", category: .app)
-
-        var allFrames: [FrameReference] = []
-
-        // Check secondary sources for data after timestamp (respecting cutoffs)
-        for (sourceType, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate {
-                // Only query if timestamp is before cutoff
-                if timestamp < cutoff {
-                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for frames after \(dateFormatter.string(from: timestamp))", category: .app)
-                    let frames = try await source.getFramesAfter(timestamp: timestamp, limit: limit)
-                    allFrames.append(contentsOf: frames)
-                    Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-                }
-            } else {
-                let frames = try await source.getFramesAfter(timestamp: timestamp, limit: limit)
-                allFrames.append(contentsOf: frames)
-                Log.info("[DataAdapter] ✓ Got \(frames.count) frames from \(sourceType.displayName)", category: .app)
-            }
-        }
-
-        // Get frames from primary source
-        Log.info("[DataAdapter] Querying primary source for frames after \(dateFormatter.string(from: timestamp))", category: .app)
-        let primaryFrames = try await primarySource.getFramesAfter(timestamp: timestamp, limit: limit)
-        allFrames.append(contentsOf: primaryFrames)
-        Log.info("[DataAdapter] ✓ Got \(primaryFrames.count) frames from primary source", category: .app)
-
-        // Sort all frames by timestamp ascending (oldest first) and take top N
-        allFrames.sort { $0.timestamp < $1.timestamp }
-        let result = Array(allFrames.prefix(limit))
-
-        Log.info("[DataAdapter] Returning \(result.count) frames after timestamp", category: .app)
-        return result
+        let framesWithVideo = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+        return framesWithVideo.map { $0.frame }
     }
 
-    /// Get the timestamp of the most recent frame across all sources
-    /// Used to find where data actually exists when recent queries return empty
+    /// Get the most recent frame timestamp
     public func getMostRecentFrameTimestamp() async throws -> Date? {
-        guard isInitialized else {
-            Log.error("[DataAdapter] getMostRecentFrameTimestamp called but not initialized", category: .app)
-            throw DataAdapterError.notInitialized
-        }
-
-        Log.info("[DataAdapter] getMostRecentFrameTimestamp: searching for latest frame", category: .app)
-
-        // Just get 1 frame from each source and compare
         let frames = try await getMostRecentFrames(limit: 1)
-
-        if let mostRecent = frames.first {
-            let dateFormatter = DateFormatter()
-            dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-            Log.info("[DataAdapter] Most recent frame: \(dateFormatter.string(from: mostRecent.timestamp))", category: .app)
-            return mostRecent.timestamp
-        }
-
-        Log.info("[DataAdapter] No frames found in any source", category: .app)
-        return nil
+        return frames.first?.timestamp
     }
+
+    // MARK: - Image Extraction
 
     /// Get image data for a specific frame
-    /// Routes to appropriate source based on frame's source property
     public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> Data {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // Route to appropriate data source based on frame source
-        if frameSource == .native {
-            return try await primarySource.getFrameImage(segmentID: segmentID, timestamp: timestamp)
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+
+        // Get video info
+        guard let videoInfo = try getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, connection: connection, config: config) else {
+            throw DataAdapterError.frameNotFound
         }
 
-        // Check secondary sources
-        if let source = secondarySources[frameSource], await source.isConnected {
-            return try await source.getFrameImage(segmentID: segmentID, timestamp: timestamp)
+        // Extract image based on source
+        if frameSource == .rewind, let extractor = rewindImageExtractor {
+            return try await extractor.extractFrame(videoPath: videoInfo.videoPath, frameIndex: videoInfo.frameIndex, frameRate: videoInfo.frameRate)
         }
-
-        // Fallback: try primary source
-        Log.warning("No source found for \(frameSource.displayName), falling back to primary", category: .app)
-        return try await primarySource.getFrameImage(segmentID: segmentID, timestamp: timestamp)
+        return try await retraceImageExtractor.extractFrame(videoPath: videoInfo.videoPath, frameIndex: videoInfo.frameIndex, frameRate: videoInfo.frameRate)
     }
 
-    /// Convenience method that determines source from timestamp
-    /// Uses cutoff dates to route appropriately
+    /// Get image data for a frame by timestamp (auto-detects source)
     public func getFrameImage(segmentID: VideoSegmentID, timestamp: Date) async throws -> Data {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Check if any secondary source should handle this timestamp
-        for (_, source) in secondarySources {
-            guard await source.isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate, timestamp < cutoff {
-                return try await source.getFrameImage(segmentID: segmentID, timestamp: timestamp)
-            }
-        }
-
-        // Default to primary source
-        return try await primarySource.getFrameImage(segmentID: segmentID, timestamp: timestamp)
+        // Determine source based on cutoff
+        let source: FrameSource = (cutoffDate != nil && timestamp < cutoffDate! && rewindConnection != nil) ? .rewind : .native
+        return try await getFrameImage(segmentID: segmentID, timestamp: timestamp, source: source)
     }
 
-    /// Get video info for a frame (if source is video-based)
-    public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Route to appropriate data source
-        if frameSource == .native {
-            return try await primarySource.getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp)
-        }
-
-        // Check secondary sources
-        if let source = secondarySources[frameSource], await source.isConnected {
-            return try await source.getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp)
-        }
-
-        // Fallback
-        return nil
-    }
-
-    /// Get frame image by exact videoID and frameIndex (more reliable than timestamp matching)
+    /// Get frame image by exact videoID and frameIndex
     public func getFrameImageByIndex(videoID: VideoSegmentID, frameIndex: Int, source frameSource: FrameSource) async throws -> Data {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // Route to appropriate data source based on frame source
-        if frameSource == .native {
-            // Native data uses storage system (direct frame extraction)
-            if let retraceSource = primarySource as? RetraceDataSource {
-                return try await retraceSource.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex)
-            }
-        } else if frameSource == .rewind {
-            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                return try await rewindSource.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex)
-            }
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+
+        // Query video info directly
+        let sql = """
+            SELECT v.path, v.frameRate
+            FROM video v
+            WHERE v.id = ?
+            LIMIT 1;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            throw DataAdapterError.frameNotFound
+        }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, videoID.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DataAdapterError.frameNotFound
         }
 
-        throw DataAdapterError.notInitialized
+        guard let pathPtr = sqlite3_column_text(statement, 0) else {
+            throw DataAdapterError.frameNotFound
+        }
+        let videoPath = String(cString: pathPtr)
+        let frameRate = sqlite3_column_double(statement, 1)
+
+        let fullPath = "\(config.storageRoot)/\(videoPath)"
+
+        // Extract image based on source
+        if frameSource == .rewind, let extractor = rewindImageExtractor {
+            return try await extractor.extractFrame(videoPath: fullPath, frameIndex: frameIndex, frameRate: frameRate)
+        }
+        return try await retraceImageExtractor.extractFrame(videoPath: fullPath, frameIndex: frameIndex, frameRate: frameRate)
     }
 
-    // MARK: - Session Retrieval
+    /// Get video info for a frame
+    public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+        return try getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, connection: connection, config: config)
+    }
 
-    /// Get segments in a time range, blending data from all available sources
-    /// Results are cached for 5 minutes to avoid repeated queries
+    // MARK: - Segments
+
+    /// Get segments in a time range
     public func getSegments(from startDate: Date, to endDate: Date) async throws -> [Segment] {
         guard isInitialized else {
-            Log.error("[DataAdapter] getSegments called but not initialized", category: .app)
             throw DataAdapterError.notInitialized
         }
 
         let cacheKey = SegmentCacheKey(startDate: startDate, endDate: endDate)
 
-        // Check cache first
+        // Check cache
         if let cached = segmentCache[cacheKey] {
-            let age = Date().timeIntervalSince(cached.timestamp)
-            if age < segmentCacheTTL {
-                Log.info("[DataAdapter] getSegments: cache hit (\(cached.segments.count) segments, age: \(Int(age))s)", category: .app)
+            if Date().timeIntervalSince(cached.timestamp) < segmentCacheTTL {
                 return cached.segments
-            } else {
-                // Expired - remove from cache
-                segmentCache.removeValue(forKey: cacheKey)
             }
+            segmentCache.removeValue(forKey: cacheKey)
         }
 
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        var allSegments: [Segment] = []
 
-        Log.info("[DataAdapter] getSegments: cache miss, querying \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: endDate))", category: .app)
-
-        var allSessions: [Segment] = []
-
-        // Check if any secondary source can provide data for this range
-        for (sourceType, source) in secondarySources {
-            let isConnected = await source.isConnected
-            guard isConnected else { continue }
-
-            if let cutoff = await source.cutoffDate {
-                // Source only has data before cutoff
-                if startDate < cutoff {
-                    let effectiveEnd = min(endDate, cutoff)
-                    Log.info("[DataAdapter] Querying \(sourceType.displayName) for segments: \(dateFormatter.string(from: startDate)) → \(dateFormatter.string(from: effectiveEnd))", category: .app)
-                    let segments = try await source.getSegments(from: startDate, to: effectiveEnd)
-                    allSessions.append(contentsOf: segments)
-                    Log.info("[DataAdapter] ✓ Got \(segments.count) segments from \(sourceType.displayName)", category: .app)
-                }
-            } else {
-                // Source has no cutoff - can provide data for any range
-                let segments = try await source.getSegments(from: startDate, to: endDate)
-                allSessions.append(contentsOf: segments)
-                Log.info("[DataAdapter] ✓ Got \(segments.count) segments from \(sourceType.displayName)", category: .app)
-            }
+        // Query Rewind
+        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
+            let effectiveEnd = min(endDate, cutoff)
+            let segments = try querySegments(from: startDate, to: effectiveEnd, connection: rewind, config: config)
+            allSegments.append(contentsOf: segments)
         }
 
-        // Get segments from primary source (native Retrace)
-        // If secondary sources have cutoffs, only query primary for dates after the latest cutoff
-        var primaryStartDate = startDate
-        for (_, source) in secondarySources {
-            if let cutoff = await source.cutoffDate, await source.isConnected {
-                primaryStartDate = max(primaryStartDate, cutoff)
-            }
+        // Query Retrace
+        var retraceStart = startDate
+        if let cutoff = cutoffDate {
+            retraceStart = max(startDate, cutoff)
+        }
+        if retraceStart < endDate {
+            let segments = try querySegments(from: retraceStart, to: endDate, connection: retraceConnection, config: retraceConfig)
+            allSegments.append(contentsOf: segments)
         }
 
-        if primaryStartDate < endDate {
-            let primarySessions = try await primarySource.getSegments(from: primaryStartDate, to: endDate)
-            allSessions.append(contentsOf: primarySessions)
-            Log.info("[DataAdapter] ✓ Got \(primarySessions.count) segments from primary source", category: .app)
-        }
+        // Sort by start time
+        allSegments.sort { $0.startDate < $1.startDate }
 
-        // Sort all segments by start time (ascending - oldest first)
-        allSessions.sort { (a: Segment, b: Segment) -> Bool in a.startDate < b.startDate }
-
-        // Cache the results
-        segmentCache[cacheKey] = SegmentCacheEntry(segments: allSessions, timestamp: Date())
-
-        Log.info("[DataAdapter] Total segments after merge & sort: \(allSessions.count) (cached)", category: .app)
-        return allSessions
+        // Cache
+        segmentCache[cacheKey] = SegmentCacheEntry(segments: allSegments, timestamp: Date())
+        return allSegments
     }
 
-    /// Invalidate the session cache (call when new data is recorded)
+    /// Invalidate the segment cache
     public func invalidateSessionCache() {
         segmentCache.removeAll()
-        Log.info("[DataAdapter] Session cache invalidated", category: .app)
     }
 
-    // MARK: - Source Information
+    // MARK: - OCR Nodes
 
-    /// Get all registered sources
-    public var registeredSources: [FrameSource] {
-        get async {
-            var sources: [FrameSource] = [await primarySource.source]
-            sources.append(contentsOf: secondarySources.keys)
-            return sources
+    /// Get all OCR nodes for a frame by timestamp
+    public func getAllOCRNodes(timestamp: Date, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
         }
+
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+
+        return try getAllOCRNodes(timestamp: timestamp, connection: connection, config: config)
     }
 
-    /// Check if a specific source is available
-    public func isSourceAvailable(_ source: FrameSource) async -> Bool {
-        if await primarySource.source == source {
-            return await primarySource.isConnected
+    /// Get all OCR nodes for a frame by frameID
+    public func getAllOCRNodes(frameID: FrameID, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
         }
-        guard let secondarySource = secondarySources[source] else {
-            return false
+
+        let connection = frameSource == .rewind && rewindConnection != nil
+            ? rewindConnection!
+            : retraceConnection
+
+        return try getAllOCRNodes(frameID: frameID, connection: connection)
+    }
+
+    // MARK: - App Discovery
+
+    /// Get all distinct apps from all data sources
+    public func getDistinctApps() async throws -> [AppInfo] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
         }
-        return await secondarySource.isConnected
+
+        var bundleIDs: [String] = []
+
+        // Try Rewind first (more historical data)
+        if let rewind = rewindConnection {
+            bundleIDs = try queryDistinctApps(connection: rewind)
+        }
+
+        // If empty, try Retrace
+        if bundleIDs.isEmpty {
+            bundleIDs = try queryDistinctApps(connection: retraceConnection)
+        }
+
+        return await AppNameResolver.resolveAll(bundleIDs: bundleIDs)
+    }
+
+    // MARK: - URL Bounding Box Detection
+
+    /// Get bounding box for URL in a frame's OCR text
+    public func getURLBoundingBox(timestamp: Date, source frameSource: FrameSource) async throws -> URLBoundingBox? {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+
+        return try getURLBoundingBox(timestamp: timestamp, connection: connection, config: config)
+    }
+
+    // MARK: - Full-Text Search
+
+    /// Search across all data sources
+    public func search(query: SearchQuery) async throws -> SearchResults {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let startTime = Date()
+        var allResults: [SearchResult] = []
+        var totalCount = 0
+
+        // Search Retrace
+        do {
+            let retraceResults = try searchConnection(query: query, connection: retraceConnection, config: retraceConfig, source: .native)
+            allResults.append(contentsOf: retraceResults.results)
+            totalCount += retraceResults.totalCount
+        } catch {
+            Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
+        }
+
+        // Search Rewind
+        if let rewind = rewindConnection, let config = rewindConfig {
+            do {
+                var rewindResults = try searchConnection(query: query, connection: rewind, config: config, source: .rewind)
+                rewindResults.results = rewindResults.results.map { result in
+                    var modified = result
+                    modified.source = .rewind
+                    return modified
+                }
+                allResults.append(contentsOf: rewindResults.results)
+                totalCount += rewindResults.totalCount
+            } catch {
+                Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
+            }
+        }
+
+        // Sort by search mode
+        switch query.mode {
+        case .relevant:
+            allResults.sort { $0.relevanceScore > $1.relevanceScore }
+        case .all:
+            allResults.sort { $0.timestamp > $1.timestamp }
+        }
+
+        let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+
+        return SearchResults(
+            query: query,
+            results: Array(allResults.prefix(query.limit)),
+            totalCount: totalCount,
+            searchTimeMs: searchTimeMs
+        )
     }
 
     // MARK: - Deletion
 
-    /// Delete a frame from the appropriate data source
-    /// Routes to the correct source based on the frame's source property
+    /// Delete a frame
     public func deleteFrame(frameID: FrameID, source frameSource: FrameSource) async throws {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        if frameSource == .native {
-            try await primarySource.deleteFrame(frameID: frameID)
-            Log.info("[DataAdapter] Deleted frame from primary source", category: .app)
-            return
-        }
+        let connection = frameSource == .rewind && rewindConnection != nil
+            ? rewindConnection!
+            : retraceConnection
 
-        // Check secondary sources
-        if let source = secondarySources[frameSource], await source.isConnected {
-            try await source.deleteFrame(frameID: frameID)
-            Log.info("[DataAdapter] Deleted frame from \(frameSource.displayName)", category: .app)
-            return
-        }
-
-        throw DataAdapterError.sourceNotAvailable(frameSource)
+        try deleteFrames(frameIDs: [frameID], connection: connection)
     }
 
-    /// Delete multiple frames from their respective data sources
-    /// Groups frames by source and deletes in batches
+    /// Delete multiple frames
     public func deleteFrames(_ frames: [(frameID: FrameID, source: FrameSource)]) async throws {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // Group frames by source
+        // Group by source
         var framesBySource: [FrameSource: [FrameID]] = [:]
         for (frameID, source) in frames {
             framesBySource[source, default: []].append(frameID)
         }
 
         // Delete from each source
-        for (frameSource, frameIDs) in framesBySource {
-            if frameSource == .native {
-                try await primarySource.deleteFrames(frameIDs: frameIDs)
-                Log.info("[DataAdapter] Deleted \(frameIDs.count) frames from primary source", category: .app)
-            } else if let source = secondarySources[frameSource], await source.isConnected {
-                try await source.deleteFrames(frameIDs: frameIDs)
-                Log.info("[DataAdapter] Deleted \(frameIDs.count) frames from \(frameSource.displayName)", category: .app)
-            } else {
-                Log.warning("[DataAdapter] Source \(frameSource.displayName) not available for deletion", category: .app)
-            }
+        for (source, frameIDs) in framesBySource {
+            let connection = source == .rewind && rewindConnection != nil
+                ? rewindConnection!
+                : retraceConnection
+            try deleteFrames(frameIDs: frameIDs, connection: connection)
         }
     }
 
-    /// Delete a frame by timestamp (more reliable for Rewind data where UUIDs are synthetic)
+    /// Delete frame by timestamp
     public func deleteFrameByTimestamp(_ timestamp: Date, source frameSource: FrameSource) async throws {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
-        // For Rewind source, find the frame by timestamp and delete by ID
-        if frameSource == .rewind {
-            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                // Get frames at this exact timestamp to find the frame ID
-                let frames = try await rewindSource.getFrames(from: timestamp, to: timestamp, limit: 1)
-                guard let frame = frames.first else {
-                    throw DataSourceError.frameNotFound
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, retraceConfig)
+
+        // Find frame by timestamp
+        let sql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        guard let statement = try? connection.prepare(sql: sql) else {
+            throw DataAdapterError.frameNotFound
+        }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(timestamp, to: statement, at: 1)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DataAdapterError.frameNotFound
+        }
+
+        let frameID = FrameID(value: sqlite3_column_int64(statement, 0))
+        try deleteFrames(frameIDs: [frameID], connection: connection)
+    }
+
+    // MARK: - Source Information
+
+    /// Get registered sources
+    public var registeredSources: [FrameSource] {
+        var sources: [FrameSource] = [.native]
+        if rewindConnection != nil {
+            sources.append(.rewind)
+        }
+        return sources
+    }
+
+    /// Check if source is available
+    public func isSourceAvailable(_ source: FrameSource) -> Bool {
+        if source == .native { return true }
+        if source == .rewind { return rewindConnection != nil }
+        return false
+    }
+
+    // MARK: - Private SQL Query Methods
+
+    private func queryFramesWithVideoInfo(
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> [FrameWithVideoInfo] {
+        let effectiveEndDate = config.applyCutoff(to: endDate)
+        guard startDate < effectiveEndDate else { return [] }
+
+        let sql = """
+            SELECT
+                f.id,
+                f.createdAt,
+                f.segmentId,
+                f.videoId,
+                f.videoFrameIndex,
+                f.encodingStatus,
+                s.bundleID,
+                s.windowName,
+                s.browserUrl,
+                v.path,
+                v.frameRate,
+                v.width,
+                v.height
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE f.createdAt >= ? AND f.createdAt <= ?
+            ORDER BY f.createdAt ASC
+            LIMIT ?;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(startDate, to: statement, at: 1)
+        config.bindDate(effectiveEndDate, to: statement, at: 2)
+        sqlite3_bind_int(statement, 3, Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    private func queryMostRecentFramesWithVideoInfo(
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> [FrameWithVideoInfo] {
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                ORDER BY createdAt DESC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            ORDER BY f.createdAt DESC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int(statement, 1, Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    private func queryFramesWithVideoInfoBefore(
+        timestamp: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> [FrameWithVideoInfo] {
+        let effectiveTimestamp = config.applyCutoff(to: timestamp)
+
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                WHERE createdAt < ?
+                ORDER BY createdAt DESC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            ORDER BY f.createdAt DESC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(effectiveTimestamp, to: statement, at: 1)
+        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    private func queryFramesWithVideoInfoAfter(
+        timestamp: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> [FrameWithVideoInfo] {
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM (
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                FROM frame
+                WHERE createdAt > ?
+                ORDER BY createdAt ASC
+                LIMIT ?
+            ) f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            ORDER BY f.createdAt ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(timestamp, to: statement, at: 1)
+        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    private func getFrameVideoInfo(
+        segmentID: VideoSegmentID,
+        timestamp: Date,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> FrameVideoInfo? {
+        let sql = """
+            SELECT v.id, v.path, v.width, v.height, v.frameRate, f.videoFrameIndex
+            FROM frame f
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE f.createdAt = ?
+            LIMIT 1;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(timestamp, to: statement, at: 1)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+
+        guard let relativePath = getTextOrNil(statement, 1) else { return nil }
+
+        let width = Int(sqlite3_column_int(statement, 2))
+        let height = Int(sqlite3_column_int(statement, 3))
+        let frameRate = sqlite3_column_double(statement, 4)
+        let frameIndex = Int(sqlite3_column_int(statement, 5))
+
+        let fullPath = "\(config.storageRoot)/\(relativePath)"
+
+        return FrameVideoInfo(
+            videoPath: fullPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate,
+            width: width,
+            height: height
+        )
+    }
+
+    private func querySegments(
+        from startDate: Date,
+        to endDate: Date,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> [Segment] {
+        let sql = """
+            SELECT id, bundleID, startDate, endDate, windowName, browserUrl, type
+            FROM segment
+            WHERE startDate >= ? AND startDate <= ?
+            ORDER BY startDate ASC;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(startDate, to: statement, at: 1)
+        config.bindDate(endDate, to: statement, at: 2)
+
+        var segments: [Segment] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let segment = try? parseSegment(statement: statement, config: config) {
+                segments.append(segment)
+            }
+        }
+
+        return segments
+    }
+
+    private func getAllOCRNodes(timestamp: Date, connection: DatabaseConnection, config: DatabaseConfig) throws -> [OCRNodeWithText] {
+        // First find the frame ID
+        let frameSql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
+        guard let frameStatement = try? connection.prepare(sql: frameSql) else { return [] }
+        defer { connection.finalize(frameStatement) }
+
+        config.bindDate(timestamp, to: frameStatement, at: 1)
+
+        guard sqlite3_step(frameStatement) == SQLITE_ROW else { return [] }
+
+        let frameID = FrameID(value: sqlite3_column_int64(frameStatement, 0))
+        return try getAllOCRNodes(frameID: frameID, connection: connection)
+    }
+
+    private func getAllOCRNodes(frameID: FrameID, connection: DatabaseConnection) throws -> [OCRNodeWithText] {
+        let sql = """
+            SELECT
+                n.id,
+                n.nodeOrder,
+                n.textOffset,
+                n.textLength,
+                n.leftX,
+                n.topY,
+                n.width,
+                n.height,
+                (COALESCE(sc.c0, '') || COALESCE(sc.c1, '')) as fullText
+            FROM node n
+            JOIN doc_segment ds ON n.frameId = ds.frameId
+            JOIN searchRanking_content sc ON ds.docid = sc.id
+            WHERE n.frameId = ?
+            ORDER BY n.nodeOrder ASC;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, frameID.value)
+
+        var nodes: [OCRNodeWithText] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let node = parseOCRNodeFromRow(statement: statement) {
+                nodes.append(node)
+            }
+        }
+
+        return nodes
+    }
+
+    private func queryDistinctApps(connection: DatabaseConnection) throws -> [String] {
+        let sql = """
+            SELECT bundleID, COUNT(*) as usage_count
+            FROM segment
+            WHERE bundleID IS NOT NULL AND bundleID != ''
+            GROUP BY bundleID
+            ORDER BY usage_count DESC
+            LIMIT 100;
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var bundleIDs: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let bundleIDPtr = sqlite3_column_text(statement, 0) else { continue }
+            bundleIDs.append(String(cString: bundleIDPtr))
+        }
+
+        return bundleIDs
+    }
+
+    private func getURLBoundingBox(timestamp: Date, connection: DatabaseConnection, config: DatabaseConfig) throws -> URLBoundingBox? {
+        // Get frameId and browserUrl
+        let frameSQL = """
+            SELECT f.id, s.browserUrl
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            WHERE f.createdAt = ?
+            LIMIT 1;
+            """
+
+        guard let frameStmt = try? connection.prepare(sql: frameSQL) else { return nil }
+        defer { connection.finalize(frameStmt) }
+
+        config.bindDate(timestamp, to: frameStmt, at: 1)
+
+        guard sqlite3_step(frameStmt) == SQLITE_ROW else { return nil }
+
+        let frameId = sqlite3_column_int64(frameStmt, 0)
+        guard let browserUrlPtr = sqlite3_column_text(frameStmt, 1) else { return nil }
+        let browserUrl = String(cString: browserUrlPtr)
+        guard !browserUrl.isEmpty else { return nil }
+
+        // Get FTS content
+        let ftsSQL = """
+            SELECT src.c0, src.c1
+            FROM doc_segment ds
+            JOIN searchRanking_content src ON ds.docid = src.id
+            WHERE ds.frameId = ?
+            LIMIT 1;
+            """
+
+        guard let ftsStmt = try? connection.prepare(sql: ftsSQL) else { return nil }
+        defer { connection.finalize(ftsStmt) }
+
+        sqlite3_bind_int64(ftsStmt, 1, frameId)
+
+        guard sqlite3_step(ftsStmt) == SQLITE_ROW else { return nil }
+
+        let c0Text = sqlite3_column_text(ftsStmt, 0).map { String(cString: $0) } ?? ""
+        let c1Text = sqlite3_column_text(ftsStmt, 1).map { String(cString: $0) } ?? ""
+        let ocrText = c0Text + c1Text
+
+        // Get nodes
+        let nodesSQL = """
+            SELECT nodeOrder, textOffset, textLength, leftX, topY, width, height
+            FROM node
+            WHERE frameId = ?
+            ORDER BY nodeOrder ASC;
+            """
+
+        guard let nodesStmt = try? connection.prepare(sql: nodesSQL) else { return nil }
+        defer { connection.finalize(nodesStmt) }
+
+        sqlite3_bind_int64(nodesStmt, 1, frameId)
+
+        let domain = URL(string: browserUrl)?.host ?? browserUrl
+        var bestMatch: (x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, score: Int)?
+
+        while sqlite3_step(nodesStmt) == SQLITE_ROW {
+            let textOffset = Int(sqlite3_column_int(nodesStmt, 1))
+            let textLength = Int(sqlite3_column_int(nodesStmt, 2))
+            let leftX = CGFloat(sqlite3_column_double(nodesStmt, 3))
+            let topY = CGFloat(sqlite3_column_double(nodesStmt, 4))
+            let width = CGFloat(sqlite3_column_double(nodesStmt, 5))
+            let height = CGFloat(sqlite3_column_double(nodesStmt, 6))
+
+            let startIndex = ocrText.index(ocrText.startIndex, offsetBy: min(textOffset, ocrText.count), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+            let endIndex = ocrText.index(startIndex, offsetBy: min(textLength, ocrText.count - textOffset), limitedBy: ocrText.endIndex) ?? ocrText.endIndex
+
+            guard startIndex < endIndex else { continue }
+
+            let nodeText = String(ocrText[startIndex..<endIndex])
+            guard nodeText.lowercased().contains(domain.lowercased()) else { continue }
+
+            var score = 0
+            let urlRatio = Double(domain.count) / Double(nodeText.count)
+            if urlRatio > 0.6 { score += 100 }
+            else if urlRatio > 0.3 { score += 50 }
+            else { score += 10 }
+
+            if topY > 0.07 && topY < 0.15 { score += 50 }
+            else if topY < 0.07 { score += 20 }
+
+            if nodeText.contains("/") && !nodeText.contains(" ") { score += 30 }
+
+            if let current = bestMatch {
+                if score > current.score {
+                    bestMatch = (x: leftX, y: topY, width: width, height: height, score: score)
                 }
-                try await rewindSource.deleteFrame(frameID: frame.id)
-                Log.info("[DataAdapter] Deleted Rewind frame by timestamp", category: .app)
-                return
+            } else {
+                bestMatch = (x: leftX, y: topY, width: width, height: height, score: score)
             }
-            throw DataAdapterError.sourceNotAvailable(frameSource)
         }
 
-        // For native source, we need to find the frame by timestamp first
-        // This is a fallback - prefer using deleteFrame with frameID for native data
-        Log.warning("[DataAdapter] deleteFrameByTimestamp called for native source - this is inefficient", category: .app)
-        throw DataSourceError.unsupportedOperation
+        guard let bounds = bestMatch else { return nil }
+
+        return URLBoundingBox(
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+            url: browserUrl
+        )
     }
 
-    // MARK: - URL Bounding Box Detection
-
-    /// Get the bounding box of a browser URL on screen for a given frame
-    /// Returns the bounding box if the URL text is found in the OCR nodes
-    public func getURLBoundingBox(timestamp: Date, source frameSource: FrameSource) async throws -> URLBoundingBox? {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Both sources now support URL bounding box detection
-        if frameSource == .rewind {
-            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                return try await rewindSource.getURLBoundingBox(timestamp: timestamp)
-            }
-        } else if frameSource == .native {
-            if let retraceSource = primarySource as? RetraceDataSource {
-                return try await retraceSource.getURLBoundingBox(timestamp: timestamp)
-            }
-        }
-
-        return nil
-    }
-
-    // MARK: - OCR Node Detection (for text selection)
-
-    /// Get all OCR nodes for a given frame by timestamp
-    /// Returns array of nodes with bounding boxes and text content
-    /// Currently only supported for Rewind data source
-    public func getAllOCRNodes(timestamp: Date, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Both Rewind and native sources now have identical OCR node data (same DB schema)
-        if frameSource == .rewind {
-            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                return try await rewindSource.getAllOCRNodes(timestamp: timestamp)
-            }
-        } else if frameSource == .native {
-            // Native Retrace source - use primary source
-            if let retraceSource = primarySource as? RetraceDataSource {
-                return try await retraceSource.getAllOCRNodes(timestamp: timestamp)
-            }
-        }
-
-        return []
-    }
-
-    /// Get all OCR nodes for a given frame by frameID (more reliable than timestamp)
-    /// Returns array of nodes with bounding boxes and text content
-    public func getAllOCRNodes(frameID: FrameID, source frameSource: FrameSource) async throws -> [OCRNodeWithText] {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Both Rewind and native sources now have identical OCR node data (same DB schema)
-        if frameSource == .rewind {
-            if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-                return try await rewindSource.getAllOCRNodes(frameID: frameID)
-            }
-        } else if frameSource == .native {
-            // Native Retrace source - use primary source
-            if let retraceSource = primarySource as? RetraceDataSource {
-                return try await retraceSource.getAllOCRNodes(frameID: frameID)
-            }
-        }
-
-        return []
-    }
-
-    // MARK: - App Discovery
-
-    /// Get all distinct apps from all data sources
-    /// Returns apps sorted by usage frequency (most used first)
-    public func getDistinctApps() async throws -> [AppInfo] {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        // Try Rewind data source first (it has the most historical data)
-        if let rewindSource = secondarySources[.rewind] as? RewindDataSource,
-           await rewindSource.isConnected {
-            return try await rewindSource.getDistinctApps()
-        }
-
-        // Try native source as fallback
-        if let retraceSource = primarySource as? RetraceDataSource {
-            return try await retraceSource.getDistinctApps()
-        }
-
-        // Fallback to empty if no source available
-        Log.warning("[DataAdapter] No data source available for app discovery", category: .app)
-        return []
-    }
-
-    // MARK: - Full-Text Search
-
-    /// Search across all data sources and consolidate results
-    /// Searches both Retrace (native) and Rewind databases, merging results by relevance
-    public func search(query: SearchQuery) async throws -> SearchResults {
-        guard isInitialized else {
-            throw DataAdapterError.notInitialized
-        }
-
-        Log.info("[DataAdapter] Search request: '\(query.text)'", category: .app)
-
-        let startTime = Date()
-        var allResults: [SearchResult] = []
-        var totalCount = 0
-
-        // Search primary source (native Retrace)
-        if let retraceSource = primarySource as? RetraceDataSource {
-            do {
-                let retraceResults = try await retraceSource.search(query: query)
-                allResults.append(contentsOf: retraceResults.results)
-                totalCount += retraceResults.totalCount
-                Log.info("[DataAdapter] ✓ Found \(retraceResults.results.count) results from Retrace (total: \(retraceResults.totalCount))", category: .app)
-            } catch {
-                Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
-            }
-        }
-
-        // Search Rewind data source (if available and connected)
-        if let rewindSource = secondarySources[.rewind] as? RewindDataSource {
-            let isRewindConnected = await rewindSource.isConnected
-            Log.debug("[DataAdapter] Rewind source found, isConnected: \(isRewindConnected)", category: .app)
-
-            if isRewindConnected {
-                do {
-                    Log.debug("[DataAdapter] Starting Rewind search...", category: .app)
-                    var rewindResults = try await rewindSource.search(query: query)
-                    Log.debug("[DataAdapter] Rewind search completed with \(rewindResults.results.count) results, tagging...", category: .app)
-                    // Tag results with Rewind source
-                    rewindResults.results = rewindResults.results.map { result in
-                        var modifiedResult = result
-                        modifiedResult.source = .rewind
-                        return modifiedResult
-                    }
-                    allResults.append(contentsOf: rewindResults.results)
-                    totalCount += rewindResults.totalCount
-                    Log.info("[DataAdapter] ✓ Found \(rewindResults.results.count) results from Rewind (total: \(rewindResults.totalCount))", category: .app)
-                } catch {
-                    Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
-                }
-            }
-        } else {
-            Log.debug("[DataAdapter] No Rewind source available", category: .app)
-        }
-
-        // Sort consolidated results based on search mode
+    private func searchConnection(
+        query: SearchQuery,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        source: FrameSource
+    ) throws -> SearchResults {
         switch query.mode {
         case .relevant:
-            // Sort by relevance score (highest first)
-            allResults.sort { $0.relevanceScore > $1.relevanceScore }
+            return try searchRelevant(query: query, connection: connection, config: config, source: source)
         case .all:
-            // Sort chronologically (most recent first)
-            allResults.sort { $0.timestamp > $1.timestamp }
+            return try searchAll(query: query, connection: connection, config: config, source: source)
+        }
+    }
+
+    private func searchRelevant(
+        query: SearchQuery,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        source: FrameSource
+    ) throws -> SearchResults {
+        let startTime = Date()
+        let ftsQuery = buildFTSQuery(query.text)
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        // Phase 1: Pure FTS search
+        let relevanceLimit = 50
+        let ftsSQL = """
+            SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
+            FROM searchRanking
+            WHERE searchRanking MATCH ?
+            ORDER BY bm25(searchRanking)
+            LIMIT ?
+        """
+
+        guard let ftsStatement = try? connection.prepare(sql: ftsSQL) else {
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        }
+        defer { connection.finalize(ftsStatement) }
+
+        sqlite3_bind_text(ftsStatement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(ftsStatement, 2, Int32(relevanceLimit))
+
+        var ftsResults: [(rowid: Int64, snippet: String, rank: Double)] = []
+        while sqlite3_step(ftsStatement) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(ftsStatement, 0)
+            let snippet = sqlite3_column_text(ftsStatement, 1).map { String(cString: $0) } ?? ""
+            let rank = sqlite3_column_double(ftsStatement, 2)
+            ftsResults.append((rowid: rowid, snippet: snippet, rank: rank))
         }
 
-        // Apply limit
-        let limitedResults = Array(allResults.prefix(query.limit))
+        guard !ftsResults.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: elapsed)
+        }
 
-        let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+        // Phase 2: Join to get metadata
+        let rowids = ftsResults.map { $0.rowid }
+        let rowidPlaceholders = rowids.map { _ in "?" }.joined(separator: ", ")
 
-        Log.info("[DataAdapter] Consolidated \(allResults.count) results from all sources (returned: \(limitedResults.count), total: \(totalCount)) in \(searchTimeMs)ms", category: .app)
+        var whereConditions = ["ds.docid IN (\(rowidPlaceholders))"]
+        var extraBindValues: [Any] = []
 
-        return SearchResults(
-            query: query,
-            results: limitedResults,
-            totalCount: totalCount,
-            searchTimeMs: searchTimeMs
+        if let cutoffDate = config.cutoffDate {
+            whereConditions.append("f.createdAt < ?")
+            extraBindValues.append(config.formatDate(cutoffDate))
+        }
+
+        if let startDate = query.filters.startDate {
+            whereConditions.append("f.createdAt >= ?")
+            extraBindValues.append(config.formatDate(startDate))
+        }
+        if let endDate = query.filters.endDate {
+            whereConditions.append("f.createdAt <= ?")
+            extraBindValues.append(config.formatDate(endDate))
+        }
+
+        if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
+            let appPlaceholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("s.bundleID IN (\(appPlaceholders))")
+            extraBindValues.append(contentsOf: appBundleIDs)
+        }
+
+        let whereClause = whereConditions.joined(separator: " AND ")
+
+        let metadataSQL = """
+            SELECT
+                ds.docid,
+                f.id as frame_id,
+                f.createdAt as timestamp,
+                s.id as segment_id,
+                s.bundleID as app_bundle_id,
+                s.windowName as window_title,
+                f.videoId as video_id,
+                f.videoFrameIndex as frame_index
+            FROM doc_segment ds
+            JOIN frame f ON ds.frameId = f.id
+            JOIN segment s ON f.segmentId = s.id
+            WHERE \(whereClause)
+            ORDER BY f.createdAt DESC
+            LIMIT ? OFFSET ?
+        """
+
+        guard let metaStatement = try? connection.prepare(sql: metadataSQL) else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: elapsed)
+        }
+        defer { connection.finalize(metaStatement) }
+
+        var bindIndex: Int32 = 1
+        for rowid in rowids {
+            sqlite3_bind_int64(metaStatement, bindIndex, rowid)
+            bindIndex += 1
+        }
+
+        for value in extraBindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(metaStatement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            } else if let intValue = value as? Int64 {
+                sqlite3_bind_int64(metaStatement, bindIndex, intValue)
+            }
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.limit))
+        bindIndex += 1
+        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.offset))
+
+        let ftsLookup = Dictionary(uniqueKeysWithValues: ftsResults.map { ($0.rowid, (snippet: $0.snippet, rank: $0.rank)) })
+
+        var results: [SearchResult] = []
+
+        while sqlite3_step(metaStatement) == SQLITE_ROW {
+            let docid = sqlite3_column_int64(metaStatement, 0)
+            let frameId = sqlite3_column_int64(metaStatement, 1)
+            let segmentId = sqlite3_column_int64(metaStatement, 3)
+            let appBundleID = sqlite3_column_text(metaStatement, 4).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(metaStatement, 5).map { String(cString: $0) }
+            let videoId = sqlite3_column_int64(metaStatement, 6)
+            let frameIndex = Int(sqlite3_column_int(metaStatement, 7))
+
+            guard let ftsData = ftsLookup[docid] else { continue }
+            let snippet = ftsData.snippet
+            let rank = ftsData.rank
+
+            let appName = appBundleID?.components(separatedBy: ".").last
+            let timestamp = config.parseDate(from: metaStatement, column: 2) ?? Date()
+
+            let cleanSnippet = snippet
+                .replacingOccurrences(of: "<mark>", with: "")
+                .replacingOccurrences(of: "</mark>", with: "")
+
+            let result = SearchResult(
+                id: FrameID(value: frameId),
+                timestamp: timestamp,
+                snippet: cleanSnippet,
+                matchedText: query.text,
+                relevanceScore: abs(rank) / (1.0 + abs(rank)),
+                metadata: FrameMetadata(
+                    appBundleID: appBundleID,
+                    appName: appName,
+                    windowName: windowName,
+                    browserURL: nil,
+                    displayID: 0
+                ),
+                segmentID: AppSegmentID(value: segmentId),
+                videoID: VideoSegmentID(value: videoId),
+                frameIndex: frameIndex,
+                source: source
+            )
+
+            results.append(result)
+        }
+
+        let totalElapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+        return SearchResults(query: query, results: results, totalCount: min(ftsResults.count, relevanceLimit), searchTimeMs: totalElapsed)
+    }
+
+    private func searchAll(
+        query: SearchQuery,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        source: FrameSource
+    ) throws -> SearchResults {
+        let startTime = Date()
+        let ftsQuery = buildFTSQuery(query.text)
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        var whereConditions: [String] = []
+        var bindValues: [Any] = []
+
+        if let cutoffDate = config.cutoffDate {
+            whereConditions.append("f.createdAt < ?")
+            bindValues.append(config.formatDate(cutoffDate))
+        }
+
+        if let startDate = query.filters.startDate {
+            whereConditions.append("f.createdAt >= ?")
+            bindValues.append(config.formatDate(startDate))
+        }
+        if let endDate = query.filters.endDate {
+            whereConditions.append("f.createdAt <= ?")
+            bindValues.append(config.formatDate(endDate))
+        }
+
+        let needsSegmentJoin = query.filters.appBundleIDs != nil
+        var appFilterClause = ""
+        if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
+            let placeholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            appFilterClause = "AND s.bundleID IN (\(placeholders))"
+            bindValues.append(contentsOf: appBundleIDs)
+        }
+
+        let whereClause = whereConditions.isEmpty ? "1=1" : whereConditions.joined(separator: " AND ")
+        let recentFramesLimit = 10000
+
+        let sql: String
+        if needsSegmentJoin {
+            sql = """
+                SELECT
+                    ds.docid as docid,
+                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                    bm25(searchRanking) as rank,
+                    recent_frames.frame_id,
+                    recent_frames.timestamp,
+                    recent_frames.segment_id,
+                    recent_frames.video_id,
+                    recent_frames.frame_index
+                FROM (
+                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
+                    FROM frame f
+                    JOIN segment s ON f.segmentId = s.id
+                    WHERE \(whereClause) \(appFilterClause)
+                    ORDER BY f.createdAt DESC
+                    LIMIT \(recentFramesLimit)
+                ) recent_frames
+                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
+                JOIN searchRanking ON searchRanking.rowid = ds.docid
+                WHERE searchRanking MATCH ?
+                ORDER BY recent_frames.timestamp DESC
+                LIMIT ? OFFSET ?
+            """
+        } else {
+            sql = """
+                SELECT
+                    ds.docid as docid,
+                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
+                    bm25(searchRanking) as rank,
+                    recent_frames.frame_id,
+                    recent_frames.timestamp,
+                    recent_frames.segment_id,
+                    recent_frames.video_id,
+                    recent_frames.frame_index
+                FROM (
+                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
+                    FROM frame f
+                    WHERE \(whereClause)
+                    ORDER BY f.createdAt DESC
+                    LIMIT \(recentFramesLimit)
+                ) recent_frames
+                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
+                JOIN searchRanking ON searchRanking.rowid = ds.docid
+                WHERE searchRanking MATCH ?
+                ORDER BY recent_frames.timestamp DESC
+                LIMIT ? OFFSET ?
+            """
+        }
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+
+        for value in bindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            } else if let intValue = value as? Int64 {
+                sqlite3_bind_int64(statement, bindIndex, intValue)
+            }
+            bindIndex += 1
+        }
+
+        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        sqlite3_bind_int(statement, bindIndex, Int32(query.limit))
+        bindIndex += 1
+        sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
+
+        var frameResults: [(docid: Int64, snippet: String, rank: Double, frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int)] = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let docid = sqlite3_column_int64(statement, 0)
+            let snippet = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
+            let rank = sqlite3_column_double(statement, 2)
+            let frameId = sqlite3_column_int64(statement, 3)
+            let segmentId = sqlite3_column_int64(statement, 5)
+            let videoId = sqlite3_column_int64(statement, 6)
+            let frameIndex = Int(sqlite3_column_int(statement, 7))
+
+            let timestamp = config.parseDate(from: statement, column: 4) ?? Date()
+            frameResults.append((docid: docid, snippet: snippet, rank: rank, frameId: frameId, timestamp: timestamp, segmentId: segmentId, videoId: videoId, frameIndex: frameIndex))
+        }
+
+        guard !frameResults.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            let totalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
+            return SearchResults(query: query, results: [], totalCount: totalCount, searchTimeMs: elapsed)
+        }
+
+        let segmentIds = Array(Set(frameResults.map { $0.segmentId }))
+        let segmentMetadata = fetchSegmentMetadata(segmentIds: segmentIds, connection: connection)
+
+        var results: [SearchResult] = []
+
+        for frame in frameResults {
+            let segmentMeta = segmentMetadata[frame.segmentId]
+            let appBundleID = segmentMeta?.bundleID
+            let windowName = segmentMeta?.windowName
+            let appName = appBundleID?.components(separatedBy: ".").last
+
+            let cleanSnippet = frame.snippet
+                .replacingOccurrences(of: "<mark>", with: "")
+                .replacingOccurrences(of: "</mark>", with: "")
+
+            let result = SearchResult(
+                id: FrameID(value: frame.frameId),
+                timestamp: frame.timestamp,
+                snippet: cleanSnippet,
+                matchedText: query.text,
+                relevanceScore: abs(frame.rank) / (1.0 + abs(frame.rank)),
+                metadata: FrameMetadata(
+                    appBundleID: appBundleID,
+                    appName: appName,
+                    windowName: windowName,
+                    browserURL: nil,
+                    displayID: 0
+                ),
+                segmentID: AppSegmentID(value: frame.segmentId),
+                videoID: VideoSegmentID(value: frame.videoId),
+                frameIndex: frame.frameIndex,
+                source: source
+            )
+
+            results.append(result)
+        }
+
+        let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+        let totalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
+
+        return SearchResults(query: query, results: results, totalCount: totalCount, searchTimeMs: elapsed)
+    }
+
+    private func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?)] {
+        guard !segmentIds.isEmpty else { return [:] }
+
+        let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")
+        let sql = "SELECT id, bundleID, windowName FROM segment WHERE id IN (\(placeholders))"
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [:] }
+        defer { connection.finalize(statement) }
+
+        for (index, segmentId) in segmentIds.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 1), segmentId)
+        }
+
+        var metadata: [Int64: (bundleID: String?, windowName: String?)] = [:]
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            let bundleID = sqlite3_column_text(statement, 1).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 2).map { String(cString: $0) }
+            metadata[id] = (bundleID: bundleID, windowName: windowName)
+        }
+
+        return metadata
+    }
+
+    private func buildFTSQuery(_ text: String) -> String {
+        let words = text.components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .map { word -> String in
+                let escaped = word
+                    .replacingOccurrences(of: "\"", with: "\"\"")
+                    .replacingOccurrences(of: "*", with: "")
+                    .replacingOccurrences(of: ":", with: "")
+                return "\"\(escaped)\"*"
+            }
+
+        return words.joined(separator: " ")
+    }
+
+    private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
+        let countSQL = """
+            SELECT COUNT(*)
+            FROM searchRanking
+            WHERE searchRanking MATCH ?
+        """
+
+        guard let countStmt = try? connection.prepare(sql: countSQL) else { return 0 }
+        defer { connection.finalize(countStmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(countStmt, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+
+        if sqlite3_step(countStmt) == SQLITE_ROW {
+            return Int(sqlite3_column_int(countStmt, 0))
+        }
+
+        return 0
+    }
+
+    private func deleteFrames(frameIDs: [FrameID], connection: DatabaseConnection) throws {
+        guard !frameIDs.isEmpty else { return }
+
+        try connection.beginTransaction()
+
+        do {
+            for frameID in frameIDs {
+                // Delete OCR nodes
+                let deleteNodesSql = "DELETE FROM node WHERE frameId = ?;"
+                if let stmt = try? connection.prepare(sql: deleteNodesSql) {
+                    sqlite3_bind_int64(stmt, 1, frameID.value)
+                    sqlite3_step(stmt)
+                    connection.finalize(stmt)
+                }
+
+                // Delete doc_segment entries
+                let deleteDocSegmentSql = "DELETE FROM doc_segment WHERE frameId = ?;"
+                if let stmt = try? connection.prepare(sql: deleteDocSegmentSql) {
+                    sqlite3_bind_int64(stmt, 1, frameID.value)
+                    sqlite3_step(stmt)
+                    connection.finalize(stmt)
+                }
+
+                // Delete frame itself
+                let deleteFrameSql = "DELETE FROM frame WHERE id = ?;"
+                if let stmt = try? connection.prepare(sql: deleteFrameSql) {
+                    sqlite3_bind_int64(stmt, 1, frameID.value)
+                    sqlite3_step(stmt)
+                    connection.finalize(stmt)
+                }
+            }
+
+            try connection.commit()
+        } catch {
+            try connection.rollback()
+            throw error
+        }
+    }
+
+    // MARK: - Row Parsing
+
+    private func parseFrameWithVideoInfo(statement: OpaquePointer, config: DatabaseConfig) throws -> FrameWithVideoInfo {
+        let id = FrameID(value: sqlite3_column_int64(statement, 0))
+
+        guard let timestamp = config.parseDate(from: statement, column: 1) else {
+            throw DataAdapterError.parseFailed
+        }
+
+        let segmentID = AppSegmentID(value: sqlite3_column_int64(statement, 2))
+        let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
+        let videoFrameIndex = Int(sqlite3_column_int(statement, 4))
+
+        let encodingStatusText = sqlite3_column_text(statement, 5)
+        let encodingStatusString = encodingStatusText != nil ? String(cString: encodingStatusText!) : "pending"
+        let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
+
+        let bundleID = getTextOrNil(statement, 6) ?? ""
+        let windowName = getTextOrNil(statement, 7)
+        let browserUrl = getTextOrNil(statement, 8)
+
+        let videoPath = getTextOrNil(statement, 9)
+        let frameRate = sqlite3_column_type(statement, 10) != SQLITE_NULL ? sqlite3_column_double(statement, 10) : nil
+        let width = sqlite3_column_type(statement, 11) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 11)) : nil
+        let height = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
+
+        let metadata = FrameMetadata(
+            appBundleID: bundleID.isEmpty ? nil : bundleID,
+            appName: bundleID.components(separatedBy: ".").last,
+            windowName: windowName,
+            browserURL: browserUrl,
+            displayID: 0
         )
+
+        let frame = FrameReference(
+            id: id,
+            timestamp: timestamp,
+            segmentID: segmentID,
+            videoID: videoID,
+            frameIndexInSegment: videoFrameIndex,
+            encodingStatus: encodingStatus,
+            metadata: metadata,
+            source: config.source
+        )
+
+        let videoInfo: FrameVideoInfo?
+        if let relativePath = videoPath, let rate = frameRate, let w = width, let h = height {
+            let fullPath = "\(config.storageRoot)/\(relativePath)"
+            videoInfo = FrameVideoInfo(
+                videoPath: fullPath,
+                frameIndex: videoFrameIndex,
+                frameRate: rate,
+                width: w,
+                height: h
+            )
+        } else {
+            videoInfo = nil
+        }
+
+        return FrameWithVideoInfo(frame: frame, videoInfo: videoInfo)
+    }
+
+    private func parseSegment(statement: OpaquePointer, config: DatabaseConfig) throws -> Segment {
+        let id = SegmentID(value: sqlite3_column_int64(statement, 0))
+        let bundleID = getTextOrNil(statement, 1) ?? ""
+
+        guard let startDate = config.parseDate(from: statement, column: 2),
+              let endDate = config.parseDate(from: statement, column: 3) else {
+            throw DataAdapterError.parseFailed
+        }
+
+        let windowName = getTextOrNil(statement, 4)
+        let browserUrl = getTextOrNil(statement, 5)
+        let type = Int(sqlite3_column_int(statement, 6))
+
+        return Segment(
+            id: id,
+            bundleID: bundleID,
+            startDate: startDate,
+            endDate: endDate,
+            windowName: windowName,
+            browserUrl: browserUrl,
+            type: type
+        )
+    }
+
+    private func parseOCRNodeFromRow(statement: OpaquePointer) -> OCRNodeWithText? {
+        let id = Int(sqlite3_column_int64(statement, 0))
+        let textOffset = Int(sqlite3_column_int(statement, 2))
+        let textLength = Int(sqlite3_column_int(statement, 3))
+        let leftX = sqlite3_column_double(statement, 4)
+        let topY = sqlite3_column_double(statement, 5)
+        let width = sqlite3_column_double(statement, 6)
+        let height = sqlite3_column_double(statement, 7)
+
+        guard let fullTextCStr = sqlite3_column_text(statement, 8) else { return nil }
+        let fullText = String(cString: fullTextCStr)
+
+        let startIndex = fullText.index(
+            fullText.startIndex,
+            offsetBy: textOffset,
+            limitedBy: fullText.endIndex
+        ) ?? fullText.endIndex
+
+        let endIndex = fullText.index(
+            startIndex,
+            offsetBy: textLength,
+            limitedBy: fullText.endIndex
+        ) ?? fullText.endIndex
+
+        let text = String(fullText[startIndex..<endIndex])
+
+        return OCRNodeWithText(
+            id: id,
+            x: leftX,
+            y: topY,
+            width: width,
+            height: height,
+            text: text
+        )
+    }
+
+    private func getTextOrNil(_ statement: OpaquePointer, _ column: Int32) -> String? {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
+        guard let cString = sqlite3_column_text(statement, column) else { return nil }
+        return String(cString: cString)
     }
 }
 
@@ -916,6 +1556,8 @@ public enum DataAdapterError: Error, LocalizedError {
     case notInitialized
     case sourceNotAvailable(FrameSource)
     case noSourceForTimestamp(Date)
+    case frameNotFound
+    case parseFailed
 
     public var errorDescription: String? {
         switch self {
@@ -925,6 +1567,10 @@ public enum DataAdapterError: Error, LocalizedError {
             return "Data source not available: \(source.displayName)"
         case .noSourceForTimestamp(let date):
             return "No data source available for timestamp: \(date)"
+        case .frameNotFound:
+            return "Frame not found"
+        case .parseFailed:
+            return "Failed to parse database row"
         }
     }
 }

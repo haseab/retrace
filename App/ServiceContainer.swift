@@ -6,6 +6,7 @@ import Capture
 import Processing
 import Search
 import Migration
+import SQLCipher
 
 /// Dependency injection container for all app services
 /// Owner: APP integration
@@ -248,29 +249,34 @@ public actor ServiceContainer {
         // 8. Migration doesn't need explicit initialization
         Log.info("✓ Migration ready", category: .app)
 
-        // 9. Initialize DataAdapter with primary and secondary sources
-        let retraceSource = RetraceDataSource(database: database, storage: storage)
-        let adapter = DataAdapter(primarySource: retraceSource)
+        // 9. Initialize DataAdapter with connections directly
+        guard let dbPointer = await database.getConnection() else {
+            throw ServiceError.databaseNotReady
+        }
+
+        // Create connections and config for Retrace
+        let retraceConnection = SQLiteConnection(db: dbPointer)
+        let retraceConfig = DatabaseConfig.retrace
+        let retraceImageExtractor = HEVCStorageExtractor(storageManager: storage)
+
+        let adapter = DataAdapter(
+            retraceConnection: retraceConnection,
+            retraceConfig: retraceConfig,
+            retraceImageExtractor: retraceImageExtractor,
+            database: database
+        )
 
         // Register Rewind source if user opted in
         let useRewindData = UserDefaults.standard.bool(forKey: "useRewindData")
         Log.info("Checking Rewind source during initialization: useRewindData=\(useRewindData)", category: .app)
 
         if useRewindData {
-            // Hardcoded password for Rewind database decryption
-            let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
-            do {
-                let rewindSource = try RewindDataSource(password: rewindPassword)
-                await adapter.registerSource(rewindSource)
-                Log.info("✓ Rewind source registered during initialization", category: .app)
-            } catch {
-                Log.warning("Failed to create Rewind source during initialization: \(error)", category: .app)
-            }
+            await configureRewindSource(adapter: adapter)
         } else {
             Log.info("⊘ Rewind source not registered during initialization (useRewindData is false)", category: .app)
         }
 
-        // Initialize the adapter (connects all sources)
+        // Initialize the adapter
         try await adapter.initialize()
         self.dataAdapter = adapter
         Log.info("✓ DataAdapter initialized", category: .app)
@@ -305,20 +311,78 @@ public actor ServiceContainer {
                 return
             }
 
-            // Hardcoded password for Rewind database decryption
-            let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
-            do {
-                let rewindSource = try RewindDataSource(password: rewindPassword)
-                await adapter.registerSource(rewindSource)
-                try await rewindSource.connect()
-                Log.info("✓ Rewind source registered and connected after initialization", category: .app)
-            } catch {
-                Log.warning("Failed to create Rewind source: \(error)", category: .app)
-                throw error
-            }
+            await configureRewindSource(adapter: adapter)
+            Log.info("✓ Rewind source registered and connected after initialization", category: .app)
         } else {
             Log.info("⊘ Rewind source not registered (useRewindData is false)", category: .app)
         }
+    }
+
+    /// Helper to configure Rewind source on DataAdapter
+    private func configureRewindSource(adapter: DataAdapter) async {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+        let rewindDBPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
+
+        guard FileManager.default.fileExists(atPath: rewindDBPath) else {
+            Log.warning("Rewind database not found at: \(rewindDBPath)", category: .app)
+            return
+        }
+
+        // Open encrypted database
+        var db: OpaquePointer?
+        guard sqlite3_open(rewindDBPath, &db) == SQLITE_OK else {
+            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+            Log.error("[ServiceContainer] Failed to open Rewind database: \(errorMsg)", category: .app)
+            return
+        }
+
+        // Set encryption key
+        let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+        let keySQL = "PRAGMA key = '\(rewindPassword)'"
+        var keyError: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, keySQL, nil, nil, &keyError) != SQLITE_OK {
+            let error = keyError.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(keyError)
+            Log.error("[ServiceContainer] Failed to set Rewind encryption key: \(error)", category: .app)
+            sqlite3_close(db)
+            return
+        }
+
+        // Set cipher compatibility (Rewind uses SQLCipher 4)
+        var compatError: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, "PRAGMA cipher_compatibility = 4", nil, nil, &compatError) != SQLITE_OK {
+            let error = compatError.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(compatError)
+            Log.error("[ServiceContainer] Failed to set cipher compatibility: \(error)", category: .app)
+            sqlite3_close(db)
+            return
+        }
+
+        // Verify connection
+        var testStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
+              sqlite3_step(testStmt) == SQLITE_ROW else {
+            sqlite3_finalize(testStmt)
+            sqlite3_close(db)
+            Log.error("[ServiceContainer] Failed to verify Rewind encryption", category: .app)
+            return
+        }
+        sqlite3_finalize(testStmt)
+
+        // Create connection and config
+        let rewindConnection = SQLCipherConnection(db: db)
+        let rewindConfig = DatabaseConfig.rewind
+        let rewindChunksPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/chunks"
+        let rewindImageExtractor = AVAssetExtractor(storageRoot: rewindChunksPath)
+        let cutoffDate = Date(timeIntervalSince1970: 1766217600) // Dec 20, 2025 00:00:00 UTC
+
+        await adapter.configureRewind(
+            connection: rewindConnection,
+            config: rewindConfig,
+            imageExtractor: rewindImageExtractor,
+            cutoffDate: cutoffDate
+        )
+        Log.info("✓ Rewind source configured during initialization", category: .app)
     }
 
     /// Shutdown all services gracefully
