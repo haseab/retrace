@@ -567,6 +567,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Save the current playhead position AND frames to cache for instant restore
     public func savePosition() {
+        print("[PositionCache] savePosition() called")
+
+        // Always save search results, even if timeline has no frames
+        searchViewModel.saveSearchResults()
+
         guard let timestamp = currentTimestamp else { return }
         guard !frames.isEmpty else { return }
 
@@ -692,6 +697,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Clear the cache after restoring
             clearCachedPosition()
 
+            // Also restore cached search results if any
+            searchViewModel.restoreCachedSearchResults()
+
             // Load image if needed for current frame
             loadImageIfNeeded()
 
@@ -728,6 +736,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                     // Clear the cache after restoring
                     clearCachedPosition()
+
+                    // Restore cached search results if any
+                    searchViewModel.restoreCachedSearchResults()
 
                     // Load image if needed for current frame
                     loadImageIfNeeded()
@@ -784,6 +795,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Start at the most recent frame (last in array since sorted ascending, oldest first)
             currentIndex = frames.count - 1
+
+            // Restore cached search results if any
+            searchViewModel.restoreCachedSearchResults()
 
             // Load image if needed for current frame
             loadImageIfNeeded()

@@ -3,24 +3,24 @@ import SQLCipher
 import Shared
 
 /// CRUD operations for FTS5 search tables (Rewind-compatible)
-/// Handles searchRanking_content and doc_segment tables
+/// Handles searchRanking (FTS5), searchRanking_content, and doc_segment tables
 ///
-/// Rewind FTS Pattern:
-/// 1. INSERT INTO searchRanking_content (c0, c1, c2) → get docid
-/// 2. INSERT INTO doc_segment (docid, segmentId, frameId)
-/// 3. FTS5 automatically indexes via external content configuration
+/// Rewind-compatible FTS Pattern:
+/// 1. INSERT INTO searchRanking (text, otherText, title) → FTS auto-indexes, get rowid
+/// 2. INSERT INTO searchRanking_content (id, c0, c1, c2) with same id for OCR lookups
+/// 3. INSERT INTO doc_segment (docid, segmentId, frameId)
 enum FTSQueries {
 
     // MARK: - Insert FTS Content
 
-    /// Insert OCR text into searchRanking_content and return the docid
-    /// This is the Rewind-compatible pattern for FTS indexing
+    /// Insert OCR text into searchRanking (FTS) and searchRanking_content, return the docid
+    /// This matches Rewind's pattern where FTS table auto-indexes on insert
     ///
     /// - Parameters:
     ///   - db: Database connection
-    ///   - mainText: Main OCR text (c0) - concatenated text from all nodes
-    ///   - chromeText: UI chrome text (c1) - status bar, menu bar text (optional)
-    ///   - windowTitle: Window title (c2) - from app metadata
+    ///   - mainText: Main OCR text - concatenated text from all nodes
+    ///   - chromeText: UI chrome text - status bar, menu bar text (optional)
+    ///   - windowTitle: Window title - from app metadata
     /// - Returns: The docid (rowid) of the inserted content
     static func insertContent(
         db: OpaquePointer,
@@ -28,8 +28,9 @@ enum FTSQueries {
         chromeText: String?,
         windowTitle: String?
     ) throws -> Int64 {
+        // Insert into FTS table - auto-indexes and populates searchRanking_content shadow table
         let sql = """
-            INSERT INTO searchRanking_content (c0, c1, c2)
+            INSERT INTO searchRanking (text, otherText, title)
             VALUES (?, ?, ?);
             """
 
@@ -45,7 +46,6 @@ enum FTSQueries {
             )
         }
 
-        // Bind parameters
         sqlite3_bind_text(statement, 1, mainText, -1, SQLITE_TRANSIENT)
         bindTextOrNull(statement, 2, chromeText)
         bindTextOrNull(statement, 3, windowTitle)
@@ -57,7 +57,6 @@ enum FTSQueries {
             )
         }
 
-        // Return the docid (last inserted rowid)
         return sqlite3_last_insert_rowid(db)
     }
 
@@ -156,9 +155,9 @@ enum FTSQueries {
     /// Get FTS content by docid
     static func getContent(db: OpaquePointer, docid: Int64) throws -> (mainText: String, chromeText: String?, windowTitle: String?)? {
         let sql = """
-            SELECT c0, c1, c2
-            FROM searchRanking_content
-            WHERE id = ?;
+            SELECT text, otherText, title
+            FROM searchRanking
+            WHERE rowid = ?;
             """
 
         var statement: OpaquePointer?
@@ -247,8 +246,8 @@ enum FTSQueries {
             )
         }
 
-        // Delete from searchRanking_content
-        let deleteContentSQL = "DELETE FROM searchRanking_content WHERE id = ?;"
+        // Delete from searchRanking (FTS virtual table)
+        let deleteContentSQL = "DELETE FROM searchRanking WHERE rowid = ?;"
         var contentStatement: OpaquePointer?
         defer {
             sqlite3_finalize(contentStatement)
@@ -274,7 +273,7 @@ enum FTSQueries {
     // MARK: - Statistics
 
     static func getContentCount(db: OpaquePointer) throws -> Int {
-        let sql = "SELECT COUNT(*) FROM searchRanking_content;"
+        let sql = "SELECT COUNT(*) FROM searchRanking;"
 
         var statement: OpaquePointer?
         defer {

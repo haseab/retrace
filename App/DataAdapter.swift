@@ -433,13 +433,18 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
+        Log.info("[DataAdapter] Search started: query='\(query.text)', mode=\(query.mode), limit=\(query.limit), appFilter=\(query.filters.appBundleIDs ?? []), startDate=\(String(describing: query.filters.startDate)), endDate=\(String(describing: query.filters.endDate))", category: .app)
+
         let startTime = Date()
         var allResults: [SearchResult] = []
         var totalCount = 0
 
         // Search Retrace
+        let retraceStart = Date()
         do {
             let retraceResults = try searchConnection(query: query, connection: retraceConnection, config: retraceConfig, source: .native)
+            let retraceElapsed = Int(Date().timeIntervalSince(retraceStart) * 1000)
+            Log.info("[DataAdapter] Retrace search completed in \(retraceElapsed)ms, found \(retraceResults.results.count) results", category: .app)
             allResults.append(contentsOf: retraceResults.results)
             totalCount += retraceResults.totalCount
         } catch {
@@ -448,8 +453,11 @@ public actor DataAdapter {
 
         // Search Rewind
         if let rewind = rewindConnection, let config = rewindConfig {
+            let rewindStart = Date()
             do {
                 var rewindResults = try searchConnection(query: query, connection: rewind, config: config, source: .rewind)
+                let rewindElapsed = Int(Date().timeIntervalSince(rewindStart) * 1000)
+                Log.info("[DataAdapter] Rewind search completed in \(rewindElapsed)ms, found \(rewindResults.results.count) results", category: .app)
                 rewindResults.results = rewindResults.results.map { result in
                     var modified = result
                     modified.source = .rewind
@@ -992,138 +1000,118 @@ public actor DataAdapter {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
-        // Phase 1: Pure FTS search
         let relevanceLimit = 50
-        let ftsSQL = """
-            SELECT rowid, snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet, bm25(searchRanking) as rank
-            FROM searchRanking
-            WHERE searchRanking MATCH ?
-            ORDER BY bm25(searchRanking)
-            LIMIT ?
-        """
 
-        guard let ftsStatement = try? connection.prepare(sql: ftsSQL) else {
-            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
-        }
-        defer { connection.finalize(ftsStatement) }
+        Log.info("[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? [])", category: .app)
 
-        sqlite3_bind_text(ftsStatement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int(ftsStatement, 2, Int32(relevanceLimit))
-
-        var ftsResults: [(rowid: Int64, snippet: String, rank: Double)] = []
-        while sqlite3_step(ftsStatement) == SQLITE_ROW {
-            let rowid = sqlite3_column_int64(ftsStatement, 0)
-            let snippet = sqlite3_column_text(ftsStatement, 1).map { String(cString: $0) } ?? ""
-            let rank = sqlite3_column_double(ftsStatement, 2)
-            ftsResults.append((rowid: rowid, snippet: snippet, rank: rank))
-        }
-
-        guard !ftsResults.isEmpty else {
-            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: elapsed)
-        }
-
-        // Phase 2: Join to get metadata
-        let rowids = ftsResults.map { $0.rowid }
-        let rowidPlaceholders = rowids.map { _ in "?" }.joined(separator: ", ")
-
-        var whereConditions = ["ds.docid IN (\(rowidPlaceholders))"]
-        var extraBindValues: [Any] = []
+        // Build WHERE conditions for the outer query (filters applied after FTS subquery)
+        var outerWhereConditions: [String] = []
+        var outerBindValues: [Any] = []
 
         if let cutoffDate = config.cutoffDate {
-            whereConditions.append("f.createdAt < ?")
-            extraBindValues.append(config.formatDate(cutoffDate))
+            outerWhereConditions.append("f.createdAt < ?")
+            outerBindValues.append(config.formatDate(cutoffDate))
         }
 
         if let startDate = query.filters.startDate {
-            whereConditions.append("f.createdAt >= ?")
-            extraBindValues.append(config.formatDate(startDate))
+            outerWhereConditions.append("f.createdAt >= ?")
+            outerBindValues.append(config.formatDate(startDate))
         }
         if let endDate = query.filters.endDate {
-            whereConditions.append("f.createdAt <= ?")
-            extraBindValues.append(config.formatDate(endDate))
+            outerWhereConditions.append("f.createdAt <= ?")
+            outerBindValues.append(config.formatDate(endDate))
         }
 
         if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
             let appPlaceholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
-            whereConditions.append("s.bundleID IN (\(appPlaceholders))")
-            extraBindValues.append(contentsOf: appBundleIDs)
+            outerWhereConditions.append("s.bundleID IN (\(appPlaceholders))")
+            outerBindValues.append(contentsOf: appBundleIDs)
         }
 
-        let whereClause = whereConditions.joined(separator: " AND ")
+        let outerWhereClause = outerWhereConditions.isEmpty ? "" : "WHERE " + outerWhereConditions.joined(separator: " AND ")
 
-        let metadataSQL = """
+        // Subquery approach: FTS with bm25 FIRST (limited), then join and filter
+        // No snippet() - it's expensive and not needed (we get text from OCR nodes)
+        let sql = """
             SELECT
-                ds.docid,
+                fts.docid,
                 f.id as frame_id,
                 f.createdAt as timestamp,
                 s.id as segment_id,
                 s.bundleID as app_bundle_id,
                 s.windowName as window_title,
                 f.videoId as video_id,
-                f.videoFrameIndex as frame_index
-            FROM doc_segment ds
+                f.videoFrameIndex as frame_index,
+                fts.rank
+            FROM (
+                SELECT
+                    rowid as docid,
+                    bm25(searchRanking) as rank
+                FROM searchRanking
+                WHERE searchRanking MATCH ?
+                ORDER BY bm25(searchRanking)
+                LIMIT ?
+            ) fts
+            JOIN doc_segment ds ON fts.docid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
-            WHERE \(whereClause)
-            ORDER BY f.createdAt DESC
+            \(outerWhereClause)
+            ORDER BY fts.rank
             LIMIT ? OFFSET ?
         """
 
-        guard let metaStatement = try? connection.prepare(sql: metadataSQL) else {
-            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: elapsed)
+        Log.info("[DataAdapter.searchRelevant] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
+        Log.info("[DataAdapter.searchRelevant] Binds: ftsQuery='\(ftsQuery)', outerFilters=\(outerBindValues), limit=\(relevanceLimit), offset=\(query.offset)", category: .app)
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
         }
-        defer { connection.finalize(metaStatement) }
+        defer { connection.finalize(statement) }
 
         var bindIndex: Int32 = 1
-        for rowid in rowids {
-            sqlite3_bind_int64(metaStatement, bindIndex, rowid)
-            bindIndex += 1
-        }
 
-        for value in extraBindValues {
+        // Bind FTS query
+        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        // Bind inner LIMIT (for FTS subquery) - fetch more to account for filtering
+        let innerLimit = outerWhereConditions.isEmpty ? relevanceLimit : relevanceLimit * 10
+        sqlite3_bind_int(statement, bindIndex, Int32(innerLimit))
+        bindIndex += 1
+
+        // Bind outer WHERE values
+        for value in outerBindValues {
             if let stringValue = value as? String {
-                sqlite3_bind_text(metaStatement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
             } else if let intValue = value as? Int64 {
-                sqlite3_bind_int64(metaStatement, bindIndex, intValue)
+                sqlite3_bind_int64(statement, bindIndex, intValue)
             }
             bindIndex += 1
         }
 
-        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.limit))
+        // Bind outer LIMIT and OFFSET
+        sqlite3_bind_int(statement, bindIndex, Int32(relevanceLimit))
         bindIndex += 1
-        sqlite3_bind_int(metaStatement, bindIndex, Int32(query.offset))
-
-        let ftsLookup = Dictionary(uniqueKeysWithValues: ftsResults.map { ($0.rowid, (snippet: $0.snippet, rank: $0.rank)) })
+        sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
 
         var results: [SearchResult] = []
 
-        while sqlite3_step(metaStatement) == SQLITE_ROW {
-            let docid = sqlite3_column_int64(metaStatement, 0)
-            let frameId = sqlite3_column_int64(metaStatement, 1)
-            let segmentId = sqlite3_column_int64(metaStatement, 3)
-            let appBundleID = sqlite3_column_text(metaStatement, 4).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(metaStatement, 5).map { String(cString: $0) }
-            let videoId = sqlite3_column_int64(metaStatement, 6)
-            let frameIndex = Int(sqlite3_column_int(metaStatement, 7))
-
-            guard let ftsData = ftsLookup[docid] else { continue }
-            let snippet = ftsData.snippet
-            let rank = ftsData.rank
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frameId = sqlite3_column_int64(statement, 1)
+            let segmentId = sqlite3_column_int64(statement, 3)
+            let appBundleID = sqlite3_column_text(statement, 4).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+            let videoId = sqlite3_column_int64(statement, 6)
+            let frameIndex = Int(sqlite3_column_int(statement, 7))
+            let rank = sqlite3_column_double(statement, 8)
 
             let appName = appBundleID?.components(separatedBy: ".").last
-            let timestamp = config.parseDate(from: metaStatement, column: 2) ?? Date()
-
-            let cleanSnippet = snippet
-                .replacingOccurrences(of: "<mark>", with: "")
-                .replacingOccurrences(of: "</mark>", with: "")
+            let timestamp = config.parseDate(from: statement, column: 2) ?? Date()
 
             let result = SearchResult(
                 id: FrameID(value: frameId),
                 timestamp: timestamp,
-                snippet: cleanSnippet,
+                snippet: "", // Snippet not needed - OCR nodes provide text
                 matchedText: query.text,
                 relevanceScore: abs(rank) / (1.0 + abs(rank)),
                 metadata: FrameMetadata(
@@ -1143,7 +1131,9 @@ public actor DataAdapter {
         }
 
         let totalElapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-        return SearchResults(query: query, results: results, totalCount: min(ftsResults.count, relevanceLimit), searchTimeMs: totalElapsed)
+        Log.info("[DataAdapter.searchRelevant] Completed in \(totalElapsed)ms, found \(results.count) results", category: .app)
+
+        return SearchResults(query: query, results: results, totalCount: results.count, searchTimeMs: totalElapsed)
     }
 
     private func searchAll(
@@ -1156,6 +1146,7 @@ public actor DataAdapter {
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+        // Build WHERE conditions for outer query
         var whereConditions: [String] = []
         var bindValues: [Any] = []
 
@@ -1163,7 +1154,6 @@ public actor DataAdapter {
             whereConditions.append("f.createdAt < ?")
             bindValues.append(config.formatDate(cutoffDate))
         }
-
         if let startDate = query.filters.startDate {
             whereConditions.append("f.createdAt >= ?")
             bindValues.append(config.formatDate(startDate))
@@ -1173,76 +1163,82 @@ public actor DataAdapter {
             bindValues.append(config.formatDate(endDate))
         }
 
-        let needsSegmentJoin = query.filters.appBundleIDs != nil
-        var appFilterClause = ""
+        let hasAppFilter = query.filters.appBundleIDs != nil && !query.filters.appBundleIDs!.isEmpty
         if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
-            let placeholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
-            appFilterClause = "AND s.bundleID IN (\(placeholders))"
-            bindValues.append(contentsOf: appBundleIDs)
+            if appBundleIDs.count == 1 {
+                // Single app: use = for better query optimization
+                whereConditions.append("s.bundleID = ?")
+                bindValues.append(appBundleIDs[0])
+            } else {
+                // Multiple apps: use IN
+                let placeholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+                whereConditions.append("s.bundleID IN (\(placeholders))")
+                bindValues.append(contentsOf: appBundleIDs)
+            }
         }
 
-        let whereClause = whereConditions.isEmpty ? "1=1" : whereConditions.joined(separator: " AND ")
-        let recentFramesLimit = 10000
+        let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
 
+        // CTE MATERIALIZED approach: Force SQLite to compute FTS results first
+        // Without MATERIALIZED, SQLite may inline the CTE and optimize it poorly
         let sql: String
-        if needsSegmentJoin {
+        if hasAppFilter {
+            // With app filter: CTE MATERIALIZED for FTS first, then join all tables and filter
             sql = """
+                WITH fts_matches AS MATERIALIZED (
+                    SELECT rowid as docid FROM searchRanking WHERE searchRanking MATCH ?
+                )
                 SELECT
-                    ds.docid as docid,
-                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
-                    bm25(searchRanking) as rank,
-                    recent_frames.frame_id,
-                    recent_frames.timestamp,
-                    recent_frames.segment_id,
-                    recent_frames.video_id,
-                    recent_frames.frame_index
-                FROM (
-                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
-                    FROM frame f
-                    JOIN segment s ON f.segmentId = s.id
-                    WHERE \(whereClause) \(appFilterClause)
-                    ORDER BY f.createdAt DESC
-                    LIMIT \(recentFramesLimit)
-                ) recent_frames
-                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
-                JOIN searchRanking ON searchRanking.rowid = ds.docid
-                WHERE searchRanking MATCH ?
-                ORDER BY recent_frames.timestamp DESC
+                    f.id as frame_id,
+                    f.createdAt as timestamp,
+                    f.segmentId as segment_id,
+                    f.videoId as video_id,
+                    f.videoFrameIndex as frame_index
+                FROM fts_matches fts
+                JOIN doc_segment ds ON fts.docid = ds.docid
+                JOIN frame f ON ds.frameId = f.id
+                JOIN segment s ON f.segmentId = s.id
+                \(whereClause)
+                ORDER BY f.createdAt DESC
                 LIMIT ? OFFSET ?
             """
         } else {
+            // No app filter: use IN subquery with limit (faster for no-filter case)
+            let ftsLimit = query.limit + query.offset + 200
+            let filterClause = whereConditions.isEmpty ? "" : "AND " + whereConditions.joined(separator: " AND ")
             sql = """
                 SELECT
-                    ds.docid as docid,
-                    snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
-                    bm25(searchRanking) as rank,
-                    recent_frames.frame_id,
-                    recent_frames.timestamp,
-                    recent_frames.segment_id,
-                    recent_frames.video_id,
-                    recent_frames.frame_index
-                FROM (
-                    SELECT f.id as frame_id, f.createdAt as timestamp, f.segmentId as segment_id, f.videoId as video_id, f.videoFrameIndex as frame_index
-                    FROM frame f
-                    WHERE \(whereClause)
-                    ORDER BY f.createdAt DESC
-                    LIMIT \(recentFramesLimit)
-                ) recent_frames
-                JOIN doc_segment ds ON ds.frameId = recent_frames.frame_id
-                JOIN searchRanking ON searchRanking.rowid = ds.docid
-                WHERE searchRanking MATCH ?
-                ORDER BY recent_frames.timestamp DESC
+                    f.id as frame_id,
+                    f.createdAt as timestamp,
+                    f.segmentId as segment_id,
+                    f.videoId as video_id,
+                    f.videoFrameIndex as frame_index
+                FROM doc_segment ds
+                JOIN frame f ON ds.frameId = f.id
+                WHERE ds.docid IN (
+                    SELECT rowid FROM searchRanking WHERE searchRanking MATCH ? ORDER BY rowid DESC LIMIT \(ftsLimit)
+                ) \(filterClause)
+                ORDER BY f.createdAt DESC
                 LIMIT ? OFFSET ?
             """
         }
 
+        Log.info("[DataAdapter.searchAll] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
+        Log.info("[DataAdapter.searchAll] Binds: ftsQuery='\(ftsQuery)', bindValues=\(bindValues), limit=\(query.limit), offset=\(query.offset)", category: .app)
+
         guard let statement = try? connection.prepare(sql: sql) else {
+            Log.error("[DataAdapter.searchAll] Failed to prepare SQL statement", category: .app)
             return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
         }
         defer { connection.finalize(statement) }
 
         var bindIndex: Int32 = 1
 
+        // Bind FTS query
+        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        // Bind WHERE clause values (cutoff, date filters, app filter)
         for value in bindValues {
             if let stringValue = value as? String {
                 sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
@@ -1252,27 +1248,24 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
-        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
-        bindIndex += 1
-
+        // Bind LIMIT and OFFSET
         sqlite3_bind_int(statement, bindIndex, Int32(query.limit))
         bindIndex += 1
         sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
 
-        var frameResults: [(docid: Int64, snippet: String, rank: Double, frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int)] = []
+        var frameResults: [(frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int)] = []
 
+        let stepStartTime = Date()
         while sqlite3_step(statement) == SQLITE_ROW {
-            let docid = sqlite3_column_int64(statement, 0)
-            let snippet = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
-            let rank = sqlite3_column_double(statement, 2)
-            let frameId = sqlite3_column_int64(statement, 3)
-            let segmentId = sqlite3_column_int64(statement, 5)
-            let videoId = sqlite3_column_int64(statement, 6)
-            let frameIndex = Int(sqlite3_column_int(statement, 7))
-
-            let timestamp = config.parseDate(from: statement, column: 4) ?? Date()
-            frameResults.append((docid: docid, snippet: snippet, rank: rank, frameId: frameId, timestamp: timestamp, segmentId: segmentId, videoId: videoId, frameIndex: frameIndex))
+            let frameId = sqlite3_column_int64(statement, 0)
+            let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
+            let segmentId = sqlite3_column_int64(statement, 2)
+            let videoId = sqlite3_column_int64(statement, 3)
+            let frameIndex = Int(sqlite3_column_int(statement, 4))
+            frameResults.append((frameId: frameId, timestamp: timestamp, segmentId: segmentId, videoId: videoId, frameIndex: frameIndex))
         }
+        let queryElapsed = Int(Date().timeIntervalSince(stepStartTime) * 1000)
+        Log.info("[DataAdapter.searchAll] SQL executed in \(queryElapsed)ms, found \(frameResults.count) frames, source: \(source)", category: .app)
 
         guard !frameResults.isEmpty else {
             let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
@@ -1291,16 +1284,12 @@ public actor DataAdapter {
             let windowName = segmentMeta?.windowName
             let appName = appBundleID?.components(separatedBy: ".").last
 
-            let cleanSnippet = frame.snippet
-                .replacingOccurrences(of: "<mark>", with: "")
-                .replacingOccurrences(of: "</mark>", with: "")
-
             let result = SearchResult(
                 id: FrameID(value: frame.frameId),
                 timestamp: frame.timestamp,
-                snippet: cleanSnippet,
+                snippet: query.text, // Use query as snippet - OCR text loaded separately for highlighting
                 matchedText: query.text,
-                relevanceScore: abs(frame.rank) / (1.0 + abs(frame.rank)),
+                relevanceScore: 0.5,
                 metadata: FrameMetadata(
                     appBundleID: appBundleID,
                     appName: appName,
@@ -1317,9 +1306,9 @@ public actor DataAdapter {
             results.append(result)
         }
 
-        let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
         let totalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
 
+        let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
         return SearchResults(query: query, results: results, totalCount: totalCount, searchTimeMs: elapsed)
     }
 

@@ -716,8 +716,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             height: zoomRegion.height * actualFrameRect.height
         )
 
-        let _ = print("[ZoomDebug] ZoomUnifiedOverlay: zoomRegion=\(zoomRegion), actualFrameRect=\(actualFrameRect), startRect=\(startRect)")
-
         // Calculate end position (centered enlarged rectangle)
         let maxWidth = containerSize.width * 0.75
         let maxHeight = containerSize.height * 0.75
@@ -1257,8 +1255,6 @@ struct ZoomRegionDragPreview: View {
             height: (maxY - minY) * actualFrameRect.height
         )
 
-        let _ = print("[ZoomDebug] ZoomRegionDragPreview: start=\(start), end=\(end), minY=\(minY), maxY=\(maxY), actualFrameRect=\(actualFrameRect), rect=\(rect)")
-
         ZStack {
             // Darken outside the selection
             Color.black.opacity(0.6)
@@ -1528,8 +1524,6 @@ class TextSelectionView: NSView {
         mouseDownPoint = location
         hasMoved = false
 
-        print("[ZoomDebug] mouseDown RAW: locationInWindow=\(event.locationInWindow), convertedToView=\(location), bounds=\(bounds), frame=\(frame)")
-
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
 
@@ -1537,7 +1531,6 @@ class TextSelectionView: NSView {
         if event.modifierFlags.contains(.shift) {
             isZoomDragging = true
             isDragging = false
-            print("[ZoomDebug] mouseDown SHIFT+DRAG: rawLocation=\(location), normalizedPoint=\(normalizedPoint)")
             onZoomRegionStart?(normalizedPoint)
         } else {
             // Handle multi-click (double-click = word, triple-click = line)
@@ -1607,12 +1600,10 @@ class TextSelectionView: NSView {
         guard actualFrameRect.width > 0 && actualFrameRect.height > 0 else {
             // Fallback to old behavior if actualFrameRect not set
             guard containerSize.width > 0 && containerSize.height > 0 else { return .zero }
-            let result = CGPoint(
+            return CGPoint(
                 x: screenPoint.x / containerSize.width,
                 y: 1.0 - (screenPoint.y / containerSize.height)
             )
-            print("[ZoomDebug] screenToNormalizedCoords FALLBACK: screen=\(screenPoint), container=\(containerSize), result=\(result)")
-            return result
         }
 
         // Convert from screen coordinates to frame-relative coordinates
@@ -1621,11 +1612,9 @@ class TextSelectionView: NSView {
 
         // Normalize to 0.0-1.0 range
         let normalizedX = frameRelativeX / actualFrameRect.width
-        let normalizedY = 1.0 - (frameRelativeY / actualFrameRect.height) // Flip Y
+        let normalizedY = 1.0 - (frameRelativeY / actualFrameRect.height) // Flip Y (NSView origin at bottom)
 
-        let result = CGPoint(x: normalizedX, y: normalizedY)
-        print("[ZoomDebug] screenToNormalizedCoords: screen=\(screenPoint), actualFrameRect=\(actualFrameRect), container=\(containerSize), result=\(result)")
-        return result
+        return CGPoint(x: normalizedX, y: normalizedY)
     }
 
     override func draw(_ dirtyRect: NSRect) {

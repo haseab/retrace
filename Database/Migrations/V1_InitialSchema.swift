@@ -156,32 +156,18 @@ struct V1_InitialSchema: Migration {
     // MARK: - Full-Text Search Tables
 
     private func createSearchRankingTables(db: OpaquePointer) throws {
-        // Create external content table (Rewind's structure)
-        // This stores the actual text data that FTS5 indexes
-        let contentTableSQL = """
-            CREATE TABLE IF NOT EXISTS searchRanking_content (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                c0 TEXT,
-                c1 TEXT,
-                c2 TEXT
-            );
-            """
-        try execute(db: db, sql: contentTableSQL)
-        Log.debug("✓ Created searchRanking_content table")
-
-        // Create FTS5 virtual table with external content
-        // Matches Rewind's exact structure with c0, c1, c2 column names
+        // Create FTS5 virtual table - regular mode (matches Rewind exactly)
+        // FTS5 automatically creates shadow tables with c0, c1, c2 columns
         let ftsSQL = """
             CREATE VIRTUAL TABLE IF NOT EXISTS searchRanking USING fts5(
-                c0,
-                c1,
-                c2,
-                content='searchRanking_content',
-                content_rowid='id'
+                text,
+                otherText,
+                title,
+                tokenize=porter
             );
             """
         try execute(db: db, sql: ftsSQL)
-        Log.debug("✓ Created searchRanking FTS5 table with external content (c0=text, c1=otherText, c2=title)")
+        Log.debug("✓ Created searchRanking FTS5 table")
     }
 
     // MARK: - Event/Meeting Tables

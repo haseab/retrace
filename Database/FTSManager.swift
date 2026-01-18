@@ -244,16 +244,16 @@ public actor FTSManager: FTSProtocol {
     // MARK: - Private Helpers
 
     private func buildSearchQuery(filters: SearchFilters) -> String {
-        // Rewind schema join pattern: searchRanking → searchRanking_content → doc_segment → frame → segment
+        // Rewind-compatible join pattern: searchRanking → doc_segment → frame → segment
+        // FTS table stores content directly (no external content table needed for search)
         var sql = """
             SELECT
-                c.id, ds.frameId, f.createdAt, s.bundleID, s.windowName,
+                searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName,
                 snippet(searchRanking, 0, '<mark>', '</mark>', '...', 32) as snippet,
                 bm25(searchRanking) as rank,
                 f.videoId, f.videoFrameIndex
             FROM searchRanking
-            JOIN searchRanking_content c ON searchRanking.rowid = c.id
-            JOIN doc_segment ds ON c.id = ds.docid
+            JOIN doc_segment ds ON searchRanking.rowid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
@@ -289,8 +289,7 @@ public actor FTSManager: FTSProtocol {
         var sql = """
             SELECT COUNT(*)
             FROM searchRanking
-            JOIN searchRanking_content c ON searchRanking.rowid = c.id
-            JOIN doc_segment ds ON c.id = ds.docid
+            JOIN doc_segment ds ON searchRanking.rowid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             WHERE searchRanking MATCH ?
@@ -318,10 +317,10 @@ public actor FTSManager: FTSProtocol {
     }
 
     private func parseSearchResult(statement: OpaquePointer) throws -> FTSMatch {
-        // New column order from Rewind schema:
-        // c.id, ds.frameId, f.createdAt, s.bundleID, s.windowName, snippet, rank, f.videoId, f.videoFrameIndex
+        // Column order from query:
+        // searchRanking.rowid, ds.frameId, f.createdAt, s.bundleID, s.windowName, snippet, rank, f.videoId, f.videoFrameIndex
 
-        // Column 0: document id (searchRanking_content.id)
+        // Column 0: document id (searchRanking.rowid)
         let documentID = sqlite3_column_int64(statement, 0)
 
         // Column 1: frame_id (INTEGER from doc_segment.frameId)

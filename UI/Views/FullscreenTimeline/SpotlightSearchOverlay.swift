@@ -135,21 +135,15 @@ public struct SpotlightSearchOverlay: View {
                 .foregroundColor(.white)
                 .focused($isSearchFocused)
                 .onSubmit {
-                    // If we have results and user presses Enter, select first result
-                    // Otherwise, trigger search
-                    if let firstResult = viewModel.results?.results.first {
-                        selectResult(firstResult)
-                    } else if !viewModel.searchQuery.isEmpty {
+                    // Always trigger a new search on Enter
+                    if !viewModel.searchQuery.isEmpty {
                         Log.debug("\(searchLog) Submit pressed, triggering search", category: .ui)
                         viewModel.submitSearch()
                     }
                 }
 
-            if viewModel.isSearching {
-                ProgressView()
-                    .scaleEffect(0.8)
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-            } else if !viewModel.searchQuery.isEmpty {
+            // Clear button when there's text
+            if !viewModel.searchQuery.isEmpty && !viewModel.isSearching {
                 Button(action: {
                     viewModel.searchQuery = ""
                 }) {
@@ -158,6 +152,27 @@ public struct SpotlightSearchOverlay: View {
                         .foregroundColor(.white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
+            }
+
+            // Search button
+            if viewModel.isSearching {
+                ProgressView()
+                    .scaleEffect(0.8)
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .frame(width: 32, height: 32)
+            } else {
+                Button(action: {
+                    if !viewModel.searchQuery.isEmpty {
+                        Log.debug("\(searchLog) Search button clicked, triggering search", category: .ui)
+                        viewModel.submitSearch()
+                    }
+                }) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(viewModel.searchQuery.isEmpty ? .white.opacity(0.2) : .blue)
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.searchQuery.isEmpty)
             }
         }
         .padding(.horizontal, 20)
@@ -298,6 +313,24 @@ public struct SpotlightSearchOverlay: View {
             Text("Searching...")
                 .font(.system(size: 14))
                 .foregroundColor(.white.opacity(0.5))
+
+            // Show slow query alert when filtering by app with "All" mode
+            if viewModel.selectedAppFilter != nil && viewModel.searchMode == .all {
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle.fill")
+                        .font(.system(size: 12))
+                    Text("\"All\" queries with app filters are slower")
+                        .font(.system(size: 12))
+                }
+                .foregroundColor(.yellow.opacity(0.8))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.yellow.opacity(0.15))
+                )
+                .padding(.top, 4)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -322,12 +355,15 @@ public struct SpotlightSearchOverlay: View {
     // MARK: - Thumbnail Loading
 
     private func thumbnailKey(for result: SearchResult) -> String {
-        "\(result.segmentID.stringValue)_\(result.timestamp.timeIntervalSince1970)_\(viewModel.searchQuery)"
+        // Use committedSearchQuery (set on Enter) instead of live searchQuery
+        // This prevents thumbnails from reloading while user is typing
+        "\(result.segmentID.stringValue)_\(result.timestamp.timeIntervalSince1970)_\(viewModel.committedSearchQuery)"
     }
 
     private func loadThumbnail(for result: SearchResult) {
         let key = thumbnailKey(for: result)
-        let searchQuery = viewModel.searchQuery
+        // Use committedSearchQuery for highlighting (the query that was actually searched)
+        let searchQuery = viewModel.committedSearchQuery
         let currentGeneration = viewModel.searchGeneration
 
         guard viewModel.thumbnailCache[key] == nil, !viewModel.loadingThumbnails.contains(key) else {

@@ -345,7 +345,7 @@ final class OCRPipelineTests: XCTestCase {
 
         // Delete FTS content first (before frames are deleted due to foreign key constraints)
         var stmt: OpaquePointer?
-        sqlite3_exec(db, "DELETE FROM searchRanking_content;", nil, nil, nil)
+        sqlite3_exec(db, "DELETE FROM searchRanking;", nil, nil, nil)
         sqlite3_exec(db, "DELETE FROM doc_segment;", nil, nil, nil)
 
         // Delete all frames (cascade will delete nodes)
