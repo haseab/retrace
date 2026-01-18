@@ -461,6 +461,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                         viewModel: viewModel,
                         zoomRegion: region,
                         containerSize: geometry.size,
+                        actualFrameRect: actualFrameRect,
                         isTransitioning: showTransition
                     ) {
                         content()
@@ -478,7 +479,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         ZoomRegionDragPreview(
                             start: start,
                             end: end,
-                            containerSize: geometry.size
+                            containerSize: geometry.size,
+                            actualFrameRect: actualFrameRect
                         )
                     }
 
@@ -691,6 +693,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let zoomRegion: CGRect
     let containerSize: CGSize
+    let actualFrameRect: CGRect
     let isTransitioning: Bool
     let content: () -> Content
 
@@ -699,19 +702,27 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         let progress = isTransitioning ? viewModel.zoomTransitionProgress : 1.0
         let blurOpacity = isTransitioning ? viewModel.zoomTransitionBlurOpacity : 1.0
 
-        // Calculate start position (original drag rectangle)
+        // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
+        // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
+        // So we just multiply directly without flipping again
+        let regionMinX = zoomRegion.origin.x
+        let regionMinY = zoomRegion.origin.y
+
+        // Calculate start position (original drag rectangle) in screen coords
         let startRect = CGRect(
-            x: zoomRegion.origin.x * containerSize.width,
-            y: zoomRegion.origin.y * containerSize.height,
-            width: zoomRegion.width * containerSize.width,
-            height: zoomRegion.height * containerSize.height
+            x: actualFrameRect.origin.x + regionMinX * actualFrameRect.width,
+            y: actualFrameRect.origin.y + regionMinY * actualFrameRect.height,
+            width: zoomRegion.width * actualFrameRect.width,
+            height: zoomRegion.height * actualFrameRect.height
         )
+
+        let _ = print("[ZoomDebug] ZoomUnifiedOverlay: zoomRegion=\(zoomRegion), actualFrameRect=\(actualFrameRect), startRect=\(startRect)")
 
         // Calculate end position (centered enlarged rectangle)
         let maxWidth = containerSize.width * 0.75
         let maxHeight = containerSize.height * 0.75
-        let regionWidth = zoomRegion.width * containerSize.width
-        let regionHeight = zoomRegion.height * containerSize.height
+        let regionWidth = zoomRegion.width * actualFrameRect.width
+        let regionHeight = zoomRegion.height * actualFrameRect.height
         let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
         let enlargedWidth = regionWidth * scaleToFit
         let enlargedHeight = regionHeight * scaleToFit
@@ -733,9 +744,10 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // Current scale factor (1.0 at start, scaleToFit at end)
         let currentScale = lerp(1.0, scaleToFit, progress)
 
-        // Center of zoom region in original content
-        let zoomCenterX = (zoomRegion.origin.x + zoomRegion.width / 2) * containerSize.width
-        let zoomCenterY = (zoomRegion.origin.y + zoomRegion.height / 2) * containerSize.height
+        // Center of zoom region in original content (screen coords)
+        // Y is already in top-down space, so no flip needed
+        let zoomCenterX = actualFrameRect.origin.x + (zoomRegion.origin.x + zoomRegion.width / 2) * actualFrameRect.width
+        let zoomCenterY = actualFrameRect.origin.y + (zoomRegion.origin.y + zoomRegion.height / 2) * actualFrameRect.height
 
         ZStack {
             // Blur overlay that fades in
@@ -1227,6 +1239,7 @@ struct ZoomRegionDragPreview: View {
     let start: CGPoint
     let end: CGPoint
     let containerSize: CGSize
+    let actualFrameRect: CGRect
 
     var body: some View {
         let minX = min(start.x, end.x)
@@ -1234,12 +1247,17 @@ struct ZoomRegionDragPreview: View {
         let minY = min(start.y, end.y)
         let maxY = max(start.y, end.y)
 
+        // Convert from actualFrameRect-normalized coords back to SwiftUI screen coords
+        // The normalized Y from screenToNormalizedCoords is already flipped to "top-down" space (0=top, 1=bottom)
+        // So we just multiply directly without flipping again
         let rect = CGRect(
-            x: minX * containerSize.width,
-            y: minY * containerSize.height,
-            width: (maxX - minX) * containerSize.width,
-            height: (maxY - minY) * containerSize.height
+            x: actualFrameRect.origin.x + minX * actualFrameRect.width,
+            y: actualFrameRect.origin.y + minY * actualFrameRect.height,
+            width: (maxX - minX) * actualFrameRect.width,
+            height: (maxY - minY) * actualFrameRect.height
         )
+
+        let _ = print("[ZoomDebug] ZoomRegionDragPreview: start=\(start), end=\(end), minY=\(minY), maxY=\(maxY), actualFrameRect=\(actualFrameRect), rect=\(rect)")
 
         ZStack {
             // Darken outside the selection
@@ -1510,6 +1528,8 @@ class TextSelectionView: NSView {
         mouseDownPoint = location
         hasMoved = false
 
+        print("[ZoomDebug] mouseDown RAW: locationInWindow=\(event.locationInWindow), convertedToView=\(location), bounds=\(bounds), frame=\(frame)")
+
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
 
@@ -1517,6 +1537,7 @@ class TextSelectionView: NSView {
         if event.modifierFlags.contains(.shift) {
             isZoomDragging = true
             isDragging = false
+            print("[ZoomDebug] mouseDown SHIFT+DRAG: rawLocation=\(location), normalizedPoint=\(normalizedPoint)")
             onZoomRegionStart?(normalizedPoint)
         } else {
             // Handle multi-click (double-click = word, triple-click = line)
@@ -1586,10 +1607,12 @@ class TextSelectionView: NSView {
         guard actualFrameRect.width > 0 && actualFrameRect.height > 0 else {
             // Fallback to old behavior if actualFrameRect not set
             guard containerSize.width > 0 && containerSize.height > 0 else { return .zero }
-            return CGPoint(
+            let result = CGPoint(
                 x: screenPoint.x / containerSize.width,
                 y: 1.0 - (screenPoint.y / containerSize.height)
             )
+            print("[ZoomDebug] screenToNormalizedCoords FALLBACK: screen=\(screenPoint), container=\(containerSize), result=\(result)")
+            return result
         }
 
         // Convert from screen coordinates to frame-relative coordinates
@@ -1600,7 +1623,9 @@ class TextSelectionView: NSView {
         let normalizedX = frameRelativeX / actualFrameRect.width
         let normalizedY = 1.0 - (frameRelativeY / actualFrameRect.height) // Flip Y
 
-        return CGPoint(x: normalizedX, y: normalizedY)
+        let result = CGPoint(x: normalizedX, y: normalizedY)
+        print("[ZoomDebug] screenToNormalizedCoords: screen=\(screenPoint), actualFrameRect=\(actualFrameRect), container=\(containerSize), result=\(result)")
+        return result
     }
 
     override func draw(_ dirtyRect: NSRect) {
