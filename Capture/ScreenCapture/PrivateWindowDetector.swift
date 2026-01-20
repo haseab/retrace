@@ -129,20 +129,39 @@ struct PrivateWindowDetector {
     private static func checkViaTitlePatterns(title: String, additionalPatterns: [String]) -> Bool {
         let lowercaseTitle = title.lowercased()
 
-        // Default patterns
-        let defaultPatterns = [
-            "private",           // Safari: "Page Title — Private"
-            "incognito",         // Chrome: "Page Title - Incognito"
-            "inprivate",         // Edge: "Page Title - InPrivate"
-            "private browsing",  // Firefox: "Page Title — Private Browsing"
-            "private window"     // Brave: "Page Title - Private Window"
+        // Browser-specific suffix patterns (more precise to avoid false positives)
+        // These patterns match the actual suffixes browsers add to window titles
+        let suffixPatterns = [
+            " — private",           // Safari: "Page Title — Private"
+            " - private",           // Safari alternate
+            " - incognito",         // Chrome: "Page Title - Incognito"
+            " — incognito",         // Chrome alternate
+            "(incognito)",          // Chrome alternate format
+            " - inprivate",         // Edge: "Page Title - InPrivate"
+            " — inprivate",         // Edge alternate
+            "(inprivate)",          // Edge alternate format
+            " — private browsing",  // Firefox: "Page Title — Private Browsing"
+            " - private browsing",  // Firefox alternate
+            "(private browsing)",   // Firefox alternate format
+            " - private window",    // Brave: "Page Title - Private Window"
+            " — private window",    // Brave alternate
         ]
 
-        let allPatterns = defaultPatterns + additionalPatterns
-
-        return allPatterns.contains { pattern in
-            lowercaseTitle.contains(pattern.lowercased())
+        // Check browser-specific suffix patterns
+        for pattern in suffixPatterns {
+            if lowercaseTitle.contains(pattern) {
+                return true
+            }
         }
+
+        // Check additional custom patterns (these use contains for flexibility)
+        for pattern in additionalPatterns {
+            if lowercaseTitle.contains(pattern.lowercased()) {
+                return true
+            }
+        }
+
+        return false
     }
 
     /// Detect if a window is private and return permission status
@@ -364,20 +383,8 @@ struct PrivateWindowDetector {
             return false
         }
 
-        let lowercaseTitle = title.lowercased()
-
-        // Common patterns across browsers
-        let patterns = [
-            "private",           // Safari: "Page Title — Private"
-            "incognito",         // Chrome: "Page Title - Incognito"
-            "inprivate",         // Edge: "Page Title - InPrivate"
-            "private browsing",  // Firefox: "Page Title — Private Browsing"
-            "private window"     // Brave: "Page Title - Private Window"
-        ]
-
-        return patterns.contains { pattern in
-            lowercaseTitle.contains(pattern)
-        }
+        // Reuse the same pattern matching logic
+        return checkViaTitlePatterns(title: title, additionalPatterns: [])
     }
 
     // MARK: - Accessibility Helpers

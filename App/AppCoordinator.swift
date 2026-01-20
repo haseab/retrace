@@ -29,6 +29,9 @@ public actor AppCoordinator {
     // Segment tracking (app focus sessions - Rewind compatible)
     private var currentSegmentID: Int64?
 
+    // Timeline visibility tracking - pause capture when timeline is open
+    private var isTimelineVisible = false
+
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
@@ -50,6 +53,14 @@ public actor AppCoordinator {
 
     nonisolated public var modelManager: ModelManager {
         services.modelManager
+    }
+
+    // MARK: - Timeline Visibility
+
+    /// Set whether the timeline is currently visible (pauses frame processing when true)
+    public func setTimelineVisible(_ visible: Bool) {
+        isTimelineVisible = visible
+        Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
     }
 
     // MARK: - Lifecycle
@@ -316,6 +327,11 @@ public actor AppCoordinator {
 
             // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
             if frame.metadata.appBundleID == "com.apple.loginwindow" {
+                continue
+            }
+
+            // Skip frames when timeline is visible (don't record while user is viewing timeline)
+            if isTimelineVisible {
                 continue
             }
 

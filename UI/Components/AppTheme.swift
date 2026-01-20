@@ -655,6 +655,12 @@ extension CGFloat {
     public static let toolbarHeight: CGFloat = 44
     public static let timelineBarHeight: CGFloat = 80
     public static let thumbnailSize: CGFloat = 120
+
+    // MARK: Utility
+    /// Clamp value to a closed range
+    public func clamped(to range: ClosedRange<CGFloat>) -> CGFloat {
+        return Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+    }
 }
 
 // MARK: - Shadow Styles
@@ -846,4 +852,143 @@ extension View {
     public func retraceHover() -> some View {
         self.modifier(RetraceHoverModifier())
     }
+}
+
+// MARK: - Timeline Scale Factor
+
+/// Provides resolution-adaptive scaling for timeline UI elements
+/// Baseline is 1080p (1920x1080) where scale = 1.0
+/// Scales proportionally for larger/smaller screens
+public struct TimelineScaleFactor {
+    /// Reference height for scale factor 1.0 (1080p)
+    private static let referenceHeight: CGFloat = 1080
+
+    /// Minimum scale factor to prevent UI from becoming too small
+    private static let minScale: CGFloat = 0.85
+
+    /// Maximum scale factor to prevent UI from becoming too large
+    private static let maxScale: CGFloat = 1.6
+
+    /// Calculate scale factor based on current screen height
+    public static var current: CGFloat {
+        guard let screen = NSScreen.main else { return 1.0 }
+        let screenHeight = screen.frame.height
+        let rawScale = screenHeight / referenceHeight
+        return min(maxScale, max(minScale, rawScale))
+    }
+
+    /// Calculate scale factor for a specific screen
+    public static func forScreen(_ screen: NSScreen?) -> CGFloat {
+        guard let screen = screen else { return 1.0 }
+        let screenHeight = screen.frame.height
+        let rawScale = screenHeight / referenceHeight
+        return min(maxScale, max(minScale, rawScale))
+    }
+
+    // MARK: - Timeline Tape Dimensions (scaled)
+
+    /// Base tape height (42pt at 1080p)
+    public static var tapeHeight: CGFloat { 42 * current }
+
+    /// Block spacing between app segments
+    public static var blockSpacing: CGFloat { 2 * current }
+
+    /// App icon size within blocks
+    public static var appIconSize: CGFloat { 30 * current }
+
+    /// Minimum block width to show app icon
+    public static var iconDisplayThreshold: CGFloat { 40 * current }
+
+    /// Playhead width
+    public static var playheadWidth: CGFloat { 6 * current }
+
+    // MARK: - Control Positioning (scaled)
+
+    /// Y offset for control buttons above tape
+    public static var controlsYOffset: CGFloat { -55 * current }
+
+    /// Y offset for floating search panel
+    public static var searchPanelYOffset: CGFloat { -175 * current }
+
+    /// Y offset for calendar picker
+    public static var calendarPickerYOffset: CGFloat { -280 * current }
+
+    /// X position for left controls
+    public static var leftControlsX: CGFloat { 120 * current }
+
+    /// X offset from right edge for right controls
+    public static var rightControlsXOffset: CGFloat { 100 * current }
+
+    // MARK: - Container Dimensions (scaled)
+
+    /// Blur backdrop height
+    public static var blurBackdropHeight: CGFloat { 350 * current }
+
+    /// Bottom padding for tape
+    public static var tapeBottomPadding: CGFloat { 40 * current }
+
+    /// Offset when controls are hidden
+    public static var hiddenControlsOffset: CGFloat { 150 * current }
+
+    /// Close button Y offset when hidden
+    public static var closeButtonHiddenYOffset: CGFloat { -100 * current }
+
+    // MARK: - Button/Control Sizes (scaled)
+
+    /// Control button size
+    public static var controlButtonSize: CGFloat { 32 * current }
+
+    /// Zoom slider width
+    public static var zoomSliderWidth: CGFloat { 100 * current }
+
+    /// Search button width
+    public static var searchButtonWidth: CGFloat { 160 * current }
+
+    // MARK: - Panel Dimensions (scaled)
+
+    /// Floating date search panel width
+    public static var searchPanelWidth: CGFloat { 380 * current }
+
+    /// Calendar picker width
+    public static var calendarPickerWidth: CGFloat { 280 * current }
+
+    /// Calendar picker height
+    public static var calendarPickerHeight: CGFloat { 340 * current }
+
+    // MARK: - Font Sizes (scaled)
+
+    /// Callout font size (14pt base)
+    public static var fontCallout: CGFloat { 14 * current }
+
+    /// Caption font size (13pt base)
+    public static var fontCaption: CGFloat { 13 * current }
+
+    /// Caption2 font size (11pt base)
+    public static var fontCaption2: CGFloat { 11 * current }
+
+    /// Tiny font size (10pt base)
+    public static var fontTiny: CGFloat { 10 * current }
+
+    /// Mono font size (13pt base)
+    public static var fontMono: CGFloat { 13 * current }
+
+    // MARK: - Padding/Spacing (scaled)
+
+    /// Standard horizontal padding for buttons
+    public static var buttonPaddingH: CGFloat { 12 * current }
+
+    /// Standard vertical padding for buttons
+    public static var buttonPaddingV: CGFloat { 8 * current }
+
+    /// Larger horizontal padding
+    public static var paddingH: CGFloat { 16 * current }
+
+    /// Larger vertical padding
+    public static var paddingV: CGFloat { 10 * current }
+
+    /// Control spacing
+    public static var controlSpacing: CGFloat { 12 * current }
+
+    /// Icon spacing within buttons
+    public static var iconSpacing: CGFloat { 8 * current }
 }

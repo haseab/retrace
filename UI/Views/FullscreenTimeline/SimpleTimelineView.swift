@@ -39,6 +39,35 @@ public struct SimpleTimelineView: View {
                 frameDisplay
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+                // Bottom blur + gradient backdrop (behind timeline controls)
+                VStack {
+                    Spacer()
+                    // Blur with built-in tint (NSVisualEffectView needs content to blur)
+                    PureBlurView(radius: 50)
+                        .frame(height: TimelineScaleFactor.blurBackdropHeight)
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: Color.white.opacity(0.0), location: 0.0),
+                                    .init(color: Color.white.opacity(0.03), location: 0.1),
+                                    .init(color: Color.white.opacity(0.08), location: 0.2),
+                                    .init(color: Color.white.opacity(0.15), location: 0.3),
+                                    .init(color: Color.white.opacity(0.35), location: 0.4),
+                                    .init(color: Color.white.opacity(0.6), location: 0.5),
+                                    .init(color: Color.white.opacity(0.85), location: 0.6),
+                                    .init(color: Color.white.opacity(0.95), location: 0.7),
+                                    .init(color: Color.white.opacity(1.0), location: 0.8),
+                                    .init(color: Color.white.opacity(0.85), location: 1.0)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                }
+                .allowsHitTesting(false)
+                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : 0)
+                .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+
                 // Timeline tape overlay at bottom
                 VStack {
                     Spacer()
@@ -46,9 +75,9 @@ public struct SimpleTimelineView: View {
                         viewModel: viewModel,
                         width: geometry.size.width
                     )
-                    .padding(.bottom, 40)
+                    .padding(.bottom, TimelineScaleFactor.tapeBottomPadding)
                 }
-                .offset(y: viewModel.areControlsHidden ? 150 : 0)
+                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 // Close button (top-right) and debug frame ID (top-left)
@@ -65,7 +94,7 @@ public struct SimpleTimelineView: View {
                     Spacer()
                 }
                 .padding(.spacingL)
-                .offset(y: viewModel.areControlsHidden ? -100 : 0)
+                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
 
@@ -314,6 +343,12 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         playerView.showsSharingServiceButton = false
         playerView.showsFullScreenToggleButton = false
 
+        // Disable Live Text analysis to prevent VKImageAnalysisButton crashes
+        // when the window is in an inconsistent state during display cycles
+        if #available(macOS 13.0, *) {
+            playerView.allowsVideoFrameAnalysis = false
+        }
+
         // Create player immediately
         let player = AVPlayer()
         player.actionAtItemEnd = .pause
@@ -433,6 +468,7 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 /// Wraps a frame display with an interactive URL bounding box overlay
 /// Shows a dotted rectangle when hovering over a detected URL, with click-to-open functionality
 /// When zoom region is active, shows enlarged region centered with darkened/blurred background
+/// Supports trackpad pinch-to-zoom for zooming in/out of the frame
 struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onURLClicked: () -> Void
@@ -455,8 +491,11 @@ struct FrameWithURLOverlay<Content: View>: View {
 
             ZStack {
                 // The actual frame content (always present as base layer)
+                // Apply frame zoom transformations (magnification handled at window level)
                 content()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
 
                 // Unified zoom overlay - handles BOTH transition AND final state
                 // Uses the same view instance throughout to avoid VideoView reload flicker
@@ -564,6 +603,15 @@ struct FrameWithURLOverlay<Content: View>: View {
                     }
                 }
             )
+            // Zoom indicator overlay (shows current zoom level when zoomed)
+            // Note: Magnification gesture is handled at window level in TimelineWindowController
+            .overlay(alignment: .topLeading) {
+                if viewModel.isFrameZoomed {
+                    FrameZoomIndicator(zoomScale: viewModel.frameZoomScale)
+                        .padding(.spacingL)
+                        .padding(.top, 40) // Below close button
+                }
+            }
         }
     }
 
@@ -612,6 +660,30 @@ struct FrameWithURLOverlay<Content: View>: View {
         }
 
         return CGRect(origin: offset, size: displayedSize)
+    }
+}
+
+// MARK: - Frame Zoom Indicator
+
+/// Shows the current zoom level when frame is zoomed
+struct FrameZoomIndicator: View {
+    let zoomScale: CGFloat
+
+    var body: some View {
+        HStack(spacing: .spacingS) {
+            Image(systemName: zoomScale > 1.0 ? "plus.magnifyingglass" : "minus.magnifyingglass")
+                .font(.retraceCaption)
+            Text("\(Int(zoomScale * 100))%")
+                .font(.retraceCaption.monospacedDigit())
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, .spacingM)
+        .padding(.vertical, .spacingS)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.6))
+        )
+        .transition(.opacity.combined(with: .scale))
     }
 }
 
@@ -821,6 +893,25 @@ struct ZoomUnifiedOverlay<Content: View>: View {
     private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
         a + (b - a) * t
     }
+}
+
+// MARK: - Pure Blur View
+
+/// A pure blur view that blurs content behind it using withinWindow blending
+struct PureBlurView: NSViewRepresentable {
+    let radius: CGFloat
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .withinWindow
+        view.material = .hudWindow
+        view.state = .active
+        view.wantsLayer = true
+        view.appearance = NSAppearance(named: .darkAqua)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
 // MARK: - Zoom Background Overlay

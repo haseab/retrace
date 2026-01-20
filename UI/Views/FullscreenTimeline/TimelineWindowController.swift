@@ -106,6 +106,11 @@ public class TimelineWindowController: NSObject {
         // Setup keyboard monitoring
         setupEventMonitors()
 
+        // Notify coordinator to pause frame processing while timeline is visible
+        Task {
+            await coordinator.setTimelineVisible(true)
+        }
+
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
     }
@@ -132,6 +137,11 @@ public class TimelineWindowController: NSObject {
                 self?.timelineViewModel = nil
                 self?.isVisible = false
                 self?.onClose?()
+
+                // Notify coordinator to resume frame processing
+                if let coordinator = self?.coordinator {
+                    await coordinator.setTimelineVisible(false)
+                }
 
                 // Post notification so menu bar can restore recording indicator
                 NotificationCenter.default.post(name: .timelineDidClose, object: nil)
@@ -195,16 +205,18 @@ public class TimelineWindowController: NSObject {
 
     private func setupEventMonitors() {
         // Monitor for escape key and toggle shortcut (global)
-        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
                 self?.handleScrollEvent(event, source: "GLOBAL")
+            } else if event.type == .magnify {
+                self?.handleMagnifyEvent(event)
             }
         }
 
         // Also monitor local events (when our window is key)
-        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel]) { [weak self] event in
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
                 // Check if a text field is currently active
                 let isTextFieldActive: Bool
@@ -215,9 +227,32 @@ public class TimelineWindowController: NSObject {
                     isTextFieldActive = false
                 }
 
-                // Always handle Cmd+K to toggle search overlay, even when text field is active
+                // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+                // Cmd+K to toggle search overlay
                 if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
+                // Cmd+=/+ to zoom in (handle before system can intercept)
+                if (event.keyCode == 24 || event.keyCode == 69) && (modifiers == [.command] || modifiers == [.command, .shift]) {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
+                // Cmd+- to zoom out (handle before system can intercept)
+                if (event.keyCode == 27 || event.keyCode == 78) && modifiers == [.command] {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
+                // Cmd+0 to reset zoom (handle before system can intercept)
+                if event.keyCode == 29 && (modifiers == [.command] || modifiers == [.control]) {
                     if self?.handleKeyEvent(event) == true {
                         return nil // Consume the event
                     }
@@ -239,6 +274,9 @@ public class TimelineWindowController: NSObject {
                 }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
+            } else if event.type == .magnify {
+                self?.handleMagnifyEvent(event)
+                return nil // Consume magnify events
             }
             return event
         }
@@ -414,6 +452,39 @@ public class TimelineWindowController: NSObject {
             }
         }
 
+        // Ctrl+0 to reset frame zoom to 100%
+        if event.keyCode == 29 && modifiers == [.control] { // 0 key with Control
+            if let viewModel = timelineViewModel, viewModel.isFrameZoomed {
+                viewModel.resetFrameZoom()
+                return true
+            }
+        }
+
+        // Cmd+0 to reset frame zoom to 100% (alternative shortcut)
+        if event.keyCode == 29 && modifiers == [.command] { // 0 key with Command
+            if let viewModel = timelineViewModel, viewModel.isFrameZoomed {
+                viewModel.resetFrameZoom()
+                return true
+            }
+        }
+
+        // Cmd++ (Cmd+=) to zoom in frame
+        // Key code 24 is '=' which is '+' with shift, but Cmd+= works as zoom in
+        if (event.keyCode == 24 || event.keyCode == 69) && (modifiers == [.command] || modifiers == [.command, .shift]) {
+            if let viewModel = timelineViewModel {
+                viewModel.applyMagnification(1.25, animated: true) // Zoom in by 25%
+                return true
+            }
+        }
+
+        // Cmd+- to zoom out frame
+        if (event.keyCode == 27 || event.keyCode == 78) && modifiers == [.command] { // - key (main or numpad)
+            if let viewModel = timelineViewModel {
+                viewModel.applyMagnification(0.8, animated: true) // Zoom out by 20%
+                return true
+            }
+        }
+
         // Any other key (not a modifier) clears text selection
         if let viewModel = timelineViewModel,
            viewModel.hasSelection,
@@ -447,6 +518,23 @@ public class TimelineWindowController: NSObject {
                 await viewModel.handleScroll(delta: CGFloat(delta))
             }
         }
+    }
+
+    private func handleMagnifyEvent(_ event: NSEvent) {
+        guard isVisible, let viewModel = timelineViewModel else { return }
+
+        // Don't handle magnify when zoom region or search overlay is active
+        if viewModel.isZoomRegionActive || viewModel.isSearchOverlayVisible {
+            return
+        }
+
+        // magnification is the delta from the last event (can be positive or negative)
+        // Convert to a scale factor: 1.0 + magnification
+        let magnification = event.magnification
+        let scaleFactor = 1.0 + magnification
+
+        // Apply the magnification to the view model
+        viewModel.applyMagnification(scaleFactor)
     }
 
     // MARK: - Key Code Mapping

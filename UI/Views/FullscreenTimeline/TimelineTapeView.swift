@@ -13,9 +13,11 @@ public struct TimelineTapeView: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let width: CGFloat
 
-    // Tape dimensions
-    private let tapeHeight: CGFloat = 42
-    private let blockSpacing: CGFloat = 2
+    // Tape dimensions (resolution-adaptive)
+    private var tapeHeight: CGFloat { TimelineScaleFactor.tapeHeight }
+    private var blockSpacing: CGFloat { TimelineScaleFactor.blockSpacing }
+    private var appIconSize: CGFloat { TimelineScaleFactor.appIconSize }
+    private var iconDisplayThreshold: CGFloat { TimelineScaleFactor.iconDisplayThreshold }
     private var pixelsPerFrame: CGFloat { viewModel.pixelsPerFrame }
 
     // MARK: - Body
@@ -24,7 +26,7 @@ public struct TimelineTapeView: View {
         ZStack {
             // Background (tap to clear selection)
             Rectangle()
-                .fill(Color.black.opacity(0.85))
+                .fill(Color.clear)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     viewModel.clearSelection()
@@ -100,9 +102,9 @@ public struct TimelineTapeView: View {
             .frame(width: blockWidth, height: tapeHeight)
 
             // App icon (only show if block is wide enough)
-            if blockWidth > 40, let bundleID = block.bundleID {
+            if blockWidth > iconDisplayThreshold, let bundleID = block.bundleID {
                 appIcon(for: bundleID)
-                    .frame(width: 30, height: 30)
+                    .frame(width: appIconSize, height: appIconSize)
                     .allowsHitTesting(false) // Allow clicks to pass through to frame segments
             }
         }
@@ -208,21 +210,21 @@ public struct TimelineTapeView: View {
                         viewModel.isDateSearchActive = true
                     }
                 }) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: TimelineScaleFactor.iconSpacing) {
                         Text(viewModel.currentDateString)
-                            .font(.retraceCaptionMedium)
+                            .font(.system(size: TimelineScaleFactor.fontCaption, weight: .medium))
                             .foregroundColor(.white.opacity(0.7))
 
                         Text(viewModel.currentTimeString)
-                            .font(.retraceMono)
+                            .font(.system(size: TimelineScaleFactor.fontMono, weight: .regular, design: .monospaced))
                             .foregroundColor(.white)
 
                         Image(systemName: "chevron.down")
-                            .font(.retraceTinyBold)
+                            .font(.system(size: TimelineScaleFactor.fontTiny, weight: .bold))
                             .foregroundColor(.white.opacity(0.4))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, TimelineScaleFactor.paddingH)
+                    .padding(.vertical, TimelineScaleFactor.paddingV)
                     .background(
                         Capsule()
                             .fill(Color(white: 0.15))
@@ -240,26 +242,26 @@ public struct TimelineTapeView: View {
                         NSCursor.pop()
                     }
                 }
-                .position(x: centerX, y: -55)
+                .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
                 // Left side controls (hide UI + search)
-                HStack(spacing: 12) {
+                HStack(spacing: TimelineScaleFactor.controlSpacing) {
                     ControlsToggleButton(viewModel: viewModel)
                     SearchButton(viewModel: viewModel)
                 }
-                .position(x: 120, y: -55)
+                .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
                 // Right side controls (zoom + more options)
-                HStack(spacing: 12) {
+                HStack(spacing: TimelineScaleFactor.controlSpacing) {
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
-                .position(x: geometry.size.width - 100, y: -55)
+                .position(x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset, y: TimelineScaleFactor.controlsYOffset)
 
                 // Playhead vertical line (fixed at center)
                 UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3)
                     .fill(Color.white)
-                    .frame(width: 6, height: tapeHeight * 2.5)
+                    .frame(width: TimelineScaleFactor.playheadWidth, height: tapeHeight * 2.5)
                     .position(x: centerX, y: tapeHeight / 2)
 
                 // Floating search input (appears above the datetime button when active)
@@ -278,7 +280,7 @@ public struct TimelineTapeView: View {
                         enableFrameIDSearch: viewModel.enableFrameIDSearch,
                         viewModel: viewModel
                     )
-                    .position(x: centerX, y: -175)
+                    .position(x: centerX, y: TimelineScaleFactor.searchPanelYOffset)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
                         removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
@@ -288,7 +290,7 @@ public struct TimelineTapeView: View {
                 // Calendar picker (appears when calendar button is clicked)
                 if viewModel.isCalendarPickerVisible {
                     CalendarPickerView(viewModel: viewModel)
-                        .position(x: centerX, y: -280)
+                        .position(x: centerX, y: TimelineScaleFactor.calendarPickerYOffset)
                         .transition(.asymmetric(
                             insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
                             removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
@@ -308,11 +310,11 @@ struct ZoomControl: View {
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: TimelineScaleFactor.iconSpacing) {
             // Zoom out icon (when expanded)
             if viewModel.isZoomSliderExpanded {
                 Image(systemName: "minus.magnifyingglass")
-                    .font(.retraceCaption2Medium)
+                    .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
                     .transition(.opacity.combined(with: .scale))
             }
@@ -320,14 +322,14 @@ struct ZoomControl: View {
             // Slider (when expanded)
             if viewModel.isZoomSliderExpanded {
                 ZoomSlider(value: $viewModel.zoomLevel)
-                    .frame(width: 100)
+                    .frame(width: TimelineScaleFactor.zoomSliderWidth)
                     .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .trailing)))
             }
 
             // Zoom in icon (when expanded)
             if viewModel.isZoomSliderExpanded {
                 Image(systemName: "plus.magnifyingglass")
-                    .font(.retraceCaption2Medium)
+                    .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
                     .transition(.opacity.combined(with: .scale))
             }
@@ -339,9 +341,9 @@ struct ZoomControl: View {
                 }
             }) {
                 Image(systemName: "plus.magnifyingglass")
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                     .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
-                    .frame(width: 32, height: 32)
+                    .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                     .background(
                         Circle()
                             .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color(white: 0.15))
@@ -358,8 +360,8 @@ struct ZoomControl: View {
                 else { NSCursor.pop() }
             }
         }
-        .padding(.horizontal, viewModel.isZoomSliderExpanded ? 12 : 0)
-        .padding(.vertical, viewModel.isZoomSliderExpanded ? 8 : 0)
+        .padding(.horizontal, viewModel.isZoomSliderExpanded ? TimelineScaleFactor.buttonPaddingH : 0)
+        .padding(.vertical, viewModel.isZoomSliderExpanded ? TimelineScaleFactor.buttonPaddingV : 0)
         .background(
             Group {
                 if viewModel.isZoomSliderExpanded {
@@ -388,9 +390,9 @@ struct ControlsToggleButton: View {
             viewModel.toggleControlsVisibility()
         }) {
             Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
-                .font(.retraceCalloutMedium)
+                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                 .foregroundColor(isHovering ? .white : .white.opacity(0.6))
-                .frame(width: 32, height: 32)
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                 .background(
                     Circle()
                         .fill(Color(white: 0.15))
@@ -433,13 +435,13 @@ struct SearchButton: View {
             viewModel.clearSearchHighlight()
             viewModel.isSearchOverlayVisible = true
         }) {
-            HStack(spacing: 8) {
+            HStack(spacing: TimelineScaleFactor.iconSpacing) {
                 Image(systemName: "magnifyingglass")
-                    .font(.retraceCaptionMedium)
+                    .font(.system(size: TimelineScaleFactor.fontCaption, weight: .medium))
                     .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.9) : .white.opacity(0.5)))
 
                 Text(displayText)
-                    .font(.retraceCaption)
+                    .font(.system(size: TimelineScaleFactor.fontCaption, weight: .regular))
                     .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.8) : .white.opacity(0.4)))
                     .lineLimit(1)
 
@@ -447,18 +449,18 @@ struct SearchButton: View {
 
                 // Keyboard shortcut hint
                 Text("⌘K")
-                    .font(.retraceCaption2Medium)
+                    .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
+                    .padding(.horizontal, 6 * TimelineScaleFactor.current)
+                    .padding(.vertical, 2 * TimelineScaleFactor.current)
                     .background(
-                        RoundedRectangle(cornerRadius: 4)
+                        RoundedRectangle(cornerRadius: 4 * TimelineScaleFactor.current)
                             .fill(isHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.1))
                     )
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .frame(width: 160)
+            .padding(.horizontal, TimelineScaleFactor.buttonPaddingH)
+            .padding(.vertical, TimelineScaleFactor.buttonPaddingV)
+            .frame(width: TimelineScaleFactor.searchButtonWidth)
             .background(
                 Capsule()
                     .fill(Color(white: 0.15))
@@ -489,9 +491,9 @@ struct MoreOptionsMenu: View {
     var body: some View {
         Button(action: { showMenu.toggle() }) {
             Image(systemName: "ellipsis")
-                .font(.retraceCalloutMedium)
+                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                 .foregroundColor(isHovering || showMenu ? .white : .white.opacity(0.6))
-                .frame(width: 32, height: 32)
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                 .background(
                     Circle()
                         .fill(showMenu ? Color.white.opacity(0.15) : Color(white: 0.15))
@@ -947,7 +949,7 @@ struct FloatingDateSearchPanel: View {
                 .padding(.top, 10)
                 .padding(.bottom, 16)
         }
-        .frame(width: 380)
+        .frame(width: TimelineScaleFactor.searchPanelWidth)
         .background(
             ZStack {
                 // Dark solid background
@@ -1049,7 +1051,7 @@ struct CalendarPickerView: View {
         HStack(alignment: .top, spacing: 0) {
             // Left side: Calendar
             calendarView
-                .frame(width: 280)
+                .frame(width: TimelineScaleFactor.calendarPickerWidth)
 
             // Divider
             Rectangle()
@@ -1059,9 +1061,9 @@ struct CalendarPickerView: View {
 
             // Right side: Time list
             timeListView
-                .frame(width: 90)
+                .frame(width: 90 * TimelineScaleFactor.current)
         }
-        .frame(height: 340)
+        .frame(height: TimelineScaleFactor.calendarPickerHeight)
         .background(
             ZStack {
                 RoundedRectangle(cornerRadius: 20)

@@ -225,6 +225,73 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Blur opacity during transition (0.0 = no blur, 1.0 = full blur)
     @Published public var zoomTransitionBlurOpacity: CGFloat = 0
 
+    // MARK: - Frame Zoom State (Trackpad pinch-to-zoom)
+
+    /// Current frame zoom scale (1.0 = 100%, fit to screen)
+    /// Values > 1.0 zoom in, values < 1.0 zoom out (frame becomes smaller than display)
+    @Published public var frameZoomScale: CGFloat = 1.0
+
+    /// Pan offset when zoomed in (for navigating around the zoomed frame)
+    @Published public var frameZoomOffset: CGSize = .zero
+
+    /// Minimum zoom scale (frame smaller than display)
+    public static let minFrameZoomScale: CGFloat = 0.25
+
+    /// Maximum zoom scale (zoomed in)
+    public static let maxFrameZoomScale: CGFloat = 10.0
+
+    /// Whether the frame is currently zoomed (not at 100%)
+    public var isFrameZoomed: Bool {
+        abs(frameZoomScale - 1.0) > 0.001
+    }
+
+    /// Reset frame zoom to 100% (fit to screen)
+    public func resetFrameZoom() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            frameZoomScale = 1.0
+            frameZoomOffset = .zero
+        }
+    }
+
+    /// Apply magnification gesture delta to zoom scale
+    /// - Parameters:
+    ///   - magnification: The magnification value from the gesture (1.0 = no change)
+    ///   - anchor: The anchor point for zooming (in normalized coordinates 0.0-1.0)
+    ///   - animated: Whether to animate the zoom change (use true for keyboard shortcuts, false for trackpad gestures)
+    public func applyMagnification(_ magnification: CGFloat, anchor: CGPoint = CGPoint(x: 0.5, y: 0.5), animated: Bool = false) {
+        let newScale = (frameZoomScale * magnification).clamped(to: Self.minFrameZoomScale...Self.maxFrameZoomScale)
+
+        // Adjust offset to zoom toward the anchor point
+        let newOffset: CGSize
+        if newScale != frameZoomScale {
+            let scaleDelta = newScale / frameZoomScale
+            newOffset = CGSize(
+                width: frameZoomOffset.width * scaleDelta,
+                height: frameZoomOffset.height * scaleDelta
+            )
+        } else {
+            newOffset = frameZoomOffset
+        }
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.15)) {
+                frameZoomScale = newScale
+                frameZoomOffset = newOffset
+            }
+        } else {
+            frameZoomScale = newScale
+            frameZoomOffset = newOffset
+        }
+    }
+
+    /// Update pan offset when dragging while zoomed
+    public func updateFrameZoomOffset(by delta: CGSize) {
+        frameZoomOffset = CGSize(
+            width: frameZoomOffset.width + delta.width,
+            height: frameZoomOffset.height + delta.height
+        )
+    }
+
     // MARK: - Search State
 
     /// Whether the search overlay is visible
@@ -980,6 +1047,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard clampedIndex != currentIndex else { return }
 
         currentIndex = clampedIndex
+
+        // Keep zoom level consistent across frames (don't reset on navigation)
+        // User can reset with Cmd+0 if needed
 
         // Load image if this is an image-based frame
         loadImageIfNeeded()
