@@ -545,13 +545,15 @@ extension CaptureConfig {
     public static var `default`: CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
         let captureIntervalSeconds = UserDefaults.standard.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
-        // Default to true - exclude private/incognito windows by default for privacy
-        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? true
+        // TODO: Re-enable once private window detection is more reliable
+        // Currently disabled because detection has false positives and doesn't reliably detect incognito
+        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? false
         // excludeCursor = true means hide cursor, so showCursor = !excludeCursor
         let excludeCursor = UserDefaults.standard.object(forKey: "excludeCursor") as? Bool ?? false
         let showCursor = !excludeCursor
         // Delete duplicate frames setting controls adaptive capture (deduplication)
-        let deleteDuplicateFrames = UserDefaults.standard.object(forKey: "deleteDuplicateFrames") as? Bool ?? false
+        // Default to true - deduplication enabled by default
+        let deleteDuplicateFrames = UserDefaults.standard.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
@@ -572,7 +574,7 @@ extension CaptureConfig {
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
-            deduplicationThreshold: 0.90, // 0.90 = strict (filters static/similar frames, keeps only >10% different)
+            deduplicationThreshold: 0.99, // 0.99 = only discard nearly identical frames (99%+ similar)
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,

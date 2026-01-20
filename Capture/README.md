@@ -10,7 +10,7 @@ The Capture module handles screen recording, frame deduplication, and metadata e
 
 **Implemented Features**:
 - ✅ ScreenCaptureKit integration for screen capture
-- ✅ Perceptual hashing (dHash) for frame deduplication
+- ✅ Simple pixel-based frame deduplication
 - ✅ App metadata extraction (active app, window title, browser URL)
 - ✅ Permission handling (screen recording + accessibility)
 - ✅ Display monitoring and enumeration
@@ -48,8 +48,7 @@ CaptureManager (actor) - Main coordinator
 ├── ScreenCaptureService - ScreenCaptureKit wrapper
 │   └── StreamOutput - SCStream output handler
 ├── DisplayMonitor - Display tracking
-├── FrameDeduplicator - Deduplication protocol implementation
-│   └── PerceptualHash - dHash computation
+├── FrameDeduplicator - Simple pixel-based deduplication
 └── AppInfoProvider - Metadata extraction
     └── BrowserURLExtractor - Browser URL extraction
 ```

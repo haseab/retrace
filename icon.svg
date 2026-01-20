@@ -1,28 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 100 100">
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 100 100">
   <defs>
-    <!-- Subtle blue gradient -->
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#0B3571"/>
       <stop offset="1" stop-color="#082B5F"/>
     </linearGradient>
   </defs>
-
-  <!-- Rounded background -->
-  <rect
-    x="0"
-    y="0"
-    width="100"
-    height="100"
-    rx="18"
-    ry="18"
-    fill="url(#bg)"
-  />
-
-  <!-- Retrace mark -->
-  <g fill="#FFFFFF">
-    <!-- left triangle -->
-    <polygon points="23,50 47,34 47,66"/>
-    <!-- right triangle -->
-    <polygon points="77,50 53,34 53,66"/>
+  <rect width="100" height="100" rx="18" fill="url(#bg)"/>
+  <g fill="#fff">
+    <polygon points="20,50 45,34 45,66"/>
+    <polygon points="80,50 55,34 55,66"/>
   </g>
 </svg>

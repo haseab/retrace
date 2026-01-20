@@ -178,15 +178,19 @@ public actor CGWindowListCapture {
             }
 
             // Check 2: Private/incognito windows
-            if config.excludePrivateWindows {
-                if PrivateWindowDetector.isPrivateWindow(
-                    windowInfo: windowInfo,
-                    patterns: config.customPrivateWindowPatterns
-                ) {
-                    excludedIDs.insert(windowID)
-                    Log.info("[PrivateDetect] EXCLUDING private window: '\(windowName)' from \(ownerName)", category: .capture)
-                }
-            }
+            // TODO: Re-enable once private window detection is more reliable
+            // Currently disabled because title-based detection has false positives
+            // (e.g., pages with "private" in the title) and AX-based detection
+            // doesn't reliably detect Chrome/Safari incognito windows
+            // if config.excludePrivateWindows {
+            //     if PrivateWindowDetector.isPrivateWindow(
+            //         windowInfo: windowInfo,
+            //         patterns: config.customPrivateWindowPatterns
+            //     ) {
+            //         excludedIDs.insert(windowID)
+            //         Log.info("[PrivateDetect] EXCLUDING private window: '\(windowName)' from \(ownerName)", category: .capture)
+            //     }
+            // }
         }
 
         return excludedIDs

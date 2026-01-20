@@ -55,6 +55,16 @@ public actor AppCoordinator {
         services.modelManager
     }
 
+    /// Get current capture configuration
+    public func getCaptureConfig() async -> CaptureConfig {
+        await services.capture.getConfig()
+    }
+
+    /// Update capture configuration
+    public func updateCaptureConfig(_ config: CaptureConfig) async throws {
+        try await services.capture.updateConfig(config)
+    }
+
     // MARK: - Timeline Visibility
 
     /// Set whether the timeline is currently visible (pauses frame processing when true)

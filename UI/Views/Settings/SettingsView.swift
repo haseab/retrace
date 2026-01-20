@@ -34,12 +34,13 @@ public struct SettingsView: View {
     @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
     @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
     @AppStorage("videoQuality") private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
-    @AppStorage("deleteDuplicateFrames") private var deleteDuplicateFrames: Bool = false
+    @AppStorage("deleteDuplicateFrames") private var deleteDuplicateFrames: Bool = true
     @AppStorage("useRewindData") private var useRewindData: Bool = false
 
     // Privacy settings
     @AppStorage("excludedApps") private var excludedAppsString = ""
-    @AppStorage("excludePrivateWindows") private var excludePrivateWindows = true
+    // TODO: Re-enable once private window detection is more reliable
+    @AppStorage("excludePrivateWindows") private var excludePrivateWindows = false
 
     // Computed property to manage excluded apps as array
     private var excludedApps: [ExcludedAppInfo] {
@@ -719,6 +720,9 @@ public struct SettingsView: View {
                     subtitle: "Automatically remove similar consecutive frames",
                     isOn: $deleteDuplicateFrames
                 )
+                .onChange(of: deleteDuplicateFrames) { newValue in
+                    updateDeduplicationSetting(enabled: newValue)
+                }
             }
         }
     }
@@ -784,29 +788,33 @@ public struct SettingsView: View {
                 }
             }
 
-            ModernSettingsCard(title: "Excluded Windows", icon: "eye.slash") {
-                ModernToggleRow(
-                    title: "Exclude Private/Incognito Windows",
-                    subtitle: "Automatically skip private browsing windows",
-                    isOn: $excludePrivateWindows
-                )
-
-                if excludePrivateWindows {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Detects private windows from:")
-                            .font(.retraceCaption2Medium)
-                            .foregroundColor(.retraceSecondary)
-
-                        Text("Safari, Chrome, Edge, Firefox, Brave")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.8))
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white.opacity(0.03))
-                    .cornerRadius(10)
-                }
-            }
+            // TODO: Re-enable once private window detection is more reliable
+            // Currently disabled because title-based detection has false positives
+            // (e.g., pages with "private" in the title) and AX-based detection
+            // doesn't reliably detect Chrome/Safari incognito windows
+            // ModernSettingsCard(title: "Excluded Windows", icon: "eye.slash") {
+            //     ModernToggleRow(
+            //         title: "Exclude Private/Incognito Windows",
+            //         subtitle: "Automatically skip private browsing windows",
+            //         isOn: $excludePrivateWindows
+            //     )
+            //
+            //     if excludePrivateWindows {
+            //         VStack(alignment: .leading, spacing: 8) {
+            //             Text("Detects private windows from:")
+            //                 .font(.retraceCaption2Medium)
+            //                 .foregroundColor(.retraceSecondary)
+            //
+            //             Text("Safari, Chrome, Edge, Firefox, Brave")
+            //                 .font(.retraceCaption2)
+            //                 .foregroundColor(.retraceSecondary.opacity(0.8))
+            //         }
+            //         .padding(12)
+            //         .frame(maxWidth: .infinity, alignment: .leading)
+            //         .background(Color.white.opacity(0.03))
+            //         .cornerRadius(10)
+            //     }
+            // }
 
             ModernSettingsCard(title: "Quick Delete", icon: "clock.arrow.circlepath") {
                 VStack(alignment: .leading, spacing: 12) {
@@ -1732,7 +1740,7 @@ extension SettingsView {
         videoQuality = 0.5
         retentionDays = 0
         maxStorageGB = 50.0
-        deleteDuplicateFrames = false
+        deleteDuplicateFrames = true
         launchAtLogin = false
         showMenuBarIcon = true
         excludePrivateWindows = true
@@ -2180,6 +2188,36 @@ extension SettingsView {
             NSApp.appearance = NSAppearance(named: .aqua)
         case .dark:
             NSApp.appearance = NSAppearance(named: .darkAqua)
+        }
+    }
+
+    /// Update deduplication setting in capture config
+    private func updateDeduplicationSetting(enabled: Bool) {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+
+            // Get current config from capture manager
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            // Create new config with updated deduplication setting
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: enabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor
+            )
+
+            // Update the capture manager config
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Deduplication setting updated to: \(enabled)", category: .ui)
+            } catch {
+                Log.error("[SettingsView] Failed to update deduplication setting: \(error)", category: .ui)
+            }
         }
     }
 }

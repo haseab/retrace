@@ -1,7 +1,7 @@
 import Foundation
 import Shared
 
-/// Implementation of frame deduplication using perceptual hashing
+/// Implementation of frame deduplication using simple pixel sampling
 /// Conforms to DeduplicationProtocol from Shared/Protocols
 public struct FrameDeduplicator: DeduplicationProtocol {
 
@@ -15,8 +15,8 @@ public struct FrameDeduplicator: DeduplicationProtocol {
     /// - Parameters:
     ///   - frame: The new frame to evaluate
     ///   - reference: The reference frame to compare against (nil means always keep)
-    ///   - threshold: Similarity threshold (0-1, higher = more strict, more frames filtered)
-    /// - Returns: True if frame should be kept, false if it's too similar (duplicate)
+    ///   - threshold: Similarity threshold (0-1, where 1.0 means identical)
+    /// - Returns: True if frame should be kept, false if it's basically the same (duplicate)
     public func shouldKeepFrame(
         _ frame: CapturedFrame,
         comparedTo reference: CapturedFrame?,
@@ -30,22 +30,41 @@ public struct FrameDeduplicator: DeduplicationProtocol {
             return true
         }
 
-        // Compute similarity
+        // Check if frames are basically identical
         let similarity = computeSimilarity(frame, reference)
 
-        // Interpret threshold as minimum required dissimilarity
-        // Higher threshold = more strict = more frames filtered
-        // threshold 0.98 → keep if similarity < 0.02 (very strict, almost all filtered)
-        // threshold 0.02 → keep if similarity < 0.98 (lenient, only identical filtered)
-        let maxAllowedSimilarity = 1.0 - threshold
-        return similarity < maxAllowedSimilarity
+        // If similarity is below threshold, keep the frame (it changed enough)
+        // threshold 0.95 → keep if similarity < 0.95 (frames are different enough)
+        return similarity < threshold
     }
 
     /// Compute a perceptual hash for a frame
     /// - Parameter frame: The frame to hash
     /// - Returns: 64-bit hash value
     public func computeHash(for frame: CapturedFrame) -> UInt64 {
-        PerceptualHash.computeHash(for: frame)
+        // Simple checksum of sampled pixels
+        var hash: UInt64 = 0
+        let sampleSize = 64
+
+        frame.imageData.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            guard let baseAddress = bytes.baseAddress else { return }
+            let pixels = baseAddress.assumingMemoryBound(to: UInt8.self)
+
+            let totalPixels = frame.width * frame.height
+            let step = max(1, totalPixels / sampleSize)
+
+            for i in stride(from: 0, to: totalPixels, by: step).prefix(sampleSize) {
+                let offset = i * 4
+                if offset + 2 < frame.imageData.count {
+                    let r = UInt64(pixels[offset + 2])
+                    let g = UInt64(pixels[offset + 1])
+                    let b = UInt64(pixels[offset])
+                    hash = hash &+ (r &+ g &+ b)
+                }
+            }
+        }
+
+        return hash
     }
 
     /// Compute similarity score between two frames
@@ -62,11 +81,48 @@ public struct FrameDeduplicator: DeduplicationProtocol {
             return 0.0 // Completely different
         }
 
-        // Compute hashes
-        let hash1 = computeHash(for: frame1)
-        let hash2 = computeHash(for: frame2)
+        // Sample pixels across the image and compare
+        let sampleSize = 100 // Check 100 evenly-distributed pixels
+        var matchingPixels = 0
+        var totalSamples = 0
 
-        // Compare hashes
-        return PerceptualHash.computeSimilarity(hash1: hash1, hash2: hash2)
+        frame1.imageData.withUnsafeBytes { bytes1 in
+            frame2.imageData.withUnsafeBytes { bytes2 in
+                guard let base1 = bytes1.baseAddress,
+                      let base2 = bytes2.baseAddress else { return }
+
+                let pixels1 = base1.assumingMemoryBound(to: UInt8.self)
+                let pixels2 = base2.assumingMemoryBound(to: UInt8.self)
+
+                let totalPixels = frame1.width * frame1.height
+                let step = max(1, totalPixels / sampleSize)
+
+                for i in stride(from: 0, to: totalPixels, by: step).prefix(sampleSize) {
+                    let offset = i * 4
+                    if offset + 2 < frame1.imageData.count && offset + 2 < frame2.imageData.count {
+                        let r1 = pixels1[offset + 2]
+                        let g1 = pixels1[offset + 1]
+                        let b1 = pixels1[offset]
+
+                        let r2 = pixels2[offset + 2]
+                        let g2 = pixels2[offset + 1]
+                        let b2 = pixels2[offset]
+
+                        // Check if pixels are very similar (within 5% tolerance)
+                        let rDiff = abs(Int(r1) - Int(r2))
+                        let gDiff = abs(Int(g1) - Int(g2))
+                        let bDiff = abs(Int(b1) - Int(b2))
+
+                        if rDiff < 13 && gDiff < 13 && bDiff < 13 { // 13 ≈ 5% of 255
+                            matchingPixels += 1
+                        }
+                        totalSamples += 1
+                    }
+                }
+            }
+        }
+
+        guard totalSamples > 0 else { return 0.0 }
+        return Double(matchingPixels) / Double(totalSamples)
     }
 }

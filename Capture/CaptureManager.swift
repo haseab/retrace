@@ -268,6 +268,7 @@ public actor CaptureManager: CaptureProtocol {
 
             // Apply deduplication if enabled
             if currentConfig.adaptiveCaptureEnabled {
+                let similarity = lastKeptFrame != nil ? deduplicator.computeSimilarity(frame, lastKeptFrame!) : 0.0
                 let shouldKeep = deduplicator.shouldKeepFrame(
                     frame,
                     comparedTo: lastKeptFrame,
@@ -286,6 +287,8 @@ public actor CaptureManager: CaptureProtocol {
                         captureStartTime: stats.captureStartTime,
                         lastFrameTime: frame.timestamp
                     )
+
+                    Log.debug("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
                 } else {
                     // Frame was filtered out
                     stats = CaptureStatistics(
@@ -295,6 +298,8 @@ public actor CaptureManager: CaptureProtocol {
                         captureStartTime: stats.captureStartTime,
                         lastFrameTime: stats.lastFrameTime
                     )
+
+                    Log.info("Frame deduplicated (similarity: \(String(format: "%.2f%%", similarity * 100)), threshold: \(String(format: "%.2f%%", currentConfig.deduplicationThreshold * 100)))", category: .capture)
                 }
             } else {
                 // No deduplication - pass through all frames

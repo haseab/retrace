@@ -266,7 +266,7 @@ struct PrivateWindowDetector {
         let roleDesc = getAXAttribute(element, kAXRoleDescriptionAttribute as CFString) as? String
         let description = getAXAttribute(element, kAXDescriptionAttribute as CFString) as? String
 
-        Log.info("[ChromiumPrivate] Checking window '\(title)' - subrole: \(subrole ?? "nil"), roleDesc: \(roleDesc ?? "nil"), desc: \(description ?? "nil")", category: .capture)
+        Log.debug("[ChromiumPrivate] Checking window '\(title)' - subrole: \(subrole ?? "nil"), roleDesc: \(roleDesc ?? "nil"), desc: \(description ?? "nil")", category: .capture)
 
         // Check AXSubrole - Chromium sets different subroles for incognito windows
         if let subrole = subrole {
@@ -294,42 +294,61 @@ struct PrivateWindowDetector {
             }
         }
 
-        // Check window title (fallback)
-        if title.contains(" - Incognito") ||
-           title.contains("(Incognito)") ||
-           title.contains(" - InPrivate") ||
-           title.contains("(InPrivate)") {
+        // Check window title - Chrome/Edge append " - Incognito" or " — Incognito" (em-dash)
+        // Using lowercased comparison to be safe
+        let lowercaseTitle = title.lowercased()
+        if lowercaseTitle.contains(" - incognito") ||
+           lowercaseTitle.contains(" — incognito") ||
+           lowercaseTitle.contains("(incognito)") ||
+           lowercaseTitle.contains(" - inprivate") ||
+           lowercaseTitle.contains(" — inprivate") ||
+           lowercaseTitle.contains("(inprivate)") {
             Log.info("[ChromiumPrivate] MATCH via title: \(title)", category: .capture)
             return true
         }
 
-        Log.info("[ChromiumPrivate] NO MATCH for '\(title)'", category: .capture)
+        Log.debug("[ChromiumPrivate] NO MATCH for '\(title)'", category: .capture)
         return false
     }
 
     /// Check if a Safari window is in private browsing mode
     private static func checkSafariPrivate(_ element: AXUIElement) -> Bool {
-        // Safari sets specific attributes for private windows
+        let title = getAXAttribute(element, kAXTitleAttribute as CFString) as? String
+        let description = getAXAttribute(element, kAXDescriptionAttribute as CFString) as? String
 
-        // Check for private browsing attribute
+        Log.debug("[SafariPrivate] Checking window '\(title ?? "(no title)")' - desc: \(description ?? "nil")", category: .capture)
+
+        // Check for private browsing attribute (Safari-specific)
         if let isPrivate = getAXAttribute(element, "AXIsPrivateBrowsing" as CFString) as? Bool {
+            Log.info("[SafariPrivate] MATCH via AXIsPrivateBrowsing: \(isPrivate)", category: .capture)
             return isPrivate
         }
 
-        // Check window title - Safari appends " — Private"
-        if let title = getAXAttribute(element, kAXTitleAttribute as CFString) as? String {
-            if title.hasSuffix(" — Private") || title.hasSuffix(" - Private") {
+        // Check window title - Safari appends " — Private" or " - Private"
+        if let title = title {
+            let lowercaseTitle = title.lowercased()
+            // Safari uses " — Private" suffix (em-dash)
+            if lowercaseTitle.hasSuffix(" — private") ||
+               lowercaseTitle.hasSuffix(" - private") ||
+               lowercaseTitle.contains(" — private") ||
+               lowercaseTitle.contains(" - private") {
+                Log.info("[SafariPrivate] MATCH via title: \(title)", category: .capture)
                 return true
             }
         }
 
         // Check AXDescription
-        if let description = getAXAttribute(element, kAXDescriptionAttribute as CFString) as? String {
-            if description.lowercased().contains("private") {
+        if let description = description {
+            // Be more specific - look for "private browsing" or title-like patterns
+            let lowercaseDesc = description.lowercased()
+            if lowercaseDesc.contains("private browsing") ||
+               lowercaseDesc.hasSuffix(" private") {
+                Log.info("[SafariPrivate] MATCH via description: \(description)", category: .capture)
                 return true
             }
         }
 
+        Log.debug("[SafariPrivate] NO MATCH for '\(title ?? "(no title)")'", category: .capture)
         return false
     }
 
