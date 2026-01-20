@@ -256,14 +256,30 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Apply magnification gesture delta to zoom scale
     /// - Parameters:
     ///   - magnification: The magnification value from the gesture (1.0 = no change)
-    ///   - anchor: The anchor point for zooming (in normalized coordinates 0.0-1.0)
+    ///   - anchor: The anchor point for zooming (in normalized coordinates 0.0-1.0, where 0.5,0.5 is center)
+    ///   - frameSize: The size of the frame view in points (needed for anchor-based zoom calculations)
     ///   - animated: Whether to animate the zoom change (use true for keyboard shortcuts, false for trackpad gestures)
-    public func applyMagnification(_ magnification: CGFloat, anchor: CGPoint = CGPoint(x: 0.5, y: 0.5), animated: Bool = false) {
+    public func applyMagnification(_ magnification: CGFloat, anchor: CGPoint = CGPoint(x: 0.5, y: 0.5), frameSize: CGSize? = nil, animated: Bool = false) {
         let newScale = (frameZoomScale * magnification).clamped(to: Self.minFrameZoomScale...Self.maxFrameZoomScale)
 
-        // Adjust offset to zoom toward the anchor point
+        // Calculate new offset to zoom toward the anchor point
         let newOffset: CGSize
-        if newScale != frameZoomScale {
+        if newScale != frameZoomScale, let size = frameSize {
+            // Convert anchor from normalized (0-1) to offset from center
+            // anchor (0.5, 0.5) = center, (0,0) = top-left, (1,1) = bottom-right
+            let anchorOffsetX = (anchor.x - 0.5) * size.width
+            let anchorOffsetY = (anchor.y - 0.5) * size.height
+
+            let scaleDelta = newScale / frameZoomScale
+
+            // When zooming, the point under the cursor should stay stationary
+            // newOffset = oldOffset * scaleDelta + anchorOffset * (1 - scaleDelta)
+            newOffset = CGSize(
+                width: frameZoomOffset.width * scaleDelta + anchorOffsetX * (1 - scaleDelta),
+                height: frameZoomOffset.height * scaleDelta + anchorOffsetY * (1 - scaleDelta)
+            )
+        } else if newScale != frameZoomScale {
+            // No frame size provided, just scale existing offset (zoom from center)
             let scaleDelta = newScale / frameZoomScale
             newOffset = CGSize(
                 width: frameZoomOffset.width * scaleDelta,

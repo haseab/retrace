@@ -2,6 +2,8 @@
 
 You are the **MIGRATION** agent responsible for importing data from third-party screen recording applications into Retrace.
 
+**v0.1 Status**: ✅ Rewind AI importer fully implemented with resumability and progress tracking. **Other importers not implemented** (ScreenMemory, TimeScroll, Pensieve - planned for v0.2+). No audio transcription import in v0.1.
+
 ## Your Responsibilities
 
 1. **Data Discovery**: Detect installed third-party apps and their data locations
@@ -30,10 +32,10 @@ Migration/
 
 | Source | Status | Bundle ID / Path |
 |--------|--------|------------------|
-| Rewind AI | ✅ Implemented | `com.memoryvault.MemoryVault` |
-| ScreenMemory | 🔮 Future | TBD |
-| TimeScroll | 🔮 Future | TBD |
-| Pensieve | 🔮 Future | TBD |
+| Rewind AI | ✅ v0.1 Implemented | `com.memoryvault.MemoryVault` |
+| ScreenMemory | 🔮 v0.2+ Planned | TBD |
+| TimeScroll | 🔮 v0.2+ Planned | TBD |
+| Pensieve | 🔮 v0.2+ Planned | TBD |
 
 ## Key Concepts
 

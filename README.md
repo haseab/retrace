@@ -1,61 +1,59 @@
 # Retrace
 
-> ⚠️ **VERY EARLY DEVELOPMENT** - This project is in active development and not yet ready for production use. Expect breaking changes, incomplete features, and bugs.
+> ⚠️ **VERY EARLY DEVELOPMENT** - This project is in very early development. Expect breaking changes, incomplete features, and bugs.
 
-A local-first screen recording and search application for macOS, inspired by Rewind AI. Retrace captures your screen activity, extracts text via OCR, and makes everything searchable—all on-device with encryption you control.
+A local-first screen recording and search application for macOS, inspired by Rewind AI. Retrace captures your screen activity, extracts text via OCR, and makes everything searchable—all locally on-device.
 
 ## What is Retrace?
 
-Retrace is an open source alternative to Rewind AI that gives you photographic memory of everything you've seen on your screen. It continuously captures screenshots (every 2 seconds), extracts text using OCR, and stores everything in a searchable database—entirely on your Mac with no cloud dependencies.
+Retrace is an open source alternative to Rewind AI that gives you photographic memory of everything you've seen on your screen. It continuously captures screenshots (every 2 seconds by default), extracts text using OCR, and stores everything in a searchable database—entirely on your Mac with no cloud dependencies.
 
-### Key Features
+## Current Status (v0.1)
 
-- **📸 Continuous Screen Capture** - Captures active displays every 2 seconds with intelligent deduplication (95% reduction)
-- **🔍 Full-Text Search** - Find anything you've seen on screen using natural language queries (SQLite FTS5)
-- **🎙️ Audio Transcription (WORK IN PROGRESS)** - Transcribe microphone and system audio using whisper.cpp (local, on-device)
-- **🔒 Privacy-First** - All data stays on your device with AES-256-GCM encryption at rest
-- **🎬 Efficient Storage (WORK IN PROGRESS)** - HEVC video encoding for ~15-20GB/month storage footprint
-- **📦 Rewind Import** - Connect to your existing Rewind AI data without any manual work.
-- **🧩 Modular Architecture** - Clean separation of concerns with protocol-based boundaries
-- **⚡ Performance Optimized (WORK IN PROGRESS)** - <20% CPU, <1GB RAM target during active capture
+### ✅ What's Working
+
+- **Continuous screen capture** with configurable intervals (every 2 seconds default)
+- **OCR text extraction** using Apple's Vision framework
+- **Full-text search** with advanced filters (app, date, exclusions)
+- **Timeline viewer** - Scrub through your screen history frame-by-frame
+- **Dashboard analytics** - Visualize app usage, screen time, and activity patterns
+- **Rewind AI import** - Seamless, resumable background import of existing Rewind data
+- **Settings panel** - Comprehensive controls for capture, storage, privacy, and shortcuts
+- **Global hotkeys** - Quick access (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard)
+- **HEVC video encoding** - Working but not yet optimized for efficiency
+- **Search highlighting** - Visual highlighting of search results in frames
+- **Privacy controls** - Exclude apps and private browsing windows
+
+### 🚧 Coming Soon
+
+- **Optimized storage** - Improving HEVC compression efficiency
+- **Audio recording and transcription** - Whisper.cpp integration ready but disabled
+- **Advanced keyboard shortcuts** - More customizable shortcuts
+- **Decrypt and backup Rewind database** - Export your Rewind data
 
 ## Architecture
 
-Retrace is built with a modular architecture consisting of 8 independent components:
+**v0.1 Data Flow (Current Implementation):**
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                          UI                             │
-│                    (SwiftUI Views)                      │
-└─────────────────────────────────────────────────────────┘
-                            │
-┌─────────────────────────────────────────────────────────┐
-│                         App                             │
-│        (Coordination, Lifecycle, Services)              │
-└─────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-┌───────▼──────┐   ┌────────▼────────┐   ┌─────▼──────┐
-│   Capture    │   │   Processing    │   │   Search   │
-│ (Screen/Audio)│──▶│  (OCR/Whisper)  │──▶│  (FTS5)    │
-└───────┬──────┘   └────────┬────────┘   └─────┬──────┘
-        │                   │                   │
-        └───────────────────┼───────────────────┘
-                            │
-                ┌───────────┴───────────┐
-                │                       │
-        ┌───────▼──────┐       ┌────────▼────────┐
-        │   Storage    │       │    Database     │
-        │ (Video/Audio)│       │   (SQLite)      │
-        └──────────────┘       └─────────────────┘
+CGWindowListCapture (every 2s)
+    ↓
+Frame Deduplication
+    ↓
+Split into two paths:
+    ├─ OCR Path: Vision OCR → Text Extraction → SQLite Database
+    └─ Video Path: HEVC Encoding → .mp4 segments
+    ↓
+Full-Text Search (FTS5) → Timeline/Dashboard UI
 ```
+
+Retrace is built with a modular architecture:
 
 - **Database** - SQLite + FTS5 for metadata and full-text search
-- **Storage** - HEVC video encoding and audio segment management (WORK IN PROGRESS)
-- **Capture** - Screen capture (ScreenCaptureKit) and audio recording (WORK IN PROGRESS)
-- **Processing** - OCR (Vision), audio transcription (whisper.cpp - WORK IN PROGRESS), text merging
-- **Search** - Query parsing, FTS5 ranking, result snippets, hybrid search (future)
+- **Storage** - HEVC video encoding for screen recordings
+- **Capture** - Screen capture using CGWindowListCapture API
+- **Processing** - OCR text extraction using Apple's Vision framework
+- **Search** - Query parsing, FTS5 ranking, and result snippets
 - **Migration** - Import from Rewind AI databases
 - **App** - Coordination, lifecycle management, service container
 - **UI** - SwiftUI interface with search, timeline, and settings
@@ -64,30 +62,34 @@ See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 
 ## Tech Stack
 
-- **Language**: Swift 5.9+ (async/await, Actors, Sendable)
-- **Platform**: macOS 13.0+ (Ventura) - requires ScreenCaptureKit
-- **UI**: SwiftUI
-- **OCR**: Vision framework
+### Active in v0.1
+
+- **Language**: Swift 5.9+ with async/await, Actors, Sendable
+- **Platform**: macOS 13.0+ (Apple Silicon required)
+- **UI**: SwiftUI with custom design system
+- **Screen Capture**: CGWindowListCapture API (legacy, no privacy indicator)
+- **OCR**: Vision framework (macOS native)
 - **Video**: VideoToolbox (HEVC encoding)
-- **Audio**: AVFoundation, ScreenCaptureKit (system audio) - WORK IN PROGRESS
-- **Database**: SQLite with FTS5 (full-text search)
-- **Encryption**: CryptoKit (AES-256-GCM)
-- **Transcription**: [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (bundled in Vendors/) - WORK IN PROGRESS
-- **Embeddings**: [llama.cpp](https://github.com/ggerganov/llama.cpp) (bundled in Vendors/) - WORK IN PROGRESS
+- **Database**: SQLite with FTS5 full-text search
+- **Encryption**: CryptoKit (AES-256-GCM) for database
+
+### Planned for Future Releases
+
+- **Audio transcription**: whisper.cpp (bundled, ready but disabled)
+- **Embeddings**: llama.cpp for semantic search (prepared but not active)
 
 ## Requirements
 
-- macOS 13.0+ (Ventura or later)
-- Xcode 15.0+ or Swift 5.9+
-- Apple Silicon (for Metal acceleration)
+- **macOS 13.0+** (Ventura or later)
+- **Apple Silicon** (M1/M2/M3) - Intel not supported
+- **Xcode 15.0+** or Swift 5.9+ for building from source
 
 ### Permissions Required
 
 Retrace needs the following macOS permissions:
 
 - **Screen Recording** - To capture your screen
-- **Accessibility** (optional) - For enhanced context extraction (WORK IN PROGRESS)
-- **Microphone** (optional) - For audio transcription (WORK IN PROGRESS)
+- **Accessibility** - For enhanced context extraction (app names, window titles, browser URLs)
 
 ## Quick Start
 
@@ -98,35 +100,56 @@ git clone https://github.com/haseab/retrace.git
 cd retrace
 ```
 
-### 2. Build the Project
+### 2. Build and Run
 
-```bash
-swift build
-```
-
-Or open in Xcode:
+**Option A: Using Xcode (Recommended)**
 
 ```bash
 open Package.swift
 ```
 
-### 3. Run the App (WORK IN PROGRESS)
+1. Wait for Swift Package Manager to resolve dependencies
+2. Select the `Retrace` scheme in Xcode
+3. Build and run (⌘R)
 
-**Note: The app is not yet runnable in v0.1. Full app functionality is coming in future releases.**
+**Option B: Command Line**
 
-Once ready, from Xcode, select the `UI` scheme and run (⌘R).
+```bash
+# Build the project
+swift build -c release
 
-On first launch:
+# Run the executable
+.build/release/Retrace
+```
 
-- Grant Screen Recording permission in System Settings
-- The app will create its database at `~/Library/Application Support/Retrace/`
+**First Launch:**
 
-### 4. Reset Database (Development)
+1. Grant **Screen Recording** permission when prompted (System Settings → Privacy & Security)
+2. Grant **Accessibility** permission for enhanced context extraction
+3. Complete the onboarding flow
+4. Optionally import existing Rewind AI data
+5. Configure settings (capture interval, excluded apps, shortcuts)
 
-If you need to start fresh:
+The app will create its database at `~/Library/Application Support/Retrace/`
+
+### 3. Development Scripts
+
+**Reset database** (keeps settings):
 
 ```bash
 ./scripts/reset_database.sh
+```
+
+**Reset onboarding** (safe, preserves data):
+
+```bash
+./scripts/reset_onboarding_safe.sh
+```
+
+**Hard reset** (deletes everything):
+
+```bash
+./scripts/hardreset_onboarding.sh
 ```
 
 ## Development
@@ -152,48 +175,54 @@ retrace/
 ├── App/                 # App coordination and lifecycle
 ├── UI/                  # SwiftUI views and view models
 ├── Database/            # SQLite + FTS5 implementation
-├── Storage/             # Video/audio file management
-├── Capture/             # Screen and audio capture
-├── Processing/          # OCR, transcription, text merging
-├── Search/              # Query parsing and ranking
+├── Storage/             # HEVC video encoding and file management
+├── Capture/             # Screen capture (CGWindowListCapture)
+├── Processing/          # OCR and text extraction
+├── Search/              # Query parsing and FTS5 ranking
 ├── Migration/           # Rewind import tools
-├── Shared/              # Protocols and logging
-├── Vendors/             # Bundled C++ libraries (whisper, llama)
-└── scripts/             # Setup and utility scripts
+├── Shared/              # Protocols and shared models
+└── scripts/             # Build and utility scripts
 ```
 
 ## Roadmap
 
-**v0.1 (Current Release):**
+### v0.1 (Current Release - January 2026) ✅
 
 - [x] Screen capture with deduplication
-- [x] OCR text extraction (Vision)
-- [x] Full-text search (FTS5)
-- [x] Rewind AI import
-- [x] Database schema and migrations
-- [x] Modular architecture with protocol boundaries
+- [x] OCR text extraction (Vision framework)
+- [x] Full-text search (SQLite FTS5)
+- [x] Dashboard with app usage analytics
+- [x] Timeline frame viewer
+- [x] HEVC video encoding (working but not optimized)
+- [x] Settings and preferences
+- [x] Rewind AI import (resumable)
+- [x] Menu bar and global hotkeys
+- [x] Search highlighting
 
-**Future Releases:**
+### v0.2+ (Future Releases) - TBD
 
-- [ ] HEVC video encoding
-- [ ] Audio transcription (whisper.cpp)
-- [ ] Timeline view improvements
-- [ ] Advanced search filters (date, app, URL)
-- [ ] Hybrid search (vector + FTS5)
-- [ ] Private window detection (exclude sensitive content)
-- [ ] Meeting detection and segmentation
-- [ ] Web UI for search
-- [ ] iOS companion app
+_Roadmap for future releases to be determined based on user feedback and priorities._
 
 ## Performance
 
-Retrace will be designed ((WORK IN PROGRESS) to run in the background with minimal impact:
+**Current v0.1 Metrics:**
 
-- **CPU**: <20% average (target)
-- **Memory**: <1GB RAM during active capture
-- **Storage**: ~15-20GB/month with HEVC compression
-- **Capture Rate**: Every 2 seconds (configurable)
-- **Deduplication**: ~95% reduction via perceptual hashing
+- **Capture Rate**: Every 2 seconds (configurable: 1-60 seconds)
+- **OCR Speed**: ~200-500ms per frame on Apple Silicon
+- **Search Speed**: <100ms for typical queries
+
+**Storage (Work in Progress):**
+
+- **Current**: ~50-70GB/month (HEVC working but not optimized)
+- **Target**: ~15-20GB/month with optimized compression
+
+## Known Limitations (v0.1)
+
+- **macOS 13.0+ and Apple Silicon only** - Intel Macs not supported
+- **Storage not yet efficient** - Currently 4-5x less efficient than Rewind AI (~50-70GB/month vs ~15GB/month). HEVC encoding is working but not optimized
+- **No audio capture** - Audio recording and transcription infrastructure exists but is disabled for v0.1
+
+See [GitHub Issues](https://github.com/haseab/retrace/issues) for known bugs and feature requests.
 
 ## Privacy & Security
 
@@ -201,6 +230,18 @@ Retrace will be designed ((WORK IN PROGRESS) to run in the background with minim
 - **Encrypted at Rest** - AES-256-GCM encryption for stored data
 - **No Telemetry** - No data sent to external servers
 - **Open Source** - Audit the code yourself
+
+## Dependencies
+
+Retrace uses minimal external dependencies:
+
+- **[swift-sqlcipher](https://github.com/skiptools/swift-sqlcipher)** - SQLite with encryption for Rewind database import
+- **[Sparkle](https://github.com/sparkle-project/Sparkle)** - Auto-update framework
+- **Apple Frameworks**: CoreGraphics, Vision, AppKit, SwiftUI, VideoToolbox, CryptoKit
+
+Future releases will add:
+- **whisper.cpp** (bundled in Vendors/) - Local audio transcription
+- **llama.cpp** (bundled in Vendors/) - Local embeddings for semantic search
 
 ## Contributing
 
@@ -213,7 +254,7 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for gu
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Attribution
 
@@ -225,8 +266,8 @@ Created with ♥ by [@haseab](https://github.com/haseab)
 ## Acknowledgments
 
 - Inspired by [Rewind AI](https://www.rewind.ai/)
-- (WORK IN PROGRESS) Audio will be Built with [whisper.cpp](https://github.com/ggerganov/whisper.cpp) by @ggerganov
-- (WORK IN PROGRESS) Embeddings will be Built with [llama.cpp](https://github.com/ggerganov/llama.cpp) by @ggerganov
+- Future audio transcription will use [whisper.cpp](https://github.com/ggerganov/whisper.cpp) by @ggerganov
+- Future semantic search will use [llama.cpp](https://github.com/ggerganov/llama.cpp) by @ggerganov
 
 ---
 

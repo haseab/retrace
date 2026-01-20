@@ -786,25 +786,11 @@ struct FloatingDateSearchPanel: View {
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
 
-    private let suggestions = [
-        ("30 min ago", "clock.arrow.circlepath"),
-        ("yesterday", "calendar"),
-        ("last week", "calendar.badge.clock")
-    ]
-
-    private var helperText: String {
-        if enableFrameIDSearch {
-            return "Enter a frame # or date like \"2 hours ago\""
-        } else {
-            return "Try natural phrases like \"2 hours ago\" or \"Dec 15 3pm\""
-        }
-    }
-
     private var placeholderText: String {
         if enableFrameIDSearch {
-            return "Enter frame # or date..."
+            return "e.g. 8 minutes ago"
         } else {
-            return "Enter a date or time..."
+            return "e.g. 8 minutes ago"
         }
     }
 
@@ -888,21 +874,6 @@ struct FloatingDateSearchPanel: View {
             )
             .padding(.horizontal, 20)
 
-            // Quick suggestions
-            HStack(spacing: 8) {
-                ForEach(suggestions, id: \.0) { suggestion in
-                    SuggestionChip(
-                        text: suggestion.0,
-                        icon: suggestion.1
-                    ) {
-                        text = suggestion.0
-                        onSubmit()
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-
             // Calendar button
             Button(action: {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
@@ -941,14 +912,8 @@ struct FloatingDateSearchPanel: View {
                 if hovering { NSCursor.pointingHand.push() }
                 else { NSCursor.pop() }
             }
-
-            // Helper text
-            Text(helperText)
-                .font(.retraceCaption2)
-                .foregroundColor(.white.opacity(0.35))
-                .padding(.top, 10)
-                .padding(.bottom, 16)
         }
+        .padding(.bottom, 16)
         .frame(width: TimelineScaleFactor.searchPanelWidth)
         .background(
             ZStack {
@@ -1057,13 +1022,11 @@ struct CalendarPickerView: View {
             Rectangle()
                 .fill(Color.white.opacity(0.1))
                 .frame(width: 1)
-                .padding(.vertical, 12)
+                .padding(.vertical, 20)
 
-            // Right side: Time list
+            // Right side: Time grid (3 columns)
             timeListView
-                .frame(width: 90 * TimelineScaleFactor.current)
         }
-        .frame(height: TimelineScaleFactor.calendarPickerHeight)
         .background(
             ZStack {
                 RoundedRectangle(cornerRadius: 20)
@@ -1195,35 +1158,42 @@ struct CalendarPickerView: View {
             // Spacer to align with calendar title area
             Color.clear.frame(height: 40)
 
-            // Time list scroll area - always show 00:00 to 23:00
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(spacing: 2) {
-                    ForEach(0..<24, id: \.self) { hour in
-                        let hasFrames = hourHasFrames(hour)
-                        TimeSlotButton(
-                            hourValue: hour,
-                            hasFrames: hasFrames,
-                            selectedDate: viewModel.selectedCalendarDate
-                        ) {
-                            if hasFrames, let selectedDate = viewModel.selectedCalendarDate {
-                                let cal = Calendar.current
-                                var components = cal.dateComponents([.year, .month, .day], from: selectedDate)
-                                components.hour = hour
-                                components.minute = 0
-                                if let targetDate = cal.date(from: components) {
-                                    Task {
-                                        await viewModel.navigateToHour(targetDate)
-                                    }
+            // Time grid - show all 24 hours in a 3-column grid with proper spacing
+            LazyVGrid(
+                columns: [
+                    GridItem(.fixed(58), spacing: 6),
+                    GridItem(.fixed(58), spacing: 6),
+                    GridItem(.fixed(58), spacing: 6)
+                ],
+                spacing: 6
+            ) {
+                ForEach(0..<24, id: \.self) { hour in
+                    let hasFrames = hourHasFrames(hour)
+                    TimeSlotButton(
+                        hourValue: hour,
+                        hasFrames: hasFrames,
+                        selectedDate: viewModel.selectedCalendarDate
+                    ) {
+                        if hasFrames, let selectedDate = viewModel.selectedCalendarDate {
+                            let cal = Calendar.current
+                            var components = cal.dateComponents([.year, .month, .day], from: selectedDate)
+                            components.hour = hour
+                            components.minute = 0
+                            if let targetDate = cal.date(from: components) {
+                                Task {
+                                    await viewModel.navigateToHour(targetDate)
                                 }
                             }
                         }
                     }
+                    .frame(width: 58)
                 }
-                .padding(.horizontal, 6)
-                .padding(.vertical, 8)
             }
-            .frame(maxHeight: .infinity)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .frame(maxHeight: .infinity, alignment: .top)
         }
+        .frame(width: 210)
         .clipped()
     }
 
@@ -1503,6 +1473,7 @@ class FocusableTextField: NSTextField {
         return super.performKeyEquivalent(with: event)
     }
 }
+
 
 // MARK: - Preview
 

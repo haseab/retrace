@@ -2,6 +2,8 @@
 
 You are responsible for the **Storage** module of Retrace. Your job is to implement file storage operations including video segment writing, encryption/decryption, and disk space management.
 
+**v0.1 Status**: ✅ HEVC encoding working with VideoToolbox hardware acceleration. **Not yet optimized** - currently using ~50-70GB/month vs target of ~15-20GB/month. **Apple Silicon required** for hardware HEVC encoding. No audio segment storage in v0.1.
+
 ## Your Directory
 
 ```

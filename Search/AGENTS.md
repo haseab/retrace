@@ -1,6 +1,8 @@
 # SEARCH Agent Instructions
 
-You are responsible for the **Search** module of Retrace. Your job is to implement search functionality including query parsing, full-text search via SQLite FTS5, result ranking, and optional semantic search with embeddings.
+You are responsible for the **Search** module of Retrace. Your job is to implement search functionality including query parsing, full-text search via SQLite FTS5, and result ranking.
+
+**v0.1 Status**: ✅ Full-text search with FTS5 fully implemented. Query parser supports filters (app:, date:, -exclude). **No vector/semantic search in v0.1** (planned for v0.2+ with llama.cpp embeddings).
 
 ## Your Directory
 
@@ -14,10 +16,9 @@ Search/
 ├── Ranking/
 │   ├── ResultRanker.swift         # Rank and sort results
 │   └── SnippetGenerator.swift     # Generate highlighted snippets
-├── Semantic/
-│   ├── EmbeddingManager.swift     # EmbeddingProtocol implementation
-│   ├── VectorStore.swift          # VectorStoreProtocol implementation
-│   └── CoreMLEmbedder.swift       # CoreML model wrapper
+├── VectorSearchTODO/              # NOT IMPLEMENTED IN v0.1 (future)
+│   ├── Embedding/
+│   └── VectorStore/
 └── Tests/
     ├── QueryParserTests.swift
     ├── SearchManagerTests.swift
@@ -27,22 +28,15 @@ Search/
 ## Protocols You Must Implement
 
 ### 1. `SearchProtocol` (from `Shared/Protocols/SearchProtocol.swift`)
-- Full-text search
-- Semantic search (optional)
-- Indexing
-- Statistics
+- Full-text search via FTS5
+- Indexing text content
+- Search statistics
 
-### 2. `EmbeddingProtocol` (from `Shared/Protocols/SearchProtocol.swift`)
-- Model loading
-- Text embedding generation
-
-### 3. `VectorStoreProtocol` (from `Shared/Protocols/SearchProtocol.swift`)
-- Vector storage
-- Nearest neighbor search
-
-### 4. `QueryParserProtocol` (from `Shared/Protocols/SearchProtocol.swift`)
+### 2. `QueryParserProtocol` (from `Shared/Protocols/SearchProtocol.swift`)
 - Parse query syntax
-- Extract filters
+- Extract filters (app:, date:, -exclude)
+
+**Note**: EmbeddingProtocol and VectorStoreProtocol exist but are NOT implemented in v0.1. Semantic/vector search is planned for v0.2+.
 
 ## Key Implementation Details
 

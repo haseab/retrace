@@ -133,24 +133,29 @@ public struct SettingsView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header with back button
-            Button(action: {
-                NotificationCenter.default.post(name: .openDashboard, object: nil)
-            }) {
-                HStack(spacing: 10) {
+            // Header with separate back button
+            HStack(spacing: 12) {
+                // Back button - distinct and easy to click
+                Button(action: {
+                    NotificationCenter.default.post(name: .openDashboard, object: nil)
+                }) {
                     Image(systemName: "chevron.left")
-                        .font(.retraceCaption2Bold)
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(.retraceSecondary)
-
-                    Text("Settings")
-                        .font(.retraceTitle3)
-                        .foregroundColor(.retracePrimary)
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 24)
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+
+                Text("Settings")
+                    .font(.retraceTitle3)
+                    .foregroundColor(.retracePrimary)
             }
-            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 24)
 
             // Navigation items
             VStack(spacing: 4) {

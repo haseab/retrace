@@ -2,7 +2,9 @@
 
 > **Standard**: This file follows the [AGENTS.md](https://agents.md) specification - a vendor-agnostic standard for AI agent guidance. For human-readable project information, see [README.md](README.md).
 
-Retrace is a local-first screen recording and search application for macOS, inspired by Rewind AI. It captures screens, extracts text via OCR, and makes everything searchable—all on-device with encryption.
+Retrace is a local-first screen recording and search application for macOS, inspired by Rewind AI. It captures screens, extracts text via OCR, and makes everything searchable—all locally on-device.
+
+**v0.1 Status**: Core screen capture (CGWindowListCapture), OCR (Vision), full-text search (FTS5), HEVC encoding, and Rewind import are working. Audio transcription and vector search are planned for future releases.
 
 ---
 
@@ -85,7 +87,7 @@ retrace/
 │   ├── VideoEncoder/
 │   └── Tests/
 │
-├── Capture/                     # ScreenCaptureKit integration
+├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
 │   ├── ScreenCapture/
@@ -110,8 +112,8 @@ retrace/
 │   ├── MigrationManager.swift
 │   └── Importers/
 │
-├── App/                         # Main application (future)
-└── UI/                          # SwiftUI interface (future)
+├── App/                         # Main application coordinator
+└── UI/                          # SwiftUI interface
     └── AGENTS.md
 ```
 
@@ -122,12 +124,12 @@ retrace/
 | Module | Directory | Agent File | Responsibility |
 |--------|-----------|------------|----------------|
 | **DATABASE** | `Database/` | `Database/AGENTS.md` | SQLite schema, FTS5, CRUD operations, migrations |
-| **STORAGE** | `Storage/` | `Storage/AGENTS.md` | File I/O, HEVC video segments, encryption (AES-256-GCM) |
-| **CAPTURE** | `Capture/` | `Capture/AGENTS.md` | ScreenCaptureKit integration, frame deduplication |
-| **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API text extraction |
-| **SEARCH** | `Search/` | `Search/AGENTS.md` | Query parsing, FTS queries, result ranking |
-| **MIGRATION** | `Migration/` | `Migration/AGENTS.md` | Import from Rewind AI, ScreenMemory, etc. |
-| **UI** | `UI/` | `UI/AGENTS.md` | SwiftUI interface (planned) |
+| **STORAGE** | `Storage/` | `Storage/AGENTS.md` | File I/O, HEVC video encoding (working, not optimized), encryption |
+| **CAPTURE** | `Capture/` | `Capture/AGENTS.md` | CGWindowListCapture API, frame deduplication, metadata extraction |
+| **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (v0.1: no audio transcription) |
+| **SEARCH** | `Search/` | `Search/AGENTS.md` | Query parsing, FTS5 queries, result ranking (v0.1: no vector search) |
+| **MIGRATION** | `Migration/` | `Migration/AGENTS.md` | Import from Rewind AI (v0.1: Rewind only, others planned) |
+| **UI** | `UI/` | `UI/AGENTS.md` | SwiftUI interface (timeline, dashboard, settings, search) |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.
 
@@ -352,30 +354,29 @@ open test_report.html
 
 ```
 CAPTURE Module:
-  Input:  ScreenCaptureKit API
-  Output: CGImage + AppInfo metadata
+  Input:  CGWindowListCapture API (every 2 seconds)
+  Output: CGImage + AppInfo metadata → deduplication (~95% filtered)
 
 STORAGE Module (Video Path):
-  Input:  CGImage stream (150 frames)
-  Output: .mp4 file → ~/Library/.../videos/{YYYYMM}/{DD}/{xid}.mp4
+  Input:  CGImage stream
+  Output: .mp4 file (HEVC encoded) → ~/Library/Application Support/Retrace/videos/
 
 PROCESSING Module (OCR Path):
   Input:  CGImage
-  Output: OCRRegion[] with bounds + text
+  Output: ExtractedText with OCRRegion[] (bounds + text)
 
 DATABASE Module:
-  Input:  AppInfo + OCRRegion[] + Video metadata
-  Output: 6 tables written:
-    • segment (app session)
-    • frame (screenshot timestamp + links)
-    • node (OCR bounding boxes, 10-100 per frame)
-    • searchRanking_content (FTS5 index)
-    • doc_segment (FTS → frame link)
+  Input:  AppInfo + ExtractedText + Video metadata
+  Output: Core tables:
+    • segment (app/window context)
+    • frame (screenshot metadata)
+    • searchRanking (FTS5 full-text index)
+    • doc_segment (linking table)
     • video (file metadata)
 
 SEARCH Module:
-  Input:  Query string
-  Output: SearchResult[] with frameId + snippet
+  Input:  Query string (with filters: app:, date:, -exclude)
+  Output: SearchResult[] with frameId + snippet + highlighting
 ```
 
 ### Database Relationships
@@ -418,23 +419,24 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 | Component | Technology | Notes |
 |-----------|------------|-------|
 | Language | Swift 5.9+ | Actors, async/await, Sendable required |
-| UI Framework | SwiftUI | Planned for future |
-| Screen Capture | ScreenCaptureKit | macOS 13.0+ required |
-| Video Encoding | VideoToolbox (HEVC) | Hardware encoding on Apple Silicon |
+| UI Framework | SwiftUI | Fully implemented in v0.1 |
+| Screen Capture | CGWindowListCapture | Legacy API, no privacy indicator |
+| Video Encoding | VideoToolbox (HEVC) | Hardware encoding on Apple Silicon (working, not optimized) |
 | OCR | Vision framework | macOS native OCR |
 | Database | SQLite + FTS5 | Full-text search built-in |
-| Encryption | CryptoKit (AES-256-GCM) | On-device encryption |
-| Embeddings | CoreML | Optional semantic search |
+| Encryption | CryptoKit (AES-256-GCM) | Optional on-device encryption |
+| Audio Transcription | whisper.cpp | Planned for v0.2+ (bundled but disabled) |
+| Vector Search | llama.cpp | Planned for v0.2+ (prepared but not active) |
 
 ---
 
 ## System Requirements
 
-- **macOS**: 13.0+ (Ventura) for ScreenCaptureKit improvements
-- **Hardware**: Apple Silicon recommended for hardware encoding/Neural Engine
-- **Entitlements**:
-  - `com.apple.security.device.screen-recording`
-  - Accessibility permission (runtime request)
+- **macOS**: 13.0+ (Ventura or later)
+- **Hardware**: **Apple Silicon required** (M1/M2/M3) - Intel not supported
+- **Permissions**:
+  - Screen Recording permission (required)
+  - Accessibility permission (required for app context extraction)
 
 ---
 

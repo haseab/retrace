@@ -521,7 +521,7 @@ public class TimelineWindowController: NSObject {
     }
 
     private func handleMagnifyEvent(_ event: NSEvent) {
-        guard isVisible, let viewModel = timelineViewModel else { return }
+        guard isVisible, let viewModel = timelineViewModel, let window = window else { return }
 
         // Don't handle magnify when zoom region or search overlay is active
         if viewModel.isZoomRegionActive || viewModel.isSearchOverlayVisible {
@@ -533,8 +533,18 @@ public class TimelineWindowController: NSObject {
         let magnification = event.magnification
         let scaleFactor = 1.0 + magnification
 
-        // Apply the magnification to the view model
-        viewModel.applyMagnification(scaleFactor)
+        // Get mouse location in window coordinates and convert to normalized anchor point
+        let mouseLocation = event.locationInWindow
+        let windowSize = window.frame.size
+
+        // Convert to normalized coordinates (0-1 range, with 0.5,0.5 being center)
+        // Note: macOS window coordinates have Y=0 at bottom, so we flip Y
+        let normalizedX = mouseLocation.x / windowSize.width
+        let normalizedY = 1.0 - (mouseLocation.y / windowSize.height)
+        let anchor = CGPoint(x: normalizedX, y: normalizedY)
+
+        // Apply the magnification with anchor point
+        viewModel.applyMagnification(scaleFactor, anchor: anchor, frameSize: windowSize)
     }
 
     // MARK: - Key Code Mapping

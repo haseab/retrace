@@ -2,6 +2,8 @@
 
 You are the **UI** agent responsible for building the SwiftUI interface for Retrace.
 
+**v0.1 Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, and feedback views all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. **Apple Silicon required**. Audio transcription UI not implemented (planned for v0.2+).
+
 ## Your Directory
 
 ```

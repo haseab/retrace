@@ -938,6 +938,9 @@ public struct TimelineScaleFactor {
     /// Control button size
     public static var controlButtonSize: CGFloat { 32 * current }
 
+    /// Close button size (top-right X button)
+    public static var closeButtonSize: CGFloat { 38 * current }
+
     /// Zoom slider width
     public static var zoomSliderWidth: CGFloat { 100 * current }
 

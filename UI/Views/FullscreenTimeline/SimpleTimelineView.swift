@@ -68,6 +68,33 @@ public struct SimpleTimelineView: View {
                 .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
+                // Dismiss overlay for date search panel (Cmd+G) - clicking outside closes it
+                // Must be BEFORE TimelineTapeView in ZStack so it's behind the panel
+                if viewModel.isDateSearchActive && !viewModel.isCalendarPickerVisible {
+                    Color.black.opacity(0.001) // Nearly invisible but captures taps
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
+                                viewModel.isDateSearchActive = false
+                                viewModel.dateSearchText = ""
+                            }
+                        }
+                }
+
+                // Dismiss overlay for calendar picker - clicking outside closes it
+                // Must be BEFORE TimelineTapeView in ZStack so it's behind the picker
+                if viewModel.isCalendarPickerVisible {
+                    Color.black.opacity(0.001) // Nearly invisible but captures taps
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
+                                viewModel.isCalendarPickerVisible = false
+                                viewModel.hoursWithFrames = []
+                                viewModel.selectedCalendarDate = nil
+                            }
+                        }
+                }
+
                 // Timeline tape overlay at bottom
                 VStack {
                     Spacer()
@@ -89,6 +116,13 @@ public struct SimpleTimelineView: View {
                         }
 
                         Spacer()
+
+                        // Reset zoom button (appears when frame is zoomed)
+                        if viewModel.isFrameZoomed {
+                            ResetZoomButton(viewModel: viewModel)
+                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        }
+
                         closeButton
                     }
                     Spacer()
@@ -96,6 +130,7 @@ public struct SimpleTimelineView: View {
                 .padding(.spacingL)
                 .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
+                .animation(.easeInOut(duration: 0.2), value: viewModel.isFrameZoomed)
 
 
                 // Loading overlay
@@ -151,6 +186,9 @@ public struct SimpleTimelineView: View {
                         containerSize: geometry.size,
                         actualFrameRect: actualFrameRect
                     )
+                    // Apply the same zoom transformations as the frame content
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
                 }
 
                 // Text selection hint toast (top center)
@@ -242,10 +280,17 @@ public struct SimpleTimelineView: View {
     private var closeButton: some View {
         Button(action: onClose) {
             Image(systemName: "xmark.circle.fill")
-                .font(.retraceTitle)
+                .font(.system(size: TimelineScaleFactor.closeButtonSize))
                 .foregroundColor(.white.opacity(0.6))
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     // MARK: - Loading Overlay
@@ -326,6 +371,50 @@ public struct SimpleTimelineView: View {
             RoundedRectangle(cornerRadius: .cornerRadiusM)
                 .fill(Color.black.opacity(0.8))
         )
+    }
+}
+
+// MARK: - Reset Zoom Button
+
+/// Floating button that appears when the frame is zoomed, allowing quick reset to 100%
+struct ResetZoomButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        Button(action: {
+            viewModel.resetFrameZoom()
+        }) {
+            HStack(spacing: 10 * scale) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 18 * scale, weight: .semibold))
+                Text("Reset Zoom")
+                    .font(.system(size: 17 * scale, weight: .medium))
+            }
+            .foregroundColor(isHovering ? .white : .white.opacity(0.8))
+            .padding(.horizontal, 20 * scale)
+            .padding(.vertical, 12 * scale)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(isHovering ? 0.7 : 0.5))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .help("Reset zoom to 100% (Cmd+0)")
     }
 }
 
@@ -525,6 +614,9 @@ struct FrameWithURLOverlay<Content: View>: View {
                             containerSize: geometry.size,
                             actualFrameRect: actualFrameRect
                         )
+                        // Apply the same zoom transformations as the frame content
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
                     }
 
                     // Text selection overlay (for drag selection and zoom region creation)
@@ -564,6 +656,9 @@ struct FrameWithURLOverlay<Content: View>: View {
                                 viewModel.selectNodeAt(point: point)
                             }
                         )
+                        // Apply the same zoom transformations as the frame content
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
                     }
 
                     // URL bounding box overlay (if URL detected)
@@ -582,6 +677,9 @@ struct FrameWithURLOverlay<Content: View>: View {
                                 onURLClicked()
                             }
                         )
+                        // Apply the same zoom transformations as the frame content
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
                     }
                 }
 
