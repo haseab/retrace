@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Shared
 
 /// Invisible NSView wrapper that captures scroll wheel events
 /// Used to enable trackpad scrolling for timeline navigation
@@ -38,7 +39,7 @@ struct ScrollCaptureView: NSViewRepresentable {
             guard !hasSetupMonitor else { return }
             hasSetupMonitor = true
 
-            print("[ScrollCaptureView] Setting up BOTH local and global event monitors")
+            Log.debug("[ScrollCaptureView] Setting up BOTH local and global event monitors", category: .ui)
 
             // Local monitor - for when our window is key
             self.localMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
@@ -70,7 +71,7 @@ struct ScrollCaptureView: NSViewRepresentable {
         }
 
         deinit {
-            print("[ScrollCaptureView] Coordinator deinit - removing event monitors")
+            Log.debug("[ScrollCaptureView] Coordinator deinit - removing event monitors", category: .ui)
             if let monitor = localMonitor {
                 NSEvent.removeMonitor(monitor)
             }

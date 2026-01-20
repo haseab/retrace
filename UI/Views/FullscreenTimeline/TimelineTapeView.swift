@@ -14,7 +14,7 @@ public struct TimelineTapeView: View {
     let width: CGFloat
 
     // Tape dimensions
-    private let tapeHeight: CGFloat = 30
+    private let tapeHeight: CGFloat = 42
     private let blockSpacing: CGFloat = 2
     private var pixelsPerFrame: CGFloat { viewModel.pixelsPerFrame }
 
@@ -102,7 +102,7 @@ public struct TimelineTapeView: View {
             // App icon (only show if block is wide enough)
             if blockWidth > 40, let bundleID = block.bundleID {
                 appIcon(for: bundleID)
-                    .frame(width: 22, height: 22)
+                    .frame(width: 30, height: 30)
                     .allowsHitTesting(false) // Allow clicks to pass through to frame segments
             }
         }
@@ -116,12 +116,12 @@ public struct TimelineTapeView: View {
         return Rectangle()
             .fill(Color.clear)
             .frame(width: pixelsPerFrame, height: tapeHeight)
-            .overlay(
-                // Selection highlight
-                isSelected ? RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.retraceAccent.opacity(0.4))
-                    .padding(2) : nil
-            )
+            // .overlay(
+            //     // Selection highlight
+            //     isSelected ? RoundedRectangle(cornerRadius: 2)
+            //         .fill(Color.retraceAccent.opacity(0.4))
+            //         .padding(2) : nil
+            // )
             .contentShape(Rectangle())
             .onTapGesture {
                 viewModel.selectFrame(at: frameIndex)
@@ -210,15 +210,15 @@ public struct TimelineTapeView: View {
                 }) {
                     HStack(spacing: 8) {
                         Text(viewModel.currentDateString)
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.retraceCaptionMedium)
                             .foregroundColor(.white.opacity(0.7))
 
                         Text(viewModel.currentTimeString)
-                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .font(.retraceMono)
                             .foregroundColor(.white)
 
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.retraceTinyBold)
                             .foregroundColor(.white.opacity(0.4))
                     }
                     .padding(.horizontal, 16)
@@ -242,6 +242,13 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: centerX, y: -55)
 
+                // Left side controls (hide UI + search)
+                HStack(spacing: 12) {
+                    ControlsToggleButton(viewModel: viewModel)
+                    SearchButton(viewModel: viewModel)
+                }
+                .position(x: 120, y: -55)
+
                 // Right side controls (zoom + more options)
                 HStack(spacing: 12) {
                     ZoomControl(viewModel: viewModel)
@@ -250,13 +257,13 @@ public struct TimelineTapeView: View {
                 .position(x: geometry.size.width - 100, y: -55)
 
                 // Playhead vertical line (fixed at center)
-                Rectangle()
+                UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3)
                     .fill(Color.white)
-                    .frame(width: 3, height: tapeHeight * 2.5)
+                    .frame(width: 6, height: tapeHeight * 2.5)
                     .position(x: centerX, y: tapeHeight / 2)
 
                 // Floating search input (appears above the datetime button when active)
-                if viewModel.isDateSearchActive {
+                if viewModel.isDateSearchActive && !viewModel.isCalendarPickerVisible {
                     FloatingDateSearchPanel(
                         text: $viewModel.dateSearchText,
                         onSubmit: {
@@ -267,13 +274,25 @@ public struct TimelineTapeView: View {
                         onCancel: {
                             viewModel.isDateSearchActive = false
                             viewModel.dateSearchText = ""
-                        }
+                        },
+                        enableFrameIDSearch: viewModel.enableFrameIDSearch,
+                        viewModel: viewModel
                     )
                     .position(x: centerX, y: -175)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
                         removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
                     ))
+                }
+
+                // Calendar picker (appears when calendar button is clicked)
+                if viewModel.isCalendarPickerVisible {
+                    CalendarPickerView(viewModel: viewModel)
+                        .position(x: centerX, y: -280)
+                        .transition(.asymmetric(
+                            insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
+                            removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
+                        ))
                 }
             }
         }
@@ -293,7 +312,7 @@ struct ZoomControl: View {
             // Zoom out icon (when expanded)
             if viewModel.isZoomSliderExpanded {
                 Image(systemName: "minus.magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.white.opacity(0.5))
                     .transition(.opacity.combined(with: .scale))
             }
@@ -308,7 +327,7 @@ struct ZoomControl: View {
             // Zoom in icon (when expanded)
             if viewModel.isZoomSliderExpanded {
                 Image(systemName: "plus.magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.white.opacity(0.5))
                     .transition(.opacity.combined(with: .scale))
             }
@@ -320,7 +339,7 @@ struct ZoomControl: View {
                 }
             }) {
                 Image(systemName: "plus.magnifyingglass")
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.retraceCalloutMedium)
                     .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
                     .frame(width: 32, height: 32)
                     .background(
@@ -357,6 +376,40 @@ struct ZoomControl: View {
     }
 }
 
+// MARK: - Controls Toggle Button
+
+/// Button to toggle timeline controls visibility
+struct ControlsToggleButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.toggleControlsVisibility()
+        }) {
+            Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
+                .font(.retraceCalloutMedium)
+                .foregroundColor(isHovering ? .white : .white.opacity(0.6))
+                .frame(width: 32, height: 32)
+                .background(
+                    Circle()
+                        .fill(Color(white: 0.15))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .help(viewModel.areControlsHidden ? "Show Controls (Cmd+.)" : "Hide Controls (Cmd+.)")
+    }
+}
+
 // MARK: - Search Button
 
 /// Search button styled as an input field that opens the spotlight search overlay
@@ -382,11 +435,11 @@ struct SearchButton: View {
         }) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.retraceCaptionMedium)
                     .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.9) : .white.opacity(0.5)))
 
                 Text(displayText)
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
                     .foregroundColor(hasSearchQuery ? .white.opacity(0.9) : (isHovering ? .white.opacity(0.8) : .white.opacity(0.4)))
                     .lineLimit(1)
 
@@ -394,7 +447,7 @@ struct SearchButton: View {
 
                 // Keyboard shortcut hint
                 Text("⌘K")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
@@ -436,7 +489,7 @@ struct MoreOptionsMenu: View {
     var body: some View {
         Button(action: { showMenu.toggle() }) {
             Image(systemName: "ellipsis")
-                .font(.system(size: 14, weight: .medium))
+                .font(.retraceCalloutMedium)
                 .foregroundColor(isHovering || showMenu ? .white : .white.opacity(0.6))
                 .frame(width: 32, height: 32)
                 .background(
@@ -559,27 +612,45 @@ struct MoreOptionsPopoverContent: View {
             return
         }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
-        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-        if !FileManager.default.fileExists(atPath: symlinkPath) {
-            do {
-                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
-            } catch {
+        // Check if file exists (try both with and without .mp4 extension)
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
                 completion(nil)
                 return
             }
         }
 
-        let url = URL(fileURLWithPath: symlinkPath)
+        // Determine the URL to use - if file already has .mp4 extension, use directly
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    completion(nil)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
 
-        let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
+        // Use integer arithmetic to avoid floating point precision issues
+        let time = videoInfo.frameTimeCMTime
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
@@ -615,19 +686,19 @@ struct MenuRow: View {
         Button(action: action) {
             HStack(spacing: 10) {
                 Image(systemName: icon)
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
                     .foregroundColor(.white.opacity(0.7))
                     .frame(width: 18)
 
                 Text(title)
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
                     .foregroundColor(.white)
 
                 Spacer()
 
                 if let shortcut = shortcut {
                     Text(shortcut)
-                        .font(.system(size: 11))
+                        .font(.retraceCaption2)
                         .foregroundColor(.white.opacity(0.4))
                 }
             }
@@ -704,8 +775,11 @@ struct FloatingDateSearchPanel: View {
     @Binding var text: String
     let onSubmit: () -> Void
     let onCancel: () -> Void
+    var enableFrameIDSearch: Bool = false
+    @ObservedObject var viewModel: SimpleTimelineViewModel
 
     @State private var isHovering = false
+    @State private var isCalendarButtonHovering = false
     /// Accumulated position from completed drags
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
@@ -716,24 +790,40 @@ struct FloatingDateSearchPanel: View {
         ("last week", "calendar.badge.clock")
     ]
 
+    private var helperText: String {
+        if enableFrameIDSearch {
+            return "Enter a frame # or date like \"2 hours ago\""
+        } else {
+            return "Try natural phrases like \"2 hours ago\" or \"Dec 15 3pm\""
+        }
+    }
+
+    private var placeholderText: String {
+        if enableFrameIDSearch {
+            return "Enter frame # or date..."
+        } else {
+            return "Enter a date or time..."
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header with title and close button - this is the drag handle
             HStack {
                 Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.retraceTinyBold)
                     .foregroundColor(.white.opacity(0.25))
                     .padding(.trailing, 4)
 
                 Text("Jump to")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.retraceCaptionMedium)
                     .foregroundColor(.white.opacity(0.5))
 
                 Spacer()
 
                 Button(action: onCancel) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(.retraceTinyBold)
                         .foregroundColor(.white.opacity(0.4))
                         .frame(width: 20, height: 20)
                         .background(Color.white.opacity(0.1))
@@ -769,14 +859,15 @@ struct FloatingDateSearchPanel: View {
                 DateSearchField(
                     text: $text,
                     onSubmit: onSubmit,
-                    onCancel: onCancel
+                    onCancel: onCancel,
+                    placeholder: placeholderText
                 )
                 .frame(height: 28)
 
                 if !text.isEmpty {
                     Button(action: { text = "" }) {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 16))
+                            .font(.retraceHeadline)
                             .foregroundColor(.white.opacity(0.35))
                     }
                     .buttonStyle(.plain)
@@ -810,11 +901,50 @@ struct FloatingDateSearchPanel: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
 
+            // Calendar button
+            Button(action: {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    viewModel.isCalendarPickerVisible = true
+                }
+                Task {
+                    await viewModel.loadDatesWithFrames()
+                }
+            }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "calendar")
+                        .font(.retraceCalloutMedium)
+                    Text("Browse Calendar")
+                        .font(.retraceCaptionMedium)
+                }
+                .foregroundColor(isCalendarButtonHovering ? .white : .white.opacity(0.7))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(isCalendarButtonHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(isCalendarButtonHovering ? 0.2 : 0.1), lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    isCalendarButtonHovering = hovering
+                }
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
+
             // Helper text
-            Text("Try natural phrases like \"2 hours ago\" or \"Dec 15 3pm\"")
-                .font(.system(size: 11))
+            Text(helperText)
+                .font(.retraceCaption2)
                 .foregroundColor(.white.opacity(0.35))
-                .padding(.top, 12)
+                .padding(.top, 10)
                 .padding(.bottom, 16)
         }
         .frame(width: 380)
@@ -875,9 +1005,9 @@ struct SuggestionChip: View {
         Button(action: action) {
             HStack(spacing: 5) {
                 Image(systemName: icon)
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.retraceTinyMedium)
                 Text(text)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.retraceCaption2Medium)
             }
             .foregroundColor(isHovering ? .white : .white.opacity(0.6))
             .padding(.horizontal, 10)
@@ -902,6 +1032,361 @@ struct SuggestionChip: View {
     }
 }
 
+// MARK: - Calendar Picker View
+
+/// Calendar picker with month view and time list - similar to Rewind's design
+struct CalendarPickerView: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    @State private var displayedMonth: Date = Date()
+    @GestureState private var dragOffset: CGSize = .zero
+    @State private var panelPosition: CGSize = .zero
+
+    private let calendar = Calendar.current
+    private let weekdaySymbols = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            // Left side: Calendar
+            calendarView
+                .frame(width: 280)
+
+            // Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.1))
+                .frame(width: 1)
+                .padding(.vertical, 12)
+
+            // Right side: Time list
+            timeListView
+                .frame(width: 90)
+        }
+        .frame(height: 340)
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(Color(white: 0.08))
+
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.08), Color.white.opacity(0.02)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.15), Color.white.opacity(0.03)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
+            }
+        )
+        .shadow(color: .black.opacity(0.4), radius: 40, y: 20)
+        .shadow(color: .retraceAccent.opacity(0.1), radius: 60, y: 30)
+        .offset(
+            x: panelPosition.width + dragOffset.width,
+            y: panelPosition.height + dragOffset.height
+        )
+    }
+
+    // MARK: - Calendar View
+
+    private var calendarView: some View {
+        VStack(spacing: 0) {
+            // Title header - "Jump to Date & Time"
+            HStack {
+                Spacer()
+                Text("Jump to Date & Time")
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.white)
+                Spacer()
+            }
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($dragOffset) { value, state, _ in
+                        state = value.translation
+                    }
+                    .onEnded { value in
+                        panelPosition.width += value.translation.width
+                        panelPosition.height += value.translation.height
+                    }
+            )
+            .onHover { hovering in
+                if hovering { NSCursor.openHand.push() }
+                else { NSCursor.pop() }
+            }
+
+            // Month navigation row
+            HStack {
+                // Previous month button
+                Button(action: { changeMonth(by: -1) }) {
+                    Image(systemName: "chevron.left")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+
+                Spacer()
+
+                Text(monthYearString)
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.white.opacity(0.8))
+
+                Spacer()
+
+                // Next month button
+                Button(action: { changeMonth(by: 1) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            // Weekday headers
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbols, id: \.self) { day in
+                    Text(day)
+                        .font(.retraceTinyMedium)
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+
+            // Calendar grid
+            let days = daysInMonth()
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
+                ForEach(days, id: \.self) { day in
+                    dayCell(for: day)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 14)
+        }
+    }
+
+    // MARK: - Time List View
+
+    private var timeListView: some View {
+        VStack(spacing: 0) {
+            // Spacer to align with calendar title area
+            Color.clear.frame(height: 40)
+
+            // Time list scroll area - always show 00:00 to 23:00
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(spacing: 2) {
+                    ForEach(0..<24, id: \.self) { hour in
+                        let hasFrames = hourHasFrames(hour)
+                        TimeSlotButton(
+                            hourValue: hour,
+                            hasFrames: hasFrames,
+                            selectedDate: viewModel.selectedCalendarDate
+                        ) {
+                            if hasFrames, let selectedDate = viewModel.selectedCalendarDate {
+                                let cal = Calendar.current
+                                var components = cal.dateComponents([.year, .month, .day], from: selectedDate)
+                                components.hour = hour
+                                components.minute = 0
+                                if let targetDate = cal.date(from: components) {
+                                    Task {
+                                        await viewModel.navigateToHour(targetDate)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 8)
+            }
+            .frame(maxHeight: .infinity)
+        }
+        .clipped()
+    }
+
+    /// Check if a specific hour has frames for the selected date
+    private func hourHasFrames(_ hour: Int) -> Bool {
+        guard viewModel.selectedCalendarDate != nil else { return false }
+        let cal = Calendar.current
+        return viewModel.hoursWithFrames.contains { date in
+            cal.component(.hour, from: date) == hour
+        }
+    }
+
+    // MARK: - Day Cell
+
+    private func dayCell(for day: Date?) -> some View {
+        Group {
+            if let day = day {
+                let isToday = calendar.isDateInToday(day)
+                let isSelected = viewModel.selectedCalendarDate.map { calendar.isDate($0, inSameDayAs: day) } ?? false
+                let hasFrames = dateHasFrames(day)
+                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
+
+                Button(action: {
+                    if hasFrames {
+                        Task {
+                            await viewModel.loadHoursForDate(day)
+                        }
+                    }
+                }) {
+                    Text("\(calendar.component(.day, from: day))")
+                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
+                        .foregroundColor(
+                            hasFrames
+                                ? (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.9 : 0.4))
+                                : .white.opacity(isCurrentMonth ? 0.25 : 0.1)
+                        )
+                        .frame(width: 32, height: 32)
+                        .background(
+                            ZStack {
+                                if isSelected {
+                                    Circle()
+                                        .fill(Color.retraceAccent)
+                                } else if isToday {
+                                    Circle()
+                                        .stroke(Color.retraceAccent, lineWidth: 1.5)
+                                }
+                            }
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!hasFrames)
+                .onHover { h in
+                    if hasFrames {
+                        if h { NSCursor.pointingHand.push() }
+                        else { NSCursor.pop() }
+                    }
+                }
+            } else {
+                Color.clear
+                    .frame(width: 32, height: 32)
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private var monthYearString: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM yyyy"
+        return formatter.string(from: displayedMonth)
+    }
+
+    private func changeMonth(by value: Int) {
+        if let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                displayedMonth = newMonth
+            }
+        }
+    }
+
+    private func daysInMonth() -> [Date?] {
+        var days: [Date?] = []
+
+        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
+              let monthFirstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
+            return days
+        }
+
+        // Start from the first day of the week containing the first day of the month
+        var currentDate = monthFirstWeek.start
+
+        // Generate 6 weeks (42 days) to fill the grid
+        for _ in 0..<42 {
+            if calendar.isDate(currentDate, equalTo: displayedMonth, toGranularity: .month) {
+                days.append(currentDate)
+            } else if currentDate < monthInterval.start {
+                // Previous month days
+                days.append(currentDate)
+            } else if days.count < 35 || days.suffix(7).contains(where: { $0 != nil && calendar.isDate($0!, equalTo: displayedMonth, toGranularity: .month) }) {
+                // Next month days (only if needed)
+                days.append(currentDate)
+            } else {
+                days.append(nil)
+            }
+
+            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
+        }
+
+        return days
+    }
+
+    private func dateHasFrames(_ date: Date) -> Bool {
+        let startOfDay = calendar.startOfDay(for: date)
+        return viewModel.datesWithFrames.contains(startOfDay)
+    }
+}
+
+// MARK: - Time Slot Button
+
+struct TimeSlotButton: View {
+    let hourValue: Int
+    let hasFrames: Bool
+    let selectedDate: Date?
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    private var timeString: String {
+        String(format: "%02d:00", hourValue)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(timeString)
+                .font(.retraceMono)
+                .foregroundColor(
+                    hasFrames
+                        ? (isHovering ? .white : .white.opacity(0.9))
+                        : .white.opacity(0.25)
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(
+                            hasFrames
+                                ? (isHovering ? Color.retraceAccent : Color.white.opacity(0.1))
+                                : Color.clear
+                        )
+                )
+        }
+        .buttonStyle(.plain)
+        .disabled(!hasFrames)
+        .onHover { hovering in
+            if hasFrames {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    isHovering = hovering
+                }
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
+        }
+    }
+}
+
 // MARK: - Date Search Field
 
 /// Custom text field for date searching with auto-focus
@@ -909,12 +1394,13 @@ struct DateSearchField: NSViewRepresentable {
     @Binding var text: String
     let onSubmit: () -> Void
     let onCancel: () -> Void
+    var placeholder: String = "Enter a date or time..."
 
     func makeNSView(context: Context) -> FocusableTextField {
         let textField = FocusableTextField()
-        textField.placeholderString = "Enter a date or time..."
+        textField.placeholderString = placeholder
         textField.placeholderAttributedString = NSAttributedString(
-            string: "Enter a date or time...",
+            string: placeholder,
             attributes: [
                 .foregroundColor: NSColor.white.withAlphaComponent(0.35),
                 .font: NSFont.systemFont(ofSize: 16, weight: .regular)

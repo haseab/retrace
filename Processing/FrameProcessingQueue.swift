@@ -4,10 +4,6 @@ import Database
 import Storage
 import Search
 import AppKit
-import SQLCipher
-
-// SQLITE_TRANSIENT constant for Swift
-let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 /// Asynchronous frame processing queue with SQLite-backed durability
 ///
@@ -54,32 +50,8 @@ public actor FrameProcessingQueue {
 
     /// Enqueue a frame for processing
     public func enqueue(frameID: Int64, priority: Int = 0) async throws {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        let sql = """
-            INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
-            VALUES (?, ?, ?, 0);
-        """
-
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare enqueue statement")
-        }
-
-        sqlite3_bind_int64(stmt, 1, frameID)
-        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-        sqlite3_bind_int(stmt, 3, Int32(priority))
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryExecutionFailed("Failed to enqueue frame")
-        }
-
+        try await databaseManager.enqueueFrameForProcessing(frameID: frameID, priority: priority)
         currentQueueDepth += 1
-
         Log.debug("[Queue] Enqueued frame \(frameID), depth: \(currentQueueDepth)", category: .processing)
     }
 
@@ -92,69 +64,16 @@ public actor FrameProcessingQueue {
 
     /// Dequeue the next frame for processing
     private func dequeue() async throws -> QueuedFrame? {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        // Get highest priority item
-        let sql = """
-            SELECT id, frameId, retryCount
-            FROM processing_queue
-            ORDER BY priority DESC, enqueuedAt ASC
-            LIMIT 1;
-        """
-
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare dequeue statement")
-        }
-
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
+        guard let result = try await databaseManager.dequeueFrameForProcessing() else {
             return nil // Queue empty
         }
-
-        let queueID = sqlite3_column_int64(stmt, 0)
-        let frameID = sqlite3_column_int64(stmt, 1)
-        let retryCount = Int(sqlite3_column_int(stmt, 2))
-
-        // Delete from queue
-        let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
-        var deleteStmt: OpaquePointer?
-        defer { sqlite3_finalize(deleteStmt) }
-
-        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare delete statement")
-        }
-
-        sqlite3_bind_int64(deleteStmt, 1, queueID)
-
-        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
-            throw DatabaseError.queryExecutionFailed("Failed to delete from queue")
-        }
-
         currentQueueDepth -= 1
-
-        return QueuedFrame(queueID: queueID, frameID: frameID, retryCount: retryCount)
+        return QueuedFrame(queueID: result.queueID, frameID: result.frameID, retryCount: result.retryCount)
     }
 
     /// Get current queue depth
     public func getQueueDepth() async throws -> Int {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        let sql = "SELECT COUNT(*) FROM processing_queue;"
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
-              sqlite3_step(stmt) == SQLITE_ROW else {
-            throw DatabaseError.queryExecutionFailed("Failed to get queue depth")
-        }
-
-        return Int(sqlite3_column_int(stmt, 0))
+        return try await databaseManager.getProcessingQueueDepth()
     }
 
     // MARK: - Worker Pool
@@ -199,7 +118,17 @@ public actor FrameProcessingQueue {
     private func runWorker(id: Int) async {
         Log.debug("[Queue] Worker \(id) started", category: .processing)
 
+        // Initial delay to ensure database is fully stable
+        // This prevents race conditions on first launch after onboarding
+        try? await Task.sleep(nanoseconds: 500_000_000) // 500ms - increased for stability
+
         while isRunning {
+            // Wait for database to be ready before attempting any operations
+            guard await databaseManager.isReady() else {
+                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                continue
+            }
+
             do {
                 // Try to dequeue a frame
                 guard let queuedFrame = try await dequeue() else {
@@ -278,6 +207,10 @@ public actor FrameProcessingQueue {
 
         // Run OCR
         let extractedText = try await processing.extractText(from: capturedFrame)
+
+        // Debug: Log first 100 chars of extracted text to verify we're processing the right frame
+        let textPreview = extractedText.fullText.prefix(100).replacingOccurrences(of: "\n", with: " ")
+        Log.info("[OCR-TRACE] frameID=\(frameID) OCR found \(extractedText.regions.count) regions, text preview: \"\(textPreview)...\"", category: .processing)
 
         // Index in FTS
         let docid = try await search.index(
@@ -362,53 +295,16 @@ public actor FrameProcessingQueue {
 
     /// Update frame processing status
     private func updateFrameProcessingStatus(_ frameID: Int64, status: FrameProcessingStatus) async throws {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        let sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare status update")
-        }
-
-        sqlite3_bind_int(stmt, 1, Int32(status.rawValue))
-        sqlite3_bind_int64(stmt, 2, frameID)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryExecutionFailed("Failed to update processing status")
-        }
+        try await databaseManager.updateFrameProcessingStatus(frameID: frameID, status: status.rawValue)
     }
 
     /// Retry a failed frame
     private func retryFrame(_ queuedFrame: QueuedFrame, error: Error) async throws {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        let sql = """
-            INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount, lastError)
-            VALUES (?, ?, 0, ?, ?);
-        """
-
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare retry statement")
-        }
-
-        sqlite3_bind_int64(stmt, 1, queuedFrame.frameID)
-        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
-        sqlite3_bind_int(stmt, 3, Int32(queuedFrame.retryCount + 1))
-        sqlite3_bind_text(stmt, 4, error.localizedDescription, -1, SQLITE_TRANSIENT)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryExecutionFailed("Failed to retry frame")
-        }
-
+        try await databaseManager.retryFrameProcessing(
+            frameID: queuedFrame.frameID,
+            retryCount: queuedFrame.retryCount + 1,
+            errorMessage: error.localizedDescription
+        )
         Log.warning("[Queue] Retrying frame \(queuedFrame.frameID), attempt \(queuedFrame.retryCount + 1)", category: .processing)
     }
 
@@ -420,23 +316,7 @@ public actor FrameProcessingQueue {
 
     /// Re-enqueue frames that were processing during a crash
     public func requeueCrashedFrames() async throws {
-        guard let db = await databaseManager.getConnection() else {
-            throw DatabaseError.connectionFailed(underlying: "No database connection")
-        }
-
-        // Find frames that were marked as "processing" - they crashed during OCR
-        let sql = "SELECT id FROM frame WHERE processingStatus = 1;"
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryPreparationFailed("Failed to prepare requeue query")
-        }
-
-        var frameIDs: [Int64] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            frameIDs.append(sqlite3_column_int64(stmt, 0))
-        }
+        let frameIDs = try await databaseManager.getCrashedProcessingFrameIDs()
 
         if !frameIDs.isEmpty {
             Log.warning("[Queue] Re-enqueueing \(frameIDs.count) frames that crashed during processing", category: .processing)

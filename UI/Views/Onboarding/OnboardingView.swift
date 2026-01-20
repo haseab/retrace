@@ -4,12 +4,12 @@ import App
 import Database
 import Shared
 
-/// Main onboarding flow with 9 steps
+/// Main onboarding flow with 8 steps
 /// Step 1: Welcome
 /// Step 2: Creator features
 /// Step 3: Permissions
-/// Step 4: Screen Recording Indicator Info (starts recording on continue)
-/// Step 5: Encryption choice
+/// Step 4: Screen Recording Indicator Info (starts recording on continue) - COMMENTED OUT
+/// Step 5: Encryption choice - COMMENTED OUT
 /// Step 6: Rewind data decision
 /// Step 7: Keyboard shortcuts
 /// Step 8: Early Alpha / Safety info
@@ -18,7 +18,29 @@ public struct OnboardingView: View {
 
     // MARK: - Properties
 
-    @State private var currentStep: Int = 1
+    // UserDefaults keys
+    private static let onboardingStepKey = "onboardingCurrentStep"
+    private static let timelineShortcutKey = "timelineShortcutConfig"
+    private static let dashboardShortcutKey = "dashboardShortcutConfig"
+
+    // Load saved shortcuts or use defaults
+    private static func loadTimelineShortcut() -> ShortcutConfig {
+        guard let data = UserDefaults.standard.data(forKey: timelineShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultTimeline
+        }
+        return config
+    }
+
+    private static func loadDashboardShortcut() -> ShortcutConfig {
+        guard let data = UserDefaults.standard.data(forKey: dashboardShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultDashboard
+        }
+        return config
+    }
+
+    @State private var currentStep: Int = UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...9) == 0 ? 1 : UserDefaults.standard.integer(forKey: OnboardingView.onboardingStepKey).clamped(to: 1...9)
     @State private var hasScreenRecordingPermission = false
     @State private var hasAccessibilityPermission = false
     @State private var isCheckingPermissions = false
@@ -28,12 +50,12 @@ public struct OnboardingView: View {
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
-    @State private var wantsBackup: Bool? = nil
+    @State private var wantsRewindData: Bool? = UserDefaults.standard.object(forKey: "useRewindData") as? Bool
     @State private var rewindDataSizeGB: Double? = nil
 
-    // Keyboard shortcuts - initialized from defaults
-    @State private var timelineShortcut = ShortcutKey(from: .defaultTimeline)
-    @State private var dashboardShortcut = ShortcutKey(from: .defaultDashboard)
+    // Keyboard shortcuts - initialized from saved values or defaults
+    @State private var timelineShortcut = ShortcutKey(from: Self.loadTimelineShortcut())
+    @State private var dashboardShortcut = ShortcutKey(from: Self.loadDashboardShortcut())
     @State private var isRecordingTimelineShortcut = false
     @State private var isRecordingDashboardShortcut = false
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
@@ -44,7 +66,7 @@ public struct OnboardingView: View {
     let coordinator: AppCoordinator
     let onComplete: () -> Void
 
-    private let totalSteps = 9
+    private let totalSteps = 8
 
     // MARK: - Body
 
@@ -129,6 +151,10 @@ public struct OnboardingView: View {
             // Pre-fetch creator image so it's ready when user reaches step 4
             await prefetchCreatorImage()
         }
+        .onChange(of: currentStep) { newStep in
+            // Save the current step so user can resume if they quit
+            UserDefaults.standard.set(newStep, forKey: Self.onboardingStepKey)
+        }
     }
 
     // MARK: - Fixed Navigation Buttons
@@ -184,14 +210,14 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
 
         case 3:
-            // Permissions - requires both permissions, skips indicator step (step 4) and goes to encryption
+            // Permissions - requires both permissions, skips indicator step (step 4) and encryption step (step 5), goes to Rewind data
             Button(action: {
                 stopPermissionMonitoring()
                 // Start recording pipeline here (was previously in step 4)
                 Task {
                     try? await coordinator.startPipeline()
                 }
-                withAnimation { currentStep = 5 }  // Skip step 4 (indicator step)
+                withAnimation { currentStep = 6 }  // Skip step 4 (indicator step) and step 5 (encryption step)
             }) {
                 Text("Continue")
                     .font(.retraceHeadline)
@@ -222,48 +248,48 @@ public struct OnboardingView: View {
         //     }
         //     .buttonStyle(.plain)
 
-        case 5:
-            // Encryption - requires selection
-            Button(action: {
-                print("[ONBOARDING] Encryption step - Continue button clicked")
-                print("[ONBOARDING] encryptionEnabled = \(encryptionEnabled ?? false)")
-
-                UserDefaults.standard.set(encryptionEnabled ?? false, forKey: "encryptionEnabled")
-
-                if encryptionEnabled == true {
-                    print("[ONBOARDING] Setting up encryption keychain...")
-                    do {
-                        try DatabaseManager.setupEncryptionKeychain()
-                        print("[ONBOARDING] Keychain setup complete, now verifying...")
-
-                        // Immediately verify we can read it back
-                        // This triggers the keychain access prompt in context, right after enabling encryption
-                        _ = try DatabaseManager.verifyEncryptionKeychain()
-                        print("[ONBOARDING] ✅ Encryption keychain setup and verified successfully")
-                    } catch {
-                        print("[ONBOARDING] ❌ Failed to setup encryption keychain: \(error)")
-                    }
-                } else {
-                    print("[ONBOARDING] Encryption disabled, skipping keychain setup")
-                }
-
-                withAnimation { currentStep = 6 }
-            }) {
-                Text("Continue")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, .spacingL)
-                    .padding(.vertical, .spacingM)
-                    .background(encryptionEnabled != nil ? Color.retraceAccent : Color.retraceSecondaryColor)
-                    .cornerRadius(.cornerRadiusM)
-            }
-            .buttonStyle(.plain)
-            .disabled(encryptionEnabled == nil)
+        // case 5: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
+        //     // Encryption - requires selection
+        //     Button(action: {
+        //         print("[ONBOARDING] Encryption step - Continue button clicked")
+        //         print("[ONBOARDING] encryptionEnabled = \(encryptionEnabled ?? false)")
+        //
+        //         UserDefaults.standard.set(encryptionEnabled ?? false, forKey: "encryptionEnabled")
+        //
+        //         if encryptionEnabled == true {
+        //             print("[ONBOARDING] Setting up encryption keychain...")
+        //             do {
+        //                 try DatabaseManager.setupEncryptionKeychain()
+        //                 print("[ONBOARDING] Keychain setup complete, now verifying...")
+        //
+        //                 // Immediately verify we can read it back
+        //                 // This triggers the keychain access prompt in context, right after enabling encryption
+        //                 _ = try DatabaseManager.verifyEncryptionKeychain()
+        //                 print("[ONBOARDING] ✅ Encryption keychain setup and verified successfully")
+        //             } catch {
+        //                 print("[ONBOARDING] ❌ Failed to setup encryption keychain: \(error)")
+        //             }
+        //         } else {
+        //             print("[ONBOARDING] Encryption disabled, skipping keychain setup")
+        //         }
+        //
+        //         withAnimation { currentStep = 6 }
+        //     }) {
+        //         Text("Continue")
+        //             .font(.retraceHeadline)
+        //             .foregroundColor(.white)
+        //             .padding(.horizontal, .spacingL)
+        //             .padding(.vertical, .spacingM)
+        //             .background(encryptionEnabled != nil ? Color.retraceAccent : Color.retraceSecondaryColor)
+        //             .cornerRadius(.cornerRadiusM)
+        //     }
+        //     .buttonStyle(.plain)
+        //     .disabled(encryptionEnabled == nil)
 
         case 6:
             // Rewind data - requires selection if data exists
             Button(action: {
-                UserDefaults.standard.set(wantsBackup == true, forKey: "useRewindData")
+                UserDefaults.standard.set(wantsRewindData == true, forKey: "useRewindData")
                 withAnimation { currentStep = 7 }
             }) {
                 Text("Continue")
@@ -271,11 +297,11 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background((hasRewindData == false || wantsBackup != nil) ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .background((hasRewindData == false || wantsRewindData != nil) ? Color.retraceAccent : Color.retraceSecondaryColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
-            .disabled(hasRewindData == true && wantsBackup == nil)
+            .disabled(hasRewindData == true && wantsRewindData == nil)
 
         case 7:
             // Keyboard shortcuts
@@ -313,6 +339,8 @@ public struct OnboardingView: View {
         case 9:
             // Completion - Just finish onboarding (recording already started at step 4)
             Button(action: {
+                // Clear saved step since onboarding is complete
+                UserDefaults.standard.removeObject(forKey: Self.onboardingStepKey)
                 Task {
                     await coordinator.onboardingManager.markOnboardingCompleted()
                     // Register Rewind data source if user opted in during onboarding
@@ -368,8 +396,8 @@ public struct OnboardingView: View {
             permissionsStep
         // case 4: - COMMENTED OUT - Screen Recording Indicator step not needed for now
         //     screenRecordingIndicatorStep
-        case 5:
-            encryptionStep
+        // case 5: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
+        //     encryptionStep
         case 6:
             rewindDataStep
         case 7:
@@ -394,7 +422,7 @@ public struct OnboardingView: View {
                 .frame(width: 120, height: 120)
 
             Text("Welcome to Retrace")
-                .font(.system(size: 36, weight: .bold))
+                .font(.retraceDisplay2)
                 .foregroundColor(.retracePrimary)
 
             Text("Remember everything.")
@@ -500,7 +528,7 @@ public struct OnboardingView: View {
         VStack(alignment: .leading, spacing: .spacingS) {
             HStack(spacing: .spacingM) {
                 Image(systemName: icon)
-                    .font(.system(size: 28))
+                    .font(.retraceTitle)
                     .foregroundColor(isGranted ? .retraceSuccess : (isDenied ? .retraceWarning : .retraceAccent))
                     .frame(width: 44)
 
@@ -524,7 +552,7 @@ public struct OnboardingView: View {
 
                 if isGranted {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 24))
+                        .font(.retraceTitle2)
                         .foregroundColor(.retraceSuccess)
                 } else if isDenied, let openSettings = openSettingsAction {
                     Button(action: openSettings) {
@@ -557,7 +585,7 @@ public struct OnboardingView: View {
                     HStack(spacing: .spacingXS) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.retraceWarning)
-                            .font(.system(size: 12))
+                            .font(.retraceCaption2)
                         Text("Permission may have been denied in the past")
                             .font(.retraceCaption)
                             .foregroundColor(.retraceWarning)
@@ -581,7 +609,7 @@ public struct OnboardingView: View {
             Spacer()
 
             Text("Screen Capture Indicator...")
-                .font(.system(size: 32, weight: .bold))
+                .font(.retraceDisplay3)
                 .foregroundColor(.retracePrimary)
 
             Text("Look for this indicator in your menu bar")
@@ -628,7 +656,7 @@ public struct OnboardingView: View {
                     .frame(width: 100, height: 100)
 
                 Image(systemName: encryptionEnabled == true ? "lock.shield.fill" : "lock.open.fill")
-                    .font(.system(size: 44))
+                    .font(.retraceDisplay)
                     .foregroundColor(encryptionEnabled == true ? .retraceSuccess : .retraceSecondary)
             }
 
@@ -675,7 +703,7 @@ public struct OnboardingView: View {
                 }) {
                     HStack(spacing: .spacingM) {
                         Image(systemName: encryptionEnabled == true ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 24))
+                            .font(.retraceTitle2)
                             .foregroundColor(encryptionEnabled == true ? .retraceSuccess : .retraceSecondary)
 
                         Text("Yes")
@@ -700,7 +728,7 @@ public struct OnboardingView: View {
                 }) {
                     HStack(spacing: .spacingM) {
                         Image(systemName: encryptionEnabled == false ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 24))
+                            .font(.retraceTitle2)
                             .foregroundColor(encryptionEnabled == false ? .retraceAccent : .retraceSecondary)
 
                         Text("No")
@@ -761,7 +789,7 @@ public struct OnboardingView: View {
             .fill(Color.retraceAccent.opacity(0.3))
             .overlay(
                 Text("H")
-                    .font(.system(size: 32, weight: .bold))
+                    .font(.retraceDisplay3)
                     .foregroundColor(.white)
             )
     }
@@ -798,8 +826,12 @@ public struct OnboardingView: View {
                             featureItem(icon: "checkmark.circle.fill", text: "Timeline Scrolling", color: .retraceSuccess)
                             featureItem(icon: "checkmark.circle.fill", text: "Continuous Screen Capture", color: .retraceSuccess)
                             featureItem(icon: "checkmark.circle.fill", text: "Basic Search", color: .retraceSuccess)
-                            featureItem(icon: "checkmark.circle.fill", text: "Basic Keyboard Shortcuts", color: .retraceSuccess)
+                            // featureItem(icon: "checkmark.circle.fill", text: "Basic Keyboard Shortcuts", color: .retraceSuccess)
                             featureItem(icon: "checkmark.circle.fill", text: "Deletion of Data", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Basic Settings", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Daily Dashboard", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Search Highlighting", color: .retraceSuccess)
+                            featureItem(icon: "checkmark.circle.fill", text: "Exclude Apps / Private Windows", color: .retraceSuccess)
                         }
                     }
                     .padding(.spacingL)
@@ -816,10 +848,6 @@ public struct OnboardingView: View {
                         VStack(alignment: .leading, spacing: .spacingS) {
                             featureItem(icon: "circle.fill", text: "Audio Recording", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "Optimized Power & Storage", color: .retraceWarning)
-                            featureItem(icon: "circle.fill", text: "More Settings", color: .retraceWarning)
-                            featureItem(icon: "circle.fill", text: "Daily Dashboard", color: .retraceWarning)
-                            featureItem(icon: "circle.fill", text: "Search Highlighting", color: .retraceWarning)
-                            featureItem(icon: "circle.fill", text: "Exclude Apps / Private Windows", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "Decrypt and Backup your Rewind Database", color: .retraceWarning)
                             featureItem(icon: "circle.fill", text: "More Advanced Shortcuts", color: .retraceWarning)
                         }
@@ -848,18 +876,16 @@ public struct OnboardingView: View {
                 .frame(maxWidth: 600)
                 .padding(.spacingM)
             }
-            .frame(height: 350)
+            .frame(minHeight: 350, maxHeight: .infinity)
             .background(Color.retraceSecondaryBackground.opacity(0.5))
             .cornerRadius(.cornerRadiusL)
-
-            Spacer()
         }
     }
 
     private func featureItem(icon: String, text: String, color: Color) -> some View {
         HStack(spacing: .spacingS) {
             Image(systemName: icon)
-                .font(.system(size: 12))
+                .font(.retraceCaption2)
                 .foregroundColor(color)
             Text(text)
                 .font(.retraceBody)
@@ -876,7 +902,7 @@ public struct OnboardingView: View {
             ForEach(features, id: \.1) { icon, text, color in
                 HStack(spacing: .spacingS) {
                     Image(systemName: icon)
-                        .font(.system(size: 12))
+                        .font(.retraceCaption2)
                         .foregroundColor(color)
                     Text(text)
                         .font(.retraceBody)
@@ -920,8 +946,7 @@ public struct OnboardingView: View {
                             }
 
                             Text("~/Library/Application Support/com.memoryvault.MemoryVault")
-                                .font(.retraceMono)
-                                .font(.system(size: 11))
+                                .font(.retraceMonoSmall)
                                 .foregroundColor(.retracePrimary)
                                 .multilineTextAlignment(.center)
 
@@ -942,13 +967,13 @@ public struct OnboardingView: View {
                     HStack(spacing: .spacingM) {
                         Button(action: {
                             withAnimation {
-                                wantsBackup = true
+                                wantsRewindData = true
                             }
                         }) {
                             HStack(spacing: .spacingM) {
-                                Image(systemName: wantsBackup == true ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 24))
-                                    .foregroundColor(wantsBackup == true ? .retraceSuccess : .retraceSecondary)
+                                Image(systemName: wantsRewindData == true ? "checkmark.circle.fill" : "circle")
+                                    .font(.retraceTitle2)
+                                    .foregroundColor(wantsRewindData == true ? .retraceSuccess : .retraceSecondary)
 
                                 Text("Yes, Use")
                                     .font(.retraceHeadline)
@@ -956,24 +981,24 @@ public struct OnboardingView: View {
                             }
                             .padding(.spacingM)
                             .frame(width: 180)
-                            .background(wantsBackup == true ? Color.retraceSuccess.opacity(0.1) : Color.retraceSecondaryBackground)
+                            .background(wantsRewindData == true ? Color.retraceSuccess.opacity(0.1) : Color.retraceSecondaryBackground)
                             .cornerRadius(.cornerRadiusM)
                             .overlay(
                                 RoundedRectangle(cornerRadius: .cornerRadiusM)
-                                    .stroke(wantsBackup == true ? Color.retraceSuccess : Color.retraceBorder, lineWidth: 2)
+                                    .stroke(wantsRewindData == true ? Color.retraceSuccess : Color.retraceBorder, lineWidth: 2)
                             )
                         }
                         .buttonStyle(.plain)
 
                         Button(action: {
                             withAnimation {
-                                wantsBackup = false
+                                wantsRewindData = false
                             }
                         }) {
                             HStack(spacing: .spacingM) {
-                                Image(systemName: wantsBackup == false ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 24))
-                                    .foregroundColor(wantsBackup == false ? .retraceAccent : .retraceSecondary)
+                                Image(systemName: wantsRewindData == false ? "checkmark.circle.fill" : "circle")
+                                    .font(.retraceTitle2)
+                                    .foregroundColor(wantsRewindData == false ? .retraceAccent : .retraceSecondary)
 
                                 Text("No, Don't Use")
                                     .font(.retraceHeadline)
@@ -981,11 +1006,11 @@ public struct OnboardingView: View {
                             }
                             .padding(.spacingM)
                             .frame(width: 200)
-                            .background(wantsBackup == false ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
+                            .background(wantsRewindData == false ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
                             .cornerRadius(.cornerRadiusM)
                             .overlay(
                                 RoundedRectangle(cornerRadius: .cornerRadiusM)
-                                    .stroke(wantsBackup == false ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
+                                    .stroke(wantsRewindData == false ? Color.retraceAccent : Color.retraceBorder, lineWidth: 2)
                             )
                         }
                         .buttonStyle(.plain)
@@ -1013,7 +1038,7 @@ public struct OnboardingView: View {
                     VStack(spacing: .spacingM) {
                         HStack(spacing: .spacingM) {
                             Image(systemName: "info.circle.fill")
-                                .font(.system(size: 20))
+                                .font(.retraceTitle3)
                                 .foregroundColor(.retraceSecondary)
                             Text("No Rewind data found on this machine")
                                 .font(.retraceBody)
@@ -1057,7 +1082,15 @@ public struct OnboardingView: View {
                     label: "Launch Timeline",
                     shortcut: $timelineShortcut,
                     isRecording: $isRecordingTimelineShortcut,
-                    otherShortcut: dashboardShortcut
+                    otherShortcut: dashboardShortcut,
+                    onShortcutCaptured: { newShortcut in
+                        // Save and apply timeline shortcut immediately
+                        Task {
+                            await coordinator.onboardingManager.setTimelineShortcut(newShortcut.toConfig)
+                            // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
+                            MenuBarManager.shared?.reloadShortcuts()
+                        }
+                    }
                 )
 
                 Divider()
@@ -1067,7 +1100,15 @@ public struct OnboardingView: View {
                     label: "Launch Dashboard",
                     shortcut: $dashboardShortcut,
                     isRecording: $isRecordingDashboardShortcut,
-                    otherShortcut: timelineShortcut
+                    otherShortcut: timelineShortcut,
+                    onShortcutCaptured: { newShortcut in
+                        // Save and apply dashboard shortcut immediately
+                        Task {
+                            await coordinator.onboardingManager.setDashboardShortcut(newShortcut.toConfig)
+                            // Reload shortcuts and re-register hotkeys so the new shortcut works immediately
+                            MenuBarManager.shared?.reloadShortcuts()
+                        }
+                    }
                 )
             }
             .padding(.spacingXL)
@@ -1106,7 +1147,8 @@ public struct OnboardingView: View {
         label: String,
         shortcut: Binding<ShortcutKey>,
         isRecording: Binding<Bool>,
-        otherShortcut: ShortcutKey
+        otherShortcut: ShortcutKey,
+        onShortcutCaptured: @escaping (ShortcutKey) -> Void
     ) -> some View {
         HStack(spacing: .spacingL) {
             VStack(alignment: .leading, spacing: .spacingS) {
@@ -1151,7 +1193,7 @@ public struct OnboardingView: View {
                             // Display modifier keys dynamically
                             ForEach(shortcut.wrappedValue.modifierSymbols, id: \.self) { symbol in
                                 Text(symbol)
-                                    .font(.system(size: 18, weight: .medium, design: .rounded))
+                                    .font(.retraceHeadline)
                                     .foregroundColor(.retraceSecondary)
                                     .frame(width: 32, height: 32)
                                     .background(Color.retraceCard)
@@ -1166,7 +1208,7 @@ public struct OnboardingView: View {
 
                             // Key
                             Text(shortcut.wrappedValue.key)
-                                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                                .font(.retraceHeadline)
                                 .foregroundColor(.retracePrimary)
                                 .frame(minWidth: 50, minHeight: 32)
                                 .padding(.horizontal, .spacingM)
@@ -1192,7 +1234,8 @@ public struct OnboardingView: View {
                     otherShortcut: otherShortcut,
                     onDuplicateAttempt: {
                         shortcutError = "This shortcut is already in use"
-                    }
+                    },
+                    onShortcutCaptured: onShortcutCaptured
                 )
                 .frame(width: 0, height: 0)
             )
@@ -1217,9 +1260,9 @@ public struct OnboardingView: View {
                     // Badge
                     HStack(spacing: .spacingS) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 18, weight: .bold))
+                            .font(.retraceHeadline)
                         Text("EARLY ALPHA")
-                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                            .font(.retraceHeadline)
                     }
                     .foregroundColor(.retraceWarning)
                     .padding(.horizontal, .spacingL)
@@ -1273,7 +1316,7 @@ public struct OnboardingView: View {
             VStack(alignment: .leading, spacing: .spacingM) {
                 HStack(spacing: .spacingM) {
                     Image(systemName: "ant.fill")
-                        .font(.system(size: 20))
+                        .font(.retraceTitle3)
                         .foregroundColor(.retraceWarning)
                     Text("Expect bugs - things will break")
                         .font(.retraceBody)
@@ -1282,7 +1325,7 @@ public struct OnboardingView: View {
 
                 HStack(spacing: .spacingM) {
                     Image(systemName: "message.fill")
-                        .font(.system(size: 20))
+                        .font(.retraceTitle3)
                         .foregroundColor(.retraceAccent)
                     Text("Please report issues often")
                         .font(.retraceBody)
@@ -1291,7 +1334,7 @@ public struct OnboardingView: View {
 
                 HStack(spacing: .spacingM) {
                     Image(systemName: "wrench.and.screwdriver.fill")
-                        .font(.system(size: 20))
+                        .font(.retraceTitle3)
                         .foregroundColor(.retraceSuccess)
                     Text("Fixes ship fast")
                         .font(.retraceBody)
@@ -1318,7 +1361,7 @@ public struct OnboardingView: View {
                 .frame(width: 120, height: 120)
 
             Text("You're All Set!")
-                .font(.system(size: 36, weight: .bold))
+                .font(.retraceDisplay2)
                 .foregroundColor(.retracePrimary)
 
             Text("Retrace is now capturing your screen in the background.")
@@ -1343,7 +1386,7 @@ public struct OnboardingView: View {
                     // Display modifier keys dynamically
                     ForEach(timelineShortcut.modifierSymbols, id: \.self) { symbol in
                         Text(symbol)
-                            .font(.system(size: 20, weight: .medium, design: .rounded))
+                            .font(.retraceTitle3)
                             .foregroundColor(.retraceSecondary)
                             .frame(width: 40, height: 40)
                             .background(Color.retraceCard)
@@ -1358,7 +1401,7 @@ public struct OnboardingView: View {
 
                     // Key
                     Text(timelineShortcut.key)
-                        .font(.system(size: 18, weight: .semibold, design: .rounded))
+                        .font(.retraceHeadline)
                         .foregroundColor(.retracePrimary)
                         .frame(minWidth: 60, minHeight: 40)
                         .padding(.horizontal, .spacingM)
@@ -1391,7 +1434,7 @@ public struct OnboardingView: View {
 
             // Person with screen icon
             Image(systemName: "rectangle.inset.filled.and.person.filled")
-                .font(.system(size: 36, weight: .medium))
+                .font(.retraceDisplay2)
                 .foregroundColor(.white)
         }
     }
@@ -1577,14 +1620,14 @@ public struct OnboardingView: View {
                 _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             } catch {
                 let errorDescription = error.localizedDescription
-                print("[OnboardingView] Screen recording permission request: \(error)")
+                Log.warning("[OnboardingView] Screen recording permission request: \(error)", category: .ui)
 
                 // If we get the TCC "declined" error, they denied
                 if errorDescription.contains("declined") {
                     await MainActor.run {
                         screenRecordingDenied = true
                     }
-                    print("[OnboardingView] User denied - showing Open Settings button")
+                    Log.info("[OnboardingView] User denied - showing Open Settings button", category: .ui)
                 }
             }
         }
@@ -1748,6 +1791,7 @@ struct ShortcutCaptureField: NSViewRepresentable {
     @Binding var capturedShortcut: ShortcutKey
     let otherShortcut: ShortcutKey
     let onDuplicateAttempt: () -> Void
+    let onShortcutCaptured: ((ShortcutKey) -> Void)?
 
     func makeNSView(context: Context) -> ShortcutCaptureNSView {
         let view = ShortcutCaptureNSView()
@@ -1805,6 +1849,8 @@ struct ShortcutCaptureField: NSViewRepresentable {
 
             parent.capturedShortcut = newShortcut
             parent.isRecording = false
+            // Call the callback to save immediately
+            parent.onShortcutCaptured?(newShortcut)
         }
 
         private func mapKeyCodeToString(keyCode: UInt16, characters: String?) -> String {
@@ -1855,13 +1901,21 @@ class ShortcutCaptureNSView: NSView {
     }
 }
 
+// MARK: - Int Clamped Extension
+
+private extension Int {
+    func clamped(to range: ClosedRange<Int>) -> Int {
+        return Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+    }
+}
+
 // MARK: - Preview
 
 #if DEBUG
 struct OnboardingView_Previews: PreviewProvider {
     static var previews: some View {
         OnboardingView(coordinator: AppCoordinator()) {
-            print("Onboarding complete")
+            Log.info("[OnboardingView] Onboarding complete", category: .ui)
         }
         .preferredColorScheme(.dark)
     }

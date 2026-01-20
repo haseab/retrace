@@ -28,10 +28,16 @@ public final class HEVCStorageExtractor: ImageExtractor {
 
     public func extractFrame(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> Data {
         // Extract segment ID from path (Retrace uses integer IDs as filenames)
-        // Path format: chunks/YYYYMM/DD/123456789
+        // Path format: chunks/YYYYMM/DD/123456789 or chunks/YYYYMM/DD/123456789.mp4
         let components = videoPath.split(separator: "/")
-        guard let filename = components.last,
-              let segmentIDValue = Int64(filename) else {
+        guard var filename = components.last.map(String.init) else {
+            throw ImageExtractionError.invalidPath(videoPath)
+        }
+        // Strip .mp4 extension if present
+        if filename.hasSuffix(".mp4") {
+            filename = String(filename.dropLast(4))
+        }
+        guard let segmentIDValue = Int64(filename) else {
             throw ImageExtractionError.invalidPath(videoPath)
         }
 
@@ -69,45 +75,86 @@ public final class AVAssetExtractor: ImageExtractor {
         }
 
         // Construct full path from storage root
-        let fullVideoPath: String
+        var fullVideoPath: String
         if videoPath.hasPrefix("/") {
             fullVideoPath = videoPath
         } else {
             fullVideoPath = "\(storageRoot)/\(videoPath)"
         }
 
-        // CRITICAL: Rewind videos lack file extensions
-        // AVAssetImageGenerator requires .mp4 extension to identify format
-        // Solution: Create temporary symlink with .mp4 extension
-        let originalURL = URL(fileURLWithPath: fullVideoPath)
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString + ".mp4")
-
-        defer {
-            try? FileManager.default.removeItem(at: tempURL)
+        // Check if file exists - if not, try with .mp4 extension
+        // This handles the case where database stores path without extension but file has .mp4
+        if !FileManager.default.fileExists(atPath: fullVideoPath) {
+            let pathWithExtension = fullVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                fullVideoPath = pathWithExtension
+            }
         }
 
-        do {
-            try FileManager.default.createSymbolicLink(
-                at: tempURL,
-                withDestinationURL: originalURL
+        // Check if file is empty (incomplete/damaged video)
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: fullVideoPath)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            // Delete empty file and throw
+            try? FileManager.default.removeItem(atPath: fullVideoPath)
+            throw ImageExtractionError.extractionFailed(
+                path: fullVideoPath,
+                frameIndex: frameIndex,
+                error: NSError(domain: "AVAssetExtractor", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video file is empty (incomplete write)"])
             )
-        } catch {
-            throw ImageExtractionError.symlinkFailed(path: fullVideoPath, error: error)
+        }
+
+        // Determine the URL to use for AVFoundation
+        // If file already has .mp4 extension, use it directly
+        // Otherwise, create a temporary symlink with .mp4 extension so AVFoundation can identify the format
+        let originalURL = URL(fileURLWithPath: fullVideoPath)
+        let assetURL: URL
+        var tempURL: URL? = nil
+
+        if originalURL.pathExtension.lowercased() == "mp4" {
+            // File already has .mp4 extension, use directly
+            assetURL = originalURL
+        } else {
+            // Create temporary symlink with .mp4 extension (for extensionless files)
+            let tempPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + ".mp4")
+            tempURL = tempPath
+
+            do {
+                try FileManager.default.createSymbolicLink(
+                    at: tempPath,
+                    withDestinationURL: originalURL
+                )
+            } catch {
+                throw ImageExtractionError.symlinkFailed(path: fullVideoPath, error: error)
+            }
+            assetURL = tempPath
+        }
+
+        defer {
+            if let tempURL = tempURL {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
         }
 
         // Use AVAssetImageGenerator for frame extraction
-        let asset = AVAsset(url: tempURL)
+        let asset = AVAsset(url: assetURL)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
         imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
 
-        // Calculate CMTime from frame index
-        // Use provided frame rate or assume 30fps
+        // Calculate CMTime from frame index using integer arithmetic to avoid floating point precision issues
+        // For 30fps with timescale 600: each frame = 20 time units (600/30 = 20)
         let effectiveFrameRate = frameRate ?? 30.0
-        let timeInSeconds = Double(frameIndex) / effectiveFrameRate
-        let time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+        let time: CMTime
+        if effectiveFrameRate == 30.0 {
+            // Fast path for 30fps - use exact integer arithmetic
+            time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
+        } else {
+            // For other frame rates, use floating point
+            let timeInSeconds = Double(frameIndex) / effectiveFrameRate
+            time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+        }
 
         // Extract CGImage → NSImage → TIFF → Bitmap → JPEG (macOS conversion pipeline)
         let cgImage: CGImage

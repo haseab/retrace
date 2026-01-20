@@ -90,7 +90,7 @@ public actor AudioProcessingManager {
 
             // Step 3: Prepare transcription data for batch insert
             guard let queries = transcriptionQueries else {
-                print("⚠️ Audio storage not configured, skipping save")
+                Log.warning("[AudioProcessingManager] Audio storage not configured, skipping save", category: .processing)
                 return
             }
 
@@ -133,7 +133,7 @@ public actor AudioProcessingManager {
             }
 
         } catch {
-            print("❌ Audio transcription error: \(error)")
+            Log.error("[AudioProcessingManager] Audio transcription error: \(error)", category: .processing)
             // TODO: Implement retry logic or error queue
         }
     }

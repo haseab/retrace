@@ -32,10 +32,10 @@ public actor IDMappingService {
 
     /// Load mappings from database into memory cache
     public func initialize() throws {
-        print("[IDMappingService] Loading UUID mappings into cache...")
+        Log.debug("[IDMappingService] Loading UUID mappings into cache...", category: .database)
         try loadMappings(entityType: "frame", uuidToInt: &frameUUIDToInt, intToUUID: &frameIntToUUID)
         try loadMappings(entityType: "segment", uuidToInt: &segmentUUIDToInt, intToUUID: &segmentIntToUUID)
-        print("[IDMappingService] Loaded \(frameUUIDToInt.count) frame, \(segmentUUIDToInt.count) segment mappings")
+        Log.debug("[IDMappingService] Loaded \(frameUUIDToInt.count) frame, \(segmentUUIDToInt.count) segment mappings", category: .database)
     }
 
     // MARK: - Frame Mappings
@@ -104,7 +104,7 @@ public actor IDMappingService {
             )
         }
 
-        print("[IDMappingService] Purged old mappings before \(date)")
+        Log.debug("[IDMappingService] Purged old mappings before \(date)", category: .database)
     }
 
     /// Get statistics about mapping cache
@@ -140,7 +140,7 @@ public actor IDMappingService {
             let dbID = sqlite3_column_int64(statement, 1)
 
             guard let uuid = UUID(uuidString: uuidString) else {
-                print("[IDMappingService] Warning: Invalid UUID in mapping: \(uuidString)")
+                Log.warning("[IDMappingService] Warning: Invalid UUID in mapping: \(uuidString)", category: .database)
                 continue
             }
 

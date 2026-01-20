@@ -2,23 +2,13 @@ import Foundation
 import CoreGraphics
 import Shared
 
-// Note: If ScreenCaptureKit import fails on older macOS, conditionally import
-#if canImport(ScreenCaptureKit)
-import ScreenCaptureKit
-#endif
-
 /// Main coordinator for screen capture
 /// Implements CaptureProtocol from Shared/Protocols
 public actor CaptureManager: CaptureProtocol {
 
     // MARK: - Properties
 
-    // Toggle between ScreenCaptureKit and CGWindowList
-    // Set to false to use CGWindowList (no purple indicator)
-    private let useScreenCaptureKit: Bool
-
-    private let screenCapture: ScreenCaptureService?
-    private let cgWindowListCapture: CGWindowListCapture?
+    private let cgWindowListCapture: CGWindowListCapture
     private let displayMonitor: DisplayMonitor
     private let displaySwitchMonitor: DisplaySwitchMonitor
     private let deduplicator: FrameDeduplicator
@@ -53,18 +43,9 @@ public actor CaptureManager: CaptureProtocol {
 
     // MARK: - Initialization
 
-    public init(config: CaptureConfig = .default, useScreenCaptureKit: Bool = false) {
+    public init(config: CaptureConfig = .default) {
         self.currentConfig = config
-        self.useScreenCaptureKit = useScreenCaptureKit
-
-        if useScreenCaptureKit {
-            self.screenCapture = ScreenCaptureService()
-            self.cgWindowListCapture = nil
-        } else {
-            self.screenCapture = nil
-            self.cgWindowListCapture = CGWindowListCapture()
-        }
-
+        self.cgWindowListCapture = CGWindowListCapture()
         self.displayMonitor = DisplayMonitor()
         self.displaySwitchMonitor = DisplaySwitchMonitor(displayMonitor: DisplayMonitor())
         self.deduplicator = FrameDeduplicator()
@@ -91,7 +72,7 @@ public actor CaptureManager: CaptureProtocol {
 
         self.currentConfig = config
 
-        // Create raw frame stream from ScreenCaptureService
+        // Create raw frame stream
         let (rawStream, rawContinuation) = AsyncStream<CapturedFrame>.makeStream()
         self.rawFrameContinuation = rawContinuation
 
@@ -100,26 +81,15 @@ public actor CaptureManager: CaptureProtocol {
         self.dedupedFrameContinuation = dedupedContinuation
         self._frameStream = dedupedStream
 
-        // Start screen capture with appropriate backend
-        if useScreenCaptureKit {
-            // Set up callback for when stream stops unexpectedly (e.g., user clicks "Stop sharing")
-            screenCapture?.onStreamStopped = { [weak self] in
-                guard let self = self else { return }
-                await self.handleStreamStopped()
-            }
+        // Get the active display (the one containing the focused window)
+        let activeDisplayID = await displayMonitor.getActiveDisplayID()
 
-            // Start ScreenCaptureKit capture
-            try await screenCapture?.startCapture(
-                config: config,
-                frameContinuation: rawContinuation
-            )
-        } else {
-            // Start CGWindowList capture
-            try await cgWindowListCapture?.startCapture(
-                config: config,
-                frameContinuation: rawContinuation
-            )
-        }
+        // Start CGWindowList capture on the active display
+        try await cgWindowListCapture.startCapture(
+            config: config,
+            frameContinuation: rawContinuation,
+            displayID: activeDisplayID
+        )
 
         _isCapturing = true
         stats = CaptureStatistics(
@@ -146,12 +116,8 @@ public actor CaptureManager: CaptureProtocol {
         // Stop display switch monitoring
         await displaySwitchMonitor.stopMonitoring()
 
-        // Stop capture with appropriate backend
-        if useScreenCaptureKit {
-            try await screenCapture?.stopCapture()
-        } else {
-            try await cgWindowListCapture?.stopCapture()
-        }
+        // Stop capture
+        try await cgWindowListCapture.stopCapture()
 
         _isCapturing = false
         rawFrameContinuation?.finish()
@@ -186,11 +152,7 @@ public actor CaptureManager: CaptureProtocol {
         self.currentConfig = config
 
         if _isCapturing {
-            if useScreenCaptureKit {
-                try await screenCapture?.updateConfig(config)
-            } else {
-                try await cgWindowListCapture?.updateConfig(config)
-            }
+            try await cgWindowListCapture.updateConfig(config)
         }
     }
 
@@ -229,11 +191,6 @@ public actor CaptureManager: CaptureProtocol {
             await self.handleAccessibilityPermissionDenied()
         }
 
-        // Set up callback for private window detection AX permission denial
-        screenCapture?.onAccessibilityPermissionDenied = {
-            await self.handleAccessibilityPermissionDenied()
-        }
-
         await displaySwitchMonitor.startMonitoring(initialDisplayID: initialDisplayID)
     }
 
@@ -241,35 +198,21 @@ public actor CaptureManager: CaptureProtocol {
     private func handleDisplaySwitch(from oldDisplayID: UInt32, to newDisplayID: UInt32) async {
         guard _isCapturing else { return }
 
-        // logger.info("Switching capture from display \(oldDisplayID) to \(newDisplayID)")
-
         do {
             // Recreate raw frame continuation with same stream
             guard let continuation = rawFrameContinuation else { return }
 
-            if useScreenCaptureKit {
-                // Stop current capture
-                try await screenCapture?.stopCapture()
+            // Stop current capture
+            try await cgWindowListCapture.stopCapture()
 
-                // Start capture on new display
-                try await screenCapture?.startCapture(
-                    config: currentConfig,
-                    frameContinuation: continuation
-                )
-            } else {
-                // Stop current capture
-                try await cgWindowListCapture?.stopCapture()
-
-                // Start capture on new display
-                try await cgWindowListCapture?.startCapture(
-                    config: currentConfig,
-                    frameContinuation: continuation
-                )
-            }
-
-            // logger.info("Successfully switched to display \(newDisplayID)")
+            // Start capture on new display
+            try await cgWindowListCapture.startCapture(
+                config: currentConfig,
+                frameContinuation: continuation,
+                displayID: newDisplayID
+            )
         } catch {
-            // logger.error("Failed to switch displays: \(error.localizedDescription)")
+            Log.error("Failed to switch displays: \(error.localizedDescription)", category: .capture)
         }
     }
 

@@ -35,33 +35,45 @@ struct VideoFrameView: NSViewRepresentable {
         // Load video file
         Log.debug("[VideoFrameView] Loading video from: \(videoInfo.videoPath)", category: .app)
 
-        // Check if file exists
-        if !FileManager.default.fileExists(atPath: videoInfo.videoPath) {
-            Log.error("[VideoFrameView] Video file does not exist: \(videoInfo.videoPath)", category: .app)
-            return
+        // Check if file exists (try both with and without .mp4 extension)
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                Log.error("[VideoFrameView] Video file does not exist: \(videoInfo.videoPath)", category: .app)
+                return
+            }
         }
 
-        // Rewind stores video files without extensions - AVPlayer requires .mp4 extension
-        // Create a symlink with .mp4 extension in temp directory
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
-        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+        // Determine the URL to use - if file already has .mp4 extension, use directly
+        // Otherwise create symlink with .mp4 extension for AVFoundation
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            // Rewind stores video files without extensions - AVPlayer requires .mp4 extension
+            // Create a symlink with .mp4 extension in temp directory
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
 
-        // Remove old symlink if it exists
-        if FileManager.default.fileExists(atPath: symlinkPath) {
-            try? FileManager.default.removeItem(atPath: symlinkPath)
+            // Remove old symlink if it exists
+            if FileManager.default.fileExists(atPath: symlinkPath) {
+                try? FileManager.default.removeItem(atPath: symlinkPath)
+            }
+
+            // Create symlink
+            do {
+                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                Log.debug("[VideoFrameView] Created symlink: \(symlinkPath)", category: .app)
+            } catch {
+                Log.error("[VideoFrameView] Failed to create symlink: \(error)", category: .app)
+                return
+            }
+            url = URL(fileURLWithPath: symlinkPath)
         }
-
-        // Create symlink
-        do {
-            try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
-            Log.debug("[VideoFrameView] Created symlink: \(symlinkPath)", category: .app)
-        } catch {
-            Log.error("[VideoFrameView] Failed to create symlink: \(error)", category: .app)
-            return
-        }
-
-        let url = URL(fileURLWithPath: symlinkPath)
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let playerItem = AVPlayerItem(asset: asset)
 
@@ -84,10 +96,10 @@ struct VideoFrameView: NSViewRepresentable {
 
             guard item.status == .readyToPlay else { return }
 
-            Log.debug("[VideoFrameView] Player ready, seeking to \(videoInfo.timeInSeconds)s", category: .app)
+            Log.debug("[VideoFrameView] Player ready, seeking to frame \(videoInfo.frameIndex)", category: .app)
 
-            // Seek to exact frame
-            let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
+            // Seek to exact frame using integer arithmetic to avoid floating point precision issues
+            let time = videoInfo.frameTimeCMTime
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
                 Log.debug("[VideoFrameView] Seek completed, finished: \(finished)", category: .app)
                 // Pause at this frame

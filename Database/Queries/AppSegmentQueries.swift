@@ -238,6 +238,73 @@ enum AppSegmentQueries {
         return results
     }
 
+    static func getByBundleIDAndTimeRange(
+        db: OpaquePointer,
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) throws -> [Segment] {
+        let sql = """
+            SELECT id, bundleID, startDate, endDate, windowName, browserUrl, type
+            FROM segment
+            WHERE bundleID = ?
+              AND startDate <= ?
+              AND endDate >= ?
+            ORDER BY startDate DESC
+            LIMIT ? OFFSET ?
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, bundleID, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
+        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int(statement, 4, Int32(limit))
+        sqlite3_bind_int(statement, 5, Int32(offset))
+
+        var results: [Segment] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            results.append(try parseSegment(statement: statement!))
+        }
+        return results
+    }
+
+    // MARK: - Statistics
+
+    static func getCount(db: OpaquePointer) throws -> Int {
+        let sql = "SELECT COUNT(*) FROM segment;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return 0
+        }
+
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
     // MARK: - Delete
 
     static func delete(db: OpaquePointer, id: Int64) throws {

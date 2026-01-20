@@ -23,7 +23,7 @@ public struct SearchBar: View {
                 // Search icon
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.retraceSecondary)
-                    .font(.system(size: 18))
+                    .font(.retraceHeadline)
 
                 // Text field
                 TextField("Search your screen history...", text: $searchQuery)
@@ -106,7 +106,7 @@ public struct SearchBar: View {
                                 .foregroundColor(.retracePrimary)
                             Spacer()
                             Image(systemName: "chevron.down")
-                                .font(.system(size: 12))
+                                .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary)
                         }
                         .padding(.spacingS)

@@ -67,14 +67,14 @@ public struct TimelineSegment: View {
                         .frame(width: 16, height: 16)
                         .overlay(
                             Text(String(appName.prefix(1)))
-                                .font(.system(size: 10, weight: .bold))
+                                .font(.retraceTinyBold)
                                 .foregroundColor(.white)
                         )
 
                     // App name (if space allows)
                     if segmentWidth > 80 {
                         Text(appName)
-                            .font(.system(size: 10, weight: .medium))
+                            .font(.retraceTinyMedium)
                             .foregroundColor(.white)
                             .lineLimit(1)
                     }

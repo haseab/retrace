@@ -111,7 +111,7 @@ public struct FloatingSearchPanel: View {
                 }
             }) {
                 Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.white.opacity(0.6))
             }
             .buttonStyle(.plain)
@@ -119,7 +119,7 @@ public struct FloatingSearchPanel: View {
             // Close button
             Button(action: onClose) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.white.opacity(0.6))
             }
             .buttonStyle(.plain)
@@ -135,12 +135,12 @@ public struct FloatingSearchPanel: View {
     private var searchBar: some View {
         HStack(spacing: .spacingM) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 16))
+                .font(.retraceHeadline)
                 .foregroundColor(.white.opacity(0.5))
 
             TextField("Search your screen history...", text: $viewModel.searchQuery)
                 .textFieldStyle(.plain)
-                .font(.system(size: 16))
+                .font(.retraceHeadline)
                 .foregroundColor(.white)
                 .focused($isSearchFocused)
                 .onSubmit {
@@ -154,7 +154,7 @@ public struct FloatingSearchPanel: View {
                     viewModel.searchQuery = ""
                 }) {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 14))
+                        .font(.retraceCallout)
                         .foregroundColor(.white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
@@ -224,20 +224,20 @@ public struct FloatingSearchPanel: View {
                     // App name and timestamp
                     HStack {
                         Text(result.appName ?? "Unknown App")
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.retraceCaptionMedium)
                             .foregroundColor(.white)
 
                         Spacer()
 
                         Text(formatTimestamp(result.timestamp))
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.retraceMonoSmall)
                             .foregroundColor(.white.opacity(0.5))
                     }
 
                     // Snippet with highlighted match
                     if !result.snippet.isEmpty {
                         Text(result.snippet)
-                            .font(.system(size: 12))
+                            .font(.retraceCaption2)
                             .foregroundColor(.white.opacity(0.7))
                             .lineLimit(2)
                     }
@@ -257,15 +257,15 @@ public struct FloatingSearchPanel: View {
     private var emptyStateView: some View {
         VStack(spacing: .spacingM) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 32))
+                .font(.retraceDisplay3)
                 .foregroundColor(.white.opacity(0.3))
 
             Text("Search your screen history")
-                .font(.system(size: 14))
+                .font(.retraceCallout)
                 .foregroundColor(.white.opacity(0.5))
 
             Text("Type to find any text you've seen")
-                .font(.system(size: 12))
+                .font(.retraceCaption2)
                 .foregroundColor(.white.opacity(0.3))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -277,7 +277,7 @@ public struct FloatingSearchPanel: View {
                 .progressViewStyle(CircularProgressViewStyle(tint: .white))
 
             Text("Searching...")
-                .font(.system(size: 14))
+                .font(.retraceCallout)
                 .foregroundColor(.white.opacity(0.5))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -286,15 +286,15 @@ public struct FloatingSearchPanel: View {
     private var noResultsView: some View {
         VStack(spacing: .spacingM) {
             Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 32))
+                .font(.retraceDisplay3)
                 .foregroundColor(.white.opacity(0.3))
 
             Text("No results found")
-                .font(.system(size: 14))
+                .font(.retraceCallout)
                 .foregroundColor(.white.opacity(0.5))
 
             Text("Try a different search term")
-                .font(.system(size: 12))
+                .font(.retraceCaption2)
                 .foregroundColor(.white.opacity(0.3))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

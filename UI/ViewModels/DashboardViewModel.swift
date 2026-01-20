@@ -18,6 +18,10 @@ public class DashboardViewModel: ObservableObject {
     @Published public var totalWeeklyTime: TimeInterval = 0
     @Published public var weekDateRange: String = ""
 
+    // Overall statistics
+    @Published public var totalStorageBytes: Int64 = 0
+    @Published public var daysRecorded: Int = 0
+
     // Loading state
     @Published public var isLoading = false
     @Published public var error: String?
@@ -64,7 +68,7 @@ public class DashboardViewModel: ObservableObject {
             // Update recording status immediately
             await updateRecordingStatus()
         } catch {
-            print("Failed to toggle recording: \(error)")
+            Log.error("[DashboardViewModel] Failed to toggle recording: \(error)", category: .ui)
             // Revert to actual state on error
             await updateRecordingStatus()
         }
@@ -94,6 +98,11 @@ public class DashboardViewModel: ObservableObject {
         await updateRecordingStatus()
 
         do {
+            // Load overall statistics
+            totalStorageBytes = try await coordinator.getTotalStorageUsed()
+            let allDates = try await coordinator.getDistinctDates()
+            daysRecorded = allDates.count
+
             // Calculate week date range
             let calendar = Calendar.current
             let now = Date()
@@ -115,8 +124,8 @@ public class DashboardViewModel: ObservableObject {
                 // Calculate session duration
                 let duration = session.endDate.timeIntervalSince(session.startDate)
 
-                // Derive app name from bundle ID (e.g., "com.google.Chrome" -> "Chrome")
-                let appName = session.bundleID.components(separatedBy: ".").last ?? session.bundleID
+                // Resolve app name using the smart resolver (handles random IDs, system lookups, etc.)
+                let appName = AppNameResolver.shared.displayName(for: session.bundleID)
 
                 if var existing = appDurations[session.bundleID] {
                     existing.duration += duration
@@ -151,6 +160,45 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    // MARK: - App Session Details
+
+    /// Fetch detailed sessions for a specific app with pagination
+    /// - Parameters:
+    ///   - bundleID: The app's bundle identifier
+    ///   - offset: Number of sessions to skip (for pagination)
+    ///   - limit: Maximum number of sessions to return
+    /// - Returns: Array of sessions sorted by most recent first
+    public func getSessionsForApp(bundleID: String, offset: Int, limit: Int) async -> [AppSessionDetail] {
+        do {
+            let calendar = Calendar.current
+            let now = Date()
+            let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: now))!
+
+            // Use efficient SQL query with bundleID filter, time range, and pagination
+            let segments = try await coordinator.getSegments(
+                bundleID: bundleID,
+                from: weekStart,
+                to: now,
+                limit: limit,
+                offset: offset
+            )
+
+            return segments.map { segment in
+                AppSessionDetail(
+                    id: segment.id.value,
+                    appBundleID: segment.bundleID,
+                    appName: AppNameResolver.shared.displayName(for: segment.bundleID),
+                    startDate: segment.startDate,
+                    endDate: segment.endDate,
+                    windowName: segment.windowName
+                )
+            }
+        } catch {
+            Log.error("[DashboardViewModel] Failed to fetch sessions for app: \(error)", category: .ui)
+            return []
+        }
+    }
+
     // MARK: - Cleanup
 
     deinit {
@@ -168,4 +216,18 @@ public struct AppUsageData: Identifiable {
     public let duration: TimeInterval
     public let sessionCount: Int
     public let percentage: Double
+}
+
+/// Represents a single session (continuous usage period) for an app
+public struct AppSessionDetail: Identifiable {
+    public let id: Int64
+    public let appBundleID: String
+    public let appName: String
+    public let startDate: Date
+    public let endDate: Date
+    public let windowName: String?
+
+    public var duration: TimeInterval {
+        endDate.timeIntervalSince(startDate)
+    }
 }

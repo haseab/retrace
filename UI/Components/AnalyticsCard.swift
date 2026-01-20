@@ -57,28 +57,28 @@ public struct AnalyticsCard: View {
                     .frame(width: 48, height: 48)
 
                 Image(systemName: icon)
-                    .font(.system(size: 20, weight: .semibold))
+                    .font(.retraceTitle3)
                     .foregroundStyle(gradient)
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 // Value
                 Text(value)
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .font(.retraceLargeNumber)
                     .foregroundColor(.retracePrimary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
 
                 // Title
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.retraceCalloutMedium)
                     .foregroundColor(.retraceSecondary)
             }
 
             // Subtitle (optional)
             if let subtitle = subtitle {
                 Text(subtitle)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary.opacity(0.7))
                     .lineLimit(1)
             }

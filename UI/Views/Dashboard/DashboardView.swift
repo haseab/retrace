@@ -11,8 +11,21 @@ public struct DashboardView: View {
     @StateObject private var viewModel: DashboardViewModel
     @State private var isPulsing = false
     @State private var showFeedbackSheet = false
-    @State private var hoveredAppIndex: Int? = nil
-    @State private var animateStats = false
+    @State private var usageViewMode: AppUsageViewMode = .hardDrive
+    @State private var selectedApp: AppUsageData? = nil
+    @State private var showSessionsSheet = false
+
+    enum AppUsageViewMode: String, CaseIterable {
+        case list = "list"
+        case hardDrive = "squares"
+
+        var icon: String {
+            switch self {
+            case .list: return "list.bullet"
+            case .hardDrive: return "square.grid.2x2"
+            }
+        }
+    }
 
     // MARK: - Initialization
 
@@ -48,9 +61,9 @@ public struct DashboardView: View {
                     .padding(.bottom, 32)
 
                 // Stats Cards Row
-                statsCardsSection
+                statsCardsRow
                     .padding(.horizontal, 32)
-                    .padding(.bottom, 32)
+                    .padding(.bottom, 24)
 
                 // App Usage Section
                 appUsageSection
@@ -97,10 +110,36 @@ public struct DashboardView: View {
         )
         .task {
             await viewModel.loadStatistics()
-            withAnimation(.easeOut(duration: 0.6).delay(0.2)) {
-                animateStats = true
+        }
+        .sheet(isPresented: $showSessionsSheet) {
+            if let app = selectedApp {
+                AppSessionsDetailView(
+                    app: app,
+                    onOpenInTimeline: { date in
+                        openTimelineAt(date: date)
+                    },
+                    loadSessions: { offset, limit in
+                        await viewModel.getSessionsForApp(
+                            bundleID: app.appBundleID,
+                            offset: offset,
+                            limit: limit
+                        )
+                    }
+                )
             }
         }
+    }
+
+    // MARK: - App Session Actions
+
+    private func handleAppTapped(_ app: AppUsageData) {
+        selectedApp = app
+        showSessionsSheet = true
+    }
+
+    private func openTimelineAt(date: Date) {
+        // Show the timeline and navigate to the specific date
+        TimelineWindowController.shared.showAndNavigate(to: date)
     }
 
     // MARK: - Header
@@ -109,11 +148,11 @@ public struct DashboardView: View {
         HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Dashboard")
-                    .font(.system(size: 32, weight: .bold))
+                    .font(.retraceDisplay3)
                     .foregroundColor(.retracePrimary)
 
                 Text(viewModel.weekDateRange)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.retraceCalloutMedium)
                     .foregroundColor(.retraceSecondary)
             }
 
@@ -124,10 +163,6 @@ public struct DashboardView: View {
                 recordingIndicator
 
                 // Action buttons
-                actionButton(icon: "bubble.left.and.bubble.right", label: "Feedback") {
-                    showFeedbackSheet = true
-                }
-
                 actionButton(icon: "arrow.clockwise", label: nil) {
                     Task { await viewModel.loadStatistics() }
                 }
@@ -146,10 +181,10 @@ public struct DashboardView: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.retraceCalloutMedium)
                 if let label = label {
                     Text(label)
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.retraceCaptionMedium)
                 }
             }
             .foregroundColor(.retraceSecondary)
@@ -192,7 +227,7 @@ public struct DashboardView: View {
             }
 
             Text(viewModel.isRecording ? "Recording" : "Paused")
-                .font(.system(size: 13, weight: .medium))
+                .font(.retraceCaptionMedium)
                 .foregroundColor(viewModel.isRecording ? .retraceSuccess : .retraceSecondary)
 
             Toggle("", isOn: Binding(
@@ -219,94 +254,162 @@ public struct DashboardView: View {
         )
     }
 
-    // MARK: - Stats Cards Section
+    // MARK: - Stats Cards Row
 
-    private var statsCardsSection: some View {
+    private var statsCardsRow: some View {
         HStack(spacing: 16) {
-            // Total Screen Time Card
-            StatCard(
+            // Screen Time Card
+            statCard(
+                icon: "clock.fill",
                 title: "Screen Time",
                 value: formatTotalTime(viewModel.totalWeeklyTime),
                 subtitle: "This week",
-                icon: "clock.fill",
-                gradient: LinearGradient.retraceAccentGradient,
-                animate: animateStats
+                gradient: LinearGradient.retraceAccentGradient
             )
 
-            // Apps Used Card
-            StatCard(
-                title: "Apps Used",
-                value: "\(viewModel.weeklyAppUsage.count)",
-                subtitle: "Unique apps",
-                icon: "square.grid.2x2.fill",
-                gradient: LinearGradient.retracePurpleGradient,
-                animate: animateStats
+            // Storage Used Card
+            statCard(
+                icon: "externaldrive.fill",
+                title: "Storage Used",
+                value: formatStorageSize(viewModel.totalStorageBytes),
+                subtitle: "Total",
+                gradient: LinearGradient(
+                    colors: [Color(red: 139/255, green: 92/255, blue: 246/255), Color(red: 168/255, green: 85/255, blue: 247/255)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
             )
 
-            // Total Sessions Card
-            StatCard(
-                title: "Sessions",
-                value: "\(totalSessions)",
-                subtitle: "App switches",
-                icon: "arrow.triangle.swap",
-                gradient: LinearGradient.retraceGreenGradient,
-                animate: animateStats
-            )
-
-            // Most Used App Card
-            StatCard(
-                title: "Top App",
-                value: topAppName,
-                subtitle: topAppTime,
-                icon: "star.fill",
-                gradient: LinearGradient.retraceOrangeGradient,
-                animate: animateStats
+            // Days Recorded Card
+            statCard(
+                icon: "calendar",
+                title: "Days Recorded",
+                value: formatDaysRecorded(viewModel.daysRecorded),
+                subtitle: "\(viewModel.daysRecorded) day\(viewModel.daysRecorded == 1 ? "" : "s") total",
+                gradient: LinearGradient(
+                    colors: [Color(red: 34/255, green: 197/255, blue: 94/255), Color(red: 22/255, green: 163/255, blue: 74/255)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
             )
         }
     }
 
-    private var totalSessions: Int {
-        viewModel.weeklyAppUsage.reduce(0) { $0 + $1.sessionCount }
+    private func statCard(icon: String, title: String, value: String, subtitle: String, gradient: LinearGradient) -> some View {
+        HStack(spacing: 14) {
+            // Icon
+            ZStack {
+                Circle()
+                    .fill(gradient.opacity(0.2))
+                    .frame(width: 44, height: 44)
+
+                Image(systemName: icon)
+                    .font(.retraceHeadline)
+                    .foregroundStyle(gradient)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary)
+
+                Text(value)
+                    .font(.retraceMediumNumber)
+                    .foregroundColor(.retracePrimary)
+
+                Text(subtitle)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary.opacity(0.7))
+            }
+
+            Spacer()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity)
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(14)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
-    private var topAppName: String {
-        viewModel.weeklyAppUsage.first?.appName ?? "—"
+    private func formatStorageSize(_ bytes: Int64) -> String {
+        // Use decimal (SI) units to match Finder
+        let gb = Double(bytes) / 1_000_000_000
+        if gb >= 1.0 {
+            return String(format: "%.2f GB", gb)
+        } else {
+            let mb = Double(bytes) / 1_000_000
+            return String(format: "%.0f MB", mb)
+        }
     }
 
-    private var topAppTime: String {
-        guard let topApp = viewModel.weeklyAppUsage.first else { return "No data" }
-        return formatDuration(topApp.duration)
+    private func formatDaysRecorded(_ days: Int) -> String {
+        if days == 0 {
+            return "0"
+        } else if days < 7 {
+            return "\(days) day\(days == 1 ? "" : "s")"
+        } else if days < 30 {
+            let weeks = days / 7
+            return "\(weeks) week\(weeks == 1 ? "" : "s")"
+        } else if days < 365 {
+            let months = days / 30
+            return "\(months) month\(months == 1 ? "" : "s")"
+        } else {
+            let years = days / 365
+            return "\(years) year\(years == 1 ? "" : "s")"
+        }
     }
 
     // MARK: - App Usage Section
 
     private var appUsageSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // Section header
-            HStack {
-                Text("App Usage")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(.retracePrimary)
-
-                Spacer()
-
-                if !viewModel.weeklyAppUsage.isEmpty {
-                    Text("\(viewModel.weeklyAppUsage.count) apps")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.retraceSecondary)
-                }
-            }
-
+        VStack(alignment: .leading, spacing: 0) {
             if viewModel.weeklyAppUsage.isEmpty {
                 emptyStateView
             } else {
-                // App usage list with modern cards
-                VStack(spacing: 8) {
-                    ForEach(Array(viewModel.weeklyAppUsage.prefix(10).enumerated()), id: \.offset) { index, app in
-                        appUsageRow(index: index, app: app)
+                VStack(spacing: 0) {
+                    // Header row with view mode toggle
+                    HStack {
+                        Text("App Usage")
+                            .font(.retraceHeadline)
+                            .foregroundColor(.retracePrimary)
+
+                        Spacer()
+
+                        Text("\(viewModel.weeklyAppUsage.count) apps this week")
+                            .font(.retraceCaptionMedium)
+                            .foregroundColor(.retraceSecondary)
+
+                        // View mode toggle
+                        viewModeToggle
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
+
+                    Divider()
+                        .background(Color.white.opacity(0.06))
+
+                    // Content based on view mode
+                    switch usageViewMode {
+                    case .list:
+                        AppUsageListView(
+                            apps: viewModel.weeklyAppUsage,
+                            onAppTapped: { app in
+                                handleAppTapped(app)
+                            }
+                        )
+                    case .hardDrive:
+                        AppUsageHardDriveView(
+                            apps: viewModel.weeklyAppUsage,
+                            totalTime: viewModel.totalWeeklyTime,
+                            onAppTapped: { app in
+                                handleAppTapped(app)
+                            }
+                        )
                     }
                 }
-                .padding(16)
                 .background(Color.white.opacity(0.03))
                 .cornerRadius(16)
                 .overlay(
@@ -317,6 +420,33 @@ public struct DashboardView: View {
         }
     }
 
+    private var viewModeToggle: some View {
+        HStack(spacing: 4) {
+            ForEach(AppUsageViewMode.allCases, id: \.self) { mode in
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        usageViewMode = mode
+                    }
+                }) {
+                    Image(systemName: mode.icon)
+                        .font(.retraceCaption2Medium)
+                        .foregroundColor(usageViewMode == mode ? .retracePrimary : .retraceSecondary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(usageViewMode == mode ? Color.white.opacity(0.1) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.05))
+        )
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 16) {
             ZStack {
@@ -325,17 +455,17 @@ public struct DashboardView: View {
                     .frame(width: 80, height: 80)
 
                 Image(systemName: "clock.badge.questionmark")
-                    .font(.system(size: 32, weight: .light))
+                    .font(.retraceDisplay3)
                     .foregroundColor(.retraceAccent)
             }
 
             VStack(spacing: 8) {
                 Text("No activity recorded yet")
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
 
                 Text("Start using your Mac and Retrace will track your app usage automatically.")
-                    .font(.system(size: 14))
+                    .font(.retraceCallout)
                     .foregroundColor(.retraceSecondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 320)
@@ -349,83 +479,6 @@ public struct DashboardView: View {
             RoundedRectangle(cornerRadius: 16)
                 .stroke(Color.white.opacity(0.06), lineWidth: 1)
         )
-    }
-
-    private func appUsageRow(index: Int, app: AppUsageData) -> some View {
-        let isHovered = hoveredAppIndex == index
-        let appColor = Color.segmentColor(for: app.appBundleID)
-
-        return HStack(spacing: 14) {
-            // Rank number
-            Text("\(index + 1)")
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .foregroundColor(index < 3 ? appColor : .retraceSecondary)
-                .frame(width: 24)
-
-            // Color indicator
-            RoundedRectangle(cornerRadius: 3)
-                .fill(appColor)
-                .frame(width: 4, height: 36)
-
-            // App info
-            VStack(alignment: .leading, spacing: 2) {
-                Text(app.appName)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.retracePrimary)
-                    .lineLimit(1)
-
-                Text("\(app.sessionCount) session\(app.sessionCount == 1 ? "" : "s")")
-                    .font(.system(size: 12))
-                    .foregroundColor(.retraceSecondary)
-            }
-
-            Spacer()
-
-            // Progress bar
-            GeometryReader { geometry in
-                ZStack(alignment: .trailing) {
-                    // Background
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.white.opacity(0.05))
-
-                    // Progress
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(
-                            LinearGradient(
-                                colors: [appColor.opacity(0.8), appColor.opacity(0.4)],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(width: max(geometry.size.width * app.percentage, 8))
-                }
-            }
-            .frame(width: 120, height: 6)
-
-            // Duration and percentage
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(formatDuration(app.duration))
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
-                    .foregroundColor(.retracePrimary)
-
-                Text(String(format: "%.1f%%", app.percentage * 100))
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.retraceSecondary)
-            }
-            .frame(width: 70, alignment: .trailing)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(isHovered ? Color.white.opacity(0.05) : Color.clear)
-        )
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                hoveredAppIndex = hovering ? index : nil
-            }
-        }
     }
 
     // MARK: - Footer
@@ -442,7 +495,7 @@ public struct DashboardView: View {
                         Text("@haseab")
                             .foregroundColor(.retraceAccent)
                     }
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                 }
                 .buttonStyle(.plain)
 
@@ -453,10 +506,25 @@ public struct DashboardView: View {
                 Link(destination: URL(string: "https://buymeacoffee.com/haseab")!) {
                     HStack(spacing: 6) {
                         Image(systemName: "cup.and.saucer.fill")
-                            .font(.system(size: 11))
+                            .font(.retraceCaption2)
                         Text("Support")
                     }
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary)
+                }
+                .buttonStyle(.plain)
+
+                Circle()
+                    .fill(Color.retraceSecondary.opacity(0.5))
+                    .frame(width: 3, height: 3)
+
+                Button(action: { showFeedbackSheet = true }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "bubble.left.and.bubble.right")
+                            .font(.retraceCaption2)
+                        Text("Feedback")
+                    }
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
                 }
                 .buttonStyle(.plain)
@@ -480,79 +548,6 @@ public struct DashboardView: View {
         }
     }
 
-    private func formatDuration(_ duration: TimeInterval) -> String {
-        let hours = Int(duration) / 3600
-        let minutes = (Int(duration) % 3600) / 60
-
-        if hours > 0 {
-            return "\(hours)h \(minutes)m"
-        } else {
-            return "\(minutes)m"
-        }
-    }
-}
-
-// MARK: - Stat Card Component
-
-private struct StatCard: View {
-    let title: String
-    let value: String
-    let subtitle: String
-    let icon: String
-    let gradient: LinearGradient
-    let animate: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Icon with gradient background
-            ZStack {
-                Circle()
-                    .fill(gradient.opacity(0.2))
-                    .frame(width: 40, height: 40)
-
-                Image(systemName: icon)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(gradient)
-            }
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(value)
-                    .font(.system(size: 24, weight: .bold, design: .rounded))
-                    .foregroundColor(.retracePrimary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.retraceSecondary)
-            }
-
-            Text(subtitle)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(.retraceSecondary.opacity(0.7))
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(20)
-        .background(
-            ZStack {
-                Color.white.opacity(0.03)
-
-                // Subtle gradient overlay
-                LinearGradient(
-                    colors: [Color.white.opacity(0.02), Color.clear],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-            }
-        )
-        .cornerRadius(16)
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
-        .opacity(animate ? 1 : 0)
-        .offset(y: animate ? 0 : 10)
-    }
 }
 
 // MARK: - Preview

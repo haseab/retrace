@@ -17,6 +17,11 @@ public actor HEVCEncoder {
     private var segmentStartTime: Date?
     private var isUsingHardwareAcceleration = false
 
+    // Fragment tracking for logging
+    private var lastLoggedFileSize: Int64 = 0
+    private var frameCount: Int = 0
+    private var fragmentCount: Int = 0
+
     public init() {}
 
     /// Check if hardware encoding is available for the given codec
@@ -70,8 +75,14 @@ public actor HEVCEncoder {
         // Video output settings
         // Note: AVAssetWriter will automatically use hardware encoding if available
         // We verify availability above but cannot force it through compressionProperties
+
+        // Use quality-based encoding (CRF-style) for consistent quality regardless of content complexity
+        // AVVideoQualityKey: 0.0 = max compression (lowest quality), 1.0 = min compression (highest quality)
+        let quality = config.quality
+        Log.info("Video encoder using quality-based encoding: \(quality) for \(width)x\(height)", category: .storage)
+
         var compressionProperties: [String: Any] = [
-            AVVideoAverageBitRateKey: config.targetBitrate ?? 2_000_000,
+            AVVideoQualityKey: quality,
             AVVideoMaxKeyFrameIntervalKey: config.keyframeInterval,
             AVVideoAllowFrameReorderingKey: false,
             AVVideoExpectedSourceFrameRateKey: 30
@@ -112,6 +123,12 @@ public actor HEVCEncoder {
 
         writer.add(input)
 
+        // Enable movie fragment interval for incremental readability
+        // This writes moof/mdat pairs every 0.1 seconds of video time, allowing AVAssetImageGenerator
+        // to read frames before finalization. With 2-second capture intervals and 30fps encoding,
+        // each frame is 1/30s of video time, so first fragment writes after ~3 frames (~6 real seconds)
+        writer.movieFragmentInterval = CMTime(seconds: 0.1, preferredTimescale: 600)
+
         // Add metadata including segment start time
         let metadataItem = AVMutableMetadataItem()
         metadataItem.identifier = .quickTimeMetadataCreationDate
@@ -136,6 +153,11 @@ public actor HEVCEncoder {
         self.videoInput = input
         self.adaptor = adaptor
         self.isFinalized = false
+        self.frameCount = 0
+        self.fragmentCount = 0
+        self.lastLoggedFileSize = 0
+
+        Log.info("Video encoder initialized with movieFragmentInterval=0.1s (frames readable after ~3 captures)", category: .storage)
     }
 
     public func encode(pixelBuffer: CVPixelBuffer, timestamp: CMTime) async throws {
@@ -143,27 +165,59 @@ public actor HEVCEncoder {
             throw StorageModuleError.encodingFailed(underlying: "Encoder not initialized or finalized")
         }
 
-        // Wait for input to be ready
+        // Wait for input to be ready with timeout (5 seconds max)
+        let maxWaitIterations = 5000 // 5000 * 1ms = 5 seconds
+        var waitIterations = 0
         while !input.isReadyForMoreMediaData {
+            waitIterations += 1
+            if waitIterations >= maxWaitIterations {
+                Log.error("Encoder timeout: isReadyForMoreMediaData never became true after 5s, auto-finalizing", category: .storage)
+                try await finalize()
+                throw StorageModuleError.encodingFailed(underlying: "Encoder timeout waiting for input ready - auto-finalized")
+            }
             try await Task.sleep(nanoseconds: 1_000_000) // 1ms
         }
 
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {
             throw StorageModuleError.encodingFailed(underlying: "Failed to append pixel buffer")
         }
+
+        frameCount += 1
+
+        // Check if a new fragment was written by monitoring file size changes
+        // Fragments are written every ~4 seconds of video time
+        if let url = outputURL {
+            let currentSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+            let sizeIncrease = currentSize - lastLoggedFileSize
+
+            // A fragment write typically causes a significant size jump (>1KB)
+            // Log when we detect a new fragment has been flushed to disk
+            if sizeIncrease > 1024 && lastLoggedFileSize > 0 {
+                fragmentCount += 1
+                Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(frameCount) frames, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
+                lastLoggedFileSize = currentSize
+            } else if lastLoggedFileSize == 0 && currentSize > 0 {
+                // First write - initialization
+                lastLoggedFileSize = currentSize
+            }
+        }
     }
 
     public func finalize() async throws {
         guard let writer = assetWriter, let input = videoInput, !isFinalized else { return }
+
+        let preSize = (try? FileManager.default.attributesOfItem(atPath: outputURL?.path ?? "")[.size] as? Int64) ?? 0
+
         isFinalized = true
-
         input.markAsFinished()
-
         await writer.finishWriting()
 
         if writer.status == .failed {
             throw StorageModuleError.encodingFailed(underlying: "Writer failed: \(writer.error?.localizedDescription ?? "unknown")")
         }
+
+        let postSize = (try? FileManager.default.attributesOfItem(atPath: outputURL?.path ?? "")[.size] as? Int64) ?? 0
+        Log.info("✅ Video finalized: \(frameCount) frames, \(fragmentCount) fragments written during recording, final size: \(postSize / 1024)KB (defragmented: +\((postSize - preSize) / 1024)KB)", category: .storage)
 
         assetWriter = nil
         videoInput = nil
@@ -190,5 +244,11 @@ public actor HEVCEncoder {
     /// Returns true if hardware acceleration is being used for encoding
     public func isHardwareAccelerated() -> Bool {
         return isUsingHardwareAcceleration
+    }
+
+    /// Returns true if at least one fragment has been written to disk
+    /// The fragmented MP4 is only readable after the first fragment is flushed
+    public func hasFragmentWritten() -> Bool {
+        return fragmentCount > 0
     }
 }

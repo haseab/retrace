@@ -126,12 +126,12 @@ public struct SpotlightSearchOverlay: View {
     private var searchBar: some View {
         HStack(spacing: 12) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 20, weight: .medium))
+                .font(.retraceTitle3)
                 .foregroundColor(.white.opacity(0.5))
 
             TextField("Search your screen history...", text: $viewModel.searchQuery)
                 .textFieldStyle(.plain)
-                .font(.system(size: 18))
+                .font(.retraceHeadline)
                 .foregroundColor(.white)
                 .focused($isSearchFocused)
                 .onSubmit {
@@ -148,7 +148,7 @@ public struct SpotlightSearchOverlay: View {
                     viewModel.searchQuery = ""
                 }) {
                     Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 16))
+                        .font(.retraceHeadline)
                         .foregroundColor(.white.opacity(0.4))
                 }
                 .buttonStyle(.plain)
@@ -168,7 +168,7 @@ public struct SpotlightSearchOverlay: View {
                     }
                 }) {
                     Image(systemName: "arrow.right.circle.fill")
-                        .font(.system(size: 24))
+                        .font(.retraceMediumNumber)
                         .foregroundColor(viewModel.searchQuery.isEmpty ? .white.opacity(0.2) : .blue)
                 }
                 .buttonStyle(.plain)
@@ -278,7 +278,7 @@ public struct SpotlightSearchOverlay: View {
                             .progressViewStyle(CircularProgressViewStyle(tint: .white))
                             .scaleEffect(0.8)
                         Text("Loading more...")
-                            .font(.system(size: 12))
+                            .font(.retraceCaption2)
                             .foregroundColor(.white.opacity(0.5))
                         Spacer()
                     }
@@ -311,16 +311,16 @@ public struct SpotlightSearchOverlay: View {
                 .scaleEffect(1.2)
 
             Text("Searching...")
-                .font(.system(size: 14))
+                .font(.retraceCallout)
                 .foregroundColor(.white.opacity(0.5))
 
             // Show slow query alert when filtering by app with "All" mode
             if viewModel.selectedAppFilter != nil && viewModel.searchMode == .all {
                 HStack(spacing: 6) {
                     Image(systemName: "info.circle.fill")
-                        .font(.system(size: 12))
+                        .font(.retraceCaption2)
                     Text("\"All\" queries with app filters are slower")
-                        .font(.system(size: 12))
+                        .font(.retraceCaption2)
                 }
                 .foregroundColor(.yellow.opacity(0.8))
                 .padding(.horizontal, 12)
@@ -338,15 +338,15 @@ public struct SpotlightSearchOverlay: View {
     private var noResultsView: some View {
         VStack(spacing: 12) {
             Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 36))
+                .font(.retraceDisplay2)
                 .foregroundColor(.white.opacity(0.3))
 
             Text("No results found")
-                .font(.system(size: 15, weight: .medium))
+                .font(.retraceBodyMedium)
                 .foregroundColor(.white.opacity(0.6))
 
             Text("Try a different search term")
-                .font(.system(size: 13))
+                .font(.retraceCaption)
                 .foregroundColor(.white.opacity(0.4))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -666,6 +666,10 @@ public struct SpotlightSearchOverlay: View {
 
     private func dismissOverlay() {
         Log.debug("\(searchLog) Dismissing overlay", category: .ui)
+
+        // Cancel any in-flight search tasks to prevent blocking
+        viewModel.cancelSearch()
+
         withAnimation(.easeOut(duration: 0.15)) {
             isVisible = false
         }
@@ -729,13 +733,13 @@ private struct GalleryResultCard: View {
                         // Title with source badge
                         HStack(spacing: 6) {
                             Text(displayTitle)
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.retraceCaption2Medium)
                                 .foregroundColor(.white)
                                 .lineLimit(1)
 
                             // Source badge
                             Text(result.source == .native ? "Retrace" : "Rewind")
-                                .font(.system(size: 9, weight: .semibold))
+                                .font(.retraceTinyBold)
                                 .foregroundColor(result.source == .native ? .blue : .purple)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
@@ -746,15 +750,15 @@ private struct GalleryResultCard: View {
                         // Timestamp and relevance
                         HStack(spacing: 6) {
                             Text(formatTimestamp(result.timestamp))
-                                .font(.system(size: 10))
+                                .font(.retraceTiny)
                                 .foregroundColor(.white.opacity(0.5))
 
                             Text("•")
-                                .font(.system(size: 10))
+                                .font(.retraceTiny)
                                 .foregroundColor(.white.opacity(0.3))
 
                             Text(String(format: "relevance: %.0f%%", result.relevanceScore * 100))
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .font(.retraceMonoSmall)
                                 .foregroundColor(.yellow.opacity(0.7))
                         }
                     }

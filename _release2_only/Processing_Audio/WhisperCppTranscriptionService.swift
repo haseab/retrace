@@ -40,7 +40,7 @@ public actor WhisperCppTranscriptionService: TranscriptionProtocol {
 
                 if whisperContext != nil {
                     isInitialized = true
-                    print("✅ Whisper.cpp initialized with CoreML acceleration: \(expandedPath)")
+                    Log.info("[WhisperCppTranscriptionService] Whisper.cpp initialized with CoreML acceleration: \(expandedPath)", category: .processing)
                     return
                 }
             }
@@ -54,7 +54,7 @@ public actor WhisperCppTranscriptionService: TranscriptionProtocol {
         }
 
         isInitialized = true
-        print("✅ Whisper.cpp initialized with model: \(expandedPath)")
+        Log.info("[WhisperCppTranscriptionService] Whisper.cpp initialized with model: \(expandedPath)", category: .processing)
     }
 
     /// Cleanup

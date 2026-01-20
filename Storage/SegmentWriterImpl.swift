@@ -8,16 +8,22 @@ public actor SegmentWriterImpl: SegmentWriter {
     public let segmentID: VideoSegmentID
     public private(set) var frameCount: Int = 0
     public let startTime: Date
+    public let relativePath: String
+    public private(set) var frameWidth: Int = 0
+    public private(set) var frameHeight: Int = 0
+
+    public var currentFileSize: Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int64) ?? 0
+    }
+
+    public private(set) var hasFragmentWritten: Bool = false
 
     private let encoder: HEVCEncoder
     private let encoderConfig: VideoEncoderConfig
     private let fileURL: URL
-    private let relativePath: String
     private var encoderInitialized = false
     private var cancelled = false
     private var lastFrameTime: Date?
-    private var frameWidth: Int = 0
-    private var frameHeight: Int = 0
 
     init(
         segmentID: VideoSegmentID,
@@ -59,16 +65,20 @@ public actor SegmentWriterImpl: SegmentWriter {
         }
 
         let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
-        // Encode at fixed 30 FPS regardless of actual capture intervals
-        // Frame N is at time N/30.0 seconds (so frame 0 = 0s, frame 1 = 0.033s, etc.)
-        // This creates a smooth video that can be seeked frame-by-frame
-        let frameTime = Double(frameCount) / 30.0
-        let timestamp = CMTime(seconds: frameTime, preferredTimescale: 600)
+        // Use integer arithmetic to avoid floating point precision issues
+        // At 30fps with timescale 600: each frame = 20 time units (600/30 = 20)
+        // This ensures exact timestamps: frame 0 = 0, frame 1 = 20, frame 11 = 220, etc.
+        let timestamp = CMTime(value: Int64(frameCount) * 20, timescale: 600)
 
         try await encoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
 
         frameCount += 1
         lastFrameTime = frame.timestamp
+
+        // Check if first fragment has been written (makes video readable)
+        if !hasFragmentWritten {
+            hasFragmentWritten = await encoder.hasFragmentWritten()
+        }
     }
 
     public func finalize() async throws -> VideoSegment {

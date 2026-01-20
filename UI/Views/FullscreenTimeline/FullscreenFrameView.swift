@@ -97,7 +97,7 @@ public struct FullscreenFrameView: View {
     private var emptyStateView: some View {
         VStack(spacing: .spacingL) {
             Image(systemName: "photo.on.rectangle.angled")
-                .font(.system(size: 64))
+                .font(.retraceDisplay)
                 .foregroundColor(.white.opacity(0.3))
 
             VStack(spacing: .spacingS) {

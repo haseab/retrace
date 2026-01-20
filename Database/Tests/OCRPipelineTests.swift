@@ -94,11 +94,6 @@ final class OCRPipelineTests: XCTestCase {
 
     /// Process all screenshots through the full pipeline
     func testProcessScreenshotsThroughFullPipeline() async throws {
-        // STEP 0: Clean database to prevent duplication from multiple test runs
-        print("\n🧹 Cleaning database...")
-        try await cleanDatabase()
-        print("   ✓ Database cleaned")
-
         // STEP 1: Discover all screenshot files
         print("\n📁 Scanning for screenshots...")
         let files = try FileManager.default.contentsOfDirectory(atPath: screenshotPath)

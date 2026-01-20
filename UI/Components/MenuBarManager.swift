@@ -6,6 +6,11 @@ import Shared
 /// Manages the macOS menu bar icon and status menu
 public class MenuBarManager: ObservableObject {
 
+    // MARK: - Shared Instance
+
+    /// Shared instance for accessing from Settings and other views
+    public static var shared: MenuBarManager?
+
     // MARK: - Properties
 
     private var statusItem: NSStatusItem?
@@ -18,6 +23,9 @@ public class MenuBarManager: ObservableObject {
     /// Tracks whether recording indicator should be hidden (e.g., when timeline is open)
     private var shouldHideRecordingIndicator = false
 
+    /// Tracks whether the menu bar icon should be visible (user preference)
+    private var isMenuBarIconEnabled = true
+
     /// Cached shortcuts (loaded from OnboardingManager)
     private var timelineShortcut: ShortcutConfig = .defaultTimeline
     private var dashboardShortcut: ShortcutConfig = .defaultDashboard
@@ -27,16 +35,20 @@ public class MenuBarManager: ObservableObject {
     public init(coordinator: AppCoordinator, onboardingManager: OnboardingManager) {
         self.coordinator = coordinator
         self.onboardingManager = onboardingManager
+        MenuBarManager.shared = self
     }
 
     // MARK: - Setup
 
     public func setup() {
+        // Don't create status item if menu bar icon is disabled
+        guard isMenuBarIconEnabled else { return }
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if statusItem?.button != nil {
-            // Start with custom icon showing both indicators
-            updateIcon(recording: false)
+            // Start with icon showing current recording state
+            updateIcon(recording: isRecording)
         }
 
         // Load shortcuts then setup menu and hotkeys
@@ -46,6 +58,8 @@ public class MenuBarManager: ObservableObject {
             setupTimelineNotifications()
             setupGlobalHotkey()
             setupAutoRefresh()
+            // Sync with coordinator to get current recording state
+            syncWithCoordinator()
         }
     }
 
@@ -63,6 +77,16 @@ public class MenuBarManager: ObservableObject {
     private func loadShortcuts() async {
         timelineShortcut = await onboardingManager.timelineShortcut
         dashboardShortcut = await onboardingManager.dashboardShortcut
+        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString)", category: .ui)
+    }
+
+    /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
+    public func reloadShortcuts() {
+        Task { @MainActor in
+            await loadShortcuts()
+            setupGlobalHotkey()
+            setupMenu()
+        }
     }
 
     /// Setup notifications for timeline open/close
@@ -86,6 +110,10 @@ public class MenuBarManager: ObservableObject {
 
     /// Setup global hotkeys for timeline and dashboard
     private func setupGlobalHotkey() {
+        // Clear existing hotkeys before registering new ones
+        // This prevents old shortcuts from persisting after settings changes
+        HotkeyManager.shared.unregisterAll()
+
         // Register timeline global hotkey
         HotkeyManager.shared.registerHotkey(
             key: timelineShortcut.key,
@@ -299,21 +327,21 @@ public class MenuBarManager: ObservableObject {
             do {
                 // Check actual coordinator state first
                 let coordinatorIsRunning = await coordinator.getStatus().isRunning
-                print("[MenuBar] toggleRecording called, coordinatorIsRunning=\(coordinatorIsRunning)")
+                Log.debug("[MenuBar] toggleRecording called, coordinatorIsRunning=\(coordinatorIsRunning)", category: .ui)
 
                 if coordinatorIsRunning {
-                    print("[MenuBar] Stopping pipeline...")
+                    Log.debug("[MenuBar] Stopping pipeline...", category: .ui)
                     try await coordinator.stopPipeline()
-                    print("[MenuBar] Pipeline stopped, updating status to false")
+                    Log.debug("[MenuBar] Pipeline stopped, updating status to false", category: .ui)
                     updateRecordingStatus(false)
                 } else {
-                    print("[MenuBar] Starting pipeline...")
+                    Log.debug("[MenuBar] Starting pipeline...", category: .ui)
                     try await coordinator.startPipeline()
-                    print("[MenuBar] Pipeline started, updating status to true")
+                    Log.debug("[MenuBar] Pipeline started, updating status to true", category: .ui)
                     updateRecordingStatus(true)
                 }
             } catch {
-                print("[MenuBar] Failed to toggle recording: \(error)")
+                Log.error("[MenuBar] Failed to toggle recording: \(error)", category: .ui)
                 // Sync state with coordinator on error
                 let actualState = await coordinator.getStatus().isRunning
                 updateRecordingStatus(actualState)
@@ -353,15 +381,23 @@ public class MenuBarManager: ObservableObject {
 
     /// Show the menu bar icon
     public func show() {
-        if statusItem == nil {
-            setup()
+        isMenuBarIconEnabled = true
+        DispatchQueue.main.async {
+            if self.statusItem == nil {
+                self.setup()
+            }
         }
-        statusItem?.isVisible = true
     }
 
     /// Hide the menu bar icon
     public func hide() {
-        statusItem?.isVisible = false
+        isMenuBarIconEnabled = false
+        DispatchQueue.main.async {
+            if let item = self.statusItem {
+                NSStatusBar.system.removeStatusItem(item)
+                self.statusItem = nil
+            }
+        }
     }
 
     // MARK: - Cleanup
@@ -380,4 +416,5 @@ extension Notification.Name {
     static let toggleDashboard = Notification.Name("toggleDashboard")
     static let openSettings = Notification.Name("openSettings")
     static let openFeedback = Notification.Name("openFeedback")
+    static let dataSourceDidChange = Notification.Name("dataSourceDidChange")
 }

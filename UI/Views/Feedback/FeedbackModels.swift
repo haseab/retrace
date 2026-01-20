@@ -18,6 +18,15 @@ public enum FeedbackType: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Short label for compact button display
+    public var shortLabel: String {
+        switch self {
+        case .bug: return "Bug"
+        case .feature: return "Feature"
+        case .question: return "Question"
+        }
+    }
+
     public var placeholder: String {
         switch self {
         case .bug: return "Describe what happened and what you expected..."
@@ -39,6 +48,7 @@ public struct DiagnosticInfo: Codable {
     public let freeDiskSpace: String
     public let databaseStats: DatabaseStats
     public let recentErrors: [String]
+    public let recentLogs: [String]
     public let timestamp: Date
 
     public struct DatabaseStats: Codable {
@@ -56,7 +66,8 @@ public struct DiagnosticInfo: Codable {
         totalDiskSpace: String,
         freeDiskSpace: String,
         databaseStats: DatabaseStats,
-        recentErrors: [String]
+        recentErrors: [String],
+        recentLogs: [String] = []
     ) {
         self.appVersion = appVersion
         self.buildNumber = buildNumber
@@ -66,10 +77,11 @@ public struct DiagnosticInfo: Codable {
         self.freeDiskSpace = freeDiskSpace
         self.databaseStats = databaseStats
         self.recentErrors = recentErrors
+        self.recentLogs = recentLogs
         self.timestamp = Date()
     }
 
-    /// Format as readable text for display
+    /// Format as readable text for display (summary without full logs)
     public func formattedText() -> String {
         """
         App Version: \(appVersion) (\(buildNumber))
@@ -83,8 +95,26 @@ public struct DiagnosticInfo: Codable {
         - Segments: \(databaseStats.segmentCount)
         - Size: \(String(format: "%.1f", databaseStats.databaseSizeMB)) MB
 
-        Recent Errors: \(recentErrors.isEmpty ? "None" : "\n" + recentErrors.joined(separator: "\n"))
+        Recent Errors: \(recentErrors.isEmpty ? "None" : "\(recentErrors.count) error(s)")
+        Recent Logs: \(recentLogs.count) entries from last hour
         """
+    }
+
+    /// Full formatted text including all logs
+    public func fullFormattedText() -> String {
+        var text = formattedText()
+
+        if !recentErrors.isEmpty {
+            text += "\n\n--- ERRORS ---\n"
+            text += recentErrors.joined(separator: "\n")
+        }
+
+        if !recentLogs.isEmpty {
+            text += "\n\n--- FULL LOGS (last hour) ---\n"
+            text += recentLogs.joined(separator: "\n")
+        }
+
+        return text
     }
 }
 
@@ -93,6 +123,7 @@ public struct DiagnosticInfo: Codable {
 /// Complete feedback submission payload
 public struct FeedbackSubmission: Codable {
     public let type: String
+    public let email: String?
     public let description: String
     public let diagnostics: DiagnosticInfo
     public let includeScreenshot: Bool
@@ -100,12 +131,14 @@ public struct FeedbackSubmission: Codable {
 
     public init(
         type: FeedbackType,
+        email: String = "",
         description: String,
         diagnostics: DiagnosticInfo,
         includeScreenshot: Bool = false,
         screenshotData: Data? = nil
     ) {
         self.type = type.rawValue
+        self.email = email.isEmpty ? nil : email
         self.description = description
         self.diagnostics = diagnostics
         self.includeScreenshot = includeScreenshot

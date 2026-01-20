@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import App
+import Shared
 
 /// Manages the full-screen timeline overlay window
 /// This is a singleton that can be triggered from anywhere via keyboard shortcut
@@ -32,6 +33,19 @@ public class TimelineWindowController: NSObject {
 
     private override init() {
         super.init()
+    }
+
+    // MARK: - Shortcut Loading
+
+    private static let timelineShortcutKey = "timelineShortcutConfig"
+
+    /// Load the current timeline shortcut from UserDefaults
+    private func loadTimelineShortcut() -> ShortcutConfig {
+        guard let data = UserDefaults.standard.data(forKey: Self.timelineShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultTimeline
+        }
+        return config
     }
 
     // MARK: - Configuration
@@ -131,6 +145,17 @@ public class TimelineWindowController: NSObject {
             hide()
         } else {
             show()
+        }
+    }
+
+    /// Show the timeline and navigate to a specific date
+    public func showAndNavigate(to date: Date) {
+        show()
+
+        // Navigate after a brief delay to allow the view to initialize
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+            await timelineViewModel?.navigateToHour(date)
         }
     }
 
@@ -250,6 +275,19 @@ public class TimelineWindowController: NSObject {
                     viewModel.cancelZoomRegionDrag()
                     return true
                 }
+                // If calendar picker is showing, close it first
+                if viewModel.isCalendarPickerVisible {
+                    viewModel.isCalendarPickerVisible = false
+                    viewModel.hoursWithFrames = []
+                    viewModel.selectedCalendarDate = nil
+                    return true
+                }
+                // If date search is active, close it
+                if viewModel.isDateSearchActive {
+                    viewModel.isDateSearchActive = false
+                    viewModel.dateSearchText = ""
+                    return true
+                }
                 // If search overlay is showing, close it
                 if viewModel.isSearchOverlayVisible {
                     viewModel.isSearchOverlayVisible = false
@@ -281,9 +319,11 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Check if it's the toggle shortcut (Option+Shift+Space)
+        // Check if it's the toggle shortcut (uses saved shortcut config)
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
-        if event.keyCode == 49 && modifiers == [.option, .shift] { // Space with Option+Shift
+        let shortcutConfig = loadTimelineShortcut()
+        let expectedKeyCode = keyCodeForString(shortcutConfig.key)
+        if event.keyCode == expectedKeyCode && modifiers == shortcutConfig.modifiers.nsModifiers {
             hide()
             return true
         }
@@ -358,6 +398,22 @@ public class TimelineWindowController: NSObject {
             }
         }
 
+        // Left arrow key - navigate to previous frame
+        if event.keyCode == 123 && modifiers.isEmpty { // Left arrow
+            if let viewModel = timelineViewModel {
+                viewModel.navigateToFrame(viewModel.currentIndex - 1)
+                return true
+            }
+        }
+
+        // Right arrow key - navigate to next frame
+        if event.keyCode == 124 && modifiers.isEmpty { // Right arrow
+            if let viewModel = timelineViewModel {
+                viewModel.navigateToFrame(viewModel.currentIndex + 1)
+                return true
+            }
+        }
+
         // Any other key (not a modifier) clears text selection
         if let viewModel = timelineViewModel,
            viewModel.hasSelection,
@@ -392,6 +448,64 @@ public class TimelineWindowController: NSObject {
             }
         }
     }
+
+    // MARK: - Key Code Mapping
+
+    private func keyCodeForString(_ key: String) -> UInt16 {
+        switch key.lowercased() {
+        case "space": return 49
+        case "return", "enter": return 36
+        case "tab": return 48
+        case "escape", "esc": return 53
+        case "delete", "backspace": return 51
+        case "left", "leftarrow", "←": return 123
+        case "right", "rightarrow", "→": return 124
+        case "down", "downarrow", "↓": return 125
+        case "up", "uparrow", "↑": return 126
+
+        // Letters
+        case "a": return 0
+        case "b": return 11
+        case "c": return 8
+        case "d": return 2
+        case "e": return 14
+        case "f": return 3
+        case "g": return 5
+        case "h": return 4
+        case "i": return 34
+        case "j": return 38
+        case "k": return 40
+        case "l": return 37
+        case "m": return 46
+        case "n": return 45
+        case "o": return 31
+        case "p": return 35
+        case "q": return 12
+        case "r": return 15
+        case "s": return 1
+        case "t": return 17
+        case "u": return 32
+        case "v": return 9
+        case "w": return 13
+        case "x": return 7
+        case "y": return 16
+        case "z": return 6
+
+        // Numbers
+        case "0": return 29
+        case "1": return 18
+        case "2": return 19
+        case "3": return 20
+        case "4": return 21
+        case "5": return 23
+        case "6": return 22
+        case "7": return 26
+        case "8": return 28
+        case "9": return 25
+
+        default: return 0
+        }
+    }
 }
 
 // MARK: - Notifications
@@ -399,6 +513,7 @@ public class TimelineWindowController: NSObject {
 extension Notification.Name {
     static let timelineDidOpen = Notification.Name("timelineDidOpen")
     static let timelineDidClose = Notification.Name("timelineDidClose")
+    static let navigateTimelineToDate = Notification.Name("navigateTimelineToDate")
 }
 
 // MARK: - Custom Window for Text Input Support

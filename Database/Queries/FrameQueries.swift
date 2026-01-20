@@ -427,6 +427,65 @@ enum FrameQueries {
         return Int(sqlite3_changes(db))
     }
 
+    /// Delete all frames newer than (after) the specified date
+    /// Used for quick delete functionality to remove recent recordings
+    static func deleteNewerThan(db: OpaquePointer, date: Date) throws -> Int {
+        let sql = "DELETE FROM frame WHERE createdAt > ?;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        return Int(sqlite3_changes(db))
+    }
+
+    // MARK: - Exists Check
+
+    /// Check if a frame exists with the given timestamp (to the second)
+    /// Used by recovery manager to avoid inserting duplicates
+    static func existsAtTimestamp(db: OpaquePointer, timestamp: Date) throws -> Bool {
+        // Convert to seconds precision (truncate milliseconds)
+        let timestampSeconds = Int64(timestamp.timeIntervalSince1970)
+        let startMs = timestampSeconds * 1000
+        let endMs = (timestampSeconds + 1) * 1000 - 1
+
+        let sql = "SELECT 1 FROM frame WHERE createdAt >= ? AND createdAt <= ? LIMIT 1;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, startMs)
+        sqlite3_bind_int64(statement, 2, endMs)
+
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
     // MARK: - Count
 
     static func getCount(db: OpaquePointer) throws -> Int {
@@ -707,6 +766,37 @@ enum FrameQueries {
         return results
     }
 
+    /// Get a single frame by ID with video info (optimized - single query with JOINs)
+    static func getByIDWithVideoInfo(db: OpaquePointer, id: FrameID) throws -> FrameWithVideoInfo? {
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE f.id = ?
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, id.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseFrameWithVideoInfoRow(statement: statement!)
+    }
+
     /// Parse a row from a query that JOINs frame with segment and video tables
     /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
     ///          s.bundleID, s.windowName, v.path, v.frameRate
@@ -780,5 +870,89 @@ enum FrameQueries {
         }
 
         return FrameWithVideoInfo(frame: frame, videoInfo: videoInfo)
+    }
+
+    // MARK: - Calendar Support
+
+    /// Get all distinct dates that have frames (for calendar display)
+    /// Returns dates in descending order (most recent first)
+    static func getDistinctDates(db: OpaquePointer) throws -> [Date] {
+        // Group by date (truncated to day) and return the first timestamp of each day
+        let sql = """
+            SELECT MIN(createdAt) as dayTimestamp
+            FROM frame
+            GROUP BY date(createdAt / 1000, 'unixepoch', 'localtime')
+            ORDER BY dayTimestamp DESC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var dates: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let timestampMs = sqlite3_column_int64(statement, 0)
+            let date = Schema.timestampToDate(timestampMs)
+            // Normalize to start of day in local timezone
+            let calendar = Calendar.current
+            let startOfDay = calendar.startOfDay(for: date)
+            dates.append(startOfDay)
+        }
+
+        return dates
+    }
+
+    /// Get distinct hours (as Date objects) for a specific day that have frames
+    /// Returns times in ascending order
+    static func getDistinctHoursForDate(db: OpaquePointer, date: Date) throws -> [Date] {
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: date)
+        let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
+
+        let startMs = Schema.dateToTimestamp(startOfDay)
+        let endMs = Schema.dateToTimestamp(endOfDay)
+
+        // Group by hour and get first timestamp of each hour
+        let sql = """
+            SELECT MIN(createdAt) as hourTimestamp
+            FROM frame
+            WHERE createdAt >= ? AND createdAt < ?
+            GROUP BY strftime('%H', createdAt / 1000, 'unixepoch', 'localtime')
+            ORDER BY hourTimestamp ASC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, startMs)
+        sqlite3_bind_int64(statement, 2, endMs)
+
+        var hours: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let timestampMs = sqlite3_column_int64(statement, 0)
+            let timestamp = Schema.timestampToDate(timestampMs)
+            // Normalize to start of hour
+            var components = calendar.dateComponents([.year, .month, .day, .hour], from: timestamp)
+            components.minute = 0
+            components.second = 0
+            if let hourDate = calendar.date(from: components) {
+                hours.append(hourDate)
+            }
+        }
+
+        return hours
     }
 }

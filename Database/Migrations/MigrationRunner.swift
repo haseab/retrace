@@ -88,7 +88,8 @@ actor MigrationRunner {
         // Return all migration instances in order
         // New migrations should be added to this array
         [
-            V1_InitialSchema()
+            V1_InitialSchema(),
+            V2_UnfinalisedVideoTracking()
         ]
     }
 

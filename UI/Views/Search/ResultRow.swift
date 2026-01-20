@@ -69,7 +69,7 @@ public struct ResultRow: View {
                     if result.relevanceScore > 0 {
                         HStack(spacing: 4) {
                             Image(systemName: "star.fill")
-                                .font(.system(size: 10))
+                                .font(.retraceTiny)
                             Text(String(format: "%.0f%%", result.relevanceScore * 100))
                                 .font(.retraceCaption2)
                         }
@@ -84,7 +84,7 @@ public struct ResultRow: View {
                 if let windowName = result.windowName, !windowName.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "macwindow")
-                            .font(.system(size: 10))
+                            .font(.retraceTiny)
                             .foregroundColor(.retraceSecondary)
 
                         Text(windowName)
@@ -98,7 +98,7 @@ public struct ResultRow: View {
 
             // Chevron
             Image(systemName: "chevron.right")
-                .font(.system(size: 14))
+                .font(.retraceCallout)
                 .foregroundColor(.retraceSecondary)
                 .opacity(isHovered ? 1 : 0.5)
         }

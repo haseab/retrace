@@ -75,7 +75,7 @@ public struct SearchView: View {
                         Text("Sort")
                             .font(.retraceCallout)
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 10))
+                            .font(.retraceTiny)
                     }
                     .foregroundColor(.retraceSecondary)
                 }
@@ -114,7 +114,7 @@ public struct SearchView: View {
     private var emptyStateView: some View {
         VStack(spacing: .spacingL) {
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 64))
+                .font(.retraceDisplay)
                 .foregroundColor(.retraceSecondary)
 
             VStack(spacing: .spacingS) {
@@ -144,7 +144,7 @@ public struct SearchView: View {
     private func searchTip(icon: String, text: String) -> some View {
         HStack(spacing: .spacingM) {
             Image(systemName: icon)
-                .font(.system(size: 20))
+                .font(.retraceTitle3)
                 .foregroundColor(.retraceAccent)
                 .frame(width: 24)
 
@@ -157,7 +157,7 @@ public struct SearchView: View {
     private var noResultsView: some View {
         VStack(spacing: .spacingL) {
             Image(systemName: "doc.text.magnifyingglass")
-                .font(.system(size: 64))
+                .font(.retraceDisplay)
                 .foregroundColor(.retraceSecondary)
 
             VStack(spacing: .spacingS) {
@@ -193,7 +193,7 @@ public struct SearchView: View {
     private func errorView(_ message: String) -> some View {
         VStack(spacing: .spacingL) {
             Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 48))
+                .font(.retraceDisplay)
                 .foregroundColor(.retraceDanger)
 
             Text("Search Error")

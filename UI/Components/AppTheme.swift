@@ -7,6 +7,241 @@ public struct AppTheme {
     private init() {}
 }
 
+// MARK: - App Name Resolution
+
+/// Resolves bundle IDs to human-readable app names with caching
+public class AppNameResolver {
+    public static let shared = AppNameResolver()
+
+    private var cache: [String: String] = [:]
+    private let lock = NSLock()
+    private let cacheFileURL: URL
+    private var diskCache: [String: String] = [:]
+    private var isDirty = false
+
+    private init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let retraceDir = appSupport.appendingPathComponent("Retrace", isDirectory: true)
+        try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
+        cacheFileURL = retraceDir.appendingPathComponent("app_names.json")
+        loadFromDisk()
+    }
+
+    /// Get a human-readable name for an app bundle ID
+    public func displayName(for bundleID: String) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Return from memory cache if available
+        if let cached = cache[bundleID] {
+            return cached
+        }
+
+        // Return from disk cache if available
+        if let stored = diskCache[bundleID] {
+            cache[bundleID] = stored
+            return stored
+        }
+
+        // Resolve the name
+        let name = resolveAppName(for: bundleID)
+        cache[bundleID] = name
+
+        // Save to disk cache
+        saveToDiskAsync(bundleID: bundleID, name: name)
+
+        return name
+    }
+
+    /// Resolve bundle ID to app name using multiple strategies
+    private func resolveAppName(for bundleID: String) -> String {
+        // Strategy 1: Look up the actual app name from the system
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID),
+           let bundle = Bundle(url: appURL),
+           let name = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+                   ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String {
+            return name
+        }
+
+        // Strategy 2: Handle standard reverse-DNS bundle IDs (e.g., com.google.Chrome -> Chrome)
+        if bundleID.contains(".") {
+            let components = bundleID.components(separatedBy: ".")
+            if components.count >= 2,
+               let lastComponent = components.last,
+               !lastComponent.isEmpty,
+               lastComponent.first?.isLetter == true {
+                // Capitalize first letter if needed
+                return lastComponent.prefix(1).uppercased() + lastComponent.dropFirst()
+            }
+        }
+
+        // Strategy 3: Handle non-standard identifiers (e.g., "230313mzl4w4u92")
+        // Check if it looks like a random/hash identifier
+        if looksLikeRandomIdentifier(bundleID) {
+            return "Unknown App"
+        }
+
+        // Strategy 4: Clean up and return as-is for other cases
+        return cleanupName(bundleID)
+    }
+
+    /// Check if a string looks like a random/generated identifier
+    private func looksLikeRandomIdentifier(_ identifier: String) -> Bool {
+        // If it starts with a number, it's likely a random ID
+        if identifier.first?.isNumber == true {
+            return true
+        }
+
+        // If it's mostly alphanumeric with no clear word structure
+        let letterCount = identifier.filter { $0.isLetter }.count
+        let numberCount = identifier.filter { $0.isNumber }.count
+
+        // High ratio of numbers to letters suggests a random ID
+        if letterCount > 0 && Double(numberCount) / Double(letterCount) > 0.5 {
+            return true
+        }
+
+        // Very short or very long without dots suggests random
+        if !identifier.contains(".") && (identifier.count < 3 || identifier.count > 20) {
+            return true
+        }
+
+        return false
+    }
+
+    /// Clean up an identifier for display
+    private func cleanupName(_ identifier: String) -> String {
+        // Replace common separators with spaces
+        var cleaned = identifier
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+
+        // Capitalize words
+        cleaned = cleaned.split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
+
+        return cleaned.isEmpty ? "Unknown App" : cleaned
+    }
+
+    // MARK: - Disk Persistence
+
+    private func loadFromDisk() {
+        guard FileManager.default.fileExists(atPath: cacheFileURL.path) else { return }
+        do {
+            let data = try Data(contentsOf: cacheFileURL)
+            diskCache = try JSONDecoder().decode([String: String].self, from: data)
+        } catch {
+            // Silently fail
+        }
+    }
+
+    private func saveToDiskAsync(bundleID: String, name: String) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            self.diskCache[bundleID] = name
+            self.isDirty = true
+            self.lock.unlock()
+            self.flushToDiskIfNeeded()
+        }
+    }
+
+    private func flushToDiskIfNeeded() {
+        lock.lock()
+        guard isDirty else {
+            lock.unlock()
+            return
+        }
+        let cacheToSave = diskCache
+        isDirty = false
+        lock.unlock()
+
+        do {
+            let data = try JSONEncoder().encode(cacheToSave)
+            try data.write(to: cacheFileURL, options: .atomic)
+        } catch {
+            // Silently fail
+        }
+    }
+}
+
+// MARK: - App Icon Provider
+
+/// Provides app icons for bundle IDs with caching
+public class AppIconProvider {
+    public static let shared = AppIconProvider()
+
+    private var cache: [String: NSImage] = [:]
+    private let lock = NSLock()
+
+    private init() {}
+
+    /// Get the app icon for a bundle ID as an NSImage
+    public func icon(for bundleID: String) -> NSImage? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Return from cache if available
+        if let cached = cache[bundleID] {
+            return cached
+        }
+
+        // Try to get the icon from the system
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+            cache[bundleID] = icon
+            return icon
+        }
+
+        return nil
+    }
+}
+
+/// SwiftUI view that displays an app icon for a bundle ID
+public struct AppIconView: View {
+    let bundleID: String
+    let size: CGFloat
+
+    public init(bundleID: String, size: CGFloat = 32) {
+        self.bundleID = bundleID
+        self.size = size
+    }
+
+    public var body: some View {
+        Group {
+            if let nsImage = AppIconProvider.shared.icon(for: bundleID) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                // Fallback: colored rounded square with first letter
+                fallbackIcon
+            }
+        }
+        .frame(width: size, height: size)
+    }
+
+    private var fallbackIcon: some View {
+        let appName = AppNameResolver.shared.displayName(for: bundleID)
+        let firstLetter = appName.first.map { String($0).uppercased() } ?? "?"
+        let color = Color.segmentColor(for: bundleID)
+
+        return ZStack {
+            RoundedRectangle(cornerRadius: size * 0.22)
+                .fill(color.opacity(0.2))
+
+            RoundedRectangle(cornerRadius: size * 0.22)
+                .stroke(color.opacity(0.3), lineWidth: 1)
+
+            Text(firstLetter)
+                .font(RetraceFont.font(size: size * 0.45, weight: .semibold))
+                .foregroundColor(color)
+        }
+    }
+}
+
 // MARK: - App Icon Color Extraction
 
 /// Storable color data for persistence
@@ -279,25 +514,116 @@ extension Color {
 
 // MARK: - Typography
 
+/// Available font styles for the app
+public enum RetraceFontStyle: String, CaseIterable, Identifiable {
+    case `default` = "default"
+    case rounded = "rounded"
+    case serif = "serif"
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .default: return "SF Pro"
+        case .rounded: return "SF Pro Rounded"
+        case .serif: return "New York"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .default: return "Clean and professional"
+        case .rounded: return "Friendly and approachable"
+        case .serif: return "Classic and elegant"
+        }
+    }
+
+    var design: Font.Design {
+        switch self {
+        case .default: return .default
+        case .rounded: return .rounded
+        case .serif: return .serif
+        }
+    }
+}
+
+/// Centralized font configuration for the entire app.
+/// Font style can be changed in Settings.
+public enum RetraceFont {
+    /// UserDefaults key for font preference
+    private static let fontStyleKey = "retraceFontStyle"
+
+    /// The current font style (persisted in UserDefaults)
+    public static var currentStyle: RetraceFontStyle {
+        get {
+            if let rawValue = UserDefaults.standard.string(forKey: fontStyleKey),
+               let style = RetraceFontStyle(rawValue: rawValue) {
+                return style
+            }
+            return .default
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: fontStyleKey)
+        }
+    }
+
+    /// The font design used throughout the app
+    public static var design: Font.Design {
+        currentStyle.design
+    }
+
+    /// Creates a font with the app's current design style
+    public static func font(size: CGFloat, weight: Font.Weight) -> Font {
+        .system(size: size, weight: weight, design: design)
+    }
+
+    /// Creates a monospaced font (ignores the global design setting)
+    public static func mono(size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
+    }
+}
+
 extension Font {
+    // MARK: Display (Hero text, large numbers)
+    public static let retraceDisplay = RetraceFont.font(size: 48, weight: .bold)
+    public static let retraceDisplay2 = RetraceFont.font(size: 36, weight: .bold)
+    public static let retraceDisplay3 = RetraceFont.font(size: 32, weight: .bold)
+
     // MARK: Titles
-    public static let retraceTitle = Font.system(size: 28, weight: .bold)
-    public static let retraceTitle2 = Font.system(size: 22, weight: .bold)
-    public static let retraceTitle3 = Font.system(size: 20, weight: .semibold)
+    public static let retraceTitle = RetraceFont.font(size: 28, weight: .bold)
+    public static let retraceTitle2 = RetraceFont.font(size: 22, weight: .bold)
+    public static let retraceTitle3 = RetraceFont.font(size: 20, weight: .semibold)
+
+    // MARK: Large Numbers (for stats/metrics display)
+    public static let retraceLargeNumber = RetraceFont.font(size: 28, weight: .bold)
+    public static let retraceMediumNumber = RetraceFont.font(size: 24, weight: .semibold)
 
     // MARK: Body Text
-    public static let retraceHeadline = Font.system(size: 17, weight: .semibold)
-    public static let retraceBody = Font.system(size: 15, weight: .regular)
-    public static let retraceBodyBold = Font.system(size: 15, weight: .semibold)
-    public static let retraceCallout = Font.system(size: 14, weight: .regular)
+    public static let retraceHeadline = RetraceFont.font(size: 17, weight: .semibold)
+    public static let retraceBody = RetraceFont.font(size: 15, weight: .regular)
+    public static let retraceBodyMedium = RetraceFont.font(size: 15, weight: .medium)
+    public static let retraceBodyBold = RetraceFont.font(size: 15, weight: .semibold)
+    public static let retraceCallout = RetraceFont.font(size: 14, weight: .regular)
+    public static let retraceCalloutMedium = RetraceFont.font(size: 14, weight: .medium)
+    public static let retraceCalloutBold = RetraceFont.font(size: 14, weight: .semibold)
 
     // MARK: Small Text
-    public static let retraceCaption = Font.system(size: 13, weight: .regular)
-    public static let retraceCaption2 = Font.system(size: 11, weight: .regular)
+    public static let retraceCaption = RetraceFont.font(size: 13, weight: .regular)
+    public static let retraceCaptionMedium = RetraceFont.font(size: 13, weight: .medium)
+    public static let retraceCaptionBold = RetraceFont.font(size: 13, weight: .semibold)
+    public static let retraceCaption2 = RetraceFont.font(size: 11, weight: .regular)
+    public static let retraceCaption2Medium = RetraceFont.font(size: 11, weight: .medium)
+    public static let retraceCaption2Bold = RetraceFont.font(size: 11, weight: .semibold)
 
-    // MARK: Monospace (for IDs, technical data)
-    public static let retraceMono = Font.system(size: 13, weight: .regular, design: .monospaced)
-    public static let retraceMonoSmall = Font.system(size: 11, weight: .regular, design: .monospaced)
+    // MARK: Tiny Text (for labels, badges)
+    public static let retraceTiny = RetraceFont.font(size: 10, weight: .regular)
+    public static let retraceTinyMedium = RetraceFont.font(size: 10, weight: .medium)
+    public static let retraceTinyBold = RetraceFont.font(size: 10, weight: .semibold)
+
+    // MARK: Monospace (for IDs, technical data - always uses monospaced design)
+    public static let retraceMono = RetraceFont.mono(size: 13)
+    public static let retraceMonoSmall = RetraceFont.mono(size: 11)
+    public static let retraceMonoLarge = RetraceFont.mono(size: 15)
 }
 
 // MARK: - Spacing

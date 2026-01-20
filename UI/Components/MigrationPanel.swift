@@ -91,7 +91,7 @@ public struct MigrationPanel: View {
             // Checkbox
             Image(systemName: source.isInstalled ? "checkmark.square.fill" : "square")
                 .foregroundColor(source.isInstalled ? .retraceSuccess : .retraceSecondary)
-                .font(.system(size: 20))
+                .font(.retraceTitle3)
 
             // Source info
             VStack(alignment: .leading, spacing: 4) {

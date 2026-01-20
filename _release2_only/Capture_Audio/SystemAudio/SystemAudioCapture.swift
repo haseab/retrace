@@ -221,7 +221,7 @@ private class SystemAudioStreamOutput: NSObject, SCStreamOutput {
             )
 
             guard status == noErr else {
-                print("Error getting audio buffer list: \(status)")
+                Log.error("[SystemAudioCapture] Error getting audio buffer list: \(status)", category: .capture)
                 return
             }
 
@@ -258,7 +258,7 @@ private class SystemAudioStreamOutput: NSObject, SCStreamOutput {
             }
 
         } catch {
-            print("Error converting system audio: \(error)")
+            Log.error("[SystemAudioCapture] Error converting system audio: \(error)", category: .capture)
         }
     }
 

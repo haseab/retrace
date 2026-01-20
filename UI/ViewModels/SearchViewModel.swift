@@ -56,6 +56,10 @@ public class SearchViewModel: ObservableObject {
     public let coordinator: AppCoordinator
     private var cancellables = Set<AnyCancellable>()
 
+    // Active search tasks that can be cancelled
+    private var currentSearchTask: Task<Void, Never>?
+    private var currentLoadMoreTask: Task<Void, Never>?
+
     // MARK: - Constants
 
     private let debounceDelay: TimeInterval = 0.3
@@ -107,9 +111,9 @@ public class SearchViewModel: ObservableObject {
             .removeDuplicates()
             .dropFirst()  // Skip initial empty value so we don't clear cache on init
             .sink { [weak self] query in
-                print("[SearchCache] searchQuery sink fired: query='\(query)'")
+                Log.debug("[SearchCache] searchQuery sink fired: query='\(query)'", category: .ui)
                 if query.isEmpty {
-                    print("[SearchCache] Query is empty, clearing results and cache")
+                    Log.debug("[SearchCache] Query is empty, clearing results and cache", category: .ui)
                     self?.results = nil
                     self?.committedSearchQuery = ""
                     self?.clearSearchCache()
@@ -128,7 +132,9 @@ public class SearchViewModel: ObservableObject {
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
             guard let self = self, !self.searchQuery.isEmpty, !self.isRestoringFromCache else { return }
-            Task {
+            // Cancel any existing search before starting a new one
+            self.currentSearchTask?.cancel()
+            self.currentSearchTask = Task {
                 await self.performSearch(query: self.searchQuery)
             }
         }
@@ -139,7 +145,9 @@ public class SearchViewModel: ObservableObject {
 
     /// Trigger search with current query (called on Enter key)
     public func submitSearch() {
-        Task {
+        // Cancel any existing search before starting a new one
+        currentSearchTask?.cancel()
+        currentSearchTask = Task {
             await performSearch(query: searchQuery)
         }
     }
@@ -163,12 +171,18 @@ public class SearchViewModel: ObservableObject {
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
 
         do {
+            // Check for cancellation before starting the search
+            try Task.checkCancellation()
+
             let searchQuery = buildSearchQuery(query)
             Log.debug("[SearchViewModel] Built search query: text='\(searchQuery.text)', limit=\(searchQuery.limit), offset=\(searchQuery.offset)", category: .ui)
 
             let startTime = Date()
             let searchResults = try await coordinator.search(query: searchQuery)
             let elapsed = Date().timeIntervalSince(startTime) * 1000
+
+            // Check for cancellation after the search completes
+            try Task.checkCancellation()
 
             Log.info("[SearchViewModel] Search completed in \(Int(elapsed))ms: \(searchResults.results.count) results (total: \(searchResults.totalCount))", category: .ui)
 
@@ -180,6 +194,11 @@ public class SearchViewModel: ObservableObject {
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 results = searchResults
+                isSearching = false
+            }
+        } catch is CancellationError {
+            Log.debug("[SearchViewModel] Search was cancelled", category: .ui)
+            await MainActor.run {
                 isSearching = false
             }
         } catch {
@@ -215,7 +234,9 @@ public class SearchViewModel: ObservableObject {
         searchMode = mode
         // Clear results and re-search with new mode
         if !searchQuery.isEmpty {
-            Task {
+            // Cancel any existing search before starting a new one
+            currentSearchTask?.cancel()
+            currentSearchTask = Task {
                 await performSearch(query: searchQuery)
             }
         }
@@ -237,8 +258,14 @@ public class SearchViewModel: ObservableObject {
         isLoadingMore = true
 
         do {
+            // Check for cancellation before starting
+            try Task.checkCancellation()
+
             let query = buildSearchQuery(searchQuery, offset: currentResults.results.count)
             let moreResults = try await coordinator.search(query: query)
+
+            // Check for cancellation after the search completes
+            try Task.checkCancellation()
 
             Log.info("[SearchViewModel] Loaded \(moreResults.results.count) more results", category: .ui)
 
@@ -251,6 +278,9 @@ public class SearchViewModel: ObservableObject {
                 searchTimeMs: moreResults.searchTimeMs
             )
 
+            isLoadingMore = false
+        } catch is CancellationError {
+            Log.debug("[SearchViewModel] Load more was cancelled", category: .ui)
             isLoadingMore = false
         } catch {
             Log.error("[SearchViewModel] Load more failed: \(error.localizedDescription)", category: .ui)
@@ -380,14 +410,14 @@ public class SearchViewModel: ObservableObject {
 
     /// Save the current search results to cache for instant restore on app reopen
     public func saveSearchResults() {
-        print("[SearchCache] saveSearchResults called - query: '\(committedSearchQuery)', results: \(results?.results.count ?? 0)")
+        Log.debug("[SearchCache] saveSearchResults called - query: '\(committedSearchQuery)', results: \(results?.results.count ?? 0)", category: .ui)
 
         guard let results = results, !results.isEmpty else {
-            print("[SearchCache] SKIP: No results to save (results is nil or empty)")
+            Log.debug("[SearchCache] SKIP: No results to save (results is nil or empty)", category: .ui)
             return
         }
         guard !committedSearchQuery.isEmpty else {
-            print("[SearchCache] SKIP: committedSearchQuery is empty")
+            Log.debug("[SearchCache] SKIP: committedSearchQuery is empty", category: .ui)
             return
         }
 
@@ -396,7 +426,7 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.set(committedSearchQuery, forKey: Self.cachedSearchQueryKey)
         UserDefaults.standard.set(Double(savedScrollPosition), forKey: Self.cachedScrollPositionKey)
         UserDefaults.standard.set(Self.searchCacheVersion, forKey: Self.searchCacheVersionKey)
-        print("[SearchCache] Saved version=\(Self.searchCacheVersion) to key='\(Self.searchCacheVersionKey)'")
+        Log.debug("[SearchCache] Saved version=\(Self.searchCacheVersion) to key='\(Self.searchCacheVersionKey)'", category: .ui)
 
         // Save filters
         UserDefaults.standard.set(selectedAppFilter, forKey: Self.cachedAppFilterKey)
@@ -421,26 +451,26 @@ public class SearchViewModel: ObservableObject {
             do {
                 let data = try JSONEncoder().encode(results)
                 try data.write(to: Self.cachedSearchResultsPath)
-                print("[SearchCache] Saved \(results.results.count) search results to cache (\(data.count / 1024)KB)")
+                Log.debug("[SearchCache] Saved \(results.results.count) search results to cache (\(data.count / 1024)KB)", category: .ui)
             } catch {
-                print("[SearchCache] Failed to save search results: \(error)")
+                Log.warning("[SearchCache] Failed to save search results: \(error)", category: .ui)
             }
         }
 
-        print("[SearchCache] Saved search results for query: '\(committedSearchQuery)' with filters")
+        Log.debug("[SearchCache] Saved search results for query: '\(committedSearchQuery)' with filters", category: .ui)
     }
 
     /// Restore cached search results if they exist and haven't expired
     /// Returns true if cache was restored, false otherwise
     @discardableResult
     public func restoreCachedSearchResults() -> Bool {
-        print("[SearchCache] restoreCachedSearchResults() called")
+        Log.debug("[SearchCache] restoreCachedSearchResults() called", category: .ui)
 
         // Check cache version first - invalidate if version mismatch
         let cachedVersion = UserDefaults.standard.integer(forKey: Self.searchCacheVersionKey)
-        print("[SearchCache] Reading version from key='\(Self.searchCacheVersionKey)', got: \(cachedVersion)")
+        Log.debug("[SearchCache] Reading version from key='\(Self.searchCacheVersionKey)', got: \(cachedVersion)", category: .ui)
         if cachedVersion != Self.searchCacheVersion {
-            print("[SearchCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.searchCacheVersion)) - invalidating")
+            Log.debug("[SearchCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.searchCacheVersion)) - invalidating", category: .ui)
             clearSearchCache()
             return false
         }
@@ -453,7 +483,7 @@ public class SearchViewModel: ObservableObject {
 
         // Check if cache has expired
         if elapsed > Self.searchCacheExpirationSeconds {
-            print("[SearchCache] Cache expired (elapsed: \(Int(elapsed))s)")
+            Log.debug("[SearchCache] Cache expired (elapsed: \(Int(elapsed))s)", category: .ui)
             clearSearchCache()
             return false
         }
@@ -485,11 +515,11 @@ public class SearchViewModel: ObservableObject {
             isRestoringFromCache = true
 
             // Restore state
-            print("[SearchCache] Restoring: setting searchQuery='\(cachedQuery)', results=\(cachedResults.results.count)")
+            Log.debug("[SearchCache] Restoring: setting searchQuery='\(cachedQuery)', results=\(cachedResults.results.count)", category: .ui)
             searchQuery = cachedQuery
             committedSearchQuery = cachedQuery
             results = cachedResults
-            print("[SearchCache] After restore: searchQuery='\(searchQuery)', results=\(results?.results.count ?? 0)")
+            Log.debug("[SearchCache] After restore: searchQuery='\(searchQuery)', results=\(results?.results.count ?? 0)", category: .ui)
             savedScrollPosition = CGFloat(cachedScrollPosition)
             searchGeneration += 1
 
@@ -509,35 +539,81 @@ public class SearchViewModel: ObservableObject {
                 self?.isRestoringFromCache = false
             }
 
-            print("[SearchCache] INSTANT RESTORE: Loaded \(cachedResults.results.count) cached results for '\(cachedQuery)' with filters (saved \(Int(elapsed))s ago)")
+            Log.debug("[SearchCache] INSTANT RESTORE: Loaded \(cachedResults.results.count) cached results for '\(cachedQuery)' with filters (saved \(Int(elapsed))s ago)", category: .ui)
             return true
         } catch {
-            print("[SearchCache] Failed to load cached search results: \(error)")
+            Log.warning("[SearchCache] Failed to load cached search results: \(error)", category: .ui)
             return false
         }
     }
 
     /// Clear the cached search results
     private func clearSearchCache() {
-        UserDefaults.standard.removeObject(forKey: Self.cachedSearchSavedAtKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedSearchQueryKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedScrollPositionKey)
-        UserDefaults.standard.removeObject(forKey: Self.searchCacheVersionKey)
+        Self.clearPersistedSearchCache()
+    }
+
+    /// Static method to clear persisted search cache (can be called without an instance)
+    /// Call this when data sources change (e.g., Rewind data toggled)
+    public static func clearPersistedSearchCache() {
+        Log.info("[SearchCache] Clearing persisted search cache (static)", category: .ui)
+
+        UserDefaults.standard.removeObject(forKey: cachedSearchSavedAtKey)
+        UserDefaults.standard.removeObject(forKey: cachedSearchQueryKey)
+        UserDefaults.standard.removeObject(forKey: cachedScrollPositionKey)
+        UserDefaults.standard.removeObject(forKey: searchCacheVersionKey)
 
         // Clear cached filters
-        UserDefaults.standard.removeObject(forKey: Self.cachedAppFilterKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedStartDateKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedEndDateKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedContentTypeKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedSearchModeKey)
+        UserDefaults.standard.removeObject(forKey: cachedAppFilterKey)
+        UserDefaults.standard.removeObject(forKey: cachedStartDateKey)
+        UserDefaults.standard.removeObject(forKey: cachedEndDateKey)
+        UserDefaults.standard.removeObject(forKey: cachedContentTypeKey)
+        UserDefaults.standard.removeObject(forKey: cachedSearchModeKey)
 
         // Remove cached results file
-        try? FileManager.default.removeItem(at: Self.cachedSearchResultsPath)
+        try? FileManager.default.removeItem(at: cachedSearchResultsPath)
+    }
+
+    /// Clear all search results and caches (called when data source changes)
+    public func clearSearchResults() {
+        Log.info("[SearchViewModel] Clearing search results due to data source change", category: .ui)
+
+        // Cancel any in-flight searches
+        cancelSearch()
+
+        // Clear results and query
+        results = nil
+        searchQuery = ""
+        committedSearchQuery = ""
+        error = nil
+
+        // Clear all caches
+        thumbnailCache.removeAll()
+        loadingThumbnails.removeAll()
+        savedScrollPosition = 0
+        searchGeneration += 1
+
+        // Clear persisted cache
+        clearSearchCache()
     }
 
     // MARK: - Cleanup
 
+    /// Cancel any in-flight search and load-more tasks
+    /// Call this when the search overlay is dismissed to prevent blocking
+    public func cancelSearch() {
+        Log.debug("[SearchViewModel] Cancelling in-flight search tasks", category: .ui)
+        currentSearchTask?.cancel()
+        currentSearchTask = nil
+        currentLoadMoreTask?.cancel()
+        currentLoadMoreTask = nil
+        isSearching = false
+        isLoadingMore = false
+    }
+
     deinit {
+        // Cancel tasks directly - deinit is not actor-isolated so we can't call cancelSearch()
+        currentSearchTask?.cancel()
+        currentLoadMoreTask?.cancel()
         cancellables.removeAll()
     }
 }

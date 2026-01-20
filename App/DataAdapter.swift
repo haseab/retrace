@@ -73,6 +73,19 @@ public actor DataAdapter {
         Log.info("[DataAdapter] Rewind source configured with cutoff \(cutoffDate)", category: .app)
     }
 
+    /// Disconnect Rewind data source (clears connection without deleting data)
+    public func disconnectRewind() {
+        guard rewindConnection != nil else {
+            Log.info("[DataAdapter] No Rewind source to disconnect", category: .app)
+            return
+        }
+        self.rewindConnection = nil
+        self.rewindConfig = nil
+        self.rewindImageExtractor = nil
+        self.cutoffDate = nil
+        Log.info("[DataAdapter] Rewind source disconnected", category: .app)
+    }
+
     /// Initialize the adapter
     public func initialize() async throws {
         isInitialized = true
@@ -218,6 +231,25 @@ public actor DataAdapter {
     public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
         let framesWithVideo = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
         return framesWithVideo.map { $0.frame }
+    }
+
+    /// Get a single frame by ID with video info
+    public func getFrameWithVideoInfoByID(id: FrameID) async throws -> FrameWithVideoInfo? {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        // Try Retrace first (more likely for recent frames)
+        if let frame = try queryFrameWithVideoInfoByID(id: id, connection: retraceConnection, config: retraceConfig) {
+            return frame
+        }
+
+        // Try Rewind if available
+        if let rewind = rewindConnection, let config = rewindConfig {
+            return try queryFrameWithVideoInfoByID(id: id, connection: rewind, config: config)
+        }
+
+        return nil
     }
 
     /// Get the most recent frame timestamp
@@ -734,6 +766,31 @@ public actor DataAdapter {
         return frames
     }
 
+    private func queryFrameWithVideoInfoByID(
+        id: FrameID,
+        connection: DatabaseConnection,
+        config: DatabaseConfig
+    ) throws -> FrameWithVideoInfo? {
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE f.id = ?
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, id.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+
+        return try parseFrameWithVideoInfo(statement: statement, config: config)
+    }
+
     private func getFrameVideoInfo(
         segmentID: VideoSegmentID,
         timestamp: Date,
@@ -817,6 +874,26 @@ public actor DataAdapter {
     }
 
     private func getAllOCRNodes(frameID: FrameID, connection: DatabaseConnection) throws -> [OCRNodeWithText] {
+        // DEBUG: First check what docid is linked to this frame
+        let debugSQL = """
+            SELECT ds.docid, ds.frameId, LENGTH(COALESCE(sc.c0, '')) as textLen
+            FROM doc_segment ds
+            JOIN searchRanking_content sc ON ds.docid = sc.id
+            WHERE ds.frameId = ?;
+            """
+        if let debugStmt = try? connection.prepare(sql: debugSQL) {
+            sqlite3_bind_int64(debugStmt, 1, frameID.value)
+            if sqlite3_step(debugStmt) == SQLITE_ROW {
+                let docid = sqlite3_column_int64(debugStmt, 0)
+                let dsFrameId = sqlite3_column_int64(debugStmt, 1)
+                let textLen = sqlite3_column_int(debugStmt, 2)
+                Log.debug("[DB-DEBUG] For frameID=\(frameID.value): doc_segment has docid=\(docid), frameId=\(dsFrameId), textLen=\(textLen)", category: .database)
+            } else {
+                Log.debug("[DB-DEBUG] For frameID=\(frameID.value): NO doc_segment found!", category: .database)
+            }
+            connection.finalize(debugStmt)
+        }
+
         let sql = """
             SELECT
                 n.id,
@@ -827,7 +904,8 @@ public actor DataAdapter {
                 n.topY,
                 n.width,
                 n.height,
-                (COALESCE(sc.c0, '') || COALESCE(sc.c1, '')) as fullText
+                (COALESCE(sc.c0, '') || COALESCE(sc.c1, '')) as fullText,
+                n.frameId
             FROM node n
             JOIN doc_segment ds ON n.frameId = ds.frameId
             JOIN searchRanking_content sc ON ds.docid = sc.id
@@ -840,13 +918,26 @@ public actor DataAdapter {
 
         sqlite3_bind_int64(statement, 1, frameID.value)
 
+        // Reset parse debug counter for new frame
+        DataAdapter.parseDebugCounter = 0
+
         var nodes: [OCRNodeWithText] = []
+        var isFirstNode = true
         while sqlite3_step(statement) == SQLITE_ROW {
+            // DEBUG: Log first row's fullText to see what we're getting
+            if isFirstNode {
+                if let fullTextPtr = sqlite3_column_text(statement, 8) {
+                    let fullText = String(cString: fullTextPtr)
+                    Log.debug("[DB-DEBUG] frameID=\(frameID.value) fullText preview: '\(fullText.prefix(100))...'", category: .database)
+                }
+                isFirstNode = false
+            }
             if let node = parseOCRNodeFromRow(statement: statement) {
                 nodes.append(node)
             }
         }
 
+        Log.debug("[DB-DEBUG] frameID=\(frameID.value) returned \(nodes.count) nodes", category: .database)
         return nodes
     }
 
@@ -1496,6 +1587,8 @@ public actor DataAdapter {
         )
     }
 
+    private static var parseDebugCounter = 0
+
     private func parseOCRNodeFromRow(statement: OpaquePointer) -> OCRNodeWithText? {
         let id = Int(sqlite3_column_int64(statement, 0))
         let textOffset = Int(sqlite3_column_int(statement, 2))
@@ -1507,6 +1600,9 @@ public actor DataAdapter {
 
         guard let fullTextCStr = sqlite3_column_text(statement, 8) else { return nil }
         let fullText = String(cString: fullTextCStr)
+
+        // Column 9: frameId for debugging
+        let frameId = sqlite3_column_int64(statement, 9)
 
         let startIndex = fullText.index(
             fullText.startIndex,
@@ -1522,8 +1618,18 @@ public actor DataAdapter {
 
         let text = String(fullText[startIndex..<endIndex])
 
+        // DEBUG: Log first 5 nodes to see offset/length details
+        DataAdapter.parseDebugCounter += 1
+        if DataAdapter.parseDebugCounter <= 5 {
+            Log.debug("[PARSE-DEBUG] Node \(DataAdapter.parseDebugCounter): id=\(id), offset=\(textOffset), length=\(textLength), fullTextLen=\(fullText.count), extracted='\(text.prefix(30))'", category: .database)
+        } else if DataAdapter.parseDebugCounter == 6 {
+            Log.debug("[PARSE-DEBUG] (suppressing further logs...)", category: .database)
+            DataAdapter.parseDebugCounter = 100 // prevent re-printing "suppressing" message
+        }
+
         return OCRNodeWithText(
             id: id,
+            frameId: frameId,
             x: leftX,
             y: topY,
             width: width,

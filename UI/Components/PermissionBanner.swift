@@ -13,11 +13,11 @@ struct PermissionBanner: View {
             // Warning icon
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.orange)
-                .font(.system(size: 20))
+                .font(.retraceTitle3)
 
             // Message
             Text(message)
-                .font(.system(size: 13))
+                .font(.retraceCaption)
                 .foregroundColor(.primary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -26,7 +26,7 @@ struct PermissionBanner: View {
             // Action button
             Button(action: action) {
                 Text(actionTitle)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.white)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
@@ -39,7 +39,7 @@ struct PermissionBanner: View {
             Button(action: onDismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundColor(.secondary)
-                    .font(.system(size: 16))
+                    .font(.retraceHeadline)
             }
             .buttonStyle(.plain)
         }

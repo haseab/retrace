@@ -4,5 +4,9 @@
 <dict>
 	<key>com.apple.security.device.screen-recording</key>
 	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<false/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<false/>
 </dict>
 </plist>

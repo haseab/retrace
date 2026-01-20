@@ -2,6 +2,7 @@ import SwiftUI
 import AVKit
 import Shared
 import App
+import UniformTypeIdentifiers
 
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
@@ -45,7 +46,7 @@ public struct SimpleTimelineView: View {
                         viewModel: viewModel,
                         width: geometry.size.width
                     )
-                    .padding(.bottom, 20)
+                    .padding(.bottom, 40)
                 }
                 .offset(y: viewModel.areControlsHidden ? 150 : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
@@ -123,18 +124,25 @@ public struct SimpleTimelineView: View {
                     )
                 }
 
-                // Controls toggle button and search bar (bottom-left, always visible unless dragging zoom region)
-                VStack {
-                    Spacer()
-                    HStack(spacing: 12) {
-                        controlsToggleButton
-                        SearchButton(viewModel: viewModel)
+                // Text selection hint toast (top center)
+                if viewModel.showTextSelectionHint {
+                    VStack {
+                        TextSelectionHintBanner(
+                            onDismiss: {
+                                viewModel.dismissTextSelectionHint()
+                            }
+                        )
+                        .fixedSize()
+                        .padding(.top, 60)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .opacity
+                        ))
                         Spacer()
                     }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
                 }
-                .padding(.spacingL)
-                .padding(.bottom, viewModel.areControlsHidden ? 0 : 60)
-                .opacity(viewModel.isDraggingZoomRegion ? 0 : 1)
+
             }
             .background(Color.black)
             .ignoresSafeArea()
@@ -158,8 +166,9 @@ public struct SimpleTimelineView: View {
         let _ = print("[SimpleTimelineView] frameDisplay: videoInfo=\(viewModel.currentVideoInfo != nil), currentImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), framesCount=\(viewModel.frames.count)")
         if let videoInfo = viewModel.currentVideoInfo {
             // Video-based frame (Rewind) with URL overlay
-            // Only show if video file exists
-            let fileExists = FileManager.default.fileExists(atPath: videoInfo.videoPath)
+            // Only show if video file exists (check both with and without .mp4 extension)
+            let fileExists = FileManager.default.fileExists(atPath: videoInfo.videoPath) ||
+                             FileManager.default.fileExists(atPath: videoInfo.videoPath + ".mp4")
             let _ = print("[SimpleTimelineView] Video path: \(videoInfo.videoPath), exists: \(fileExists)")
             if fileExists {
                 FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
@@ -185,14 +194,14 @@ public struct SimpleTimelineView: View {
             let _ = print("[SimpleTimelineView] Empty state - no video or image, frames.isEmpty=\(viewModel.frames.isEmpty)")
             VStack(spacing: .spacingM) {
                 Image(systemName: "photo.on.rectangle.angled")
-                    .font(.system(size: 48))
+                    .font(.retraceDisplay)
                     .foregroundColor(.white.opacity(0.3))
                 Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not available")
                     .font(.retraceBody)
                     .foregroundColor(.white.opacity(0.5))
                 if !viewModel.frames.isEmpty {
                     Text("Video segment missing")
-                        .font(.system(size: 13))
+                        .font(.retraceCaption)
                         .foregroundColor(.white.opacity(0.3))
                 }
             }
@@ -204,33 +213,10 @@ public struct SimpleTimelineView: View {
     private var closeButton: some View {
         Button(action: onClose) {
             Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 28))
+                .font(.retraceTitle)
                 .foregroundColor(.white.opacity(0.6))
         }
         .buttonStyle(.plain)
-    }
-
-    // MARK: - Controls Toggle Button
-
-    private var controlsToggleButton: some View {
-        Button(action: {
-            viewModel.toggleControlsVisibility()
-        }) {
-            Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
-                .font(.system(size: 20))
-                .foregroundColor(.white.opacity(0.6))
-                .frame(width: 36, height: 36)
-                .background(
-                    Circle()
-                        .fill(Color(white: 0.15))
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
-        }
-        .buttonStyle(.plain)
-        .help(viewModel.areControlsHidden ? "Show Controls (Cmd+.)" : "Hide Controls (Cmd+.)")
     }
 
     // MARK: - Loading Overlay
@@ -299,7 +285,7 @@ public struct SimpleTimelineView: View {
     private func errorOverlay(_ message: String) -> some View {
         VStack(spacing: .spacingM) {
             Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 32))
+                .font(.retraceDisplay3)
                 .foregroundColor(.retraceWarning)
             Text(message)
                 .font(.retraceBody)
@@ -342,11 +328,11 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         let currentPath = context.coordinator.currentVideoPath
         let currentFrameIdx = context.coordinator.currentFrameIndex
 
-        print("[VideoView] updateNSView: frameIndex=\(videoInfo.frameIndex), coordFrameIdx=\(currentFrameIdx ?? -1)")
+        Log.debug("[VideoView] updateNSView: frameIndex=\(videoInfo.frameIndex), coordFrameIdx=\(currentFrameIdx ?? -1)", category: .ui)
 
         // If same video and same frame, nothing to do
         if currentPath == videoInfo.videoPath && currentFrameIdx == videoInfo.frameIndex {
-            print("[VideoView] Same video and frame, skipping")
+            Log.debug("[VideoView] Same video and frame, skipping", category: .ui)
             return
         }
 
@@ -355,40 +341,56 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         // If same video, just seek (fast path - no flickering)
         if currentPath == videoInfo.videoPath {
-            print("[VideoView] Same video, SEEKING to frame \(videoInfo.frameIndex)")
-            let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            Log.debug("[VideoView] Same video, SEEKING to frame \(videoInfo.frameIndex)", category: .ui)
+            // Use integer arithmetic to avoid floating point precision issues
+            let time = videoInfo.frameTimeCMTime
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                let actualTime = player.currentTime().seconds
+                let actualFrame = Int(actualTime * 30.0)
+                Log.debug("[VideoView] Seek completed: finished=\(finished), targetFrame=\(self.videoInfo.frameIndex), actualTime=\(actualTime)s, actualFrame=\(actualFrame)", category: .ui)
+            }
             return
         }
 
-        print("[VideoView] LOADING NEW VIDEO: \(videoInfo.videoPath.suffix(30))")
+        Log.debug("[VideoView] LOADING NEW VIDEO: \(videoInfo.videoPath.suffix(30))", category: .ui)
 
         // Different video - need to load new player item
         context.coordinator.currentVideoPath = videoInfo.videoPath
 
-        // Check if file exists
-        guard FileManager.default.fileExists(atPath: videoInfo.videoPath) else {
-            Log.error("[SimpleVideoFrameView] Video file not found: \(videoInfo.videoPath)", category: .app)
-            return
-        }
-
-        // Create symlink with .mp4 extension (Rewind videos don't have extensions)
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
-        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-        // Only create symlink if it doesn't exist
-        if !FileManager.default.fileExists(atPath: symlinkPath) {
-            do {
-                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
-            } catch {
-                Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
+        // Check if file exists (try both with and without .mp4 extension)
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                Log.error("[SimpleVideoFrameView] Video file not found: \(videoInfo.videoPath)", category: .app)
                 return
             }
         }
 
-        // Load new video
-        let url = URL(fileURLWithPath: symlinkPath)
+        // Determine the URL to use - if file already has .mp4 extension, use directly
+        // Otherwise create symlink with .mp4 extension for AVFoundation
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            // Create symlink with .mp4 extension (Rewind videos don't have extensions)
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            // Only create symlink if it doesn't exist
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let playerItem = AVPlayerItem(asset: asset)
 
@@ -398,13 +400,12 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         player.replaceCurrentItem(with: playerItem)
 
-        // Seek to frame when ready
-        let targetTime = videoInfo.timeInSeconds
+        // Seek to frame when ready - use integer arithmetic to avoid floating point precision issues
+        let targetTime = videoInfo.frameTimeCMTime
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { item, _ in
             guard item.status == .readyToPlay else { return }
 
-            let time = CMTime(seconds: targetTime, preferredTimescale: 600)
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
                 player.pause()
             }
         }
@@ -436,6 +437,9 @@ struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onURLClicked: () -> Void
     let content: () -> Content
+
+    @State private var showContextMenu = false
+    @State private var contextMenuLocation: CGPoint = .zero
 
     var body: some View {
         GeometryReader { geometry in
@@ -495,9 +499,12 @@ struct FrameWithURLOverlay<Content: View>: View {
                             },
                             onDragUpdate: { point in
                                 viewModel.updateDragSelection(to: point)
+                                // Show hint banner when user drags through the screen
+                                viewModel.showTextSelectionHintBannerOnce()
                             },
                             onDragEnd: {
                                 viewModel.endDragSelection()
+                                viewModel.resetTextSelectionHintState()
                             },
                             onClearSelection: {
                                 viewModel.clearTextSelection()
@@ -538,7 +545,25 @@ struct FrameWithURLOverlay<Content: View>: View {
                         )
                     }
                 }
+
             }
+            .onRightClick { location in
+                contextMenuLocation = location
+                showContextMenu = true
+            }
+            .overlay(
+                // Floating context menu at click location
+                Group {
+                    if showContextMenu {
+                        FloatingContextMenu(
+                            viewModel: viewModel,
+                            isPresented: $showContextMenu,
+                            location: contextMenuLocation,
+                            containerSize: geometry.size
+                        )
+                    }
+                }
+            )
         }
     }
 
@@ -984,11 +1009,15 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     let containerSize: CGSize
 
     func makeNSView(context: Context) -> ZoomedSelectionView {
+        Log.debug("[ZoomedTextSelectionNSView] makeNSView - creating new ZoomedSelectionView", category: .ui)
         let view = ZoomedSelectionView()
         view.onDragStart = { point in viewModel.startDragSelection(at: point) }
         view.onDragUpdate = { point in viewModel.updateDragSelection(to: point) }
         view.onDragEnd = { viewModel.endDragSelection() }
-        view.onClearSelection = { viewModel.clearTextSelection() }
+        view.onClearSelection = {
+            Log.debug("[ZoomedTextSelectionNSView] onClearSelection callback triggered", category: .ui)
+            viewModel.clearTextSelection()
+        }
         view.onCopyImage = { [weak viewModel] in viewModel?.copyZoomedRegionImage() }
         view.onDoubleClick = { point in viewModel.selectWordAt(point: point) }
         view.onTripleClick = { point in viewModel.selectNodeAt(point: point) }
@@ -996,6 +1025,7 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ZoomedSelectionView, context: Context) {
+        Log.debug("[ZoomedTextSelectionNSView] updateNSView called, selectionStart=\(viewModel.selectionStart != nil)", category: .ui)
         nsView.zoomRegion = zoomRegion
         nsView.enlargedSize = enlargedSize
 
@@ -1047,6 +1077,8 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
             let transformedH = clippedHeight / zoomRegion.height
 
             // Convert to screen coordinates within the enlarged view
+            // Note: NSView has Y=0 at bottom, but our normalized coords have Y=0 at top
+            // So we flip: screenY = (1.0 - normalizedY - normalizedH) * height
             let rect = NSRect(
                 x: transformedX * enlargedSize.width,
                 y: (1.0 - transformedY - transformedH) * enlargedSize.height,
@@ -1070,7 +1102,11 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
                 rect: rect,
                 text: visibleText,
                 selectionRange: adjustedSelectionRange,
-                visibleCharOffset: visibleStartChar
+                visibleCharOffset: visibleStartChar,
+                originalX: node.x,
+                originalY: node.y,
+                originalW: node.width,
+                originalH: node.height
             )
         }
 
@@ -1087,6 +1123,11 @@ class ZoomedSelectionView: NSView {
         let selectionRange: (start: Int, end: Int)?
         /// Offset of the first visible character (for clipped nodes)
         let visibleCharOffset: Int
+        /// Original normalized coordinates (for debugging hit-testing)
+        let originalX: CGFloat
+        let originalY: CGFloat
+        let originalW: CGFloat
+        let originalH: CGFloat
     }
 
     var nodeData: [NodeData] = []
@@ -1128,10 +1169,13 @@ class ZoomedSelectionView: NSView {
 
         // Handle multi-click (double-click = word, triple-click = line)
         let clickCount = event.clickCount
+        Log.debug("[ZoomedSelectionView] mouseDown clickCount=\(clickCount) isDragging=\(isDragging)", category: .ui)
         if clickCount == 2 {
+            Log.debug("[ZoomedSelectionView] Double-click detected, calling onDoubleClick", category: .ui)
             onDoubleClick?(normalizedPoint)
             isDragging = false
         } else if clickCount >= 3 {
+            Log.debug("[ZoomedSelectionView] Triple-click detected, calling onTripleClick", category: .ui)
             onTripleClick?(normalizedPoint)
             isDragging = false
         } else {
@@ -1159,11 +1203,18 @@ class ZoomedSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        isDragging = false
-        if !hasMoved {
-            onClearSelection?()
-        } else {
-            onDragEnd?()
+        Log.debug("[ZoomedSelectionView] mouseUp isDragging=\(isDragging) hasMoved=\(hasMoved)", category: .ui)
+        // Only process mouseUp for drag operations (single-click starts drag)
+        // Double/triple clicks set isDragging=false in mouseDown, so we skip clearing selection for them
+        if isDragging {
+            isDragging = false
+            if !hasMoved {
+                // Single click without drag = clear selection
+                Log.debug("[ZoomedSelectionView] Single click without drag, clearing selection", category: .ui)
+                onClearSelection?()
+            } else {
+                onDragEnd?()
+            }
         }
         needsDisplay = true
     }
@@ -1193,10 +1244,12 @@ class ZoomedSelectionView: NSView {
         )
 
         // Transform back to original frame coordinates
-        return CGPoint(
+        let original = CGPoint(
             x: normalizedInZoom.x * zoomRegion.width + zoomRegion.origin.x,
             y: normalizedInZoom.y * zoomRegion.height + zoomRegion.origin.y
         )
+
+        return original
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1676,22 +1729,22 @@ struct DeleteConfirmationDialog: View {
             VStack(spacing: 20) {
                 // Icon
                 Image(systemName: "trash.fill")
-                    .font(.system(size: 32))
+                    .font(.retraceDisplay3)
                     .foregroundColor(.red.opacity(0.8))
 
                 // Title
                 Text("Delete Frame?")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.retraceHeadline)
                     .foregroundColor(.white)
 
                 // Description
                 VStack(spacing: 8) {
                     Text("Choose to delete this frame or the entire segment.")
-                        .font(.system(size: 14))
+                        .font(.retraceCallout)
                         .foregroundColor(.white.opacity(0.6))
 
                     Text("Note: Removes from database only. Video files remain on disk.")
-                        .font(.system(size: 12))
+                        .font(.retraceCaption2)
                         .foregroundColor(.white.opacity(0.4))
                         .italic()
                 }
@@ -1703,9 +1756,9 @@ struct DeleteConfirmationDialog: View {
                     Button(action: onDeleteFrame) {
                         HStack(spacing: 10) {
                             Image(systemName: "square")
-                                .font(.system(size: 14))
+                                .font(.retraceCallout)
                             Text("Delete Frame")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.retraceCalloutMedium)
                         }
                         .foregroundColor(.white)
                         .frame(width: 240, height: 40)
@@ -1725,9 +1778,9 @@ struct DeleteConfirmationDialog: View {
                     Button(action: onDeleteSegment) {
                         HStack(spacing: 10) {
                             Image(systemName: "rectangle.stack")
-                                .font(.system(size: 14))
+                                .font(.retraceCallout)
                             Text("Delete Segment (\(segmentFrameCount) frames)")
-                                .font(.system(size: 14, weight: .semibold))
+                                .font(.retraceCalloutBold)
                         }
                         .foregroundColor(.white)
                         .frame(width: 240, height: 44)
@@ -1746,7 +1799,7 @@ struct DeleteConfirmationDialog: View {
                     // Cancel button
                     Button(action: onCancel) {
                         Text("Cancel")
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.retraceCalloutMedium)
                             .foregroundColor(.white.opacity(0.8))
                             .frame(width: 240, height: 40)
                             .background(
@@ -1853,64 +1906,727 @@ struct SearchHighlightOverlay: View {
 // MARK: - Debug Frame ID Badge
 
 /// Debug badge showing the current frame ID with click-to-copy functionality
+/// and reprocess OCR button that appears on hover
 /// Only visible when "Show frame IDs in UI" is enabled in Settings > Advanced
 struct DebugFrameIDBadge: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var showCopiedFeedback = false
+    @State private var showReprocessFeedback = false
     @State private var isHovering = false
+    @State private var isHoveringReprocess = false
+
+    /// Whether the current frame can be reprocessed (only Retrace frames)
+    private var canReprocess: Bool {
+        viewModel.currentFrame?.source == .native
+    }
 
     var body: some View {
-        Button(action: {
-            viewModel.copyCurrentFrameID()
-            showCopiedFeedback = true
+        HStack(spacing: 8) {
+            // Frame ID copy button
+            Button(action: {
+                viewModel.copyCurrentFrameID()
+                showCopiedFeedback = true
 
-            // Reset feedback after 1.5 seconds
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                showCopiedFeedback = false
-            }
-        }) {
-            HStack(spacing: 6) {
-                Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(showCopiedFeedback ? .green : .white.opacity(0.7))
+                // Reset feedback after 1.5 seconds
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    showCopiedFeedback = false
+                }
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+                        .font(.retraceTinyMedium)
+                        .foregroundColor(showCopiedFeedback ? .green : .white.opacity(0.7))
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Frame ID")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.white.opacity(0.5))
-
-                    if let frame = viewModel.currentFrame {
-                        Text(showCopiedFeedback ? "Copied!" : String(frame.id.value))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundColor(showCopiedFeedback ? .green : .white)
-                    } else {
-                        Text("--")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Frame ID")
+                            .font(.retraceTinyMedium)
                             .foregroundColor(.white.opacity(0.5))
+
+                        if let frame = viewModel.currentFrame {
+                            Text(showCopiedFeedback ? "Copied!" : String(frame.id.value))
+                                .font(.retraceMonoSmall)
+                                .foregroundColor(showCopiedFeedback ? .green : .white)
+                        } else {
+                            Text("--")
+                                .font(.retraceMonoSmall)
+                                .foregroundColor(.white.opacity(0.5))
+                        }
+
+                        // Debug: Show video frame index being requested
+                        if let videoInfo = viewModel.currentVideoInfo {
+                            Text("VidIdx: \(videoInfo.frameIndex)")
+                                .font(.retraceMonoSmall)
+                                .foregroundColor(.orange.opacity(0.8))
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color(white: 0.15).opacity(0.9))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .help("Click to copy frame ID")
+
+            // Reprocess OCR button (only shown on hover and for Retrace frames)
+            if canReprocess {
+                Button(action: {
+                    Task {
+                        do {
+                            try await viewModel.reprocessCurrentFrameOCR()
+                            showReprocessFeedback = true
+                            // Reset feedback after 1.5 seconds
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                showReprocessFeedback = false
+                            }
+                        } catch {
+                            Log.error("[OCR] Failed to reprocess OCR: \(error)", category: .ui)
+                        }
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: showReprocessFeedback ? "checkmark" : "arrow.clockwise")
+                            .font(.retraceTinyMedium)
+                            .foregroundColor(showReprocessFeedback ? .green : .white.opacity(0.7))
+
+                        Text(showReprocessFeedback ? "Queued" : "OCR")
+                            .font(.retraceTinyMedium)
+                            .foregroundColor(showReprocessFeedback ? .green : .white.opacity(0.7))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color(white: 0.15).opacity(0.9))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isHoveringReprocess ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+                    )
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    isHoveringReprocess = hovering
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+                .help("Reprocess OCR for this frame")
+            }
+        }
+    }
+}
+
+// MARK: - Text Selection Hint Banner
+
+/// Banner displayed at the top of the screen when user attempts text selection
+/// Suggests using Shift + Drag for area selection mode (like Rewind)
+struct TextSelectionHintBanner: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Info icon
+            Image(systemName: "info.circle.fill")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Message
+            Text("Selecting text?")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Try area selection mode:")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+
+            // Keyboard shortcut badges
+            HStack(spacing: 4) {
+                KeyboardBadge(symbol: "⇧ Shift")
+                Text("+")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.5))
+                KeyboardBadge(symbol: "⊹ Drag")
+            }
+
+            // Dismiss button
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.retraceCaption2Bold)
+                    .foregroundColor(.white.opacity(0.6))
+                    .frame(width: 24, height: 24)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(white: 0.2).opacity(0.95))
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
+    }
+}
+
+/// Small keyboard shortcut badge
+private struct KeyboardBadge: View {
+    let symbol: String
+
+    var body: some View {
+        Text(symbol)
+            .font(.retraceCaption2Medium)
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.white.opacity(0.15))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.white.opacity(0.2), lineWidth: 1)
+            )
+    }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let showFrameContextMenu = Notification.Name("showFrameContextMenu")
+}
+
+// MARK: - Right Click Handler
+
+/// NSViewRepresentable that detects right-clicks and reports the location
+/// View modifier that monitors for right-clicks using a local event monitor
+struct RightClickOverlay: ViewModifier {
+    let onRightClick: (CGPoint) -> Void
+    @State private var eventMonitor: Any?
+    @State private var viewBounds: CGRect = .zero
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear {
+                            viewBounds = geo.frame(in: .global)
+                        }
+                        .onChange(of: geo.frame(in: .global)) { newFrame in
+                            viewBounds = newFrame
+                        }
+                }
+            )
+            .onAppear {
+                setupEventMonitor()
+            }
+            .onDisappear {
+                removeEventMonitor()
+            }
+    }
+
+    private func setupEventMonitor() {
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
+            // Get the click location in screen coordinates
+            let screenLocation = NSEvent.mouseLocation
+
+            // Check if click is within our view bounds (approximately)
+            // Note: viewBounds is in SwiftUI global coordinates
+            if viewBounds.contains(CGPoint(x: screenLocation.x, y: screenLocation.y)) {
+                // Convert to view-local coordinates
+                let localX = screenLocation.x - viewBounds.minX
+                let localY = viewBounds.height - (screenLocation.y - viewBounds.minY)
+
+                DispatchQueue.main.async {
+                    onRightClick(CGPoint(x: localX, y: localY))
+                }
+                return nil // Consume the event
+            }
+            return event
+        }
+    }
+
+    private func removeEventMonitor() {
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
+    }
+}
+
+extension View {
+    func onRightClick(perform action: @escaping (CGPoint) -> Void) -> some View {
+        modifier(RightClickOverlay(onRightClick: action))
+    }
+}
+
+// MARK: - Floating Context Menu
+
+/// Floating context menu that appears at click location with smart edge detection
+struct FloatingContextMenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @Binding var isPresented: Bool
+    let location: CGPoint
+    let containerSize: CGSize
+
+    // Menu dimensions (approximate)
+    private let menuWidth: CGFloat = 200
+    private let menuHeight: CGFloat = 220
+    private let edgePadding: CGFloat = 16
+
+    var body: some View {
+        ZStack {
+            // Dismiss overlay
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        isPresented = false
+                    }
+                }
+
+            // Menu content
+            VStack(alignment: .leading, spacing: 2) {
+                ContextMenuRow(title: "Copy Moment Link", icon: "link") {
+                    isPresented = false
+                    copyMomentLink()
+                }
+
+                ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
+                    isPresented = false
+                    copyImageToClipboard()
+                }
+
+                ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+                    isPresented = false
+                    saveImage()
+                }
+
+                Divider()
+                    .background(Color.white.opacity(0.1))
+                    .padding(.vertical, 4)
+
+                ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2") {
+                    isPresented = false
+                    openDashboard()
+                }
+
+                ContextMenuRow(title: "Settings", icon: "gear") {
+                    isPresented = false
+                    openSettings()
+                }
+            }
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color(white: 0.1))
+                    .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+            )
+            .fixedSize()
+            .position(adjustedPosition)
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
+        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+    }
+
+    /// Whether menu should appear above the click (bottom-left at cursor) vs below (top-left at cursor)
+    private var shouldShowAbove: Bool {
+        // Show above if not enough room below
+        location.y + menuHeight > containerSize.height - edgePadding
+    }
+
+    /// Calculate position so corner is at mouse location
+    private var adjustedPosition: CGPoint {
+        // Top-left corner at cursor (default), or bottom-left corner at cursor if near bottom edge
+        var x = location.x + menuWidth / 2
+        var y = shouldShowAbove ? (location.y - menuHeight / 2) : (location.y + menuHeight / 2)
+
+        // Clamp X to keep menu on screen
+        if x + menuWidth / 2 > containerSize.width - edgePadding {
+            x = containerSize.width - menuWidth / 2 - edgePadding
+        }
+        if x - menuWidth / 2 < edgePadding {
+            x = menuWidth / 2 + edgePadding
+        }
+
+        // Clamp Y to keep menu on screen
+        if y - menuHeight / 2 < edgePadding {
+            y = menuHeight / 2 + edgePadding
+        }
+        if y + menuHeight / 2 > containerSize.height - edgePadding {
+            y = containerSize.height - menuHeight / 2 - edgePadding
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Determine anchor point for animation based on position
+    private var anchorPoint: UnitPoint {
+        shouldShowAbove ? .bottomLeading : .topLeading
+    }
+
+    // MARK: - Actions
+
+    private func copyMomentLink() {
+        guard let timestamp = viewModel.currentTimestamp else { return }
+
+        if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(url.absoluteString, forType: .string)
+        }
+    }
+
+    private func saveImage() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
                     }
                 }
             }
+        }
+    }
+
+    private func copyImageToClipboard() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
+        }
+    }
+
+    private func openDashboard() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openDashboard, object: nil)
+        }
+    }
+
+    private func openSettings() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openSettings, object: nil)
+        }
+    }
+
+    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        if let image = viewModel.currentImage {
+            completion(image)
+            return
+        }
+
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                completion(nil)
+                return
+            }
+        }
+
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    completion(nil)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
+
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = videoInfo.frameTimeCMTime
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    private func formattedTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    }
+}
+
+// MARK: - Frame Context Menu Content (Legacy - kept for MoreOptionsMenu)
+
+/// Context menu popover content for right-click on frame
+struct FrameContextMenuContent: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @Binding var showMenu: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ContextMenuRow(title: "Copy Moment Link", icon: "link") {
+                showMenu = false
+                copyMomentLink()
+            }
+
+            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
+                showMenu = false
+                copyImageToClipboard()
+            }
+
+            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+                showMenu = false
+                saveImage()
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.vertical, 4)
+
+            ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2") {
+                showMenu = false
+                openDashboard()
+            }
+
+            ContextMenuRow(title: "Settings", icon: "gear") {
+                showMenu = false
+                openSettings()
+            }
+        }
+        .padding(8)
+        .background(Color.black.opacity(0.9))
+    }
+
+    // MARK: - Actions
+
+    private func copyMomentLink() {
+        guard let timestamp = viewModel.currentTimestamp else { return }
+
+        if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(url.absoluteString, forType: .string)
+        }
+    }
+
+    private func saveImage() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
+                    }
+                }
+            }
+        }
+    }
+
+    private func copyImageToClipboard() {
+        getCurrentFrameImage { image in
+            guard let image = image else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
+        }
+    }
+
+    private func openDashboard() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openDashboard, object: nil)
+        }
+    }
+
+    private func openSettings() {
+        TimelineWindowController.shared.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openSettings, object: nil)
+        }
+    }
+
+    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        if let image = viewModel.currentImage {
+            completion(image)
+            return
+        }
+
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        // Check if file exists (try both with and without .mp4 extension)
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                completion(nil)
+                return
+            }
+        }
+
+        // Determine the URL to use
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    completion(nil)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
+
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = videoInfo.frameTimeCMTime
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    private func formattedTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    }
+}
+
+// MARK: - Context Menu Row
+
+/// Styled menu row for the context menu popover
+private struct ContextMenuRow: View {
+    let title: String
+    let icon: String
+    var shortcut: String? = nil
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.7))
+                    .frame(width: 18)
+
+                Text(title)
+                    .font(.retraceCaption)
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if let shortcut = shortcut {
+                    Text(shortcut)
+                        .font(.retraceCaption2)
+                        .foregroundColor(.white.opacity(0.4))
+                }
+            }
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
             .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(white: 0.15).opacity(0.9))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
             )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             isHovering = hovering
-            if hovering {
-                NSCursor.pointingHand.push()
-            } else {
-                NSCursor.pop()
-            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
         }
-        .help("Click to copy frame ID")
     }
 }
 

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Shared
 
 /// Manages global keyboard shortcuts for the application
 /// Allows timeline to be triggered even when app is not in focus
@@ -63,13 +64,25 @@ public class HotkeyManager: NSObject {
         callback: @escaping () -> Void
     ) {
         let keyCode = keyCodeForString(key)
+        Log.info("[HotkeyManager] Registering hotkey: key='\(key)' keyCode=\(keyCode) modifiers=\(modifierDescription(modifiers))", category: .ui)
         registerHotkey(keyCode: keyCode, modifiers: modifiers, callback: callback)
     }
 
     /// Unregister all hotkeys
     public func unregisterAll() {
+        Log.info("[HotkeyManager] Unregistering all hotkeys (count: \(hotkeys.count))", category: .ui)
         stopEventTap()
         hotkeys.removeAll()
+    }
+
+    /// Helper to describe modifiers for logging
+    private func modifierDescription(_ modifiers: NSEvent.ModifierFlags) -> String {
+        var parts: [String] = []
+        if modifiers.contains(.command) { parts.append("Cmd") }
+        if modifiers.contains(.shift) { parts.append("Shift") }
+        if modifiers.contains(.option) { parts.append("Option") }
+        if modifiers.contains(.control) { parts.append("Ctrl") }
+        return parts.isEmpty ? "none" : parts.joined(separator: "+")
     }
 
     /// Retry setting up event tap if permissions are now available
@@ -111,7 +124,7 @@ public class HotkeyManager: NSObject {
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            print("[HotkeyManager] Failed to create event tap. Check accessibility permissions.")
+            Log.error("[HotkeyManager] Failed to create event tap. Check accessibility permissions.", category: .ui)
             return
         }
 
@@ -128,7 +141,7 @@ public class HotkeyManager: NSObject {
         CGEvent.tapEnable(tap: tap, enable: true)
         eventTap = tap
 
-        print("[HotkeyManager] Global hotkey monitoring started")
+        Log.info("[HotkeyManager] Global hotkey monitoring started", category: .ui)
     }
 
     private func stopEventTap() {

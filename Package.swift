@@ -39,7 +39,9 @@ let package = Package(
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
 
         // SQLCipher for reading encrypted Rewind database
-        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0")
+        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0"),
+        // Sparkle for auto-updates
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.0")
     ],
     targets: [
         // MARK: - Shared models and protocols
@@ -218,7 +220,8 @@ let package = Package(
                 "Capture",
                 "Processing",
                 "Search",
-                "Migration"
+                "Migration",
+                .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "UI",
             exclude: [

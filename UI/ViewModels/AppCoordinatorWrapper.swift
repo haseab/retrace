@@ -32,13 +32,31 @@ public class AppCoordinatorWrapper: ObservableObject {
     // MARK: - Lifecycle
 
     public func initialize() async throws {
+        Log.debug("[AppCoordinatorWrapper] initialize() called - starting coordinator.initialize()", category: .app)
         try await coordinator.initialize()
+        Log.debug("[AppCoordinatorWrapper] coordinator.initialize() completed", category: .app)
 
         // Set up accessibility permission warning callback
         await coordinator.setupAccessibilityWarningCallback { [weak self] in
             Task { @MainActor in
                 self?.showAccessibilityPermissionWarning = true
             }
+        }
+
+        // Auto-start recording if it was previously running
+        let shouldAutoStart = AppCoordinator.shouldAutoStartRecording()
+        Log.debug("[AppCoordinatorWrapper] shouldAutoStartRecording() = \(shouldAutoStart)", category: .app)
+        if shouldAutoStart {
+            Log.debug("[AppCoordinatorWrapper] Auto-starting recording based on previous state", category: .app)
+            do {
+                try await coordinator.startPipeline()
+                await updateStatus()
+                Log.debug("[AppCoordinatorWrapper] Auto-start recording succeeded", category: .app)
+            } catch {
+                Log.error("[AppCoordinatorWrapper] Auto-start recording failed: \(error)", category: .app)
+            }
+        } else {
+            Log.debug("[AppCoordinatorWrapper] Not auto-starting (shouldAutoStart=false)", category: .app)
         }
     }
 

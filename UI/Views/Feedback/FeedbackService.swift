@@ -1,6 +1,15 @@
 import Foundation
 import AppKit
 import Shared
+import OSLog
+
+// MARK: - Feedback Stats Provider
+
+/// Protocol for providing database statistics to feedback service
+public protocol FeedbackStatsProvider {
+    func getDatabaseStats() async throws -> DatabaseStatistics
+    func getAppSessionCount() async throws -> Int
+}
 
 // MARK: - Feedback Service
 
@@ -13,9 +22,12 @@ public final class FeedbackService {
 
     // MARK: - Diagnostic Collection
 
-    /// Collect current diagnostic information
+    /// Collect current diagnostic information (with placeholder database stats)
     public func collectDiagnostics() -> DiagnosticInfo {
-        DiagnosticInfo(
+        let logs = collectRecentLogs()
+        let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
+
+        return DiagnosticInfo(
             appVersion: appVersion,
             buildNumber: buildNumber,
             macOSVersion: macOSVersion,
@@ -23,18 +35,63 @@ public final class FeedbackService {
             totalDiskSpace: totalDiskSpace,
             freeDiskSpace: freeDiskSpace,
             databaseStats: collectDatabaseStats(),
-            recentErrors: collectRecentErrors()
+            recentErrors: errors,
+            recentLogs: logs
+        )
+    }
+
+    /// Collect current diagnostic information with real database stats from provider
+    public func collectDiagnostics(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
+        let logs = collectRecentLogs()
+        let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
+
+        return DiagnosticInfo(
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            macOSVersion: macOSVersion,
+            deviceModel: deviceModel,
+            totalDiskSpace: totalDiskSpace,
+            freeDiskSpace: freeDiskSpace,
+            databaseStats: stats,
+            recentErrors: errors,
+            recentLogs: logs
         )
     }
 
     // MARK: - App Info
 
+    /// Get the app bundle - handles both running as .app bundle and debug mode
+    private var appBundle: Bundle {
+        // First try Bundle.main
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
+            return Bundle.main
+        }
+
+        // If running in debug mode, try to find the app bundle by identifier
+        if let bundle = Bundle(identifier: "io.retrace.app") {
+            return bundle
+        }
+
+        // Fallback to main bundle
+        return Bundle.main
+    }
+
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
+        // First try bundle lookup
+        if let version = appBundle.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
+            return version
+        }
+        // Fallback to hardcoded version for debug builds
+        return "0.1.0"
     }
 
     private var buildNumber: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "Unknown"
+        // First try bundle lookup
+        if let build = appBundle.infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty {
+            return build
+        }
+        // Fallback to hardcoded build for debug builds
+        return "dev"
     }
 
     // MARK: - System Info
@@ -93,12 +150,45 @@ public final class FeedbackService {
         )
     }
 
-    // MARK: - Error Collection
+    // MARK: - Log Collection
 
-    private func collectRecentErrors() -> [String] {
-        // Collect recent errors from system log
-        // For now, return empty - can be enhanced to read from os_log
-        return []
+    /// Collect recent logs from the last hour using OSLogStore
+    private func collectRecentLogs() -> [String] {
+        guard #available(macOS 12.0, *) else {
+            return ["Log collection requires macOS 12.0+"]
+        }
+
+        do {
+            let store = try OSLogStore(scope: .currentProcessIdentifier)
+            let oneHourAgo = Date().addingTimeInterval(-3600) // Last 1 hour
+            let position = store.position(date: oneHourAgo)
+
+            let entries = try store.getEntries(at: position)
+                .compactMap { $0 as? OSLogEntryLog }
+                .filter { $0.subsystem == "io.retrace.app" }
+                .suffix(500) // Limit to last 500 entries to avoid huge payloads
+
+            return entries.map { entry in
+                let timestamp = ISO8601DateFormatter().string(from: entry.date)
+                let level = logLevelString(entry.level)
+                return "[\(timestamp)] [\(level)] [\(entry.category)] \(entry.composedMessage)"
+            }
+        } catch {
+            return ["Failed to collect logs: \(error.localizedDescription)"]
+        }
+    }
+
+    /// Convert OSLogEntryLog.Level to readable string
+    @available(macOS 12.0, *)
+    private func logLevelString(_ level: OSLogEntryLog.Level) -> String {
+        switch level {
+        case .debug: return "DEBUG"
+        case .info: return "INFO"
+        case .notice: return "NOTICE"
+        case .error: return "ERROR"
+        case .fault: return "FAULT"
+        default: return "UNKNOWN"
+        }
     }
 
     // MARK: - Submission
@@ -107,8 +197,11 @@ public final class FeedbackService {
     /// - Parameter submission: The feedback to submit
     /// - Returns: True if successful
     public func submitFeedback(_ submission: FeedbackSubmission) async throws -> Bool {
-        // TODO: Replace with actual endpoint
-        let endpoint = URL(string: "https://api.retrace.io/feedback")!
+        // TODO: Replace with your actual feedback endpoint
+        let endpoint = URL(string: "https://retrace.to/api/feedback")!
+
+        Log.info("[FeedbackService] Submitting feedback to \(endpoint.absoluteString)", category: .app)
+        Log.debug("[FeedbackService] Type: \(submission.type), Email: \(submission.email ?? "none"), HasImage: \(submission.screenshotData != nil)", category: .app)
 
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -118,18 +211,30 @@ public final class FeedbackService {
         encoder.dateEncodingStrategy = .iso8601
         request.httpBody = try encoder.encode(submission)
 
-        // For now, simulate success (dummy endpoint)
-        // In production, uncomment below:
-        // let (_, response) = try await URLSession.shared.data(for: request)
-        // guard let httpResponse = response as? HTTPURLResponse,
-        //       (200...299).contains(httpResponse.statusCode) else {
-        //     throw FeedbackError.submissionFailed
-        // }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                Log.error("[FeedbackService] Invalid response type", category: .app)
+                throw FeedbackError.submissionFailed
+            }
 
-        // Simulate network delay
-        try await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+            Log.info("[FeedbackService] Response status: \(httpResponse.statusCode)", category: .app)
 
-        return true
+            if !(200...299).contains(httpResponse.statusCode) {
+                let responseBody = String(data: data, encoding: .utf8) ?? "no body"
+                Log.error("[FeedbackService] Submission failed with status \(httpResponse.statusCode): \(responseBody)", category: .app)
+                throw FeedbackError.submissionFailed
+            }
+
+            Log.info("[FeedbackService] Feedback submitted successfully", category: .app)
+            return true
+        } catch let urlError as URLError {
+            Log.error("[FeedbackService] Network error: \(urlError.localizedDescription) (code: \(urlError.code.rawValue))", category: .app)
+            throw FeedbackError.networkError(urlError.localizedDescription)
+        } catch {
+            Log.error("[FeedbackService] Submission error: \(error.localizedDescription)", category: .app)
+            throw error
+        }
     }
 
     // MARK: - Screenshot
@@ -180,6 +285,7 @@ public final class FeedbackService {
 public enum FeedbackError: LocalizedError {
     case submissionFailed
     case invalidData
+    case networkError(String)
 
     public var errorDescription: String? {
         switch self {
@@ -187,6 +293,8 @@ public enum FeedbackError: LocalizedError {
             return "Failed to submit feedback. Please try again."
         case .invalidData:
             return "Invalid feedback data."
+        case .networkError(let message):
+            return "Network error: \(message)"
         }
     }
 }

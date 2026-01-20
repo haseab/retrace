@@ -10,7 +10,6 @@ public struct ContentView: View {
     @State private var showOnboarding: Bool? = nil  // nil = loading, true = show onboarding, false = show main app
     @State private var showFeedbackSheet = false
     @StateObject private var deeplinkHandler = DeeplinkHandler()
-    @StateObject private var menuBarManager: MenuBarManager
 
     private let coordinator: AppCoordinator
 
@@ -18,10 +17,6 @@ public struct ContentView: View {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
-        _menuBarManager = StateObject(wrappedValue: MenuBarManager(
-            coordinator: coordinator,
-            onboardingManager: coordinator.onboardingManager
-        ))
     }
 
     // MARK: - Body
@@ -35,7 +30,7 @@ public struct ContentView: View {
                         withAnimation {
                             self.showOnboarding = false
                             // Sync menu bar recording status after onboarding completes
-                            menuBarManager.syncWithCoordinator()
+                            MenuBarManager.shared?.syncWithCoordinator()
                         }
                     }
                 } else {
@@ -86,7 +81,6 @@ public struct ContentView: View {
                 }
             }
 
-            menuBarManager.setup()
             setupNotifications()
         }
         .onOpenURL { url in

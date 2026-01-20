@@ -165,7 +165,10 @@ public actor WALManager {
     /// Finalize a WAL session (after successful video encoding)
     public func finalizeSession(_ session: WALSession) async throws {
         // Delete the WAL directory - video is now safely encoded
-        try FileManager.default.removeItem(at: session.sessionDir)
+        // Use try? to handle case where directory was already deleted (e.g., double-finalize)
+        if FileManager.default.fileExists(atPath: session.sessionDir.path) {
+            try FileManager.default.removeItem(at: session.sessionDir)
+        }
     }
 
     // MARK: - Recovery Operations

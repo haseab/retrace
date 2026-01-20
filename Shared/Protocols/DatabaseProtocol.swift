@@ -45,6 +45,9 @@ public protocol DatabaseProtocol: Actor {
     /// Get total frame count
     func getFrameCount() async throws -> Int
 
+    /// Check if a frame exists at the given timestamp (to the second)
+    func frameExistsAtTimestamp(_ timestamp: Date) async throws -> Bool
+
     /// Update frame's videoId and videoFrameIndex after video encoding
     func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws
 
@@ -67,6 +70,23 @@ public protocol DatabaseProtocol: Actor {
 
     /// Get total storage used by all video segments
     func getTotalStorageBytes() async throws -> Int64
+
+    // MARK: - Unfinalised Video Operations (Multi-Resolution Support)
+
+    /// Get an unfinalised video matching the given resolution
+    /// Returns nil if no unfinalised video exists for this resolution
+    /// Used to resume writing to an existing video when a frame with matching resolution comes in
+    func getUnfinalisedVideoByResolution(width: Int, height: Int) async throws -> UnfinalisedVideo?
+
+    /// Get all unfinalised videos (for recovery on app startup)
+    func getAllUnfinalisedVideos() async throws -> [UnfinalisedVideo]
+
+    /// Mark a video as finalized (complete, no more frames will be added)
+    /// Also updates uploadedAt timestamp and fileSize
+    func markVideoFinalized(id: Int64, frameCount: Int, fileSize: Int64) async throws
+
+    /// Update video segment with current frame count
+    func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64, frameCount: Int) async throws
 
     // MARK: - Text/Document Operations
 
@@ -108,6 +128,15 @@ public protocol DatabaseProtocol: Actor {
 
     /// Get segments for a specific app
     func getSegments(bundleID: String, limit: Int) async throws -> [Segment]
+
+    /// Get segments for a specific app within a time range with pagination
+    func getSegments(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) async throws -> [Segment]
 
     /// Delete a segment
     func deleteSegment(id: Int64) async throws
@@ -337,6 +366,8 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
 /// Used for text selection UI layer - compatible with both Rewind and Retrace data
 public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
     public let id: Int  // nodeOrder from database
+    /// The frame ID this node belongs to (for debugging frame offset issues)
+    public let frameId: Int64
     /// Normalized X coordinate (0.0-1.0)
     public let x: CGFloat
     /// Normalized Y coordinate (0.0-1.0)
@@ -348,8 +379,9 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
     /// The text content of this node
     public let text: String
 
-    public init(id: Int, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, text: String) {
+    public init(id: Int, frameId: Int64, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, text: String) {
         self.id = id
+        self.frameId = frameId
         self.x = x
         self.y = y
         self.width = width

@@ -37,8 +37,8 @@ enum SegmentQueries {
         sqlite3_bind_int64(statement, 4, segment.fileSizeBytes)
         // Frame rate: Retrace uses 30 FPS like Rewind
         sqlite3_bind_double(statement, 5, 30.0)
-        // processingState: 0 = completed (like Rewind)
-        sqlite3_bind_int(statement, 6, 0)
+        // processingState: 1 = in progress (still being written to), 0 = completed
+        sqlite3_bind_int(statement, 6, 1)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -48,6 +48,177 @@ enum SegmentQueries {
         }
 
         return sqlite3_last_insert_rowid(db)
+    }
+
+    // MARK: - Update
+
+    /// Update video segment metadata (fileSize, frameCount, width, height)
+    /// Called periodically during recording to keep DB in sync with file
+    static func update(db: OpaquePointer, id: Int64, width: Int, height: Int, fileSize: Int64, frameCount: Int? = nil) throws {
+        let sql: String
+        if frameCount != nil {
+            sql = """
+                UPDATE video SET width = ?, height = ?, fileSize = ?, frameCount = ?
+                WHERE id = ?;
+                """
+        } else {
+            sql = """
+                UPDATE video SET width = ?, height = ?, fileSize = ?
+                WHERE id = ?;
+                """
+        }
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int(statement, 1, Int32(width))
+        sqlite3_bind_int(statement, 2, Int32(height))
+        sqlite3_bind_int64(statement, 3, fileSize)
+
+        if let frameCount = frameCount {
+            sqlite3_bind_int(statement, 4, Int32(frameCount))
+            sqlite3_bind_int64(statement, 5, id)
+        } else {
+            sqlite3_bind_int64(statement, 4, id)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Mark a video as finalized (complete, no more frames will be added)
+    /// Sets processingState = 0 (completed), updates uploadedAt timestamp, fileSize, and frameCount
+    static func markFinalized(db: OpaquePointer, id: Int64, frameCount: Int, fileSize: Int64) throws {
+        let sql = """
+            UPDATE video SET processingState = 0, frameCount = ?, fileSize = ?, uploadedAt = ?
+            WHERE id = ?;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let currentTimestamp = Schema.currentTimestamp()
+        sqlite3_bind_int(statement, 1, Int32(frameCount))
+        sqlite3_bind_int64(statement, 2, fileSize)
+        sqlite3_bind_int64(statement, 3, currentTimestamp)
+        sqlite3_bind_int64(statement, 4, id)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Get an unfinalised video matching the given resolution
+    /// Returns nil if no unfinalised video exists for this resolution
+    /// Used to resume writing to an existing video when a frame with matching resolution comes in
+    static func getUnfinalisedByResolution(db: OpaquePointer, width: Int, height: Int) throws -> UnfinalisedVideo? {
+        let sql = """
+            SELECT id, path, frameCount
+            FROM video
+            WHERE width = ? AND height = ? AND processingState = 1
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int(statement, 1, Int32(width))
+        sqlite3_bind_int(statement, 2, Int32(height))
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        let id = sqlite3_column_int64(statement, 0)
+        guard let pathText = sqlite3_column_text(statement, 1) else {
+            return nil
+        }
+        let path = String(cString: pathText)
+        let frameCount = Int(sqlite3_column_int(statement, 2))
+
+        return UnfinalisedVideo(
+            id: id,
+            relativePath: path,
+            frameCount: frameCount,
+            width: width,
+            height: height
+        )
+    }
+
+    /// Get all unfinalised videos (for recovery on app startup)
+    /// processingState = 1 means video is still being written to
+    static func getAllUnfinalised(db: OpaquePointer) throws -> [UnfinalisedVideo] {
+        let sql = """
+            SELECT id, path, frameCount, width, height
+            FROM video
+            WHERE processingState = 1;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var results: [UnfinalisedVideo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            guard let pathText = sqlite3_column_text(statement, 1) else { continue }
+            let path = String(cString: pathText)
+            let frameCount = Int(sqlite3_column_int(statement, 2))
+            let width = Int(sqlite3_column_int(statement, 3))
+            let height = Int(sqlite3_column_int(statement, 4))
+
+            results.append(UnfinalisedVideo(
+                id: id,
+                relativePath: path,
+                frameCount: frameCount,
+                width: width,
+                height: height
+            ))
+        }
+
+        return results
     }
 
     // MARK: - Select by ID

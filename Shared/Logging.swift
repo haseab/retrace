@@ -38,12 +38,9 @@ public enum Log {
     /// Subsystem for os.log
     private static let subsystem = "io.retrace.app"
 
-    /// Whether to also print to console (always true in DEBUG, configurable in release)
-    #if DEBUG
-    private static let printToConsole = true
-    #else
-    private static var printToConsole = false
-    #endif
+    /// Whether to also print to console (always true for both DEBUG and release builds)
+    /// This ensures logs are always written to stdout for export capabilities
+    private static var printToConsole = true
 
     /// Enable console printing in release builds (for debugging)
     public static func enableConsolePrinting() {

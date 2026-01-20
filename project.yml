@@ -38,15 +38,23 @@ targets:
       - target: Processing
       - target: Search
       - target: Migration
-      - package: Inject
+      - package: Sparkle
+      - package: swift-sqlcipher
+        product: SQLCipher
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app
         INFOPLIST_FILE: UI/Info.plist
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
         CODE_SIGN_ENTITLEMENTS: UI/Retrace.entitlements
-        CODE_SIGN_STYLE: Automatic
-        CODE_SIGNING_REQUIRED: NO
-        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        DEVELOPMENT_TEAM: 5X5W7C3L9D
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 
   Shared:
     type: framework
@@ -72,6 +80,8 @@ targets:
           - PROGRESS.md
     dependencies:
       - target: Shared
+      - package: swift-sqlcipher
+        product: SQLCipher
     settings:
       base:
         CODE_SIGNING_REQUIRED: NO
@@ -168,6 +178,8 @@ targets:
           - PROGRESS.md
     dependencies:
       - target: Shared
+      - package: swift-sqlcipher
+        product: SQLCipher
     settings:
       base:
         CODE_SIGNING_REQUIRED: NO
@@ -191,6 +203,8 @@ targets:
       - target: Processing
       - target: Search
       - target: Migration
+      - package: swift-sqlcipher
+        product: SQLCipher
     settings:
       base:
         CODE_SIGNING_REQUIRED: NO
@@ -199,6 +213,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.App
 
 packages:
-  Inject:
-    url: https://github.com/krzysztofzablocki/Inject.git
-    from: "1.5.2"
+  swift-sqlcipher:
+    url: https://github.com/skiptools/swift-sqlcipher.git
+    from: "1.0.0"
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle.git
+    from: "2.6.0"

@@ -155,7 +155,7 @@ public actor MicrophoneAudioCapture {
             audioContinuation.yield(capturedAudio)
 
         } catch {
-            print("Error converting microphone audio: \(error)")
+            Log.error("[MicrophoneAudioCapture] Error converting microphone audio: \(error)", category: .capture)
         }
     }
 

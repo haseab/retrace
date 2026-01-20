@@ -20,6 +20,11 @@ public actor DatabaseManager: DatabaseProtocol {
         db
     }
 
+    /// Check if the database has been fully initialized
+    public func isReady() -> Bool {
+        isInitialized && db != nil
+    }
+
     // MARK: - Initialization
 
     public init(databasePath: String) {
@@ -35,11 +40,11 @@ public actor DatabaseManager: DatabaseProtocol {
 
     public func initialize() async throws {
         guard !isInitialized else { return }
-        print("[DEBUG] DatabaseManager.initialize() started")
+        Log.debug("[DatabaseManager] initialize() started", category: .database)
 
         // Expand tilde in path if present
         let expandedPath = NSString(string: databasePath).expandingTildeInPath
-        print("[DEBUG] Expanded path: \(expandedPath)")
+        Log.debug("[DatabaseManager] Expanded path: \(expandedPath)", category: .database)
 
         // Create parent directory if needed (unless in-memory)
         // Check for both ":memory:" and URI-based in-memory databases (file:xxx?mode=memory)
@@ -57,13 +62,13 @@ public actor DatabaseManager: DatabaseProtocol {
         // Use sqlite3_open_v2 with SQLITE_OPEN_URI to support URI filenames like:
         // file:memdb_xxx?mode=memory&cache=private for unique in-memory databases
         // SQLITE_OPEN_FULLMUTEX enables thread-safe serialized access mode
-        print("[DEBUG] Opening database...")
+        Log.debug("[DatabaseManager] Opening database...", category: .database)
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(expandedPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
-        print("[DEBUG] Database opened successfully")
+        Log.debug("[DatabaseManager] Database opened successfully", category: .database)
 
         // Set encryption key (SQLCipher) if encryption is enabled and not in-memory
         if !isInMemory {
@@ -71,23 +76,23 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         // Enable foreign keys and WAL mode
-        print("[DEBUG] Executing pragmas...")
+        Log.debug("[DatabaseManager] Executing pragmas...", category: .database)
         try executePragmas()
-        print("[DEBUG] Pragmas executed")
+        Log.debug("[DatabaseManager] Pragmas executed", category: .database)
 
         // Run migrations
-        print("[DEBUG] Running migrations...")
+        Log.debug("[DatabaseManager] Running migrations...", category: .database)
         let migrationRunner = MigrationRunner(db: db!)
         try await migrationRunner.runMigrations()
-        print("[DEBUG] Migrations complete")
+        Log.debug("[DatabaseManager] Migrations complete", category: .database)
 
         // Offset AUTOINCREMENT to avoid collision with Rewind's frozen data
-        print("[DEBUG] Setting AUTOINCREMENT offset...")
+        Log.debug("[DatabaseManager] Setting AUTOINCREMENT offset...", category: .database)
         try await offsetAutoincrementFromRewind()
-        print("[DEBUG] AUTOINCREMENT offset complete")
+        Log.debug("[DatabaseManager] AUTOINCREMENT offset complete", category: .database)
 
         isInitialized = true
-        print("Database initialized at: \(expandedPath)")
+        Log.info("[DatabaseManager] Database initialized at: \(expandedPath)", category: .database)
     }
 
     public func close() async throws {
@@ -113,7 +118,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         self.db = nil
         isInitialized = false
-        print("Database closed")
+        Log.info("[DatabaseManager] Database closed", category: .database)
     }
 
     // MARK: - Audio Transcription Operations
@@ -275,6 +280,13 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getAfterWithVideoInfo(db: db, timestamp: timestamp, limit: limit)
     }
 
+    public func getFrameWithVideoInfoByID(id: FrameID) async throws -> FrameWithVideoInfo? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getByIDWithVideoInfo(db: db, id: id)
+    }
+
     public func getFrames(appBundleID: String, limit: Int, offset: Int) async throws -> [FrameReference] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -289,6 +301,14 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.deleteOlderThan(db: db, date: date)
     }
 
+    /// Delete frames newer than the specified date (for quick delete feature)
+    public func deleteFrames(newerThan date: Date) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.deleteNewerThan(db: db, date: date)
+    }
+
     public func deleteFrame(id: FrameID) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -301,6 +321,29 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try FrameQueries.getCount(db: db)
+    }
+
+    /// Get all distinct dates that have frames (for calendar display)
+    public func getDistinctDates() async throws -> [Date] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getDistinctDates(db: db)
+    }
+
+    /// Get distinct hours for a specific date that have frames
+    public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getDistinctHoursForDate(db: db, date: date)
+    }
+
+    public func frameExistsAtTimestamp(_ timestamp: Date) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.existsAtTimestamp(db: db, timestamp: timestamp)
     }
 
     public func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws {
@@ -330,7 +373,8 @@ public actor DatabaseManager: DatabaseProtocol {
                 n.topY,
                 n.width,
                 n.height,
-                sc.c0
+                sc.c0,
+                n.frameId
             FROM node n
             JOIN doc_segment ds ON n.frameId = ds.frameId
             JOIN searchRanking_content sc ON ds.docid = sc.id
@@ -364,6 +408,9 @@ public actor DatabaseManager: DatabaseProtocol {
             guard let fullTextCStr = sqlite3_column_text(statement, 8) else { continue }
             let fullText = String(cString: fullTextCStr)
 
+            // Column 9: frameId for debugging
+            let nodeFrameId = sqlite3_column_int64(statement, 9)
+
             let startIndex = fullText.index(
                 fullText.startIndex,
                 offsetBy: textOffset,
@@ -380,6 +427,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
             results.append(OCRNodeWithText(
                 id: id,
+                frameId: nodeFrameId,
                 x: leftX,
                 y: topY,
                 width: width,
@@ -398,6 +446,13 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.insert(db: db, segment: segment)
+    }
+
+    public func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try SegmentQueries.update(db: db, id: id, width: width, height: height, fileSize: fileSize)
     }
 
     public func getVideoSegment(id: VideoSegmentID) async throws -> VideoSegment? {
@@ -433,6 +488,36 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getTotalStorageBytes(db: db)
+    }
+
+    // MARK: - Unfinalised Video Operations (Multi-Resolution Support)
+
+    public func getUnfinalisedVideoByResolution(width: Int, height: Int) async throws -> UnfinalisedVideo? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.getUnfinalisedByResolution(db: db, width: width, height: height)
+    }
+
+    public func getAllUnfinalisedVideos() async throws -> [UnfinalisedVideo] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.getAllUnfinalised(db: db)
+    }
+
+    public func markVideoFinalized(id: Int64, frameCount: Int, fileSize: Int64) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try SegmentQueries.markFinalized(db: db, id: id, frameCount: frameCount, fileSize: fileSize)
+    }
+
+    public func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64, frameCount: Int) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try SegmentQueries.update(db: db, id: id, width: width, height: height, fileSize: fileSize, frameCount: frameCount)
     }
 
     // MARK: - Document Operations
@@ -531,6 +616,26 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try AppSegmentQueries.getByBundleID(db: db, bundleID: bundleID, limit: limit)
+    }
+
+    public func getSegments(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) async throws -> [Segment] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getByBundleIDAndTimeRange(
+            db: db,
+            bundleID: bundleID,
+            from: startDate,
+            to: endDate,
+            limit: limit,
+            offset: offset
+        )
     }
 
     public func deleteSegment(id: Int64) async throws {
@@ -642,7 +747,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         let frameCount = try FrameQueries.getCount(db: db)
-        let segmentCount = try SegmentQueries.getCount(db: db)
+        let segmentCount = try SegmentQueries.getCount(db: db) // Video segments
         let documentCount = try DocumentQueries.getCount(db: db)
 
         // Get database file size (doesn't work for in-memory)
@@ -668,6 +773,14 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    /// Get app session count (from segment table, not video table)
+    public func getAppSessionCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getCount(db: db)
+    }
+
     // MARK: - Maintenance Operations
 
     /// Checkpoint the WAL file (merge WAL into main database and truncate)
@@ -688,7 +801,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: message)
         }
 
-        print("Database WAL checkpointed and truncated")
+        Log.info("[DatabaseManager] Database WAL checkpointed and truncated", category: .database)
     }
 
     /// Rebuild database file to reclaim space from deleted records
@@ -709,7 +822,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: message)
         }
 
-        print("Database vacuumed successfully")
+        Log.info("[DatabaseManager] Database vacuumed successfully", category: .database)
     }
 
     /// Update query planner statistics for better performance
@@ -730,7 +843,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: message)
         }
 
-        print("Database statistics analyzed successfully")
+        Log.info("[DatabaseManager] Database statistics analyzed successfully", category: .database)
     }
 
     // MARK: - Private Helpers
@@ -754,7 +867,7 @@ public actor DatabaseManager: DatabaseProtocol {
         if sqlite3_step(checkStmt) == SQLITE_ROW {
             let count = sqlite3_column_int(checkStmt, 0)
             if count > 0 {
-                print("[DatabaseManager] AUTOINCREMENT already initialized, skipping offset")
+                Log.debug("[DatabaseManager] AUTOINCREMENT already initialized, skipping offset", category: .database)
                 return
             }
         }
@@ -765,7 +878,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         // Check if Rewind database exists
         guard FileManager.default.fileExists(atPath: expandedRewindPath) else {
-            print("[DatabaseManager] Rewind database not found, skipping AUTOINCREMENT offset")
+            Log.debug("[DatabaseManager] Rewind database not found, skipping AUTOINCREMENT offset", category: .database)
             return
         }
 
@@ -778,7 +891,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         // Open Rewind database (read-only)
         guard sqlite3_open_v2(expandedRewindPath, &rewindDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            print("[DatabaseManager] Failed to open Rewind database, skipping AUTOINCREMENT offset")
+            Log.debug("[DatabaseManager] Failed to open Rewind database, skipping AUTOINCREMENT offset", category: .database)
             return
         }
 
@@ -804,7 +917,7 @@ public actor DatabaseManager: DatabaseProtocol {
             maxVideoID = sqlite3_column_int64(maxVideoStmt, 0)
         }
 
-        print("[DatabaseManager] Rewind max IDs - frame: \(maxFrameID), video: \(maxVideoID)")
+        Log.debug("[DatabaseManager] Rewind max IDs - frame: \(maxFrameID), video: \(maxVideoID)", category: .database)
 
         // Set Retrace's AUTOINCREMENT to start after Rewind's max IDs
         // We do this by inserting/updating the sqlite_sequence table
@@ -819,7 +932,7 @@ public actor DatabaseManager: DatabaseProtocol {
             if sqlite3_prepare_v2(db, updateFrameSeq, -1, &updateFrameStmt, nil) == SQLITE_OK {
                 sqlite3_bind_int64(updateFrameStmt, 1, maxFrameID)
                 if sqlite3_step(updateFrameStmt) == SQLITE_DONE {
-                    print("[DatabaseManager] Set frame AUTOINCREMENT to start at \(maxFrameID + 1)")
+                    Log.debug("[DatabaseManager] Set frame AUTOINCREMENT to start at \(maxFrameID + 1)", category: .database)
                 }
             }
         }
@@ -834,7 +947,7 @@ public actor DatabaseManager: DatabaseProtocol {
             if sqlite3_prepare_v2(db, updateVideoSeq, -1, &updateVideoStmt, nil) == SQLITE_OK {
                 sqlite3_bind_int64(updateVideoStmt, 1, maxVideoID)
                 if sqlite3_step(updateVideoStmt) == SQLITE_DONE {
-                    print("[DatabaseManager] Set video AUTOINCREMENT to start at \(maxVideoID + 1)")
+                    Log.debug("[DatabaseManager] Set video AUTOINCREMENT to start at \(maxVideoID + 1)", category: .database)
                 }
             }
         }
@@ -912,7 +1025,7 @@ public actor DatabaseManager: DatabaseProtocol {
         // For unencrypted databases, simply don't set any PRAGMA key.
         // SQLCipher will operate as regular SQLite when no key is provided on a new/plaintext database.
         if !encryptionEnabled {
-            print("[DEBUG] Database encryption disabled - no key set")
+            Log.debug("[DatabaseManager] Database encryption disabled - no key set", category: .database)
             return
         }
 
@@ -923,13 +1036,13 @@ public actor DatabaseManager: DatabaseProtocol {
         var keyData: Data
         do {
             keyData = try loadKeyFromKeychain(service: keychainService, account: keychainAccount)
-            print("[DEBUG] Loaded existing database encryption key from Keychain")
+            Log.debug("[DatabaseManager] Loaded existing database encryption key from Keychain", category: .database)
         } catch {
             // Generate new key
             let key = SymmetricKey(size: .bits256)
             keyData = key.withUnsafeBytes { Data($0) }
             try saveKeyToKeychain(keyData, service: keychainService, account: keychainAccount)
-            print("[DEBUG] Generated and saved new database encryption key to Keychain")
+            Log.debug("[DatabaseManager] Generated and saved new database encryption key to Keychain", category: .database)
         }
 
         // Set key using PRAGMA key (SQLCipher)
@@ -944,13 +1057,13 @@ public actor DatabaseManager: DatabaseProtocol {
 
         guard sqlite3_exec(db, pragma, nil, nil, &errorMessage) == SQLITE_OK else {
             let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
-            print("[ERROR] Failed to set database encryption key: \(message)")
-            print("[WARNING] SQLCipher may not be available - falling back to unencrypted database")
+            Log.error("[DatabaseManager] Failed to set database encryption key: \(message)", category: .database)
+            Log.warning("[DatabaseManager] SQLCipher may not be available - falling back to unencrypted database", category: .database)
             // Don't throw - fall back to unencrypted database
             return
         }
 
-        print("[DEBUG] Database encryption key set successfully")
+        Log.debug("[DatabaseManager] Database encryption key set successfully", category: .database)
     }
 
     /// Save encryption key to Keychain
@@ -1017,7 +1130,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
         if checkStatus == errSecSuccess {
             // Key already exists, no need to create again
-            print("[DEBUG] Encryption key already exists in Keychain, skipping setup")
+            Log.debug("[DatabaseManager] Encryption key already exists in Keychain, skipping setup", category: .database)
             return
         }
 
@@ -1051,7 +1164,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw NSError(domain: "com.retrace.keychain", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to save encryption key to Keychain (status: \(status))"])
         }
 
-        print("[DEBUG] Generated and saved new database encryption key to Keychain during onboarding")
+        Log.debug("[DatabaseManager] Generated and saved new database encryption key to Keychain during onboarding", category: .database)
     }
 
     /// Verify we can read the encryption key from Keychain
@@ -1091,11 +1204,181 @@ public actor DatabaseManager: DatabaseProtocol {
 
         let status = SecItemDelete(deleteQuery as CFDictionary)
         if status == errSecSuccess {
-            print("[DEBUG] Deleted encryption key from Keychain")
+            Log.debug("[DatabaseManager] Deleted encryption key from Keychain", category: .database)
         } else if status == errSecItemNotFound {
-            print("[DEBUG] No encryption key found in Keychain to delete")
+            Log.debug("[DatabaseManager] No encryption key found in Keychain to delete", category: .database)
         } else {
-            print("[ERROR] Failed to delete encryption key from Keychain (status: \(status))")
+            Log.error("[DatabaseManager] Failed to delete encryption key from Keychain (status: \(status))", category: .database)
+        }
+    }
+
+    // MARK: - Processing Queue Operations
+
+    /// Enqueue a frame for OCR processing
+    public func enqueueFrameForProcessing(frameID: Int64, priority: Int = 0) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
+            VALUES (?, ?, ?, 0);
+        """
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, frameID)
+        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+        sqlite3_bind_int(stmt, 3, Int32(priority))
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Dequeue the next frame for processing (highest priority, oldest first)
+    /// Returns tuple of (queueID, frameID, retryCount) or nil if queue is empty
+    public func dequeueFrameForProcessing() async throws -> (queueID: Int64, frameID: Int64, retryCount: Int)? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Get highest priority item
+        let selectSql = """
+            SELECT id, frameId, retryCount
+            FROM processing_queue
+            ORDER BY priority DESC, enqueuedAt ASC
+            LIMIT 1;
+        """
+
+        var selectStmt: OpaquePointer?
+        defer { sqlite3_finalize(selectStmt) }
+
+        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(selectStmt) == SQLITE_ROW else {
+            return nil // Queue empty
+        }
+
+        let queueID = sqlite3_column_int64(selectStmt, 0)
+        let frameID = sqlite3_column_int64(selectStmt, 1)
+        let retryCount = Int(sqlite3_column_int(selectStmt, 2))
+
+        // Delete from queue
+        let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
+        var deleteStmt: OpaquePointer?
+        defer { sqlite3_finalize(deleteStmt) }
+
+        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(deleteStmt, 1, queueID)
+
+        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        return (queueID: queueID, frameID: frameID, retryCount: retryCount)
+    }
+
+    /// Get the current processing queue depth
+    public func getProcessingQueueDepth() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM processing_queue;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Get frame IDs that were in "processing" status (crashed during OCR)
+    public func getCrashedProcessingFrameIDs() async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // processingStatus = 1 means "processing" (crashed)
+        let sql = "SELECT id FROM frame WHERE processingStatus = 1;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var frameIDs: [Int64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(stmt, 0))
+        }
+
+        return frameIDs
+    }
+
+    /// Retry a frame by re-adding it to the processing queue with incremented retry count
+    public func retryFrameProcessing(frameID: Int64, retryCount: Int, errorMessage: String) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount, lastError)
+            VALUES (?, ?, 0, ?, ?);
+        """
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        sqlite3_bind_int64(stmt, 1, frameID)
+        sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+        sqlite3_bind_int(stmt, 3, Int32(retryCount))
+        sqlite3_bind_text(stmt, 4, errorMessage, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Update frame processing status
+    public func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int(stmt, 1, Int32(status))
+        sqlite3_bind_int64(stmt, 2, frameID)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
     }
 }

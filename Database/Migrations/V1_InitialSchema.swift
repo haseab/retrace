@@ -28,6 +28,9 @@ struct V1_InitialSchema: Migration {
         // Create all indexes
         try createIndexes(db: db)
 
+        // Set initial ID sequences to avoid collision with Rewind data
+        try setInitialSequences(db: db)
+
         Log.info("✅ Initial schema created successfully", category: .database)
     }
 
@@ -319,6 +322,22 @@ struct V1_InitialSchema: Migration {
         try execute(db: db, sql: "CREATE INDEX IF NOT EXISTS idx_frame_processing_status ON frame(processingStatus);")
 
         Log.debug("✓ Created all 24 indexes (21 Rewind-compatible + 3 new for async processing)")
+    }
+
+    // MARK: - ID Sequence Configuration
+
+    private func setInitialSequences(db: OpaquePointer) throws {
+        // Set starting IDs to avoid collision with Rewind data
+        // Rewind max IDs: frame ~7M, node ~614M, segment ~1.8M, video ~53K
+        // Retrace starts at: frame 50M, segment 10M, video 1M, node 5B
+        let sql = """
+            INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('frame', 50000000);
+            INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('segment', 10000000);
+            INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('video', 1000000);
+            INSERT OR REPLACE INTO sqlite_sequence (name, seq) VALUES ('node', 5000000000);
+        """
+        try execute(db: db, sql: sql)
+        Log.debug("✓ Set initial ID sequences (frame: 50M, segment: 10M, video: 1M, node: 5B)")
     }
 
     // MARK: - Helper

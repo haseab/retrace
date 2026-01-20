@@ -59,6 +59,22 @@ public protocol SegmentWriter: Actor {
     /// Start time of this segment
     var startTime: Date { get }
 
+    /// Relative path to the video file (from storage root)
+    var relativePath: String { get }
+
+    /// Frame width (0 until first frame is appended)
+    var frameWidth: Int { get }
+
+    /// Frame height (0 until first frame is appended)
+    var frameHeight: Int { get }
+
+    /// Current file size in bytes
+    var currentFileSize: Int64 { get }
+
+    /// Returns true if at least one fragment has been written to disk
+    /// The fragmented MP4 is only readable after the first fragment is flushed
+    var hasFragmentWritten: Bool { get }
+
     /// Append a frame to the segment
     func appendFrame(_ frame: CapturedFrame) async throws
 
@@ -87,19 +103,27 @@ public struct VideoEncoderConfig: Sendable {
     /// Whether to use hardware encoding
     public let useHardwareEncoder: Bool
 
+    /// Quality level (0.0 = max compression/lowest quality, 1.0 = min compression/highest quality)
+    public let quality: Float
+
     public init(
         codec: VideoCodec = .hevc,
         targetBitrate: Int? = nil,
         keyframeInterval: Int = 1,  // Every frame is keyframe at 0.5fps
-        useHardwareEncoder: Bool = true
+        useHardwareEncoder: Bool = true,
+        quality: Float = 0.5
     ) {
         self.codec = codec
         self.targetBitrate = targetBitrate
         self.keyframeInterval = keyframeInterval
         self.useHardwareEncoder = useHardwareEncoder
+        self.quality = quality
     }
 
-    public static let `default` = VideoEncoderConfig()
+    public static var `default`: VideoEncoderConfig {
+        let quality = UserDefaults.standard.object(forKey: "videoQuality") as? Double ?? 0.5
+        return VideoEncoderConfig(quality: Float(quality))
+    }
 }
 
 public enum VideoCodec: String, Sendable {

@@ -59,14 +59,31 @@ public actor AppCoordinator {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
 
-        // Run crash recovery from WAL
-        try await recoverFromCrash()
+        // Run crash recovery from WAL in background (non-blocking)
+        Task {
+            do {
+                try await recoverFromCrash()
+            } catch {
+                Log.error("Background crash recovery failed: \(error)", category: .app)
+            }
+        }
 
         Log.info("AppCoordinator initialized successfully", category: .app)
+
+        // Log auto-start state for debugging
+        let shouldAutoStart = Self.shouldAutoStartRecording()
+        Log.info("Auto-start recording check: shouldAutoStartRecording=\(shouldAutoStart)", category: .app)
     }
 
     /// Recover frames from write-ahead log (WAL) after a crash
     private func recoverFromCrash() async throws {
+        // Skip crash recovery during first launch (onboarding) - there's nothing to recover
+        // and the database may not be fully ready yet
+        guard await services.onboardingManager.hasCompletedOnboarding else {
+            Log.info("Skipping crash recovery during onboarding (first launch)", category: .app)
+            return
+        }
+
         Log.info("Checking for crash recovery...", category: .app)
 
         // Cast to concrete StorageManager to access WAL
@@ -111,9 +128,35 @@ public actor AppCoordinator {
         try await services.registerRewindSourceIfEnabled()
     }
 
+    /// Set Rewind data source enabled/disabled
+    /// Updates UserDefaults and connects/disconnects the data source immediately
+    public func setRewindSourceEnabled(_ enabled: Bool) async {
+        await services.setRewindSourceEnabled(enabled)
+    }
+
     /// Setup callback for accessibility permission warnings
     public func setupAccessibilityWarningCallback(_ callback: @escaping @Sendable () -> Void) async {
         services.capture.onAccessibilityPermissionWarning = callback
+    }
+
+    // MARK: - Recording State Persistence
+
+    private static let recordingStateKey = "shouldAutoStartRecording"
+    /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
+    private static let userDefaultsSuite = UserDefaults(suiteName: "Retrace") ?? .standard
+
+    /// Save recording state to UserDefaults for persistence across app restarts
+    private nonisolated func saveRecordingState(_ isRecording: Bool) {
+        Self.userDefaultsSuite.set(isRecording, forKey: Self.recordingStateKey)
+        Self.userDefaultsSuite.synchronize()  // Force immediate write to disk
+        Log.debug("[AppCoordinator] saveRecordingState(\(isRecording)) - saved to UserDefaults", category: .app)
+    }
+
+    /// Check if recording should auto-start based on previous state
+    public nonisolated static func shouldAutoStartRecording() -> Bool {
+        let value = userDefaultsSuite.bool(forKey: recordingStateKey)
+        Log.debug("[AppCoordinator] shouldAutoStartRecording() checking key '\(recordingStateKey)' in suite 'Retrace' = \(value)", category: .app)
+        return value
     }
 
     /// Start the capture pipeline
@@ -157,11 +200,16 @@ public actor AppCoordinator {
         //     await runAudioPipeline()
         // }
 
+        // Save recording state for persistence across restarts
+        saveRecordingState(true)
+
         Log.info("Capture pipeline started successfully", category: .app)
     }
 
     /// Stop the capture pipeline
-    public func stopPipeline() async throws {
+    /// - Parameter persistState: If true, saves recording state as stopped. Set to false during shutdown
+    ///   so the app remembers recording was active and auto-starts on next launch.
+    public func stopPipeline(persistState: Bool = true) async throws {
         guard isRunning else {
             Log.warning("Pipeline not running", category: .app)
             return
@@ -188,13 +236,21 @@ public actor AppCoordinator {
         // Audio processing drains automatically when stream ends
 
         isRunning = false
+
+        // Only save recording state as stopped if explicitly requested (user clicked stop)
+        // During shutdown, we want to preserve the "recording" state so it auto-starts next launch
+        if persistState {
+            saveRecordingState(false)
+        }
+
         Log.info("Capture pipeline stopped successfully", category: .app)
     }
 
     /// Shutdown all services
     public func shutdown() async throws {
         if isRunning {
-            try await stopPipeline()
+            // Don't persist state as stopped - we want to auto-start on next launch
+            try await stopPipeline(persistState: false)
         }
 
         Log.info("Shutting down AppCoordinator...", category: .app)
@@ -221,108 +277,313 @@ public actor AppCoordinator {
 
     // MARK: - Pipeline Implementation
 
+    /// State for tracking a video writer by resolution
+    private struct VideoWriterState {
+        var writer: SegmentWriter
+        var videoDBID: Int64
+        var frameCount: Int
+        var isReadable: Bool
+        var pendingFrameIDs: [Int64]
+        /// Buffer for recently captured frame IDs that haven't been flushed to video yet
+        /// Due to movieFragmentInterval buffering, we need to delay OCR by ~3 frames
+        var recentFrameBuffer: [Int64] = []
+        var width: Int
+        var height: Int
+    }
+
+    /// Number of frames to buffer before enqueueing for OCR
+    /// This accounts for AVAssetWriter's movieFragmentInterval buffering
+    /// At 30fps with 0.1s fragment interval = ~3 frames buffered
+    /// Using 6 for extra safety margin under load
+    private let ocrFrameBufferSize = 6
+
     /// Main pipeline: Capture → Storage → Processing → Database → Search
+    /// Uses Rewind-style multi-resolution video writing
     private func runPipeline() async {
         Log.info("Pipeline processing started", category: .app)
 
-        // Get the frame stream from capture
         let frameStream = await services.capture.frameStream
-
-        // Current segment writer
-        var currentWriter: SegmentWriter?
-        var frameCount = 0
-        let maxFramesPerSegment = 150 // 5 minutes at 2s intervals
-
+        var writersByResolution: [String: VideoWriterState] = [:]
+        let maxFramesPerSegment = 150
+        let videoUpdateInterval = 5
         for await frame in frameStream {
-            // Check if task was cancelled
+            Log.debug("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
+
             if Task.isCancelled {
                 Log.info("Pipeline task cancelled", category: .app)
                 break
             }
 
-            do {
-                // STEP 1: Store frame in video segment
-                if currentWriter == nil || frameCount >= maxFramesPerSegment {
-                    // Finalize previous segment
-                    if let writer = currentWriter {
-                        let segment = try await writer.finalize()
-                        let dbSegmentID = try await services.database.insertVideoSegment(segment)
-                        Log.debug("Video segment finalized with DB ID: \(dbSegmentID)", category: .app)
-                    }
+            // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
+            if frame.metadata.appBundleID == "com.apple.loginwindow" {
+                continue
+            }
 
-                    // Create new segment
-                    currentWriter = try await services.storage.createSegmentWriter()
-                    frameCount = 0
-                    Log.debug("New segment created", category: .app)
+            do {
+                let resolutionKey = "\(frame.width)x\(frame.height)"
+                var writerState: VideoWriterState
+
+                if var existingState = writersByResolution[resolutionKey] {
+                    if existingState.frameCount >= maxFramesPerSegment {
+                        try await finalizeWriter(&existingState, processingQueue: await services.processingQueue)
+                        writersByResolution.removeValue(forKey: resolutionKey)
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height)
+                        writersByResolution[resolutionKey] = writerState
+                    } else {
+                        writerState = existingState
+                    }
+                } else {
+                    if let unfinalised = try await services.database.getUnfinalisedVideoByResolution(
+                        width: frame.width,
+                        height: frame.height
+                    ) {
+                        Log.info("Resuming unfinalised video \(unfinalised.id) for resolution \(resolutionKey)", category: .app)
+                        writerState = try await resumeWriterState(from: unfinalised)
+                    } else {
+                        writerState = try await createNewWriterState(width: frame.width, height: frame.height)
+                    }
+                    writersByResolution[resolutionKey] = writerState
                 }
 
-                try await currentWriter?.appendFrame(frame)
-                frameCount += 1
+                try await writerState.writer.appendFrame(frame)
+                writerState.frameCount += 1
 
-                // STEP 2: Track app session changes
+                if writerState.width == 0 {
+                    writerState.width = await writerState.writer.frameWidth
+                    writerState.height = await writerState.writer.frameHeight
+                }
+
                 try await trackSessionChange(frame: frame)
 
-                // STEP 3: Store frame reference in database with pending status
-                // Rewind-compatible: segmentID = app session, videoID = video chunk
-                let videoSegmentID = await currentWriter!.segmentID
                 guard let appSegmentID = currentSegmentID else {
                     Log.warning("No current app segment ID for frame insertion", category: .app)
+                    writersByResolution[resolutionKey] = writerState
                     continue
                 }
+
+                let frameIndexInSegment = writerState.frameCount - 1
                 let frameRef = FrameReference(
-                    id: FrameID(value: 0), // Placeholder - will be replaced by database AUTOINCREMENT
-                    timestamp: frame.timestamp,  // Real capture timestamp (source of truth)
-                    segmentID: AppSegmentID(value: appSegmentID),  // Link to app session (segment table)
-                    videoID: videoSegmentID,  // Link to video chunk (video table)
-                    frameIndexInSegment: frameCount - 1,  // Position in video file (NOT for timestamp calculation!)
-                    metadata: frame.metadata,  // Use original metadata from capture
+                    id: FrameID(value: 0),
+                    timestamp: frame.timestamp,
+                    segmentID: AppSegmentID(value: appSegmentID),
+                    videoID: VideoSegmentID(value: writerState.videoDBID),
+                    frameIndexInSegment: frameIndexInSegment,
+                    metadata: frame.metadata,
                     source: .native
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
 
-                // STEP 4: Enqueue for async OCR processing
-                // OCR, FTS indexing, and node insertion happen in background workers
+                Log.debug("[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), app=\(frame.metadata.appName)", category: .app)
+
+                if writerState.frameCount % videoUpdateInterval == 0 {
+                    let width = await writerState.writer.frameWidth
+                    let height = await writerState.writer.frameHeight
+                    let fileSize = await writerState.writer.currentFileSize
+                    try await services.database.updateVideoSegment(
+                        id: writerState.videoDBID,
+                        width: width,
+                        height: height,
+                        fileSize: fileSize,
+                        frameCount: writerState.frameCount
+                    )
+                }
+
                 guard let processingQueue = await services.processingQueue else {
                     Log.error("Processing queue not initialized", category: .app)
+                    writersByResolution[resolutionKey] = writerState
                     continue
                 }
-                try await processingQueue.enqueue(frameID: frameID)
 
-                Log.debug("Frame \(frameID) enqueued for async processing", category: .app)
+                if !writerState.isReadable {
+                    writerState.isReadable = await writerState.writer.hasFragmentWritten
+                    if writerState.isReadable && !writerState.pendingFrameIDs.isEmpty {
+                        Log.info("Video fragment written for \(resolutionKey) - moving \(writerState.pendingFrameIDs.count) buffered frames to recent buffer", category: .app)
+                        // Move pending frames to recent buffer instead of immediately enqueueing
+                        writerState.recentFrameBuffer.append(contentsOf: writerState.pendingFrameIDs)
+                        writerState.pendingFrameIDs = []
+                    }
+                }
 
+                if writerState.isReadable {
+                    // Add current frame to recent buffer
+                    writerState.recentFrameBuffer.append(frameID)
+
+                    // Only enqueue frames that are old enough to be flushed to video
+                    // Keep the most recent ocrFrameBufferSize frames in buffer
+                    while writerState.recentFrameBuffer.count > ocrFrameBufferSize {
+                        let frameToEnqueue = writerState.recentFrameBuffer.removeFirst()
+                        try await processingQueue.enqueue(frameID: frameToEnqueue)
+                    }
+                } else {
+                    writerState.pendingFrameIDs.append(frameID)
+                }
+
+                writersByResolution[resolutionKey] = writerState
                 totalFramesProcessed += 1
 
                 if totalFramesProcessed % 10 == 0 {
-                    Log.debug("Pipeline processed \(totalFramesProcessed) frames", category: .app)
+                    Log.debug("Pipeline processed \(totalFramesProcessed) frames, \(writersByResolution.count) active writers", category: .app)
                 }
 
-            } catch {
+            } catch let error as StorageError {
                 totalErrors += 1
                 Log.error("Pipeline error processing frame: \(error)", category: .app)
 
-                // Continue processing despite errors
+                // If it's a file write failure, the writer is broken - remove it so a fresh one is created
+                if case .fileWriteFailed = error {
+                    let resolutionKey = "\(frame.width)x\(frame.height)"
+                    if let brokenWriter = writersByResolution[resolutionKey] {
+                        Log.warning("Removing broken writer for \(resolutionKey) due to write failure - will create fresh writer", category: .app)
+                        try? await brokenWriter.writer.cancel()
+                        writersByResolution.removeValue(forKey: resolutionKey)
+                    }
+                }
+                continue
+            } catch {
+                totalErrors += 1
+                Log.error("Pipeline error processing frame: \(error)", category: .app)
                 continue
             }
         }
 
-        // Finalize last segment
-        if let writer = currentWriter {
+        // Save all remaining writers (unfinalised - can be resumed later)
+        for (resolutionKey, var writerState) in writersByResolution {
             do {
-                let segment = try await writer.finalize()
-                let dbSegmentID = try await services.database.insertVideoSegment(segment)
-                Log.info("Final video segment finalized with DB ID: \(dbSegmentID)", category: .app)
+                let finalWidth = await writerState.writer.frameWidth
+                let finalHeight = await writerState.writer.frameHeight
+                let finalSize = await writerState.writer.currentFileSize
+                try await services.database.updateVideoSegment(
+                    id: writerState.videoDBID,
+                    width: finalWidth,
+                    height: finalHeight,
+                    fileSize: finalSize,
+                    frameCount: writerState.frameCount
+                )
+                _ = try await writerState.writer.finalize()
+                Log.info("Video segment for \(resolutionKey) saved (unfinalised, \(writerState.frameCount) frames)", category: .app)
+
+                // After finalization, enqueue all remaining frames
+                if let processingQueue = await services.processingQueue {
+                    if !writerState.pendingFrameIDs.isEmpty {
+                        try await processingQueue.enqueueBatch(frameIDs: writerState.pendingFrameIDs)
+                    }
+                    if !writerState.recentFrameBuffer.isEmpty {
+                        try await processingQueue.enqueueBatch(frameIDs: writerState.recentFrameBuffer)
+                    }
+                }
             } catch {
-                Log.error("Failed to finalize last segment: \(error)", category: .app)
+                Log.error("Failed to save video segment for \(resolutionKey): \(error)", category: .app)
             }
         }
 
-        // Close final segment
         if let segmentID = currentSegmentID {
             try? await services.database.updateSegmentEndDate(id: segmentID, endDate: Date())
             currentSegmentID = nil
         }
 
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
+    }
+
+    private func createNewWriterState(width: Int, height: Int) async throws -> VideoWriterState {
+        let writer = try await services.storage.createSegmentWriter()
+        let relativePath = await writer.relativePath
+
+        let placeholderSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: Date(),
+            endTime: Date(),
+            frameCount: 0,
+            fileSizeBytes: 0,
+            relativePath: relativePath,
+            width: width,
+            height: height
+        )
+        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment)
+        Log.debug("New video segment created with DB ID: \(videoDBID) for resolution \(width)x\(height)", category: .app)
+
+        return VideoWriterState(
+            writer: writer,
+            videoDBID: videoDBID,
+            frameCount: 0,
+            isReadable: false,
+            pendingFrameIDs: [],
+            recentFrameBuffer: [],
+            width: width,
+            height: height
+        )
+    }
+
+    private func resumeWriterState(from unfinalised: UnfinalisedVideo) async throws -> VideoWriterState {
+        let writer = try await services.storage.createSegmentWriter()
+
+        // Get file size from filesystem for the old video
+        let storageDir = await services.storage.getStorageDirectory()
+        let oldVideoPath = storageDir.appendingPathComponent(unfinalised.relativePath).appendingPathExtension("mp4")
+        let fileSize: Int64
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path),
+           let size = attrs[.size] as? Int64 {
+            fileSize = size
+        } else {
+            fileSize = 0
+        }
+
+        // Clean up WAL session for the old unfinalised video (frames are already in the video file)
+        let walDir = storageDir.deletingLastPathComponent().appendingPathComponent("wal")
+            .appendingPathComponent("active_segment_\(unfinalised.id)")
+        if FileManager.default.fileExists(atPath: walDir.path) {
+            try? FileManager.default.removeItem(at: walDir)
+            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id)", category: .app)
+        }
+
+        // Mark old video as finalized and start fresh
+        try await services.database.markVideoFinalized(id: unfinalised.id, frameCount: unfinalised.frameCount, fileSize: fileSize)
+        Log.info("Marked previous unfinalised video \(unfinalised.id) as finalized with \(unfinalised.frameCount) frames, \(fileSize) bytes", category: .app)
+
+        let relativePath = await writer.relativePath
+        let placeholderSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: Date(),
+            endTime: Date(),
+            frameCount: 0,
+            fileSizeBytes: 0,
+            relativePath: relativePath,
+            width: unfinalised.width,
+            height: unfinalised.height
+        )
+        let videoDBID = try await services.database.insertVideoSegment(placeholderSegment)
+
+        return VideoWriterState(
+            writer: writer,
+            videoDBID: videoDBID,
+            frameCount: 0,
+            isReadable: false,
+            pendingFrameIDs: [],
+            recentFrameBuffer: [],
+            width: unfinalised.width,
+            height: unfinalised.height
+        )
+    }
+
+    private func finalizeWriter(_ writerState: inout VideoWriterState, processingQueue: FrameProcessingQueue?) async throws {
+        let fileSize = await writerState.writer.currentFileSize
+        try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
+        _ = try await writerState.writer.finalize()
+        Log.debug("Video segment finalized with DB ID: \(writerState.videoDBID), \(writerState.frameCount) frames, \(fileSize) bytes", category: .app)
+
+        // After finalization, all frames are flushed to disk - enqueue everything
+        if let processingQueue = processingQueue {
+            // Enqueue any pending frames (from before first fragment)
+            if !writerState.pendingFrameIDs.isEmpty {
+                try await processingQueue.enqueueBatch(frameIDs: writerState.pendingFrameIDs)
+                writerState.pendingFrameIDs = []
+            }
+            // Enqueue buffered recent frames (now safe to read from finalized video)
+            if !writerState.recentFrameBuffer.isEmpty {
+                Log.debug("Enqueueing \(writerState.recentFrameBuffer.count) buffered frames after finalization", category: .app)
+                try await processingQueue.enqueueBatch(frameIDs: writerState.recentFrameBuffer)
+                writerState.recentFrameBuffer = []
+            }
+        }
     }
 
     /// Track app/window changes and create/close segments accordingly
@@ -580,6 +841,16 @@ public actor AppCoordinator {
         return try await adapter.getMostRecentFrameTimestamp()
     }
 
+    /// Get a single frame by ID with video info (optimized - single query with JOINs)
+    public func getFrameWithVideoInfoByID(id: FrameID) async throws -> FrameWithVideoInfo? {
+        guard let adapter = await services.dataAdapter else {
+            // Fallback to database
+            return try await services.database.getFrameWithVideoInfoByID(id: id)
+        }
+
+        return try await adapter.getFrameWithVideoInfoByID(id: id)
+    }
+
     // MARK: - Segment Retrieval
 
     /// Get segments in a time range
@@ -601,6 +872,23 @@ public actor AppCoordinator {
     /// Get segments for a specific app
     public func getSegments(bundleID: String, limit: Int = 100) async throws -> [Segment] {
         try await services.database.getSegments(bundleID: bundleID, limit: limit)
+    }
+
+    /// Get segments for a specific app within a time range with pagination
+    public func getSegments(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) async throws -> [Segment] {
+        try await services.database.getSegments(
+            bundleID: bundleID,
+            from: startDate,
+            to: endDate,
+            limit: limit,
+            offset: offset
+        )
     }
 
     // MARK: - Text Region Retrieval
@@ -704,6 +992,29 @@ public actor AppCoordinator {
         return try await adapter.getAllOCRNodes(frameID: frameID, source: source)
     }
 
+    // MARK: - OCR Reprocessing
+
+    /// Reprocess OCR for a specific frame
+    /// This clears existing OCR data and re-enqueues the frame for processing
+    public func reprocessOCR(frameID: FrameID) async throws {
+        Log.info("[OCR] Reprocessing OCR for frame \(frameID.value)", category: .processing)
+
+        // Clear existing OCR nodes for this frame
+        try await services.database.deleteNodes(frameID: frameID)
+
+        // Clear existing FTS entry for this frame
+        try await services.database.deleteFTSContent(frameId: frameID.value)
+
+        // Enqueue for reprocessing with high priority
+        guard let queue = await services.processingQueue else {
+            throw AppError.processingQueueNotAvailable
+        }
+
+        try await queue.enqueue(frameID: frameID.value, priority: 100)
+
+        Log.info("[OCR] Frame \(frameID.value) enqueued for OCR reprocessing", category: .processing)
+    }
+
     // MARK: - Migration
 
     /// Import data from Rewind AI
@@ -726,6 +1037,25 @@ public actor AppCoordinator {
         )
 
         Log.info("Rewind import completed", category: .app)
+    }
+
+    // MARK: - Calendar Support
+
+    /// Get all distinct dates that have frames (for calendar display)
+    public func getDistinctDates() async throws -> [Date] {
+        try await services.database.getDistinctDates()
+    }
+
+    // MARK: - Storage Statistics
+
+    /// Get total storage used in bytes
+    public func getTotalStorageUsed() async throws -> Int64 {
+        try await services.storage.getTotalStorageUsed()
+    }
+
+    /// Get distinct hours for a specific date that have frames
+    public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
+        try await services.database.getDistinctHoursForDate(date)
     }
 
     // MARK: - Statistics & Monitoring
@@ -759,6 +1089,16 @@ public actor AppCoordinator {
             capture: captureStats,
             processing: processingStats
         )
+    }
+
+    /// Get database statistics for feedback/diagnostics
+    public func getDatabaseStatistics() async throws -> DatabaseStatistics {
+        try await services.getDatabaseStats()
+    }
+
+    /// Get app session count (distinct from video segment count)
+    public func getAppSessionCount() async throws -> Int {
+        try await services.getAppSessionCount()
     }
 
     /// Get current pipeline status
@@ -797,6 +1137,29 @@ public actor AppCoordinator {
             deletedFrames: deletedFrameCount,
             deletedSegments: deletedSegmentIDs.count,
             reclaimedBytes: 0 // TODO: Calculate actual reclaimed space
+        )
+    }
+
+    /// Delete recent data (newer than specified date) - used for quick delete feature
+    /// This deletes all frames captured after the cutoff date
+    public func deleteRecentData(newerThan date: Date) async throws -> CleanupResult {
+        Log.info("Starting quick delete for data newer than \(date)", category: .app)
+
+        // Delete recent frames from database
+        let deletedFrameCount = try await services.database.deleteFrames(newerThan: date)
+
+        // Note: Video segments are not deleted here because they may contain older frames too
+        // The storage cleanup based on retention policy will handle orphaned segments
+
+        // Vacuum database to reclaim space
+        try await services.database.vacuum()
+
+        Log.info("Quick delete complete. Deleted \(deletedFrameCount) frames", category: .app)
+
+        return CleanupResult(
+            deletedFrames: deletedFrameCount,
+            deletedSegments: 0, // Segments are not deleted in quick delete
+            reclaimedBytes: 0
         )
     }
 
@@ -849,6 +1212,7 @@ public enum AppError: Error {
     case notInitialized
     case alreadyRunning
     case notRunning
+    case processingQueueNotAvailable
 }
 
 // MARK: - Migration Delegate

@@ -27,6 +27,7 @@ public actor ServiceContainer {
     public let migration: MigrationManager
     public let modelManager: ModelManager
     nonisolated public let onboardingManager: OnboardingManager
+    public let retentionManager: RetentionManager
     public var dataAdapter: DataAdapter?
     public var processingQueue: FrameProcessingQueue?
 
@@ -123,6 +124,13 @@ public actor ServiceContainer {
         self.modelManager = ModelManager()
         self.onboardingManager = OnboardingManager()
 
+        // Retention manager for data cleanup
+        self.retentionManager = RetentionManager(
+            database: database,
+            storage: storage,
+            search: search
+        )
+
         Log.info("ServiceContainer created", category: .app)
     }
 
@@ -186,6 +194,13 @@ public actor ServiceContainer {
         self.modelManager = ModelManager()
         self.onboardingManager = OnboardingManager()
 
+        // Retention manager for data cleanup
+        self.retentionManager = RetentionManager(
+            database: database,
+            storage: storage,
+            search: search
+        )
+
         Log.info("ServiceContainer created (in-memory mode)", category: .app)
     }
 
@@ -234,7 +249,7 @@ public actor ServiceContainer {
         try await search.initialize(config: searchConfig)
         Log.info("✓ Search initialized", category: .app)
 
-        // 7. Initialize processing queue and start workers
+        // 7. Initialize processing queue (workers started after full initialization)
         let queue = FrameProcessingQueue(
             database: database,
             storage: storage,
@@ -242,9 +257,8 @@ public actor ServiceContainer {
             search: search,
             config: .default
         )
-        await queue.startWorkers()
         self.processingQueue = queue
-        Log.info("✓ Processing queue initialized with \(ProcessingQueueConfig.default.workerCount) workers", category: .app)
+        Log.info("✓ Processing queue initialized", category: .app)
 
         // 8. Migration doesn't need explicit initialization
         Log.info("✓ Migration ready", category: .app)
@@ -281,10 +295,19 @@ public actor ServiceContainer {
         self.dataAdapter = adapter
         Log.info("✓ DataAdapter initialized", category: .app)
 
+        // 10. Start retention manager (runs periodic cleanup based on user settings)
+        await retentionManager.start()
+        Log.info("✓ Retention manager started", category: .app)
+
         // Capture is initialized when startCapture() is called
 
         isInitialized = true
         Log.info("All services initialized successfully", category: .app)
+
+        // Start processing queue workers immediately after initialization
+        // Safe to run anytime since all DB operations go through DatabaseManager actor
+        await queue.startWorkers()
+        Log.info("✓ Processing queue workers started (\(ProcessingQueueConfig.default.workerCount) workers)", category: .app)
     }
 
     /// Register Rewind data source if user has opted in
@@ -315,6 +338,38 @@ public actor ServiceContainer {
             Log.info("✓ Rewind source registered and connected after initialization", category: .app)
         } else {
             Log.info("⊘ Rewind source not registered (useRewindData is false)", category: .app)
+        }
+    }
+
+    /// Set Rewind data source enabled/disabled and update connection accordingly
+    /// - Parameter enabled: Whether to connect or disconnect Rewind data
+    public func setRewindSourceEnabled(_ enabled: Bool) async {
+        guard isInitialized else {
+            Log.warning("Cannot change Rewind source - ServiceContainer not initialized", category: .app)
+            return
+        }
+
+        guard let adapter = dataAdapter else {
+            Log.warning("Cannot change Rewind source - DataAdapter not available", category: .app)
+            return
+        }
+
+        // Save preference
+        UserDefaults.standard.set(enabled, forKey: "useRewindData")
+
+        if enabled {
+            // Connect Rewind source if not already connected
+            let sources = await adapter.registeredSources
+            if sources.contains(.rewind) {
+                Log.info("Rewind source already connected", category: .app)
+                return
+            }
+            await configureRewindSource(adapter: adapter)
+            Log.info("✓ Rewind source connected", category: .app)
+        } else {
+            // Disconnect Rewind source
+            await adapter.disconnectRewind()
+            Log.info("✓ Rewind source disconnected", category: .app)
         }
     }
 
@@ -416,6 +471,10 @@ public actor ServiceContainer {
         // // Audio processing will complete when stream ends
         // Log.info("✓ Audio processing drained", category: .app)
 
+        // Stop retention manager
+        await retentionManager.stop()
+        Log.info("✓ Retention manager stopped", category: .app)
+
         // Shutdown DataAdapter (disconnects all sources)
         await dataAdapter?.shutdown()
         Log.info("✓ DataAdapter shutdown", category: .app)
@@ -441,6 +500,11 @@ public actor ServiceContainer {
     /// Get database statistics
     public func getDatabaseStats() async throws -> DatabaseStatistics {
         try await database.getStatistics()
+    }
+
+    /// Get app session count (distinct from video segment count)
+    public func getAppSessionCount() async throws -> Int {
+        try await database.getAppSessionCount()
     }
 
     /// Get search statistics
@@ -480,17 +544,39 @@ extension StorageConfig {
 extension CaptureConfig {
     public static var `default`: CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
-        let captureRate = UserDefaults.standard.object(forKey: "captureRate") as? Double ?? 0.5
-        // Default to false - capture everything (private windows exclusion not implemented yet)
-        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? false
+        let captureIntervalSeconds = UserDefaults.standard.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
+        // Default to true - exclude private/incognito windows by default for privacy
+        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? true
+        // excludeCursor = true means hide cursor, so showCursor = !excludeCursor
+        let excludeCursor = UserDefaults.standard.object(forKey: "excludeCursor") as? Bool ?? false
+        let showCursor = !excludeCursor
+        // Delete duplicate frames setting controls adaptive capture (deduplication)
+        let deleteDuplicateFrames = UserDefaults.standard.object(forKey: "deleteDuplicateFrames") as? Bool ?? false
+
+        // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
+        var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
+        if let excludedAppsString = UserDefaults.standard.string(forKey: "excludedApps"),
+           !excludedAppsString.isEmpty,
+           let data = excludedAppsString.data(using: .utf8) {
+            // Decode the JSON array and extract bundle IDs
+            struct ExcludedAppInfo: Codable {
+                let bundleID: String
+            }
+            if let apps = try? JSONDecoder().decode([ExcludedAppInfo].self, from: data) {
+                for app in apps {
+                    excludedBundleIDs.insert(app.bundleID)
+                }
+            }
+        }
 
         return CaptureConfig(
-            captureIntervalSeconds: 1.0 / captureRate, // Convert FPS to interval
-            adaptiveCaptureEnabled: true,
+            captureIntervalSeconds: captureIntervalSeconds,
+            adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
             deduplicationThreshold: 0.90, // 0.90 = strict (filters static/similar frames, keeps only >10% different)
             maxResolution: .uhd4K,
-            excludedAppBundleIDs: [], // Empty - no apps excluded by default
-            excludePrivateWindows: excludePrivateWindows
+            excludedAppBundleIDs: excludedBundleIDs,
+            excludePrivateWindows: excludePrivateWindows,
+            showCursor: showCursor
         )
     }
 }
@@ -498,7 +584,7 @@ extension CaptureConfig {
 extension ProcessingConfig {
     public static var `default`: ProcessingConfig {
         ProcessingConfig(
-            accessibilityEnabled: true,
+            accessibilityEnabled: false,  // Disabled - reads live screen, not video frames
             ocrAccuracyLevel: .accurate,
             recognitionLanguages: ["en-US"],
             minimumConfidence: 0.5

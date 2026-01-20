@@ -96,9 +96,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
-                print("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)")
+                Log.debug("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)", category: .ui)
                 if let frame = currentTimelineFrame {
-                    print("[SimpleTimelineViewModel] New frame: timestamp=\(frame.frame.timestamp), frameIndex=\(frame.videoInfo?.frameIndex ?? -1)")
+                    Log.debug("[SimpleTimelineViewModel] New frame: timestamp=\(frame.frame.timestamp), frameIndex=\(frame.videoInfo?.frameIndex ?? -1)", category: .ui)
                 }
             }
         }
@@ -118,6 +118,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Date search text input
     @Published public var dateSearchText = ""
+
+    /// Whether the calendar picker is shown
+    @Published public var isCalendarPickerVisible = false
+
+    /// Dates that have frames (for calendar highlighting)
+    @Published public var datesWithFrames: Set<Date> = []
+
+    /// Hours with frames for selected calendar date
+    @Published public var hoursWithFrames: [Date] = []
+
+    /// Currently selected date in calendar
+    @Published public var selectedCalendarDate: Date? = nil
 
     /// Zoom level (0.0 to 1.0, where 1.0 is max detail/zoomed in)
     @Published public var zoomLevel: CGFloat = TimelineConfig.defaultZoomLevel
@@ -188,6 +200,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Current end point of zoom region drag (normalized coordinates)
     @Published public var zoomRegionDragEnd: CGPoint?
 
+    // MARK: - Text Selection Hint Banner State
+
+    /// Whether to show the text selection hint banner ("Try area selection mode: Shift + Drag")
+    @Published public var showTextSelectionHint: Bool = false
+
+    /// Timer to auto-dismiss the text selection hint
+    private var textSelectionHintTimer: Timer?
+
+    /// Whether the hint banner has already been shown for the current drag session
+    private var hasShownHintThisDrag: Bool = false
+
     // MARK: - Zoom Transition Animation State
 
     /// Whether we're currently animating the zoom transition
@@ -227,6 +250,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         let frameIDString = String(frame.id.value)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(frameIDString, forType: .string)
+    }
+
+    /// Reprocess OCR for the current frame (developer tool)
+    /// Clears existing OCR data and re-enqueues the frame for processing
+    public func reprocessCurrentFrameOCR() async throws {
+        guard let frame = currentFrame else { return }
+        // Only allow reprocessing for Retrace frames (not imported Rewind videos)
+        guard frame.source == .native else {
+            Log.warning("[OCR] Cannot reprocess OCR for Rewind frames", category: .ui)
+            return
+        }
+        try await coordinator.reprocessOCR(frameID: frame.id)
     }
 
     /// The search query to highlight on the current frame (set when navigating from search)
@@ -289,18 +324,18 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
         guard let timelineFrame = currentTimelineFrame else {
-            print("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)")
+            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)", category: .ui)
             return nil
         }
         guard let info = timelineFrame.videoInfo else {
-            print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source)")
+            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source)", category: .ui)
             return nil
         }
         guard info.frameIndex >= 0 else {
-            print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)")
+            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)", category: .ui)
             return nil
         }
-        print("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex)")
+        Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex)", category: .ui)
         return info
     }
 
@@ -385,6 +420,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Cache version - increment when data structure changes to invalidate old caches
     private static let cacheVersion = 2  // v2: Added optimized frame queries with video info
     private static let cacheVersionKey = "timeline.cacheVersion"
+    /// Key for tracking data source changes (Rewind toggle, etc.)
+    private static let dataSourceVersionKey = "timeline.dataSourceVersion"
+    /// Key for tracking when data was last cached (to compare with data source version)
+    private static let cachedDataSourceVersionKey = "timeline.cachedDataSourceVersion"
     /// How long the cached position remains valid (2 minutes)
     private static let cacheExpirationSeconds: TimeInterval = 120
 
@@ -402,6 +441,108 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+
+        // Listen for data source changes (e.g., Rewind data toggled)
+        Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
+        NotificationCenter.default.addObserver(
+            forName: .dataSourceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Log.debug("[SimpleTimelineViewModel] Received dataSourceDidChange notification", category: .ui)
+            Task { @MainActor in
+                Log.debug("[SimpleTimelineViewModel] About to call invalidateCachesAndReload, self is nil: \(self == nil)", category: .ui)
+                self?.invalidateCachesAndReload()
+            }
+        }
+    }
+
+    /// Invalidate all caches and reload frames from the current position
+    /// Called when data sources change (e.g., Rewind toggled on/off)
+    @MainActor
+    public func invalidateCachesAndReload() {
+        Log.info("[DataSourceChange] invalidateCachesAndReload() called", category: .ui)
+
+        // Clear image cache
+        let oldImageCount = imageCache.count
+        Log.debug("[DataSourceChange] Clearing image cache with \(oldImageCount) entries", category: .ui)
+        imageCache.removeAll()
+        Log.debug("[DataSourceChange] Image cache cleared, new count: \(imageCache.count)", category: .ui)
+
+        // Clear app blocks cache
+        let hadAppBlocks = _cachedAppBlocks != nil
+        _cachedAppBlocks = nil
+        Log.debug("[DataSourceChange] Cleared app blocks cache (had cached: \(hadAppBlocks))", category: .ui)
+
+        // Clear position cache
+        clearCachedPosition()
+        Log.debug("[DataSourceChange] Cleared position cache", category: .ui)
+
+        // Clear search results (data source changed, results may no longer be valid)
+        Log.debug("[DataSourceChange] Clearing search results", category: .ui)
+        searchViewModel.clearSearchResults()
+
+        Log.info("[DataSourceChange] Cleared \(oldImageCount) cached images and search results, reloading from current position", category: .ui)
+        Log.debug("[DataSourceChange] Current frames count: \(frames.count), currentIndex: \(currentIndex)", category: .ui)
+
+        // Reload frames from the current timestamp
+        if currentIndex >= 0 && currentIndex < frames.count {
+            let currentTimestamp = frames[currentIndex].frame.timestamp
+            Log.debug("[DataSourceChange] Will reload frames around timestamp: \(currentTimestamp)", category: .ui)
+            Task {
+                await reloadFramesAroundTimestamp(currentTimestamp)
+            }
+        } else {
+            // No current position, load most recent
+            Log.debug("[DataSourceChange] No valid current position, will load most recent frame", category: .ui)
+            Task {
+                await loadMostRecentFrame()
+            }
+        }
+        Log.debug("[DataSourceChange] invalidateCachesAndReload() completed", category: .ui)
+    }
+
+    /// Reload frames around a specific timestamp (used after data source changes)
+    private func reloadFramesAroundTimestamp(_ timestamp: Date) async {
+        Log.debug("[DataSourceChange] reloadFramesAroundTimestamp() starting for timestamp: \(timestamp)", category: .ui)
+        isLoading = true
+        error = nil
+
+        do {
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: timestamp) ?? timestamp
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: timestamp) ?? timestamp
+
+            Log.debug("[DataSourceChange] Fetching frames from \(startDate) to \(endDate)", category: .ui)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            Log.debug("[DataSourceChange] Fetched \(framesWithVideoInfo.count) frames from data adapter", category: .ui)
+
+            if !framesWithVideoInfo.isEmpty {
+                frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+
+                // Find the frame closest to the original timestamp
+                let closestIndex = findClosestFrameIndex(to: timestamp)
+                currentIndex = closestIndex
+
+                updateWindowBoundaries()
+                hasMoreOlder = true
+                hasMoreNewer = true
+
+                loadImageIfNeeded()
+
+                Log.info("[DataSourceChange] Reloaded \(frames.count) frames around \(timestamp)", category: .ui)
+            } else {
+                // No frames found, try loading most recent
+                Log.info("[DataSourceChange] No frames found around timestamp, loading most recent", category: .ui)
+                await loadMostRecentFrame()
+                return
+            }
+        } catch {
+            Log.error("[DataSourceChange] Failed to reload frames: \(error)", category: .ui)
+            self.error = error.localizedDescription
+        }
+
+        isLoading = false
     }
 
     // MARK: - Frame Selection & Deletion
@@ -462,7 +603,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load image if needed for new current frame
         loadImageIfNeeded()
 
-        print("[Delete] Frame \(frameID) removed from UI (optimistic deletion)")
+        Log.debug("[Delete] Frame \(frameID) removed from UI (optimistic deletion)", category: .ui)
 
         // Persist deletion to database in background
         Task {
@@ -472,11 +613,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                     timestamp: frameRef.timestamp,
                     source: frameRef.source
                 )
-                print("[Delete] Frame \(frameID) deleted from database")
+                Log.debug("[Delete] Frame \(frameID) deleted from database", category: .ui)
             } catch {
                 // Log error but don't restore UI - user already saw it deleted
-                Log.error("[Delete] Failed to delete frame from database: \(error)", category: .app)
-                print("[Delete] ERROR: Failed to delete frame from database: \(error)")
+                Log.error("[Delete] Failed to delete frame from database: \(error)", category: .ui)
             }
         }
     }
@@ -548,17 +688,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load image if needed for new current frame
         loadImageIfNeeded()
 
-        print("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)")
+        Log.debug("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)", category: .ui)
 
         // Persist deletion to database in background
         Task {
             do {
                 try await coordinator.deleteFrames(framesToDelete)
-                print("[Delete] Segment with \(deleteCount) frames deleted from database")
+                Log.debug("[Delete] Segment with \(deleteCount) frames deleted from database", category: .ui)
             } catch {
                 // Log error but don't restore UI - user already saw it deleted
-                Log.error("[Delete] Failed to delete segment from database: \(error)", category: .app)
-                print("[Delete] ERROR: Failed to delete segment from database: \(error)")
+                Log.error("[Delete] Failed to delete segment from database: \(error)", category: .ui)
             }
         }
     }
@@ -567,7 +706,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Save the current playhead position AND frames to cache for instant restore
     public func savePosition() {
-        print("[PositionCache] savePosition() called")
+        Log.debug("[PositionCache] savePosition() called", category: .ui)
 
         // Always save search results, even if timeline has no frames
         searchViewModel.saveSearchResults()
@@ -580,6 +719,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
         UserDefaults.standard.set(currentIndex, forKey: Self.cachedCurrentIndexKey)
         UserDefaults.standard.set(Self.cacheVersion, forKey: Self.cacheVersionKey)
+        // Save current data source version so we can detect changes
+        let currentDataSourceVersion = UserDefaults.standard.integer(forKey: Self.dataSourceVersionKey)
+        UserDefaults.standard.set(currentDataSourceVersion, forKey: Self.cachedDataSourceVersionKey)
 
         // Save frames to disk (JSON file) - do this async to not block the main thread
         Task.detached(priority: .utility) { [frames] in
@@ -588,13 +730,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let framesWithVideoInfo = frames.map { FrameWithVideoInfo(frame: $0.frame, videoInfo: $0.videoInfo) }
                 let data = try JSONEncoder().encode(framesWithVideoInfo)
                 try data.write(to: Self.cachedFramesPath)
-                print("[PositionCache] Saved \(frames.count) frames to cache (\(data.count / 1024)KB)")
+                Log.debug("[PositionCache] Saved \(frames.count) frames to cache (\(data.count / 1024)KB)", category: .ui)
             } catch {
-                print("[PositionCache] Failed to save frames: \(error)")
+                Log.warning("[PositionCache] Failed to save frames: \(error)", category: .ui)
             }
         }
 
-        print("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)")
+        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)", category: .ui)
     }
 
     /// Get the cached frames if they exist and haven't expired
@@ -602,7 +744,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Check cache version first - invalidate if version mismatch
         let cachedVersion = UserDefaults.standard.integer(forKey: Self.cacheVersionKey)
         if cachedVersion != Self.cacheVersion {
-            print("[PositionCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.cacheVersion)) - invalidating")
+            Log.debug("[PositionCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.cacheVersion)) - invalidating", category: .ui)
+            clearCachedPosition()
+            return nil
+        }
+
+        // Check if data source changed since cache was saved (e.g., Rewind toggled)
+        let currentDataSourceVersion = UserDefaults.standard.integer(forKey: Self.dataSourceVersionKey)
+        let cachedDataSourceVersion = UserDefaults.standard.integer(forKey: Self.cachedDataSourceVersionKey)
+        if currentDataSourceVersion != cachedDataSourceVersion {
+            Log.info("[PositionCache] Data source version changed (cached: \(cachedDataSourceVersion), current: \(currentDataSourceVersion)) - invalidating cache", category: .ui)
             clearCachedPosition()
             return nil
         }
@@ -615,7 +766,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if cache has expired
         if elapsed > Self.cacheExpirationSeconds {
-            print("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)")
+            Log.debug("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)", category: .ui)
             clearCachedPosition()
             return nil
         }
@@ -633,10 +784,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
             let validIndex = max(0, min(cachedIndex, timelineFrames.count - 1))
 
-            print("[PositionCache] Loaded \(timelineFrames.count) cached frames (saved \(Int(elapsed))s ago)")
+            Log.debug("[PositionCache] Loaded \(timelineFrames.count) cached frames (saved \(Int(elapsed))s ago)", category: .ui)
             return (frames: timelineFrames, currentIndex: validIndex)
         } catch {
-            print("[PositionCache] Failed to load cached frames: \(error)")
+            Log.warning("[PositionCache] Failed to load cached frames: \(error)", category: .ui)
             return nil
         }
     }
@@ -652,7 +803,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if cache has expired
         if elapsed > Self.cacheExpirationSeconds {
-            print("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)")
+            Log.debug("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)", category: .ui)
             clearCachedPosition()
             return nil
         }
@@ -661,7 +812,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard cachedTimestamp > 0 else { return nil }
 
         let position = Date(timeIntervalSince1970: cachedTimestamp)
-        print("[PositionCache] Found valid cached position: \(position) (saved \(Int(elapsed))s ago)")
+        Log.debug("[PositionCache] Found valid cached position: \(position) (saved \(Int(elapsed))s ago)", category: .ui)
         return position
     }
 
@@ -670,9 +821,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.cachedPositionTimestampKey)
         UserDefaults.standard.removeObject(forKey: Self.cachedPositionSavedAtKey)
         UserDefaults.standard.removeObject(forKey: Self.cachedCurrentIndexKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedDataSourceVersionKey)
 
         // Remove cached frames file
         try? FileManager.default.removeItem(at: Self.cachedFramesPath)
+    }
+
+    /// Increment the data source version to invalidate any cached frames
+    /// Call this when data sources change (e.g., Rewind data toggled)
+    public static func incrementDataSourceVersion() {
+        let current = UserDefaults.standard.integer(forKey: dataSourceVersionKey)
+        let newVersion = current + 1
+        UserDefaults.standard.set(newVersion, forKey: dataSourceVersionKey)
+        Log.info("[PositionCache] Data source version incremented: \(current) -> \(newVersion)", category: .ui)
     }
 
     // MARK: - Initial Load
@@ -684,7 +845,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // FIRST: Try to restore from cached frames (instant restore - no database query!)
         if let cached = getCachedFrames() {
-            print("[PositionCache] INSTANT RESTORE: Using \(cached.frames.count) cached frames, index: \(cached.currentIndex)")
+            Log.debug("[PositionCache] INSTANT RESTORE: Using \(cached.frames.count) cached frames, index: \(cached.currentIndex)", category: .ui)
 
             frames = cached.frames
             currentIndex = cached.currentIndex
@@ -710,7 +871,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         do {
             // SECOND: Try cached position (timestamp only) - requires database query
             if let cachedPosition = getCachedPosition() {
-                print("[PositionCache] Found cached position: \(cachedPosition), loading frames around it")
+                Log.debug("[PositionCache] Found cached position: \(cachedPosition), loading frames around it", category: .ui)
 
                 // Load frames around the cached position (±10 minutes window, like date search)
                 // Uses optimized query that JOINs on video table - no N+1 queries!
@@ -732,7 +893,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Find the frame closest to the cached position
                     let closestIndex = findClosestFrameIndex(to: cachedPosition)
                     currentIndex = closestIndex
-                    print("[PositionCache] Restored to cached position, index: \(closestIndex), frame count: \(frames.count)")
+                    Log.debug("[PositionCache] Restored to cached position, index: \(closestIndex), frame count: \(frames.count)", category: .ui)
 
                     // Clear the cache after restoring
                     clearCachedPosition()
@@ -746,7 +907,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     isLoading = false
                     return
                 } else {
-                    print("[PositionCache] No frames found around cached position, falling back to most recent")
+                    Log.debug("[PositionCache] No frames found around cached position, falling back to most recent", category: .ui)
                     clearCachedPosition()
                 }
             }
@@ -770,7 +931,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             updateWindowBoundaries()
 
             // Log the first and last few frames to verify ordering
-            print("[SimpleTimelineViewModel] Loaded \(frames.count) frames")
+            Log.debug("[SimpleTimelineViewModel] Loaded \(frames.count) frames", category: .ui)
 
             // Log initial memory state
             MemoryTracker.logMemoryState(
@@ -781,15 +942,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                 newestTimestamp: newestLoadedTimestamp
             )
             if frames.count > 0 {
-                print("[SimpleTimelineViewModel] First 3 frames (should be oldest):")
+                Log.debug("[SimpleTimelineViewModel] First 3 frames (should be oldest):", category: .ui)
                 for i in 0..<min(3, frames.count) {
                     let f = frames[i].frame
-                    print("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")")
+                    Log.debug("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")", category: .ui)
                 }
-                print("[SimpleTimelineViewModel] Last 3 frames (should be newest):")
+                Log.debug("[SimpleTimelineViewModel] Last 3 frames (should be newest):", category: .ui)
                 for i in max(0, frames.count - 3)..<frames.count {
                     let f = frames[i].frame
-                    print("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")")
+                    Log.debug("  [\(i)] \(f.timestamp) - \(f.metadata.appBundleID ?? "nil")", category: .ui)
                 }
             }
 
@@ -1143,7 +1304,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 if currentTimelineFrame?.frame.id == frame.id {
                     urlBoundingBox = boundingBox
                     if let box = boundingBox {
-                        print("[URLBoundingBox] Found URL '\(box.url)' at (\(box.x), \(box.y), \(box.width), \(box.height))")
+                        Log.debug("[URLBoundingBox] Found URL '\(box.url)' at (\(box.x), \(box.y), \(box.width), \(box.height))", category: .ui)
                     }
                 }
             } catch {
@@ -1161,20 +1322,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         NSWorkspace.shared.open(url)
-        print("[URLBoundingBox] Opened URL in browser: \(box.url)")
+        Log.info("[URLBoundingBox] Opened URL in browser: \(box.url)", category: .ui)
     }
 
     // MARK: - OCR Node Loading and Text Selection
 
     /// Load all OCR nodes for the current frame
     private func loadOCRNodes() {
-        guard let timelineFrame = currentTimelineFrame else {
+        guard currentTimelineFrame != nil else {
             ocrNodes = []
             clearTextSelection()
             return
         }
-
-        let frame = timelineFrame.frame
 
         // Clear previous selection when frame changes
         clearTextSelection()
@@ -1193,13 +1352,30 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let frame = timelineFrame.frame
+        let videoInfo = timelineFrame.videoInfo
+
+        // DEBUG: Log which frame we're loading OCR for
+        Log.debug("[OCR-LOAD-DEBUG] Loading OCR nodes for frameID=\(frame.id.value), videoFrameIndex=\(videoInfo?.frameIndex ?? -1), source=\(frame.source)", category: .ui)
 
         do {
+            // Use frameID for precise lookup - timestamp can have precision issues causing 1-2 frame offset
             let nodes = try await coordinator.getAllOCRNodes(
-                timestamp: frame.timestamp,
+                frameID: frame.id,
                 source: frame.source
             )
+
+            // DEBUG: Log what we got back
+            Log.debug("[OCR-LOAD-DEBUG] Got \(nodes.count) nodes for frameID=\(frame.id.value)", category: .ui)
+            if let firstNode = nodes.first {
+                Log.debug("[OCR-LOAD-DEBUG] First node text: '\(firstNode.text.prefix(50))...'", category: .ui)
+            }
+
             Log.debug("[SimpleTimelineViewModel] Loaded \(nodes.count) OCR nodes for frame \(frame.id.value) source=\(frame.source)", category: .ui)
+
+            // DEBUG: Log first few OCR node coordinates to verify they're correct
+            for (i, node) in nodes.prefix(5).enumerated() {
+                Log.info("[OCR-DEBUG] Node[\(i)] id=\(node.id): x=\(String(format: "%.4f", node.x)), y=\(String(format: "%.4f", node.y)), w=\(String(format: "%.4f", node.width)), h=\(String(format: "%.4f", node.height)), text='\(node.text.prefix(30))'", category: .ui)
+            }
 
             // Only update if we're still on the same frame
             if currentTimelineFrame?.frame.id == frame.id {
@@ -1249,6 +1425,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear text selection
     public func clearTextSelection() {
+        Log.debug("[Selection] clearTextSelection called (had selection: \(selectionStart != nil))", category: .ui)
         selectionStart = nil
         selectionEnd = nil
         isAllTextSelected = false
@@ -1310,13 +1487,20 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Select all text in the node at the given point (for triple-click)
     public func selectNodeAt(point: CGPoint) {
-        guard let (nodeID, _) = findCharacterPosition(at: point) else { return }
-        guard let node = ocrNodes.first(where: { $0.id == nodeID }) else { return }
+        guard let (nodeID, _) = findCharacterPosition(at: point) else {
+            Log.debug("[Selection] selectNodeAt: no node found at point \(point)", category: .ui)
+            return
+        }
+        guard let node = ocrNodes.first(where: { $0.id == nodeID }) else {
+            Log.debug("[Selection] selectNodeAt: node with ID \(nodeID) not in ocrNodes", category: .ui)
+            return
+        }
 
         // Select the entire node's text
         isAllTextSelected = false
         selectionStart = (nodeID: nodeID, charIndex: 0)
         selectionEnd = (nodeID: nodeID, charIndex: node.text.count)
+        Log.debug("[Selection] selectNodeAt: selected node \(nodeID) with \(node.text.count) chars", category: .ui)
     }
 
     /// Find word boundaries around a character index
@@ -1351,6 +1535,46 @@ public class SimpleTimelineViewModel: ObservableObject {
         return (start: wordStart, end: wordEnd)
     }
 
+    // MARK: - Text Selection Hint Banner Methods
+
+    /// Show the text selection hint banner once per drag session
+    /// Call this during drag updates - it will only show the banner the first time per drag
+    public func showTextSelectionHintBannerOnce() {
+        guard !hasShownHintThisDrag else { return }
+        hasShownHintThisDrag = true
+        showTextSelectionHintBanner()
+    }
+
+    /// Reset the hint banner state (call when drag ends)
+    public func resetTextSelectionHintState() {
+        hasShownHintThisDrag = false
+    }
+
+    /// Show the text selection hint banner with auto-dismiss after 5 seconds
+    public func showTextSelectionHintBanner() {
+        // Cancel any existing timer
+        textSelectionHintTimer?.invalidate()
+
+        // Show the banner
+        showTextSelectionHint = true
+
+        // Auto-dismiss after 5 seconds
+        textSelectionHintTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.dismissTextSelectionHint()
+            }
+        }
+    }
+
+    /// Dismiss the text selection hint banner
+    public func dismissTextSelectionHint() {
+        textSelectionHintTimer?.invalidate()
+        textSelectionHintTimer = nil
+        withAnimation(.easeOut(duration: 0.2)) {
+            showTextSelectionHint = false
+        }
+    }
+
     // MARK: - Zoom Region Methods (Shift+Drag)
 
     /// Start creating a zoom region (Shift+Drag)
@@ -1360,6 +1584,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         zoomRegionDragEnd = point
         // Clear any existing text selection when starting zoom
         clearTextSelection()
+        Log.info("[ZoomRegion] startZoomRegion at point: \(point) (normalized coords, Y=0 at top)", category: .ui)
     }
 
     /// Update zoom region drag
@@ -1392,6 +1617,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let finalRect = CGRect(x: minX, y: minY, width: width, height: height)
+
+        // DEBUG: Log the zoom region coordinates
+        Log.info("[ZoomRegion] endZoomRegion: start=\(start), end=\(end)", category: .ui)
+        Log.info("[ZoomRegion] endZoomRegion: finalRect=\(finalRect) (normalized coords, Y=0 at top)", category: .ui)
 
         // Store the starting rect for animation
         zoomTransitionStartRect = finalRect
@@ -1667,6 +1896,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         var result = ""
         // Use nodes in zoom region if active, otherwise all nodes
         let nodesToCheck = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
+
+        // DEBUG: Log what nodes we're using for selection
+        Log.debug("[SELECT-DEBUG] ocrNodes count: \(ocrNodes.count), isZoomRegionActive: \(isZoomRegionActive)", category: .ui)
+        if let firstNode = nodesToCheck.first {
+            Log.debug("[SELECT-DEBUG] First node in selection: id=\(firstNode.id), frameId=\(firstNode.frameId), text='\(firstNode.text.prefix(30))...'", category: .ui)
+        }
+
         let sortedNodes = nodesToCheck.sorted { node1, node2 in
             let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
@@ -1675,13 +1911,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             return node1.x < node2.x
         }
 
+        var nodeCount = 0
         for node in sortedNodes {
             if let range = getSelectionRange(for: node.id) {
                 let text = node.text
                 let startIdx = text.index(text.startIndex, offsetBy: min(range.start, text.count))
                 let endIdx = text.index(text.startIndex, offsetBy: min(range.end, text.count))
                 if startIdx < endIdx {
-                    result += String(text[startIdx..<endIdx])
+                    let extractedText = String(text[startIdx..<endIdx])
+                    // DEBUG: Log first 3 nodes being added to result
+                    nodeCount += 1
+                    if nodeCount <= 3 {
+                        Log.debug("[SELECT-DEBUG] Adding node \(nodeCount): id=\(node.id), y=\(String(format: "%.3f", node.y)), range=\(range.start)-\(range.end), text='\(extractedText.prefix(40))...'", category: .ui)
+                    }
+                    result += extractedText
                     result += " "  // Add space between nodes
                 }
             }
@@ -1694,6 +1937,25 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func copySelectedText() {
         let text = selectedText
         guard !text.isEmpty else { return }
+
+        // DEBUG: Dump ALL nodes for this frame
+        if let frame = currentFrame, let videoInfo = currentVideoInfo {
+            Log.debug("[COPY-DEBUG] ========== FRAME \(frame.id.value) (videoIndex=\(videoInfo.frameIndex)) ==========", category: .ui)
+            Log.debug("[COPY-DEBUG] Total ocrNodes: \(ocrNodes.count)", category: .ui)
+            Log.debug("[COPY-DEBUG] Selection: start=\(selectionStart?.nodeID ?? -1), end=\(selectionEnd?.nodeID ?? -1)", category: .ui)
+            Log.debug("[COPY-DEBUG] --- ALL NODES (sorted by y, x) ---", category: .ui)
+            let sorted = ocrNodes.sorted { n1, n2 in
+                if abs(n1.y - n2.y) > 0.02 { return n1.y < n2.y }
+                return n1.x < n2.x
+            }
+            for (i, node) in sorted.enumerated() {
+                let selected = (selectionStart != nil && selectionEnd != nil) ? (getSelectionRange(for: node.id) != nil ? "✓" : " ") : " "
+                Log.debug("[COPY-DEBUG] [\(selected)] \(i): id=\(node.id) y=\(String(format: "%.3f", node.y)) x=\(String(format: "%.3f", node.x)) text='\(node.text.prefix(50))...'", category: .ui)
+            }
+            Log.debug("[COPY-DEBUG] --- COPIED TEXT ---", category: .ui)
+            Log.debug("[COPY-DEBUG] '\(text.prefix(200))...'", category: .ui)
+            Log.debug("[COPY-DEBUG] ==========================================", category: .ui)
+        }
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -1742,27 +2004,45 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = (videoInfo.videoPath as NSString).lastPathComponent
-        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-        if !FileManager.default.fileExists(atPath: symlinkPath) {
-            do {
-                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: videoInfo.videoPath)
-            } catch {
+        // Check if file exists (try both with and without .mp4 extension)
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
                 completion(nil)
                 return
             }
         }
 
-        let url = URL(fileURLWithPath: symlinkPath)
+        // Determine the URL to use - if file already has .mp4 extension, use directly
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    completion(nil)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
         imageGenerator.requestedTimeToleranceAfter = .zero
 
-        let time = CMTime(seconds: videoInfo.timeInSeconds, preferredTimescale: 600)
+        // Use integer arithmetic to avoid floating point precision issues
+        let time = videoInfo.frameTimeCMTime
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
@@ -1871,7 +2151,99 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Date Search
 
-    /// Search for frames around a natural language date string
+    /// Whether frame ID search is enabled (read from UserDefaults)
+    public var enableFrameIDSearch: Bool {
+        UserDefaults.standard.bool(forKey: "enableFrameIDSearch")
+    }
+
+    // MARK: - Calendar Picker
+
+    /// Load dates that have frames for calendar display
+    /// Also auto-loads hours for today if today has frames
+    public func loadDatesWithFrames() async {
+        do {
+            let dates = try await coordinator.getDistinctDates()
+            await MainActor.run {
+                self.datesWithFrames = Set(dates)
+            }
+
+            // Auto-load hours for today if available, otherwise the most recent date
+            let calendar = Calendar.current
+            let today = calendar.startOfDay(for: Date())
+
+            if dates.contains(today) {
+                await loadHoursForDate(today)
+            } else if let mostRecent = dates.first {
+                await loadHoursForDate(mostRecent)
+            }
+        } catch {
+            Log.error("Failed to load dates with frames: \(error)", category: .ui)
+        }
+    }
+
+    /// Load hours with frames for a specific date
+    public func loadHoursForDate(_ date: Date) async {
+        do {
+            let hours = try await coordinator.getDistinctHoursForDate(date)
+            await MainActor.run {
+                self.selectedCalendarDate = date
+                self.hoursWithFrames = hours
+            }
+        } catch {
+            Log.error("Failed to load hours for date: \(error)", category: .ui)
+        }
+    }
+
+    /// Navigate to a specific hour from the calendar picker
+    public func navigateToHour(_ hour: Date) async {
+        isCalendarPickerVisible = false
+        isDateSearchActive = false
+        await navigateToDate(hour)
+    }
+
+    /// Navigate to a specific date (start of day or specific time)
+    private func navigateToDate(_ targetDate: Date) async {
+        isLoading = true
+        error = nil
+
+        do {
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
+
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+
+            guard !framesWithVideoInfo.isEmpty else {
+                error = "No frames found around \(targetDate)"
+                isLoading = false
+                return
+            }
+
+            // Clear old image cache
+            let oldCacheCount = imageCache.count
+            imageCache.removeAll()
+            if oldCacheCount > 0 {
+                Log.info("[Memory] Cleared image cache on calendar navigation (\(oldCacheCount) images removed)", category: .ui)
+            }
+
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+
+            updateWindowBoundaries()
+            hasMoreOlder = true
+            hasMoreNewer = true
+
+            let closestIndex = findClosestFrameIndex(to: targetDate)
+            currentIndex = closestIndex
+
+            loadImageIfNeeded()
+            isLoading = false
+        } catch {
+            self.error = "Failed to navigate: \(error.localizedDescription)"
+            isLoading = false
+        }
+    }
+
+    /// Search for frames around a natural language date string, or by frame ID if enabled
     public func searchForDate(_ searchText: String) async {
         guard !searchText.isEmpty else { return }
 
@@ -1879,9 +2251,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         error = nil
 
         do {
+            // If frame ID search is enabled and input looks like a frame ID (pure number), try that first
+            if enableFrameIDSearch, let frameID = Int64(searchText.trimmingCharacters(in: .whitespaces)) {
+                if await searchForFrameID(frameID) {
+                    return // Successfully jumped to frame
+                }
+                // If frame ID search fails, fall through to date search
+            }
+
             // Parse natural language date
             guard let targetDate = parseNaturalLanguageDate(searchText) else {
-                error = "Could not understand date: \(searchText)"
+                error = "Could not understand: \(searchText)"
                 isLoading = false
                 return
             }
@@ -1895,17 +2275,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             let df = DateFormatter()
             df.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
             df.timeZone = .current
-            print("[DateSearch] Input: '\(searchText)'")
-            print("[DateSearch] Parsed targetDate (local): \(df.string(from: targetDate))")
+            Log.debug("[DateSearch] Input: '\(searchText)'", category: .ui)
+            Log.debug("[DateSearch] Parsed targetDate (local): \(df.string(from: targetDate))", category: .ui)
             df.timeZone = TimeZone(identifier: "UTC")
-            print("[DateSearch] Parsed targetDate (UTC): \(df.string(from: targetDate))")
+            Log.debug("[DateSearch] Parsed targetDate (UTC): \(df.string(from: targetDate))", category: .ui)
             df.timeZone = .current
-            print("[DateSearch] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))")
+            Log.debug("[DateSearch] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))", category: .ui)
 
             // Fetch all frames in the 20-minute window
             // Uses optimized query that JOINs on video table - no N+1 queries!
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
-            print("[DateSearch] Got \(framesWithVideoInfo.count) frames")
+            Log.debug("[DateSearch] Got \(framesWithVideoInfo.count) frames", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
                 error = "No frames found around \(targetDate)"
@@ -1951,6 +2331,90 @@ public class SimpleTimelineViewModel: ObservableObject {
         } catch {
             self.error = "Failed to search for date: \(error.localizedDescription)"
             isLoading = false
+        }
+    }
+
+    /// Search for a frame by its ID and navigate to it
+    /// Returns true if frame was found and navigation succeeded
+    private func searchForFrameID(_ frameID: Int64) async -> Bool {
+        Log.debug("[FrameIDSearch] Looking for frame ID: \(frameID)", category: .ui)
+
+        do {
+            // Try to get the frame by ID
+            guard let frameWithVideo = try await coordinator.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
+                Log.debug("[FrameIDSearch] Frame not found: \(frameID)", category: .ui)
+                error = "Frame #\(frameID) not found"
+                isLoading = false
+                return false
+            }
+
+            let targetFrame = frameWithVideo.frame
+            let targetDate = targetFrame.timestamp
+            Log.debug("[FrameIDSearch] Found frame \(frameID) at \(targetDate)", category: .ui)
+
+            // Load frames around the target frame's timestamp (±10 minutes window)
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
+
+            // Fetch all frames in the window
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            Log.debug("[FrameIDSearch] Got \(framesWithVideoInfo.count) frames in window", category: .ui)
+
+            guard !framesWithVideoInfo.isEmpty else {
+                error = "No frames found around frame #\(frameID)"
+                isLoading = false
+                return false
+            }
+
+            // Clear old image cache since we're jumping to a new time window
+            let oldCacheCount = imageCache.count
+            imageCache.removeAll()
+            if oldCacheCount > 0 {
+                Log.info("[Memory] Cleared image cache on frame ID search (\(oldCacheCount) images removed)", category: .ui)
+            }
+
+            // Convert to TimelineFrame
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+
+            // Reset infinite scroll state for new window
+            updateWindowBoundaries()
+            hasMoreOlder = true
+            hasMoreNewer = true
+
+            // Find the exact frame by ID in our loaded frames
+            if let exactIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) {
+                currentIndex = exactIndex
+                Log.debug("[FrameIDSearch] Navigated to exact frame at index \(exactIndex)", category: .ui)
+            } else {
+                // Fallback to closest by timestamp
+                let closestIndex = findClosestFrameIndex(to: targetDate)
+                currentIndex = closestIndex
+                Log.debug("[FrameIDSearch] Frame not in window, using closest at index \(closestIndex)", category: .ui)
+            }
+
+            // Load image if needed
+            loadImageIfNeeded()
+
+            // Log memory state after frame ID search
+            MemoryTracker.logMemoryState(
+                context: "FRAME ID SEARCH COMPLETE",
+                frameCount: frames.count,
+                imageCacheCount: imageCache.count,
+                oldestTimestamp: oldestLoadedTimestamp,
+                newestTimestamp: newestLoadedTimestamp
+            )
+
+            isLoading = false
+            isDateSearchActive = false
+            dateSearchText = ""
+
+            return true
+
+        } catch {
+            Log.error("[FrameIDSearch] Error: \(error)", category: .ui)
+            // Don't set error here - let date search try as fallback
+            return false
         }
     }
 
@@ -2007,6 +2471,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // === ABSOLUTE DATES ===
+
+        // Try parsing time-only input (assumes "today" if just time is given)
+        // Handles: "938pm", "9:38pm", "938 pm", "9:38 pm", "938", "9:38", "21:38"
+        if let timeOnlyDate = parseTimeOnly(trimmed, relativeTo: now) {
+            return timeOnlyDate
+        }
 
         // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
@@ -2068,6 +2538,76 @@ public class SimpleTimelineViewModel: ObservableObject {
             return Int(text[range])
         }
         return nil
+    }
+
+    /// Parse time-only input and return a Date for today at that time
+    /// Handles formats like: "938pm", "9:38pm", "938 pm", "9:38 pm", "938", "9:38", "21:38", "2138"
+    private func parseTimeOnly(_ text: String, relativeTo now: Date) -> Date? {
+        let calendar = Calendar.current
+        var input = text.trimmingCharacters(in: .whitespaces)
+
+        // Check for am/pm suffix
+        var isPM = false
+        var isAM = false
+        if input.hasSuffix("pm") || input.hasSuffix("p") {
+            isPM = true
+            input = input.replacingOccurrences(of: "pm", with: "").replacingOccurrences(of: "p", with: "").trimmingCharacters(in: .whitespaces)
+        } else if input.hasSuffix("am") || input.hasSuffix("a") {
+            isAM = true
+            input = input.replacingOccurrences(of: "am", with: "").replacingOccurrences(of: "a", with: "").trimmingCharacters(in: .whitespaces)
+        }
+
+        var hour: Int?
+        var minute: Int = 0
+
+        // Try parsing with colon first (e.g., "9:38", "21:38")
+        if input.contains(":") {
+            let parts = input.split(separator: ":")
+            if parts.count == 2,
+               let h = Int(parts[0]),
+               let m = Int(parts[1]),
+               h >= 0 && h <= 23 && m >= 0 && m <= 59 {
+                hour = h
+                minute = m
+            }
+        } else if let numericValue = Int(input) {
+            // Parse compact format (e.g., "938", "1430", "9")
+            if numericValue >= 0 && numericValue <= 23 {
+                // Single or double digit hour (e.g., "9" or "21")
+                hour = numericValue
+                minute = 0
+            } else if numericValue >= 100 && numericValue <= 2359 {
+                // 3-4 digit time (e.g., "938" -> 9:38, "1430" -> 14:30)
+                hour = numericValue / 100
+                minute = numericValue % 100
+                // Validate
+                if hour! > 23 || minute > 59 {
+                    return nil
+                }
+            } else {
+                return nil
+            }
+        }
+
+        guard var finalHour = hour else { return nil }
+
+        // Apply AM/PM conversion
+        if isPM && finalHour < 12 {
+            finalHour += 12
+        } else if isAM && finalHour == 12 {
+            finalHour = 0
+        }
+
+        // If no AM/PM specified and hour is small, could be either - assume as-is
+        // (e.g., "9" without am/pm stays as 9:00 AM, "21" stays as 21:00)
+
+        // Build the date for today at that time
+        var components = calendar.dateComponents([.year, .month, .day], from: now)
+        components.hour = finalHour
+        components.minute = minute
+        components.second = 0
+
+        return calendar.date(from: components)
     }
 
     /// Find the frame index closest to a target date
@@ -2139,7 +2679,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         newestLoadedTimestamp = frames.last?.frame.timestamp
 
         if let oldest = oldestLoadedTimestamp, let newest = newestLoadedTimestamp {
-            print("[InfiniteScroll] Window boundaries: \(oldest) to \(newest)")
+            Log.debug("[InfiniteScroll] Window boundaries: \(oldest) to \(newest)", category: .ui)
         }
     }
 
@@ -2166,7 +2706,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard !isLoadingOlder else { return }
 
         isLoadingOlder = true
-        print("[InfiniteScroll] Loading older frames before \(oldestTimestamp)...")
+        Log.debug("[InfiniteScroll] Loading older frames before \(oldestTimestamp)...", category: .ui)
 
         do {
             // Query frames before the oldest timestamp
@@ -2177,14 +2717,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             guard !framesWithVideoInfo.isEmpty else {
-                print("[InfiniteScroll] No more older frames available - reached absolute start")
+                Log.debug("[InfiniteScroll] No more older frames available - reached absolute start", category: .ui)
                 hasMoreOlder = false
                 hasReachedAbsoluteStart = true  // Mark that we've hit the absolute start
                 isLoadingOlder = false
                 return
             }
 
-            print("[InfiniteScroll] Got \(framesWithVideoInfo.count) older frames")
+            Log.debug("[InfiniteScroll] Got \(framesWithVideoInfo.count) older frames", category: .ui)
 
             // Convert to TimelineFrame - video info is already included from the JOIN
             // framesWithVideoInfo are returned DESC (newest first), reverse to get ASC (oldest first)
@@ -2216,7 +2756,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             isLoadingOlder = false
 
         } catch {
-            print("[InfiniteScroll] Error loading older frames: \(error)")
+            Log.error("[InfiniteScroll] Error loading older frames: \(error)", category: .ui)
             isLoadingOlder = false
         }
     }
@@ -2227,7 +2767,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard !isLoadingNewer else { return }
 
         isLoadingNewer = true
-        print("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...")
+        Log.debug("[InfiniteScroll] Loading newer frames after \(newestTimestamp)...", category: .ui)
 
         do {
             // Query frames after the newest timestamp
@@ -2238,14 +2778,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             guard !framesWithVideoInfo.isEmpty else {
-                print("[InfiniteScroll] No more newer frames available - reached absolute end")
+                Log.debug("[InfiniteScroll] No more newer frames available - reached absolute end", category: .ui)
                 hasMoreNewer = false
                 hasReachedAbsoluteEnd = true  // Mark that we've hit the absolute end
                 isLoadingNewer = false
                 return
             }
 
-            print("[InfiniteScroll] Got \(framesWithVideoInfo.count) newer frames")
+            Log.debug("[InfiniteScroll] Got \(framesWithVideoInfo.count) newer frames", category: .ui)
 
             // Convert to TimelineFrame - video info is already included from the JOIN
             // framesWithVideoInfo are returned ASC (oldest first), which is correct for appending
@@ -2274,7 +2814,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             isLoadingNewer = false
 
         } catch {
-            print("[InfiniteScroll] Error loading newer frames: \(error)")
+            Log.error("[InfiniteScroll] Error loading newer frames: \(error)", category: .ui)
             isLoadingNewer = false
         }
     }

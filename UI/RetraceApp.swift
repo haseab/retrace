@@ -1,5 +1,6 @@
 import SwiftUI
 import App
+import Shared
 
 /// Main app entry point
 @main
@@ -17,6 +18,7 @@ struct RetraceApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(coordinator: coordinatorWrapper.coordinator)
+                .environmentObject(coordinatorWrapper)
                 .task {
                     await initializeApp()
                 }
@@ -47,7 +49,8 @@ struct RetraceApp: App {
                 // Open fullscreen timeline overlay
                 TimelineWindowController.shared.toggle()
             }
-            .keyboardShortcut(.space, modifiers: [.option, .shift])
+            // Note: Global hotkey is registered via HotkeyManager from saved settings
+            // Don't add a static .keyboardShortcut here as it would conflict
 
             Divider()
 
@@ -72,7 +75,7 @@ struct RetraceApp: App {
     private func initializeApp() async {
         do {
             try await coordinatorWrapper.initialize()
-            print("[RetraceApp] Initialized successfully")
+            Log.info("[RetraceApp] Initialized successfully", category: .app)
 
             // Setup menu bar icon and timeline window controller
             await MainActor.run {
@@ -85,18 +88,19 @@ struct RetraceApp: App {
                 // Configure the timeline window controller
                 TimelineWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
 
+                // Configure the pause reminder window controller
+                PauseReminderWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
+
                 // Store in AppDelegate to keep it alive
                 if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
                     appDelegate.menuBarManager = menuBar
                 }
 
-                print("[RetraceApp] Menu bar icon and timeline controller initialized")
+                Log.info("[RetraceApp] Menu bar icon and timeline controller initialized", category: .app)
             }
-
-            // Optionally start capture immediately
-            // try await coordinatorWrapper.startPipeline()
+            // Note: Auto-start recording is handled in AppCoordinatorWrapper.initialize()
         } catch {
-            print("[RetraceApp] Failed to initialize: \(error)")
+            Log.error("[RetraceApp] Failed to initialize: \(error)", category: .app)
         }
     }
 }
@@ -108,6 +112,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var menuBarManager: MenuBarManager?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prompt user to move app to Applications folder if not already there
+        AppMover.moveToApplicationsFolderIfNecessary()
+
         // CRITICAL FIX: Ensure bundle identifier is set
         // When running from Xcode/SPM, the bundle ID might not be set correctly
         if Bundle.main.bundleIdentifier == nil {
@@ -118,7 +125,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Check if another instance is already running
         if isAnotherInstanceRunning() {
-            print("[AppDelegate] Another instance of Retrace is already running. Activating existing instance...")
+            Log.info("[AppDelegate] Another instance of Retrace is already running. Activating existing instance...", category: .app)
             activateExistingInstance()
             NSApp.terminate(nil)
             return
@@ -126,6 +133,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Configure app appearance
         configureAppearance()
+
+        // Initialize the Sparkle updater for automatic updates
+        UpdaterManager.shared.initialize()
 
         // Activate the app and bring window to front
         // Use a slight delay to ensure window is created first
@@ -171,7 +181,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Cleanup
-        print("[AppDelegate] Application terminating")
+        Log.info("[AppDelegate] Application terminating", category: .app)
     }
 
     // MARK: - Permissions
@@ -191,18 +201,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Appearance
 
     private func configureAppearance() {
-        // Read theme preference from UserDefaults
-        let themeRaw = UserDefaults.standard.string(forKey: "theme") ?? "Auto"
-        let theme = ThemePreference(rawValue: themeRaw) ?? .auto
-
-        switch theme {
-        case .auto:
-            NSApp.appearance = nil // Use system setting
-        case .light:
-            NSApp.appearance = NSAppearance(named: .aqua)
-        case .dark:
-            NSApp.appearance = NSAppearance(named: .darkAqua)
-        }
+        // Force dark mode - the app UI is designed for dark theme
+        NSApp.appearance = NSAppearance(named: .darkAqua)
     }
 }
 
@@ -211,7 +211,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 extension RetraceApp {
     /// Handle URL scheme: retrace://
     func onOpenURL(_ url: URL) {
-        print("[RetraceApp] Handling URL: \(url)")
+        Log.info("[RetraceApp] Handling URL: \(url)", category: .app)
         // URL handling is done in ContentView via .onOpenURL
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Shared
 
 /// Handles deeplink URL routing for Retrace
 /// Supports: retrace://search?q={query}&timestamp={unix_ms}&app={bundle_id}
@@ -15,12 +16,12 @@ public class DeeplinkHandler: ObservableObject {
 
     public func handle(_ url: URL) {
         guard url.scheme == "retrace" else {
-            print("[DeeplinkHandler] Invalid scheme: \(url.scheme ?? "none")")
+            Log.warning("[DeeplinkHandler] Invalid scheme: \(url.scheme ?? "none")", category: .ui)
             return
         }
 
         guard let host = url.host else {
-            print("[DeeplinkHandler] No host in URL: \(url)")
+            Log.warning("[DeeplinkHandler] No host in URL: \(url)", category: .ui)
             return
         }
 
@@ -34,7 +35,7 @@ public class DeeplinkHandler: ObservableObject {
             handleTimelineRoute(queryParams: queryParams)
 
         default:
-            print("[DeeplinkHandler] Unknown route: \(host)")
+            Log.warning("[DeeplinkHandler] Unknown route: \(host)", category: .ui)
         }
     }
 
@@ -52,7 +53,7 @@ public class DeeplinkHandler: ObservableObject {
         )
 
         activeRoute = route
-        print("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")")
+        Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
     }
 
     private func handleTimelineRoute(queryParams: [String: String]) {
@@ -61,7 +62,7 @@ public class DeeplinkHandler: ObservableObject {
         let route = DeeplinkRoute.timeline(timestamp: timestamp)
 
         activeRoute = route
-        print("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))")
+        Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
     }
 
     // MARK: - URL Generation

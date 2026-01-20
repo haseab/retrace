@@ -66,9 +66,9 @@ public struct SearchFilterBar: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "xmark")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.retraceTinyBold)
                         Text("Clear")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.retraceCaption2Medium)
                     }
                     .foregroundColor(.white.opacity(0.6))
                 }
@@ -122,15 +122,15 @@ private struct FilterChip: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.retraceCaption2Medium)
 
                 Text(label)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.retraceCaptionMedium)
                     .lineLimit(1)
 
                 if showChevron {
                     Image(systemName: "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.retraceTinyBold)
                 }
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
@@ -177,11 +177,11 @@ private struct AppsFilterPopover: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(.secondary)
-                    .font(.system(size: 12))
+                    .font(.retraceCaption2)
 
                 TextField("Search apps...", text: $searchText)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
             }
             .padding(10)
             .background(Color(nsColor: .textBackgroundColor))
@@ -249,14 +249,14 @@ private struct AppFilterRow: View {
                         .frame(width: 20, height: 20)
                 } else {
                     Image(systemName: "app.fill")
-                        .font(.system(size: 16))
+                        .font(.retraceHeadline)
                         .foregroundColor(.secondary)
                         .frame(width: 20, height: 20)
                 }
 
                 // App name
                 Text(name)
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
                     .foregroundColor(.primary)
                     .lineLimit(1)
 
@@ -265,7 +265,7 @@ private struct AppFilterRow: View {
                 // Checkmark for selected
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.retraceCaption2Bold)
                         .foregroundColor(.accentColor)
                 }
             }
@@ -330,11 +330,11 @@ private struct DateFilterPopover: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: "calendar")
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.retraceCalloutMedium)
                     .foregroundColor(.accentColor)
 
                 Text("Date Range")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.retraceCalloutBold)
                     .foregroundColor(.primary)
 
                 Spacer()
@@ -346,7 +346,7 @@ private struct DateFilterPopover: View {
                         }
                     }) {
                         Text("Clear")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.retraceCaption2Medium)
                             .foregroundColor(.accentColor)
                     }
                     .buttonStyle(.plain)
@@ -358,13 +358,13 @@ private struct DateFilterPopover: View {
                 HStack(spacing: 8) {
                     dateChip(date: start, label: "From")
                     Image(systemName: "arrow.right")
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.retraceTinyMedium)
                         .foregroundColor(.secondary)
                     dateChip(date: end, label: "To")
                 }
             } else {
                 Text("All time")
-                    .font(.system(size: 13))
+                    .font(.retraceCaption)
                     .foregroundColor(.secondary)
             }
         }
@@ -373,12 +373,12 @@ private struct DateFilterPopover: View {
     private func dateChip(date: Date, label: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
-                .font(.system(size: 9, weight: .medium))
+                .font(.retraceTinyMedium)
                 .foregroundColor(.secondary)
                 .textCase(.uppercase)
 
             Text(formatDate(date))
-                .font(.system(size: 12, weight: .medium))
+                .font(.retraceCaption2Medium)
                 .foregroundColor(.primary)
         }
         .padding(.horizontal, 10)
@@ -394,7 +394,7 @@ private struct DateFilterPopover: View {
     private var quickPresetsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Quick Select")
-                .font(.system(size: 11, weight: .medium))
+                .font(.retraceCaption2Medium)
                 .foregroundColor(.secondary)
                 .textCase(.uppercase)
 
@@ -426,10 +426,10 @@ private struct DateFilterPopover: View {
             HStack(spacing: 4) {
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.retraceTinyBold)
                 }
                 Text(preset.shortLabel)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                    .font(isSelected ? .retraceCaption2Bold : .retraceCaption2Medium)
             }
             .foregroundColor(isSelected ? .white : .primary)
             .padding(.horizontal, 12)
@@ -452,7 +452,7 @@ private struct DateFilterPopover: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Custom Range")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.retraceCaption2Medium)
                     .foregroundColor(.secondary)
                     .textCase(.uppercase)
 
@@ -465,9 +465,9 @@ private struct DateFilterPopover: View {
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: showCustomCalendar ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
+                            .font(.retraceTinyBold)
                         Text(showCustomCalendar ? "Hide" : "Show")
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.retraceCaption2Medium)
                     }
                     .foregroundColor(.accentColor)
                 }
@@ -480,7 +480,7 @@ private struct DateFilterPopover: View {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Start")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.retraceTinyMedium)
                                 .foregroundColor(.secondary)
                                 .textCase(.uppercase)
 
@@ -492,7 +492,7 @@ private struct DateFilterPopover: View {
 
                         VStack(alignment: .leading, spacing: 4) {
                             Text("End")
-                                .font(.system(size: 10, weight: .medium))
+                                .font(.retraceTinyMedium)
                                 .foregroundColor(.secondary)
                                 .textCase(.uppercase)
 
@@ -515,9 +515,9 @@ private struct DateFilterPopover: View {
                     }) {
                         HStack {
                             Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 12))
+                                .font(.retraceCaption2)
                             Text("Apply Range")
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.retraceCaptionBold)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
@@ -563,20 +563,20 @@ private struct DateFilterPopover: View {
             // Range label
             HStack {
                 Text(formatDateShort(customStartDate))
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.retraceTinyMedium)
                     .foregroundColor(.secondary)
 
                 Spacer()
 
                 let daysDiff = calendar.dateComponents([.day], from: customStartDate, to: customEndDate).day ?? 0
                 Text("\(daysDiff) day\(daysDiff == 1 ? "" : "s")")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.retraceTinyBold)
                     .foregroundColor(.accentColor)
 
                 Spacer()
 
                 Text(formatDateShort(customEndDate))
-                    .font(.system(size: 10, weight: .medium))
+                    .font(.retraceTinyMedium)
                     .foregroundColor(.secondary)
             }
         }
@@ -715,7 +715,7 @@ private struct SearchModeTab: View {
     var body: some View {
         Button(action: action) {
             Text(label)
-                .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                .font(isSelected ? .retraceCaption2Bold : .retraceCaption2Medium)
                 .foregroundColor(isSelected ? .white : .white.opacity(0.6))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)

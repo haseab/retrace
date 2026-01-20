@@ -9,13 +9,17 @@
     <key>CFBundleIdentifier</key>
     <string>io.retrace.app</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>$(MARKETING_VERSION)</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
     <string>Retrace</string>
+
+    <!-- App Icon -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 
     <!-- URL Scheme for deeplinks -->
     <key>CFBundleURLTypes</key>
@@ -64,5 +68,33 @@
     <!-- Support for Dark Mode -->
     <key>NSRequiresAquaSystemAppearance</key>
     <false/>
+
+    <!-- Sparkle Auto-Update Configuration -->
+    <!-- IMPORTANT: Replace SUFeedURL with your actual appcast URL before release -->
+    <key>SUFeedURL</key>
+    <string>https://retrace.to/appcast.xml</string>
+
+    <!-- Enable automatic update checks -->
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+
+    <!-- Check for updates every 24 hours (86400 seconds) -->
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+
+    <!-- Allow users to opt into automatic updates -->
+    <key>SUAllowsAutomaticUpdates</key>
+    <true/>
+
+    <!-- Show release notes in update dialog -->
+    <key>SUShowReleaseNotes</key>
+    <true/>
+
+    <!-- EdDSA public key for update signature verification -->
+    <!-- IMPORTANT: Generate your own key pair using Sparkle's generate_keys tool -->
+    <!-- Run: ./Sparkle.framework/bin/generate_keys and save the private key securely -->
+    <!-- Then replace this placeholder with your actual public key -->
+    <key>SUPublicEDKey</key>
+    <string>pM8r2LSHH+MAg7cpZDAle5ZjRB4Kfd4aOaUnud2ePA8=</string>
 </dict>
 </plist>

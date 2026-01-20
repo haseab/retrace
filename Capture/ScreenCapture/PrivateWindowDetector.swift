@@ -6,7 +6,7 @@ import Shared
 /// Detects private/incognito browser windows using Accessibility API and fallback methods
 struct PrivateWindowDetector {
 
-    // MARK: - Detection Methods
+    // MARK: - Detection Methods (SCWindow)
 
     /// Detect if a window is a private/incognito browsing window
     /// - Parameter window: The SCWindow to check
@@ -14,6 +14,135 @@ struct PrivateWindowDetector {
     static func isPrivateWindow(_ window: SCWindow) -> Bool {
         let (isPrivate, _) = isPrivateWindowWithPermissionStatus(window)
         return isPrivate
+    }
+
+    // MARK: - Detection Methods (CGWindowList)
+
+    /// Detect if a window from CGWindowList is a private/incognito browsing window
+    /// - Parameters:
+    ///   - windowInfo: The window dictionary from CGWindowListCopyWindowInfo
+    ///   - patterns: Additional patterns to check for private windows
+    /// - Returns: true if the window is determined to be private
+    static func isPrivateWindow(windowInfo: [String: Any], patterns: [String] = []) -> Bool {
+        guard let ownerName = windowInfo[kCGWindowOwnerName as String] as? String else {
+            return false
+        }
+
+        // Check if this is a browser that could have private windows
+        let browserOwnerNames = [
+            "Safari", "Google Chrome", "Chrome", "Brave Browser", "Microsoft Edge",
+            "Firefox", "Arc", "Vivaldi", "Chromium", "Opera"
+        ]
+
+        let isBrowser = browserOwnerNames.contains { ownerName.contains($0) }
+        guard isBrowser else { return false }
+
+        // Get window title for pattern matching
+        guard let windowName = windowInfo[kCGWindowName as String] as? String,
+              !windowName.isEmpty else {
+            return false
+        }
+
+        // Try Accessibility API first for more reliable detection
+        if let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t {
+            if let isPrivate = checkViaAccessibilityAPI(pid: ownerPID, windowTitle: windowName, ownerName: ownerName) {
+                return isPrivate
+            }
+        }
+
+        // Fallback to title-based detection
+        return checkViaTitlePatterns(title: windowName, additionalPatterns: patterns)
+    }
+
+    /// Check if a window is private using Accessibility API (for CGWindowList)
+    /// - Parameters:
+    ///   - pid: Process ID of the window owner
+    ///   - windowTitle: The window title to match
+    ///   - ownerName: The application name
+    /// - Returns: true/false if detection succeeds, nil if unable to determine
+    private static func checkViaAccessibilityAPI(pid: pid_t, windowTitle: String, ownerName: String) -> Bool? {
+        let appElement = AXUIElementCreateApplication(pid)
+
+        // Get all windows for this application
+        var windowsRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXWindowsAttribute as CFString,
+            &windowsRef
+        )
+
+        // Check for permission denial
+        if result == .apiDisabled || result == .cannotComplete {
+            return nil // Trigger fallback
+        }
+
+        guard result == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            return nil
+        }
+
+        // Determine bundle ID from owner name for browser-specific detection
+        let bundleID = bundleIDFromOwnerName(ownerName)
+
+        // Find the matching window by comparing titles
+        for axWindow in windows {
+            if let axTitle = getAXAttribute(axWindow, kAXTitleAttribute as CFString) as? String,
+               axTitle == windowTitle {
+                return isPrivateWindowElement(axWindow, bundleID: bundleID)
+            }
+        }
+
+        return nil
+    }
+
+    /// Map owner name to bundle ID for browser-specific detection
+    private static func bundleIDFromOwnerName(_ ownerName: String) -> String {
+        switch ownerName {
+        case "Safari":
+            return "com.apple.Safari"
+        case "Google Chrome", "Chrome":
+            return "com.google.Chrome"
+        case "Brave Browser":
+            return "com.brave.Browser"
+        case "Microsoft Edge":
+            return "com.microsoft.edgemac"
+        case "Firefox":
+            return "org.mozilla.firefox"
+        case "Arc":
+            return "company.thebrowser.Browser"
+        case "Vivaldi":
+            return "com.vivaldi.Vivaldi"
+        case "Chromium":
+            return "org.chromium.Chromium"
+        case "Opera":
+            return "com.operasoftware.Opera"
+        default:
+            return ownerName
+        }
+    }
+
+    /// Fallback detection using title patterns
+    /// - Parameters:
+    ///   - title: The window title to check
+    ///   - additionalPatterns: Additional patterns to check beyond defaults
+    /// - Returns: true if title suggests private window
+    private static func checkViaTitlePatterns(title: String, additionalPatterns: [String]) -> Bool {
+        let lowercaseTitle = title.lowercased()
+
+        // Default patterns
+        let defaultPatterns = [
+            "private",           // Safari: "Page Title — Private"
+            "incognito",         // Chrome: "Page Title - Incognito"
+            "inprivate",         // Edge: "Page Title - InPrivate"
+            "private browsing",  // Firefox: "Page Title — Private Browsing"
+            "private window"     // Brave: "Page Title - Private Window"
+        ]
+
+        let allPatterns = defaultPatterns + additionalPatterns
+
+        return allPatterns.contains { pattern in
+            lowercaseTitle.contains(pattern.lowercased())
+        }
     }
 
     /// Detect if a window is private and return permission status
@@ -113,40 +242,49 @@ struct PrivateWindowDetector {
 
     /// Check if a Chromium-based browser window is in incognito mode
     private static func checkChromiumPrivate(_ element: AXUIElement) -> Bool {
+        let title = getAXAttribute(element, kAXTitleAttribute as CFString) as? String ?? "(no title)"
+        let subrole = getAXAttribute(element, kAXSubroleAttribute as CFString) as? String
+        let roleDesc = getAXAttribute(element, kAXRoleDescriptionAttribute as CFString) as? String
+        let description = getAXAttribute(element, kAXDescriptionAttribute as CFString) as? String
+
+        Log.info("[ChromiumPrivate] Checking window '\(title)' - subrole: \(subrole ?? "nil"), roleDesc: \(roleDesc ?? "nil"), desc: \(description ?? "nil")", category: .capture)
+
         // Check AXSubrole - Chromium sets different subroles for incognito windows
-        if let subrole = getAXAttribute(element, kAXSubroleAttribute as CFString) as? String {
+        if let subrole = subrole {
             if subrole.contains("Incognito") || subrole.contains("Private") {
+                Log.info("[ChromiumPrivate] MATCH via subrole: \(subrole)", category: .capture)
                 return true
             }
         }
 
         // Check AXRoleDescription
-        if let roleDesc = getAXAttribute(element, kAXRoleDescriptionAttribute as CFString) as? String {
+        if let roleDesc = roleDesc {
             if roleDesc.lowercased().contains("incognito") ||
                roleDesc.lowercased().contains("private") {
+                Log.info("[ChromiumPrivate] MATCH via roleDesc: \(roleDesc)", category: .capture)
                 return true
             }
         }
 
         // Check AXDescription
-        if let description = getAXAttribute(element, kAXDescriptionAttribute as CFString) as? String {
+        if let description = description {
             if description.lowercased().contains("incognito") ||
                description.lowercased().contains("private") {
+                Log.info("[ChromiumPrivate] MATCH via description: \(description)", category: .capture)
                 return true
             }
         }
 
         // Check window title (fallback)
-        if let title = getAXAttribute(element, kAXTitleAttribute as CFString) as? String {
-            // Chromium appends " - Incognito" or " (Incognito)" to window titles
-            if title.contains(" - Incognito") ||
-               title.contains("(Incognito)") ||
-               title.contains(" - InPrivate") ||
-               title.contains("(InPrivate)") {
-                return true
-            }
+        if title.contains(" - Incognito") ||
+           title.contains("(Incognito)") ||
+           title.contains(" - InPrivate") ||
+           title.contains("(InPrivate)") {
+            Log.info("[ChromiumPrivate] MATCH via title: \(title)", category: .capture)
+            return true
         }
 
+        Log.info("[ChromiumPrivate] NO MATCH for '\(title)'", category: .capture)
         return false
     }
 

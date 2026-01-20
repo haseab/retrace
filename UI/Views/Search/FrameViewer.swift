@@ -251,7 +251,7 @@ public struct FrameViewer: View {
     private var errorView: some View {
         VStack(spacing: .spacingL) {
             Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 48))
+                .font(.retraceDisplay)
                 .foregroundColor(.retraceDanger)
 
             Text("Failed to load frame")
