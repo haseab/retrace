@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Retrace</string>
+    <key>CFBundleDisplayName</key>
+    <string>Retrace</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.retrace.app</string>
+    <key>CFBundleVersion</key>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>CFBundleShortVersionString</key>
+    <string>$(MARKETING_VERSION)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>Retrace</string>
+
+    <!-- App Icon -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+
+    <!-- URL Scheme for deeplinks -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>Retrace Deeplink</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>retrace</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- Minimum macOS version -->
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+
+    <!-- Application Category -->
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+
+    <!-- High Resolution Support -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- Privacy - Screen Recording Usage Description -->
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Retrace needs screen recording permission to capture your screen history. All data stays local and encrypted on your Mac.</string>
+
+    <!-- Privacy - Accessibility Usage Description -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Retrace needs accessibility permission to extract text from applications. All data stays local and encrypted on your Mac.</string>
+
+    <!-- Required Entitlements -->
+    <key>com.apple.security.device.screen-recording</key>
+    <true/>
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+
+    <!-- LSUIElement: Run as menu bar app (no dock icon) -->
+    <!-- Set to false if you want the app in the Dock -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <!-- Support for Dark Mode -->
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+
+    <!-- Sparkle Auto-Update Configuration -->
+    <!-- IMPORTANT: Replace SUFeedURL with your actual appcast URL before release -->
+    <key>SUFeedURL</key>
+    <string>https://retrace.to/appcast.xml</string>
+
+    <!-- Enable automatic update checks -->
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+
+    <!-- Check for updates every 24 hours (86400 seconds) -->
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+
+    <!-- Allow users to opt into automatic updates -->
+    <key>SUAllowsAutomaticUpdates</key>
+    <true/>
+
+    <!-- Show release notes in update dialog -->
+    <key>SUShowReleaseNotes</key>
+    <true/>
+
+    <!-- EdDSA public key for update signature verification -->
+    <!-- IMPORTANT: Generate your own key pair using Sparkle's generate_keys tool -->
+    <!-- Run: ./Sparkle.framework/bin/generate_keys and save the private key securely -->
+    <!-- Then replace this placeholder with your actual public key -->
+    <key>SUPublicEDKey</key>
+    <string>pM8r2LSHH+MAg7cpZDAle5ZjRB4Kfd4aOaUnud2ePA8=</string>
+</dict>
+</plist>

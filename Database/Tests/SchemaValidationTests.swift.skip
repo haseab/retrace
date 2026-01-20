@@ -1,0 +1,735 @@
+import XCTest
+import SQLite3
+import Shared
+@testable import Database
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                        SCHEMA VALIDATION TESTS                               ║
+// ║                                                                              ║
+// ║  These tests verify that all SQL statements in Schema.swift are valid.       ║
+// ║  If any CREATE TABLE/INDEX statement has a typo, these tests will catch it.  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+final class SchemaValidationTests: XCTestCase {
+
+    var db: OpaquePointer?
+
+    override func setUp() {
+        // Open in-memory database for validation
+        sqlite3_open(":memory:", &db)
+
+        // Enable foreign keys (needed for FK validation)
+        sqlite3_exec(db, "PRAGMA foreign_keys=ON;", nil, nil, nil)
+    }
+
+    override func tearDown() {
+        sqlite3_close(db)
+        db = nil
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ HELPER: Validate SQL compiles without error                             │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    private func assertValidSQL(
+        _ sql: String,
+        description: String = "Execute SQL",
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        TestLogger.logSQL(sql)
+        TestLogger.logFunctionCall("sqlite3_exec", inputs: [("sql", sql.prefix(60) + "...")])
+
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+
+        let resultDescription = result == SQLITE_OK ? "SQLITE_OK (0)" : "Error (\(result))"
+
+        if result != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(errorMessage)
+
+            TestLogger.logExpected("SQLITE_OK (0)", value: "SQL executes without error")
+            TestLogger.logActual("Error code \(result)", value: message)
+            TestLogger.logFailure("SQL validation failed", error: message)
+
+            XCTFail("Invalid SQL: \(message)\n\nSQL:\n\(sql)", file: file, line: line)
+        } else {
+            TestLogger.assertTrue(
+                result == SQLITE_OK,
+                expected: "SQLITE_OK (0)",
+                actual: resultDescription,
+                description,
+                file: file,
+                line: line
+            )
+            TestLogger.logSuccess("SQL is valid")
+        }
+    }
+
+    private func assertSQLCompiles(
+        _ sql: String,
+        description: String = "Compile SQL",
+        file: StaticString = #file,
+        line: UInt = #line
+    ) {
+        TestLogger.logSQL(sql)
+        TestLogger.logFunctionCall("sqlite3_prepare_v2", inputs: [("sql", sql.prefix(60) + "...")])
+
+        var statement: OpaquePointer?
+        let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+        sqlite3_finalize(statement)
+
+        if result != SQLITE_OK {
+            let message = String(cString: sqlite3_errmsg(db))
+            TestLogger.logExpected("SQLITE_OK (0)", value: "SQL compiles")
+            TestLogger.logActual("Error code \(result)", value: message)
+            TestLogger.logFailure("SQL compilation failed", error: message)
+
+            XCTFail("SQL does not compile: \(message)\n\nSQL:\n\(sql)", file: file, line: line)
+        } else {
+            TestLogger.logSuccess("SQL compiles successfully")
+        }
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ CORE TABLE CREATION                                                     │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testCreateSchemaMigrationsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing schema_migrations table creation")
+        assertValidSQL(Schema.createSchemaMigrationsTable, description: "Create schema_migrations table")
+    }
+
+    func testCreateSegmentsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing segments table creation")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments table")
+    }
+
+    func testCreateAppSessionsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing app_sessions table creation")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions table")
+    }
+
+    func testCreateFramesTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments, app_sessions")
+
+        // Frames depends on segments and app_sessions
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing frames table creation")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames table")
+    }
+
+    func testCreateDocumentsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments -> app_sessions -> frames")
+
+        // Documents depends on frames
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing documents table creation")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents table")
+    }
+
+    func testCreateTextRegionsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments -> app_sessions -> frames")
+
+        // Text regions depends on frames
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing text_regions table creation")
+        assertValidSQL(Schema.createTextRegionsTable, description: "Create text_regions table")
+    }
+
+    func testCreateAudioCapturesTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: app_sessions")
+
+        // Audio captures depends on app_sessions
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing audio_captures table creation")
+        assertValidSQL(Schema.createAudioCapturesTable, description: "Create audio_captures table")
+    }
+
+    func testCreateDocumentSessionsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments -> app_sessions -> frames -> documents")
+
+        // Junction table depends on documents and app_sessions
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing document_sessions junction table creation")
+        assertValidSQL(Schema.createDocumentSessionsTable, description: "Create document_sessions table")
+    }
+
+    func testCreateSessionSegmentsTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments, app_sessions")
+
+        // Junction table depends on app_sessions and segments
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing session_segments junction table creation")
+        assertValidSQL(Schema.createSessionSegmentsTable, description: "Create session_segments table")
+    }
+
+    func testCreateEncodingQueueTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies: segments -> app_sessions -> frames")
+
+        // Encoding queue depends on frames
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing encoding_queue table creation")
+        assertValidSQL(Schema.createEncodingQueueTable, description: "Create encoding_queue table")
+    }
+
+    func testCreateDeletionQueueTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing deletion_queue table creation (no dependencies)")
+        assertValidSQL(Schema.createDeletionQueueTable, description: "Create deletion_queue table")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ FTS5 VIRTUAL TABLE                                                      │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testCreateDocumentsFTSTable_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for FTS: segments -> app_sessions -> frames -> documents")
+
+        // FTS depends on documents table
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing documents_fts FTS5 virtual table creation")
+        assertValidSQL(Schema.createDocumentsFTSTable, description: "Create documents_fts virtual table")
+    }
+
+    func testCreateFTSTriggers_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up all dependencies for FTS triggers")
+
+        // Set up dependencies
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents (dependency)")
+        assertValidSQL(Schema.createDocumentsFTSTable, description: "Create documents_fts (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing FTS sync triggers")
+
+        // Now test triggers
+        assertValidSQL(Schema.createDocumentsFTSInsertTrigger, description: "Create INSERT trigger")
+        assertValidSQL(Schema.createDocumentsFTSDeleteTrigger, description: "Create DELETE trigger")
+        assertValidSQL(Schema.createDocumentsFTSUpdateTrigger, description: "Create UPDATE trigger")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ INDEX CREATION                                                          │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testCreateSegmentIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up segments table")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing segment indexes")
+        assertValidSQL(Schema.createSegmentsTimeIndex, description: "Create idx_segments_time")
+        assertValidSQL(Schema.createSegmentsSourceIndex, description: "Create idx_segments_source")
+    }
+
+    func testCreateFrameIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for frame indexes")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing frame indexes")
+        assertValidSQL(Schema.createFramesTimestampIndex, description: "Create idx_frames_timestamp")
+        assertValidSQL(Schema.createFramesSegmentIndex, description: "Create idx_frames_segment")
+        assertValidSQL(Schema.createFramesAppIndex, description: "Create idx_frames_app")
+        assertValidSQL(Schema.createFramesSourceIndex, description: "Create idx_frames_source")
+        assertValidSQL(Schema.createFramesSessionIndex, description: "Create idx_frames_session")
+        assertValidSQL(Schema.createFramesEncodingStatusIndex, description: "Create idx_frames_encoding_status")
+    }
+
+    func testCreateAppSessionIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up app_sessions table")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing app_sessions indexes")
+        assertValidSQL(Schema.createAppSessionsTimeIndex, description: "Create idx_app_sessions_time")
+        assertValidSQL(Schema.createAppSessionsAppIndex, description: "Create idx_app_sessions_app")
+    }
+
+    func testCreateTextRegionIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for text_region indexes")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createTextRegionsTable, description: "Create text_regions table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing text_regions indexes")
+        assertValidSQL(Schema.createTextRegionsFrameIndex, description: "Create idx_text_regions_frame")
+        assertValidSQL(Schema.createTextRegionsTextIndex, description: "Create idx_text_regions_text")
+    }
+
+    func testCreateAudioCaptureIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for audio_captures indexes")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createAudioCapturesTable, description: "Create audio_captures table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing audio_captures indexes")
+        assertValidSQL(Schema.createAudioCapturesTimeIndex, description: "Create idx_audio_captures_time")
+        assertValidSQL(Schema.createAudioCapturesSessionIndex, description: "Create idx_audio_captures_session")
+        assertValidSQL(Schema.createAudioCapturesSourceIndex, description: "Create idx_audio_captures_source")
+    }
+
+    func testCreateJunctionTableIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up all dependencies for junction table indexes")
+
+        // Set up all dependencies
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing document_sessions indexes")
+        // Document sessions
+        assertValidSQL(Schema.createDocumentSessionsTable, description: "Create document_sessions table")
+        assertValidSQL(Schema.createDocumentSessionsDocIndex, description: "Create idx_document_sessions_doc")
+        assertValidSQL(Schema.createDocumentSessionsSessionIndex, description: "Create idx_document_sessions_session")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing session_segments indexes")
+        // Session segments
+        assertValidSQL(Schema.createSessionSegmentsTable, description: "Create session_segments table")
+        assertValidSQL(Schema.createSessionSegmentsSessionIndex, description: "Create idx_session_segments_session")
+        assertValidSQL(Schema.createSessionSegmentsSegmentIndex, description: "Create idx_session_segments_segment")
+    }
+
+    func testCreateQueueIndexes_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for queue indexes")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing encoding_queue indexes")
+        assertValidSQL(Schema.createEncodingQueueTable, description: "Create encoding_queue table")
+        assertValidSQL(Schema.createEncodingQueueStatusIndex, description: "Create idx_encoding_queue_status")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing deletion_queue indexes")
+        assertValidSQL(Schema.createDeletionQueueTable, description: "Create deletion_queue table")
+        assertValidSQL(Schema.createDeletionQueueTypeIndex, description: "Create idx_deletion_queue_type")
+    }
+
+    func testCreateDocumentsTimestampIndex_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Setting up dependencies for documents timestamp index")
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments (dependency)")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions (dependency)")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames (dependency)")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Testing documents timestamp index")
+        assertValidSQL(Schema.createDocumentsTimestampIndex, description: "Create idx_documents_timestamp")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ PRAGMA STATEMENTS                                                       │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testPragmaStatements_AreValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing all initialization pragma statements")
+
+        for (index, pragma) in Schema.initializationPragmas.enumerated() {
+            TestLogger.logStep("Pragma \(index + 1)/\(Schema.initializationPragmas.count)")
+            assertValidSQL(pragma, description: "Execute pragma")
+        }
+    }
+
+    func testEnableWAL_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing WAL mode pragma")
+        assertValidSQL(Schema.enableWAL, description: "Enable WAL journal mode")
+    }
+
+    func testSetSynchronousNormal_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing synchronous mode pragma")
+        assertValidSQL(Schema.setSynchronousNormal, description: "Set synchronous=NORMAL")
+    }
+
+    func testEnableForeignKeys_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing foreign keys pragma")
+        assertValidSQL(Schema.enableForeignKeys, description: "Enable foreign keys")
+    }
+
+    func testSetTempStoreMemory_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing temp store pragma")
+        assertValidSQL(Schema.setTempStoreMemory, description: "Set temp_store=MEMORY")
+    }
+
+    func testSetWALAutocheckpoint_IsValidSQL() {
+        logStart()
+        TestLogger.logStep("Testing WAL autocheckpoint pragma")
+        assertValidSQL(Schema.setWALAutocheckpoint, description: "Set wal_autocheckpoint=1000")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ FULL SCHEMA CREATION (Integration)                                      │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testFullSchemaCreation_Succeeds() {
+        logStart()
+        TestLogger.logStep("Testing full schema creation in correct order")
+        TestLogger.logStep("This simulates what happens during app startup")
+
+        // This tests that ALL tables can be created in the correct order
+        let allStatements = [
+            // Core tables
+            ("schema_migrations", Schema.createSchemaMigrationsTable),
+            ("segments", Schema.createSegmentsTable),
+            ("app_sessions", Schema.createAppSessionsTable),
+            ("frames", Schema.createFramesTable),
+            ("documents", Schema.createDocumentsTable),
+
+            // Supporting tables
+            ("text_regions", Schema.createTextRegionsTable),
+            ("audio_captures", Schema.createAudioCapturesTable),
+
+            // Junction tables
+            ("document_sessions", Schema.createDocumentSessionsTable),
+            ("session_segments", Schema.createSessionSegmentsTable),
+
+            // Queues
+            ("encoding_queue", Schema.createEncodingQueueTable),
+            ("deletion_queue", Schema.createDeletionQueueTable),
+
+            // FTS
+            ("documents_fts", Schema.createDocumentsFTSTable),
+            ("fts_insert_trigger", Schema.createDocumentsFTSInsertTrigger),
+            ("fts_delete_trigger", Schema.createDocumentsFTSDeleteTrigger),
+            ("fts_update_trigger", Schema.createDocumentsFTSUpdateTrigger),
+
+            // Indexes
+            ("idx_segments_time", Schema.createSegmentsTimeIndex),
+            ("idx_segments_source", Schema.createSegmentsSourceIndex),
+            ("idx_frames_timestamp", Schema.createFramesTimestampIndex),
+            ("idx_frames_segment", Schema.createFramesSegmentIndex),
+            ("idx_frames_app", Schema.createFramesAppIndex),
+            ("idx_frames_source", Schema.createFramesSourceIndex),
+            ("idx_frames_session", Schema.createFramesSessionIndex),
+            ("idx_frames_encoding_status", Schema.createFramesEncodingStatusIndex),
+            ("idx_app_sessions_time", Schema.createAppSessionsTimeIndex),
+            ("idx_app_sessions_app", Schema.createAppSessionsAppIndex),
+            ("idx_text_regions_frame", Schema.createTextRegionsFrameIndex),
+            ("idx_text_regions_text", Schema.createTextRegionsTextIndex),
+            ("idx_audio_captures_time", Schema.createAudioCapturesTimeIndex),
+            ("idx_audio_captures_session", Schema.createAudioCapturesSessionIndex),
+            ("idx_audio_captures_source", Schema.createAudioCapturesSourceIndex),
+            ("idx_document_sessions_doc", Schema.createDocumentSessionsDocIndex),
+            ("idx_document_sessions_session", Schema.createDocumentSessionsSessionIndex),
+            ("idx_session_segments_session", Schema.createSessionSegmentsSessionIndex),
+            ("idx_session_segments_segment", Schema.createSessionSegmentsSegmentIndex),
+            ("idx_encoding_queue_status", Schema.createEncodingQueueStatusIndex),
+            ("idx_deletion_queue_type", Schema.createDeletionQueueTypeIndex),
+            ("idx_documents_timestamp", Schema.createDocumentsTimestampIndex)
+        ]
+
+        for (index, (name, sql)) in allStatements.enumerated() {
+            TestLogger.logStep("[\(index + 1)/\(allStatements.count)] Creating: \(name)")
+            assertValidSQL(sql, description: "Create \(name)")
+        }
+
+        TestLogger.logSuccess("Full schema created successfully (\(allStatements.count) statements)")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ DATE CONVERSION UTILITIES                                               │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testDateToTimestamp_ConvertsCorrectly() {
+        logStart()
+        let date = Date(timeIntervalSince1970: 1702406400) // 2023-12-12 12:00:00 UTC
+
+        TestLogger.logFunctionCall("Schema.dateToTimestamp", inputs: [
+            ("date", date),
+            ("timeIntervalSince1970", 1702406400)
+        ])
+
+        let timestamp = Schema.dateToTimestamp(date)
+
+        TestLogger.assertEqual(
+            timestamp,
+            1702406400000,
+            "Timestamp should be in milliseconds (seconds × 1000)"
+        )
+    }
+
+    func testTimestampToDate_ConvertsCorrectly() {
+        logStart()
+        let timestamp: Int64 = 1702406400000 // Milliseconds
+
+        TestLogger.logFunctionCall("Schema.timestampToDate", inputs: [
+            ("timestamp", timestamp),
+            ("note", "milliseconds since epoch")
+        ])
+
+        let date = Schema.timestampToDate(timestamp)
+
+        TestLogger.logExpected("1702406400 seconds since epoch", value: nil)
+        TestLogger.logActual("\(date.timeIntervalSince1970) seconds since epoch", value: nil)
+
+        XCTAssertEqual(date.timeIntervalSince1970, 1702406400, accuracy: 0.001)
+        TestLogger.logSuccess("Date conversion is accurate within 1ms")
+    }
+
+    func testDateConversion_IsReversible() {
+        logStart()
+        let originalDate = Date()
+
+        TestLogger.logFunctionCall("Roundtrip conversion", inputs: [
+            ("originalDate", originalDate),
+            ("timeInterval", originalDate.timeIntervalSince1970)
+        ])
+
+        let timestamp = Schema.dateToTimestamp(originalDate)
+        TestLogger.logStep("dateToTimestamp -> \(timestamp)")
+
+        let convertedDate = Schema.timestampToDate(timestamp)
+        TestLogger.logStep("timestampToDate -> \(convertedDate)")
+
+        let diff = abs(originalDate.timeIntervalSince1970 - convertedDate.timeIntervalSince1970)
+        TestLogger.logExpected("Difference < 0.001 seconds", value: nil)
+        TestLogger.logActual("Difference = \(diff) seconds", value: nil)
+
+        // Should be equal within 1ms (we lose sub-millisecond precision)
+        XCTAssertEqual(
+            originalDate.timeIntervalSince1970,
+            convertedDate.timeIntervalSince1970,
+            accuracy: 0.001
+        )
+        TestLogger.logSuccess("Roundtrip conversion preserves date within 1ms")
+    }
+
+    func testCurrentTimestamp_IsReasonable() {
+        logStart()
+        let before = Int64(Date().timeIntervalSince1970 * 1000)
+
+        TestLogger.logFunctionCall("Schema.currentTimestamp", inputs: [])
+
+        let timestamp = Schema.currentTimestamp()
+        let after = Int64(Date().timeIntervalSince1970 * 1000)
+
+        TestLogger.logStep("Timestamp captured: \(timestamp)")
+        TestLogger.logStep("Range: [\(before), \(after)]")
+
+        TestLogger.assertTrue(
+            timestamp >= before,
+            expected: "timestamp >= \(before)",
+            actual: "timestamp = \(timestamp)",
+            "Timestamp should be >= before measurement"
+        )
+
+        TestLogger.assertTrue(
+            timestamp <= after,
+            expected: "timestamp <= \(after)",
+            actual: "timestamp = \(timestamp)",
+            "Timestamp should be <= after measurement"
+        )
+
+        TestLogger.logSuccess("currentTimestamp returns reasonable value")
+    }
+
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ FOREIGN KEY CONSTRAINTS                                                 │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testForeignKey_FramesToSegments_EnforcedOnInsert() {
+        logStart()
+        TestLogger.logStep("Setting up schema with foreign keys enabled")
+
+        // Set up schema
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments table")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions table")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Attempting to insert frame with non-existent segment_id")
+
+        // Try to insert frame with non-existent segment_id
+        let sql = """
+            INSERT INTO frames (id, segment_id, timestamp, frame_index)
+            VALUES ('frame-1', 'non-existent-segment', 1702406400000, 0);
+            """
+
+        TestLogger.logSQL(sql)
+        TestLogger.logFunctionCall("sqlite3_exec", inputs: [
+            ("sql", "INSERT with invalid FK"),
+            ("segment_id", "non-existent-segment")
+        ])
+
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+        let errorStr = errorMessage.map { String(cString: $0) }
+        sqlite3_free(errorMessage)
+
+        TestLogger.logExpected("NOT SQLITE_OK (foreign key violation)", value: nil)
+        TestLogger.logActual("Result code: \(result)", value: errorStr)
+
+        // Should fail due to foreign key constraint
+        XCTAssertNotEqual(result, SQLITE_OK, "FK constraint should prevent insert with invalid segment_id")
+
+        if result != SQLITE_OK {
+            TestLogger.logSuccess("Foreign key constraint correctly prevented invalid insert")
+        }
+    }
+
+    func testForeignKey_DocumentsToFrames_EnforcedOnInsert() {
+        logStart()
+        TestLogger.logStep("Setting up schema with foreign keys enabled")
+
+        // Set up schema
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments table")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions table")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames table")
+        assertValidSQL(Schema.createDocumentsTable, description: "Create documents table")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Attempting to insert document with non-existent frame_id")
+
+        // Try to insert document with non-existent frame_id
+        let sql = """
+            INSERT INTO documents (frame_id, content, timestamp)
+            VALUES ('non-existent-frame', 'test content', 1702406400000);
+            """
+
+        TestLogger.logSQL(sql)
+        TestLogger.logFunctionCall("sqlite3_exec", inputs: [
+            ("sql", "INSERT with invalid FK"),
+            ("frame_id", "non-existent-frame")
+        ])
+
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+        let errorStr = errorMessage.map { String(cString: $0) }
+        sqlite3_free(errorMessage)
+
+        TestLogger.logExpected("NOT SQLITE_OK (foreign key violation)", value: nil)
+        TestLogger.logActual("Result code: \(result)", value: errorStr)
+
+        // Should fail due to foreign key constraint
+        XCTAssertNotEqual(result, SQLITE_OK, "FK constraint should prevent insert with invalid frame_id")
+
+        if result != SQLITE_OK {
+            TestLogger.logSuccess("Foreign key constraint correctly prevented invalid insert")
+        }
+    }
+
+    func testCascadeDelete_SegmentDeletesFrames() {
+        logStart()
+        TestLogger.logStep("Setting up schema and inserting test data")
+
+        // Set up schema
+        assertValidSQL(Schema.createSegmentsTable, description: "Create segments table")
+        assertValidSQL(Schema.createAppSessionsTable, description: "Create app_sessions table")
+        assertValidSQL(Schema.createFramesTable, description: "Create frames table")
+
+        // Insert segment
+        let insertSegment = """
+            INSERT INTO segments (id, start_time, end_time, frame_count, file_size_bytes, relative_path, width, height)
+            VALUES ('seg-1', 1702406400000, 1702406700000, 10, 1000000, 'test.hevc', 1920, 1080);
+            """
+        TestLogger.logStep("Inserting segment 'seg-1'")
+        assertValidSQL(insertSegment, description: "Insert test segment")
+
+        // Insert frame
+        let insertFrame = """
+            INSERT INTO frames (id, segment_id, timestamp, frame_index)
+            VALUES ('frame-1', 'seg-1', 1702406400000, 0);
+            """
+        TestLogger.logStep("Inserting frame 'frame-1' linked to 'seg-1'")
+        assertValidSQL(insertFrame, description: "Insert test frame")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Verifying frame exists before deletion")
+
+        // Verify frame exists
+        var count: Int32 = 0
+        var statement: OpaquePointer?
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM frames WHERE id = 'frame-1'", -1, &statement, nil)
+        sqlite3_step(statement)
+        count = sqlite3_column_int(statement, 0)
+        sqlite3_finalize(statement)
+
+        TestLogger.logDatabaseState(table: "frames", rowCount: Int(count))
+        TestLogger.assertEqual(count, 1, "Frame should exist before deletion")
+
+        TestLogger.logSeparator()
+        TestLogger.logStep("Deleting segment 'seg-1' (should cascade to frames)")
+
+        // Delete segment
+        assertValidSQL("DELETE FROM segments WHERE id = 'seg-1';", description: "Delete segment")
+
+        // Verify frame is gone (cascade delete)
+        TestLogger.logStep("Verifying frame was deleted by cascade")
+        sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM frames WHERE id = 'frame-1'", -1, &statement, nil)
+        sqlite3_step(statement)
+        count = sqlite3_column_int(statement, 0)
+        sqlite3_finalize(statement)
+
+        TestLogger.logDatabaseState(table: "frames", rowCount: Int(count))
+        TestLogger.assertEqual(count, 0, "Frame should be deleted by cascade")
+
+        TestLogger.logSuccess("CASCADE DELETE working correctly")
+    }
+}

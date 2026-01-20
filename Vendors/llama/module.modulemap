@@ -1,0 +1,5 @@
+module llama {
+    header "include/llama/llama.h"
+    header "include/llama/ggml.h"
+    export *
+}

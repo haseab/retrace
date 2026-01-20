@@ -1,0 +1,254 @@
+import AVFoundation
+import CoreMedia
+import Foundation
+import VideoToolbox
+import Shared
+
+/// Hardware-accelerated HEVC encoder using AVAssetWriter for proper MP4/MOV container format.
+/// This ensures frames can be seeked and read reliably with AVAssetImageGenerator.
+///
+/// Hardware acceleration is verified at initialization and logged for monitoring.
+public actor HEVCEncoder {
+    private var assetWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var isFinalized = false
+    private var outputURL: URL?
+    private var segmentStartTime: Date?
+    private var isUsingHardwareAcceleration = false
+
+    // Fragment tracking for logging
+    private var lastLoggedFileSize: Int64 = 0
+    private var frameCount: Int = 0
+    private var fragmentCount: Int = 0
+
+    public init() {}
+
+    /// Check if hardware encoding is available for the given codec
+    private static func isHardwareEncodingAvailable(for codecType: CMVideoCodecType) -> Bool {
+        // Query VideoToolbox for hardware encoder support
+        var encoderListOut: CFArray?
+        let status = VTCopyVideoEncoderList(nil, &encoderListOut)
+
+        guard status == noErr, let encoderList = encoderListOut as? [[String: Any]] else {
+            return false
+        }
+
+        // Look for hardware encoder matching our codec
+        for encoder in encoderList {
+            if let encoderID = encoder[kVTVideoEncoderList_CodecType as String] as? UInt32,
+               let isHardwareAccelerated = encoder[kVTVideoEncoderList_IsHardwareAccelerated as String] as? Bool,
+               encoderID == codecType,
+               isHardwareAccelerated {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    public func initialize(width: Int, height: Int, config: VideoEncoderConfig, outputURL: URL, segmentStartTime: Date) throws {
+        guard assetWriter == nil else { return }
+
+        self.outputURL = outputURL
+        self.segmentStartTime = segmentStartTime
+
+        // Remove any existing file
+        try? FileManager.default.removeItem(at: outputURL)
+
+        // Configure video codec
+        let codecType: AVVideoCodecType = (config.codec == .h264) ? .h264 : .hevc
+        let cmCodecType: CMVideoCodecType = (config.codec == .h264) ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC
+
+        // Verify hardware encoding is available
+        let hardwareAvailable = Self.isHardwareEncodingAvailable(for: cmCodecType)
+        if !hardwareAvailable {
+            Log.warning("Hardware encoding not available for \(config.codec.rawValue), will use software fallback", category: .storage)
+        } else {
+            Log.info("Hardware encoding available for \(config.codec.rawValue)", category: .storage)
+        }
+        self.isUsingHardwareAcceleration = hardwareAvailable
+
+        // Create AVAssetWriter with MP4 format
+        let writer = try AVAssetWriter(url: outputURL, fileType: .mp4)
+
+        // Video output settings
+        // Note: AVAssetWriter will automatically use hardware encoding if available
+        // We verify availability above but cannot force it through compressionProperties
+
+        // Use quality-based encoding (CRF-style) for consistent quality regardless of content complexity
+        // AVVideoQualityKey: 0.0 = max compression (lowest quality), 1.0 = min compression (highest quality)
+        let quality = config.quality
+        Log.info("Video encoder using quality-based encoding: \(quality) for \(width)x\(height)", category: .storage)
+
+        var compressionProperties: [String: Any] = [
+            AVVideoQualityKey: quality,
+            AVVideoMaxKeyFrameIntervalKey: config.keyframeInterval,
+            AVVideoAllowFrameReorderingKey: false,
+            AVVideoExpectedSourceFrameRateKey: 30
+        ]
+
+        // Add profile level - must use String for HEVC
+        if codecType == .hevc {
+            compressionProperties[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main_AutoLevel as String
+        } else {
+            compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+        }
+
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: codecType,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: compressionProperties
+        ]
+
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        input.expectsMediaDataInRealTime = false
+
+        // Create pixel buffer adaptor
+        let sourcePixelBufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ]
+
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: sourcePixelBufferAttributes
+        )
+
+        guard writer.canAdd(input) else {
+            throw StorageModuleError.encodingFailed(underlying: "Cannot add video input to writer")
+        }
+
+        writer.add(input)
+
+        // Enable movie fragment interval for incremental readability
+        // This writes moof/mdat pairs every 0.1 seconds of video time, allowing AVAssetImageGenerator
+        // to read frames before finalization. With 2-second capture intervals and 30fps encoding,
+        // each frame is 1/30s of video time, so first fragment writes after ~3 frames (~6 real seconds)
+        writer.movieFragmentInterval = CMTime(seconds: 0.1, preferredTimescale: 600)
+
+        // Add metadata including segment start time
+        let metadataItem = AVMutableMetadataItem()
+        metadataItem.identifier = .quickTimeMetadataCreationDate
+        metadataItem.dataType = kCMMetadataBaseDataType_RawData as String
+
+        // Use ISO 8601 date format for creation date
+        let dateFormatter = ISO8601DateFormatter()
+        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let dateString = dateFormatter.string(from: segmentStartTime)
+        metadataItem.value = dateString as NSString
+
+        writer.metadata = [metadataItem]
+
+        // Start writing session
+        guard writer.startWriting() else {
+            throw StorageModuleError.encodingFailed(underlying: "Failed to start writing: \(writer.error?.localizedDescription ?? "unknown")")
+        }
+
+        writer.startSession(atSourceTime: .zero)
+
+        self.assetWriter = writer
+        self.videoInput = input
+        self.adaptor = adaptor
+        self.isFinalized = false
+        self.frameCount = 0
+        self.fragmentCount = 0
+        self.lastLoggedFileSize = 0
+
+        Log.info("Video encoder initialized with movieFragmentInterval=0.1s (frames readable after ~3 captures)", category: .storage)
+    }
+
+    public func encode(pixelBuffer: CVPixelBuffer, timestamp: CMTime) async throws {
+        guard let input = videoInput, let adaptor = adaptor, !isFinalized else {
+            throw StorageModuleError.encodingFailed(underlying: "Encoder not initialized or finalized")
+        }
+
+        // Wait for input to be ready with timeout (5 seconds max)
+        let maxWaitIterations = 5000 // 5000 * 1ms = 5 seconds
+        var waitIterations = 0
+        while !input.isReadyForMoreMediaData {
+            waitIterations += 1
+            if waitIterations >= maxWaitIterations {
+                Log.error("Encoder timeout: isReadyForMoreMediaData never became true after 5s, auto-finalizing", category: .storage)
+                try await finalize()
+                throw StorageModuleError.encodingFailed(underlying: "Encoder timeout waiting for input ready - auto-finalized")
+            }
+            try await Task.sleep(nanoseconds: 1_000_000) // 1ms
+        }
+
+        guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {
+            throw StorageModuleError.encodingFailed(underlying: "Failed to append pixel buffer")
+        }
+
+        frameCount += 1
+
+        // Check if a new fragment was written by monitoring file size changes
+        // Fragments are written every ~4 seconds of video time
+        if let url = outputURL {
+            let currentSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+            let sizeIncrease = currentSize - lastLoggedFileSize
+
+            // A fragment write typically causes a significant size jump (>1KB)
+            // Log when we detect a new fragment has been flushed to disk
+            if sizeIncrease > 1024 && lastLoggedFileSize > 0 {
+                fragmentCount += 1
+                Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(frameCount) frames, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
+                lastLoggedFileSize = currentSize
+            } else if lastLoggedFileSize == 0 && currentSize > 0 {
+                // First write - initialization
+                lastLoggedFileSize = currentSize
+            }
+        }
+    }
+
+    public func finalize() async throws {
+        guard let writer = assetWriter, let input = videoInput, !isFinalized else { return }
+
+        let preSize = (try? FileManager.default.attributesOfItem(atPath: outputURL?.path ?? "")[.size] as? Int64) ?? 0
+
+        isFinalized = true
+        input.markAsFinished()
+        await writer.finishWriting()
+
+        if writer.status == .failed {
+            throw StorageModuleError.encodingFailed(underlying: "Writer failed: \(writer.error?.localizedDescription ?? "unknown")")
+        }
+
+        let postSize = (try? FileManager.default.attributesOfItem(atPath: outputURL?.path ?? "")[.size] as? Int64) ?? 0
+        Log.info("✅ Video finalized: \(frameCount) frames, \(fragmentCount) fragments written during recording, final size: \(postSize / 1024)KB (defragmented: +\((postSize - preSize) / 1024)KB)", category: .storage)
+
+        assetWriter = nil
+        videoInput = nil
+        adaptor = nil
+    }
+
+    public func reset() async {
+        if let writer = assetWriter {
+            videoInput?.markAsFinished()
+            await writer.finishWriting()
+        }
+        assetWriter = nil
+        videoInput = nil
+        adaptor = nil
+        isFinalized = false
+        isUsingHardwareAcceleration = false
+        if let url = outputURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        outputURL = nil
+        segmentStartTime = nil
+    }
+
+    /// Returns true if hardware acceleration is being used for encoding
+    public func isHardwareAccelerated() -> Bool {
+        return isUsingHardwareAcceleration
+    }
+
+    /// Returns true if at least one fragment has been written to disk
+    /// The fragmented MP4 is only readable after the first fragment is flushed
+    public func hasFragmentWritten() -> Bool {
+        return fragmentCount > 0
+    }
+}
