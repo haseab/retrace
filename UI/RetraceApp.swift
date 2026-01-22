@@ -22,7 +22,9 @@ struct RetraceApp: App {
                 .task {
                     await initializeApp()
                 }
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
         }
+        .handlesExternalEvents(matching: ["*"])
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
         .defaultPosition(.center)

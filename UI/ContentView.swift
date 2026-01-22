@@ -189,13 +189,21 @@ public struct ContentView: View {
         guard let route = route else { return }
 
         switch route {
-        case .search:
+        case .search(_, let timestamp, _):
             // Open fullscreen timeline with search
-            TimelineWindowController.shared.show()
+            if let timestamp = timestamp {
+                TimelineWindowController.shared.showAndNavigate(to: timestamp)
+            } else {
+                TimelineWindowController.shared.show()
+            }
 
-        case .timeline:
-            // Open fullscreen timeline
-            TimelineWindowController.shared.show()
+        case .timeline(let timestamp):
+            // Open fullscreen timeline at specific timestamp
+            if let timestamp = timestamp {
+                TimelineWindowController.shared.showAndNavigate(to: timestamp)
+            } else {
+                TimelineWindowController.shared.show()
+            }
         }
     }
 

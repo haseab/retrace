@@ -69,6 +69,10 @@
     <key>NSRequiresAquaSystemAppearance</key>
     <false/>
 
+    <!-- Prevent multiple instances -->
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
+
     <!-- Sparkle Auto-Update Configuration -->
     <!-- IMPORTANT: Replace SUFeedURL with your actual appcast URL before release -->
     <key>SUFeedURL</key>

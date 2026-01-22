@@ -198,8 +198,11 @@ private struct AppsFilterPopover: View {
                         bundleID: nil,
                         isSelected: viewModel.selectedAppFilter == nil
                     ) {
-                        viewModel.setAppFilter(nil)
+                        // Dismiss popover FIRST to prevent crash during animation
                         isPresented = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            viewModel.setAppFilter(nil)
+                        }
                     }
 
                     Divider()
@@ -213,8 +216,12 @@ private struct AppsFilterPopover: View {
                             bundleID: app.bundleID,
                             isSelected: viewModel.selectedAppFilter == app.bundleID
                         ) {
-                            viewModel.setAppFilter(app.bundleID)
+                            // Dismiss popover FIRST to prevent crash during animation
                             isPresented = false
+                            let bundleID = app.bundleID
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                viewModel.setAppFilter(bundleID)
+                            }
                         }
                     }
                 }
@@ -508,10 +515,16 @@ private struct DateFilterPopover: View {
 
                     // Apply button
                     Button(action: {
+                        // Dismiss popover FIRST to prevent crash during animation
+                        // The popover can crash if SwiftUI updates the view hierarchy while it's animating
+                        isPresented = false
+
+                        // Delay the filter update to allow popover dismissal animation to complete
                         let start = calendar.startOfDay(for: customStartDate)
                         let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: customEndDate)
-                        viewModel.setDateRange(start: start, end: end)
-                        isPresented = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            viewModel.setDateRange(start: start, end: end)
+                        }
                     }) {
                         HStack {
                             Image(systemName: "checkmark.circle.fill")
@@ -624,34 +637,38 @@ private struct DateFilterPopover: View {
     }
 
     private func applyPreset(_ preset: DatePreset) {
-        let now = Date()
+        // Dismiss popover FIRST to prevent crash during animation
+        // The popover can crash if SwiftUI updates the view hierarchy while it's animating
+        isPresented = false
 
-        switch preset {
-        case .anytime:
-            viewModel.setDateRange(start: nil, end: nil)
-        case .today:
-            let start = calendar.startOfDay(for: now)
-            let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
-            viewModel.setDateRange(start: start, end: end)
-        case .yesterday:
-            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
-                let start = calendar.startOfDay(for: yesterday)
-                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
+        // Delay the filter update to allow popover dismissal animation to complete
+        let now = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [viewModel, calendar] in
+            switch preset {
+            case .anytime:
+                viewModel.setDateRange(start: nil, end: nil)
+            case .today:
+                let start = calendar.startOfDay(for: now)
+                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
                 viewModel.setDateRange(start: start, end: end)
-            }
-        case .lastWeek:
-            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                let start = calendar.startOfDay(for: weekAgo)
-                viewModel.setDateRange(start: start, end: now)
-            }
-        case .lastMonth:
-            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                let start = calendar.startOfDay(for: monthAgo)
-                viewModel.setDateRange(start: start, end: now)
+            case .yesterday:
+                if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
+                    let start = calendar.startOfDay(for: yesterday)
+                    let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
+                    viewModel.setDateRange(start: start, end: end)
+                }
+            case .lastWeek:
+                if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
+                    let start = calendar.startOfDay(for: weekAgo)
+                    viewModel.setDateRange(start: start, end: now)
+                }
+            case .lastMonth:
+                if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
+                    let start = calendar.startOfDay(for: monthAgo)
+                    viewModel.setDateRange(start: start, end: now)
+                }
             }
         }
-
-        isPresented = false
     }
 }
 
