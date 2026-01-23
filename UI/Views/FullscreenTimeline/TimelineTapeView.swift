@@ -206,6 +206,7 @@ public struct TimelineTapeView: View {
             ZStack {
                 // Datetime button (truly centered)
                 Button(action: {
+                    viewModel.dismissContextMenu()
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                         viewModel.isDateSearchActive = true
                     }
@@ -336,6 +337,7 @@ struct ZoomControl: View {
 
             // Zoom button (always visible)
             Button(action: {
+                viewModel.dismissContextMenu()
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                     viewModel.isZoomSliderExpanded.toggle()
                 }
@@ -387,6 +389,7 @@ struct ControlsToggleButton: View {
 
     var body: some View {
         Button(action: {
+            viewModel.dismissContextMenu()
             viewModel.toggleControlsVisibility()
         }) {
             Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
@@ -432,6 +435,8 @@ struct SearchButton: View {
 
     var body: some View {
         Button(action: {
+            // Dismiss right-click context menu if open
+            viewModel.dismissContextMenu()
             viewModel.clearSearchHighlight()
             viewModel.isSearchOverlayVisible = true
         }) {
@@ -489,7 +494,11 @@ struct MoreOptionsMenu: View {
     @State private var showMenu = false
 
     var body: some View {
-        Button(action: { showMenu.toggle() }) {
+        Button(action: {
+            // Dismiss right-click context menu if open
+            viewModel.dismissContextMenu()
+            showMenu.toggle()
+        }) {
             Image(systemName: "ellipsis")
                 .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                 .foregroundColor(isHovering || showMenu ? .white : .white.opacity(0.6))
@@ -510,212 +519,9 @@ struct MoreOptionsMenu: View {
             else { NSCursor.pop() }
         }
         .popover(isPresented: $showMenu, attachmentAnchor: .point(.top), arrowEdge: .bottom) {
-            MoreOptionsPopoverContent(viewModel: viewModel, showMenu: $showMenu)
-        }
-    }
-}
-
-// MARK: - More Options Popover Content
-
-/// Custom styled popover content for more options menu
-struct MoreOptionsPopoverContent: View {
-    @ObservedObject var viewModel: SimpleTimelineViewModel
-    @Binding var showMenu: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            MenuRow(title: "Save Image", icon: "square.and.arrow.down") {
-                showMenu = false
-                saveImage()
-            }
-
-            MenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
-                showMenu = false
-                copyImageToClipboard()
-            }
-
-            MenuRow(title: "Moment Deeplink", icon: "link") {
-                showMenu = false
-                // TODO: Implement moment deeplink
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.vertical, 4)
-
-            MenuRow(title: "Dashboard", icon: "square.grid.2x2") {
-                showMenu = false
-                openDashboard()
-            }
-
-            MenuRow(title: "Settings", icon: "gear") {
-                showMenu = false
-                openSettings()
-            }
-        }
-        .padding(8)
-        .background(Color.black.opacity(0.9))
-    }
-
-    // MARK: - Actions
-
-    private func saveImage() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-
-            let savePanel = NSSavePanel()
-            savePanel.allowedContentTypes = [.png]
-            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
-            savePanel.level = .screenSaver + 1
-
-            savePanel.begin { response in
-                if response == .OK, let url = savePanel.url {
-                    if let tiffData = image.tiffRepresentation,
-                       let bitmap = NSBitmapImageRep(data: tiffData),
-                       let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        try? pngData.write(to: url)
-                    }
-                }
-            }
-        }
-    }
-
-    private func copyImageToClipboard() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
-    }
-
-    private func openDashboard() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openDashboard, object: nil)
-        }
-    }
-
-    private func openSettings() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openSettings, object: nil)
-        }
-    }
-
-    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
-        if let image = viewModel.currentImage {
-            completion(image)
-            return
-        }
-
-        guard let videoInfo = viewModel.currentVideoInfo else {
-            completion(nil)
-            return
-        }
-
-        // Check if file exists (try both with and without .mp4 extension)
-        var actualVideoPath = videoInfo.videoPath
-        if !FileManager.default.fileExists(atPath: actualVideoPath) {
-            let pathWithExtension = actualVideoPath + ".mp4"
-            if FileManager.default.fileExists(atPath: pathWithExtension) {
-                actualVideoPath = pathWithExtension
-            } else {
-                completion(nil)
-                return
-            }
-        }
-
-        // Determine the URL to use - if file already has .mp4 extension, use directly
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
-        }
-        let asset = AVURLAsset(url: url)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceBefore = .zero
-        imageGenerator.requestedTimeToleranceAfter = .zero
-
-        // Use integer arithmetic to avoid floating point precision issues
-        let time = videoInfo.frameTimeCMTime
-
-        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
-            DispatchQueue.main.async {
-                if let cgImage = cgImage {
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    completion(nsImage)
-                } else {
-                    completion(nil)
-                }
-            }
-        }
-    }
-
-    private func formattedTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        return formatter.string(from: viewModel.currentTimestamp ?? Date())
-    }
-}
-
-// MARK: - Menu Row
-
-/// Styled menu row for the popover
-struct MenuRow: View {
-    let title: String
-    let icon: String
-    var shortcut: String? = nil
-    let action: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white.opacity(0.7))
-                    .frame(width: 18)
-
-                Text(title)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white)
-
-                Spacer()
-
-                if let shortcut = shortcut {
-                    Text(shortcut)
-                        .font(.retraceCaption2)
-                        .foregroundColor(.white.opacity(0.4))
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
-            )
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovering = hovering
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
+            // Uses shared ContextMenuContent from UI/Components
+            ContextMenuContent(viewModel: viewModel, showMenu: $showMenu)
+                .background(Color.black.opacity(0.9))
         }
     }
 }

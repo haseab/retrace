@@ -356,6 +356,21 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Timer to auto-dismiss search highlight
     private var searchHighlightTimer: Timer?
 
+    // MARK: - Context Menu State
+
+    /// Whether the right-click context menu is visible
+    @Published public var showContextMenu: Bool = false
+
+    /// Location where the context menu should appear
+    @Published public var contextMenuLocation: CGPoint = .zero
+
+    /// Dismiss the context menu if it's visible
+    public func dismissContextMenu() {
+        if showContextMenu {
+            showContextMenu = false
+        }
+    }
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level

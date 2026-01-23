@@ -91,7 +91,8 @@ public class TimelineWindowController: NSObject {
 
         // Store reference and show
         self.window = window
-        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        window.makeKey()
 
         // Animate in
         window.alphaValue = 0

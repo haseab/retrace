@@ -145,7 +145,9 @@ public class MenuBarManager: ObservableObject {
 
     /// Toggle the dashboard window (show if hidden, hide if visible)
     private func toggleDashboard() {
-        NotificationCenter.default.post(name: .toggleDashboard, object: nil)
+        Task { @MainActor in
+            DashboardWindowController.shared.toggle()
+        }
     }
 
     /// Hide recording indicator (called when timeline opens)
@@ -319,7 +321,9 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openDashboard() {
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
+        Task { @MainActor in
+            DashboardWindowController.shared.show()
+        }
     }
 
     @objc private func toggleRecording() {
@@ -360,11 +364,17 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openSettings() {
-        NotificationCenter.default.post(name: .openSettings, object: nil)
+        Task { @MainActor in
+            DashboardWindowController.shared.showSettings()
+        }
     }
 
     @objc private func openFeedback() {
-        NotificationCenter.default.post(name: .openFeedback, object: nil)
+        Task { @MainActor in
+            // Show dashboard first, then trigger feedback sheet
+            DashboardWindowController.shared.show()
+            NotificationCenter.default.post(name: .openFeedback, object: nil)
+        }
     }
 
     @objc private func quit() {

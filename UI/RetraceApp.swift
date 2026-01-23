@@ -1,106 +1,26 @@
 import SwiftUI
+import AppKit
 import App
 import Shared
 
 /// Main app entry point
+/// This is a menu bar app - no automatic window is created on launch
 @main
 struct RetraceApp: App {
 
     // MARK: - Properties
 
-    @StateObject private var coordinatorWrapper = AppCoordinatorWrapper()
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    // MARK: - Initialization
 
     // MARK: - Body
 
     var body: some Scene {
-        WindowGroup {
-            ContentView(coordinator: coordinatorWrapper.coordinator)
-                .environmentObject(coordinatorWrapper)
-                .task {
-                    await initializeApp()
-                }
-        }
-        .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified(showsTitle: false))
-        .defaultPosition(.center)
-        .commands {
-            appCommands
-        }
-    }
-
-    // MARK: - Commands
-
-    @CommandsBuilder
-    private var appCommands: some Commands {
-        CommandGroup(replacing: .newItem) {
-            // Remove "New Window" since we're a single-window app
-        }
-
-        CommandMenu("View") {
-            Button("Dashboard") {
-                NotificationCenter.default.post(name: .openDashboard, object: nil)
-            }
-            .keyboardShortcut("1", modifiers: .command)
-
-            Button("Timeline") {
-                // Open fullscreen timeline overlay
-                TimelineWindowController.shared.toggle()
-            }
-            // Note: Global hotkey is registered via HotkeyManager from saved settings
-            // Don't add a static .keyboardShortcut here as it would conflict
-
-            Divider()
-
-            Button("Settings") {
-                NotificationCenter.default.post(name: .openSettings, object: nil)
-            }
-            .keyboardShortcut(",", modifiers: .command)
-        }
-
-        CommandMenu("Recording") {
-            Button("Start/Stop Recording") {
-                Task {
-                    try? await coordinatorWrapper.startPipeline()
-                }
-            }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
-        }
-    }
-
-    // MARK: - Initialization
-
-    private func initializeApp() async {
-        do {
-            try await coordinatorWrapper.initialize()
-            Log.info("[RetraceApp] Initialized successfully", category: .app)
-
-            // Setup menu bar icon and timeline window controller
-            await MainActor.run {
-                let menuBar = MenuBarManager(
-                    coordinator: coordinatorWrapper.coordinator,
-                    onboardingManager: coordinatorWrapper.coordinator.onboardingManager
-                )
-                menuBar.setup()
-
-                // Configure the timeline window controller
-                TimelineWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
-
-                // Configure the pause reminder window controller
-                PauseReminderWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
-
-                // Store in AppDelegate to keep it alive
-                if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                    appDelegate.menuBarManager = menuBar
-                }
-
-                Log.info("[RetraceApp] Menu bar icon and timeline controller initialized", category: .app)
-            }
-            // Note: Auto-start recording is handled in AppCoordinatorWrapper.initialize()
-        } catch {
-            Log.error("[RetraceApp] Failed to initialize: \(error)", category: .app)
+        // Empty body - no windows created automatically
+        // All windows (dashboard, timeline, settings) are created on-demand
+        // via their respective window controllers
+        Settings {
+            // Empty settings - we handle settings in DashboardWindowController
+            EmptyView()
         }
     }
 }
@@ -110,18 +30,29 @@ struct RetraceApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     var menuBarManager: MenuBarManager?
+    private var coordinatorWrapper: AppCoordinatorWrapper?
+
+    /// URL that was used to launch the app (for deeplink handling)
+    static var launchURL: URL?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // Register for Apple Events to catch deeplinks before app finishes launching
+        // This is called BEFORE applicationDidFinishLaunching
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prompt user to move app to Applications folder if not already there
         AppMover.moveToApplicationsFolderIfNecessary()
 
-        // CRITICAL FIX: Ensure bundle identifier is set
-        // When running from Xcode/SPM, the bundle ID might not be set correctly
-        if Bundle.main.bundleIdentifier == nil {
-            // Set activation policy to regular (shows in Dock and can be activated)
-            // This is required when running without a proper bundle ID
-            NSApp.setActivationPolicy(.regular)
-        }
+        // Set activation policy to accessory (menu bar only, no dock icon)
+        // This is the standard pattern for LSUIElement apps
+        NSApp.setActivationPolicy(.accessory)
 
         // Check if another instance is already running
         if isAnotherInstanceRunning() {
@@ -137,22 +68,143 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize the Sparkle updater for automatic updates
         UpdaterManager.shared.initialize()
 
-        // Activate the app and bring window to front
-        // Use a slight delay to ensure window is created first
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            // Use NSRunningApplication for most reliable activation
-            let currentApp = NSRunningApplication.current
-            currentApp.activate(options: .activateIgnoringOtherApps)
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        // Initialize the app (coordinator, menu bar, window controllers)
+        initializeApp()
+    }
 
-        // Menu bar will be initialized from initializeApp after coordinator is ready
-        // Note: Permissions are now handled in the onboarding flow
+    // MARK: - App Initialization
+
+    private func initializeApp() {
+        Task { @MainActor in
+            do {
+                // Create and initialize coordinator
+                let wrapper = AppCoordinatorWrapper()
+                self.coordinatorWrapper = wrapper
+                try await wrapper.initialize()
+                Log.info("[AppDelegate] Coordinator initialized successfully", category: .app)
+
+                // Setup menu bar icon
+                let menuBar = MenuBarManager(
+                    coordinator: wrapper.coordinator,
+                    onboardingManager: wrapper.coordinator.onboardingManager
+                )
+                menuBar.setup()
+                self.menuBarManager = menuBar
+
+                // Configure window controllers
+                DashboardWindowController.shared.configure(coordinator: wrapper.coordinator)
+                TimelineWindowController.shared.configure(coordinator: wrapper.coordinator)
+                PauseReminderWindowController.shared.configure(coordinator: wrapper.coordinator)
+
+                Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
+
+                // Handle launch URL if app was opened via deeplink
+                if let launchURL = AppDelegate.launchURL {
+                    AppDelegate.launchURL = nil
+                    handleDeeplink(launchURL)
+                } else {
+                    // Normal launch - show dashboard window
+                    // Use a slight delay to ensure window setup is complete
+                    DashboardWindowController.shared.show()
+                }
+            } catch {
+                Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    // MARK: - URL Handling
+
+    /// Handle Apple Event for URL (called before app finishes launching when app is launched via deeplink)
+    @objc private func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent replyEvent: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: urlString) else {
+            return
+        }
+
+        Log.info("[AppDelegate] Received Apple Event URL: \(url)", category: .app)
+
+        // If coordinator is not yet initialized, store for later
+        // This catches URLs that come in during app launch
+        if coordinatorWrapper == nil {
+            AppDelegate.launchURL = url
+            return
+        }
+
+        handleDeeplink(url)
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        // Handle deeplink URLs (called when app is already running)
+        guard let url = urls.first else { return }
+
+        Log.info("[AppDelegate] Received URL via application(_:open:): \(url)", category: .app)
+
+        // If coordinator is not yet initialized, store for later
+        if coordinatorWrapper == nil {
+            AppDelegate.launchURL = url
+            return
+        }
+
+        handleDeeplink(url)
+    }
+
+    private func handleDeeplink(_ url: URL) {
+        Log.info("[AppDelegate] Handling deeplink: \(url)", category: .app)
+
+        guard url.scheme == "retrace" else { return }
+
+        let host = url.host?.lowercased() ?? ""
+        let queryParams = url.queryParameters
+
+        Task { @MainActor in
+            switch host {
+            case "timeline":
+                // Hide dashboard first to prevent it from being brought to front
+                DashboardWindowController.shared.hide()
+
+                // Parse timestamp if provided (format: t=unix_ms)
+                if let timestampStr = queryParams["t"],
+                   let timestampMs = Int64(timestampStr) {
+                    let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
+                    Log.info("[AppDelegate] Opening timeline at date: \(date)", category: .app)
+                    TimelineWindowController.shared.showAndNavigate(to: date)
+                } else {
+                    // No timestamp - just open timeline
+                    TimelineWindowController.shared.show()
+                }
+
+            case "search":
+                // Hide dashboard first to prevent it from being brought to front
+                DashboardWindowController.shared.hide()
+
+                // Parse timestamp if provided
+                if let timestampStr = queryParams["t"],
+                   let timestampMs = Int64(timestampStr) {
+                    let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
+                    TimelineWindowController.shared.showAndNavigate(to: date)
+                } else {
+                    TimelineWindowController.shared.show()
+                }
+
+            case "dashboard":
+                // Open dashboard
+                DashboardWindowController.shared.show()
+
+            case "settings":
+                // Open settings (via dashboard)
+                DashboardWindowController.shared.showSettings()
+
+            default:
+                // Unknown route - open dashboard
+                DashboardWindowController.shared.show()
+            }
+        }
     }
 
     // MARK: - Single Instance Check
@@ -203,15 +255,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureAppearance() {
         // Force dark mode - the app UI is designed for dark theme
         NSApp.appearance = NSAppearance(named: .darkAqua)
-    }
-}
-
-// MARK: - URL Handling
-
-extension RetraceApp {
-    /// Handle URL scheme: retrace://
-    func onOpenURL(_ url: URL) {
-        Log.info("[RetraceApp] Handling URL: \(url)", category: .app)
-        // URL handling is done in ContentView via .onOpenURL
     }
 }
