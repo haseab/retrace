@@ -2494,15 +2494,23 @@ struct RightClickOverlay: ViewModifier {
 
     private func setupEventMonitor() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
-            // Get the click location in screen coordinates
-            let screenLocation = NSEvent.mouseLocation
+            guard let window = event.window else { return event }
 
-            // Check if click is within our view bounds (approximately)
-            // Note: viewBounds is in SwiftUI global coordinates
-            if viewBounds.contains(CGPoint(x: screenLocation.x, y: screenLocation.y)) {
+            // Get click location in window coordinates (origin at bottom-left of window)
+            let windowLocation = event.locationInWindow
+
+            // Convert to SwiftUI's global coordinate space (origin at top-left of window)
+            // SwiftUI's global Y increases downward, NSWindow's Y increases upward
+            let swiftUILocation = CGPoint(
+                x: windowLocation.x,
+                y: window.frame.height - windowLocation.y
+            )
+
+            // Check if click is within our view bounds (in SwiftUI global coordinates)
+            if viewBounds.contains(swiftUILocation) {
                 // Convert to view-local coordinates
-                let localX = screenLocation.x - viewBounds.minX
-                let localY = viewBounds.height - (screenLocation.y - viewBounds.minY)
+                let localX = swiftUILocation.x - viewBounds.minX
+                let localY = swiftUILocation.y - viewBounds.minY
 
                 // Check if click is in the timeline tape area at the bottom
                 // If so, let the event pass through to SwiftUI's native contextMenu
@@ -3440,7 +3448,9 @@ struct FilterDropdownOverlay: View {
                     if let bundleID = bundleID {
                         viewModel.toggleAppFilter(bundleID)
                     } else {
+                        print("[Filter] All Apps selected - clearing pendingFilterCriteria.selectedApps (was: \(String(describing: viewModel.pendingFilterCriteria.selectedApps)))")
                         viewModel.pendingFilterCriteria.selectedApps = nil
+                        print("[Filter] After clearing: pendingFilterCriteria.selectedApps = \(String(describing: viewModel.pendingFilterCriteria.selectedApps))")
                     }
                 },
                 onFilterModeChange: { mode in

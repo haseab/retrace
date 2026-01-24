@@ -920,9 +920,25 @@ public actor AppCoordinator {
         try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
     }
 
+    /// Add a tag to multiple segments
+    public func addTagToSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        for segmentId in segmentIds {
+            try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
+        }
+        Log.info("[AppCoordinator] Added tag \(tagId.value) to \(segmentIds.count) segments", category: .app)
+    }
+
     /// Remove a tag from a segment
     public func removeTagFromSegment(segmentId: SegmentID, tagId: TagID) async throws {
         try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
+    }
+
+    /// Remove a tag from multiple segments
+    public func removeTagFromSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        for segmentId in segmentIds {
+            try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
+        }
+        Log.info("[AppCoordinator] Removed tag \(tagId.value) from \(segmentIds.count) segments", category: .app)
     }
 
     /// Get all tags for a segment
@@ -942,6 +958,13 @@ public actor AppCoordinator {
 
     /// Hide a segment by adding the "hidden" tag
     public func hideSegment(segmentId: SegmentID) async throws {
+        try await hideSegments(segmentIds: [segmentId])
+    }
+
+    /// Hide multiple segments by adding the "hidden" tag to each
+    public func hideSegments(segmentIds: [SegmentID]) async throws {
+        guard !segmentIds.isEmpty else { return }
+
         // Get or create the hidden tag
         let hiddenTag: Tag
         if let existing = try await services.database.getTag(name: Tag.hiddenTagName) {
@@ -950,9 +973,11 @@ public actor AppCoordinator {
             hiddenTag = try await services.database.createTag(name: Tag.hiddenTagName)
         }
 
-        // Add the tag to the segment
-        try await services.database.addTagToSegment(segmentId: segmentId, tagId: hiddenTag.id)
-        Log.info("[AppCoordinator] Hidden segment \(segmentId.value)", category: .app)
+        // Add the tag to all segments
+        for segmentId in segmentIds {
+            try await services.database.addTagToSegment(segmentId: segmentId, tagId: hiddenTag.id)
+        }
+        Log.info("[AppCoordinator] Hidden \(segmentIds.count) segments", category: .app)
     }
 
     // MARK: - Text Region Retrieval

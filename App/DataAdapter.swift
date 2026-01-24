@@ -126,12 +126,12 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        // Use optimized filtered query if filters are active
-        if let filters = filters, filters.hasActiveFilters {
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
             return try await getFramesInRangeWithFilters(from: startDate, to: endDate, limit: limit, filters: filters)
         }
 
-        // Original unfiltered logic (fast subquery approach)
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind if timestamp is before cutoff
@@ -218,12 +218,12 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        // Use optimized filtered query if filters are active
-        if let filters = filters, filters.hasActiveFilters {
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
             return try await getMostRecentFramesWithFilters(limit: limit, filters: filters)
         }
 
-        // Original unfiltered logic (fast subquery approach)
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Retrace
@@ -299,12 +299,12 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        // Use optimized filtered query if filters are active
-        if let filters = filters, filters.hasActiveFilters {
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
             return try await getFramesBeforeWithFilters(timestamp: timestamp, limit: limit, filters: filters)
         }
 
-        // Original unfiltered logic (fast subquery approach)
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind
@@ -382,12 +382,12 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        // Use optimized filtered query if filters are active
-        if let filters = filters, filters.hasActiveFilters {
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
             return try await getFramesAfterWithFilters(timestamp: timestamp, limit: limit, filters: filters)
         }
 
-        // Original unfiltered logic (fast subquery approach)
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind (respecting cutoff)
