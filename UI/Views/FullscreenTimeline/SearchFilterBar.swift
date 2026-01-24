@@ -1,6 +1,7 @@
 import SwiftUI
 import Shared
 import App
+import AppKit
 
 /// Filter bar for search overlay - displays filter chips below the search field
 /// Styled similar to macOS Spotlight/Raycast with pill-shaped buttons
@@ -9,7 +10,7 @@ public struct SearchFilterBar: View {
     // MARK: - Properties
 
     @ObservedObject var viewModel: SearchViewModel
-    @State private var showAppsPopover = false
+    @State private var showAppsDropdown = false
     @State private var showDatePopover = false
 
     // MARK: - Body
@@ -20,22 +21,34 @@ public struct SearchFilterBar: View {
             SearchModeTabs(viewModel: viewModel)
 
             Divider()
-                .frame(height: 24)
+                .frame(height: 28)
                 .background(Color.white.opacity(0.2))
 
-            // Apps filter
-            FilterChip(
-                icon: "wrench.and.screwdriver",
-                label: viewModel.selectedAppName ?? "Apps",
-                isActive: viewModel.selectedAppFilter != nil,
-                showChevron: true
-            ) {
-                showAppsPopover.toggle()
-            }
-            .popover(isPresented: $showAppsPopover, arrowEdge: .bottom) {
+            // Apps filter (multi-select) - shows app icons when selected
+            AppsFilterChip(
+                selectedApps: viewModel.selectedAppFilters,
+                isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showAppsDropdown.toggle()
+                        showDatePopover = false // Close other dropdown
+                    }
+                }
+            )
+            .dropdownOverlay(isPresented: $showAppsDropdown) {
                 AppsFilterPopover(
-                    viewModel: viewModel,
-                    isPresented: $showAppsPopover
+                    apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
+                    otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
+                    selectedApps: viewModel.selectedAppFilters,
+                    allowMultiSelect: true,
+                    onSelectApp: { bundleID in
+                        viewModel.toggleAppFilter(bundleID)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showAppsDropdown = false
+                        }
+                    }
                 )
             }
 
@@ -46,9 +59,12 @@ public struct SearchFilterBar: View {
                 isActive: viewModel.startDate != nil || viewModel.endDate != nil,
                 showChevron: true
             ) {
-                showDatePopover.toggle()
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showDatePopover.toggle()
+                    showAppsDropdown = false // Close other dropdown
+                }
             }
-            .popover(isPresented: $showDatePopover, arrowEdge: .bottom) {
+            .dropdownOverlay(isPresented: $showDatePopover) {
                 DateFilterPopover(
                     viewModel: viewModel,
                     isPresented: $showDatePopover
@@ -84,6 +100,19 @@ public struct SearchFilterBar: View {
         .task {
             // Load available apps when the filter bar appears
             await viewModel.loadAvailableApps()
+        }
+        .onChange(of: showAppsDropdown) { _ in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover
+        }
+        .onChange(of: showDatePopover) { _ in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover
+        }
+        .onChange(of: viewModel.closeDropdownsSignal) { _ in
+            // Close all dropdowns when signal is received (from Escape key in parent)
+            withAnimation(.easeOut(duration: 0.15)) {
+                showAppsDropdown = false
+                showDatePopover = false
+            }
         }
     }
 
@@ -122,20 +151,20 @@ private struct FilterChip: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.retraceCaption2Medium)
+                    .font(.system(size: 14))
 
                 Text(label)
-                    .font(.retraceCaptionMedium)
+                    .font(.retraceCalloutMedium)
                     .lineLimit(1)
 
                 if showChevron {
                     Image(systemName: "chevron.down")
-                        .font(.retraceTinyBold)
+                        .font(.retraceCaption2)
                 }
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
@@ -154,137 +183,110 @@ private struct FilterChip: View {
     }
 }
 
-// MARK: - Apps Filter Popover
+// MARK: - Apps Filter Chip (shows app icons)
 
-private struct AppsFilterPopover: View {
-    @ObservedObject var viewModel: SearchViewModel
-    @Binding var isPresented: Bool
-    @State private var searchText = ""
-
-    private var filteredApps: [AppInfo] {
-        if searchText.isEmpty {
-            return viewModel.availableApps
-        }
-        return viewModel.availableApps.filter { app in
-            app.bundleID.localizedCaseInsensitiveContains(searchText) ||
-            app.name.localizedCaseInsensitiveContains(searchText)
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Search field
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundColor(.secondary)
-                    .font(.retraceCaption2)
-
-                TextField("Search apps...", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.retraceCaption)
-            }
-            .padding(10)
-            .background(Color(nsColor: .textBackgroundColor))
-
-            Divider()
-
-            // App list
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    // "All Apps" option
-                    AppFilterRow(
-                        icon: nil,
-                        name: "All Apps",
-                        bundleID: nil,
-                        isSelected: viewModel.selectedAppFilter == nil
-                    ) {
-                        // Dismiss popover FIRST to prevent crash during animation
-                        isPresented = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            viewModel.setAppFilter(nil)
-                        }
-                    }
-
-                    Divider()
-                        .padding(.vertical, 4)
-
-                    // Individual apps
-                    ForEach(filteredApps) { app in
-                        AppFilterRow(
-                            icon: NSWorkspace.shared.icon(forFile: NSWorkspace.shared.urlForApplication(withBundleIdentifier: app.bundleID)?.path ?? ""),
-                            name: app.name,
-                            bundleID: app.bundleID,
-                            isSelected: viewModel.selectedAppFilter == app.bundleID
-                        ) {
-                            // Dismiss popover FIRST to prevent crash during animation
-                            isPresented = false
-                            let bundleID = app.bundleID
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                viewModel.setAppFilter(bundleID)
-                            }
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-            }
-            .frame(maxHeight: 300)
-        }
-        .frame(width: 260)
-        .background(Color(nsColor: .windowBackgroundColor))
-    }
-}
-
-// MARK: - App Filter Row
-
-private struct AppFilterRow: View {
-    let icon: NSImage?
-    let name: String
-    let bundleID: String?
-    let isSelected: Bool
+private struct AppsFilterChip: View {
+    let selectedApps: Set<String>?
+    let isActive: Bool
     let action: () -> Void
 
     @State private var isHovered = false
 
+    private let maxVisibleIcons = 5
+    private let iconSize: CGFloat = 20
+
+    private var sortedApps: [String] {
+        guard let apps = selectedApps else { return [] }
+        return apps.sorted()
+    }
+
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
-                // App icon
-                if let icon = icon {
-                    Image(nsImage: icon)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 20, height: 20)
+            HStack(spacing: 6) {
+                if sortedApps.count == 1 {
+                    // Single app: show icon + name
+                    let bundleID = sortedApps[0]
+                    appIcon(for: bundleID)
+                        .frame(width: iconSize, height: iconSize)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .transition(.scale.combined(with: .opacity))
+
+                    Text(appName(for: bundleID))
+                        .font(.retraceCaptionMedium)
+                        .lineLimit(1)
+                        .transition(.opacity)
+                } else if sortedApps.count > 1 {
+                    // Multiple apps: show icons
+                    HStack(spacing: -4) {
+                        ForEach(Array(sortedApps.prefix(maxVisibleIcons)), id: \.self) { bundleID in
+                            appIcon(for: bundleID)
+                                .frame(width: iconSize, height: iconSize)
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                                .transition(.scale.combined(with: .opacity))
+                        }
+                    }
+
+                    // Show "+X" if more than maxVisibleIcons
+                    if sortedApps.count > maxVisibleIcons {
+                        Text("+\(sortedApps.count - maxVisibleIcons)")
+                            .font(.retraceTinyBold)
+                            .foregroundColor(.white.opacity(0.8))
+                            .transition(.scale.combined(with: .opacity))
+                    }
                 } else {
-                    Image(systemName: "app.fill")
-                        .font(.retraceHeadline)
-                        .foregroundColor(.secondary)
-                        .frame(width: 20, height: 20)
+                    // Default state - no apps selected
+                    Image(systemName: "square.grid.2x2.fill")
+                        .font(.system(size: 14))
+                        .transition(.scale.combined(with: .opacity))
+                    Text("Apps")
+                        .font(.retraceCalloutMedium)
+                        .transition(.opacity)
                 }
 
-                // App name
-                Text(name)
-                    .font(.retraceCaption)
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-
-                Spacer()
-
-                // Checkmark for selected
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.accentColor)
-                }
+                Image(systemName: "chevron.down")
+                    .font(.retraceCaption2)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(isHovered ? Color.accentColor.opacity(0.1) : Color.clear)
-            .contentShape(Rectangle())
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: sortedApps)
+            .foregroundColor(isActive ? .white : .white.opacity(0.7))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            isHovered = hovering
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
         }
+    }
+
+    @ViewBuilder
+    private func appIcon(for bundleID: String) -> some View {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(systemName: "app.fill")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundColor(.white.opacity(0.6))
+        }
+    }
+
+    private func appName(for bundleID: String) -> String {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: appURL.path)
+        }
+        // Fallback: extract last component of bundle ID
+        return bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 
@@ -515,16 +517,10 @@ private struct DateFilterPopover: View {
 
                     // Apply button
                     Button(action: {
-                        // Dismiss popover FIRST to prevent crash during animation
-                        // The popover can crash if SwiftUI updates the view hierarchy while it's animating
-                        isPresented = false
-
-                        // Delay the filter update to allow popover dismissal animation to complete
                         let start = calendar.startOfDay(for: customStartDate)
                         let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: customEndDate)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            viewModel.setDateRange(start: start, end: end)
-                        }
+                        viewModel.setDateRange(start: start, end: end)
+                        isPresented = false
                     }) {
                         HStack {
                             Image(systemName: "checkmark.circle.fill")
@@ -637,38 +633,34 @@ private struct DateFilterPopover: View {
     }
 
     private func applyPreset(_ preset: DatePreset) {
-        // Dismiss popover FIRST to prevent crash during animation
-        // The popover can crash if SwiftUI updates the view hierarchy while it's animating
-        isPresented = false
-
-        // Delay the filter update to allow popover dismissal animation to complete
         let now = Date()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [viewModel, calendar] in
-            switch preset {
-            case .anytime:
-                viewModel.setDateRange(start: nil, end: nil)
-            case .today:
-                let start = calendar.startOfDay(for: now)
-                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
+
+        switch preset {
+        case .anytime:
+            viewModel.setDateRange(start: nil, end: nil)
+        case .today:
+            let start = calendar.startOfDay(for: now)
+            let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
+            viewModel.setDateRange(start: start, end: end)
+        case .yesterday:
+            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
+                let start = calendar.startOfDay(for: yesterday)
+                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
                 viewModel.setDateRange(start: start, end: end)
-            case .yesterday:
-                if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
-                    let start = calendar.startOfDay(for: yesterday)
-                    let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
-                    viewModel.setDateRange(start: start, end: end)
-                }
-            case .lastWeek:
-                if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                    let start = calendar.startOfDay(for: weekAgo)
-                    viewModel.setDateRange(start: start, end: now)
-                }
-            case .lastMonth:
-                if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                    let start = calendar.startOfDay(for: monthAgo)
-                    viewModel.setDateRange(start: start, end: now)
-                }
+            }
+        case .lastWeek:
+            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
+                let start = calendar.startOfDay(for: weekAgo)
+                viewModel.setDateRange(start: start, end: now)
+            }
+        case .lastMonth:
+            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
+                let start = calendar.startOfDay(for: monthAgo)
+                viewModel.setDateRange(start: start, end: now)
             }
         }
+
+        isPresented = false
     }
 }
 
@@ -732,10 +724,10 @@ private struct SearchModeTab: View {
     var body: some View {
         Button(action: action) {
             Text(label)
-                .font(isSelected ? .retraceCaption2Bold : .retraceCaption2Medium)
+                .font(isSelected ? .retraceCalloutBold : .retraceCalloutMedium)
                 .foregroundColor(isSelected ? .white : .white.opacity(0.6))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
                         .fill(isSelected ? Color.white.opacity(0.2) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
@@ -749,3 +741,4 @@ private struct SearchModeTab: View {
         }
     }
 }
+

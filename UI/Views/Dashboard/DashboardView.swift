@@ -199,6 +199,13 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     // MARK: - Recording Indicator
@@ -241,6 +248,13 @@ public struct DashboardView: View {
             .labelsHidden()
             .toggleStyle(SwitchToggleStyle(tint: .retraceSuccess))
             .scaleEffect(0.85)
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -438,6 +452,13 @@ public struct DashboardView: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
             }
         }
         .padding(4)
@@ -498,6 +519,13 @@ public struct DashboardView: View {
                     .font(.retraceCaption2Medium)
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
 
                 Circle()
                     .fill(Color.retraceSecondary.opacity(0.5))
@@ -513,6 +541,13 @@ public struct DashboardView: View {
                     .foregroundColor(.retraceSecondary)
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
 
                 Circle()
                     .fill(Color.retraceSecondary.opacity(0.5))
@@ -528,6 +563,13 @@ public struct DashboardView: View {
                     .foregroundColor(.retraceSecondary)
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
             }
 
             Spacer()

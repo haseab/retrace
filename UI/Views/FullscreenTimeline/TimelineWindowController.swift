@@ -83,8 +83,8 @@ public class TimelineWindowController: NSObject {
             }
         )
 
-        // Host the SwiftUI view
-        let hostingView = NSHostingView(rootView: timelineView)
+        // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
+        let hostingView = FirstMouseHostingView(rootView: timelineView)
         hostingView.frame = window.contentView?.bounds ?? .zero
         hostingView.autoresizingMask = [.width, .height]
         window.contentView?.addSubview(hostingView)
@@ -137,6 +137,9 @@ public class TimelineWindowController: NSObject {
                 self?.timelineViewModel = nil
                 self?.isVisible = false
                 self?.onClose?()
+
+                // Reset the cached scale factor so it recalculates for next window
+                TimelineScaleFactor.resetCache()
 
                 // Notify coordinator to resume frame processing
                 if let coordinator = self?.coordinator {
@@ -209,6 +212,11 @@ public class TimelineWindowController: NSObject {
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
+                // Don't handle scroll events when search overlay or filter dropdown is open
+                if let viewModel = self?.timelineViewModel,
+                   (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen) {
+                    return // Let SwiftUI handle it
+                }
                 self?.handleScrollEvent(event, source: "GLOBAL")
             } else if event.type == .magnify {
                 self?.handleMagnifyEvent(event)
@@ -272,6 +280,11 @@ public class TimelineWindowController: NSObject {
                 if let viewModel = self?.timelineViewModel, viewModel.isSearchOverlayVisible {
                     return event // Let the ScrollView handle it
                 }
+                // Don't intercept scroll events when a filter dropdown is open
+                // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
+                if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
+                    return event // Let the dropdown ScrollView handle it
+                }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
             } else if event.type == .magnify {
@@ -313,17 +326,25 @@ public class TimelineWindowController: NSObject {
                     viewModel.cancelZoomRegionDrag()
                     return true
                 }
-                // If calendar picker is showing, close it first
+                // If calendar picker is showing, close it first with animation
                 if viewModel.isCalendarPickerVisible {
-                    viewModel.isCalendarPickerVisible = false
-                    viewModel.hoursWithFrames = []
-                    viewModel.selectedCalendarDate = nil
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
+                        viewModel.isCalendarPickerVisible = false
+                        viewModel.hoursWithFrames = []
+                        viewModel.selectedCalendarDate = nil
+                    }
                     return true
                 }
-                // If date search is active, close it
+                // If zoom slider is expanded, collapse it
+                if viewModel.isZoomSliderExpanded {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.isZoomSliderExpanded = false
+                    }
+                    return true
+                }
+                // If date search is active, close it with animation
                 if viewModel.isDateSearchActive {
-                    viewModel.isDateSearchActive = false
-                    viewModel.dateSearchText = ""
+                    viewModel.closeDateSearch()
                     return true
                 }
                 // If search overlay is showing, close it
@@ -351,6 +372,16 @@ public class TimelineWindowController: NSObject {
                     viewModel.clearTextSelection()
                     return true
                 }
+                // If filter panel is visible with open dropdown, let the panel handle it
+                if viewModel.isFilterPanelVisible && viewModel.isFilterDropdownOpen {
+                    // The FilterPanel's NSEvent monitor will handle this
+                    return false
+                }
+                // If filter panel is visible (no dropdown), close it
+                if viewModel.isFilterPanelVisible {
+                    viewModel.dismissFilterPanel()
+                    return true
+                }
             }
             // Otherwise close the timeline
             hide()
@@ -369,11 +400,7 @@ public class TimelineWindowController: NSObject {
         // Cmd+G to toggle date search panel ("Go to" date)
         if event.keyCode == 5 && modifiers == [.command] { // G key with Command
             if let viewModel = timelineViewModel {
-                viewModel.isDateSearchActive.toggle()
-                // Clear text when closing
-                if !viewModel.isDateSearchActive {
-                    viewModel.dateSearchText = ""
-                }
+                viewModel.toggleDateSearch()
             }
             return true
         }
@@ -621,4 +648,11 @@ extension Notification.Name {
 class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+}
+
+/// Custom hosting view that accepts first mouse to enable hover on first interaction
+class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
 }

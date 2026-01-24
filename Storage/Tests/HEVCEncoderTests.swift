@@ -108,6 +108,110 @@ final class HEVCEncoderTests: XCTestCase {
     // │              Movie Fragment Interval - Read Before Finalize             │
     // └──────────────────────────────────────────────────────────────────────────┘
 
+    // ┌──────────────────────────────────────────────────────────────────────────┐
+    // │              Concurrent Writers - Reproduce File Deletion Bug           │
+    // └──────────────────────────────────────────────────────────────────────────┘
+
+    /// Test that creates two writers concurrently to see if one deletes the other's file
+    /// This simulates the scenario where two resolutions are captured simultaneously
+    func testConcurrentWritersDoNotInterfere() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("concurrent_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let config = VideoEncoderConfig.default
+        let startTime = Date()
+
+        // Create two encoders with different paths (simulating different resolutions)
+        let encoder1 = HEVCEncoder()
+        let encoder2 = HEVCEncoder()
+
+        let url1 = tempDir.appendingPathComponent("video1.mp4")
+        let url2 = tempDir.appendingPathComponent("video2.mp4")
+
+        print("📝 Creating two concurrent encoders...")
+        print("   Encoder 1: \(url1.lastPathComponent)")
+        print("   Encoder 2: \(url2.lastPathComponent)")
+
+        // Initialize both nearly simultaneously
+        try await encoder1.initialize(width: 1920, height: 1080, config: config, outputURL: url1, segmentStartTime: startTime)
+        try await encoder2.initialize(width: 1280, height: 720, config: config, outputURL: url2, segmentStartTime: startTime)
+
+        print("✅ Both encoders initialized")
+        print("   File 1 exists: \(FileManager.default.fileExists(atPath: url1.path))")
+        print("   File 2 exists: \(FileManager.default.fileExists(atPath: url2.path))")
+
+        // Write frames to both concurrently
+        print("\n📝 Writing frames to both encoders concurrently...")
+
+        for i in 0..<10 {
+            // Create frames for both resolutions
+            let frame1 = createTestFrame(width: 1920, height: 1080, value: UInt8(i * 20))
+            let frame2 = createTestFrame(width: 1280, height: 720, value: UInt8(i * 20 + 10))
+
+            let pb1 = try FrameConverter.createPixelBuffer(from: frame1)
+            let pb2 = try FrameConverter.createPixelBuffer(from: frame2)
+
+            let timestamp = CMTime(value: Int64(i) * 20, timescale: 600)
+
+            // Write to both - check file existence before and after
+            let exists1Before = FileManager.default.fileExists(atPath: url1.path)
+            let exists2Before = FileManager.default.fileExists(atPath: url2.path)
+
+            try await encoder1.encode(pixelBuffer: pb1, timestamp: timestamp)
+            try await encoder2.encode(pixelBuffer: pb2, timestamp: timestamp)
+
+            let exists1After = FileManager.default.fileExists(atPath: url1.path)
+            let exists2After = FileManager.default.fileExists(atPath: url2.path)
+
+            if !exists1After && exists1Before {
+                print("   ❌ Frame \(i): File 1 was DELETED!")
+            }
+            if !exists2After && exists2Before {
+                print("   ❌ Frame \(i): File 2 was DELETED!")
+            }
+
+            if i % 3 == 0 {
+                print("   Frame \(i): file1=\(exists1After), file2=\(exists2After)")
+            }
+        }
+
+        // Finalize both
+        try await encoder1.finalize()
+        try await encoder2.finalize()
+
+        // Verify both files exist and have content
+        let size1 = (try? FileManager.default.attributesOfItem(atPath: url1.path)[.size] as? Int64) ?? 0
+        let size2 = (try? FileManager.default.attributesOfItem(atPath: url2.path)[.size] as? Int64) ?? 0
+
+        print("\n📊 Final results:")
+        print("   File 1: \(size1) bytes")
+        print("   File 2: \(size2) bytes")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url1.path), "File 1 should exist")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url2.path), "File 2 should exist")
+        XCTAssertGreaterThan(size1, 0, "File 1 should have content")
+        XCTAssertGreaterThan(size2, 0, "File 2 should have content")
+    }
+
+    private func createTestFrame(width: Int, height: Int, value: UInt8) -> CapturedFrame {
+        let bytesPerRow = width * 4
+        let imageData = Data(repeating: value, count: bytesPerRow * height)
+        return CapturedFrame(
+            imageData: imageData,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow
+        )
+    }
+
+    // ┌──────────────────────────────────────────────────────────────────────────┐
+    // │              Movie Fragment Interval - Read Before Finalize             │
+    // └──────────────────────────────────────────────────────────────────────────┘
+
     /// Test if we can read frames from an MP4 file BEFORE finalization
     /// when movieFragmentInterval is set. This is the key test for enabling
     /// "see frames within 10 seconds" functionality.

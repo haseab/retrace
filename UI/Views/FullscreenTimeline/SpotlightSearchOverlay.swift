@@ -97,6 +97,10 @@ public struct SpotlightSearchOverlay: View {
             // Focus the search field immediately
             isSearchFocused = true
         }
+        .task {
+            // Preload available apps in background so they're ready when user clicks the filter
+            await viewModel.loadAvailableApps()
+        }
         .onChange(of: isVisible) { visible in
             // Ensure focus when overlay becomes visible
             if visible {
@@ -104,8 +108,13 @@ public struct SpotlightSearchOverlay: View {
             }
         }
         .onExitCommand {
-            Log.debug("\(searchLog) Exit command received", category: .ui)
-            dismissOverlay()
+            Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen)", category: .ui)
+            // If a dropdown is open, close it instead of dismissing the entire overlay
+            if viewModel.isDropdownOpen {
+                viewModel.closeDropdownsSignal += 1
+            } else {
+                dismissOverlay()
+            }
         }
         .onChange(of: viewModel.searchQuery) { newValue in
             Log.debug("\(searchLog) Query changed to: '\(newValue)'", category: .ui)
@@ -315,7 +324,7 @@ public struct SpotlightSearchOverlay: View {
                 .foregroundColor(.white.opacity(0.5))
 
             // Show slow query alert when filtering by app with "All" mode
-            if viewModel.selectedAppFilter != nil && viewModel.searchMode == .all {
+            if viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty && viewModel.searchMode == .all {
                 HStack(spacing: 6) {
                     Image(systemName: "info.circle.fill")
                         .font(.retraceCaption2)

@@ -71,26 +71,37 @@ public struct SimpleTimelineView: View {
                 // Dismiss overlay for date search panel (Cmd+G) - clicking outside closes it
                 // Must be BEFORE TimelineTapeView in ZStack so it's behind the panel
                 if viewModel.isDateSearchActive && !viewModel.isCalendarPickerVisible {
-                    Color.black.opacity(0.001) // Nearly invisible but captures taps
+                    Color.clear
+                        .contentShape(Rectangle())
                         .ignoresSafeArea()
                         .onTapGesture {
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
-                                viewModel.isDateSearchActive = false
-                                viewModel.dateSearchText = ""
-                            }
+                            viewModel.closeDateSearch()
                         }
                 }
 
                 // Dismiss overlay for calendar picker - clicking outside closes it
                 // Must be BEFORE TimelineTapeView in ZStack so it's behind the picker
                 if viewModel.isCalendarPickerVisible {
-                    Color.black.opacity(0.001) // Nearly invisible but captures taps
+                    Color.clear
+                        .contentShape(Rectangle())
                         .ignoresSafeArea()
                         .onTapGesture {
                             withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
                                 viewModel.isCalendarPickerVisible = false
                                 viewModel.hoursWithFrames = []
                                 viewModel.selectedCalendarDate = nil
+                            }
+                        }
+                }
+
+                // Dismiss overlay for zoom slider - clicking outside closes it
+                if viewModel.isZoomSliderExpanded {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeOut(duration: 0.12)) {
+                                viewModel.isZoomSliderExpanded = false
                             }
                         }
                 }
@@ -107,30 +118,62 @@ public struct SimpleTimelineView: View {
                 .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
-                // Close button (top-right) and debug frame ID (top-left)
+                // Persistent controls toggle button (stays visible when controls are hidden)
+                if viewModel.areControlsHidden {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            ControlsToggleButton(viewModel: viewModel)
+                            Spacer()
+                        }
+                        .padding(.leading, 24)
+                        .padding(.bottom, 24)
+                    }
+                    .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))
+                }
+
+                // Debug frame ID badge (top-left)
                 VStack {
                     HStack {
-                        // Debug frame ID badge (top-left)
                         if viewModel.showFrameIDs {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
-
                         Spacer()
-
-                        // Reset zoom button (appears when frame is zoomed)
-                        if viewModel.isFrameZoomed {
-                            ResetZoomButton(viewModel: viewModel)
-                                .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                        }
-
-                        closeButton
+                            .allowsHitTesting(false)
                     }
                     Spacer()
+                        .allowsHitTesting(false)
                 }
                 .padding(.spacingL)
                 .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.closeButtonHiddenYOffset : 0)
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
-                .animation(.easeInOut(duration: 0.2), value: viewModel.isFrameZoomed)
+
+                // Reset zoom button (top center)
+                if viewModel.isFrameZoomed {
+                    VStack {
+                        ResetZoomButton(viewModel: viewModel)
+                            .padding(.top, 12) // Extra margin for MacBook notch
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.spacingL)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                    .animation(.easeInOut(duration: 0.2), value: viewModel.isFrameZoomed)
+                }
+
+                // Close button (top-right) - always visible
+                VStack {
+                    HStack {
+                        Spacer()
+                            .allowsHitTesting(false)
+                        closeButton
+                    }
+                    Spacer()
+                        .allowsHitTesting(false)
+                }
+                .padding(.spacingL)
+                .zIndex(100)
 
 
                 // Loading overlay
@@ -210,7 +253,48 @@ public struct SimpleTimelineView: View {
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
                 }
 
+                // Filter panel (floating, anchored to filter button position)
+                Group {
+                    if viewModel.isFilterPanelVisible {
+                        // Dismiss overlay for filter panel and any open dropdown
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                if viewModel.activeFilterDropdown != .none {
+                                    withAnimation(.easeOut(duration: 0.15)) {
+                                        viewModel.dismissFilterDropdown()
+                                    }
+                                } else {
+                                    viewModel.dismissFilterPanel()
+                                }
+                            }
+
+                        FilterPanel(viewModel: viewModel)
+                            .position(
+                                x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - 100,
+                                y: geometry.size.height - 450
+                            )
+                            .transition(.opacity.combined(with: .offset(y: 15)))
+
+                        // Filter dropdowns - rendered at top level to avoid clipping issues
+                        FilterDropdownOverlay(viewModel: viewModel)
+                    }
+                }
+                .animation(.easeOut(duration: 0.15), value: viewModel.isFilterPanelVisible)
+
+                // Timeline segment context menu (for right-click on timeline tape)
+                // Placed at the end of ZStack to ensure it renders above all other content
+                if viewModel.showTimelineContextMenu {
+                    TimelineSegmentContextMenu(
+                        viewModel: viewModel,
+                        isPresented: $viewModel.showTimelineContextMenu,
+                        location: viewModel.timelineContextMenuLocation,
+                        containerSize: geometry.size
+                    )
+                }
+
             }
+            .coordinateSpace(name: "timelineContent")
             .background(Color.black)
             .ignoresSafeArea()
             .onAppear {
@@ -230,27 +314,46 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
-        let _ = print("[SimpleTimelineView] frameDisplay: videoInfo=\(viewModel.currentVideoInfo != nil), currentImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), framesCount=\(viewModel.frames.count)")
+        // Debug logging for frame display state
+        let _ = Log.debug("[FrameDisplay] videoInfo=\(viewModel.currentVideoInfo != nil), currentImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), framesCount=\(viewModel.frames.count), currentIndex=\(viewModel.currentIndex)", category: .ui)
         if let videoInfo = viewModel.currentVideoInfo {
             // Video-based frame (Rewind) with URL overlay
-            // Only show if video file exists (check both with and without .mp4 extension)
-            let fileExists = FileManager.default.fileExists(atPath: videoInfo.videoPath) ||
-                             FileManager.default.fileExists(atPath: videoInfo.videoPath + ".mp4")
-            let _ = print("[SimpleTimelineView] Video path: \(videoInfo.videoPath), exists: \(fileExists)")
-            if fileExists {
+            // Check if video file exists AND has playable content (not still buffering initial fragments)
+            let path = videoInfo.videoPath
+            let pathWithExt = path + ".mp4"
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ??
+                           (try? FileManager.default.attributesOfItem(atPath: pathWithExt)[.size] as? Int64) ?? 0
+
+            // With movieFragmentInterval = 0.1s and ~3 frames needed before first fragment is written,
+            // a typical fragment with 1920x1080 HEVC frames is ~40-50KB minimum per fragment.
+            // However, to avoid corrupted/incomplete fragments, require at least 2 fragments written.
+            // Observed: Fragment 2 written at ~280KB total. Use 200KB threshold for safety.
+            let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
+            let fileReady = fileSize >= minFragmentSize
+
+            let _ = Log.debug("[FrameDisplay] Video path: \(path.suffix(50)), size: \(fileSize) bytes, ready: \(fileReady), frameIndex: \(videoInfo.frameIndex)", category: .ui)
+            if fileReady {
                 FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                     SimpleVideoFrameView(videoInfo: videoInfo)
                 }
             } else {
-                // Video file missing - show black screen
-                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                    Rectangle()
-                        .fill(Color.black)
+                let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet), showing placeholder", category: .ui)
+                // Video file not ready - show friendly message
+                VStack(spacing: .spacingM) {
+                    Image(systemName: "clock")
+                        .font(.retraceDisplay)
+                        .foregroundColor(.white.opacity(0.3))
+                    Text("Frame not ready yet")
+                        .font(.retraceBody)
+                        .foregroundColor(.white.opacity(0.5))
+                    Text("Relaunch timeline in a few seconds")
+                        .font(.retraceCaption)
+                        .foregroundColor(.white.opacity(0.3))
                 }
             }
         } else if let image = viewModel.currentImage {
             // Static image (Retrace) with URL overlay
-            let _ = print("[SimpleTimelineView] Showing static image")
+            // let _ = print("[SimpleTimelineView] Showing static image")
             FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                 Image(nsImage: image)
                     .resizable()
@@ -258,16 +361,16 @@ public struct SimpleTimelineView: View {
             }
         } else if !viewModel.isLoading {
             // Empty state - no video or image available
-            let _ = print("[SimpleTimelineView] Empty state - no video or image, frames.isEmpty=\(viewModel.frames.isEmpty)")
+            // let _ = print("[SimpleTimelineView] Empty state - no video or image, frames.isEmpty=\(viewModel.frames.isEmpty)")
             VStack(spacing: .spacingM) {
-                Image(systemName: "photo.on.rectangle.angled")
+                Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
                     .font(.retraceDisplay)
                     .foregroundColor(.white.opacity(0.3))
-                Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not available")
+                Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not ready yet")
                     .font(.retraceBody)
                     .foregroundColor(.white.opacity(0.5))
                 if !viewModel.frames.isEmpty {
-                    Text("Video segment missing")
+                    Text("Relaunch timeline in a few seconds")
                         .font(.retraceCaption)
                         .foregroundColor(.white.opacity(0.3))
                 }
@@ -277,14 +380,49 @@ public struct SimpleTimelineView: View {
 
     // MARK: - Close Button
 
+    @State private var isCloseButtonHovering = false
+
     private var closeButton: some View {
-        Button(action: onClose) {
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: TimelineScaleFactor.closeButtonSize))
-                .foregroundColor(.white.opacity(0.6))
+        let scale = TimelineScaleFactor.current
+        let buttonSize = 44 * scale
+        let expandedWidth = 120 * scale
+        return Button(action: {
+            viewModel.dismissContextMenu()
+            onClose()
+        }) {
+            // Fixed-size container prevents hover flicker
+            ZStack(alignment: .trailing) {
+                // Invisible spacer to maintain hit area
+                Color.clear
+                    .frame(width: expandedWidth, height: buttonSize)
+
+                // Animated button content
+                HStack(spacing: 10 * scale) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 18 * scale, weight: .semibold))
+                    if isCloseButtonHovering {
+                        Text("Close")
+                            .font(.system(size: 17 * scale, weight: .medium))
+                    }
+                }
+                .foregroundColor(isCloseButtonHovering ? .white : .white.opacity(0.8))
+                .frame(width: isCloseButtonHovering ? nil : buttonSize, height: buttonSize)
+                .padding(.horizontal, isCloseButtonHovering ? 20 * scale : 0)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(isCloseButtonHovering ? 0.7 : 0.5))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+                )
+                .animation(.easeOut(duration: 0.15), value: isCloseButtonHovering)
+            }
         }
         .buttonStyle(.plain)
+        .contentShape(Rectangle())
         .onHover { hovering in
+            isCloseButtonHovering = hovering
             if hovering {
                 NSCursor.pointingHand.push()
             } else {
@@ -432,6 +570,10 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         playerView.showsSharingServiceButton = false
         playerView.showsFullScreenToggleButton = false
 
+        // Set black background to hide default AVPlayer placeholder icon
+        playerView.wantsLayer = true
+        playerView.layer?.backgroundColor = NSColor.black.cgColor
+
         // Disable Live Text analysis to prevent VKImageAnalysisButton crashes
         // when the window is in an inconsistent state during display cycles
         if #available(macOS 13.0, *) {
@@ -526,10 +668,21 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         // Seek to frame when ready - use integer arithmetic to avoid floating point precision issues
         let targetTime = videoInfo.frameTimeCMTime
+        let targetFrameIndex = videoInfo.frameIndex
+        let videoPath = videoInfo.videoPath
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { item, _ in
+            Log.debug("[VideoView] PlayerItem status changed: \(item.status.rawValue) (0=unknown, 1=ready, 2=failed) for frame \(targetFrameIndex)", category: .ui)
+
+            if item.status == .failed {
+                Log.error("[VideoView] PlayerItem FAILED to load video: \(videoPath.suffix(50)), error: \(item.error?.localizedDescription ?? "unknown")", category: .ui)
+                return
+            }
+
             guard item.status == .readyToPlay else { return }
 
-            player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+            Log.debug("[VideoView] PlayerItem ready, seeking to frame \(targetFrameIndex)", category: .ui)
+            player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
+                Log.debug("[VideoView] Seek to frame \(targetFrameIndex) finished: \(finished)", category: .ui)
                 player.pause()
             }
         }
@@ -562,9 +715,6 @@ struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onURLClicked: () -> Void
     let content: () -> Content
-
-    @State private var showContextMenu = false
-    @State private var contextMenuLocation: CGPoint = .zero
 
     var body: some View {
         GeometryReader { geometry in
@@ -685,17 +835,17 @@ struct FrameWithURLOverlay<Content: View>: View {
 
             }
             .onRightClick { location in
-                contextMenuLocation = location
-                showContextMenu = true
+                viewModel.contextMenuLocation = location
+                viewModel.showContextMenu = true
             }
             .overlay(
                 // Floating context menu at click location
                 Group {
-                    if showContextMenu {
+                    if viewModel.showContextMenu {
                         FloatingContextMenu(
                             viewModel: viewModel,
-                            isPresented: $showContextMenu,
-                            location: contextMenuLocation,
+                            isPresented: $viewModel.showContextMenu,
+                            location: viewModel.contextMenuLocation,
                             containerSize: geometry.size
                         )
                     }
@@ -2315,6 +2465,12 @@ struct RightClickOverlay: ViewModifier {
     @State private var eventMonitor: Any?
     @State private var viewBounds: CGRect = .zero
 
+    /// Height of the timeline tape area at the bottom (tape height + bottom padding)
+    /// Clicks in this area are passed through to SwiftUI's native contextMenu
+    private var timelineExclusionHeight: CGFloat {
+        TimelineScaleFactor.tapeHeight + TimelineScaleFactor.tapeBottomPadding + 20 // Extra buffer for the playhead
+    }
+
     func body(content: Content) -> some View {
         content
             .background(
@@ -2347,6 +2503,14 @@ struct RightClickOverlay: ViewModifier {
                 // Convert to view-local coordinates
                 let localX = screenLocation.x - viewBounds.minX
                 let localY = viewBounds.height - (screenLocation.y - viewBounds.minY)
+
+                // Check if click is in the timeline tape area at the bottom
+                // If so, let the event pass through to SwiftUI's native contextMenu
+                let distanceFromBottom = viewBounds.height - localY
+                if distanceFromBottom < timelineExclusionHeight {
+                    // Pass through to SwiftUI for timeline tape context menu
+                    return event
+                }
 
                 DispatchQueue.main.async {
                     onRightClick(CGPoint(x: localX, y: localY))
@@ -2396,49 +2560,19 @@ struct FloatingContextMenu: View {
                     }
                 }
 
-            // Menu content
-            VStack(alignment: .leading, spacing: 2) {
-                ContextMenuRow(title: "Copy Moment Link", icon: "link") {
-                    isPresented = false
-                    copyMomentLink()
-                }
-
-                ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
-                    isPresented = false
-                    copyImageToClipboard()
-                }
-
-                ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
-                    isPresented = false
-                    saveImage()
-                }
-
-                Divider()
-                    .background(Color.white.opacity(0.1))
-                    .padding(.vertical, 4)
-
-                ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2") {
-                    isPresented = false
-                    openDashboard()
-                }
-
-                ContextMenuRow(title: "Settings", icon: "gear") {
-                    isPresented = false
-                    openSettings()
-                }
-            }
-            .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(white: 0.1))
-                    .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-            )
-            .fixedSize()
-            .position(adjustedPosition)
+            // Menu content - uses shared ContextMenuContent from UI/Components
+            ContextMenuContent(viewModel: viewModel, showMenu: $isPresented)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color(white: 0.1))
+                        .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .fixedSize()
+                .position(adjustedPosition)
         }
         .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
         .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
@@ -2479,306 +2613,241 @@ struct FloatingContextMenu: View {
     private var anchorPoint: UnitPoint {
         shouldShowAbove ? .bottomLeading : .topLeading
     }
+}
 
-    // MARK: - Actions
+// MARK: - Context Menu Dismiss Overlay
 
-    private func copyMomentLink() {
-        guard let timestamp = viewModel.currentTimestamp else { return }
+/// Overlay that dismisses the context menu on left-click, lets right-clicks pass through
+struct ContextMenuDismissOverlay: NSViewRepresentable {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
 
-        if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(url.absoluteString, forType: .string)
-        }
+    func makeNSView(context: Context) -> ContextMenuDismissNSView {
+        let view = ContextMenuDismissNSView()
+        view.viewModel = viewModel
+        return view
     }
 
-    private func saveImage() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-
-            let savePanel = NSSavePanel()
-            savePanel.allowedContentTypes = [.png]
-            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
-            savePanel.level = .screenSaver + 1
-
-            savePanel.begin { response in
-                if response == .OK, let url = savePanel.url {
-                    if let tiffData = image.tiffRepresentation,
-                       let bitmap = NSBitmapImageRep(data: tiffData),
-                       let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        try? pngData.write(to: url)
-                    }
-                }
-            }
-        }
-    }
-
-    private func copyImageToClipboard() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
-    }
-
-    private func openDashboard() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openDashboard, object: nil)
-        }
-    }
-
-    private func openSettings() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openSettings, object: nil)
-        }
-    }
-
-    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
-        if let image = viewModel.currentImage {
-            completion(image)
-            return
-        }
-
-        guard let videoInfo = viewModel.currentVideoInfo else {
-            completion(nil)
-            return
-        }
-
-        var actualVideoPath = videoInfo.videoPath
-        if !FileManager.default.fileExists(atPath: actualVideoPath) {
-            let pathWithExtension = actualVideoPath + ".mp4"
-            if FileManager.default.fileExists(atPath: pathWithExtension) {
-                actualVideoPath = pathWithExtension
-            } else {
-                completion(nil)
-                return
-            }
-        }
-
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
-        }
-
-        let asset = AVURLAsset(url: url)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceBefore = .zero
-        imageGenerator.requestedTimeToleranceAfter = .zero
-
-        let time = videoInfo.frameTimeCMTime
-
-        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
-            DispatchQueue.main.async {
-                if let cgImage = cgImage {
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    completion(nsImage)
-                } else {
-                    completion(nil)
-                }
-            }
-        }
-    }
-
-    private func formattedTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    func updateNSView(_ nsView: ContextMenuDismissNSView, context: Context) {
+        nsView.viewModel = viewModel
     }
 }
 
-// MARK: - Frame Context Menu Content (Legacy - kept for MoreOptionsMenu)
+/// NSView that handles left-clicks to dismiss, passes right-clicks through
+class ContextMenuDismissNSView: NSView {
+    weak var viewModel: SimpleTimelineViewModel?
 
-/// Context menu popover content for right-click on frame
-struct FrameContextMenuContent: View {
+    override func mouseDown(with event: NSEvent) {
+        // Left-click dismisses the menu
+        guard let viewModel = viewModel else { return }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.15)) {
+                viewModel.dismissTimelineContextMenu()
+            }
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Only capture left-clicks, let right-clicks pass through to frame handlers
+        guard let event = NSApp.currentEvent else {
+            return self
+        }
+
+        if event.type == .rightMouseDown {
+            // Dismiss the menu, then return nil to let the click pass through
+            DispatchQueue.main.async { [weak self] in
+                self?.viewModel?.dismissTimelineContextMenu()
+            }
+            return nil
+        }
+
+        // Capture all other clicks (left-click to dismiss)
+        return self
+    }
+}
+
+// MARK: - Timeline Segment Context Menu
+
+/// Context menu for right-clicking on timeline segments (Add Tag, Hide, Delete)
+struct TimelineSegmentContextMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
-    @Binding var showMenu: Bool
+    @Binding var isPresented: Bool
+    let location: CGPoint
+    let containerSize: CGSize
+
+    // Menu dimensions
+    private let menuWidth: CGFloat = 180
+    private let menuHeight: CGFloat = 140
+    private let submenuWidth: CGFloat = 160
+    private let edgePadding: CGFloat = 16
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ContextMenuRow(title: "Copy Moment Link", icon: "link") {
-                showMenu = false
-                copyMomentLink()
-            }
+        ZStack {
+            // Dismiss overlay - handles left-click to dismiss, passes right-click through
+            ContextMenuDismissOverlay(viewModel: viewModel)
 
-            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
-                showMenu = false
-                copyImageToClipboard()
-            }
-
-            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
-                showMenu = false
-                saveImage()
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.vertical, 4)
-
-            ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2") {
-                showMenu = false
-                openDashboard()
-            }
-
-            ContextMenuRow(title: "Settings", icon: "gear") {
-                showMenu = false
-                openSettings()
-            }
-        }
-        .padding(8)
-        .background(Color.black.opacity(0.9))
-    }
-
-    // MARK: - Actions
-
-    private func copyMomentLink() {
-        guard let timestamp = viewModel.currentTimestamp else { return }
-
-        if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(url.absoluteString, forType: .string)
-        }
-    }
-
-    private func saveImage() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-
-            let savePanel = NSSavePanel()
-            savePanel.allowedContentTypes = [.png]
-            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
-            savePanel.level = .screenSaver + 1
-
-            savePanel.begin { response in
-                if response == .OK, let url = savePanel.url {
-                    if let tiffData = image.tiffRepresentation,
-                       let bitmap = NSBitmapImageRep(data: tiffData),
-                       let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        try? pngData.write(to: url)
+            // Main menu content
+            VStack(alignment: .leading, spacing: 0) {
+                // Add Tag button (with submenu that opens on hover)
+                TimelineMenuButton(
+                    icon: "tag",
+                    title: "Add Tag",
+                    showChevron: true,
+                    onHoverChanged: { isHovering in
+                        viewModel.isHoveringAddTagButton = isHovering
+                        if isHovering && !viewModel.showTagSubmenu {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = true
+                            }
+                        }
+                    }
+                ) {
+                    // Toggle on click as well
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showTagSubmenu.toggle()
                     }
                 }
-            }
-        }
-    }
 
-    private func copyImageToClipboard() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
-    }
+                // Filter button
+                TimelineMenuButton(
+                    icon: "line.3.horizontal.decrease",
+                    title: "Filter",
+                    onHoverChanged: { isHovering in
+                        // Close tag submenu when hovering over other items
+                        if isHovering && viewModel.showTagSubmenu {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = false
+                                viewModel.showNewTagInput = false
+                                viewModel.newTagName = ""
+                            }
+                        }
+                    }
+                ) {
+                    viewModel.dismissTimelineContextMenu()
+                    viewModel.openFilterPanel()
+                }
 
-    private func openDashboard() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openDashboard, object: nil)
-        }
-    }
+                // Hide button
+                TimelineMenuButton(
+                    icon: "eye.slash",
+                    title: "Hide",
+                    onHoverChanged: { isHovering in
+                        // Close tag submenu when hovering over other items
+                        if isHovering && viewModel.showTagSubmenu {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = false
+                                viewModel.showNewTagInput = false
+                                viewModel.newTagName = ""
+                            }
+                        }
+                    }
+                ) {
+                    viewModel.hideSelectedTimelineSegment()
+                }
 
-    private func openSettings() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openSettings, object: nil)
-        }
-    }
+                Divider()
+                    .background(Color.white.opacity(0.1))
+                    .padding(.vertical, 4)
 
-    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
-        if let image = viewModel.currentImage {
-            completion(image)
-            return
-        }
-
-        guard let videoInfo = viewModel.currentVideoInfo else {
-            completion(nil)
-            return
-        }
-
-        // Check if file exists (try both with and without .mp4 extension)
-        var actualVideoPath = videoInfo.videoPath
-        if !FileManager.default.fileExists(atPath: actualVideoPath) {
-            let pathWithExtension = actualVideoPath + ".mp4"
-            if FileManager.default.fileExists(atPath: pathWithExtension) {
-                actualVideoPath = pathWithExtension
-            } else {
-                completion(nil)
-                return
-            }
-        }
-
-        // Determine the URL to use
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
+                // Delete button
+                TimelineMenuButton(
+                    icon: "trash",
+                    title: "Delete",
+                    isDestructive: true,
+                    onHoverChanged: { isHovering in
+                        // Close tag submenu when hovering over other items
+                        if isHovering && viewModel.showTagSubmenu {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = false
+                                viewModel.showNewTagInput = false
+                                viewModel.newTagName = ""
+                            }
+                        }
+                    }
+                ) {
+                    viewModel.requestDeleteFromTimelineMenu()
                 }
             }
-            url = URL(fileURLWithPath: symlinkPath)
-        }
+            .padding(.vertical, 8)
+            .frame(width: menuWidth)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color(white: 0.1))
+                    .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+            )
+            .position(adjustedPosition)
 
-        let asset = AVURLAsset(url: url)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceBefore = .zero
-        imageGenerator.requestedTimeToleranceAfter = .zero
-
-        let time = videoInfo.frameTimeCMTime
-
-        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
-            DispatchQueue.main.async {
-                if let cgImage = cgImage {
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    completion(nsImage)
-                } else {
-                    completion(nil)
-                }
+            // Tag submenu (appears when "Add Tag" is hovered/clicked)
+            if viewModel.showTagSubmenu {
+                TagSubmenu(viewModel: viewModel)
+                    .position(submenuPosition)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .leading)))
             }
         }
+        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
+        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: viewModel.showTagSubmenu)
     }
 
-    private func formattedTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    /// Whether menu should appear above the click
+    private var shouldShowAbove: Bool {
+        location.y + menuHeight > containerSize.height - edgePadding
+    }
+
+    /// Calculate main menu position
+    private var adjustedPosition: CGPoint {
+        var x = location.x + menuWidth / 2
+        var y = shouldShowAbove ? (location.y - menuHeight / 2) : (location.y + menuHeight / 2)
+
+        // Clamp X
+        if x + menuWidth / 2 > containerSize.width - edgePadding {
+            x = containerSize.width - menuWidth / 2 - edgePadding
+        }
+        if x - menuWidth / 2 < edgePadding {
+            x = menuWidth / 2 + edgePadding
+        }
+
+        // Clamp Y
+        if y - menuHeight / 2 < edgePadding {
+            y = menuHeight / 2 + edgePadding
+        }
+        if y + menuHeight / 2 > containerSize.height - edgePadding {
+            y = containerSize.height - menuHeight / 2 - edgePadding
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Calculate submenu position (to the right of main menu)
+    private var submenuPosition: CGPoint {
+        var x = adjustedPosition.x + menuWidth / 2 + submenuWidth / 2 + 4
+        let y = adjustedPosition.y - menuHeight / 2 + 40 // Align with "Add Tag" row
+
+        // If submenu would go off right edge, show on left side instead
+        if x + submenuWidth / 2 > containerSize.width - edgePadding {
+            x = adjustedPosition.x - menuWidth / 2 - submenuWidth / 2 - 4
+        }
+
+        return CGPoint(x: x, y: y)
+    }
+
+    private var anchorPoint: UnitPoint {
+        shouldShowAbove ? .bottomLeading : .topLeading
     }
 }
 
-// MARK: - Context Menu Row
+// MARK: - Timeline Menu Button
 
-/// Styled menu row for the context menu popover
-private struct ContextMenuRow: View {
-    let title: String
+/// A button in the timeline context menu
+struct TimelineMenuButton: View {
     let icon: String
-    var shortcut: String? = nil
+    let title: String
+    var showChevron: Bool = false
+    var isDestructive: Bool = false
+    var onHoverChanged: ((Bool) -> Void)? = nil
     let action: () -> Void
 
     @State private var isHovering = false
@@ -2787,32 +2856,774 @@ private struct ContextMenuRow: View {
         Button(action: action) {
             HStack(spacing: 10) {
                 Image(systemName: icon)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white.opacity(0.7))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isDestructive ? Color.red.opacity(0.9) : .white.opacity(0.7))
                     .frame(width: 18)
 
                 Text(title)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isDestructive ? Color.red.opacity(0.9) : .white)
 
                 Spacer()
 
-                if let shortcut = shortcut {
-                    Text(shortcut)
-                        .font(.retraceCaption2)
+                if showChevron {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white.opacity(0.4))
                 }
             }
-            .padding(.horizontal, 10)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
                     .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            isHovering = hovering
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+            onHoverChanged?(hovering)
+        }
+    }
+}
+
+// MARK: - Tag Submenu
+
+/// Submenu showing available tags with search/create functionality
+struct TagSubmenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHoveringSubmenu = false
+    @State private var closeTask: Task<Void, Never>?
+    @State private var searchText = ""
+    @FocusState private var isSearchFocused: Bool
+
+    // Filter out the "hidden" tag and apply search filter
+    private var visibleTags: [Tag] {
+        let nonHidden = viewModel.availableTags.filter { !$0.isHidden }
+        if searchText.isEmpty {
+            return nonHidden
+        }
+        return nonHidden.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    // Check if search text matches an existing tag exactly
+    private var exactTagMatch: Bool {
+        viewModel.availableTags.contains { $0.name.lowercased() == searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+    }
+
+    // Show "Create" option if there's search text that doesn't match an existing tag
+    private var showCreateOption: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !exactTagMatch
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Search/Create input field - always visible
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.5))
+
+                TextField("Search or create...", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundColor(.white)
+                    .focused($isSearchFocused)
+                    .onSubmit {
+                        if showCreateOption {
+                            createTagFromSearch()
+                        } else if visibleTags.count == 1 {
+                            // If only one result, toggle it
+                            viewModel.toggleTagOnSelectedSegment(tag: visibleTags[0])
+                        }
+                    }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .padding(.horizontal, 8)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.horizontal, 8)
+
+            // Tag list
+            if visibleTags.isEmpty && !showCreateOption {
+                Text("No tags found")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.5))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        // Existing tags that match search
+                        ForEach(visibleTags) { tag in
+                            TagSubmenuRow(
+                                tag: tag,
+                                isSelected: viewModel.selectedSegmentTags.contains(tag.id)
+                            ) {
+                                viewModel.toggleTagOnSelectedSegment(tag: tag)
+                            }
+                        }
+
+                        // "Create [searchtext]" option if search text doesn't match existing tag
+                        if showCreateOption {
+                            Button(action: createTagFromSearch) {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.retraceAccent)
+
+                                    Text("Create \"\(searchText.trimmingCharacters(in: .whitespacesAndNewlines))\"")
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(.retraceAccent)
+
+                                    Spacer()
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() }
+                                else { NSCursor.pop() }
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 200) // Limit height for scrolling
+            }
+
+            // Always-visible "Create new..." button at the bottom
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.horizontal, 8)
+                .padding(.top, 4)
+
+            Button(action: {
+                // Focus the search field for creating a new tag
+                isSearchFocused = true
+            }) {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.7))
+
+                    Text("Create new...")
+                        .font(.system(size: 13))
+                        .foregroundColor(.white.opacity(0.7))
+
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
+        }
+        .padding(.vertical, 8)
+        .frame(width: 180)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(white: 0.1))
+                .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
+        .onAppear {
+            // Delay focus slightly to ensure the view is in the responder chain
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isSearchFocused = true
+            }
+        }
+        .onHover { hovering in
+            isHoveringSubmenu = hovering
+            if !hovering {
+                // Small delay before closing to allow mouse to move back to main menu or Add Tag button
+                closeTask?.cancel()
+                closeTask = Task {
+                    try? await Task.sleep(nanoseconds: 150_000_000) // 150ms delay
+                    if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
+                        await MainActor.run {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showTagSubmenu = false
+                                searchText = ""
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Cancel any pending close
+                closeTask?.cancel()
+            }
+        }
+    }
+
+    private func createTagFromSearch() {
+        let tagName = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tagName.isEmpty else { return }
+
+        viewModel.newTagName = tagName
+        viewModel.createAndAddTag()
+        searchText = ""
+    }
+}
+
+// MARK: - Tag Submenu Row
+
+/// A single tag row in the submenu
+struct TagSubmenuRow: View {
+    let tag: Tag
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                // TODO: Add color picker/editing for tags later
+                // Circle()
+                //     .fill(Color.segmentColor(for: tag.name))
+                //     .frame(width: 8, height: 8)
+
+                Text(tag.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.retraceAccent)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+    }
+}
+
+// MARK: - Filter Panel
+
+/// Floating vertical card panel for timeline filtering
+struct FilterPanel: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @GestureState private var dragOffset: CGSize = .zero
+    @State private var panelPosition: CGSize = .zero
+    @State private var escapeMonitor: Any?
+
+    /// Label for apps filter chip (uses pending criteria)
+    private var appsLabel: String {
+        guard let selected = viewModel.pendingFilterCriteria.selectedApps, !selected.isEmpty else {
+            return "All Apps"
+        }
+        if selected.count == 1, let bundleID = selected.first,
+           let app = viewModel.availableAppsForFilter.first(where: { $0.bundleID == bundleID }) {
+            return app.name
+        }
+        return "\(selected.count) Apps"
+    }
+
+    /// Label for tags filter chip (uses pending criteria)
+    private var tagsLabel: String {
+        guard let selected = viewModel.pendingFilterCriteria.selectedTags, !selected.isEmpty else {
+            return "All Tags"
+        }
+        if selected.count == 1, let tagId = selected.first,
+           let tag = viewModel.availableTags.first(where: { $0.id.value == tagId }) {
+            return tag.name
+        }
+        return "\(selected.count) Tags"
+    }
+
+    /// Label for hidden filter dropdown
+    private var hiddenFilterLabel: String {
+        switch viewModel.pendingFilterCriteria.hiddenFilter {
+        case .hide:
+            return "Visible Only"
+        case .onlyHidden:
+            return "Hidden Only"
+        case .showAll:
+            return "All Segments"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Text("Filter Timeline")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                // Clear button (only when pending filters are active)
+                if viewModel.pendingFilterCriteria.hasActiveFilters {
+                    Button(action: { viewModel.clearPendingFilters() }) {
+                        Text("Clear")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Button(action: { viewModel.dismissFilterPanel() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.1))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 16)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($dragOffset) { value, state, _ in
+                        state = value.translation
+                    }
+                    .onEnded { value in
+                        panelPosition.width += value.translation.width
+                        panelPosition.height += value.translation.height
+                    }
+            )
+            .onHover { hovering in
+                if hovering { NSCursor.openHand.push() }
+                else { NSCursor.pop() }
+            }
+
+            // Source section
+            VStack(alignment: .leading, spacing: 12) {
+                Text("SOURCE")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.4))
+                    .tracking(0.5)
+
+                HStack(spacing: 10) {
+                    // When selectedSources is nil, show both as selected (all sources)
+                    // When it's set, only show selected ones
+                    let sources = viewModel.pendingFilterCriteria.selectedSources
+                    let retraceSelected = sources == nil || sources!.contains(.native)
+                    let rewindSelected = sources == nil || sources!.contains(.rewind)
+
+                    FilterToggleChip(
+                        label: "Retrace",
+                        icon: "desktopcomputer",
+                        isSelected: retraceSelected
+                    ) {
+                        viewModel.toggleSourceFilter(.native)
+                    }
+
+                    FilterToggleChip(
+                        label: "Rewind",
+                        icon: "arrow.counterclockwise",
+                        isSelected: rewindSelected
+                    ) {
+                        viewModel.toggleSourceFilter(.rewind)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 20)
+
+            // Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Apps section
+            VStack(alignment: .leading, spacing: 12) {
+                Text("APPS")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.4))
+                    .tracking(0.5)
+
+                GeometryReader { geo in
+                    let localFrame = geo.frame(in: .named("timelineContent"))
+                    FilterDropdownButton(
+                        label: appsLabel,
+                        icon: "square.grid.2x2",
+                        isActive: viewModel.pendingFilterCriteria.selectedApps != nil && !viewModel.pendingFilterCriteria.selectedApps!.isEmpty
+                    ) {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .apps {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.apps, anchorFrame: localFrame)
+                            }
+                        }
+                    }
+                }
+                .frame(height: 40)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 20)
+
+            // Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Tags section
+            VStack(alignment: .leading, spacing: 12) {
+                Text("TAGS")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.4))
+                    .tracking(0.5)
+
+                GeometryReader { geo in
+                    let localFrame = geo.frame(in: .named("timelineContent"))
+                    FilterDropdownButton(
+                        label: tagsLabel,
+                        icon: "tag",
+                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty
+                    ) {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .tags {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.tags, anchorFrame: localFrame)
+                            }
+                        }
+                    }
+                }
+                .frame(height: 40)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 20)
+
+            // Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Hidden segments section with dropdown
+            VStack(alignment: .leading, spacing: 12) {
+                Text("VISIBILITY")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.4))
+                    .tracking(0.5)
+
+                GeometryReader { geo in
+                    let localFrame = geo.frame(in: .named("timelineContent"))
+                    FilterDropdownButton(
+                        label: hiddenFilterLabel,
+                        icon: "eye",
+                        isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide
+                    ) {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .visibility {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.visibility, anchorFrame: localFrame)
+                            }
+                        }
+                    }
+                }
+                .frame(height: 40)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 20)
+
+            // Divider before apply button
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+
+            // Apply button
+            Button(action: { viewModel.applyFilters() }) {
+                Text("Apply Filters")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.blue)
+                    )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            .padding(.bottom, 20)
+        }
+        .frame(width: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(white: 0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+        .shadow(color: .black.opacity(0.4), radius: 30, y: 15)
+        .offset(
+            x: panelPosition.width + dragOffset.width,
+            y: panelPosition.height + dragOffset.height
+        )
+        .onAppear {
+            // Set up escape key monitor
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                if event.keyCode == 53 { // Escape key
+                    // Close any open dropdown first
+                    if viewModel.activeFilterDropdown != .none {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.dismissFilterDropdown()
+                        }
+                        return nil // Consume the event
+                    }
+                    // No dropdowns open - close the filter panel and consume event
+                    viewModel.dismissFilterPanel()
+                    return nil
+                }
+                return event
+            }
+        }
+        .onDisappear {
+            // Clean up escape key monitor
+            if let monitor = escapeMonitor {
+                NSEvent.removeMonitor(monitor)
+                escapeMonitor = nil
+            }
+        }
+    }
+}
+
+// MARK: - Filter Dropdown Overlay
+
+/// Renders filter dropdowns at the top level of SimpleTimelineView to avoid clipping issues
+/// The dropdowns are positioned absolutely based on the anchor frame from the ViewModel
+/// Using the "timelineContent" coordinate space for proper alignment
+struct FilterDropdownOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    var body: some View {
+        Group {
+            if viewModel.activeFilterDropdown != .none {
+                let anchor = viewModel.filterDropdownAnchorFrame
+                let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor)")
+
+                // Use VStack with Spacer to position dropdown at the correct Y
+                // Then use HStack with Spacer to position at the correct X
+                VStack(spacing: 0) {
+                    // Top spacer to push content down to anchor.maxY + gap
+                    Spacer()
+                        .frame(height: anchor.maxY + 8)
+
+                    HStack(spacing: 0) {
+                        // Left spacer to push content to anchor.minX
+                        Spacer()
+                            .frame(width: anchor.minX)
+
+                        // The actual dropdown content
+                        // Scroll events are handled at TimelineWindowController level
+                        dropdownContent
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color(white: 0.12))
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                            )
+                            .fixedSize()
+
+                        Spacer()
+                    }
+
+                    Spacer()
+                }
+                .transition(.opacity)
+                .zIndex(2000)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: viewModel.activeFilterDropdown)
+    }
+
+    @ViewBuilder
+    private var dropdownContent: some View {
+        switch viewModel.activeFilterDropdown {
+        case .apps:
+            AppsFilterPopover(
+                apps: viewModel.availableAppsForFilter,
+                selectedApps: viewModel.pendingFilterCriteria.selectedApps,
+                allowMultiSelect: true,
+                onSelectApp: { bundleID in
+                    if let bundleID = bundleID {
+                        viewModel.toggleAppFilter(bundleID)
+                    } else {
+                        viewModel.pendingFilterCriteria.selectedApps = nil
+                    }
+                }
+            )
+        case .tags:
+            TagsFilterPopover(
+                tags: viewModel.availableTags,
+                selectedTags: viewModel.pendingFilterCriteria.selectedTags,
+                allowMultiSelect: true,
+                onSelectTag: { tagId in
+                    if let tagId = tagId {
+                        viewModel.toggleTagFilter(tagId)
+                    } else {
+                        viewModel.pendingFilterCriteria.selectedTags = nil
+                    }
+                }
+            )
+        case .visibility:
+            VisibilityFilterPopover(
+                currentFilter: viewModel.pendingFilterCriteria.hiddenFilter,
+                onSelect: { filter in
+                    viewModel.setHiddenFilter(filter)
+                },
+                onDismiss: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                }
+            )
+        case .none:
+            EmptyView()
+        }
+    }
+}
+
+// MARK: - Filter Toggle Chip
+
+/// Toggle chip for source filters (Retrace/Rewind)
+struct FilterToggleChip: View {
+    let label: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 12))
+
+                Text(label)
+                    .font(.system(size: 13, weight: .medium))
+            }
+            .foregroundColor(isSelected ? .white : .white.opacity(0.6))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isSelected ? Color.blue : Color.white.opacity(isHovered ? 0.12 : 0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isSelected ? Color.blue.opacity(0.5) : Color.white.opacity(0.1), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.15)) {
+                isHovered = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+    }
+}
+
+// MARK: - Filter Dropdown Button
+
+/// Dropdown button for Apps/Tags selection
+struct FilterDropdownButton: View {
+    let label: String
+    let icon: String
+    let isActive: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    Image(systemName: icon)
+                        .font(.system(size: 13))
+                        .foregroundColor(isActive ? .white : .white.opacity(0.5))
+
+                    Text(label)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(isActive ? .white : .white.opacity(0.7))
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.3))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isActive ? Color.blue.opacity(0.15) : Color.white.opacity(isHovered ? 0.1 : 0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isActive ? Color.blue.opacity(0.3) : Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.15)) {
+                isHovered = hovering
+            }
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }

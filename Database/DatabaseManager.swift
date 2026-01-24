@@ -645,6 +645,254 @@ public actor DatabaseManager: DatabaseProtocol {
         try AppSegmentQueries.delete(db: db, id: id)
     }
 
+    // MARK: - Tag Operations
+
+    /// Get all tags
+    public func getAllTags() async throws -> [Tag] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT id, name FROM tag ORDER BY name ASC;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var tags: [Tag] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            guard let namePtr = sqlite3_column_text(statement, 1) else { continue }
+            let name = String(cString: namePtr)
+            tags.append(Tag(id: TagID(value: id), name: name))
+        }
+
+        return tags
+    }
+
+    /// Create a new tag
+    public func createTag(name: String) async throws -> Tag {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "INSERT INTO tag (name) VALUES (?);"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, name, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let id = sqlite3_last_insert_rowid(db)
+        return Tag(id: TagID(value: id), name: name)
+    }
+
+    /// Get a tag by name
+    public func getTag(name: String) async throws -> Tag? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT id, name FROM tag WHERE name = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, name, -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        let id = sqlite3_column_int64(statement, 0)
+        guard let namePtr = sqlite3_column_text(statement, 1) else { return nil }
+        let tagName = String(cString: namePtr)
+        return Tag(id: TagID(value: id), name: tagName)
+    }
+
+    /// Add a tag to a segment
+    public func addTagToSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "INSERT OR IGNORE INTO segment_tag (segmentId, tagId) VALUES (?, ?);"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, segmentId.value)
+        sqlite3_bind_int64(statement, 2, tagId.value)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let changes = sqlite3_changes(db)
+        Log.debug("[DB] addTagToSegment: segmentId=\(segmentId.value), tagId=\(tagId.value), rows affected=\(changes)", category: .database)
+    }
+
+    /// Remove a tag from a segment
+    public func removeTagFromSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "DELETE FROM segment_tag WHERE segmentId = ? AND tagId = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, segmentId.value)
+        sqlite3_bind_int64(statement, 2, tagId.value)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Get all tags for a segment
+    public func getTagsForSegment(segmentId: SegmentID) async throws -> [Tag] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT t.id, t.name
+            FROM tag t
+            JOIN segment_tag st ON t.id = st.tagId
+            WHERE st.segmentId = ?
+            ORDER BY t.name ASC;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, segmentId.value)
+
+        var tags: [Tag] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            guard let namePtr = sqlite3_column_text(statement, 1) else { continue }
+            let name = String(cString: namePtr)
+            tags.append(Tag(id: TagID(value: id), name: name))
+        }
+
+        return tags
+    }
+
+    /// Get all segment IDs that have the "hidden" tag
+    public func getHiddenSegmentIds() async throws -> Set<SegmentID> {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT st.segmentId
+            FROM segment_tag st
+            JOIN tag t ON st.tagId = t.id
+            WHERE t.name = 'hidden';
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var segmentIds: Set<SegmentID> = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            segmentIds.insert(SegmentID(value: id))
+        }
+
+        return segmentIds
+    }
+
+    /// Get a map of segment IDs to their tag IDs for efficient filtering
+    public func getSegmentTagsMap() async throws -> [Int64: Set<Int64>] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT segmentId, tagId FROM segment_tag;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var map: [Int64: Set<Int64>] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let segmentId = sqlite3_column_int64(statement, 0)
+            let tagId = sqlite3_column_int64(statement, 1)
+
+            if map[segmentId] == nil {
+                map[segmentId] = []
+            }
+            map[segmentId]!.insert(tagId)
+        }
+
+        return map
+    }
+
     // MARK: - OCR Node Operations (Rewind-compatible)
 
     public func insertNodes(

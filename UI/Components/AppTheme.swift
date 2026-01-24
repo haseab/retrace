@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Shared
 
 /// Retrace design system
 /// Provides consistent colors, typography, and spacing across the UI
@@ -124,6 +125,77 @@ public class AppNameResolver {
         return cleaned.isEmpty ? "Unknown App" : cleaned
     }
 
+    // MARK: - Installed Apps
+
+    /// Check if an app is currently installed (can be found by NSWorkspace)
+    public func isInstalled(bundleID: String) -> Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
+    }
+
+    /// Get all currently installed apps from /Applications (instant, no DB query needed)
+    /// Returns array of AppInfo with bundleID and name
+    /// Also pre-warms the icon cache for instant popover display
+    public func getInstalledApps() -> [AppInfo] {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        var apps: [AppInfo] = []
+        let fm = FileManager.default
+
+        let appFolders = [
+            URL(fileURLWithPath: "/Applications"),
+            URL(fileURLWithPath: "/System/Applications"),
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+        ]
+
+        for folder in appFolders {
+            guard let contents = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+                continue
+            }
+
+            for appURL in contents where appURL.pathExtension == "app" {
+                let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
+                guard let plist = NSDictionary(contentsOf: plistURL),
+                      let bundleID = plist["CFBundleIdentifier"] as? String,
+                      !bundleID.isEmpty else {
+                    continue
+                }
+
+                // Get display name
+                let name: String
+                if let displayName = plist["CFBundleDisplayName"] as? String, !displayName.isEmpty {
+                    name = displayName
+                } else if let bundleName = plist["CFBundleName"] as? String, !bundleName.isEmpty {
+                    name = bundleName
+                } else {
+                    name = appURL.deletingPathExtension().lastPathComponent
+                }
+
+                apps.append(AppInfo(bundleID: bundleID, name: name))
+
+                // Also cache the name for later lookups
+                lock.lock()
+                cache[bundleID] = name
+                lock.unlock()
+
+                // Pre-warm icon cache using the app URL we already have
+                AppIconProvider.shared.preloadIcon(for: bundleID, appURL: appURL)
+            }
+        }
+
+        let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+        print("[AppNameResolver] getInstalledApps: found \(apps.count) apps in \(elapsed)ms, icon cache size: \(AppIconProvider.shared.cacheCount)")
+
+        return apps
+    }
+
+    /// Resolve multiple bundle IDs to AppInfo objects
+    /// - Parameter bundleIDs: Array of bundle identifiers
+    /// - Returns: Array of AppInfo with resolved names
+    public func resolveAll(bundleIDs: [String]) -> [AppInfo] {
+        return bundleIDs.map { bundleID in
+            AppInfo(bundleID: bundleID, name: displayName(for: bundleID))
+        }
+    }
+
     // MARK: - Disk Persistence
 
     private func loadFromDisk() {
@@ -187,14 +259,39 @@ public class AppIconProvider {
             return cached
         }
 
+        // Cache miss - need to resolve (this is slow!)
+        let startTime = CFAbsoluteTimeGetCurrent()
+
         // Try to get the icon from the system
         if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             let icon = NSWorkspace.shared.icon(forFile: appURL.path)
             cache[bundleID] = icon
+            print("[AppIconProvider] CACHE MISS for \(bundleID) - resolved in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
             return icon
         }
 
+        print("[AppIconProvider] CACHE MISS for \(bundleID) - not found, took \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
         return nil
+    }
+
+    /// Pre-load an icon into cache when we already have the app URL
+    /// This avoids the NSWorkspace lookup when iterating through /Applications
+    public func preloadIcon(for bundleID: String, appURL: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Skip if already cached
+        guard cache[bundleID] == nil else { return }
+
+        let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+        cache[bundleID] = icon
+    }
+
+    /// Debug: Get current cache size
+    public var cacheCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache.count
     }
 }
 
@@ -869,12 +966,34 @@ public struct TimelineScaleFactor {
     /// Maximum scale factor to prevent UI from becoming too large
     private static let maxScale: CGFloat = 1.6
 
+    /// Thread-safe cached scale factor to prevent size changes during window lifecycle
+    private static var _cachedScaleFactor: CGFloat?
+    private static let lock = NSLock()
+
     /// Calculate scale factor based on current screen height
+    /// Returns cached value to prevent UI size changes during window lifecycle
     public static var current: CGFloat {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cached = _cachedScaleFactor {
+            return cached
+        }
+
+        // Calculate and cache the scale factor
         guard let screen = NSScreen.main else { return 1.0 }
         let screenHeight = screen.frame.height
         let rawScale = screenHeight / referenceHeight
-        return min(maxScale, max(minScale, rawScale))
+        let scale = min(maxScale, max(minScale, rawScale))
+        _cachedScaleFactor = scale
+        return scale
+    }
+
+    /// Reset the cached scale factor (call when timeline window closes)
+    public static func resetCache() {
+        lock.lock()
+        defer { lock.unlock() }
+        _cachedScaleFactor = nil
     }
 
     /// Calculate scale factor for a specific screen
@@ -908,13 +1027,13 @@ public struct TimelineScaleFactor {
     public static var controlsYOffset: CGFloat { -55 * current }
 
     /// Y offset for floating search panel
-    public static var searchPanelYOffset: CGFloat { -175 * current }
+    public static var searchPanelYOffset: CGFloat { -195 * current }
 
     /// Y offset for calendar picker
     public static var calendarPickerYOffset: CGFloat { -280 * current }
 
     /// X position for left controls
-    public static var leftControlsX: CGFloat { 120 * current }
+    public static var leftControlsX: CGFloat { 145 * current }
 
     /// X offset from right edge for right controls
     public static var rightControlsXOffset: CGFloat { 100 * current }
@@ -936,21 +1055,21 @@ public struct TimelineScaleFactor {
     // MARK: - Button/Control Sizes (scaled)
 
     /// Control button size
-    public static var controlButtonSize: CGFloat { 32 * current }
+    public static var controlButtonSize: CGFloat { 38 * current }
 
     /// Close button size (top-right X button)
     public static var closeButtonSize: CGFloat { 38 * current }
 
     /// Zoom slider width
-    public static var zoomSliderWidth: CGFloat { 100 * current }
+    public static var zoomSliderWidth: CGFloat { 110 * current }
 
     /// Search button width
-    public static var searchButtonWidth: CGFloat { 160 * current }
+    public static var searchButtonWidth: CGFloat { 190 * current }
 
     // MARK: - Panel Dimensions (scaled)
 
     /// Floating date search panel width
-    public static var searchPanelWidth: CGFloat { 380 * current }
+    public static var searchPanelWidth: CGFloat { 420 * current }
 
     /// Calendar picker width
     public static var calendarPickerWidth: CGFloat { 280 * current }
@@ -960,20 +1079,20 @@ public struct TimelineScaleFactor {
 
     // MARK: - Font Sizes (scaled)
 
-    /// Callout font size (14pt base)
-    public static var fontCallout: CGFloat { 14 * current }
+    /// Callout font size (16pt base)
+    public static var fontCallout: CGFloat { 16 * current }
 
-    /// Caption font size (13pt base)
-    public static var fontCaption: CGFloat { 13 * current }
+    /// Caption font size (14pt base)
+    public static var fontCaption: CGFloat { 14 * current }
 
-    /// Caption2 font size (11pt base)
-    public static var fontCaption2: CGFloat { 11 * current }
+    /// Caption2 font size (12pt base)
+    public static var fontCaption2: CGFloat { 12 * current }
 
-    /// Tiny font size (10pt base)
-    public static var fontTiny: CGFloat { 10 * current }
+    /// Tiny font size (11pt base)
+    public static var fontTiny: CGFloat { 11 * current }
 
-    /// Mono font size (13pt base)
-    public static var fontMono: CGFloat { 13 * current }
+    /// Mono font size (15pt base)
+    public static var fontMono: CGFloat { 15 * current }
 
     // MARK: - Padding/Spacing (scaled)
 
@@ -984,13 +1103,13 @@ public struct TimelineScaleFactor {
     public static var buttonPaddingV: CGFloat { 8 * current }
 
     /// Larger horizontal padding
-    public static var paddingH: CGFloat { 16 * current }
+    public static var paddingH: CGFloat { 18 * current }
 
     /// Larger vertical padding
-    public static var paddingV: CGFloat { 10 * current }
+    public static var paddingV: CGFloat { 12 * current }
 
     /// Control spacing
-    public static var controlSpacing: CGFloat { 12 * current }
+    public static var controlSpacing: CGFloat { 14 * current }
 
     /// Icon spacing within buttons
     public static var iconSpacing: CGFloat { 8 * current }

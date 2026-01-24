@@ -6,7 +6,7 @@ public struct SearchBar: View {
     // MARK: - Properties
 
     @Binding var searchQuery: String
-    @Binding var selectedApp: String?
+    @Binding var selectedApps: Set<String>?
     @Binding var startDate: Date?
     @Binding var endDate: Date?
     @Binding var contentType: ContentType
@@ -82,26 +82,26 @@ public struct SearchBar: View {
 
             // App filter
             VStack(alignment: .leading, spacing: .spacingS) {
-                Text("App")
+                Text("Apps")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
 
                 HStack {
                     Menu {
                         Button("All Apps") {
-                            selectedApp = nil
+                            selectedApps = nil
                         }
 
                         Divider()
 
                         // TODO: Load actual apps from database
-                        Button("Chrome") { selectedApp = "com.google.Chrome" }
-                        Button("Xcode") { selectedApp = "com.apple.dt.Xcode" }
-                        Button("Slack") { selectedApp = "com.tinyspeck.slackmacgap" }
-                        Button("VS Code") { selectedApp = "com.microsoft.VSCode" }
+                        Button("Chrome") { toggleApp("com.google.Chrome") }
+                        Button("Xcode") { toggleApp("com.apple.dt.Xcode") }
+                        Button("Slack") { toggleApp("com.tinyspeck.slackmacgap") }
+                        Button("VS Code") { toggleApp("com.microsoft.VSCode") }
                     } label: {
                         HStack {
-                            Text(selectedApp ?? "All Apps")
+                            Text(selectedAppsLabel)
                                 .font(.retraceBody)
                                 .foregroundColor(.retracePrimary)
                             Spacer()
@@ -115,8 +115,8 @@ public struct SearchBar: View {
                     }
                     .buttonStyle(.plain)
 
-                    if selectedApp != nil {
-                        Button(action: { selectedApp = nil }) {
+                    if selectedApps != nil && !selectedApps!.isEmpty {
+                        Button(action: { selectedApps = nil }) {
                             Image(systemName: "xmark.circle.fill")
                                 .foregroundColor(.retraceSecondary)
                         }
@@ -181,7 +181,7 @@ public struct SearchBar: View {
             // Clear all filters
             if hasActiveFilters {
                 Button("Clear All Filters") {
-                    selectedApp = nil
+                    selectedApps = nil
                     startDate = nil
                     endDate = nil
                     contentType = .all
@@ -199,7 +199,28 @@ public struct SearchBar: View {
     // MARK: - Helpers
 
     private var hasActiveFilters: Bool {
-        selectedApp != nil || startDate != nil || endDate != nil || contentType != .all
+        (selectedApps != nil && !selectedApps!.isEmpty) || startDate != nil || endDate != nil || contentType != .all
+    }
+
+    private var selectedAppsLabel: String {
+        guard let apps = selectedApps, !apps.isEmpty else { return "All Apps" }
+        if apps.count == 1 {
+            return apps.first!.components(separatedBy: ".").last ?? apps.first!
+        }
+        return "\(apps.count) Apps"
+    }
+
+    private func toggleApp(_ bundleID: String) {
+        if selectedApps == nil {
+            selectedApps = [bundleID]
+        } else if selectedApps!.contains(bundleID) {
+            selectedApps!.remove(bundleID)
+            if selectedApps!.isEmpty {
+                selectedApps = nil
+            }
+        } else {
+            selectedApps!.insert(bundleID)
+        }
     }
 }
 
@@ -211,7 +232,7 @@ struct SearchBar_Previews: PreviewProvider {
         VStack(spacing: .spacingL) {
             SearchBar(
                 searchQuery: .constant("error message"),
-                selectedApp: .constant(nil),
+                selectedApps: .constant(nil),
                 startDate: .constant(nil),
                 endDate: .constant(nil),
                 contentType: .constant(.all)
@@ -219,7 +240,7 @@ struct SearchBar_Previews: PreviewProvider {
 
             SearchBar(
                 searchQuery: .constant("password"),
-                selectedApp: .constant("com.google.Chrome"),
+                selectedApps: .constant(["com.google.Chrome"]),
                 startDate: .constant(Date().addingTimeInterval(-7 * 24 * 3600)),
                 endDate: .constant(Date()),
                 contentType: .constant(.ocr)

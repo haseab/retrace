@@ -554,11 +554,14 @@ public actor AppCoordinator {
         }
 
         // Clean up WAL session for the old unfinalised video (frames are already in the video file)
+        // The WAL directory is named with the segment tempID (from relativePath), not the database ID
+        // relativePath format: "chunks/YYYYMM/DD/{tempID}" - extract the tempID from the last component
+        let tempID = URL(fileURLWithPath: unfinalised.relativePath).lastPathComponent
         let walDir = storageDir.deletingLastPathComponent().appendingPathComponent("wal")
-            .appendingPathComponent("active_segment_\(unfinalised.id)")
+            .appendingPathComponent("active_segment_\(tempID)")
         if FileManager.default.fileExists(atPath: walDir.path) {
             try? FileManager.default.removeItem(at: walDir)
-            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id)", category: .app)
+            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id) (tempID: \(tempID))", category: .app)
         }
 
         // Mark old video as finalized and start fresh
@@ -664,13 +667,13 @@ public actor AppCoordinator {
 
     // MARK: - Search Interface
 
-    /// Get all distinct apps from the database for filter UI
-    /// Returns apps sorted by usage frequency (most used first)
-    public func getDistinctApps() async throws -> [AppInfo] {
+    /// Get all distinct app bundle IDs from the database for filter UI
+    /// Caller should use AppNameResolver.shared.resolveAll() to get display names
+    public func getDistinctAppBundleIDs() async throws -> [String] {
         guard let adapter = await services.dataAdapter else {
             return []
         }
-        return try await adapter.getDistinctApps()
+        return try await adapter.getDistinctAppBundleIDs()
     }
 
     /// Search for text across all captured frames
@@ -833,28 +836,6 @@ public actor AppCoordinator {
         return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
     }
 
-    /// Get frames around a timestamp (before and after, centered on the timestamp)
-    /// Useful for navigating to a specific point in time from search results
-    public func getFramesAround(timestamp: Date, count: Int = 200) async throws -> [FrameReference] {
-        let halfCount = count / 2
-
-        // Get frames before and after the timestamp
-        async let framesBefore = getFramesBefore(timestamp: timestamp, limit: halfCount)
-        async let framesAfter = getFramesAfter(timestamp: timestamp, limit: halfCount)
-
-        let before = try await framesBefore
-        let after = try await framesAfter
-
-        // Combine: older frames first (reversed to chronological), then newer frames
-        // before is already in descending order (newest first), so reverse it
-        var combined = before.reversed() + after
-
-        // Sort by timestamp to ensure proper order
-        combined.sort { $0.timestamp < $1.timestamp }
-
-        return Array(combined)
-    }
-
     /// Get the timestamp of the most recent frame across all sources
     /// Returns nil if no frames exist in any source
     public func getMostRecentFrameTimestamp() async throws -> Date? {
@@ -915,6 +896,63 @@ public actor AppCoordinator {
             limit: limit,
             offset: offset
         )
+    }
+
+    // MARK: - Tag Operations
+
+    /// Get all tags
+    public func getAllTags() async throws -> [Tag] {
+        try await services.database.getAllTags()
+    }
+
+    /// Create a new tag
+    public func createTag(name: String) async throws -> Tag {
+        try await services.database.createTag(name: name)
+    }
+
+    /// Get a tag by name
+    public func getTag(name: String) async throws -> Tag? {
+        try await services.database.getTag(name: name)
+    }
+
+    /// Add a tag to a segment
+    public func addTagToSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
+    }
+
+    /// Remove a tag from a segment
+    public func removeTagFromSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
+    }
+
+    /// Get all tags for a segment
+    public func getTagsForSegment(segmentId: SegmentID) async throws -> [Tag] {
+        try await services.database.getTagsForSegment(segmentId: segmentId)
+    }
+
+    /// Get all segment IDs that have the "hidden" tag
+    public func getHiddenSegmentIds() async throws -> Set<SegmentID> {
+        try await services.database.getHiddenSegmentIds()
+    }
+
+    /// Get a map of segment IDs to their tag IDs for efficient filtering
+    public func getSegmentTagsMap() async throws -> [Int64: Set<Int64>] {
+        try await services.database.getSegmentTagsMap()
+    }
+
+    /// Hide a segment by adding the "hidden" tag
+    public func hideSegment(segmentId: SegmentID) async throws {
+        // Get or create the hidden tag
+        let hiddenTag: Tag
+        if let existing = try await services.database.getTag(name: Tag.hiddenTagName) {
+            hiddenTag = existing
+        } else {
+            hiddenTag = try await services.database.createTag(name: Tag.hiddenTagName)
+        }
+
+        // Add the tag to the segment
+        try await services.database.addTagToSegment(segmentId: segmentId, tagId: hiddenTag.id)
+        Log.info("[AppCoordinator] Hidden segment \(segmentId.value)", category: .app)
     }
 
     // MARK: - Text Region Retrieval

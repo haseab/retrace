@@ -94,12 +94,12 @@ public final class AVAssetExtractor: ImageExtractor {
         // Check if file is empty (incomplete/damaged video)
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: fullVideoPath)[.size] as? Int64) ?? 0
         if fileSize == 0 {
-            // Delete empty file and throw
-            try? FileManager.default.removeItem(atPath: fullVideoPath)
+            // File is empty - likely still being written to. Do NOT delete.
+            Log.warning("[AVAssetExtractor] Video file is empty (0 bytes), still being written: \(fullVideoPath)", category: .storage)
             throw ImageExtractionError.extractionFailed(
                 path: fullVideoPath,
                 frameIndex: frameIndex,
-                error: NSError(domain: "AVAssetExtractor", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video file is empty (incomplete write)"])
+                error: NSError(domain: "AVAssetExtractor", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video file is empty (still being written)"])
             )
         }
 

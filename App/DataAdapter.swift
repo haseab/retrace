@@ -422,24 +422,32 @@ public actor DataAdapter {
     // MARK: - App Discovery
 
     /// Get all distinct apps from all data sources
-    public func getDistinctApps() async throws -> [AppInfo] {
+    /// Get distinct app bundle IDs from the database
+    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll)
+    public func getDistinctAppBundleIDs() async throws -> [String] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        let startTime = CFAbsoluteTimeGetCurrent()
         var bundleIDs: [String] = []
 
         // Try Rewind first (more historical data)
         if let rewind = rewindConnection {
+            let queryStart = CFAbsoluteTimeGetCurrent()
             bundleIDs = try queryDistinctApps(connection: rewind)
+            Log.debug("[DataAdapter] Rewind query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
         }
 
         // If empty, try Retrace
         if bundleIDs.isEmpty {
+            let queryStart = CFAbsoluteTimeGetCurrent()
             bundleIDs = try queryDistinctApps(connection: retraceConnection)
+            Log.debug("[DataAdapter] Retrace query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
         }
 
-        return await AppNameResolver.resolveAll(bundleIDs: bundleIDs)
+        Log.debug("[DataAdapter] getDistinctAppBundleIDs total: \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .database)
+        return bundleIDs
     }
 
     // MARK: - URL Bounding Box Detection
@@ -943,11 +951,9 @@ public actor DataAdapter {
 
     private func queryDistinctApps(connection: DatabaseConnection) throws -> [String] {
         let sql = """
-            SELECT bundleID, COUNT(*) as usage_count
+            SELECT DISTINCT bundleID
             FROM segment
             WHERE bundleID IS NOT NULL AND bundleID != ''
-            GROUP BY bundleID
-            ORDER BY usage_count DESC
             LIMIT 100;
             """
 

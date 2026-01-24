@@ -17,6 +17,11 @@ public actor HEVCEncoder {
     private var segmentStartTime: Date?
     private var isUsingHardwareAcceleration = false
 
+    // Store initialization parameters for potential re-initialization if file is deleted
+    private var initWidth: Int = 0
+    private var initHeight: Int = 0
+    private var initConfig: VideoEncoderConfig?
+
     // Fragment tracking for logging
     private var lastLoggedFileSize: Int64 = 0
     private var frameCount: Int = 0
@@ -52,9 +57,15 @@ public actor HEVCEncoder {
 
         self.outputURL = outputURL
         self.segmentStartTime = segmentStartTime
+        self.initWidth = width
+        self.initHeight = height
+        self.initConfig = config
 
-        // Remove any existing file
-        try? FileManager.default.removeItem(at: outputURL)
+        // Remove any existing file (should only happen if re-using a path, which shouldn't occur)
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            Log.warning("🗑️ [HEVCEncoder.initialize] Removing existing file at: \(outputURL.path)", category: .storage)
+            try? FileManager.default.removeItem(at: outputURL)
+        }
 
         // Configure video codec
         let codecType: AVVideoCodecType = (config.codec == .h264) ? .h264 : .hevc
@@ -161,8 +172,22 @@ public actor HEVCEncoder {
     }
 
     public func encode(pixelBuffer: CVPixelBuffer, timestamp: CMTime) async throws {
-        guard let input = videoInput, let adaptor = adaptor, !isFinalized else {
+        guard var input = videoInput, var adaptor = adaptor, !isFinalized else {
             throw StorageModuleError.encodingFailed(underlying: "Encoder not initialized or finalized")
+        }
+
+        // Check if the output file still exists - it may have been deleted by another process
+        // If deleted, recreate the encoder to continue writing
+        if let url = outputURL, !FileManager.default.fileExists(atPath: url.path) {
+            Log.warning("⚠️ Video file was deleted externally, recreating encoder: \(url.path)", category: .storage)
+            try await recreateEncoder()
+
+            // Re-fetch input and adaptor after recreation
+            guard let newInput = videoInput, let newAdaptor = self.adaptor else {
+                throw StorageModuleError.encodingFailed(underlying: "Failed to recreate encoder after file deletion")
+            }
+            input = newInput
+            adaptor = newAdaptor
         }
 
         // Wait for input to be ready with timeout (5 seconds max)
@@ -187,6 +212,14 @@ public actor HEVCEncoder {
         // Check if a new fragment was written by monitoring file size changes
         // Fragments are written every ~4 seconds of video time
         if let url = outputURL {
+            // Also check if file was deleted after append - if so, recreate immediately
+            // This minimizes frame loss to at most 1 frame
+            if !FileManager.default.fileExists(atPath: url.path) {
+                Log.warning("⚠️ Video file deleted after append, recreating encoder: \(url.path)", category: .storage)
+                try await recreateEncoder()
+                return
+            }
+
             let currentSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
             let sizeIncrease = currentSize - lastLoggedFileSize
 
@@ -222,6 +255,39 @@ public actor HEVCEncoder {
         assetWriter = nil
         videoInput = nil
         adaptor = nil
+    }
+
+    /// Recreate the encoder if the output file was deleted externally
+    /// This preserves the frame count so timestamps continue correctly
+    private func recreateEncoder() async throws {
+        guard let url = outputURL,
+              let startTime = segmentStartTime,
+              let config = initConfig else {
+            throw StorageModuleError.encodingFailed(underlying: "Cannot recreate encoder: missing initialization parameters")
+        }
+
+        // Clean up old writer without deleting file (it's already gone)
+        if let writer = assetWriter {
+            videoInput?.markAsFinished()
+            await writer.finishWriting()
+        }
+
+        // Clear state but preserve frame count for correct timestamps
+        let savedFrameCount = frameCount
+        assetWriter = nil
+        videoInput = nil
+        adaptor = nil
+        isFinalized = false
+        fragmentCount = 0
+        lastLoggedFileSize = 0
+
+        // Reinitialize with same parameters
+        try initialize(width: initWidth, height: initHeight, config: config, outputURL: url, segmentStartTime: startTime)
+
+        // Restore frame count so timestamps continue from where we left off
+        frameCount = savedFrameCount
+
+        Log.info("✅ Encoder recreated successfully, continuing from frame \(frameCount)", category: .storage)
     }
 
     public func reset() async {
