@@ -16,6 +16,7 @@ public struct SearchFilterBar: View {
     // MARK: - Body
 
     public var body: some View {
+        let _ = print("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover)")
         HStack(spacing: 10) {
             // Search mode tabs (Relevant / All)
             SearchModeTabs(viewModel: viewModel)
@@ -35,7 +36,7 @@ public struct SearchFilterBar: View {
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showAppsDropdown) {
+            .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: 56) {
                 AppsFilterPopover(
                     apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
                     otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
@@ -64,7 +65,7 @@ public struct SearchFilterBar: View {
                     showAppsDropdown = false // Close other dropdown
                 }
             }
-            .dropdownOverlay(isPresented: $showDatePopover) {
+            .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
                 DateFilterPopover(
                     viewModel: viewModel,
                     isPresented: $showDatePopover
@@ -296,52 +297,23 @@ private struct DateFilterPopover: View {
     @ObservedObject var viewModel: SearchViewModel
     @Binding var isPresented: Bool
 
-    @State private var customStartDate = Date()
-    @State private var customEndDate = Date()
-    @State private var showCustomCalendar = false
+    @State private var startDate: Date = Date()
+    @State private var endDate: Date = Date()
+    @State private var editingDate: EditingDate? = nil
+    @State private var displayedMonth: Date = Date()
 
     private let calendar = Calendar.current
+    private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+
+    private enum EditingDate {
+        case start
+        case end
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header with current selection
-            dateRangeHeader
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-                .padding(.bottom, 12)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Quick presets as horizontal chips
-            quickPresetsSection
-                .padding(12)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Custom range with visual calendar
-            customRangeSection
-                .padding(12)
-        }
-        .frame(width: 320)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            // Initialize custom dates from current filter or today
-            customStartDate = viewModel.startDate ?? calendar.date(byAdding: .day, value: -7, to: Date()) ?? Date()
-            customEndDate = viewModel.endDate ?? Date()
-        }
-    }
-
-    // MARK: - Header showing current selection
-
-    private var dateRangeHeader: some View {
-        VStack(alignment: .leading, spacing: 8) {
+            // Header
             HStack {
-                Image(systemName: "calendar")
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(.accentColor)
-
                 Text("Date Range")
                     .font(.retraceCalloutBold)
                     .foregroundColor(.primary)
@@ -349,245 +321,263 @@ private struct DateFilterPopover: View {
                 Spacer()
 
                 if viewModel.startDate != nil || viewModel.endDate != nil {
-                    Button(action: {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.setDateRange(start: nil, end: nil)
-                        }
-                    }) {
-                        Text("Clear")
-                            .font(.retraceCaption2Medium)
-                            .foregroundColor(.accentColor)
+                    Button("Clear") {
+                        viewModel.setDateRange(start: nil, end: nil)
+                        isPresented = false
                     }
                     .buttonStyle(.plain)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.accentColor)
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
 
-            // Visual representation of selected range
-            if let start = viewModel.startDate, let end = viewModel.endDate {
-                HStack(spacing: 8) {
-                    dateChip(date: start, label: "From")
-                    Image(systemName: "arrow.right")
-                        .font(.retraceTinyMedium)
-                        .foregroundColor(.secondary)
-                    dateChip(date: end, label: "To")
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Date selection rows
+            VStack(spacing: 8) {
+                dateRow(label: "Start", date: startDate, isEditing: editingDate == .start) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        editingDate = editingDate == .start ? nil : .start
+                        displayedMonth = startDate
+                    }
                 }
-            } else {
-                Text("All time")
-                    .font(.retraceCaption)
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-
-    private func dateChip(date: Date, label: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.retraceTinyMedium)
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-
-            Text(formatDate(date))
-                .font(.retraceCaption2Medium)
-                .foregroundColor(.primary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.accentColor.opacity(0.1))
-        )
-    }
-
-    // MARK: - Quick Presets
-
-    private var quickPresetsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Quick Select")
-                .font(.retraceCaption2Medium)
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-
-            // First row: Anytime, Today, Yesterday
-            HStack(spacing: 8) {
-                ForEach([DatePreset.anytime, .today, .yesterday], id: \.self) { preset in
-                    presetChip(preset: preset)
+                dateRow(label: "End", date: endDate, isEditing: editingDate == .end) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        editingDate = editingDate == .end ? nil : .end
+                        displayedMonth = endDate
+                    }
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
 
-            // Second row: Last 7 Days, Last 30 Days
-            HStack(spacing: 8) {
-                ForEach([DatePreset.lastWeek, .lastMonth], id: \.self) { preset in
-                    presetChip(preset: preset)
-                }
-                Spacer()
-            }
-        }
-    }
+            // Inline calendar (shown when editing)
+            if editingDate != nil {
+                Divider()
+                    .background(Color.white.opacity(0.1))
 
-    private func presetChip(preset: DatePreset) -> some View {
-        let isSelected = isPresetSelected(preset)
+                inlineCalendar
+                    .padding(12)
+                    .contentShape(Rectangle())
+                    .onTapGesture { } // Prevent tap from bubbling up
+            }
 
-        return Button(action: {
-            withAnimation(.easeOut(duration: 0.15)) {
-                applyPreset(preset)
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Quick presets (horizontal chips)
+            HStack(spacing: 6) {
+                presetChip("All", preset: .anytime)
+                presetChip("Today", preset: .today)
+                presetChip("7d", preset: .lastWeek)
+                presetChip("30d", preset: .lastMonth)
             }
-        }) {
-            HStack(spacing: 4) {
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.retraceTinyBold)
-                }
-                Text(preset.shortLabel)
-                    .font(isSelected ? .retraceCaption2Bold : .retraceCaption2Medium)
-            }
-            .foregroundColor(isSelected ? .white : .primary)
             .padding(.horizontal, 12)
-            .padding(.vertical, 7)
+            .padding(.vertical, 10)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Apply button
+            Button(action: applyCustomRange) {
+                Text("Apply")
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.accentColor)
+                    .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .padding(12)
+        }
+        .frame(width: 280)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            initializeDates()
+        }
+        .onExitCommand {
+            if editingDate != nil {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    editingDate = nil
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Collapse calendar when tapping outside of it
+            if editingDate != nil {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    editingDate = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Date Row
+
+    private func dateRow(label: String, date: Date, isEditing: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: "calendar")
+                    .font(.system(size: 14))
+                    .foregroundColor(isEditing ? .accentColor : .secondary)
+                    .frame(width: 20)
+
+                Text(label)
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.secondary)
+                    .frame(width: 36, alignment: .leading)
+
+                Spacer()
+
+                Text(formatDate(date))
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(isEditing ? .accentColor : .primary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(isSelected ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isEditing ? Color.accentColor.opacity(0.1) : Color.white.opacity(0.05))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(isSelected ? Color.clear : Color(nsColor: .separatorColor), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isEditing ? Color.accentColor.opacity(0.5) : Color.clear, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
+        .onHover { h in
+            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
     }
 
-    // MARK: - Custom Range Section
+    // MARK: - Inline Calendar
 
-    private var customRangeSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private var inlineCalendar: some View {
+        VStack(spacing: 8) {
+            // Month navigation
             HStack {
-                Text("Custom Range")
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.secondary)
-                    .textCase(.uppercase)
+                Button(action: { changeMonth(by: -1) }) {
+                    Image(systemName: "chevron.left")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 24, height: 24)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
 
                 Spacer()
 
-                Button(action: {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showCustomCalendar.toggle()
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: showCustomCalendar ? "chevron.up" : "chevron.down")
-                            .font(.retraceTinyBold)
-                        Text(showCustomCalendar ? "Hide" : "Show")
-                            .font(.retraceCaption2Medium)
-                    }
-                    .foregroundColor(.accentColor)
+                Text(monthYearString)
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.white.opacity(0.8))
+
+                Spacer()
+
+                Button(action: { changeMonth(by: 1) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 24, height: 24)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
             }
 
-            if showCustomCalendar {
-                VStack(spacing: 16) {
-                    // Date pickers in a cleaner layout
-                    HStack(spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Start")
-                                .font(.retraceTinyMedium)
-                                .foregroundColor(.secondary)
-                                .textCase(.uppercase)
-
-                            DatePicker("", selection: $customStartDate, in: ...Date(), displayedComponents: .date)
-                                .datePickerStyle(.compact)
-                                .labelsHidden()
-                        }
+            // Weekday headers
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbols, id: \.self) { day in
+                    Text(day)
+                        .font(.retraceTinyMedium)
+                        .foregroundColor(.white.opacity(0.4))
                         .frame(maxWidth: .infinity)
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("End")
-                                .font(.retraceTinyMedium)
-                                .foregroundColor(.secondary)
-                                .textCase(.uppercase)
-
-                            DatePicker("", selection: $customEndDate, in: ...Date(), displayedComponents: .date)
-                                .datePickerStyle(.compact)
-                                .labelsHidden()
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-
-                    // Visual timeline showing the range
-                    dateRangeTimeline
-
-                    // Apply button
-                    Button(action: {
-                        let start = calendar.startOfDay(for: customStartDate)
-                        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: customEndDate)
-                        viewModel.setDateRange(start: start, end: end)
-                        isPresented = false
-                    }) {
-                        HStack {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.retraceCaption2)
-                            Text("Apply Range")
-                                .font(.retraceCaptionBold)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(Color.accentColor)
-                        .foregroundColor(.white)
-                        .cornerRadius(8)
-                    }
-                    .buttonStyle(.plain)
                 }
-                .padding(.top, 4)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
+            // Calendar grid
+            let days = daysInMonth()
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
+                ForEach(days.indices, id: \.self) { index in
+                    dayCell(for: days[index])
+                }
             }
         }
     }
 
-    // MARK: - Visual Timeline
+    // MARK: - Day Cell
 
-    private var dateRangeTimeline: some View {
-        VStack(spacing: 4) {
-            GeometryReader { geometry in
-                let width = geometry.size.width
+    private func dayCell(for day: Date?) -> some View {
+        Group {
+            if let day = day {
+                let isToday = calendar.isDateInToday(day)
+                let isSelected = isDateSelected(day)
+                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
+                let isFuture = day > Date()
 
-                ZStack(alignment: .leading) {
-                    // Track background
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color(nsColor: .separatorColor).opacity(0.3))
-                        .frame(height: 8)
-
-                    // Selected range indicator
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.accentColor.opacity(0.6), Color.accentColor],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
+                Button(action: {
+                    selectDay(day)
+                }) {
+                    Text("\(calendar.component(.day, from: day))")
+                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
+                        .foregroundColor(
+                            isFuture
+                                ? .white.opacity(0.2)
+                                : (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.8 : 0.3))
                         )
-                        .frame(width: width, height: 8)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            ZStack {
+                                if isSelected {
+                                    Circle()
+                                        .fill(Color.accentColor)
+                                } else if isToday {
+                                    Circle()
+                                        .stroke(Color.accentColor, lineWidth: 1)
+                                }
+                            }
+                        )
                 }
+                .buttonStyle(.plain)
+                .disabled(isFuture)
+                .onHover { h in
+                    if !isFuture {
+                        if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                    }
+                }
+            } else {
+                Color.clear
+                    .frame(width: 30, height: 30)
             }
-            .frame(height: 8)
+        }
+    }
 
-            // Range label
-            HStack {
-                Text(formatDateShort(customStartDate))
-                    .font(.retraceTinyMedium)
-                    .foregroundColor(.secondary)
+    // MARK: - Preset Chip
 
-                Spacer()
-
-                let daysDiff = calendar.dateComponents([.day], from: customStartDate, to: customEndDate).day ?? 0
-                Text("\(daysDiff) day\(daysDiff == 1 ? "" : "s")")
-                    .font(.retraceTinyBold)
-                    .foregroundColor(.accentColor)
-
-                Spacer()
-
-                Text(formatDateShort(customEndDate))
-                    .font(.retraceTinyMedium)
-                    .foregroundColor(.secondary)
-            }
+    private func presetChip(_ label: String, preset: DatePreset) -> some View {
+        Button(action: {
+            applyPreset(preset)
+        }) {
+            Text(label)
+                .font(.retraceCaption2Medium)
+                .foregroundColor(.white.opacity(0.8))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered in
+            if isHovered { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
     }
 
@@ -599,37 +589,81 @@ private struct DateFilterPopover: View {
         return formatter.string(from: date)
     }
 
-    private func formatDateShort(_ date: Date) -> String {
+    private var monthYearString: String {
         let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d"
-        return formatter.string(from: date)
+        formatter.dateFormat = "MMMM yyyy"
+        return formatter.string(from: displayedMonth)
     }
 
-    private func isPresetSelected(_ preset: DatePreset) -> Bool {
-        guard let start = viewModel.startDate else {
-            return preset == .anytime
+    private func changeMonth(by value: Int) {
+        if let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                displayedMonth = newMonth
+            }
+        }
+    }
+
+    private func daysInMonth() -> [Date?] {
+        var days: [Date?] = []
+
+        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
+              let monthFirstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
+            return days
         }
 
+        var currentDate = monthFirstWeek.start
+
+        for _ in 0..<42 {
+            days.append(currentDate)
+            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
+        }
+
+        return days
+    }
+
+    private func isDateSelected(_ day: Date) -> Bool {
+        switch editingDate {
+        case .start:
+            return calendar.isDate(day, inSameDayAs: startDate)
+        case .end:
+            return calendar.isDate(day, inSameDayAs: endDate)
+        case .none:
+            return false
+        }
+    }
+
+    private func selectDay(_ day: Date) {
+        switch editingDate {
+        case .start:
+            startDate = day
+            if startDate > endDate {
+                endDate = startDate
+            }
+        case .end:
+            endDate = day
+            if endDate < startDate {
+                startDate = endDate
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func initializeDates() {
         let now = Date()
+        let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
 
-        switch preset {
-        case .anytime:
-            return viewModel.startDate == nil && viewModel.endDate == nil
-        case .today:
-            return calendar.isDateInToday(start)
-        case .yesterday:
-            return calendar.isDateInYesterday(start)
-        case .lastWeek:
-            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                return calendar.isDate(start, inSameDayAs: weekAgo)
-            }
-            return false
-        case .lastMonth:
-            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                return calendar.isDate(start, inSameDayAs: monthAgo)
-            }
-            return false
-        }
+        startDate = viewModel.startDate ?? weekAgo
+        endDate = viewModel.endDate ?? now
+        displayedMonth = endDate
+    }
+
+    private func applyCustomRange() {
+        let start = calendar.startOfDay(for: startDate)
+        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDate) ?? endDate
+
+        viewModel.setDateRange(start: start, end: end)
+        isPresented = false
     }
 
     private func applyPreset(_ preset: DatePreset) {
@@ -666,23 +700,12 @@ private struct DateFilterPopover: View {
 
 // MARK: - Date Preset Enum
 
-private enum DatePreset: String, CaseIterable {
-    case anytime = "Anytime"
-    case today = "Today"
-    case yesterday = "Yesterday"
-    case lastWeek = "Last 7 Days"
-    case lastMonth = "Last 30 Days"
-
-    /// Shorter labels for chip display
-    var shortLabel: String {
-        switch self {
-        case .anytime: return "All Time"
-        case .today: return "Today"
-        case .yesterday: return "Yesterday"
-        case .lastWeek: return "7 Days"
-        case .lastMonth: return "30 Days"
-        }
-    }
+private enum DatePreset {
+    case anytime
+    case today
+    case yesterday
+    case lastWeek
+    case lastMonth
 }
 
 // MARK: - Search Mode Tabs

@@ -990,6 +990,26 @@ public struct SettingsView: View {
 //                }
 //            }
 
+            ModernSettingsCard(title: "Cache", icon: "externaldrive") {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Clear App Name Cache")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+
+                        Text("Refresh cached app names if they appear incorrect or outdated")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                    }
+
+                    Spacer()
+
+                    ModernButton(title: "Clear Cache", icon: "arrow.clockwise", style: .secondary) {
+                        clearAppNameCache()
+                    }
+                }
+            }
+
             ModernSettingsCard(title: "Logging", icon: "doc.text") {
                 // TODO: Add Log Level picker later
 //                VStack(alignment: .leading, spacing: 12) {
@@ -1762,6 +1782,10 @@ extension SettingsView {
                 NSApplication.shared.terminate(nil)
             }
         }
+    }
+
+    func clearAppNameCache() {
+        AppNameResolver.shared.clearCache()
     }
 }
 

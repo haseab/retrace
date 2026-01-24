@@ -468,8 +468,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         isFilterDropdownOpen = false
     }
 
-    /// Apps available for filtering (installed apps + apps from DB history)
+    /// Apps available for filtering (installed apps only)
     @Published public var availableAppsForFilter: [(bundleID: String, name: String)] = []
+
+    /// Other apps for filtering (apps from DB history that aren't currently installed)
+    @Published public var otherAppsForFilter: [(bundleID: String, name: String)] = []
 
     /// Whether apps for filter are currently being loaded
     @Published public var isLoadingAppsForFilter = false
@@ -1107,20 +1110,20 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Create a new tag and add it to the selected segment
+    /// Keeps the menu open and shows optimistic UI update
     public func createAndAddTag() {
         let tagName = newTagName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !tagName.isEmpty else {
-            dismissTimelineContextMenu()
             return
         }
 
         guard let index = timelineContextMenuSegmentIndex,
               let segmentId = getSegmentId(forFrameAt: index) else {
-            dismissTimelineContextMenu()
             return
         }
 
-        dismissTimelineContextMenu()
+        // Clear the input
+        newTagName = ""
 
         // Create tag and add to segment in background
         Task {
@@ -1128,8 +1131,16 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let newTag = try await coordinator.createTag(name: tagName)
                 try await coordinator.addTagToSegment(segmentId: segmentId, tagId: newTag.id)
 
-                // Reload tags to update the list
-                await loadTags()
+                // Optimistic UI update: add the new tag to availableTags and mark it as selected
+                await MainActor.run {
+                    // Add to available tags if not already present
+                    if !availableTags.contains(where: { $0.id == newTag.id }) {
+                        availableTags.append(newTag)
+                        availableTags.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    }
+                    // Mark it as selected on the current segment
+                    selectedSegmentTags.insert(newTag.id)
+                }
 
                 Log.debug("[Tags] Created tag '\(tagName)' and added to segment \(segmentId.value)", category: .ui)
             } catch {
@@ -1296,16 +1307,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                 .map { (bundleID: $0.bundleID, name: $0.name) }
 
             if !historicalApps.isEmpty {
-                allApps.append(contentsOf: historicalApps)
-                availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-                Log.info("[Filter] Phase 2: Added \(historicalApps.count) historical apps, total \(availableAppsForFilter.count)", category: .ui)
+                otherAppsForFilter = historicalApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                Log.info("[Filter] Phase 2: Added \(historicalApps.count) historical apps to otherAppsForFilter", category: .ui)
             }
         } catch {
             Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-        Log.info("[Filter] Total: \(availableAppsForFilter.count) apps loaded in \(Int(totalTime * 1000))ms", category: .ui)
+        Log.info("[Filter] Total: \(availableAppsForFilter.count) installed + \(otherAppsForFilter.count) other apps loaded in \(Int(totalTime * 1000))ms", category: .ui)
         isLoadingAppsForFilter = false
     }
 

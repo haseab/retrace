@@ -65,32 +65,32 @@ public struct FilterRow: View {
 
     public var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) {
+            HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
                 // Icon
                 if let icon = icon {
                     icon
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: 20, height: 20)
-                        .foregroundColor(.secondary)
+                        .frame(width: RetraceMenuStyle.iconFrameWidth)
+                        .foregroundColor(RetraceMenuStyle.textColorMuted)
                 }
 
                 // Title and optional subtitle
                 if let subtitle = subtitle {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(title)
-                            .font(.retraceCaption)
-                            .foregroundColor(.primary)
+                            .font(RetraceMenuStyle.font)
+                            .foregroundColor(isHovered ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
                             .lineLimit(1)
                         Text(subtitle)
                             .font(.system(size: 11))
-                            .foregroundColor(.secondary)
+                            .foregroundColor(RetraceMenuStyle.textColorMuted.opacity(0.7))
                             .lineLimit(1)
                     }
                 } else {
                     Text(title)
-                        .font(.retraceCaption)
-                        .foregroundColor(.primary)
+                        .font(RetraceMenuStyle.font)
+                        .foregroundColor(isHovered ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
                         .lineLimit(1)
                 }
 
@@ -99,18 +99,25 @@ public struct FilterRow: View {
                 // Checkmark for selected
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.accentColor)
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(RetraceMenuStyle.actionBlue)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(isHovered ? Color.accentColor.opacity(0.1) : Color.clear)
+            .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
+            .padding(.vertical, RetraceMenuStyle.itemPaddingV)
+            .background(
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                    .fill(isHovered ? RetraceMenuStyle.itemHoverColor : Color.clear)
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            isHovered = hovering
+            withAnimation(.easeOut(duration: RetraceMenuStyle.hoverAnimationDuration)) {
+                isHovered = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
         }
     }
 }
@@ -133,11 +140,8 @@ public struct FilterPopoverContainer<Content: View>: View {
             content
         }
         .frame(width: width)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.15))
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .retraceMenuContainer(addPadding: false)
+        .clipShape(RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius))
     }
 }
 
@@ -147,24 +151,50 @@ public struct FilterPopoverContainer<Content: View>: View {
 public struct FilterSearchField: View {
     @Binding var text: String
     let placeholder: String
+    var isFocused: FocusState<Bool>.Binding?
 
-    public init(text: Binding<String>, placeholder: String = "Search...") {
+    public init(text: Binding<String>, placeholder: String = "Search...", isFocused: FocusState<Bool>.Binding? = nil) {
         self._text = text
         self.placeholder = placeholder
+        self.isFocused = isFocused
     }
 
     public var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .foregroundColor(.secondary)
-                .font(.retraceCaption2)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.5))
 
-            TextField(placeholder, text: $text)
+            textField
                 .textFieldStyle(.plain)
-                .font(.retraceCaption)
+                .font(RetraceMenuStyle.font)
+                .foregroundColor(.white)
+
+            if !text.isEmpty {
+                Button(action: { text = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                .buttonStyle(.plain)
+            }
         }
-        .padding(10)
-        .background(Color(white: 0.08))
+        .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
+        .padding(.vertical, RetraceMenuStyle.searchFieldPaddingV)
+        .background(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
+                .fill(RetraceMenuStyle.searchFieldBackground)
+        )
+    }
+
+    @ViewBuilder
+    private var textField: some View {
+        if let isFocused = isFocused {
+            TextField(placeholder, text: $text)
+                .focused(isFocused)
+        } else {
+            TextField(placeholder, text: $text)
+        }
     }
 }
 
@@ -181,6 +211,7 @@ public struct AppsFilterPopover: View {
     var onDismiss: (() -> Void)?
 
     @State private var searchText = ""
+    @FocusState private var isSearchFocused: Bool
 
     public init(
         apps: [(bundleID: String, name: String)],
@@ -225,7 +256,7 @@ public struct AppsFilterPopover: View {
     public var body: some View {
         FilterPopoverContainer {
             // Search field
-            FilterSearchField(text: $searchText, placeholder: "Search apps...")
+            FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFocused)
 
             Divider()
 
@@ -234,7 +265,7 @@ public struct AppsFilterPopover: View {
                 LazyVStack(spacing: 0) {
                     // "All Apps" option
                     FilterRow(
-                        systemIcon: "app.fill",
+                        systemIcon: "square.grid.2x2.fill",
                         title: "All Apps",
                         isSelected: isAllAppsSelected
                     ) {
@@ -290,6 +321,12 @@ public struct AppsFilterPopover: View {
                 .padding(.vertical, 4)
             }
             .frame(maxHeight: 300)
+        }
+        .onAppear {
+            // Autofocus the search field when popover appears
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isSearchFocused = true
+            }
         }
     }
 }
@@ -446,29 +483,39 @@ public struct VisibilityFilterPopover: View {
 
 // MARK: - Dropdown Overlay View Modifier
 
-/// A view modifier that displays content as a dropdown overlay below the modified view.
+/// A view modifier that displays content as a dropdown overlay above or below the modified view.
 /// Opens instantly without NSPopover window creation overhead.
 public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
     @Binding var isPresented: Bool
     let yOffset: CGFloat
+    let opensUpward: Bool
     let dropdownContent: () -> DropdownContent
 
     public init(
         isPresented: Binding<Bool>,
         yOffset: CGFloat = 44,
+        opensUpward: Bool = false,
         @ViewBuilder dropdownContent: @escaping () -> DropdownContent
     ) {
         self._isPresented = isPresented
         self.yOffset = yOffset
+        self.opensUpward = opensUpward
         self.dropdownContent = dropdownContent
     }
 
     public func body(content: Content) -> some View {
-        let _ = print("[DropdownOverlayModifier] body called, isPresented=\(isPresented)")
+        let _ = print("[DropdownOverlay] Rendering, isPresented=\(isPresented), opensUpward=\(opensUpward), yOffset=\(yOffset)")
         content
-            .overlay(alignment: .topLeading) {
+            .background(GeometryReader { geo in
+                Color.clear.onAppear {
+                    print("[DropdownOverlay] Anchor content frame: \(geo.frame(in: .global))")
+                }.onChange(of: isPresented) { _ in
+                    print("[DropdownOverlay] Anchor content frame (on change): \(geo.frame(in: .global))")
+                }
+            })
+            .overlay(alignment: opensUpward ? .bottomLeading : .topLeading) {
                 if isPresented {
-                    let _ = print("[DropdownOverlayModifier] Rendering dropdown content with background")
+                    let _ = print("[DropdownOverlay] Showing dropdown content with zIndex=1000")
                     // Wrap content in a background container to ensure solid background
                     ZStack {
                         // Solid background layer
@@ -479,15 +526,20 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
                         dropdownContent()
                     }
                     .fixedSize(horizontal: false, vertical: true)
-                    .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+                    .shadow(color: .black.opacity(0.4), radius: 12, y: opensUpward ? -4 : 4)
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
                             .stroke(Color.white.opacity(0.1), lineWidth: 1)
                     )
-                    .contentShape(Rectangle()) // Capture all hits including scroll
-                    .offset(y: yOffset)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .top)))
-                    .zIndex(1000) // Ensure dropdown is above everything
+                    .contentShape(Rectangle())
+                    .offset(y: opensUpward ? -yOffset : yOffset)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: opensUpward ? .bottom : .top)))
+                    .zIndex(1000)
+                    .background(GeometryReader { geo in
+                        Color.clear.onAppear {
+                            print("[DropdownOverlay] Dropdown content frame: \(geo.frame(in: .global))")
+                        }
+                    })
                 }
             }
     }
@@ -499,8 +551,9 @@ public extension View {
     func dropdownOverlay<Content: View>(
         isPresented: Binding<Bool>,
         yOffset: CGFloat = 44,
+        opensUpward: Bool = false,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        modifier(DropdownOverlayModifier(isPresented: isPresented, yOffset: yOffset, dropdownContent: content))
+        modifier(DropdownOverlayModifier(isPresented: isPresented, yOffset: yOffset, opensUpward: opensUpward, dropdownContent: content))
     }
 }

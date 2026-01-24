@@ -202,7 +202,7 @@ public struct SimpleTimelineView: View {
                     )
                 }
 
-                // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
+                // Search overlay (Cmd+F) - uses persistent searchViewModel to preserve results
                 if viewModel.isSearchOverlayVisible {
                     SpotlightSearchOverlay(
                         coordinator: coordinator,
@@ -272,7 +272,7 @@ public struct SimpleTimelineView: View {
                         FilterPanel(viewModel: viewModel)
                             .position(
                                 x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - 100,
-                                y: geometry.size.height - 450
+                                y: geometry.size.height - TimelineScaleFactor.tapeBottomPadding - TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset - 300
                             )
                             .transition(.opacity.combined(with: .offset(y: 15)))
 
@@ -305,7 +305,7 @@ public struct SimpleTimelineView: View {
                     }
                 }
             }
-            // Note: Keyboard shortcuts (Cmd+K, Escape) are handled by TimelineWindowController
+            // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
     }
@@ -2562,15 +2562,7 @@ struct FloatingContextMenu: View {
 
             // Menu content - uses shared ContextMenuContent from UI/Components
             ContextMenuContent(viewModel: viewModel, showMenu: $isPresented)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color(white: 0.1))
-                        .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                )
+                .retraceMenuContainer()
                 .fixedSize()
                 .position(adjustedPosition)
         }
@@ -2769,15 +2761,7 @@ struct TimelineSegmentContextMenu: View {
             }
             .padding(.vertical, 8)
             .frame(width: menuWidth)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(white: 0.1))
-                    .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-            )
+            .retraceMenuContainer()
             .position(adjustedPosition)
 
             // Tag submenu (appears when "Add Tag" is hovered/clicked)
@@ -2842,55 +2826,8 @@ struct TimelineSegmentContextMenu: View {
 // MARK: - Timeline Menu Button
 
 /// A button in the timeline context menu
-struct TimelineMenuButton: View {
-    let icon: String
-    let title: String
-    var showChevron: Bool = false
-    var isDestructive: Bool = false
-    var onHoverChanged: ((Bool) -> Void)? = nil
-    let action: () -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isDestructive ? Color.red.opacity(0.9) : .white.opacity(0.7))
-                    .frame(width: 18)
-
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(isDestructive ? Color.red.opacity(0.9) : .white)
-
-                Spacer()
-
-                if showChevron {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.white.opacity(0.4))
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.1)) {
-                isHovering = hovering
-            }
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
-            onHoverChanged?(hovering)
-        }
-    }
-}
+// TimelineMenuButton: now uses the unified RetraceMenuButton from AppTheme
+typealias TimelineMenuButton = RetraceMenuButton
 
 // MARK: - Tag Submenu
 
@@ -2902,13 +2839,23 @@ struct TagSubmenu: View {
     @State private var searchText = ""
     @FocusState private var isSearchFocused: Bool
 
-    // Filter out the "hidden" tag and apply search filter
+    // Filter out the "hidden" tag, apply search filter, and sort with selected tags first
     private var visibleTags: [Tag] {
         let nonHidden = viewModel.availableTags.filter { !$0.isHidden }
-        if searchText.isEmpty {
-            return nonHidden
+        let filtered = searchText.isEmpty
+            ? nonHidden
+            : nonHidden.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+
+        // Sort: selected tags first, then alphabetically within each group
+        return filtered.sorted { tag1, tag2 in
+            let tag1Selected = viewModel.selectedSegmentTags.contains(tag1.id)
+            let tag2Selected = viewModel.selectedSegmentTags.contains(tag2.id)
+
+            if tag1Selected != tag2Selected {
+                return tag1Selected // Selected tags come first
+            }
+            return tag1.name.localizedCaseInsensitiveCompare(tag2.name) == .orderedAscending
         }
-        return nonHidden.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
     // Check if search text matches an existing tag exactly
@@ -3003,51 +2950,12 @@ struct TagSubmenu: View {
                         }
                     }
                 }
-                .frame(maxHeight: 200) // Limit height for scrolling
-            }
-
-            // Always-visible "Create new..." button at the bottom
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.horizontal, 8)
-                .padding(.top, 4)
-
-            Button(action: {
-                // Focus the search field for creating a new tag
-                isSearchFocused = true
-            }) {
-                HStack(spacing: 10) {
-                    Image(systemName: "plus.circle")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.7))
-
-                    Text("Create new...")
-                        .font(.system(size: 13))
-                        .foregroundColor(.white.opacity(0.7))
-
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                if hovering { NSCursor.pointingHand.push() }
-                else { NSCursor.pop() }
+                .frame(maxHeight: 120) // Limit height for scrolling
             }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 2)
         .frame(width: 180)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color(white: 0.1))
-                .shadow(color: .black.opacity(0.5), radius: 20, y: 10)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.15), lineWidth: 1)
-        )
+        .retraceMenuContainer()
         .onAppear {
             // Delay focus slightly to ensure the view is in the responder chain
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -3384,7 +3292,7 @@ struct FilterPanel: View {
                     .padding(.vertical, 12)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.blue)
+                            .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
                     )
             }
             .buttonStyle(.plain)
@@ -3448,37 +3356,49 @@ struct FilterDropdownOverlay: View {
                 let anchor = viewModel.filterDropdownAnchorFrame
                 let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor)")
 
-                // Use VStack with Spacer to position dropdown at the correct Y
-                // Then use HStack with Spacer to position at the correct X
-                VStack(spacing: 0) {
-                    // Top spacer to push content down to anchor.maxY + gap
-                    Spacer()
-                        .frame(height: anchor.maxY + 8)
+                ZStack {
+                    // Full-screen dismiss layer (below dropdown)
+                    Color.black.opacity(0.001)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.dismissFilterDropdown()
+                            }
+                        }
 
-                    HStack(spacing: 0) {
-                        // Left spacer to push content to anchor.minX
+                    // Use VStack with Spacer to position dropdown at the correct Y
+                    // Then use HStack with Spacer to position at the correct X
+                    VStack(spacing: 0) {
+                        // Top spacer to push content down to anchor.maxY + gap
                         Spacer()
-                            .frame(width: anchor.minX)
+                            .frame(height: anchor.maxY + 8)
 
-                        // The actual dropdown content
-                        // Scroll events are handled at TimelineWindowController level
-                        dropdownContent
-                            .background(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color(white: 0.12))
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                            )
-                            .fixedSize()
+                        HStack(spacing: 0) {
+                            // Left spacer to push content to anchor.minX
+                            Spacer()
+                                .frame(width: anchor.minX)
+
+                            // The actual dropdown content
+                            // Scroll events are handled at TimelineWindowController level
+                            dropdownContent
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(Color(white: 0.12))
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                                .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                )
+                                .fixedSize()
+
+                            Spacer()
+                        }
 
                         Spacer()
                     }
-
-                    Spacer()
                 }
                 .transition(.opacity)
                 .zIndex(2000)
@@ -3493,6 +3413,7 @@ struct FilterDropdownOverlay: View {
         case .apps:
             AppsFilterPopover(
                 apps: viewModel.availableAppsForFilter,
+                otherApps: viewModel.otherAppsForFilter,
                 selectedApps: viewModel.pendingFilterCriteria.selectedApps,
                 allowMultiSelect: true,
                 onSelectApp: { bundleID in
@@ -3537,6 +3458,7 @@ struct FilterDropdownOverlay: View {
 // MARK: - Filter Toggle Chip
 
 /// Toggle chip for source filters (Retrace/Rewind)
+/// Styled similar to Relevant/All tabs in search dialog - white accent instead of blue
 struct FilterToggleChip: View {
     let label: String
     let icon: String
@@ -3552,18 +3474,14 @@ struct FilterToggleChip: View {
                     .font(.system(size: 12))
 
                 Text(label)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: 13, weight: isSelected ? .bold : .medium))
             }
             .foregroundColor(isSelected ? .white : .white.opacity(0.6))
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 10)
-                    .fill(isSelected ? Color.blue : Color.white.opacity(isHovered ? 0.12 : 0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(isSelected ? Color.blue.opacity(0.5) : Color.white.opacity(0.1), lineWidth: 1)
+                    .fill(isSelected ? Color.white.opacity(0.2) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
             )
         }
         .buttonStyle(.plain)
@@ -3612,11 +3530,11 @@ struct FilterDropdownButton: View {
             .frame(maxWidth: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: 10)
-                    .fill(isActive ? Color.blue.opacity(0.15) : Color.white.opacity(isHovered ? 0.1 : 0.06))
+                    .fill(isActive ? RetraceMenuStyle.actionBlue.opacity(0.15) : Color.white.opacity(isHovered ? 0.1 : 0.06))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
-                    .stroke(isActive ? Color.blue.opacity(0.3) : Color.white.opacity(0.08), lineWidth: 1)
+                    .stroke(isActive ? RetraceMenuStyle.actionBlue.opacity(0.3) : Color.white.opacity(0.08), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)

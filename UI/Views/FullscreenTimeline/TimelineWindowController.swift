@@ -212,9 +212,9 @@ public class TimelineWindowController: NSObject {
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
-                // Don't handle scroll events when search overlay or filter dropdown is open
+                // Don't handle scroll events when search overlay, filter dropdown, or tag submenu is open
                 if let viewModel = self?.timelineViewModel,
-                   (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen) {
+                   (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen || viewModel.showTagSubmenu) {
                     return // Let SwiftUI handle it
                 }
                 self?.handleScrollEvent(event, source: "GLOBAL")
@@ -238,8 +238,8 @@ public class TimelineWindowController: NSObject {
                 // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
 
-                // Cmd+K to toggle search overlay
-                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                // Cmd+F to toggle search overlay
+                if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     if self?.handleKeyEvent(event) == true {
                         return nil // Consume the event
                     }
@@ -284,6 +284,11 @@ public class TimelineWindowController: NSObject {
                 // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
                 if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
                     return event // Let the dropdown ScrollView handle it
+                }
+                // Don't intercept scroll events when the tag submenu is open
+                // Let SwiftUI ScrollView handle them for scrolling through tags
+                if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
+                    return event // Let the tag submenu ScrollView handle it
                 }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
@@ -405,8 +410,8 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Cmd+K to toggle search overlay
-        if event.keyCode == 40 && modifiers == [.command] { // K key with Command
+        // Cmd+F to toggle search overlay
+        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
             if let viewModel = timelineViewModel {
                 // Clear search highlight when opening search overlay
                 if !viewModel.isSearchOverlayVisible {

@@ -236,6 +236,29 @@ public class AppNameResolver {
             // Silently fail
         }
     }
+
+    /// Clear all cached app names (both memory and disk)
+    /// Call this when app names appear stale or incorrect
+    public func clearCache() {
+        lock.lock()
+        cache.removeAll()
+        diskCache.removeAll()
+        isDirty = false
+        lock.unlock()
+
+        // Delete the disk cache file
+        try? FileManager.default.removeItem(at: cacheFileURL)
+
+        // Also clear the "other apps" cache file
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        let otherAppsCache = cacheDir.appendingPathComponent("other_apps_cache.json")
+        try? FileManager.default.removeItem(at: otherAppsCache)
+
+        // Clear the timestamp so it will be refreshed
+        UserDefaults.standard.removeObject(forKey: "search.otherAppsCacheSavedAt")
+
+        print("[AppNameResolver] Cache cleared")
+    }
 }
 
 // MARK: - App Icon Provider
@@ -1113,4 +1136,299 @@ public struct TimelineScaleFactor {
 
     /// Icon spacing within buttons
     public static var iconSpacing: CGFloat { 8 * current }
+}
+
+// MARK: - Unified Menu & Popover Design System
+
+/// Unified design system for all menus, popovers, and dialogs
+/// Based on the right-click context menu design (optimal reference)
+public struct RetraceMenuStyle {
+    private init() {}
+
+    // MARK: - Container Styling
+
+    /// Background color for all menus, popovers, and dialogs
+    public static let backgroundColor = Color(white: 0.1)
+
+    /// Corner radius for all containers
+    public static let cornerRadius: CGFloat = 12
+
+    /// Border color
+    public static let borderColor = Color.white.opacity(0.15)
+
+    /// Border width
+    public static let borderWidth: CGFloat = 1
+
+    /// Shadow configuration
+    public static let shadowColor = Color.black.opacity(0.5)
+    public static let shadowRadius: CGFloat = 20
+    public static let shadowY: CGFloat = 10
+
+    // MARK: - Interactive Item Styling
+
+    /// Hover background color for menu items
+    public static let itemHoverColor = Color.white.opacity(0.1)
+
+    /// Corner radius for menu items
+    public static let itemCornerRadius: CGFloat = 6
+
+    /// Horizontal padding for menu items
+    public static let itemPaddingH: CGFloat = 12
+
+    /// Vertical padding for menu items
+    public static let itemPaddingV: CGFloat = 8
+
+    /// Spacing between items
+    public static let itemSpacing: CGFloat = 0
+
+    // MARK: - Typography
+
+    /// Font for menu item text
+    public static let font = Font.system(size: 13, weight: .medium)
+
+    /// Font size value (for non-SwiftUI contexts)
+    public static let fontSize: CGFloat = 13
+
+    /// Font weight
+    public static let fontWeight: Font.Weight = .medium
+
+    /// Icon size
+    public static let iconSize: CGFloat = 13
+
+    /// Icon frame width (for alignment)
+    public static let iconFrameWidth: CGFloat = 18
+
+    /// Spacing between icon and text
+    public static let iconTextSpacing: CGFloat = 10
+
+    // MARK: - Colors
+
+    /// Primary text color
+    public static let textColor = Color.white
+
+    /// Secondary text color (muted)
+    public static let textColorMuted = Color.white.opacity(0.7)
+
+    /// Destructive action color
+    public static let destructiveColor = Color.red.opacity(0.9)
+
+    /// Chevron color (for submenus)
+    public static let chevronColor = Color.white.opacity(0.4)
+
+    /// Chevron size
+    public static let chevronSize: CGFloat = 10
+
+    /// Action button blue color (used for all primary action buttons)
+    public static let actionBlue = Color(hex: "#0A84FF")
+
+    // MARK: - Search Field Styling (within menus)
+
+    /// Search field background
+    public static let searchFieldBackground = Color.white.opacity(0.05)
+
+    /// Search field corner radius
+    public static let searchFieldCornerRadius: CGFloat = 8
+
+    /// Search field padding
+    public static let searchFieldPaddingH: CGFloat = 12
+    public static let searchFieldPaddingV: CGFloat = 8
+
+    // MARK: - Animation
+
+    /// Standard animation duration for hover effects
+    public static let hoverAnimationDuration: CGFloat = 0.1
+
+    /// Animation for menu appearance
+    public static let appearanceAnimation = Animation.easeOut(duration: 0.15)
+}
+
+// MARK: - Reusable Menu Components
+
+/// Standardized menu button component
+/// Used in context menus, popovers, and dialogs for consistent appearance
+public struct RetraceMenuButton: View {
+    let icon: String
+    let title: String
+    var showChevron: Bool = false
+    var isDestructive: Bool = false
+    var isDisabled: Bool = false
+    var onHoverChanged: ((Bool) -> Void)? = nil
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    public init(
+        icon: String,
+        title: String,
+        showChevron: Bool = false,
+        isDestructive: Bool = false,
+        isDisabled: Bool = false,
+        onHoverChanged: ((Bool) -> Void)? = nil,
+        action: @escaping () -> Void
+    ) {
+        self.icon = icon
+        self.title = title
+        self.showChevron = showChevron
+        self.isDestructive = isDestructive
+        self.isDisabled = isDisabled
+        self.onHoverChanged = onHoverChanged
+        self.action = action
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
+                Image(systemName: icon)
+                    .font(.system(size: RetraceMenuStyle.iconSize, weight: RetraceMenuStyle.fontWeight))
+                    .foregroundColor(foregroundColor)
+                    .frame(width: RetraceMenuStyle.iconFrameWidth)
+
+                Text(title)
+                    .font(RetraceMenuStyle.font)
+                    .foregroundColor(foregroundColor)
+
+                Spacer()
+
+                if showChevron {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: RetraceMenuStyle.chevronSize, weight: .bold))
+                        .foregroundColor(RetraceMenuStyle.chevronColor)
+                }
+            }
+            .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
+            .padding(.vertical, RetraceMenuStyle.itemPaddingV)
+            .background(
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                    .fill(isHovering && !isDisabled ? RetraceMenuStyle.itemHoverColor : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: RetraceMenuStyle.hoverAnimationDuration)) {
+                isHovering = hovering
+            }
+            if hovering && !isDisabled { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+            onHoverChanged?(hovering)
+        }
+    }
+
+    private var foregroundColor: Color {
+        if isDisabled {
+            return RetraceMenuStyle.textColorMuted.opacity(0.5)
+        } else if isDestructive {
+            return RetraceMenuStyle.destructiveColor
+        } else {
+            return isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted
+        }
+    }
+}
+
+/// Standardized menu container modifier
+/// Applies consistent background, border, and shadow to any menu/popover content
+public struct RetraceMenuContainer: ViewModifier {
+    var addPadding: Bool = true
+
+    public func body(content: Content) -> some View {
+        Group {
+            if addPadding {
+                content.padding(.spacingS)
+            } else {
+                content
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+                .fill(RetraceMenuStyle.backgroundColor)
+                .shadow(
+                    color: RetraceMenuStyle.shadowColor,
+                    radius: RetraceMenuStyle.shadowRadius,
+                    y: RetraceMenuStyle.shadowY
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+                .stroke(RetraceMenuStyle.borderColor, lineWidth: RetraceMenuStyle.borderWidth)
+        )
+    }
+}
+
+extension View {
+    /// Apply standardized menu/popover container styling
+    public func retraceMenuContainer(addPadding: Bool = true) -> some View {
+        self.modifier(RetraceMenuContainer(addPadding: addPadding))
+    }
+}
+
+/// Standardized search field for menus/popovers
+public struct RetraceMenuSearchField: View {
+    @Binding var text: String
+    var placeholder: String
+    var onSubmit: (() -> Void)? = nil
+
+    public init(text: Binding<String>, placeholder: String = "Search...", onSubmit: (() -> Void)? = nil) {
+        self._text = text
+        self.placeholder = placeholder
+        self.onSubmit = onSubmit
+    }
+
+    public var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.5))
+
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(RetraceMenuStyle.font)
+                .foregroundColor(.white)
+                .onSubmit {
+                    onSubmit?()
+                }
+
+            if !text.isEmpty {
+                Button(action: { text = "" }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
+        .padding(.vertical, RetraceMenuStyle.searchFieldPaddingV)
+        .background(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
+                .fill(RetraceMenuStyle.searchFieldBackground)
+        )
+    }
+}
+
+// MARK: - Color Extension for Hex Support
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: // RGB (12-bit)
+            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: // ARGB (32-bit)
+            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default:
+            (a, r, g, b) = (255, 0, 0, 0)
+        }
+        self.init(
+            .sRGB,
+            red: Double(r) / 255,
+            green: Double(g) / 255,
+            blue: Double(b) / 255,
+            opacity: Double(a) / 255
+        )
+    }
 }

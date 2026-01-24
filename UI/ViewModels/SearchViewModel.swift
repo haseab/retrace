@@ -405,10 +405,12 @@ public class SearchViewModel: ObservableObject {
             let data = try Data(contentsOf: Self.cachedOtherAppsPath)
             let allCachedApps = try JSONDecoder().decode([CachedAppInfo].self, from: data)
 
-            // Filter out apps that are now installed
-            let uninstalledApps = allCachedApps
-                .filter { !installedBundleIDs.contains($0.bundleID) }
-                .map { AppInfo(bundleID: $0.bundleID, name: $0.name) }
+            // Filter out apps that are now installed, and resolve names fresh via AppNameResolver
+            // (don't use cached names - they may be stale)
+            let uninstalledBundleIDs = allCachedApps
+                .map { $0.bundleID }
+                .filter { !installedBundleIDs.contains($0) }
+            let uninstalledApps = AppNameResolver.shared.resolveAll(bundleIDs: uninstalledBundleIDs)
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
             return (uninstalledApps, isStale)

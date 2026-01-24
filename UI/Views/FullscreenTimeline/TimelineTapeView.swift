@@ -562,7 +562,7 @@ struct SearchButton: View {
                 Spacer()
 
                 // Keyboard shortcut hint
-                Text("⌘K")
+                Text("⌘F")
                     .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
                     .padding(.horizontal, 6 * TimelineScaleFactor.current)
@@ -590,7 +590,7 @@ struct SearchButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .help("Search (Cmd+K)")
+        .help("Search (Cmd+F)")
     }
 }
 
@@ -639,14 +639,7 @@ struct MoreOptionsMenu: View {
         .overlay(alignment: .bottomTrailing) {
             if showMenu {
                 ContextMenuContent(viewModel: viewModel, showMenu: $showMenu)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(white: 0.12))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
-                            )
-                    )
+                    .retraceMenuContainer()
                     .frame(width: 200)
                     .offset(y: -TimelineScaleFactor.controlButtonSize - 8)
                     .onHover { hovering in
@@ -846,7 +839,7 @@ struct FloatingDateSearchPanel: View {
                 Button(action: onSubmit) {
                     Image(systemName: "arrow.right.circle.fill")
                         .font(.system(size: 24))
-                        .foregroundColor(text.isEmpty ? .white.opacity(0.2) : (isSubmitButtonHovering ? .blue : .blue.opacity(0.8)))
+                        .foregroundColor(text.isEmpty ? .white.opacity(0.2) : (isSubmitButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8)))
                 }
                 .buttonStyle(.plain)
                 .disabled(text.isEmpty)
@@ -856,14 +849,14 @@ struct FloatingDateSearchPanel: View {
                     else { NSCursor.pop() }
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
+            .padding(.vertical, RetraceMenuStyle.searchFieldPaddingV)
             .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.white.opacity(0.06))
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
+                    .fill(RetraceMenuStyle.searchFieldBackground)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 16)
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
                     .stroke(Color.white.opacity(0.12), lineWidth: 1)
             )
             .padding(.horizontal, 20)
@@ -900,17 +893,13 @@ struct FloatingDateSearchPanel: View {
                     Text("Browse Calendar")
                         .font(.retraceCaptionMedium)
                 }
-                .foregroundColor(isCalendarButtonHovering ? .white : .white.opacity(0.7))
+                .foregroundColor(.white)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(isCalendarButtonHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(isCalendarButtonHovering ? 0.2 : 0.1), lineWidth: 0.5)
+                        .fill(isCalendarButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8))
                 )
             }
             .buttonStyle(.plain)
@@ -926,27 +915,11 @@ struct FloatingDateSearchPanel: View {
         }
         .padding(.bottom, 16)
         .frame(width: TimelineScaleFactor.searchPanelWidth)
+        .retraceMenuContainer(addPadding: false)
         .background(
             ZStack {
-                // Dark solid background
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(Color(white: 0.08))
-
-                // Subtle glass overlay
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.08),
-                                Color.white.opacity(0.02)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-
-                // Border
-                RoundedRectangle(cornerRadius: 20)
+                // Remove custom background - now using unified system
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
                     .stroke(
                         LinearGradient(
                             colors: [
