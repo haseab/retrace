@@ -88,6 +88,9 @@ public struct SettingsView: View {
     @State private var showingResetConfirmation = false
     @State private var showingDeleteConfirmation = false
 
+    // Cache clear feedback
+    @State private var cacheClearMessage: String? = nil
+
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
 
@@ -991,23 +994,38 @@ public struct SettingsView: View {
 //            }
 
             ModernSettingsCard(title: "Cache", icon: "externaldrive") {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Clear App Name Cache")
-                            .font(.retraceCalloutMedium)
-                            .foregroundColor(.retracePrimary)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Clear App Name Cache")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
 
-                        Text("Refresh cached app names if they appear incorrect or outdated")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
+                            Text("Refresh cached app names if they appear incorrect or outdated")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        Spacer()
+
+                        ModernButton(title: "Clear Cache", icon: "arrow.clockwise", style: .secondary) {
+                            clearAppNameCache()
+                        }
                     }
 
-                    Spacer()
-
-                    ModernButton(title: "Clear Cache", icon: "arrow.clockwise", style: .secondary) {
-                        clearAppNameCache()
+                    if let message = cacheClearMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text(message)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
+                .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
             }
 
             ModernSettingsCard(title: "Logging", icon: "doc.text") {
@@ -1785,7 +1803,17 @@ extension SettingsView {
     }
 
     func clearAppNameCache() {
-        AppNameResolver.shared.clearCache()
+        let entriesCleared = AppNameResolver.shared.clearCache()
+        if entriesCleared > 0 {
+            cacheClearMessage = "Cleared \(entriesCleared) cached app names. Changes take effect immediately."
+        } else {
+            cacheClearMessage = "Cache was already empty. No restart needed."
+        }
+
+        // Auto-hide the message after 5 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            cacheClearMessage = nil
+        }
     }
 }
 

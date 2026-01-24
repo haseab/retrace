@@ -143,7 +143,8 @@ public class AppNameResolver {
         let appFolders = [
             URL(fileURLWithPath: "/Applications"),
             URL(fileURLWithPath: "/System/Applications"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications"),
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
         ]
 
         for folder in appFolders {
@@ -239,8 +240,11 @@ public class AppNameResolver {
 
     /// Clear all cached app names (both memory and disk)
     /// Call this when app names appear stale or incorrect
-    public func clearCache() {
+    /// - Returns: Number of entries cleared from cache
+    @discardableResult
+    public func clearCache() -> Int {
         lock.lock()
+        let entriesCleared = cache.count + diskCache.count
         cache.removeAll()
         diskCache.removeAll()
         isDirty = false
@@ -257,7 +261,8 @@ public class AppNameResolver {
         // Clear the timestamp so it will be refreshed
         UserDefaults.standard.removeObject(forKey: "search.otherAppsCacheSavedAt")
 
-        print("[AppNameResolver] Cache cleared")
+        print("[AppNameResolver] Cache cleared (\(entriesCleared) entries)")
+        return entriesCleared
     }
 }
 

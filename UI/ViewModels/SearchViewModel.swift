@@ -24,9 +24,14 @@ public class SearchViewModel: ObservableObject {
 
     // Filters
     @Published public var selectedAppFilters: Set<String>?  // nil = all apps, empty set also means all apps
+    @Published public var appFilterMode: AppFilterMode = .include  // include or exclude selected apps
     @Published public var startDate: Date?
     @Published public var endDate: Date?
     @Published public var contentType: ContentType = .all
+    @Published public var selectedTags: Set<Int64>?  // nil = all tags
+    @Published public var tagFilterMode: TagFilterMode = .include  // include or exclude selected tags
+    @Published public var hiddenFilter: HiddenFilter = .hide  // How to handle hidden segments
+    @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
 
     // Search mode (tabs)
     @Published public var searchMode: SearchMode = .relevant
@@ -154,12 +159,14 @@ public class SearchViewModel: ObservableObject {
             .store(in: &cancellables)
 
         // Re-search when filters change (skip during cache restore)
+        // Use CombineLatest to watch all filter properties
         Publishers.CombineLatest4(
             $selectedAppFilters,
             $startDate,
             $endDate,
             $contentType
         )
+        .combineLatest($selectedTags, $hiddenFilter)
         .dropFirst()  // Skip initial values
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -245,17 +252,48 @@ public class SearchViewModel: ObservableObject {
 
     private func buildSearchQuery(_ text: String, offset: Int = 0) -> SearchQuery {
         // Convert Set to Array for the filter, nil if no apps selected (means all apps)
-        let appBundleIDsArray: [String]? = if let apps = selectedAppFilters, !apps.isEmpty {
-            Array(apps)
+        // Use appBundleIDs for include mode, excludedAppBundleIDs for exclude mode
+        let appBundleIDsArray: [String]?
+        let excludedAppBundleIDsArray: [String]?
+
+        if let apps = selectedAppFilters, !apps.isEmpty {
+            if appFilterMode == .include {
+                appBundleIDsArray = Array(apps)
+                excludedAppBundleIDsArray = nil
+            } else {
+                appBundleIDsArray = nil
+                excludedAppBundleIDsArray = Array(apps)
+            }
         } else {
-            nil
+            appBundleIDsArray = nil
+            excludedAppBundleIDsArray = nil
+        }
+
+        // Convert tag Set to Array, similar to apps
+        let selectedTagIdsArray: [Int64]?
+        let excludedTagIdsArray: [Int64]?
+
+        if let tags = selectedTags, !tags.isEmpty {
+            if tagFilterMode == .include {
+                selectedTagIdsArray = Array(tags)
+                excludedTagIdsArray = nil
+            } else {
+                selectedTagIdsArray = nil
+                excludedTagIdsArray = Array(tags)
+            }
+        } else {
+            selectedTagIdsArray = nil
+            excludedTagIdsArray = nil
         }
 
         let filters = SearchFilters(
             startDate: startDate,
             endDate: endDate,
             appBundleIDs: appBundleIDsArray,
-            excludedAppBundleIDs: nil
+            excludedAppBundleIDs: excludedAppBundleIDsArray,
+            selectedTagIds: selectedTagIdsArray,
+            excludedTagIds: excludedTagIdsArray,
+            hiddenFilter: hiddenFilter
         )
 
         return SearchQuery(
@@ -505,14 +543,76 @@ public class SearchViewModel: ObservableObject {
 
     public func clearAllFilters() {
         selectedAppFilters = nil
+        appFilterMode = .include
         startDate = nil
         endDate = nil
         contentType = .all
+        selectedTags = nil
+        tagFilterMode = .include
+        hiddenFilter = .hide
+    }
+
+    /// Set app filter mode (include/exclude)
+    public func setAppFilterMode(_ mode: AppFilterMode) {
+        appFilterMode = mode
+    }
+
+    // MARK: - Tag Filters
+
+    /// Load available tags for the filter dropdown
+    public func loadAvailableTags() async {
+        do {
+            let tags = try await coordinator.getAllTags()
+            await MainActor.run {
+                self.availableTags = tags
+            }
+            Log.debug("[SearchViewModel] Loaded \(tags.count) tags for filter", category: .ui)
+        } catch {
+            Log.error("[SearchViewModel] Failed to load tags: \(error)", category: .ui)
+        }
+    }
+
+    /// Toggle a tag in the filter - if tagId is nil, clears all tag filters
+    public func toggleTagFilter(_ tagId: TagID?) {
+        guard let tagId = tagId else {
+            // Clear all tag filters (select "All Tags")
+            selectedTags = nil
+            return
+        }
+
+        let tagIdValue = tagId.value
+        if selectedTags == nil {
+            // Currently showing all tags - start a new selection with just this tag
+            selectedTags = [tagIdValue]
+        } else if selectedTags!.contains(tagIdValue) {
+            // Remove this tag from selection
+            selectedTags!.remove(tagIdValue)
+            // If no tags left, go back to "all tags"
+            if selectedTags!.isEmpty {
+                selectedTags = nil
+            }
+        } else {
+            // Add this tag to selection
+            selectedTags!.insert(tagIdValue)
+        }
+    }
+
+    /// Set tag filter mode (include/exclude)
+    public func setTagFilterMode(_ mode: TagFilterMode) {
+        tagFilterMode = mode
+    }
+
+    /// Set hidden filter mode
+    public func setHiddenFilter(_ filter: HiddenFilter) {
+        hiddenFilter = filter
     }
 
     /// Check if any filters are active
     public var hasActiveFilters: Bool {
-        (selectedAppFilters != nil && !selectedAppFilters!.isEmpty) || startDate != nil || endDate != nil
+        (selectedAppFilters != nil && !selectedAppFilters!.isEmpty) ||
+        startDate != nil || endDate != nil ||
+        (selectedTags != nil && !selectedTags!.isEmpty) ||
+        hiddenFilter != .hide
     }
 
     /// Get the display name for the selected app filter(s)

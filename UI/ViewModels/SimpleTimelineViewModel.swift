@@ -419,13 +419,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Filter State
 
     /// Current applied filter criteria
-    @Published public var filterCriteria: FilterCriteria = .none {
-        didSet {
-            if filterCriteria != oldValue {
-                _cachedFilteredAppBlocks = nil  // Clear filtered cache when filters change
-            }
-        }
-    }
+    @Published public var filterCriteria: FilterCriteria = .none
 
     /// Pending filter criteria (edited in panel, applied on submit)
     @Published public var pendingFilterCriteria: FilterCriteria = .none
@@ -566,23 +560,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Cached app blocks - only recomputed when frames change
     private var _cachedAppBlocks: [AppBlock]?
 
-    /// Cached filtered app blocks - recomputed when filters change
-    private var _cachedFilteredAppBlocks: [AppBlock]?
-
     /// App blocks grouped by consecutive bundle IDs
-    /// Returns filtered blocks when filters are active
+    /// Note: Since we do server-side filtering, frames already contains only filtered results when filters are active
     public var appBlocks: [AppBlock] {
-        // If filters are active, return filtered blocks
-        if filterCriteria.hasActiveFilters {
-            if let cached = _cachedFilteredAppBlocks {
-                return cached
-            }
-            let blocks = groupFramesIntoBlocks(from: filteredFrames)
-            _cachedFilteredAppBlocks = blocks
-            return blocks
-        }
-
-        // No filters - return all blocks
         if let cached = _cachedAppBlocks {
             return cached
         }
@@ -761,7 +741,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let endDate = calendar.date(byAdding: .minute, value: 10, to: timestamp) ?? timestamp
 
             Log.debug("[DataSourceChange] Fetching frames from \(startDate) to \(endDate)", category: .ui)
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
             Log.debug("[DataSourceChange] Fetched \(framesWithVideoInfo.count) frames from data adapter", category: .ui)
 
             if !framesWithVideoInfo.isEmpty {
@@ -1164,70 +1146,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Filter Operations
 
-    /// Check if a frame passes the current filter criteria
-    public func passesFilter(_ timelineFrame: TimelineFrame) -> Bool {
-        let frame = timelineFrame.frame
-
-        // App filter
-        if let apps = filterCriteria.selectedApps, !apps.isEmpty {
-            guard let bundleID = frame.metadata.appBundleID,
-                  apps.contains(bundleID) else {
-                return false
-            }
-        }
-
-        // Source filter
-        if let sources = filterCriteria.selectedSources, !sources.isEmpty {
-            guard sources.contains(frame.source) else {
-                return false
-            }
-        }
-
-        // Hidden filter
-        let segmentId = SegmentID(value: frame.segmentID.value)
-        let isHidden = hiddenSegmentIds.contains(segmentId)
-        switch filterCriteria.hiddenFilter {
-        case .hide:
-            if isHidden { return false }
-        case .onlyHidden:
-            if !isHidden { return false }
-        case .showAll:
-            break // Show all segments regardless of hidden status
-        }
-
-        // Tag filter
-        if let tags = filterCriteria.selectedTags, !tags.isEmpty {
-            let segmentIdValue = frame.segmentID.value
-            guard let segmentTags = segmentTagsMap[segmentIdValue],
-                  !segmentTags.isDisjoint(with: tags) else {
-                return false
-            }
-        }
-
-        return true
-    }
-
-    /// Get filtered frames based on current filter criteria
-    public var filteredFrames: [TimelineFrame] {
-        guard filterCriteria.hasActiveFilters else {
-            return frames
-        }
-        return frames.filter { passesFilter($0) }
-    }
-
     /// Check if a frame at a given index is in a hidden segment
     public func isFrameHidden(at index: Int) -> Bool {
         guard index >= 0 && index < frames.count else { return false }
         let segmentId = SegmentID(value: frames[index].frame.segmentID.value)
         return hiddenSegmentIds.contains(segmentId)
-    }
-
-    /// Get app blocks from filtered frames (used when filters are active)
-    public var filteredAppBlocks: [AppBlock] {
-        guard filterCriteria.hasActiveFilters else {
-            return appBlocks
-        }
-        return groupFramesIntoBlocks(from: filteredFrames)
     }
 
     /// Group frames into app blocks (parameterized version for filtered frames)
@@ -1391,11 +1314,28 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.debug("[Filter] Set hidden filter to \(mode.rawValue) (pending)", category: .ui)
     }
 
+    /// Set app filter mode (include/exclude) (updates pending, not applied)
+    public func setAppFilterMode(_ mode: AppFilterMode) {
+        pendingFilterCriteria.appFilterMode = mode
+        Log.debug("[Filter] Set app filter mode to \(mode.rawValue) (pending)", category: .ui)
+    }
+
+    /// Set tag filter mode (include/exclude) (updates pending, not applied)
+    public func setTagFilterMode(_ mode: TagFilterMode) {
+        pendingFilterCriteria.tagFilterMode = mode
+        Log.debug("[Filter] Set tag filter mode to \(mode.rawValue) (pending)", category: .ui)
+    }
+
     /// Apply pending filters
     public func applyFilters() {
         filterCriteria = pendingFilterCriteria
-        Log.debug("[Filter] Applied filters", category: .ui)
+        Log.debug("[Filter] Applied filters: \(filterCriteria)", category: .ui)
         dismissFilterPanel()
+
+        // Reload timeline with filters
+        Task {
+            await loadMostRecentFrame()
+        }
     }
 
     /// Clear all pending filters
@@ -1409,6 +1349,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         filterCriteria = .none
         pendingFilterCriteria = .none
         Log.debug("[Filter] Cleared all filters", category: .ui)
+
+        // Reload timeline without filters
+        Task {
+            await loadMostRecentFrame()
+        }
+    }
+
+    /// Show "no results" message and provide option to clear filters
+    private func showNoResultsMessage() {
+        error = "No frames found matching the current filters. Clear filters to see all frames."
     }
 
     /// Dismiss filter panel (resets pending to match applied)
@@ -1565,6 +1515,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
 
+        // Check if filters have changed - don't use cache if filters are active
+        // (cached frames might not match current filter criteria)
+        if filterCriteria.hasActiveFilters {
+            Log.debug("[PositionCache] Filters are active - skipping frame cache", category: .ui)
+            return nil
+        }
+
         let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
         guard savedAt > 0 else { return nil }
 
@@ -1689,7 +1646,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let startDate = calendar.date(byAdding: .minute, value: -10, to: cachedPosition) ?? cachedPosition
                 let endDate = calendar.date(byAdding: .minute, value: 10, to: cachedPosition) ?? cachedPosition
 
-                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+                // Apply filters if active
+                let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
 
                 if !framesWithVideoInfo.isEmpty {
                     // Convert to TimelineFrame - video info is already included from the JOIN
@@ -1724,10 +1683,18 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // No cached position (or cache was empty) - load most recent frames
             // Uses optimized query that JOINs on video table - no N+1 queries!
-            let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: activeFilters?.selectedApps)), mode: \(activeFilters?.appFilterMode.rawValue ?? "nil")", category: .ui)
+            let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: activeFilters)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found in any database"
+                // No frames found - check if filters are active
+                if filterCriteria.hasActiveFilters {
+                    showNoResultsMessage()
+                } else {
+                    error = "No frames found in any database"
+                }
                 isLoading = false
                 return
             }
@@ -1854,7 +1821,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[SearchNavigation] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))", category: .ui)
 
             // Fetch all frames in the 20-minute window with video info (single optimized query)
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
             Log.debug("[SearchNavigation] Loaded \(framesWithVideoInfo.count) frames in time range", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -3220,10 +3189,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
             let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
 
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found around \(targetDate)"
+                // No frames found - check if filters are active
+                if filterCriteria.hasActiveFilters {
+                    showNoResultsMessage()
+                } else {
+                    error = "No frames found around \(targetDate)"
+                }
                 isLoading = false
                 return
             }
@@ -3293,7 +3269,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Fetch all frames in the 20-minute window
             // Uses optimized query that JOINs on video table - no N+1 queries!
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
             Log.debug("[DateSearch] Got \(framesWithVideoInfo.count) frames", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -3366,7 +3344,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
 
             // Fetch all frames in the window
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: activeFilters)
             Log.debug("[FrameIDSearch] Got \(framesWithVideoInfo.count) frames in window", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -3718,9 +3698,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         do {
             // Query frames before the oldest timestamp
             // Uses optimized query that JOINs on video table - no N+1 queries!
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
                 timestamp: oldestTimestamp,
-                limit: WindowConfig.loadBatchSize
+                limit: WindowConfig.loadBatchSize,
+                filters: activeFilters
             )
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -3779,9 +3762,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         do {
             // Query frames after the newest timestamp
             // Uses optimized query that JOINs on video table - no N+1 queries!
+            // Apply filters if active
+            let activeFilters = filterCriteria.hasActiveFilters ? filterCriteria : nil
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
                 timestamp: newestTimestamp,
-                limit: WindowConfig.loadBatchSize
+                limit: WindowConfig.loadBatchSize,
+                filters: activeFilters
             )
 
             guard !framesWithVideoInfo.isEmpty else {

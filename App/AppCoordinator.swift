@@ -749,91 +749,91 @@ public actor AppCoordinator {
 
     /// Get frames in a time range
     /// Seamlessly blends data from all sources via DataAdapter
-    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameReference] {
+    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database if adapter not available
             return try await services.database.getFrames(from: startDate, to: endDate, limit: limit)
         }
 
-        return try await adapter.getFrames(from: startDate, to: endDate, limit: limit)
+        return try await adapter.getFrames(from: startDate, to: endDate, limit: limit, filters: filters)
     }
 
     /// Get frames with video info in a time range (optimized - single query with JOINs)
     /// This is the preferred method for timeline views to avoid N+1 queries
-    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database (no video info for native)
             let frames = try await services.database.getFrames(from: startDate, to: endDate, limit: limit)
             return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
         }
 
-        return try await adapter.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
+        return try await adapter.getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
     }
 
     /// Get the most recent frames across all sources
     /// Returns frames sorted by timestamp descending (newest first)
-    public func getMostRecentFrames(limit: Int = 500) async throws -> [FrameReference] {
+    public func getMostRecentFrames(limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database
             return try await services.database.getMostRecentFrames(limit: limit)
         }
 
-        return try await adapter.getMostRecentFrames(limit: limit)
+        return try await adapter.getMostRecentFrames(limit: limit, filters: filters)
     }
 
     /// Get the most recent frames with video info (optimized - single query with JOINs)
-    public func getMostRecentFramesWithVideoInfo(limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+    public func getMostRecentFramesWithVideoInfo(limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database (no video info for native)
             let frames = try await services.database.getMostRecentFrames(limit: limit)
             return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
         }
 
-        return try await adapter.getMostRecentFramesWithVideoInfo(limit: limit)
+        return try await adapter.getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
     }
 
     /// Get frames before a timestamp (for infinite scroll - loading older frames)
     /// Returns frames sorted by timestamp descending (newest first of the older batch)
-    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+    public func getFramesBefore(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database
             return try await services.database.getFramesBefore(timestamp: timestamp, limit: limit)
         }
 
-        return try await adapter.getFramesBefore(timestamp: timestamp, limit: limit)
+        return try await adapter.getFramesBefore(timestamp: timestamp, limit: limit, filters: filters)
     }
 
     /// Get frames with video info before a timestamp (optimized - single query with JOINs)
-    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database (no video info for native)
             let frames = try await services.database.getFramesBefore(timestamp: timestamp, limit: limit)
             return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
         }
 
-        return try await adapter.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+        return try await adapter.getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, filters: filters)
     }
 
     /// Get frames after a timestamp (for infinite scroll - loading newer frames)
     /// Returns frames sorted by timestamp ascending (oldest first of the newer batch)
-    public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
+    public func getFramesAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database
             return try await services.database.getFramesAfter(timestamp: timestamp, limit: limit)
         }
 
-        return try await adapter.getFramesAfter(timestamp: timestamp, limit: limit)
+        return try await adapter.getFramesAfter(timestamp: timestamp, limit: limit, filters: filters)
     }
 
     /// Get frames with video info after a timestamp (optimized - single query with JOINs)
-    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard let adapter = await services.dataAdapter else {
             // Fallback to database (no video info for native)
             let frames = try await services.database.getFramesAfter(timestamp: timestamp, limit: limit)
             return frames.map { FrameWithVideoInfo(frame: $0, videoInfo: nil) }
         }
 
-        return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+        return try await adapter.getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, filters: filters)
     }
 
     /// Get the timestamp of the most recent frame across all sources

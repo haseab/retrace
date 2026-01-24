@@ -3058,11 +3058,21 @@ struct FilterPanel: View {
         guard let selected = viewModel.pendingFilterCriteria.selectedApps, !selected.isEmpty else {
             return "All Apps"
         }
+        let isExclude = viewModel.pendingFilterCriteria.appFilterMode == .exclude
+        let prefix = isExclude ? "Exclude: " : ""
+
         if selected.count == 1, let bundleID = selected.first,
            let app = viewModel.availableAppsForFilter.first(where: { $0.bundleID == bundleID }) {
-            return app.name
+            return prefix + app.name
         }
-        return "\(selected.count) Apps"
+        return prefix + "\(selected.count) Apps"
+    }
+
+    /// Whether apps filter is in exclude mode
+    private var isAppsExcludeMode: Bool {
+        viewModel.pendingFilterCriteria.appFilterMode == .exclude &&
+        viewModel.pendingFilterCriteria.selectedApps != nil &&
+        !viewModel.pendingFilterCriteria.selectedApps!.isEmpty
     }
 
     /// Label for tags filter chip (uses pending criteria)
@@ -3098,16 +3108,6 @@ struct FilterPanel: View {
                     .foregroundColor(.white)
 
                 Spacer()
-
-                // Clear button (only when pending filters are active)
-                if viewModel.pendingFilterCriteria.hasActiveFilters {
-                    Button(action: { viewModel.clearPendingFilters() }) {
-                        Text("Clear")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                }
 
                 Button(action: { viewModel.dismissFilterPanel() }) {
                     Image(systemName: "xmark")
@@ -3283,19 +3283,38 @@ struct FilterPanel: View {
                 .frame(height: 1)
                 .padding(.horizontal, 20)
 
-            // Apply button
-            Button(action: { viewModel.applyFilters() }) {
-                Text("Apply Filters")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
-                    )
+            // Action buttons
+            HStack(spacing: 12) {
+                // Clear button (only when pending filters are active)
+                if viewModel.pendingFilterCriteria.hasActiveFilters {
+                    Button(action: { viewModel.clearPendingFilters() }) {
+                        Text("Clear")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.7))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.white.opacity(0.1))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                // Apply button
+                Button(action: { viewModel.applyFilters() }) {
+                    Text("Apply Filters")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
+                        )
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
             .padding(.horizontal, 20)
             .padding(.top, 16)
             .padding(.bottom, 20)
@@ -3415,6 +3434,7 @@ struct FilterDropdownOverlay: View {
                 apps: viewModel.availableAppsForFilter,
                 otherApps: viewModel.otherAppsForFilter,
                 selectedApps: viewModel.pendingFilterCriteria.selectedApps,
+                filterMode: viewModel.pendingFilterCriteria.appFilterMode,
                 allowMultiSelect: true,
                 onSelectApp: { bundleID in
                     if let bundleID = bundleID {
@@ -3422,12 +3442,16 @@ struct FilterDropdownOverlay: View {
                     } else {
                         viewModel.pendingFilterCriteria.selectedApps = nil
                     }
+                },
+                onFilterModeChange: { mode in
+                    viewModel.setAppFilterMode(mode)
                 }
             )
         case .tags:
             TagsFilterPopover(
                 tags: viewModel.availableTags,
                 selectedTags: viewModel.pendingFilterCriteria.selectedTags,
+                filterMode: viewModel.pendingFilterCriteria.tagFilterMode,
                 allowMultiSelect: true,
                 onSelectTag: { tagId in
                     if let tagId = tagId {
@@ -3435,6 +3459,9 @@ struct FilterDropdownOverlay: View {
                     } else {
                         viewModel.pendingFilterCriteria.selectedTags = nil
                     }
+                },
+                onFilterModeChange: { mode in
+                    viewModel.setTagFilterMode(mode)
                 }
             )
         case .visibility:

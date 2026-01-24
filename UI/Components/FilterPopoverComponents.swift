@@ -2,6 +2,72 @@ import SwiftUI
 import Shared
 import AppKit
 
+// MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
+
+/// Modifier that hides the focus ring, with availability check for macOS 14.0+
+private struct FocusEffectDisabledModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+    }
+}
+
+// MARK: - Keyboard Navigation Handler
+
+/// View modifier that handles arrow key and return key navigation for filter popovers
+/// Compatible with macOS 13.0+
+private struct KeyboardNavigationModifier: ViewModifier {
+    let onUpArrow: () -> Void
+    let onDownArrow: () -> Void
+    let onReturn: () -> Void
+
+    @State private var eventMonitor: Any?
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                    switch event.keyCode {
+                    case 126: // Up arrow
+                        onUpArrow()
+                        return nil // Consume the event
+                    case 125: // Down arrow
+                        onDownArrow()
+                        return nil // Consume the event
+                    case 36: // Return key
+                        onReturn()
+                        return nil // Consume the event
+                    default:
+                        return event // Pass through other events
+                    }
+                }
+            }
+            .onDisappear {
+                if let monitor = eventMonitor {
+                    NSEvent.removeMonitor(monitor)
+                    eventMonitor = nil
+                }
+            }
+    }
+}
+
+extension View {
+    func keyboardNavigation(
+        onUpArrow: @escaping () -> Void,
+        onDownArrow: @escaping () -> Void,
+        onReturn: @escaping () -> Void
+    ) -> some View {
+        modifier(KeyboardNavigationModifier(
+            onUpArrow: onUpArrow,
+            onDownArrow: onDownArrow,
+            onReturn: onReturn
+        ))
+    }
+}
+
 // MARK: - Filter Row
 
 /// Reusable filter row component matching the spotlight search style
@@ -11,6 +77,7 @@ public struct FilterRow: View {
     let title: String
     let subtitle: String?
     let isSelected: Bool
+    let isKeyboardHighlighted: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -20,12 +87,14 @@ public struct FilterRow: View {
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
+        isKeyboardHighlighted: Bool = false,
         action: @escaping () -> Void
     ) {
         self.icon = icon
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
+        self.isKeyboardHighlighted = isKeyboardHighlighted
         self.action = action
     }
 
@@ -35,12 +104,14 @@ public struct FilterRow: View {
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
+        isKeyboardHighlighted: Bool = false,
         action: @escaping () -> Void
     ) {
         self.icon = Image(systemName: systemIcon)
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
+        self.isKeyboardHighlighted = isKeyboardHighlighted
         self.action = action
     }
 
@@ -50,6 +121,7 @@ public struct FilterRow: View {
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
+        isKeyboardHighlighted: Bool = false,
         action: @escaping () -> Void
     ) {
         if let nsImage = nsImage {
@@ -60,7 +132,12 @@ public struct FilterRow: View {
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
+        self.isKeyboardHighlighted = isKeyboardHighlighted
         self.action = action
+    }
+
+    private var shouldHighlight: Bool {
+        isHovered || isKeyboardHighlighted
     }
 
     public var body: some View {
@@ -72,7 +149,7 @@ public struct FilterRow: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(width: RetraceMenuStyle.iconFrameWidth)
-                        .foregroundColor(RetraceMenuStyle.textColorMuted)
+                        .foregroundColor(shouldHighlight ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
                 }
 
                 // Title and optional subtitle
@@ -80,7 +157,7 @@ public struct FilterRow: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(title)
                             .font(RetraceMenuStyle.font)
-                            .foregroundColor(isHovered ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                            .foregroundColor(shouldHighlight ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
                             .lineLimit(1)
                         Text(subtitle)
                             .font(.system(size: 11))
@@ -90,7 +167,7 @@ public struct FilterRow: View {
                 } else {
                     Text(title)
                         .font(RetraceMenuStyle.font)
-                        .foregroundColor(isHovered ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                        .foregroundColor(shouldHighlight ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
                         .lineLimit(1)
                 }
 
@@ -107,7 +184,7 @@ public struct FilterRow: View {
             .padding(.vertical, RetraceMenuStyle.itemPaddingV)
             .background(
                 RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
-                    .fill(isHovered ? RetraceMenuStyle.itemHoverColor : Color.clear)
+                    .fill(shouldHighlight ? RetraceMenuStyle.itemHoverColor : Color.clear)
             )
             .contentShape(Rectangle())
         }
@@ -202,50 +279,86 @@ public struct FilterSearchField: View {
 
 /// Reusable apps filter popover that can be used for both single and multi-select
 /// Supports showing installed apps first, then "Other Apps" section for uninstalled apps
+/// Supports include/exclude mode for flexible filtering
 public struct AppsFilterPopover: View {
     let apps: [(bundleID: String, name: String)]
     let otherApps: [(bundleID: String, name: String)]
     let selectedApps: Set<String>?
+    let filterMode: AppFilterMode
     let allowMultiSelect: Bool
     let onSelectApp: (String?) -> Void
+    let onFilterModeChange: ((AppFilterMode) -> Void)?
     var onDismiss: (() -> Void)?
 
     @State private var searchText = ""
+    /// Highlighted item ID: nil means "All Apps", otherwise it's the bundleID
+    @State private var highlightedItemID: String? = nil
+    /// Special flag to indicate "All Apps" is highlighted (since nil bundleID is ambiguous)
+    @State private var isAllAppsHighlighted: Bool = true
     @FocusState private var isSearchFocused: Bool
+
+    /// Cached initial selection state - used for sorting so list doesn't re-order while open
+    @State private var initialSelectedApps: Set<String> = []
 
     public init(
         apps: [(bundleID: String, name: String)],
         otherApps: [(bundleID: String, name: String)] = [],
         selectedApps: Set<String>?,
+        filterMode: AppFilterMode = .include,
         allowMultiSelect: Bool = false,
         onSelectApp: @escaping (String?) -> Void,
+        onFilterModeChange: ((AppFilterMode) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) {
         self.apps = apps
         self.otherApps = otherApps
         self.selectedApps = selectedApps
+        self.filterMode = filterMode
         self.allowMultiSelect = allowMultiSelect
         self.onSelectApp = onSelectApp
+        self.onFilterModeChange = onFilterModeChange
         self.onDismiss = onDismiss
     }
 
     private var filteredApps: [(bundleID: String, name: String)] {
+        let baseApps: [(bundleID: String, name: String)]
         if searchText.isEmpty {
-            return apps
+            baseApps = apps
+        } else {
+            baseApps = apps.filter { app in
+                app.bundleID.localizedCaseInsensitiveContains(searchText) ||
+                app.name.localizedCaseInsensitiveContains(searchText)
+            }
         }
-        return apps.filter { app in
-            app.bundleID.localizedCaseInsensitiveContains(searchText) ||
-            app.name.localizedCaseInsensitiveContains(searchText)
+        // Sort using INITIAL selection state so list doesn't jump while navigating
+        return baseApps.sorted { app1, app2 in
+            let app1Selected = initialSelectedApps.contains(app1.bundleID)
+            let app2Selected = initialSelectedApps.contains(app2.bundleID)
+            if app1Selected != app2Selected {
+                return app1Selected
+            }
+            return app1.name.localizedCaseInsensitiveCompare(app2.name) == .orderedAscending
         }
     }
 
     private var filteredOtherApps: [(bundleID: String, name: String)] {
+        let baseApps: [(bundleID: String, name: String)]
         if searchText.isEmpty {
-            return otherApps
+            baseApps = otherApps
+        } else {
+            baseApps = otherApps.filter { app in
+                app.bundleID.localizedCaseInsensitiveContains(searchText) ||
+                app.name.localizedCaseInsensitiveContains(searchText)
+            }
         }
-        return otherApps.filter { app in
-            app.bundleID.localizedCaseInsensitiveContains(searchText) ||
-            app.name.localizedCaseInsensitiveContains(searchText)
+        // Sort using INITIAL selection state so list doesn't jump while navigating
+        return baseApps.sorted { app1, app2 in
+            let app1Selected = initialSelectedApps.contains(app1.bundleID)
+            let app2Selected = initialSelectedApps.contains(app2.bundleID)
+            if app1Selected != app2Selected {
+                return app1Selected
+            }
+            return app1.name.localizedCaseInsensitiveCompare(app2.name) == .orderedAscending
         }
     }
 
@@ -253,80 +366,275 @@ public struct AppsFilterPopover: View {
         selectedApps == nil || selectedApps!.isEmpty
     }
 
+    private var hasFilterModeSupport: Bool {
+        onFilterModeChange != nil
+    }
+
+    /// Build a flat list of selectable bundle IDs for keyboard navigation
+    /// nil at the start represents "All Apps" option
+    private var selectableBundleIDs: [String?] {
+        var ids: [String?] = []
+
+        // "All Apps" option (only in include mode and not searching)
+        if filterMode == .include && searchText.isEmpty {
+            ids.append(nil)
+        }
+
+        // Installed apps
+        for app in filteredApps {
+            ids.append(app.bundleID)
+        }
+
+        // Other apps
+        for app in filteredOtherApps {
+            ids.append(app.bundleID)
+        }
+
+        return ids
+    }
+
+    private func selectHighlightedItem() {
+        if isAllAppsHighlighted {
+            onSelectApp(nil)
+        } else if let bundleID = highlightedItemID {
+            onSelectApp(bundleID)
+        }
+        if !allowMultiSelect {
+            onDismiss?()
+        }
+    }
+
+    private func moveHighlight(by offset: Int) {
+        let ids = selectableBundleIDs
+        guard !ids.isEmpty else { return }
+
+        // Find current index
+        let currentIndex: Int
+        if isAllAppsHighlighted {
+            currentIndex = ids.firstIndex(where: { $0 == nil }) ?? 0
+        } else if let bundleID = highlightedItemID {
+            currentIndex = ids.firstIndex(where: { $0 == bundleID }) ?? 0
+        } else {
+            currentIndex = 0
+        }
+
+        // Calculate new index
+        let newIndex = max(0, min(ids.count - 1, currentIndex + offset))
+        let newID = ids[newIndex]
+
+        if newID == nil {
+            isAllAppsHighlighted = true
+            highlightedItemID = nil
+        } else {
+            isAllAppsHighlighted = false
+            highlightedItemID = newID
+        }
+    }
+
+    /// Check if a specific app is keyboard-highlighted
+    private func isAppHighlighted(_ bundleID: String) -> Bool {
+        !isAllAppsHighlighted && highlightedItemID == bundleID
+    }
+
+    /// Reset highlight to first item
+    private func resetHighlightToFirst() {
+        let ids = selectableBundleIDs
+        if let first = ids.first {
+            if first == nil {
+                isAllAppsHighlighted = true
+                highlightedItemID = nil
+            } else {
+                isAllAppsHighlighted = false
+                highlightedItemID = first
+            }
+        }
+    }
+
     public var body: some View {
         FilterPopoverContainer {
             // Search field
             FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFocused)
 
+            // Include/Exclude toggle (only shown if filter mode change is supported)
+            if hasFilterModeSupport {
+                Divider()
+
+                HStack(spacing: 0) {
+                    FilterModeButton(
+                        title: "Include",
+                        icon: "checkmark.circle",
+                        isSelected: filterMode == .include
+                    ) {
+                        onFilterModeChange?(.include)
+                    }
+
+                    FilterModeButton(
+                        title: "Exclude",
+                        icon: "minus.circle",
+                        isSelected: filterMode == .exclude
+                    ) {
+                        onFilterModeChange?(.exclude)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+
             Divider()
 
             // App list
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    // "All Apps" option
-                    FilterRow(
-                        systemIcon: "square.grid.2x2.fill",
-                        title: "All Apps",
-                        isSelected: isAllAppsSelected
-                    ) {
-                        onSelectApp(nil)
-                        if !allowMultiSelect {
-                            onDismiss?()
-                        }
-                    }
-
-                    Divider()
-                        .padding(.vertical, 4)
-
-                    // Installed apps
-                    ForEach(filteredApps, id: \.bundleID) { app in
-                        FilterRow(
-                            nsImage: AppIconProvider.shared.icon(for: app.bundleID),
-                            title: app.name,
-                            isSelected: selectedApps?.contains(app.bundleID) ?? false
-                        ) {
-                            onSelectApp(app.bundleID)
-                            if !allowMultiSelect {
-                                onDismiss?()
-                            }
-                        }
-                    }
-
-                    // "Other Apps" section (uninstalled apps from history)
-                    if !filteredOtherApps.isEmpty {
-                        Divider()
-                            .padding(.vertical, 8)
-
-                        Text("Other Apps")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .padding(.bottom, 4)
-
-                        ForEach(filteredOtherApps, id: \.bundleID) { app in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        // "All Apps" option (only in include mode and when not searching)
+                        if filterMode == .include && searchText.isEmpty {
                             FilterRow(
-                                systemIcon: "app.dashed",
+                                systemIcon: "square.grid.2x2.fill",
+                                title: "All Apps",
+                                isSelected: isAllAppsSelected,
+                                isKeyboardHighlighted: isAllAppsHighlighted
+                            ) {
+                                onSelectApp(nil)
+                                if !allowMultiSelect {
+                                    onDismiss?()
+                                }
+                            }
+                            .id("all-apps")
+
+                            Divider()
+                                .padding(.vertical, 4)
+                        } else if filterMode == .exclude {
+                            // In exclude mode, show a hint
+                            Text("Select apps to hide")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                        }
+
+                        // Installed apps
+                        ForEach(filteredApps, id: \.bundleID) { app in
+                            FilterRow(
+                                nsImage: AppIconProvider.shared.icon(for: app.bundleID),
                                 title: app.name,
-                                isSelected: selectedApps?.contains(app.bundleID) ?? false
+                                isSelected: selectedApps?.contains(app.bundleID) ?? false,
+                                isKeyboardHighlighted: isAppHighlighted(app.bundleID)
                             ) {
                                 onSelectApp(app.bundleID)
                                 if !allowMultiSelect {
                                     onDismiss?()
                                 }
                             }
+                            .id(app.bundleID)
+                        }
+
+                        // "Other Apps" section (uninstalled apps from history)
+                        if !filteredOtherApps.isEmpty {
+                            Divider()
+                                .padding(.vertical, 8)
+
+                            Text("Other Apps")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 4)
+
+                            ForEach(filteredOtherApps, id: \.bundleID) { app in
+                                FilterRow(
+                                    systemIcon: "app.dashed",
+                                    title: app.name,
+                                    isSelected: selectedApps?.contains(app.bundleID) ?? false,
+                                    isKeyboardHighlighted: isAppHighlighted(app.bundleID)
+                                ) {
+                                    onSelectApp(app.bundleID)
+                                    if !allowMultiSelect {
+                                        onDismiss?()
+                                    }
+                                }
+                                .id(app.bundleID)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(maxHeight: 300)
+                .onChange(of: highlightedItemID) { newID in
+                    // Scroll to highlighted item
+                    if isAllAppsHighlighted {
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            proxy.scrollTo("all-apps", anchor: .center)
+                        }
+                    } else if let bundleID = newID {
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            proxy.scrollTo(bundleID, anchor: .center)
                         }
                     }
                 }
-                .padding(.vertical, 4)
+                .onChange(of: isAllAppsHighlighted) { highlighted in
+                    if highlighted {
+                        withAnimation(.easeOut(duration: 0.1)) {
+                            proxy.scrollTo("all-apps", anchor: .center)
+                        }
+                    }
+                }
             }
-            .frame(maxHeight: 300)
         }
         .onAppear {
+            // Capture initial selection state for stable sorting
+            initialSelectedApps = selectedApps ?? []
+
             // Autofocus the search field when popover appears
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isSearchFocused = true
             }
+            // Initialize highlight to first item
+            resetHighlightToFirst()
+        }
+        .onChange(of: searchText) { _ in
+            // Reset highlight to first item when search changes
+            resetHighlightToFirst()
+        }
+        .keyboardNavigation(
+            onUpArrow: { moveHighlight(by: -1) },
+            onDownArrow: { moveHighlight(by: 1) },
+            onReturn: { selectHighlightedItem() }
+        )
+    }
+}
+
+// MARK: - Filter Mode Button
+
+/// Toggle button for Include/Exclude filter mode
+private struct FilterModeButton: View {
+    let title: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .medium))
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? RetraceMenuStyle.actionBlue.opacity(0.2) : (isHovered ? Color.white.opacity(0.05) : Color.clear))
+            )
+            .foregroundColor(isSelected ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.textColorMuted)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
         }
     }
 }
@@ -337,21 +645,37 @@ public struct AppsFilterPopover: View {
 public struct TagsFilterPopover: View {
     let tags: [Tag]
     let selectedTags: Set<Int64>?
+    let filterMode: TagFilterMode
     let allowMultiSelect: Bool
     let onSelectTag: (TagID?) -> Void
+    let onFilterModeChange: ((TagFilterMode) -> Void)?
     var onDismiss: (() -> Void)?
+
+    @State private var searchText = ""
+    /// Highlighted tag ID: nil can mean "All Tags" or no selection
+    @State private var highlightedTagID: Int64? = nil
+    /// Special flag to indicate "All Tags" is highlighted
+    @State private var isAllTagsHighlighted: Bool = true
+    @FocusState private var isSearchFocused: Bool
+
+    /// Cached initial selection state - used for sorting so list doesn't re-order while open
+    @State private var initialSelectedTags: Set<Int64> = []
 
     public init(
         tags: [Tag],
         selectedTags: Set<Int64>?,
+        filterMode: TagFilterMode = .include,
         allowMultiSelect: Bool = false,
         onSelectTag: @escaping (TagID?) -> Void,
+        onFilterModeChange: ((TagFilterMode) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) {
         self.tags = tags
         self.selectedTags = selectedTags
+        self.filterMode = filterMode
         self.allowMultiSelect = allowMultiSelect
         self.onSelectTag = onSelectTag
+        self.onFilterModeChange = onFilterModeChange
         self.onDismiss = onDismiss
     }
 
@@ -359,12 +683,144 @@ public struct TagsFilterPopover: View {
         tags.filter { !$0.isHidden }
     }
 
+    private var filteredTags: [Tag] {
+        let baseTags: [Tag]
+        if searchText.isEmpty {
+            baseTags = visibleTags
+        } else {
+            baseTags = visibleTags.filter { tag in
+                tag.name.localizedCaseInsensitiveContains(searchText)
+            }
+        }
+        // Sort using INITIAL selection state so list doesn't jump while navigating
+        return baseTags.sorted { tag1, tag2 in
+            let tag1Selected = initialSelectedTags.contains(tag1.id.value)
+            let tag2Selected = initialSelectedTags.contains(tag2.id.value)
+            if tag1Selected != tag2Selected {
+                return tag1Selected
+            }
+            return tag1.name.localizedCaseInsensitiveCompare(tag2.name) == .orderedAscending
+        }
+    }
+
     private var isAllTagsSelected: Bool {
         selectedTags == nil || selectedTags!.isEmpty
     }
 
+    private var hasFilterModeSupport: Bool {
+        onFilterModeChange != nil
+    }
+
+    /// Build a flat list of selectable tag IDs for keyboard navigation
+    /// nil at the start represents "All Tags" option
+    private var selectableTagIDs: [Int64?] {
+        var ids: [Int64?] = []
+
+        // "All Tags" option (only in include mode and not searching)
+        if filterMode == .include && searchText.isEmpty {
+            ids.append(nil)
+        }
+
+        // Tags
+        for tag in filteredTags {
+            ids.append(tag.id.value)
+        }
+
+        return ids
+    }
+
+    private func selectHighlightedItem() {
+        if isAllTagsHighlighted {
+            onSelectTag(nil)
+        } else if let tagIDValue = highlightedTagID {
+            // Find the tag with this ID
+            if let tag = filteredTags.first(where: { $0.id.value == tagIDValue }) {
+                onSelectTag(tag.id)
+            }
+        }
+        if !allowMultiSelect {
+            onDismiss?()
+        }
+    }
+
+    private func moveHighlight(by offset: Int) {
+        let ids = selectableTagIDs
+        guard !ids.isEmpty else { return }
+
+        // Find current index
+        let currentIndex: Int
+        if isAllTagsHighlighted {
+            currentIndex = ids.firstIndex(where: { $0 == nil }) ?? 0
+        } else if let tagID = highlightedTagID {
+            currentIndex = ids.firstIndex(where: { $0 == tagID }) ?? 0
+        } else {
+            currentIndex = 0
+        }
+
+        // Calculate new index
+        let newIndex = max(0, min(ids.count - 1, currentIndex + offset))
+        let newID = ids[newIndex]
+
+        if newID == nil {
+            isAllTagsHighlighted = true
+            highlightedTagID = nil
+        } else {
+            isAllTagsHighlighted = false
+            highlightedTagID = newID
+        }
+    }
+
+    /// Check if a specific tag is keyboard-highlighted
+    private func isTagHighlighted(_ tagID: Int64) -> Bool {
+        !isAllTagsHighlighted && highlightedTagID == tagID
+    }
+
+    /// Reset highlight to first item
+    private func resetHighlightToFirst() {
+        let ids = selectableTagIDs
+        if let first = ids.first {
+            if first == nil {
+                isAllTagsHighlighted = true
+                highlightedTagID = nil
+            } else {
+                isAllTagsHighlighted = false
+                highlightedTagID = first
+            }
+        }
+    }
+
     public var body: some View {
         FilterPopoverContainer(width: 220) {
+            // Search field
+            FilterSearchField(text: $searchText, placeholder: "Search tags...", isFocused: $isSearchFocused)
+
+            // Include/Exclude toggle (only shown if filter mode change is supported)
+            if hasFilterModeSupport {
+                Divider()
+
+                HStack(spacing: 0) {
+                    FilterModeButton(
+                        title: "Include",
+                        icon: "checkmark.circle",
+                        isSelected: filterMode == .include
+                    ) {
+                        onFilterModeChange?(.include)
+                    }
+
+                    FilterModeButton(
+                        title: "Exclude",
+                        icon: "minus.circle",
+                        isSelected: filterMode == .exclude
+                    ) {
+                        onFilterModeChange?(.exclude)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+
+            Divider()
+
             if visibleTags.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "tag.slash")
@@ -376,43 +832,109 @@ public struct TagsFilterPopover: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 24)
+            } else if filteredTags.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 24))
+                        .foregroundColor(.secondary)
+                    Text("No matching tags")
+                        .font(.retraceCaption)
+                        .foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        // "All Tags" option
-                        FilterRow(
-                            systemIcon: "tag",
-                            title: "All Tags",
-                            isSelected: isAllTagsSelected
-                        ) {
-                            onSelectTag(nil)
-                            if !allowMultiSelect {
-                                onDismiss?()
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            // "All Tags" option (only in include mode and when not searching)
+                            if filterMode == .include && searchText.isEmpty {
+                                FilterRow(
+                                    systemIcon: "tag",
+                                    title: "All Tags",
+                                    isSelected: isAllTagsSelected,
+                                    isKeyboardHighlighted: isAllTagsHighlighted
+                                ) {
+                                    onSelectTag(nil)
+                                    if !allowMultiSelect {
+                                        onDismiss?()
+                                    }
+                                }
+                                .id("all-tags")
+
+                                Divider()
+                                    .padding(.vertical, 4)
+                            } else if filterMode == .exclude && searchText.isEmpty {
+                                // In exclude mode, show a hint
+                                Text("Select tags to hide")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                            }
+
+                            // Individual tags
+                            ForEach(filteredTags) { tag in
+                                FilterRow(
+                                    systemIcon: "tag.fill",
+                                    title: tag.name,
+                                    isSelected: selectedTags?.contains(tag.id.value) ?? false,
+                                    isKeyboardHighlighted: isTagHighlighted(tag.id.value)
+                                ) {
+                                    onSelectTag(tag.id)
+                                    if !allowMultiSelect {
+                                        onDismiss?()
+                                    }
+                                }
+                                .id(tag.id.value)
                             }
                         }
-
-                        Divider()
-                            .padding(.vertical, 4)
-
-                        // Individual tags
-                        ForEach(visibleTags) { tag in
-                            FilterRow(
-                                systemIcon: "tag.fill",
-                                title: tag.name,
-                                isSelected: selectedTags?.contains(tag.id.value) ?? false
-                            ) {
-                                onSelectTag(tag.id)
-                                if !allowMultiSelect {
-                                    onDismiss?()
-                                }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(maxHeight: 250)
+                    .onChange(of: highlightedTagID) { newID in
+                        // Scroll to highlighted item
+                        if isAllTagsHighlighted {
+                            withAnimation(.easeOut(duration: 0.1)) {
+                                proxy.scrollTo("all-tags", anchor: .center)
+                            }
+                        } else if let tagID = newID {
+                            withAnimation(.easeOut(duration: 0.1)) {
+                                proxy.scrollTo(tagID, anchor: .center)
                             }
                         }
                     }
-                    .padding(.vertical, 4)
+                    .onChange(of: isAllTagsHighlighted) { highlighted in
+                        if highlighted {
+                            withAnimation(.easeOut(duration: 0.1)) {
+                                proxy.scrollTo("all-tags", anchor: .center)
+                            }
+                        }
+                    }
                 }
-                .frame(maxHeight: 250)
             }
         }
+        .onAppear {
+            // Capture initial selection state for stable sorting
+            initialSelectedTags = selectedTags ?? []
+
+            // Autofocus the search field when popover appears
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isSearchFocused = true
+            }
+            // Initialize highlight to first item
+            resetHighlightToFirst()
+        }
+        .onChange(of: searchText) { _ in
+            // Reset highlight to first item when search changes
+            resetHighlightToFirst()
+        }
+        .keyboardNavigation(
+            onUpArrow: { moveHighlight(by: -1) },
+            onDownArrow: { moveHighlight(by: 1) },
+            onReturn: { selectHighlightedItem() }
+        )
     }
 }
 
@@ -424,6 +946,12 @@ public struct VisibilityFilterPopover: View {
     let onSelect: (HiddenFilter) -> Void
     var onDismiss: (() -> Void)?
 
+    /// Focus state to capture focus when popover appears - allows main search field to "steal" focus and dismiss
+    @FocusState private var isFocused: Bool
+    @State private var highlightedIndex: Int = 0
+
+    private let options: [HiddenFilter] = [.hide, .onlyHidden, .showAll]
+
     public init(
         currentFilter: HiddenFilter,
         onSelect: @escaping (HiddenFilter) -> Void,
@@ -432,6 +960,16 @@ public struct VisibilityFilterPopover: View {
         self.currentFilter = currentFilter
         self.onSelect = onSelect
         self.onDismiss = onDismiss
+    }
+
+    private func selectHighlightedItem() {
+        guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
+        onSelect(options[highlightedIndex])
+        onDismiss?()
+    }
+
+    private func moveHighlight(by offset: Int) {
+        highlightedIndex = max(0, min(options.count - 1, highlightedIndex + offset))
     }
 
     public var body: some View {
@@ -443,11 +981,13 @@ public struct VisibilityFilterPopover: View {
                         systemIcon: "eye",
                         title: "Visible Only",
                         subtitle: "Show segments that aren't hidden",
-                        isSelected: currentFilter == .hide
+                        isSelected: currentFilter == .hide,
+                        isKeyboardHighlighted: highlightedIndex == 0
                     ) {
                         onSelect(.hide)
                         onDismiss?()
                     }
+                    .id(0)
 
                     Divider()
                         .padding(.vertical, 4)
@@ -457,27 +997,56 @@ public struct VisibilityFilterPopover: View {
                         systemIcon: "eye.slash",
                         title: "Hidden Only",
                         subtitle: "Show only hidden segments",
-                        isSelected: currentFilter == .onlyHidden
+                        isSelected: currentFilter == .onlyHidden,
+                        isKeyboardHighlighted: highlightedIndex == 1
                     ) {
                         onSelect(.onlyHidden)
                         onDismiss?()
                     }
+                    .id(1)
 
                     // All Segments option
                     FilterRow(
                         systemIcon: "eye.circle",
                         title: "All Segments",
                         subtitle: "Show both visible and hidden",
-                        isSelected: currentFilter == .showAll
+                        isSelected: currentFilter == .showAll,
+                        isKeyboardHighlighted: highlightedIndex == 2
                     ) {
                         onSelect(.showAll)
                         onDismiss?()
                     }
+                    .id(2)
                 }
                 .padding(.vertical, 4)
             }
             .frame(maxHeight: 200)
         }
+        .focusable()
+        .focused($isFocused)
+        .modifier(FocusEffectDisabledModifier())
+        .onAppear {
+            // Capture focus when popover appears
+            // This allows clicking elsewhere (like main search field) to dismiss by stealing focus
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isFocused = true
+            }
+            // Set initial highlight to current selection
+            if let index = options.firstIndex(of: currentFilter) {
+                highlightedIndex = index
+            }
+        }
+        .onChange(of: isFocused) { focused in
+            // Dismiss when focus is lost (e.g., clicking on main search field)
+            if !focused {
+                onDismiss?()
+            }
+        }
+        .keyboardNavigation(
+            onUpArrow: { moveHighlight(by: -1) },
+            onDownArrow: { moveHighlight(by: 1) },
+            onReturn: { selectHighlightedItem() }
+        )
     }
 }
 

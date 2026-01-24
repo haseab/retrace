@@ -3,6 +3,19 @@ import Shared
 import App
 import AppKit
 
+// MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
+
+/// Modifier that hides the focus ring, with availability check for macOS 14.0+
+private struct FocusEffectDisabledModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+    }
+}
+
 /// Filter bar for search overlay - displays filter chips below the search field
 /// Styled similar to macOS Spotlight/Raycast with pill-shaped buttons
 public struct SearchFilterBar: View {
@@ -12,6 +25,8 @@ public struct SearchFilterBar: View {
     @ObservedObject var viewModel: SearchViewModel
     @State private var showAppsDropdown = false
     @State private var showDatePopover = false
+    @State private var showTagsDropdown = false
+    @State private var showVisibilityDropdown = false
 
     // MARK: - Body
 
@@ -28,11 +43,14 @@ public struct SearchFilterBar: View {
             // Apps filter (multi-select) - shows app icons when selected
             AppsFilterChip(
                 selectedApps: viewModel.selectedAppFilters,
+                filterMode: viewModel.appFilterMode,
                 isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
                 action: {
                     withAnimation(.easeOut(duration: 0.15)) {
                         showAppsDropdown.toggle()
-                        showDatePopover = false // Close other dropdown
+                        showDatePopover = false
+                        showTagsDropdown = false
+                        showVisibilityDropdown = false
                     }
                 }
             )
@@ -41,9 +59,13 @@ public struct SearchFilterBar: View {
                     apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
                     otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
                     selectedApps: viewModel.selectedAppFilters,
+                    filterMode: viewModel.appFilterMode,
                     allowMultiSelect: true,
                     onSelectApp: { bundleID in
                         viewModel.toggleAppFilter(bundleID)
+                    },
+                    onFilterModeChange: { mode in
+                        viewModel.setAppFilterMode(mode)
                     },
                     onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
@@ -62,13 +84,77 @@ public struct SearchFilterBar: View {
             ) {
                 withAnimation(.easeOut(duration: 0.15)) {
                     showDatePopover.toggle()
-                    showAppsDropdown = false // Close other dropdown
+                    showAppsDropdown = false
+                    showTagsDropdown = false
+                    showVisibilityDropdown = false
                 }
             }
             .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
                 DateFilterPopover(
                     viewModel: viewModel,
                     isPresented: $showDatePopover
+                )
+            }
+
+            // Tags filter
+            TagsFilterChip(
+                selectedTags: viewModel.selectedTags,
+                availableTags: viewModel.availableTags,
+                filterMode: viewModel.tagFilterMode,
+                isActive: viewModel.selectedTags != nil && !viewModel.selectedTags!.isEmpty,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showTagsDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showVisibilityDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: 56) {
+                TagsFilterPopover(
+                    tags: viewModel.availableTags,
+                    selectedTags: viewModel.selectedTags,
+                    filterMode: viewModel.tagFilterMode,
+                    allowMultiSelect: true,
+                    onSelectTag: { tagId in
+                        viewModel.toggleTagFilter(tagId)
+                    },
+                    onFilterModeChange: { mode in
+                        viewModel.setTagFilterMode(mode)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showTagsDropdown = false
+                        }
+                    }
+                )
+            }
+
+            // Visibility filter
+            VisibilityFilterChip(
+                currentFilter: viewModel.hiddenFilter,
+                isActive: viewModel.hiddenFilter != .hide,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showVisibilityDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showTagsDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: 56) {
+                VisibilityFilterPopover(
+                    currentFilter: viewModel.hiddenFilter,
+                    onSelect: { filter in
+                        viewModel.setHiddenFilter(filter)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showVisibilityDropdown = false
+                        }
+                    }
                 )
             }
 
@@ -99,20 +185,29 @@ public struct SearchFilterBar: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .task {
-            // Load available apps when the filter bar appears
+            // Load available apps and tags when the filter bar appears
             await viewModel.loadAvailableApps()
+            await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { _ in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
         }
         .onChange(of: showDatePopover) { _ in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+        }
+        .onChange(of: showTagsDropdown) { _ in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+        }
+        .onChange(of: showVisibilityDropdown) { _ in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { _ in
             // Close all dropdowns when signal is received (from Escape key in parent)
             withAnimation(.easeOut(duration: 0.15)) {
                 showAppsDropdown = false
                 showDatePopover = false
+                showTagsDropdown = false
+                showVisibilityDropdown = false
             }
         }
     }
@@ -188,6 +283,7 @@ private struct FilterChip: View {
 
 private struct AppsFilterChip: View {
     let selectedApps: Set<String>?
+    let filterMode: AppFilterMode
     let isActive: Bool
     let action: () -> Void
 
@@ -201,9 +297,21 @@ private struct AppsFilterChip: View {
         return apps.sorted()
     }
 
+    private var isExcludeMode: Bool {
+        filterMode == .exclude && isActive
+    }
+
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
+                // Show exclude indicator
+                if isExcludeMode {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                        .transition(.scale.combined(with: .opacity))
+                }
+
                 if sortedApps.count == 1 {
                     // Single app: show icon + name
                     let bundleID = sortedApps[0]
@@ -215,6 +323,7 @@ private struct AppsFilterChip: View {
                     Text(appName(for: bundleID))
                         .font(.retraceCaptionMedium)
                         .lineLimit(1)
+                        .strikethrough(isExcludeMode, color: .orange)
                         .transition(.opacity)
                 } else if sortedApps.count > 1 {
                     // Multiple apps: show icons
@@ -223,6 +332,7 @@ private struct AppsFilterChip: View {
                             appIcon(for: bundleID)
                                 .frame(width: iconSize, height: iconSize)
                                 .clipShape(RoundedRectangle(cornerRadius: 3))
+                                .opacity(isExcludeMode ? 0.6 : 1.0)
                                 .transition(.scale.combined(with: .opacity))
                         }
                     }
@@ -301,6 +411,9 @@ private struct DateFilterPopover: View {
     @State private var endDate: Date = Date()
     @State private var editingDate: EditingDate? = nil
     @State private var displayedMonth: Date = Date()
+
+    /// Focus state to capture focus when popover appears - allows main search field to "steal" focus and dismiss
+    @FocusState private var isFocused: Bool
 
     private let calendar = Calendar.current
     private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
@@ -396,8 +509,22 @@ private struct DateFilterPopover: View {
         }
         .frame(width: 280)
         .background(Color(nsColor: .windowBackgroundColor))
+        .focusable()
+        .focused($isFocused)
+        .modifier(FocusEffectDisabledModifier())
         .onAppear {
             initializeDates()
+            // Capture focus when popover appears
+            // This allows clicking elsewhere (like main search field) to dismiss by stealing focus
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isFocused = true
+            }
+        }
+        .onChange(of: isFocused) { focused in
+            // Dismiss when focus is lost (e.g., clicking on main search field)
+            if !focused {
+                isPresented = false
+            }
         }
         .onExitCommand {
             if editingDate != nil {
@@ -755,6 +882,138 @@ private struct SearchModeTab: View {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(isSelected ? Color.white.opacity(0.2) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
                 )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+// MARK: - Tags Filter Chip
+
+private struct TagsFilterChip: View {
+    let selectedTags: Set<Int64>?
+    let availableTags: [Tag]
+    let filterMode: TagFilterMode
+    let isActive: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    private var selectedTagCount: Int {
+        selectedTags?.count ?? 0
+    }
+
+    private var isExcludeMode: Bool {
+        filterMode == .exclude && isActive
+    }
+
+    private var label: String {
+        if selectedTagCount == 0 {
+            return "Tags"
+        } else if selectedTagCount == 1, let tagId = selectedTags?.first,
+                  let tag = availableTags.first(where: { $0.id.value == tagId }) {
+            return tag.name
+        } else {
+            return "\(selectedTagCount) Tags"
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                // Show exclude indicator
+                if isExcludeMode {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                        .transition(.scale.combined(with: .opacity))
+                }
+
+                Image(systemName: isActive ? "tag.fill" : "tag")
+                    .font(.system(size: 14))
+
+                Text(label)
+                    .font(.retraceCalloutMedium)
+                    .lineLimit(1)
+                    .strikethrough(isExcludeMode, color: .orange)
+
+                Image(systemName: "chevron.down")
+                    .font(.retraceCaption2)
+            }
+            .foregroundColor(isActive ? .white : .white.opacity(0.7))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+// MARK: - Visibility Filter Chip
+
+private struct VisibilityFilterChip: View {
+    let currentFilter: HiddenFilter
+    let isActive: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    private var icon: String {
+        switch currentFilter {
+        case .hide: return "eye"
+        case .onlyHidden: return "eye.slash"
+        case .showAll: return "eye.circle"
+        }
+    }
+
+    private var label: String {
+        switch currentFilter {
+        case .hide: return "Visible"
+        case .onlyHidden: return "Hidden"
+        case .showAll: return "All"
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+
+                Text(label)
+                    .font(.retraceCalloutMedium)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.down")
+                    .font(.retraceCaption2)
+            }
+            .foregroundColor(isActive ? .white : .white.opacity(0.7))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+            )
         }
         .buttonStyle(.plain)
         .onHover { hovering in

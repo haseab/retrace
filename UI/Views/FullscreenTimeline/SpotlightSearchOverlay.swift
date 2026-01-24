@@ -70,12 +70,15 @@ public struct SpotlightSearchOverlay: View {
                 ZStack(alignment: .top) {
                     // Results area (bottom layer)
                     VStack(spacing: 0) {
-                        // Spacer for the filter bar height
+                        // Spacer for the filter bar height (chips ~40px + vertical padding 24px = ~64px)
                         Color.clear
-                            .frame(height: 52) // Approximate filter bar height
+                            .frame(height: 56)
 
                         if hasResults {
                             let _ = print("[SpotlightSearchOverlay] Rendering results area (zIndex=0)")
+                            // Small gap before divider to maintain visual spacing below filter bar
+                            Color.clear.frame(height: 4)
+
                             Divider()
                                 .background(Color.white.opacity(0.1))
 
@@ -183,6 +186,13 @@ public struct SpotlightSearchOverlay: View {
                     if !viewModel.searchQuery.isEmpty {
                         Log.debug("\(searchLog) Submit pressed, triggering search", category: .ui)
                         viewModel.submitSearch()
+                    }
+                }
+                .onChange(of: isSearchFocused) { focused in
+                    // Dismiss any open dropdowns when search field gains focus
+                    if focused && viewModel.isDropdownOpen {
+                        print("[SpotlightSearchOverlay] TextField focused, closing dropdowns")
+                        viewModel.closeDropdownsSignal += 1
                     }
                 }
 
