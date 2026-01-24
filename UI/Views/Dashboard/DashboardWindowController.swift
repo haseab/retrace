@@ -24,6 +24,17 @@ public class DashboardWindowController: NSObject {
 
     private override init() {
         super.init()
+        setupNotifications()
+    }
+
+    private func setupNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: .toggleDashboard,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.toggle()
+        }
     }
 
     // MARK: - Configuration
@@ -156,9 +167,17 @@ extension DashboardWindowController: NSWindowDelegate {
 struct DashboardContentView: View {
     let coordinator: AppCoordinator
 
+    /// Wrapper for coordinator to inject as environment object for child views
+    @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
+
     @State private var selectedView: DashboardSelectedView = .dashboard
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
+
+    init(coordinator: AppCoordinator) {
+        self.coordinator = coordinator
+        self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+    }
 
     var body: some View {
         ZStack {
@@ -181,6 +200,7 @@ struct DashboardContentView: View {
 
                         case .settings:
                             SettingsView()
+                                .environmentObject(coordinatorWrapper)
                         }
                     }
                 }

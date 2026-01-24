@@ -81,6 +81,7 @@ public struct SettingsView: View {
 
     // Quick delete state
     @State private var quickDeleteConfirmation: QuickDeleteOption? = nil
+    @State private var deletingOption: QuickDeleteOption? = nil
     @State private var isDeleting = false
     @State private var deleteResult: DeleteResultInfo? = nil
 
@@ -830,7 +831,7 @@ public struct SettingsView: View {
                             title: "Last 5 min",
                             option: .fiveMinutes,
                             isDeleting: isDeleting,
-                            currentOption: quickDeleteConfirmation
+                            currentOption: deletingOption
                         ) {
                             quickDeleteConfirmation = .fiveMinutes
                         }
@@ -839,7 +840,7 @@ public struct SettingsView: View {
                             title: "Last hour",
                             option: .oneHour,
                             isDeleting: isDeleting,
-                            currentOption: quickDeleteConfirmation
+                            currentOption: deletingOption
                         ) {
                             quickDeleteConfirmation = .oneHour
                         }
@@ -848,7 +849,7 @@ public struct SettingsView: View {
                             title: "Last 24h",
                             option: .oneDay,
                             isDeleting: isDeleting,
-                            currentOption: quickDeleteConfirmation
+                            currentOption: deletingOption
                         ) {
                             quickDeleteConfirmation = .oneDay
                         }
@@ -1619,8 +1620,9 @@ private struct CaptureIntervalPicker: View {
 private struct RetentionPolicyPicker: View {
     @Binding var selectedDays: Int
 
-    // Retention options: 1 week through 1 year, then Forever (0) at the end
+    // Retention options: 3 days through 1 year, then Forever (0) at the end
     private let options: [(days: Int, label: String)] = [
+        (3, "3D"),
         (7, "1W"),
         (14, "2W"),
         (30, "1M"),
@@ -1642,19 +1644,24 @@ private struct RetentionPolicyPicker: View {
         VStack(spacing: 12) {
             // Custom slider track with markers
             GeometryReader { geometry in
-                let segmentWidth = geometry.size.width / CGFloat(options.count - 1)
-                let trackWidth = geometry.size.width
+                let totalWidth = geometry.size.width
+                // Inset from edges so dots are centered under labels
+                let horizontalInset: CGFloat = totalWidth / CGFloat(options.count) / 2
+                let trackWidth = totalWidth - (horizontalInset * 2)
+                let segmentWidth = trackWidth / CGFloat(options.count - 1)
 
                 ZStack(alignment: .leading) {
-                    // Track background
-                    RoundedRectangle(cornerRadius: 4)
+                    // Track background - only between first and last dot
+                    RoundedRectangle(cornerRadius: 3)
                         .fill(Color.white.opacity(0.08))
-                        .frame(height: 6)
+                        .frame(width: trackWidth, height: 4)
+                        .offset(x: horizontalInset)
 
-                    // Track fill (from left to current position)
-                    RoundedRectangle(cornerRadius: 4)
+                    // Track fill (from first dot to current position)
+                    RoundedRectangle(cornerRadius: 3)
                         .fill(LinearGradient.retraceAccentGradient)
-                        .frame(width: min(CGFloat(sliderIndex) * segmentWidth + 8, trackWidth), height: 6)
+                        .frame(width: max(0, CGFloat(sliderIndex) * segmentWidth), height: 4)
+                        .offset(x: horizontalInset)
 
                     // Marker dots (non-interactive, just visual)
                     HStack(spacing: 0) {
@@ -1679,7 +1686,9 @@ private struct RetentionPolicyPicker: View {
                         }
                         .onChanged { value in
                             let x = value.location.x
-                            let index = Int(round(x / segmentWidth))
+                            // Adjust for inset
+                            let adjustedX = x - horizontalInset
+                            let index = Int(round(adjustedX / segmentWidth))
                             let clampedIndex = max(0, min(options.count - 1, index))
                             if options[clampedIndex].days != selectedDays {
                                 selectedDays = options[clampedIndex].days
@@ -1720,6 +1729,7 @@ extension SettingsView {
     var retentionDisplayText: String {
         switch retentionDays {
         case 0: return "Forever"
+        case 3: return "3 days"
         case 7: return "1 week"
         case 14: return "2 weeks"
         case 30: return "1 month"
@@ -1974,15 +1984,17 @@ private struct QuickDeleteButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
+            Group {
                 if isThisDeleting {
                     ProgressView()
-                        .scaleEffect(0.6)
-                        .frame(width: 12, height: 12)
+                        .controlSize(.small)
+                        .tint(.retraceDanger)
+                } else {
+                    Text(title)
+                        .font(.retraceCaptionMedium)
                 }
-                Text(title)
-                    .font(.retraceCaptionMedium)
             }
+            .frame(minWidth: 70)
             .foregroundColor(isDeleting ? .retraceSecondary : .retraceDanger)
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -2004,6 +2016,7 @@ extension SettingsView {
     /// Perform quick delete for the specified time range
     func performQuickDelete(option: QuickDeleteOption) {
         isDeleting = true
+        deletingOption = option
         deleteResult = nil
 
         Task {
@@ -2013,11 +2026,14 @@ extension SettingsView {
 
                 await MainActor.run {
                     isDeleting = false
+                    deletingOption = nil
                     if result.deletedFrames > 0 {
                         deleteResult = DeleteResultInfo(
                             success: true,
                             message: "Deleted \(result.deletedFrames) frames from the \(option.displayName)"
                         )
+                        // Invalidate timeline cache so deleted frames don't appear
+                        SimpleTimelineViewModel.incrementDataSourceVersion()
                     } else {
                         deleteResult = DeleteResultInfo(
                             success: true,
@@ -2038,6 +2054,7 @@ extension SettingsView {
             } catch {
                 await MainActor.run {
                     isDeleting = false
+                    deletingOption = nil
                     deleteResult = DeleteResultInfo(
                         success: false,
                         message: "Delete failed: \(error.localizedDescription)"

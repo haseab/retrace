@@ -132,6 +132,9 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor in
+                // Hide dashboard window BEFORE closing timeline to prevent it from becoming key
+                DashboardWindowController.shared.hide()
+
                 window.orderOut(nil)
                 self?.window = nil
                 self?.timelineViewModel = nil
@@ -468,18 +471,20 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        // Left arrow key - navigate to previous frame
-        if event.keyCode == 123 && modifiers.isEmpty { // Left arrow
+        // Left arrow key - navigate to previous frame (Option = 3x speed)
+        if event.keyCode == 123 && (modifiers.isEmpty || modifiers == [.option]) { // Left arrow
             if let viewModel = timelineViewModel {
-                viewModel.navigateToFrame(viewModel.currentIndex - 1)
+                let step = modifiers.contains(.option) ? 3 : 1
+                viewModel.navigateToFrame(viewModel.currentIndex - step)
                 return true
             }
         }
 
-        // Right arrow key - navigate to next frame
-        if event.keyCode == 124 && modifiers.isEmpty { // Right arrow
+        // Right arrow key - navigate to next frame (Option = 3x speed)
+        if event.keyCode == 124 && (modifiers.isEmpty || modifiers == [.option]) { // Right arrow
             if let viewModel = timelineViewModel {
-                viewModel.navigateToFrame(viewModel.currentIndex + 1)
+                let step = modifiers.contains(.option) ? 3 : 1
+                viewModel.navigateToFrame(viewModel.currentIndex + step)
                 return true
             }
         }

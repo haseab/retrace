@@ -8,26 +8,15 @@ struct RetraceApp: App {
 
     // MARK: - Properties
 
-    @StateObject private var coordinatorWrapper = AppCoordinatorWrapper()
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    // MARK: - Initialization
 
     // MARK: - Body
 
     var body: some Scene {
-        WindowGroup {
-            ContentView(coordinator: coordinatorWrapper.coordinator)
-                .environmentObject(coordinatorWrapper)
-                .task {
-                    await initializeApp()
-                }
-                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
+        // Menu bar app - no WindowGroup, use Settings for menu commands only
+        Settings {
+            EmptyView()
         }
-        .handlesExternalEvents(matching: ["*"])
-        .windowStyle(.hiddenTitleBar)
-        .windowToolbarStyle(.unified(showsTitle: false))
-        .defaultPosition(.center)
         .commands {
             appCommands
         }
@@ -38,12 +27,12 @@ struct RetraceApp: App {
     @CommandsBuilder
     private var appCommands: some Commands {
         CommandGroup(replacing: .newItem) {
-            // Remove "New Window" since we're a single-window app
+            // Remove "New Window" since we're a menu bar app
         }
 
         CommandMenu("View") {
             Button("Dashboard") {
-                NotificationCenter.default.post(name: .openDashboard, object: nil)
+                DashboardWindowController.shared.show()
             }
             .keyboardShortcut("1", modifiers: .command)
 
@@ -57,7 +46,7 @@ struct RetraceApp: App {
             Divider()
 
             Button("Settings") {
-                NotificationCenter.default.post(name: .openSettings, object: nil)
+                DashboardWindowController.shared.showSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
         }
@@ -65,46 +54,15 @@ struct RetraceApp: App {
         CommandMenu("Recording") {
             Button("Start/Stop Recording") {
                 Task {
-                    try? await coordinatorWrapper.startPipeline()
+                    if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                        try? await appDelegate.toggleRecording()
+                    }
                 }
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
         }
     }
 
-    // MARK: - Initialization
-
-    private func initializeApp() async {
-        do {
-            try await coordinatorWrapper.initialize()
-            Log.info("[RetraceApp] Initialized successfully", category: .app)
-
-            // Setup menu bar icon and timeline window controller
-            await MainActor.run {
-                let menuBar = MenuBarManager(
-                    coordinator: coordinatorWrapper.coordinator,
-                    onboardingManager: coordinatorWrapper.coordinator.onboardingManager
-                )
-                menuBar.setup()
-
-                // Configure the timeline window controller
-                TimelineWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
-
-                // Configure the pause reminder window controller
-                PauseReminderWindowController.shared.configure(coordinator: coordinatorWrapper.coordinator)
-
-                // Store in AppDelegate to keep it alive
-                if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                    appDelegate.menuBarManager = menuBar
-                }
-
-                Log.info("[RetraceApp] Menu bar icon and timeline controller initialized", category: .app)
-            }
-            // Note: Auto-start recording is handled in AppCoordinatorWrapper.initialize()
-        } catch {
-            Log.error("[RetraceApp] Failed to initialize: \(error)", category: .app)
-        }
-    }
 }
 
 // MARK: - App Delegate
@@ -112,6 +70,7 @@ struct RetraceApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     var menuBarManager: MenuBarManager?
+    private var coordinatorWrapper: AppCoordinatorWrapper?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prompt user to move app to Applications folder if not already there
@@ -139,22 +98,64 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize the Sparkle updater for automatic updates
         UpdaterManager.shared.initialize()
 
-        // Activate the app and bring window to front
-        // Use a slight delay to ensure window is created first
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            // Use NSRunningApplication for most reliable activation
-            let currentApp = NSRunningApplication.current
-            currentApp.activate(options: .activateIgnoringOtherApps)
-            NSApp.activate(ignoringOtherApps: true)
+        // Initialize the app coordinator and UI
+        Task { @MainActor in
+            await initializeApp()
         }
 
-        // Menu bar will be initialized from initializeApp after coordinator is ready
         // Note: Permissions are now handled in the onboarding flow
+    }
+
+    @MainActor
+    private func initializeApp() async {
+        do {
+            let wrapper = AppCoordinatorWrapper()
+            self.coordinatorWrapper = wrapper
+            try await wrapper.initialize()
+            Log.info("[AppDelegate] Coordinator initialized successfully", category: .app)
+
+            // Setup menu bar icon
+            let menuBar = MenuBarManager(
+                coordinator: wrapper.coordinator,
+                onboardingManager: wrapper.coordinator.onboardingManager
+            )
+            menuBar.setup()
+            self.menuBarManager = menuBar
+
+            // Configure the timeline window controller
+            TimelineWindowController.shared.configure(coordinator: wrapper.coordinator)
+
+            // Configure the dashboard window controller
+            DashboardWindowController.shared.configure(coordinator: wrapper.coordinator)
+
+            // Configure the pause reminder window controller
+            PauseReminderWindowController.shared.configure(coordinator: wrapper.coordinator)
+
+            Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
+
+            // Show dashboard on first launch
+            DashboardWindowController.shared.show()
+
+        } catch {
+            Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    // MARK: - Recording Control
+
+    func toggleRecording() async throws {
+        guard let wrapper = coordinatorWrapper else { return }
+        let isCapturing = await wrapper.coordinator.isCapturing()
+        if isCapturing {
+            try await wrapper.stopPipeline()
+        } else {
+            try await wrapper.startPipeline()
+        }
     }
 
     // MARK: - Single Instance Check

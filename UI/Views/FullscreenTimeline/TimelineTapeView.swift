@@ -1379,26 +1379,54 @@ struct DateSearchField: NSViewRepresentable {
         // Wire up Cmd+G to close the panel
         textField.onCancelCallback = onCancel
 
+        // Focus the text field immediately when created
+        // Use multiple dispatch levels to ensure focus happens after SwiftUI layout
+        focusTextField(textField)
+
         return textField
     }
 
     func updateNSView(_ textField: FocusableTextField, context: Context) {
         textField.stringValue = text
+        // No focus logic needed here - makeNSView handles initial focus
+    }
 
-        // Auto-focus when the field appears
-        if context.coordinator.shouldFocus {
-            DispatchQueue.main.async {
-                guard let window = textField.window else { return }
-                window.makeKey()
-                window.makeFirstResponder(textField)
-
-                // Ensure field editor is created for caret to appear
-                if window.fieldEditor(false, for: textField) == nil {
-                    _ = window.fieldEditor(true, for: textField)
-                    window.makeFirstResponder(textField)
+    /// Robustly focus the text field using multiple attempts
+    private func focusTextField(_ textField: FocusableTextField) {
+        // Attempt 1: Immediate focus on next run loop
+        DispatchQueue.main.async {
+            guard let window = textField.window else {
+                // Window not ready yet, retry
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                    self.performFocus(textField)
                 }
+                return
             }
-            context.coordinator.shouldFocus = false
+            self.performFocus(textField, in: window)
+        }
+    }
+
+    /// Actually perform the focus operation
+    private func performFocus(_ textField: FocusableTextField, in window: NSWindow? = nil) {
+        let targetWindow = window ?? textField.window
+        guard let window = targetWindow else { return }
+
+        // Make window key first
+        window.makeKey()
+
+        // Make text field first responder
+        let success = window.makeFirstResponder(textField)
+
+        // Ensure field editor exists for caret to appear
+        if window.fieldEditor(false, for: textField) == nil {
+            _ = window.fieldEditor(true, for: textField)
+        }
+
+        // If initial attempt failed, retry
+        if !success {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                window.makeFirstResponder(textField)
+            }
         }
     }
 
@@ -1410,7 +1438,6 @@ struct DateSearchField: NSViewRepresentable {
         @Binding var text: String
         let onSubmit: () -> Void
         let onCancel: () -> Void
-        var shouldFocus = true
 
         init(text: Binding<String>, onSubmit: @escaping () -> Void, onCancel: @escaping () -> Void) {
             self._text = text
