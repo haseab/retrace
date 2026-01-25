@@ -109,7 +109,7 @@ public struct VideoEncoderConfig: Sendable {
     public init(
         codec: VideoCodec = .hevc,
         targetBitrate: Int? = nil,
-        keyframeInterval: Int = 1,  // Every frame is keyframe at 0.5fps
+        keyframeInterval: Int = 30,  // Keyframe every 30 frames, enables P/B-frame compression
         useHardwareEncoder: Bool = true,
         quality: Float = 0.5
     ) {

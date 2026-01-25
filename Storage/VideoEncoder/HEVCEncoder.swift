@@ -94,8 +94,8 @@ public actor HEVCEncoder {
 
         var compressionProperties: [String: Any] = [
             AVVideoQualityKey: quality,
-            AVVideoMaxKeyFrameIntervalKey: config.keyframeInterval,
-            AVVideoAllowFrameReorderingKey: false,
+            AVVideoMaxKeyFrameIntervalKey: 30,  // Keyframe every 30 frames (like Rewind) for better compression
+            AVVideoAllowFrameReorderingKey: true,  // Allow B-frames for bidirectional prediction
             AVVideoExpectedSourceFrameRateKey: 30
         ]
 
