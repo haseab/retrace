@@ -1223,8 +1223,8 @@ public struct RetraceMenuStyle {
     /// Chevron size
     public static let chevronSize: CGFloat = 10
 
-    /// Action button blue color (used for all primary action buttons) - lighter blue for better visibility
-    public static let actionBlue = Color(hex: "#7AB8F5")
+    /// Action button blue color (used for all primary action buttons) - Retrace official
+    public static let actionBlue = Color(hex: "#0b336c")
 
     // MARK: - Search Field Styling (within menus)
 

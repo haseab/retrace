@@ -1594,8 +1594,8 @@ class ZoomedSelectionView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        // Retrace brand color for selection highlight (#0b336c with transparency)
-        let selectionColor = NSColor(red: 11/255, green: 51/255, blue: 108/255, alpha: 0.5)
+        // Lighter blue for text selection highlight
+        let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.4)
 
         // Draw character-level selections
         for node in nodeData {
@@ -2014,8 +2014,8 @@ class TextSelectionView: NSView {
 
         // Note: Zoom region drag preview is now handled by ZoomRegionDragPreview in SwiftUI
 
-        // Retrace brand color for selection highlight (#0b336c with transparency)
-        let selectionColor = NSColor(red: 11/255, green: 51/255, blue: 108/255, alpha: 0.5)
+        // Lighter blue for text selection highlight
+        let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.4)
 
         // Draw character-level selections
         for node in nodeData {
