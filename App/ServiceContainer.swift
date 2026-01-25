@@ -281,7 +281,8 @@ public actor ServiceContainer {
         )
 
         // Register Rewind source if user opted in
-        let useRewindData = UserDefaults.standard.bool(forKey: "useRewindData")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let useRewindData = defaults.bool(forKey: "useRewindData")
         Log.info("Checking Rewind source during initialization: useRewindData=\(useRewindData)", category: .app)
 
         if useRewindData {
@@ -323,7 +324,8 @@ public actor ServiceContainer {
             return
         }
 
-        let useRewindData = UserDefaults.standard.bool(forKey: "useRewindData")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let useRewindData = defaults.bool(forKey: "useRewindData")
         Log.info("Checking if Rewind source should be registered: useRewindData=\(useRewindData)", category: .app)
 
         if useRewindData {
@@ -355,7 +357,8 @@ public actor ServiceContainer {
         }
 
         // Save preference
-        UserDefaults.standard.set(enabled, forKey: "useRewindData")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        defaults.set(enabled, forKey: "useRewindData")
 
         if enabled {
             // Connect Rewind source if not already connected
@@ -529,8 +532,9 @@ extension StorageConfig {
     public static var `default`: StorageConfig {
         // Read settings from UserDefaults (synced with Settings UI)
         // Defaults: retention = forever (0/nil), storage = unlimited (500GB max)
-        let retentionDays = UserDefaults.standard.object(forKey: "retentionDays") as? Int ?? 0
-        let maxStorageGB = UserDefaults.standard.object(forKey: "maxStorageGB") as? Double ?? 500.0
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let retentionDays = defaults.object(forKey: "retentionDays") as? Int ?? 0
+        let maxStorageGB = defaults.object(forKey: "maxStorageGB") as? Double ?? 500.0
 
         return StorageConfig(
             storageRootPath: AppPaths.storageRoot,
@@ -544,20 +548,21 @@ extension StorageConfig {
 extension CaptureConfig {
     public static var `default`: CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
-        let captureIntervalSeconds = UserDefaults.standard.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let captureIntervalSeconds = defaults.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
         // TODO: Re-enable once private window detection is more reliable
         // Currently disabled because detection has false positives and doesn't reliably detect incognito
-        let excludePrivateWindows = UserDefaults.standard.object(forKey: "excludePrivateWindows") as? Bool ?? false
+        let excludePrivateWindows = defaults.object(forKey: "excludePrivateWindows") as? Bool ?? false
         // excludeCursor = true means hide cursor, so showCursor = !excludeCursor
-        let excludeCursor = UserDefaults.standard.object(forKey: "excludeCursor") as? Bool ?? false
+        let excludeCursor = defaults.object(forKey: "excludeCursor") as? Bool ?? false
         let showCursor = !excludeCursor
         // Delete duplicate frames setting controls adaptive capture (deduplication)
         // Default to true - deduplication enabled by default
-        let deleteDuplicateFrames = UserDefaults.standard.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
+        let deleteDuplicateFrames = defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
-        if let excludedAppsString = UserDefaults.standard.string(forKey: "excludedApps"),
+        if let excludedAppsString = defaults.string(forKey: "excludedApps"),
            !excludedAppsString.isEmpty,
            let data = excludedAppsString.data(using: .utf8) {
             // Decode the JSON array and extract bundle IDs

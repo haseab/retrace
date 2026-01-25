@@ -221,9 +221,14 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.submitSearch()
                     }
                 }) {
-                    Image(systemName: "arrow.right.circle.fill")
-                        .font(.retraceMediumNumber)
-                        .foregroundColor(viewModel.searchQuery.isEmpty ? .white.opacity(0.2) : RetraceMenuStyle.actionBlue)
+                    ZStack {
+                        Circle()
+                            .fill(viewModel.searchQuery.isEmpty ? Color.white.opacity(0.2) : Color(hex: "#0b336c"))
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    .frame(width: 26, height: 26)
                 }
                 .buttonStyle(.plain)
                 .disabled(viewModel.searchQuery.isEmpty)

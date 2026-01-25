@@ -327,7 +327,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether to show frame IDs in debug mode (read from UserDefaults)
     public var showFrameIDs: Bool {
-        UserDefaults.standard.bool(forKey: "showFrameIDs")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return defaults.bool(forKey: "showFrameIDs")
     }
 
     /// Copy the current frame ID to clipboard
@@ -3213,7 +3214,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Whether frame ID search is enabled (read from UserDefaults)
     public var enableFrameIDSearch: Bool {
-        UserDefaults.standard.bool(forKey: "enableFrameIDSearch")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return defaults.bool(forKey: "enableFrameIDSearch")
     }
 
     // MARK: - Calendar Picker

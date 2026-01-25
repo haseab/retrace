@@ -177,7 +177,7 @@ public struct FilterRow: View {
                 if isSelected {
                     Image(systemName: "checkmark")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(RetraceMenuStyle.actionBlue)
+                        .foregroundColor(.white)
                 }
             }
             .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
@@ -628,9 +628,9 @@ private struct FilterModeButton: View {
             .frame(maxWidth: .infinity)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isSelected ? RetraceMenuStyle.actionBlue.opacity(0.2) : (isHovered ? Color.white.opacity(0.05) : Color.clear))
+                    .fill(isSelected ? RetraceMenuStyle.actionBlue : (isHovered ? Color.white.opacity(0.05) : Color.clear))
             )
-            .foregroundColor(isSelected ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.textColorMuted)
+            .foregroundColor(isSelected ? .white : RetraceMenuStyle.textColorMuted)
         }
         .buttonStyle(.plain)
         .onHover { hovering in

@@ -23,6 +23,9 @@ public class TimelineWindowController: NSObject {
     /// Whether the timeline overlay is currently visible
     public private(set) var isVisible = false
 
+    /// Whether the dashboard was the key window when timeline opened
+    private var dashboardWasKeyWindow = false
+
     /// Callback when timeline closes
     public var onClose: (() -> Void)?
 
@@ -41,7 +44,8 @@ public class TimelineWindowController: NSObject {
 
     /// Load the current timeline shortcut from UserDefaults
     private func loadTimelineShortcut() -> ShortcutConfig {
-        guard let data = UserDefaults.standard.data(forKey: Self.timelineShortcutKey),
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard let data = defaults.data(forKey: Self.timelineShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultTimeline
         }
@@ -60,6 +64,10 @@ public class TimelineWindowController: NSObject {
     /// Show the timeline overlay on the current screen
     public func show() {
         guard !isVisible, let coordinator = coordinator else { return }
+
+        // Remember if dashboard was the key window before we take over
+        dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
+            NSApp.keyWindow == DashboardWindowController.shared.window
 
         // Get the screen where the mouse cursor is located
         let mouseLocation = NSEvent.mouseLocation
@@ -132,8 +140,11 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor in
-                // Hide dashboard window BEFORE closing timeline to prevent it from becoming key
-                DashboardWindowController.shared.hide()
+                // Only hide dashboard if it wasn't the active window before timeline opened
+                // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
+                if self?.dashboardWasKeyWindow != true {
+                    DashboardWindowController.shared.hide()
+                }
 
                 window.orderOut(nil)
                 self?.window = nil

@@ -275,7 +275,7 @@ public struct FeedbackFormView: View {
                         Image(systemName: viewModel.showDiagnosticsDetail ? "chevron.up" : "chevron.down")
                             .font(.retraceTinyBold)
                     }
-                    .foregroundColor(.retraceAccent)
+                    .foregroundStyle(LinearGradient.retraceAccentGradient)
                 }
                 .buttonStyle(.plain)
             }
@@ -558,14 +558,14 @@ public struct FeedbackFormView: View {
                         Text("Chat with us on retrace.to")
                             .font(.retraceCalloutMedium)
                     }
-                    .foregroundColor(.retraceAccent)
+                    .foregroundColor(.white)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(Color.retraceAccent.opacity(0.1))
+                    .background(Color.retraceAccent.opacity(0.3))
                     .cornerRadius(10)
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 1)
+                            .stroke(Color.retraceAccent.opacity(0.5), lineWidth: 1)
                     )
                 }
             }

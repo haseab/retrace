@@ -4,6 +4,9 @@ import AppKit
 import App
 import ScreenCaptureKit
 
+/// Shared UserDefaults store for consistent settings across debug/release builds
+private let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
 public struct SettingsView: View {
@@ -12,9 +15,9 @@ public struct SettingsView: View {
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
-    @AppStorage("launchAtLogin") private var launchAtLogin = false
-    @AppStorage("showMenuBarIcon") private var showMenuBarIcon = true
-    @AppStorage("theme") private var theme: ThemePreference = .auto
+    @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = false
+    @AppStorage("showMenuBarIcon", store: settingsStore) private var showMenuBarIcon = true
+    @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = .auto
 
     // Keyboard shortcuts
     @State private var timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
@@ -25,22 +28,22 @@ public struct SettingsView: View {
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
     // Capture settings
-    @AppStorage("captureIntervalSeconds") private var captureIntervalSeconds: Double = 2.0
-    @AppStorage("captureResolution") private var captureResolution: CaptureResolution = .original
-    @AppStorage("captureActiveDisplayOnly") private var captureActiveDisplayOnly = false
-    @AppStorage("excludeCursor") private var excludeCursor = false
+    @AppStorage("captureIntervalSeconds", store: settingsStore) private var captureIntervalSeconds: Double = 2.0
+    @AppStorage("captureResolution", store: settingsStore) private var captureResolution: CaptureResolution = .original
+    @AppStorage("captureActiveDisplayOnly", store: settingsStore) private var captureActiveDisplayOnly = false
+    @AppStorage("excludeCursor", store: settingsStore) private var excludeCursor = false
 
     // Storage settings
-    @AppStorage("retentionDays") private var retentionDays: Int = 0 // 0 = forever
-    @AppStorage("maxStorageGB") private var maxStorageGB: Double = 50.0
-    @AppStorage("videoQuality") private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
-    @AppStorage("deleteDuplicateFrames") private var deleteDuplicateFrames: Bool = true
-    @AppStorage("useRewindData") private var useRewindData: Bool = false
+    @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = 0 // 0 = forever
+    @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = 50.0
+    @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
+    @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = true
+    @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = false
 
     // Privacy settings
-    @AppStorage("excludedApps") private var excludedAppsString = ""
+    @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = ""
     // TODO: Re-enable once private window detection is more reliable
-    @AppStorage("excludePrivateWindows") private var excludePrivateWindows = false
+    @AppStorage("excludePrivateWindows", store: settingsStore) private var excludePrivateWindows = false
 
     // Computed property to manage excluded apps as array
     private var excludedApps: [ExcludedAppInfo] {
@@ -61,13 +64,13 @@ public struct SettingsView: View {
             excludedAppsString = string
         }
     }
-    @AppStorage("excludeSafariPrivate") private var excludeSafariPrivate = true
-    @AppStorage("excludeChromeIncognito") private var excludeChromeIncognito = true
-    @AppStorage("encryptionEnabled") private var encryptionEnabled = true
+    @AppStorage("excludeSafariPrivate", store: settingsStore) private var excludeSafariPrivate = true
+    @AppStorage("excludeChromeIncognito", store: settingsStore) private var excludeChromeIncognito = true
+    @AppStorage("encryptionEnabled", store: settingsStore) private var encryptionEnabled = true
 
     // Developer settings
-    @AppStorage("showFrameIDs") private var showFrameIDs = false
-    @AppStorage("enableFrameIDSearch") private var enableFrameIDSearch = false
+    @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = false
+    @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = false
 
     // Check if Rewind data folder exists
     private var rewindDataExists: Bool {
@@ -291,6 +294,52 @@ public struct SettingsView: View {
 
     private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
+            ModernSettingsCard(title: "Keyboard Shortcuts", icon: "command") {
+                VStack(spacing: 12) {
+                    settingsShortcutRecorderRow(
+                        label: "Open Timeline",
+                        shortcut: $timelineShortcut,
+                        isRecording: $isRecordingTimelineShortcut,
+                        otherShortcut: dashboardShortcut
+                    )
+
+                    Divider()
+                        .background(Color.retraceBorder)
+
+                    settingsShortcutRecorderRow(
+                        label: "Open Dashboard",
+                        shortcut: $dashboardShortcut,
+                        isRecording: $isRecordingDashboardShortcut,
+                        otherShortcut: timelineShortcut
+                    )
+
+                    if let error = shortcutError {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.retraceTiny)
+                                .foregroundColor(.retraceWarning)
+                            Text(error)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceWarning)
+                        }
+                        .padding(.top, 4)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                // Cancel recording if user clicks outside
+                if isRecordingTimelineShortcut || isRecordingDashboardShortcut {
+                    isRecordingTimelineShortcut = false
+                    isRecordingDashboardShortcut = false
+                    recordingTimeoutTask?.cancel()
+                }
+            }
+            .task {
+                // Load saved shortcuts on appear
+                await loadSavedShortcuts()
+            }
+
             ModernSettingsCard(title: "Updates", icon: "arrow.down.circle") {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
@@ -369,52 +418,6 @@ public struct SettingsView: View {
                     ))
                 }
             }
-
-            ModernSettingsCard(title: "Keyboard Shortcuts", icon: "command") {
-                VStack(spacing: 12) {
-                    settingsShortcutRecorderRow(
-                        label: "Open Timeline",
-                        shortcut: $timelineShortcut,
-                        isRecording: $isRecordingTimelineShortcut,
-                        otherShortcut: dashboardShortcut
-                    )
-
-                    Divider()
-                        .background(Color.retraceBorder)
-
-                    settingsShortcutRecorderRow(
-                        label: "Open Dashboard",
-                        shortcut: $dashboardShortcut,
-                        isRecording: $isRecordingDashboardShortcut,
-                        otherShortcut: timelineShortcut
-                    )
-
-                    if let error = shortcutError {
-                        HStack(spacing: 4) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.retraceTiny)
-                                .foregroundColor(.retraceWarning)
-                            Text(error)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceWarning)
-                        }
-                        .padding(.top, 4)
-                    }
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                // Cancel recording if user clicks outside
-                if isRecordingTimelineShortcut || isRecordingDashboardShortcut {
-                    isRecordingTimelineShortcut = false
-                    isRecordingDashboardShortcut = false
-                    recordingTimeoutTask?.cancel()
-                }
-            }
-            .task {
-                // Load saved shortcuts on appear
-                await loadSavedShortcuts()
-            }
         }
     }
 
@@ -458,42 +461,42 @@ public struct SettingsView: View {
                     if isRecording.wrappedValue {
                         Text("Press keys...")
                             .font(.retraceCaption2)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(.white)
                             .frame(minWidth: 100, minHeight: 24)
                     } else {
                         HStack(spacing: 4) {
                             ForEach(shortcut.wrappedValue.modifierSymbols, id: \.self) { symbol in
                                 Text(symbol)
                                     .font(.retraceCaptionMedium)
-                                    .foregroundColor(.retraceSecondary)
+                                    .foregroundColor(.white.opacity(0.9))
                                     .frame(width: 22, height: 22)
-                                    .background(Color.retraceCard)
+                                    .background(Color.white.opacity(0.1))
                                     .cornerRadius(4)
                             }
 
                             if !shortcut.wrappedValue.modifierSymbols.isEmpty {
                                 Text("+")
                                     .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
+                                    .foregroundColor(.white.opacity(0.7))
                             }
 
                             Text(shortcut.wrappedValue.key)
                                 .font(.retraceCaption2Bold)
-                                .foregroundColor(.retracePrimary)
+                                .foregroundColor(.white)
                                 .frame(minWidth: 28, minHeight: 22)
                                 .padding(.horizontal, 6)
-                                .background(Color.retraceCard)
+                                .background(Color.white.opacity(0.1))
                                 .cornerRadius(4)
                         }
                     }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(isRecording.wrappedValue ? Color.retraceAccent.opacity(0.1) : Color.retraceSecondaryBackground)
+                .background(isRecording.wrappedValue ? Color.white.opacity(0.1) : Color.white.opacity(0.05))
                 .cornerRadius(6)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(isRecording.wrappedValue ? Color.retraceAccent : Color.retraceBorder, lineWidth: isRecording.wrappedValue ? 1.5 : 1)
+                        .stroke(isRecording.wrappedValue ? Color.white : Color.white.opacity(0.2), lineWidth: isRecording.wrappedValue ? 1.5 : 1)
                 )
             }
             .buttonStyle(.plain)
@@ -524,11 +527,11 @@ public struct SettingsView: View {
 
     private func loadSavedShortcuts() async {
         // Load directly from UserDefaults (same as OnboardingManager)
-        if let data = UserDefaults.standard.data(forKey: Self.timelineShortcutKey),
+        if let data = settingsStore?.data(forKey: Self.timelineShortcutKey),
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             timelineShortcut = SettingsShortcutKey(from: config)
         }
-        if let data = UserDefaults.standard.data(forKey: Self.dashboardShortcutKey),
+        if let data = settingsStore?.data(forKey: Self.dashboardShortcutKey),
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             dashboardShortcut = SettingsShortcutKey(from: config)
         }
@@ -537,10 +540,10 @@ public struct SettingsView: View {
     private func saveShortcuts() async {
         // Save directly to UserDefaults (same as OnboardingManager)
         if let data = try? JSONEncoder().encode(timelineShortcut.toConfig) {
-            UserDefaults.standard.set(data, forKey: Self.timelineShortcutKey)
+            settingsStore?.set(data, forKey: Self.timelineShortcutKey)
         }
         if let data = try? JSONEncoder().encode(dashboardShortcut.toConfig) {
-            UserDefaults.standard.set(data, forKey: Self.dashboardShortcutKey)
+            settingsStore?.set(data, forKey: Self.dashboardShortcutKey)
         }
         // Re-register hotkeys with MenuBarManager
         MenuBarManager.shared?.reloadShortcuts()
@@ -559,10 +562,10 @@ public struct SettingsView: View {
                         Spacer()
                         Text(captureIntervalDisplayText)
                             .font(.retraceCalloutBold)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(.white)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Color.retraceAccent.opacity(0.1))
+                            .background(Color.retraceAccent.opacity(0.3))
                             .cornerRadius(8)
                     }
 
@@ -647,10 +650,10 @@ public struct SettingsView: View {
                         Spacer()
                         Text(retentionDisplayText)
                             .font(.retraceCalloutBold)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(.white)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Color.retraceAccent.opacity(0.1))
+                            .background(Color.retraceAccent.opacity(0.3))
                             .cornerRadius(8)
                     }
 
@@ -668,10 +671,10 @@ public struct SettingsView: View {
 //                        Spacer()
 //                        Text(String(format: "%.0f GB", maxStorageGB))
 //                            .font(.retraceCalloutBold)
-//                            .foregroundColor(.retraceAccent)
+//                            .foregroundColor(.white)
 //                            .padding(.horizontal, 12)
 //                            .padding(.vertical, 6)
-//                            .background(Color.retraceAccent.opacity(0.1))
+//                            .background(Color.retraceAccent.opacity(0.3))
 //                            .cornerRadius(8)
 //                    }
 //
@@ -688,10 +691,10 @@ public struct SettingsView: View {
                         Spacer()
                         Text(videoQualityDisplayText)
                             .font(.retraceCalloutBold)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(.white)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .background(Color.retraceAccent.opacity(0.1))
+                            .background(Color.retraceAccent.opacity(0.3))
                             .cornerRadius(8)
                     }
 
@@ -931,10 +934,10 @@ public struct SettingsView: View {
 //                        Spacer()
 //                        Text("50")
 //                            .font(.retraceCalloutBold)
-//                            .foregroundColor(.retraceAccent)
+//                            .foregroundColor(.white)
 //                            .padding(.horizontal, 12)
 //                            .padding(.vertical, 6)
-//                            .background(Color.retraceAccent.opacity(0.1))
+//                            .background(Color.retraceAccent.opacity(0.3))
 //                            .cornerRadius(8)
 //                    }
 //
@@ -1148,10 +1151,10 @@ private struct ModernToggleRow: View {
                     if let badge = badge {
                         Text(badge)
                             .font(.retraceTinyBold)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(.white)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
-                            .background(Color.retraceAccent.opacity(0.15))
+                            .background(Color.retraceAccent.opacity(0.3))
                             .cornerRadius(4)
                     }
                 }
@@ -1778,10 +1781,9 @@ extension SettingsView {
 
     func resetAllSettings() {
         // Reset all UserDefaults to their default values
-        let defaults = UserDefaults.standard
-        let domain = Bundle.main.bundleIdentifier ?? "io.retrace.app"
-        defaults.removePersistentDomain(forName: domain)
-        defaults.synchronize()
+        let domain = "io.retrace.app"
+        settingsStore?.removePersistentDomain(forName: domain)
+        settingsStore?.synchronize()
 
         // Reset local @AppStorage values to defaults
         captureIntervalSeconds = 2.0

@@ -837,9 +837,14 @@ struct FloatingDateSearchPanel: View {
 
                 // Submit button
                 Button(action: onSubmit) {
-                    Image(systemName: "arrow.right.circle.fill")
-                        .font(.system(size: 24))
-                        .foregroundColor(text.isEmpty ? .white.opacity(0.2) : (isSubmitButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8)))
+                    ZStack {
+                        Circle()
+                            .fill(text.isEmpty ? Color.white.opacity(0.2) : Color(hex: "#0b336c").opacity(isSubmitButtonHovering ? 1.0 : 0.8))
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.white)
+                    }
+                    .frame(width: 26, height: 26)
                 }
                 .buttonStyle(.plain)
                 .disabled(text.isEmpty)

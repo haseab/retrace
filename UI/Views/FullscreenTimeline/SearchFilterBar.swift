@@ -501,7 +501,7 @@ private struct DateFilterPopover: View {
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
-                    .background(Color.accentColor)
+                    .background(Color.retraceAccent)
                     .cornerRadius(6)
             }
             .buttonStyle(.plain)

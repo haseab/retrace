@@ -25,7 +25,8 @@ public struct OnboardingView: View {
 
     // Load saved shortcuts or use defaults
     private static func loadTimelineShortcut() -> ShortcutConfig {
-        guard let data = UserDefaults.standard.data(forKey: timelineShortcutKey),
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard let data = defaults.data(forKey: timelineShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultTimeline
         }
@@ -33,7 +34,8 @@ public struct OnboardingView: View {
     }
 
     private static func loadDashboardShortcut() -> ShortcutConfig {
-        guard let data = UserDefaults.standard.data(forKey: dashboardShortcutKey),
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard let data = defaults.data(forKey: dashboardShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultDashboard
         }
@@ -50,7 +52,7 @@ public struct OnboardingView: View {
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
-    @State private var wantsRewindData: Bool? = UserDefaults.standard.object(forKey: "useRewindData") as? Bool
+    @State private var wantsRewindData: Bool? = (UserDefaults(suiteName: "io.retrace.app") ?? .standard).object(forKey: "useRewindData") as? Bool
     @State private var rewindDataSizeGB: Double? = nil
 
     // Keyboard shortcuts - initialized from saved values or defaults
@@ -289,7 +291,8 @@ public struct OnboardingView: View {
         case 6:
             // Rewind data - requires selection if data exists
             Button(action: {
-                UserDefaults.standard.set(wantsRewindData == true, forKey: "useRewindData")
+                let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+                defaults.set(wantsRewindData == true, forKey: "useRewindData")
                 withAnimation { currentStep = 7 }
             }) {
                 Text("Continue")
@@ -939,7 +942,7 @@ public struct OnboardingView: View {
                         VStack(alignment: .center, spacing: .spacingS) {
                             HStack(spacing: .spacingS) {
                                 Image(systemName: "externaldrive.fill")
-                                    .foregroundColor(.retraceAccent)
+                                    .foregroundStyle(LinearGradient.retraceAccentGradient)
                                 Text("Location")
                                     .font(.retraceCaption)
                                     .foregroundColor(.retraceSecondary)
@@ -954,7 +957,7 @@ public struct OnboardingView: View {
                                 Text(String(format: "%.1f GB", sizeGB))
                                     .font(.retraceCaption)
                                     .fontWeight(.semibold)
-                                    .foregroundColor(.retraceAccent)
+                                    .foregroundStyle(LinearGradient.retraceAccentGradient)
                             }
                         }
                     }
@@ -1185,7 +1188,7 @@ public struct OnboardingView: View {
                         // Show "Press key combo..." when recording
                         Text("Press key combo...")
                             .font(.retraceBody)
-                            .foregroundColor(.retraceAccent)
+                            .foregroundStyle(LinearGradient.retraceAccentGradient)
                             .frame(minWidth: 150, minHeight: 32)
                     } else {
                         // Show actual shortcut when not recording
@@ -1326,7 +1329,7 @@ public struct OnboardingView: View {
                 HStack(spacing: .spacingM) {
                     Image(systemName: "message.fill")
                         .font(.retraceTitle3)
-                        .foregroundColor(.retraceAccent)
+                        .foregroundStyle(LinearGradient.retraceAccentGradient)
                     Text("Please report issues often")
                         .font(.retraceBody)
                         .foregroundColor(.retracePrimary)

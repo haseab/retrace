@@ -595,8 +595,8 @@ extension Color {
     // Deep blue background: hsl(222, 47%, 4%) = #040b1a
     public static let retraceDeepBlue = Color(red: 4/255, green: 11/255, blue: 26/255)
 
-    // Primary blue: hsl(217, 91%, 60%) = vibrant blue
-    public static let retraceAccent = Color(red: 74/255, green: 144/255, blue: 226/255)
+    // Primary blue: Retrace official brand color #0b336c
+    public static let retraceAccent = Color(red: 11/255, green: 51/255, blue: 108/255)
 
     // Card background: hsl(222, 47%, 7%)
     public static let retraceCard = Color(red: 9/255, green: 18/255, blue: 38/255)
@@ -634,7 +634,7 @@ extension Color {
     // MARK: Search Highlight
     public static let retraceMatchHighlight = Color.yellow.opacity(0.4)
     public static let retraceBoundingBox = Color.retraceAccent
-    public static let retraceBoundingBoxSecondary = Color(red: 100/255, green: 200/255, blue: 255/255)
+    public static let retraceBoundingBoxSecondary = Color(red: 11/255, green: 51/255, blue: 108/255)  // #0b336c
 }
 
 // MARK: - Typography
@@ -855,8 +855,8 @@ extension View {
 extension LinearGradient {
     public static let retraceAccentGradient = LinearGradient(
         colors: [
-            Color(red: 74/255, green: 144/255, blue: 226/255),
-            Color(red: 139/255, green: 92/255, blue: 246/255)
+            Color(red: 60/255, green: 130/255, blue: 220/255),   // Bright blue for visibility
+            Color(red: 90/255, green: 160/255, blue: 240/255)    // Lighter blue
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
@@ -864,8 +864,8 @@ extension LinearGradient {
 
     public static let retracePurpleGradient = LinearGradient(
         colors: [
-            Color(red: 139/255, green: 92/255, blue: 246/255),
-            Color(red: 217/255, green: 70/255, blue: 239/255)
+            Color(red: 70/255, green: 140/255, blue: 230/255),   // Bright blue for visibility
+            Color(red: 100/255, green: 170/255, blue: 250/255)   // Lighter blue
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
@@ -1223,8 +1223,8 @@ public struct RetraceMenuStyle {
     /// Chevron size
     public static let chevronSize: CGFloat = 10
 
-    /// Action button blue color (used for all primary action buttons)
-    public static let actionBlue = Color(hex: "#0A84FF")
+    /// Action button blue color (used for all primary action buttons) - lighter blue for better visibility
+    public static let actionBlue = Color(hex: "#7AB8F5")
 
     // MARK: - Search Field Styling (within menus)
 

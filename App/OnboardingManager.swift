@@ -1,6 +1,9 @@
 import Foundation
 import Shared
 
+/// Shared UserDefaults store for consistent settings across debug/release builds
+private let settingsDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
 /// Manages first-launch onboarding flow
 /// Tracks whether user has completed the 8-step onboarding
 /// Owner: APP integration
@@ -23,21 +26,21 @@ public actor OnboardingManager {
     // MARK: - State
 
     public var hasCompletedOnboarding: Bool {
-        let completedVersion = UserDefaults.standard.integer(forKey: Self.onboardingVersionKey)
+        let completedVersion = settingsDefaults.integer(forKey: Self.onboardingVersionKey)
         return completedVersion >= Self.currentOnboardingVersion
     }
 
     public var hasDownloadedModels: Bool {
-        UserDefaults.standard.bool(forKey: Self.hasDownloadedModelsKey)
+        settingsDefaults.bool(forKey: Self.hasDownloadedModelsKey)
     }
 
     public var onboardingSkipped: Bool {
-        UserDefaults.standard.bool(forKey: Self.onboardingSkippedKey)
+        settingsDefaults.bool(forKey: Self.onboardingSkippedKey)
     }
 
     /// Timeline shortcut configuration (key + modifiers)
     public var timelineShortcut: ShortcutConfig {
-        guard let data = UserDefaults.standard.data(forKey: Self.timelineShortcutKey),
+        guard let data = settingsDefaults.data(forKey: Self.timelineShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultTimeline
         }
@@ -46,7 +49,7 @@ public actor OnboardingManager {
 
     /// Dashboard shortcut configuration (key + modifiers)
     public var dashboardShortcut: ShortcutConfig {
-        guard let data = UserDefaults.standard.data(forKey: Self.dashboardShortcutKey),
+        guard let data = settingsDefaults.data(forKey: Self.dashboardShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultDashboard
         }
@@ -54,14 +57,14 @@ public actor OnboardingManager {
     }
 
     public var hasRewindData: Bool? {
-        if UserDefaults.standard.object(forKey: Self.hasRewindDataKey) == nil {
+        if settingsDefaults.object(forKey: Self.hasRewindDataKey) == nil {
             return nil
         }
-        return UserDefaults.standard.bool(forKey: Self.hasRewindDataKey)
+        return settingsDefaults.bool(forKey: Self.hasRewindDataKey)
     }
 
     public var rewindMigrationCompleted: Bool {
-        UserDefaults.standard.bool(forKey: Self.rewindMigrationCompletedKey)
+        settingsDefaults.bool(forKey: Self.rewindMigrationCompletedKey)
     }
 
     // MARK: - Initialization
@@ -76,19 +79,19 @@ public actor OnboardingManager {
     }
 
     public func markOnboardingCompleted() {
-        UserDefaults.standard.set(Self.currentOnboardingVersion, forKey: Self.onboardingVersionKey)
-        UserDefaults.standard.set(true, forKey: Self.hasCompletedOnboardingKey)
+        settingsDefaults.set(Self.currentOnboardingVersion, forKey: Self.onboardingVersionKey)
+        settingsDefaults.set(true, forKey: Self.hasCompletedOnboardingKey)
         Log.info("Onboarding marked as completed (version \(Self.currentOnboardingVersion))", category: .app)
     }
 
     public func markModelsDownloaded() {
-        UserDefaults.standard.set(true, forKey: Self.hasDownloadedModelsKey)
+        settingsDefaults.set(true, forKey: Self.hasDownloadedModelsKey)
         Log.info("Models marked as downloaded", category: .app)
     }
 
     public func markOnboardingSkipped() {
-        UserDefaults.standard.set(true, forKey: Self.onboardingSkippedKey)
-        UserDefaults.standard.set(Self.currentOnboardingVersion, forKey: Self.onboardingVersionKey)
+        settingsDefaults.set(true, forKey: Self.onboardingSkippedKey)
+        settingsDefaults.set(Self.currentOnboardingVersion, forKey: Self.onboardingVersionKey)
         Log.info("Onboarding skipped by user", category: .app)
     }
 
@@ -97,7 +100,7 @@ public actor OnboardingManager {
     /// Set timeline shortcut (full config with key + modifiers)
     public func setTimelineShortcut(_ config: ShortcutConfig) {
         if let data = try? JSONEncoder().encode(config) {
-            UserDefaults.standard.set(data, forKey: Self.timelineShortcutKey)
+            settingsDefaults.set(data, forKey: Self.timelineShortcutKey)
             Log.info("Timeline shortcut set to: \(config.displayString)", category: .app)
         }
     }
@@ -105,7 +108,7 @@ public actor OnboardingManager {
     /// Set dashboard shortcut (full config with key + modifiers)
     public func setDashboardShortcut(_ config: ShortcutConfig) {
         if let data = try? JSONEncoder().encode(config) {
-            UserDefaults.standard.set(data, forKey: Self.dashboardShortcutKey)
+            settingsDefaults.set(data, forKey: Self.dashboardShortcutKey)
             Log.info("Dashboard shortcut set to: \(config.displayString)", category: .app)
         }
     }
@@ -113,26 +116,26 @@ public actor OnboardingManager {
     // MARK: - Rewind Data
 
     public func setHasRewindData(_ hasData: Bool) {
-        UserDefaults.standard.set(hasData, forKey: Self.hasRewindDataKey)
+        settingsDefaults.set(hasData, forKey: Self.hasRewindDataKey)
         Log.info("Has Rewind data: \(hasData)", category: .app)
     }
 
     public func markRewindMigrationCompleted() {
-        UserDefaults.standard.set(true, forKey: Self.rewindMigrationCompletedKey)
+        settingsDefaults.set(true, forKey: Self.rewindMigrationCompletedKey)
         Log.info("Rewind migration marked as completed", category: .app)
     }
 
     // MARK: - Reset (for testing)
 
     public func resetOnboarding() {
-        UserDefaults.standard.removeObject(forKey: Self.hasCompletedOnboardingKey)
-        UserDefaults.standard.removeObject(forKey: Self.hasDownloadedModelsKey)
-        UserDefaults.standard.removeObject(forKey: Self.onboardingSkippedKey)
-        UserDefaults.standard.removeObject(forKey: Self.onboardingVersionKey)
-        UserDefaults.standard.removeObject(forKey: Self.timelineShortcutKey)
-        UserDefaults.standard.removeObject(forKey: Self.dashboardShortcutKey)
-        UserDefaults.standard.removeObject(forKey: Self.hasRewindDataKey)
-        UserDefaults.standard.removeObject(forKey: Self.rewindMigrationCompletedKey)
+        settingsDefaults.removeObject(forKey: Self.hasCompletedOnboardingKey)
+        settingsDefaults.removeObject(forKey: Self.hasDownloadedModelsKey)
+        settingsDefaults.removeObject(forKey: Self.onboardingSkippedKey)
+        settingsDefaults.removeObject(forKey: Self.onboardingVersionKey)
+        settingsDefaults.removeObject(forKey: Self.timelineShortcutKey)
+        settingsDefaults.removeObject(forKey: Self.dashboardShortcutKey)
+        settingsDefaults.removeObject(forKey: Self.hasRewindDataKey)
+        settingsDefaults.removeObject(forKey: Self.rewindMigrationCompletedKey)
         Log.info("Onboarding state reset", category: .app)
     }
 }

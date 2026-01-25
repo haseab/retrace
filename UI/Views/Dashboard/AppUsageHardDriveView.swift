@@ -118,7 +118,7 @@ struct AppUsageHardDriveView: View {
                 HStack(spacing: 8) {
                     Text(formatDuration(app.duration))
                         .font(.retraceCaptionMedium)
-                        .foregroundColor(.retraceAccent)
+                        .foregroundStyle(LinearGradient.retraceAccentGradient)
 
                     Text("•")
                         .foregroundColor(.retraceSecondary.opacity(0.5))

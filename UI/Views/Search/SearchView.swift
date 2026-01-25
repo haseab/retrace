@@ -145,7 +145,7 @@ public struct SearchView: View {
         HStack(spacing: .spacingM) {
             Image(systemName: icon)
                 .font(.retraceTitle3)
-                .foregroundColor(.retraceAccent)
+                .foregroundStyle(LinearGradient.retraceAccentGradient)
                 .frame(width: 24)
 
             Text(text)

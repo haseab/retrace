@@ -1594,8 +1594,8 @@ class ZoomedSelectionView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        // Light purple color for selection highlight
-        let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)
+        // Retrace brand color for selection highlight (#0b336c with transparency)
+        let selectionColor = NSColor(red: 11/255, green: 51/255, blue: 108/255, alpha: 0.5)
 
         // Draw character-level selections
         for node in nodeData {
@@ -1801,7 +1801,7 @@ class URLOverlayView: NSView {
 
 /// Overlay for selecting text from OCR nodes via click-drag or Cmd+A
 /// Also handles Shift+Drag for zoom region creation
-/// Highlights selected text character-by-character in light purple
+/// Highlights selected text character-by-character using Retrace brand color
 struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
@@ -2014,8 +2014,8 @@ class TextSelectionView: NSView {
 
         // Note: Zoom region drag preview is now handled by ZoomRegionDragPreview in SwiftUI
 
-        // Light purple color for selection highlight
-        let selectionColor = NSColor(red: 0.7, green: 0.5, blue: 0.9, alpha: 0.4)
+        // Retrace brand color for selection highlight (#0b336c with transparency)
+        let selectionColor = NSColor(red: 11/255, green: 51/255, blue: 108/255, alpha: 0.5)
 
         // Draw character-level selections
         for node in nodeData {
@@ -2938,11 +2938,11 @@ struct TagSubmenu: View {
                                 HStack(spacing: 10) {
                                     Image(systemName: "plus")
                                         .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.retraceAccent)
+                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
 
                                     Text("Create \"\(searchText.trimmingCharacters(in: .whitespacesAndNewlines))\"")
                                         .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(.retraceAccent)
+                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
 
                                     Spacer()
                                 }
@@ -3030,7 +3030,7 @@ struct TagSubmenuRow: View {
                 if isSelected {
                     Image(systemName: "checkmark")
                         .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.retraceAccent)
+                        .foregroundColor(.white)
                 }
             }
             .padding(.horizontal, 12)

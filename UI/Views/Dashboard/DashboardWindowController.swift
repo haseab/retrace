@@ -14,7 +14,7 @@ public class DashboardWindowController: NSObject {
 
     // MARK: - Properties
 
-    private var window: NSWindow?
+    private(set) var window: NSWindow?
     private var coordinator: AppCoordinator?
 
     /// Whether the dashboard window is currently visible
@@ -88,9 +88,17 @@ public class DashboardWindowController: NSObject {
     }
 
     /// Toggle dashboard visibility
+    /// - If hidden: show and bring to front
+    /// - If visible but behind other windows: bring to front
+    /// - If visible and frontmost: hide
     public func toggle() {
         if isVisible {
-            hide()
+            // Check if window is frontmost (key window and app is active)
+            if let window = window, window.isKeyWindow && NSApp.isActive {
+                hide()
+            } else {
+                bringToFront()
+            }
         } else {
             show()
         }

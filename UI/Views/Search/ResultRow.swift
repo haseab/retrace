@@ -73,7 +73,7 @@ public struct ResultRow: View {
                             Text(String(format: "%.0f%%", result.relevanceScore * 100))
                                 .font(.retraceCaption2)
                         }
-                        .foregroundColor(.retraceAccent)
+                        .foregroundStyle(LinearGradient.retraceAccentGradient)
                     }
                 }
 

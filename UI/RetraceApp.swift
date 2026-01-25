@@ -30,6 +30,21 @@ struct RetraceApp: App {
             // Remove "New Window" since we're a menu bar app
         }
 
+        // Add Dashboard and Timeline to the app menu (top left, after "About Retrace")
+        CommandGroup(after: .appInfo) {
+            Button("Open Dashboard") {
+                DashboardWindowController.shared.show()
+            }
+            .keyboardShortcut("d", modifiers: [.command, .shift])
+
+            Button("Open Timeline") {
+                TimelineWindowController.shared.toggle()
+            }
+            .keyboardShortcut("t", modifiers: [.command, .shift])
+
+            Divider()
+        }
+
         CommandMenu("View") {
             Button("Dashboard") {
                 DashboardWindowController.shared.show()

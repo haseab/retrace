@@ -83,7 +83,8 @@ public actor RetentionManager {
     /// Get the current retention policy from user settings
     /// Returns nil if retention is set to "Forever" (0 days)
     public nonisolated func getRetentionDays() -> Int? {
-        let days = UserDefaults.standard.integer(forKey: "retentionDays")
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let days = defaults.integer(forKey: "retentionDays")
         return days == 0 ? nil : days
     }
 

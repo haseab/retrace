@@ -246,7 +246,7 @@ public struct DashboardView: View {
                 }
             ))
             .labelsHidden()
-            .toggleStyle(SwitchToggleStyle(tint: .retraceSuccess))
+            .toggleStyle(SwitchToggleStyle(tint: .retraceAccent))
             .scaleEffect(0.85)
             .onHover { hovering in
                 if hovering {
@@ -477,7 +477,7 @@ public struct DashboardView: View {
 
                 Image(systemName: "clock.badge.questionmark")
                     .font(.retraceDisplay3)
-                    .foregroundColor(.retraceAccent)
+                    .foregroundStyle(LinearGradient.retraceAccentGradient)
             }
 
             VStack(spacing: 8) {
@@ -510,11 +510,14 @@ public struct DashboardView: View {
 
             HStack(spacing: 16) {
                 Link(destination: URL(string: "https://x.com/haseab_")!) {
-                    HStack(spacing: 6) {
-                        Text("Made by")
+                    HStack(spacing: 4) {
+                        Text("Made with")
+                            .foregroundColor(.retraceSecondary)
+                        Text("❤️")
+                        Text("by")
                             .foregroundColor(.retraceSecondary)
                         Text("@haseab")
-                            .foregroundColor(.retraceAccent)
+                            .foregroundColor(Color(red: 74/255, green: 144/255, blue: 226/255))  // Bright blue for link
                     }
                     .font(.retraceCaption2Medium)
                 }

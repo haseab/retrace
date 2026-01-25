@@ -319,7 +319,7 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openDashboard() {
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
+        NotificationCenter.default.post(name: .toggleDashboard, object: nil)
     }
 
     @objc private func toggleRecording() {
