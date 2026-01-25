@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Foundation
 import Shared
+import CoreMedia
 
 /// Main StorageProtocol implementation.
 public actor StorageManager: StorageProtocol {
@@ -14,6 +15,13 @@ public actor StorageManager: StorageProtocol {
     /// Counter to ensure unique segment IDs even if created within same millisecond
     private var segmentCounter: Int = 0
 
+    /// Cache for decoded frames from B-frame videos, keyed by segment ID
+    /// Each entry contains frames sorted by PTS (presentation order)
+    private var frameCache: [Int64: FrameCacheEntry] = [:]
+
+    /// Maximum number of segments to keep in cache
+    private let maxCachedSegments = 3
+
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
         encoderConfig: VideoEncoderConfig = .default
@@ -25,6 +33,21 @@ public actor StorageManager: StorageProtocol {
         // Initialize WAL manager in wal/ subdirectory
         let walRoot = storageRoot.appendingPathComponent("wal", isDirectory: true)
         self.walManager = WALManager(walRoot: walRoot)
+    }
+
+    /// Entry in the frame cache containing decoded frames sorted by PTS
+    private struct FrameCacheEntry {
+        let segmentID: Int64
+        var frames: [DecodedFrame]  // Sorted by PTS (presentation order)
+        var lastAccessTime: Date
+        let totalFrameCount: Int
+    }
+
+    /// A decoded frame with its presentation timestamp
+    private struct DecodedFrame {
+        let pts: CMTime
+        let image: CGImage
+        let presentationIndex: Int  // Index in presentation order (0, 1, 2, ...)
     }
 
     public func initialize(config: StorageConfig) async throws {
@@ -69,84 +92,190 @@ public actor StorageManager: StorageProtocol {
     }
 
     public func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
+        let segmentIDValue = segmentID.value
 
-        // Get segment path - files are MP4 without extension (no decryption needed)
+        // Check if we have this segment cached
+        if let cacheEntry = frameCache[segmentIDValue] {
+            // Update access time
+            var updatedEntry = cacheEntry
+            updatedEntry.lastAccessTime = Date()
+            frameCache[segmentIDValue] = updatedEntry
+
+            // Check if requested frame is in cache
+            if frameIndex < cacheEntry.frames.count {
+                let frame = cacheEntry.frames[frameIndex]
+                let jpegData = try convertCGImageToJPEG(frame.image)
+                Log.debug("[StorageManager] ✅ Cache hit: segmentID=\(segmentIDValue), frameIndex=\(frameIndex), pts=\(frame.pts.seconds)s", category: .storage)
+                return jpegData
+            }
+        }
+
+        // Not in cache - need to decode the video
         let segmentURL = try await getSegmentPath(id: segmentID)
 
         // Check if file is empty or too small to be a valid video
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
         if fileSize == 0 {
-            // File is empty - likely still being written to (no fragments flushed yet)
-            // Do NOT delete - the encoder may still be writing to it
             Log.warning("[StorageManager] Video file is empty (0 bytes), still being written: \(segmentURL.path)", category: .storage)
             throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Video file is empty (still being written)")
         }
 
-        // Determine the URL to use for AVFoundation
-        // If file already has .mp4 extension, use it directly
-        // Otherwise, create a temporary symlink with .mp4 extension so AVFoundation can identify the format
+        // Decode all frames from the video using AVAssetReader
+        let frames = try await decodeAllFrames(from: segmentURL, segmentID: segmentIDValue)
+
+        // Store in cache
+        let cacheEntry = FrameCacheEntry(
+            segmentID: segmentIDValue,
+            frames: frames,
+            lastAccessTime: Date(),
+            totalFrameCount: frames.count
+        )
+        frameCache[segmentIDValue] = cacheEntry
+
+        // Evict old cache entries if needed
+        evictOldCacheEntries()
+
+        // Return requested frame
+        guard frameIndex < frames.count else {
+            throw StorageError.fileReadFailed(
+                path: segmentURL.path,
+                underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
+            )
+        }
+
+        let frame = frames[frameIndex]
+        let jpegData = try convertCGImageToJPEG(frame.image)
+        Log.debug("[StorageManager] ✅ Decoded and cached: segmentID=\(segmentIDValue), frameIndex=\(frameIndex)/\(frames.count), pts=\(String(format: "%.3f", frame.pts.seconds))s", category: .storage)
+
+        return jpegData
+    }
+
+    /// Decode all frames from a video file using AVAssetReader, sorted by PTS (presentation order)
+    private func decodeAllFrames(from url: URL, segmentID: Int64) async throws -> [DecodedFrame] {
+        // Handle extensionless files by creating symlink
         let assetURL: URL
-        if segmentURL.pathExtension.lowercased() == "mp4" {
-            // File already has .mp4 extension, use directly
-            assetURL = segmentURL
+        if url.pathExtension.lowercased() == "mp4" {
+            assetURL = url
         } else {
-            // Create temporary symlink with .mp4 extension (for extensionless files)
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = segmentURL.lastPathComponent
+            let fileName = url.lastPathComponent
             let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
 
-            // Create symlink if it doesn't exist
             if !FileManager.default.fileExists(atPath: symlinkPath.path) {
-                do {
-                    try FileManager.default.createSymbolicLink(
-                        atPath: symlinkPath.path,
-                        withDestinationPath: segmentURL.path
-                    )
-                } catch {
-                    throw StorageError.fileReadFailed(
-                        path: segmentURL.path,
-                        underlying: "Failed to create symlink: \(error.localizedDescription)"
-                    )
-                }
+                try FileManager.default.createSymbolicLink(
+                    atPath: symlinkPath.path,
+                    withDestinationPath: url.path
+                )
             }
             assetURL = symlinkPath
         }
 
-        // Load asset (with .mp4 extension for format detection)
         let asset = AVAsset(url: assetURL)
 
-        // Verify video track exists
-        guard try await !asset.loadTracks(withMediaType: .video).isEmpty else {
-            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "No video track")
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw StorageError.fileReadFailed(path: url.path, underlying: "No video track")
         }
 
-        // Videos are encoded at fixed 30 FPS
-        // Use integer arithmetic to avoid floating point precision issues
-        // At 30fps with timescale 600: each frame = 20 time units (600/30 = 20)
-        let time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
+        // Create asset reader
+        let reader = try AVAssetReader(asset: asset)
 
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
+        // Configure output to decompress frames
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
 
-        var actualTime: CMTime = .zero
-        let cgImage = try generator.copyCGImage(at: time, actualTime: &actualTime)
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
 
-        // Calculate what frame we actually got vs what we requested
-        let actualSeconds = actualTime.seconds
-        let actualFrameIndex = Int(round(actualSeconds * 30.0))
+        guard reader.canAdd(trackOutput) else {
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Cannot add track output to reader")
+        }
+        reader.add(trackOutput)
 
+        guard reader.startReading() else {
+            let errorDesc = reader.error?.localizedDescription ?? "Unknown error"
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Failed to start reading: \(errorDesc)")
+        }
+
+        // Read all frames with their PTS
+        var framesWithPTS: [(pts: CMTime, image: CGImage)] = []
+
+        while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                continue
+            }
+
+            // Convert CVPixelBuffer to CGImage
+            let ciImage = CIImage(cvPixelBuffer: imageBuffer)
+            let context = CIContext(options: nil)
+            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+                continue
+            }
+
+            framesWithPTS.append((pts: pts, image: cgImage))
+        }
+
+        // Check for read errors
+        if reader.status == .failed {
+            let errorDesc = reader.error?.localizedDescription ?? "Unknown error"
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Reader failed: \(errorDesc)")
+        }
+
+        // Sort by PTS to get presentation order
+        framesWithPTS.sort { $0.pts.seconds < $1.pts.seconds }
+
+        // Convert to DecodedFrame with presentation indices
+        let decodedFrames = framesWithPTS.enumerated().map { index, frame in
+            DecodedFrame(pts: frame.pts, image: frame.image, presentationIndex: index)
+        }
+
+        Log.info("[StorageManager] Decoded \(decodedFrames.count) frames from segment \(segmentID), sorted by PTS", category: .storage)
+
+        // Log PTS sequence for debugging
+        if decodedFrames.count > 0 {
+            let firstPTS = decodedFrames.first!.pts.seconds
+            let lastPTS = decodedFrames.last!.pts.seconds
+            Log.debug("[StorageManager] PTS range: \(String(format: "%.3f", firstPTS))s - \(String(format: "%.3f", lastPTS))s", category: .storage)
+        }
+
+        return decodedFrames
+    }
+
+    /// Convert CGImage to JPEG data
+    private func convertCGImageToJPEG(_ cgImage: CGImage) throws -> Data {
         let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let tiffData = nsImage.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
               let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
-            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Failed to convert frame")
+            throw StorageError.fileReadFailed(path: "", underlying: "Failed to convert CGImage to JPEG")
         }
-
-        Log.debug("[StorageManager] ✅ Extracted frame: requested=\(frameIndex), actual=\(actualFrameIndex) (time=\(String(format: "%.3f", actualSeconds))s), size=\(cgImage.width)x\(cgImage.height), jpegSize=\(jpegData.count) bytes", category: .storage)
-
         return jpegData
+    }
+
+    /// Evict oldest cache entries to keep memory usage bounded
+    private func evictOldCacheEntries() {
+        while frameCache.count > maxCachedSegments {
+            // Find oldest entry
+            let oldest = frameCache.min { $0.value.lastAccessTime < $1.value.lastAccessTime }
+            if let oldestKey = oldest?.key {
+                frameCache.removeValue(forKey: oldestKey)
+                Log.debug("[StorageManager] Evicted cache entry for segment \(oldestKey)", category: .storage)
+            }
+        }
+    }
+
+    /// Clear the frame cache (useful when video files are modified)
+    public func clearFrameCache() {
+        frameCache.removeAll()
+        Log.info("[StorageManager] Frame cache cleared", category: .storage)
+    }
+
+    /// Clear cache for a specific segment (call when segment is finalized or modified)
+    public func clearFrameCache(for segmentID: VideoSegmentID) {
+        frameCache.removeValue(forKey: segmentID.value)
+        Log.debug("[StorageManager] Cleared cache for segment \(segmentID.value)", category: .storage)
     }
 
     public func getSegmentPath(id: VideoSegmentID) async throws -> URL {

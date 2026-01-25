@@ -314,8 +314,6 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
-        // Debug logging for frame display state
-        let _ = Log.debug("[FrameDisplay] videoInfo=\(viewModel.currentVideoInfo != nil), currentImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), framesCount=\(viewModel.frames.count), currentIndex=\(viewModel.currentIndex)", category: .ui)
         if let videoInfo = viewModel.currentVideoInfo {
             // Video-based frame (Rewind) with URL overlay
             // Check if video file exists AND has playable content (not still buffering initial fragments)
@@ -331,7 +329,6 @@ public struct SimpleTimelineView: View {
             let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
             let fileReady = fileSize >= minFragmentSize
 
-            let _ = Log.debug("[FrameDisplay] Video path: \(path.suffix(50)), size: \(fileSize) bytes, ready: \(fileReady), frameIndex: \(videoInfo.frameIndex)", category: .ui)
             if fileReady {
                 FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                     SimpleVideoFrameView(videoInfo: videoInfo)

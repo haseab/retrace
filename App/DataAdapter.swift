@@ -2830,14 +2830,14 @@ public actor DataAdapter {
 
         let text = String(fullText[startIndex..<endIndex])
 
-        // DEBUG: Log first 5 nodes to see offset/length details
-        DataAdapter.parseDebugCounter += 1
-        if DataAdapter.parseDebugCounter <= 5 {
-            Log.debug("[PARSE-DEBUG] Node \(DataAdapter.parseDebugCounter): id=\(id), offset=\(textOffset), length=\(textLength), fullTextLen=\(fullText.count), extracted='\(text.prefix(30))'", category: .database)
-        } else if DataAdapter.parseDebugCounter == 6 {
-            Log.debug("[PARSE-DEBUG] (suppressing further logs...)", category: .database)
-            DataAdapter.parseDebugCounter = 100 // prevent re-printing "suppressing" message
-        }
+        // DEBUG: Log first 5 nodes to see offset/length details (commented out to reduce log noise)
+        // DataAdapter.parseDebugCounter += 1
+        // if DataAdapter.parseDebugCounter <= 5 {
+        //     Log.debug("[PARSE-DEBUG] Node \(DataAdapter.parseDebugCounter): id=\(id), offset=\(textOffset), length=\(textLength), fullTextLen=\(fullText.count), extracted='\(text.prefix(30))'", category: .database)
+        // } else if DataAdapter.parseDebugCounter == 6 {
+        //     Log.debug("[PARSE-DEBUG] (suppressing further logs...)", category: .database)
+        //     DataAdapter.parseDebugCounter = 100 // prevent re-printing "suppressing" message
+        // }
 
         return OCRNodeWithText(
             id: id,

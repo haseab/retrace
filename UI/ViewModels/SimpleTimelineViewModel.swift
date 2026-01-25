@@ -536,18 +536,33 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Video info for displaying the current frame - derived from currentIndex
     public var currentVideoInfo: FrameVideoInfo? {
         guard let timelineFrame = currentTimelineFrame else {
-            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)", category: .ui)
+            // Only log if we haven't logged this state recently
+            if _lastLoggedVideoInfoFrameID != -1 {
+                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: no currentTimelineFrame at index \(currentIndex)", category: .ui)
+                _lastLoggedVideoInfoFrameID = -1
+            }
             return nil
         }
         guard let info = timelineFrame.videoInfo else {
-            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source)", category: .ui)
+            if _lastLoggedVideoInfoFrameID != -2 {
+                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has nil videoInfo, source=\(timelineFrame.frame.source)", category: .ui)
+                _lastLoggedVideoInfoFrameID = -2
+            }
             return nil
         }
         guard info.frameIndex >= 0 else {
-            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)", category: .ui)
+            if _lastLoggedVideoInfoFrameID != -3 {
+                Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) has invalid frameIndex=\(info.frameIndex)", category: .ui)
+                _lastLoggedVideoInfoFrameID = -3
+            }
             return nil
         }
-        Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(timelineFrame.frame.id.value) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex)", category: .ui)
+        // Only log when frame ID changes
+        let frameID = timelineFrame.frame.id.value
+        if _lastLoggedVideoInfoFrameID != frameID {
+            Log.debug("[SimpleTimelineViewModel] currentVideoInfo: frame \(frameID) videoPath=\(info.videoPath), frameIndex=\(info.frameIndex)", category: .ui)
+            _lastLoggedVideoInfoFrameID = frameID
+        }
         return info
     }
 
@@ -574,6 +589,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     // MARK: - Private State
+
+    /// Last logged frame ID for currentVideoInfo (prevents duplicate logs from SwiftUI view updates)
+    private var _lastLoggedVideoInfoFrameID: Int64?
 
     /// Scroll accumulator for smooth scrolling
     private var scrollAccumulator: CGFloat = 0
@@ -2242,10 +2260,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             Log.debug("[SimpleTimelineViewModel] Loaded \(nodes.count) OCR nodes for frame \(frame.id.value) source=\(frame.source)", category: .ui)
 
-            // DEBUG: Log first few OCR node coordinates to verify they're correct
-            for (i, node) in nodes.prefix(5).enumerated() {
-                Log.info("[OCR-DEBUG] Node[\(i)] id=\(node.id): x=\(String(format: "%.4f", node.x)), y=\(String(format: "%.4f", node.y)), w=\(String(format: "%.4f", node.width)), h=\(String(format: "%.4f", node.height)), text='\(node.text.prefix(30))'", category: .ui)
-            }
+            // DEBUG: Log first few OCR node coordinates to verify they're correct (commented out to reduce log noise)
+            // for (i, node) in nodes.prefix(5).enumerated() {
+            //     Log.info("[OCR-DEBUG] Node[\(i)] id=\(node.id): x=\(String(format: "%.4f", node.x)), y=\(String(format: "%.4f", node.y)), w=\(String(format: "%.4f", node.width)), h=\(String(format: "%.4f", node.height)), text='\(node.text.prefix(30))'", category: .ui)
+            // }
 
             // Only update if we're still on the same frame
             if currentTimelineFrame?.frame.id == frame.id {
