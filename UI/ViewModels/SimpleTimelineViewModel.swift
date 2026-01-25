@@ -2612,63 +2612,22 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Find the character position within zoom region only
+    /// Uses the same reading-order-aware selection and padding tolerance as normal text selection
     private func findCharacterPositionInZoomRegion(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
         let nodesInRegion = ocrNodesInZoomRegion
+        let yTolerance: CGFloat = 0.02  // ~2% of screen height for same-line detection
+        // Padding in normalized coordinates (~1% of screen) to make selection easier
+        let hitPadding: CGFloat = 0.01
 
         // Sort nodes by reading order (top to bottom, left to right)
         let sortedNodes = nodesInRegion.sorted { node1, node2 in
-            let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
                 return node1.y < node2.y
             }
             return node1.x < node2.x
         }
 
-        // Find which node contains the point, or the closest node
-        var bestNode: OCRNodeWithText?
-        var bestDistance: CGFloat = .infinity
-
-        for node in sortedNodes {
-            if point.x >= node.x && point.x <= node.x + node.width &&
-               point.y >= node.y && point.y <= node.y + node.height {
-                bestNode = node
-                break
-            }
-
-            let centerX = node.x + node.width / 2
-            let centerY = node.y + node.height / 2
-            let distance = hypot(point.x - centerX, point.y - centerY)
-
-            if distance < bestDistance {
-                bestDistance = distance
-                bestNode = node
-            }
-        }
-
-        guard let node = bestNode else { return nil }
-
-        let relativeX = (point.x - node.x) / node.width
-        let charIndex = Int(relativeX * CGFloat(node.text.count))
-        let clampedIndex = max(0, min(node.text.count, charIndex))
-
-        return (nodeID: node.id, charIndex: clampedIndex)
-    }
-
-    /// Find the character position (node ID, char index) closest to a normalized point
-    /// Uses reading-order-aware selection: when point is not inside any node,
-    /// finds the best node based on reading position (row then column).
-    private func findCharacterPosition(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
-        let yTolerance: CGFloat = 0.02  // ~2% of screen height for same-line detection
-
-        // Sort nodes by reading order (top to bottom, left to right)
-        let sortedNodes = ocrNodes.sorted { node1, node2 in
-            if abs(node1.y - node2.y) > yTolerance {
-                return node1.y < node2.y
-            }
-            return node1.x < node2.x
-        }
-
-        // First, check if point is inside any node
+        // First, check if point is inside any node (exact hit)
         for node in sortedNodes {
             if point.x >= node.x && point.x <= node.x + node.width &&
                point.y >= node.y && point.y <= node.y + node.height {
@@ -2680,7 +2639,174 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        // Point is not inside any node - find the best node for reading order selection
+        // Second, check if point is within padding distance of any node (expanded hit area)
+        for node in sortedNodes {
+            let paddedMinX = node.x - hitPadding
+            let paddedMaxX = node.x + node.width + hitPadding
+            let paddedMinY = node.y - hitPadding
+            let paddedMaxY = node.y + node.height + hitPadding
+
+            if point.x >= paddedMinX && point.x <= paddedMaxX &&
+               point.y >= paddedMinY && point.y <= paddedMaxY {
+                // Point is near this node - calculate character position
+                let clampedX = max(node.x, min(node.x + node.width, point.x))
+                let relativeX = (clampedX - node.x) / node.width
+                let charIndex = Int(relativeX * CGFloat(node.text.count))
+                let clampedIndex = max(0, min(node.text.count, charIndex))
+                return (nodeID: node.id, charIndex: clampedIndex)
+            }
+        }
+
+        // Point is not inside or near any node - find the best node for reading order selection
+        // Group nodes by row (using Y tolerance)
+        var rows: [[OCRNodeWithText]] = []
+        var currentRow: [OCRNodeWithText] = []
+        var currentRowY: CGFloat?
+
+        for node in sortedNodes {
+            if let rowY = currentRowY, abs(node.y - rowY) <= yTolerance {
+                currentRow.append(node)
+            } else {
+                if !currentRow.isEmpty {
+                    rows.append(currentRow)
+                }
+                currentRow = [node]
+                currentRowY = node.y
+            }
+        }
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
+        }
+
+        guard !rows.isEmpty else { return nil }
+
+        // Find which row the point is closest to (by Y)
+        var bestRowIndex = 0
+        var bestRowDistance: CGFloat = .infinity
+
+        for (index, row) in rows.enumerated() {
+            guard let firstNode = row.first else { continue }
+            let rowMinY = row.map { $0.y }.min() ?? firstNode.y
+            let rowMaxY = row.map { $0.y + $0.height }.max() ?? (firstNode.y + firstNode.height)
+            let rowCenterY = (rowMinY + rowMaxY) / 2
+
+            let distance = abs(point.y - rowCenterY)
+            if distance < bestRowDistance {
+                bestRowDistance = distance
+                bestRowIndex = index
+            }
+        }
+
+        let targetRow = rows[bestRowIndex]
+
+        // Within this row, find the node based on X position
+        let rowMinX = targetRow.map { $0.x }.min() ?? 0
+        let rowMaxX = targetRow.map { $0.x + $0.width }.max() ?? 1
+
+        if point.x <= rowMinX {
+            // Point is to the left - select start of first node in row
+            if let firstNode = targetRow.first {
+                return (nodeID: firstNode.id, charIndex: 0)
+            }
+        } else if point.x >= rowMaxX {
+            // Point is to the right - select end of last node in row
+            if let lastNode = targetRow.last {
+                return (nodeID: lastNode.id, charIndex: lastNode.text.count)
+            }
+        } else {
+            // Point is within the row's X range - find closest node edge
+            var bestNode: OCRNodeWithText?
+            var bestCharIndex = 0
+            var bestDistance: CGFloat = .infinity
+
+            for node in targetRow {
+                let nodeStart = node.x
+                let nodeEnd = node.x + node.width
+
+                let distToStart = abs(point.x - nodeStart)
+                if distToStart < bestDistance {
+                    bestDistance = distToStart
+                    bestNode = node
+                    bestCharIndex = 0
+                }
+
+                let distToEnd = abs(point.x - nodeEnd)
+                if distToEnd < bestDistance {
+                    bestDistance = distToEnd
+                    bestNode = node
+                    bestCharIndex = node.text.count
+                }
+
+                // If point is within node bounds, calculate precise character
+                if point.x >= nodeStart && point.x <= nodeEnd {
+                    let relativeX = (point.x - node.x) / node.width
+                    let charIndex = Int(relativeX * CGFloat(node.text.count))
+                    return (nodeID: node.id, charIndex: max(0, min(node.text.count, charIndex)))
+                }
+            }
+
+            if let node = bestNode {
+                return (nodeID: node.id, charIndex: bestCharIndex)
+            }
+        }
+
+        // Fallback: return first node
+        if let firstNode = sortedNodes.first {
+            return (nodeID: firstNode.id, charIndex: 0)
+        }
+
+        return nil
+    }
+
+    /// Find the character position (node ID, char index) closest to a normalized point
+    /// Uses reading-order-aware selection: when point is not inside any node,
+    /// finds the best node based on reading position (row then column).
+    /// Includes padding tolerance to make selection easier when starting slightly outside nodes.
+    private func findCharacterPosition(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
+        let yTolerance: CGFloat = 0.02  // ~2% of screen height for same-line detection
+        // Padding in normalized coordinates (~1% of screen) to make selection easier
+        let hitPadding: CGFloat = 0.01
+
+        // Sort nodes by reading order (top to bottom, left to right)
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        // First, check if point is inside any node (exact hit)
+        for node in sortedNodes {
+            if point.x >= node.x && point.x <= node.x + node.width &&
+               point.y >= node.y && point.y <= node.y + node.height {
+                // Point is inside this node - calculate character position
+                let relativeX = (point.x - node.x) / node.width
+                let charIndex = Int(relativeX * CGFloat(node.text.count))
+                let clampedIndex = max(0, min(node.text.count, charIndex))
+                return (nodeID: node.id, charIndex: clampedIndex)
+            }
+        }
+
+        // Second, check if point is within padding distance of any node (expanded hit area)
+        for node in sortedNodes {
+            let paddedMinX = node.x - hitPadding
+            let paddedMaxX = node.x + node.width + hitPadding
+            let paddedMinY = node.y - hitPadding
+            let paddedMaxY = node.y + node.height + hitPadding
+
+            if point.x >= paddedMinX && point.x <= paddedMaxX &&
+               point.y >= paddedMinY && point.y <= paddedMaxY {
+                // Point is near this node - calculate character position
+                // Clamp the relative X to the actual node bounds
+                let clampedX = max(node.x, min(node.x + node.width, point.x))
+                let relativeX = (clampedX - node.x) / node.width
+                let charIndex = Int(relativeX * CGFloat(node.text.count))
+                let clampedIndex = max(0, min(node.text.count, charIndex))
+                return (nodeID: node.id, charIndex: clampedIndex)
+            }
+        }
+
+        // Point is not inside or near any node - find the best node for reading order selection
         // Strategy: Find which "row" the point is on, then find the appropriate node
 
         // Group nodes by row (using Y tolerance)

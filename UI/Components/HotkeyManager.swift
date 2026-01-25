@@ -16,7 +16,8 @@ public class HotkeyManager: NSObject {
     private var runLoopSource: CFRunLoopSource?
 
     /// Registered hotkeys with their callbacks
-    private var hotkeys: [(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, callback: () -> Void)] = []
+    /// Uses character-based matching to support non-QWERTY keyboard layouts (DVORAK, Colemak, etc.)
+    private var hotkeys: [(key: String, modifiers: NSEvent.ModifierFlags, callback: () -> Void)] = []
 
     /// Whether hotkeys are pending registration (waiting for permissions)
     private var pendingSetup = false
@@ -36,21 +37,20 @@ public class HotkeyManager: NSObject {
 
     // MARK: - Public API
 
-    /// Register a global hotkey
+    /// Register a global hotkey using key code (deprecated - use string-based registration)
     /// - Parameters:
     ///   - keyCode: The virtual key code
     ///   - modifiers: Modifier flags (command, shift, option, control)
     ///   - callback: Action to perform when hotkey is pressed
+    @available(*, deprecated, message: "Use registerHotkey(key:modifiers:callback:) for keyboard layout compatibility")
     public func registerHotkey(
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,
         callback: @escaping () -> Void
     ) {
-        // Add to hotkeys array
-        hotkeys.append((keyCode, modifiers, callback))
-
-        // Start monitoring if not already
-        startEventTap()
+        // Convert key code to character string for layout-independent matching
+        let key = stringForKeyCode(keyCode)
+        registerHotkey(key: key, modifiers: modifiers, callback: callback)
     }
 
     /// Register hotkey using string key representation
@@ -58,14 +58,17 @@ public class HotkeyManager: NSObject {
     ///   - key: Key string (e.g., "Space", "T", "D")
     ///   - modifiers: Modifier flags
     ///   - callback: Action to perform
+    /// - Note: Uses character-based matching to support all keyboard layouts (DVORAK, Colemak, etc.)
     public func registerHotkey(
         key: String,
         modifiers: NSEvent.ModifierFlags,
         callback: @escaping () -> Void
     ) {
-        let keyCode = keyCodeForString(key)
-        Log.info("[HotkeyManager] Registering hotkey: key='\(key)' keyCode=\(keyCode) modifiers=\(modifierDescription(modifiers))", category: .ui)
-        registerHotkey(keyCode: keyCode, modifiers: modifiers, callback: callback)
+        Log.info("[HotkeyManager] Registering hotkey: key='\(key)' modifiers=\(modifierDescription(modifiers))", category: .ui)
+        hotkeys.append((key, modifiers, callback))
+
+        // Start monitoring if not already
+        startEventTap()
     }
 
     /// Unregister all hotkeys
@@ -178,6 +181,9 @@ public class HotkeyManager: NSObject {
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
 
+        // Get the character for this key event, respecting keyboard layout
+        let pressedKey = characterForEvent(event, keyCode: keyCode)
+
         // Convert CGEventFlags to NSEvent.ModifierFlags for comparison
         var eventModifiers: NSEvent.ModifierFlags = []
         if flags.contains(.maskCommand) { eventModifiers.insert(.command) }
@@ -185,12 +191,14 @@ public class HotkeyManager: NSObject {
         if flags.contains(.maskAlternate) { eventModifiers.insert(.option) }
         if flags.contains(.maskControl) { eventModifiers.insert(.control) }
 
-        // Check if this matches any registered hotkey
+        // Check if this matches any registered hotkey using character-based comparison
         let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
         for hotkey in hotkeys {
-            if keyCode == hotkey.keyCode &&
-               eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers) {
+            // Compare characters case-insensitively for letter keys
+            let keysMatch = pressedKey.lowercased() == hotkey.key.lowercased()
+            let modifiersMatch = eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers)
 
+            if keysMatch && modifiersMatch {
                 // Execute callback on main thread
                 let callback = hotkey.callback
                 DispatchQueue.main.async {
@@ -206,7 +214,129 @@ public class HotkeyManager: NSObject {
         return Unmanaged.passRetained(event)
     }
 
+    /// Get the character for a CGEvent, respecting the current keyboard layout
+    /// - Parameters:
+    ///   - event: The CGEvent to extract the character from
+    ///   - keyCode: The key code (used for special keys like Space, Return, etc.)
+    /// - Returns: The character string representing the pressed key
+    private func characterForEvent(_ event: CGEvent, keyCode: UInt16) -> String {
+        // Handle special keys that don't have character representations
+        switch keyCode {
+        case 49: return "Space"
+        case 36: return "Return"
+        case 48: return "Tab"
+        case 53: return "Escape"
+        case 51: return "Delete"
+        case 123: return "Left"
+        case 124: return "Right"
+        case 125: return "Down"
+        case 126: return "Up"
+        // Function keys
+        case 122: return "F1"
+        case 120: return "F2"
+        case 99: return "F3"
+        case 118: return "F4"
+        case 96: return "F5"
+        case 97: return "F6"
+        case 98: return "F7"
+        case 100: return "F8"
+        case 101: return "F9"
+        case 109: return "F10"
+        case 103: return "F11"
+        case 111: return "F12"
+        default:
+            break
+        }
+
+        // For regular keys, get the character from the event using keyboard layout
+        // This respects DVORAK, Colemak, and other keyboard layouts
+        var length: Int = 0
+        var chars = [UniChar](repeating: 0, count: 4)
+
+        // Get the keyboard layout-aware character
+        // We use the event's Unicode string which respects the current input source
+        event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &chars)
+
+        if length > 0 {
+            let character = String(utf16CodeUnits: chars, count: length)
+            return character.uppercased()
+        }
+
+        // Fallback: use positional key code mapping (shouldn't normally reach here)
+        return stringForKeyCode(keyCode)
+    }
+
     // MARK: - Key Code Mapping
+
+    /// Convert a key code to its string representation (for special keys and fallback)
+    /// - Note: This uses QWERTY positions for letter keys as a fallback only.
+    ///         The primary matching uses character-based comparison via characterForEvent().
+    private func stringForKeyCode(_ keyCode: UInt16) -> String {
+        switch keyCode {
+        case 49: return "Space"
+        case 36: return "Return"
+        case 48: return "Tab"
+        case 53: return "Escape"
+        case 51: return "Delete"
+        case 123: return "Left"
+        case 124: return "Right"
+        case 125: return "Down"
+        case 126: return "Up"
+        // Function keys
+        case 122: return "F1"
+        case 120: return "F2"
+        case 99: return "F3"
+        case 118: return "F4"
+        case 96: return "F5"
+        case 97: return "F6"
+        case 98: return "F7"
+        case 100: return "F8"
+        case 101: return "F9"
+        case 109: return "F10"
+        case 103: return "F11"
+        case 111: return "F12"
+        // Numbers
+        case 18: return "1"
+        case 19: return "2"
+        case 20: return "3"
+        case 21: return "4"
+        case 23: return "5"
+        case 22: return "6"
+        case 26: return "7"
+        case 28: return "8"
+        case 25: return "9"
+        case 29: return "0"
+        // Letters (QWERTY positions - fallback only)
+        case 0: return "A"
+        case 11: return "B"
+        case 8: return "C"
+        case 2: return "D"
+        case 14: return "E"
+        case 3: return "F"
+        case 5: return "G"
+        case 4: return "H"
+        case 34: return "I"
+        case 38: return "J"
+        case 40: return "K"
+        case 37: return "L"
+        case 46: return "M"
+        case 45: return "N"
+        case 31: return "O"
+        case 35: return "P"
+        case 12: return "Q"
+        case 15: return "R"
+        case 1: return "S"
+        case 17: return "T"
+        case 32: return "U"
+        case 9: return "V"
+        case 13: return "W"
+        case 7: return "X"
+        case 16: return "Y"
+        case 6: return "Z"
+        default:
+            return "Key\(keyCode)"
+        }
+    }
 
     private func keyCodeForString(_ key: String) -> UInt16 {
         switch key.lowercased() {

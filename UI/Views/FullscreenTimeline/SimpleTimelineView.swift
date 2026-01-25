@@ -1893,6 +1893,11 @@ class TextSelectionView: NSView {
     private var hasMoved = false  // Track if mouse moved during drag
     private var mouseDownPoint: CGPoint = .zero
     private var trackingArea: NSTrackingArea?
+    private var isShowingIBeamCursor = false  // Track cursor state to avoid redundant push/pop
+
+    /// Padding in screen points to expand hit area around OCR bounding boxes
+    /// This makes it easier to start selection from slightly outside the text
+    private let boundingBoxPadding: CGFloat = 8.0
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -1906,6 +1911,46 @@ class TextSelectionView: NSView {
         let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited]
         trackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
         addTrackingArea(trackingArea!)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        updateCursorForLocation(location)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        // Reset cursor when leaving the view
+        if isShowingIBeamCursor {
+            NSCursor.pop()
+            isShowingIBeamCursor = false
+        }
+    }
+
+    /// Check if a screen point is near any OCR bounding box (within padding tolerance)
+    private func isNearAnyNode(screenPoint: CGPoint) -> Bool {
+        for node in nodeData {
+            // Expand the rect by padding on all sides
+            let expandedRect = node.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding)
+            if expandedRect.contains(screenPoint) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Update cursor based on whether we're near an OCR bounding box
+    private func updateCursorForLocation(_ location: CGPoint) {
+        let isNearNode = isNearAnyNode(screenPoint: location)
+
+        if isNearNode && !isShowingIBeamCursor {
+            // Entering text area - show IBeam cursor
+            NSCursor.iBeam.push()
+            isShowingIBeamCursor = true
+        } else if !isNearNode && isShowingIBeamCursor {
+            // Leaving text area - restore normal cursor
+            NSCursor.pop()
+            isShowingIBeamCursor = false
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
