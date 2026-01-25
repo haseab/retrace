@@ -2105,11 +2105,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func loadImageIfNeeded() {
         guard let timelineFrame = currentTimelineFrame else { return }
 
-        // Also load URL bounding box for the current frame
-        loadURLBoundingBox()
-
-        // Also load OCR nodes for text selection
-        loadOCRNodes()
+        // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
+        if !isActivelyScrolling {
+            loadURLBoundingBox()
+            loadOCRNodes()
+        } else {
+            // Clear stale OCR/URL data during scrolling so old bounding boxes don't persist
+            ocrNodes = []
+            urlBoundingBox = nil
+            clearTextSelection()
+        }
 
         let frame = timelineFrame.frame
 
@@ -3279,10 +3284,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        // Mark as actively scrolling (disables tape animation)
-        isActivelyScrolling = true
-        scrollDebounceTask?.cancel()
-
         // Accumulate scroll delta
         scrollAccumulator += delta
 
@@ -3297,7 +3298,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let frameStep = Int(scrollAccumulator * zoomAdjustedSensitivity)
 
+        // Only process if we have enough scroll to move at least one frame
         guard frameStep != 0 else { return }
+
+        // Mark as actively scrolling (disables tape animation) - only when actually moving
+        isActivelyScrolling = true
+
+        // Cancel previous debounce task since we're moving to a new frame
+        scrollDebounceTask?.cancel()
 
         // Reset accumulator after navigating
         scrollAccumulator = 0
@@ -3310,12 +3318,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             clearSearchHighlight()
         }
 
-        // Debounce: re-enable animation after 100ms of no scroll events
+        // Debounce: re-enable animation and load OCR/URL after 100ms of no frame changes
         scrollDebounceTask = Task {
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
             if !Task.isCancelled {
                 await MainActor.run {
                     self.isActivelyScrolling = false
+                    // Now load OCR/URL data that was deferred during scrubbing
+                    self.loadURLBoundingBox()
+                    self.loadOCRNodes()
                 }
             }
         }
