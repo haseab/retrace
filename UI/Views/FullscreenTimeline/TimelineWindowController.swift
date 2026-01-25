@@ -83,8 +83,8 @@ public class TimelineWindowController: NSObject {
             }
         )
 
-        // Host the SwiftUI view
-        let hostingView = NSHostingView(rootView: timelineView)
+        // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
+        let hostingView = FirstMouseHostingView(rootView: timelineView)
         hostingView.frame = window.contentView?.bounds ?? .zero
         hostingView.autoresizingMask = [.width, .height]
         window.contentView?.addSubview(hostingView)
@@ -132,11 +132,17 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor in
+                // Hide dashboard window BEFORE closing timeline to prevent it from becoming key
+                DashboardWindowController.shared.hide()
+
                 window.orderOut(nil)
                 self?.window = nil
                 self?.timelineViewModel = nil
                 self?.isVisible = false
                 self?.onClose?()
+
+                // Reset the cached scale factor so it recalculates for next window
+                TimelineScaleFactor.resetCache()
 
                 // Notify coordinator to resume frame processing
                 if let coordinator = self?.coordinator {
@@ -209,6 +215,11 @@ public class TimelineWindowController: NSObject {
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
+                // Don't handle scroll events when search overlay, filter dropdown, or tag submenu is open
+                if let viewModel = self?.timelineViewModel,
+                   (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen || viewModel.showTagSubmenu) {
+                    return // Let SwiftUI handle it
+                }
                 self?.handleScrollEvent(event, source: "GLOBAL")
             } else if event.type == .magnify {
                 self?.handleMagnifyEvent(event)
@@ -230,8 +241,8 @@ public class TimelineWindowController: NSObject {
                 // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
 
-                // Cmd+K to toggle search overlay
-                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                // Cmd+F to toggle search overlay
+                if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     if self?.handleKeyEvent(event) == true {
                         return nil // Consume the event
                     }
@@ -271,6 +282,16 @@ public class TimelineWindowController: NSObject {
                 // Let SwiftUI ScrollView handle them for scrolling through results
                 if let viewModel = self?.timelineViewModel, viewModel.isSearchOverlayVisible {
                     return event // Let the ScrollView handle it
+                }
+                // Don't intercept scroll events when a filter dropdown is open
+                // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
+                if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
+                    return event // Let the dropdown ScrollView handle it
+                }
+                // Don't intercept scroll events when the tag submenu is open
+                // Let SwiftUI ScrollView handle them for scrolling through tags
+                if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
+                    return event // Let the tag submenu ScrollView handle it
                 }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
@@ -313,17 +334,25 @@ public class TimelineWindowController: NSObject {
                     viewModel.cancelZoomRegionDrag()
                     return true
                 }
-                // If calendar picker is showing, close it first
+                // If calendar picker is showing, close it first with animation
                 if viewModel.isCalendarPickerVisible {
-                    viewModel.isCalendarPickerVisible = false
-                    viewModel.hoursWithFrames = []
-                    viewModel.selectedCalendarDate = nil
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.9)) {
+                        viewModel.isCalendarPickerVisible = false
+                        viewModel.hoursWithFrames = []
+                        viewModel.selectedCalendarDate = nil
+                    }
                     return true
                 }
-                // If date search is active, close it
+                // If zoom slider is expanded, collapse it
+                if viewModel.isZoomSliderExpanded {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.isZoomSliderExpanded = false
+                    }
+                    return true
+                }
+                // If date search is active, close it with animation
                 if viewModel.isDateSearchActive {
-                    viewModel.isDateSearchActive = false
-                    viewModel.dateSearchText = ""
+                    viewModel.closeDateSearch()
                     return true
                 }
                 // If search overlay is showing, close it
@@ -351,6 +380,16 @@ public class TimelineWindowController: NSObject {
                     viewModel.clearTextSelection()
                     return true
                 }
+                // If filter panel is visible with open dropdown, let the panel handle it
+                if viewModel.isFilterPanelVisible && viewModel.isFilterDropdownOpen {
+                    // The FilterPanel's NSEvent monitor will handle this
+                    return false
+                }
+                // If filter panel is visible (no dropdown), close it
+                if viewModel.isFilterPanelVisible {
+                    viewModel.dismissFilterPanel()
+                    return true
+                }
             }
             // Otherwise close the timeline
             hide()
@@ -369,17 +408,13 @@ public class TimelineWindowController: NSObject {
         // Cmd+G to toggle date search panel ("Go to" date)
         if event.keyCode == 5 && modifiers == [.command] { // G key with Command
             if let viewModel = timelineViewModel {
-                viewModel.isDateSearchActive.toggle()
-                // Clear text when closing
-                if !viewModel.isDateSearchActive {
-                    viewModel.dateSearchText = ""
-                }
+                viewModel.toggleDateSearch()
             }
             return true
         }
 
-        // Cmd+K to toggle search overlay
-        if event.keyCode == 40 && modifiers == [.command] { // K key with Command
+        // Cmd+F to toggle search overlay
+        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
             if let viewModel = timelineViewModel {
                 // Clear search highlight when opening search overlay
                 if !viewModel.isSearchOverlayVisible {
@@ -436,18 +471,20 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        // Left arrow key - navigate to previous frame
-        if event.keyCode == 123 && modifiers.isEmpty { // Left arrow
+        // Left arrow key - navigate to previous frame (Option = 3x speed)
+        if event.keyCode == 123 && (modifiers.isEmpty || modifiers == [.option]) { // Left arrow
             if let viewModel = timelineViewModel {
-                viewModel.navigateToFrame(viewModel.currentIndex - 1)
+                let step = modifiers.contains(.option) ? 3 : 1
+                viewModel.navigateToFrame(viewModel.currentIndex - step)
                 return true
             }
         }
 
-        // Right arrow key - navigate to next frame
-        if event.keyCode == 124 && modifiers.isEmpty { // Right arrow
+        // Right arrow key - navigate to next frame (Option = 3x speed)
+        if event.keyCode == 124 && (modifiers.isEmpty || modifiers == [.option]) { // Right arrow
             if let viewModel = timelineViewModel {
-                viewModel.navigateToFrame(viewModel.currentIndex + 1)
+                let step = modifiers.contains(.option) ? 3 : 1
+                viewModel.navigateToFrame(viewModel.currentIndex + step)
                 return true
             }
         }
@@ -621,4 +658,11 @@ extension Notification.Name {
 class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+}
+
+/// Custom hosting view that accepts first mouse to enable hover on first interaction
+class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
 }

@@ -137,6 +137,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the zoom slider is expanded/visible
     @Published public var isZoomSliderExpanded = false
 
+    /// Whether the user is actively scrolling (disables tape animation during rapid scrolling)
+    @Published public var isActivelyScrolling = false
+
     /// Currently selected frame index (for deletion, etc.) - nil means no selection
     @Published public var selectedFrameIndex: Int? = nil
 
@@ -356,6 +359,131 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Timer to auto-dismiss search highlight
     private var searchHighlightTimer: Timer?
 
+    // MARK: - Context Menu State
+
+    /// Whether the right-click context menu is visible
+    @Published public var showContextMenu: Bool = false
+
+    /// Location where the context menu should appear
+    @Published public var contextMenuLocation: CGPoint = .zero
+
+    /// Dismiss the context menu if it's visible
+    public func dismissContextMenu() {
+        if showContextMenu {
+            showContextMenu = false
+        }
+    }
+
+    // MARK: - Timeline Context Menu State (for right-click on timeline tape)
+
+    /// Whether the timeline context menu is visible
+    @Published public var showTimelineContextMenu: Bool = false
+
+    /// Location where the timeline context menu should appear
+    @Published public var timelineContextMenuLocation: CGPoint = .zero
+
+    /// The segment index that was right-clicked on the timeline
+    @Published public var timelineContextMenuSegmentIndex: Int? = nil
+
+    /// Whether the tag submenu is visible
+    @Published public var showTagSubmenu: Bool = false
+
+    /// Whether the "create new tag" input is visible
+    @Published public var showNewTagInput: Bool = false
+
+    /// Text for the new tag name input
+    @Published public var newTagName: String = ""
+
+    /// Whether the mouse is hovering over the "Add Tag" button
+    @Published public var isHoveringAddTagButton: Bool = false
+
+    /// All available tags
+    @Published public var availableTags: [Tag] = []
+
+    /// Tags applied to the currently selected segment (for showing checkmarks)
+    @Published public var selectedSegmentTags: Set<TagID> = []
+
+    /// Set of segment IDs that are hidden
+    @Published public var hiddenSegmentIds: Set<SegmentID> = []
+
+    /// Dismiss the timeline context menu
+    public func dismissTimelineContextMenu() {
+        showTimelineContextMenu = false
+        showTagSubmenu = false
+        showNewTagInput = false
+        newTagName = ""
+        isHoveringAddTagButton = false
+        selectedSegmentTags = []
+    }
+
+    // MARK: - Filter State
+
+    /// Current applied filter criteria
+    @Published public var filterCriteria: FilterCriteria = .none
+
+    /// Pending filter criteria (edited in panel, applied on submit)
+    @Published public var pendingFilterCriteria: FilterCriteria = .none
+
+    /// Whether the filter panel is visible
+    @Published public var isFilterPanelVisible: Bool = false
+
+    /// Whether any filter dropdown (apps, tags, visibility) is open in the filter panel
+    /// Set by FilterPanel view to allow TimelineWindowController to skip escape handling
+    @Published public var isFilterDropdownOpen: Bool = false
+
+    // MARK: - Filter Dropdown State (lifted to ViewModel for proper rendering outside FilterPanel)
+
+    /// Which filter dropdown is currently open (rendered at SimpleTimelineView level to avoid clipping)
+    public enum FilterDropdownType: Equatable {
+        case none
+        case apps
+        case tags
+        case visibility
+    }
+
+    /// The currently active filter dropdown
+    @Published public var activeFilterDropdown: FilterDropdownType = .none
+
+    /// Position of the currently active dropdown button in "timelineContent" coordinate space (for positioning the dropdown)
+    @Published public var filterDropdownAnchorFrame: CGRect = .zero
+
+    /// Show a specific filter dropdown
+    public func showFilterDropdown(_ type: FilterDropdownType, anchorFrame: CGRect) {
+        print("[FilterDropdown] showFilterDropdown type=\(type), anchor=\(anchorFrame)")
+        filterDropdownAnchorFrame = anchorFrame
+        activeFilterDropdown = type
+        isFilterDropdownOpen = type != .none
+    }
+
+    /// Dismiss any open filter dropdown
+    public func dismissFilterDropdown() {
+        print("[FilterDropdown] dismissFilterDropdown")
+        activeFilterDropdown = .none
+        isFilterDropdownOpen = false
+    }
+
+    /// Apps available for filtering (installed apps only)
+    @Published public var availableAppsForFilter: [(bundleID: String, name: String)] = []
+
+    /// Other apps for filtering (apps from DB history that aren't currently installed)
+    @Published public var otherAppsForFilter: [(bundleID: String, name: String)] = []
+
+    /// Whether apps for filter are currently being loaded
+    @Published public var isLoadingAppsForFilter = false
+
+    /// Map of segment IDs to their tag IDs (for efficient tag filtering)
+    @Published public var segmentTagsMap: [Int64: Set<Int64>] = [:]
+
+    /// Number of active filters (for badge display)
+    public var activeFilterCount: Int {
+        filterCriteria.activeFilterCount
+    }
+
+    /// Whether pending filters differ from applied filters
+    public var hasPendingFilterChanges: Bool {
+        pendingFilterCriteria != filterCriteria
+    }
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level
@@ -433,6 +561,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var _cachedAppBlocks: [AppBlock]?
 
     /// App blocks grouped by consecutive bundle IDs
+    /// Note: Since we do server-side filtering, frames already contains only filtered results when filters are active
     public var appBlocks: [AppBlock] {
         if let cached = _cachedAppBlocks {
             return cached
@@ -447,6 +576,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Scroll accumulator for smooth scrolling
     private var scrollAccumulator: CGFloat = 0
+
+    /// Task for debouncing scroll end detection
+    private var scrollDebounceTask: Task<Void, Never>?
 
     /// Cache for Retrace images (loaded on demand since they're from disk)
     private var imageCache: [FrameID: NSImage] = [:] {
@@ -516,6 +648,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         return cacheDir.appendingPathComponent("timeline_frames_cache.json")
     }
 
+    /// Key for storing cached hidden segment IDs
+    private static let cachedHiddenSegmentIdsKey = "timeline.cachedHiddenSegmentIds"
+
+    // MARK: - Filter Cache Keys
+
+    /// Key for storing cached filter criteria
+    private static let cachedFilterCriteriaKey = "timeline.cachedFilterCriteria"
+    /// Key for storing when filter cache was saved
+    private static let cachedFilterSavedAtKey = "timeline.cachedFilterSavedAt"
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -565,7 +707,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.debug("[DataSourceChange] Clearing search results", category: .ui)
         searchViewModel.clearSearchResults()
 
-        Log.info("[DataSourceChange] Cleared \(oldImageCount) cached images and search results, reloading from current position", category: .ui)
+        // Clear filter state and cache
+        filterCriteria = .none
+        clearCachedFilterCriteria()
+        Log.debug("[DataSourceChange] Cleared filter state and cache", category: .ui)
+
+        Log.info("[DataSourceChange] Cleared \(oldImageCount) cached images, search results, and filters, reloading from current position", category: .ui)
         Log.debug("[DataSourceChange] Current frames count: \(frames.count), currentIndex: \(currentIndex)", category: .ui)
 
         // Reload frames from the current timestamp
@@ -597,7 +744,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             let endDate = calendar.date(byAdding: .minute, value: 10, to: timestamp) ?? timestamp
 
             Log.debug("[DataSourceChange] Fetching frames from \(startDate) to \(endDate)", category: .ui)
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
             Log.debug("[DataSourceChange] Fetched \(framesWithVideoInfo.count) frames from data adapter", category: .ui)
 
             if !framesWithVideoInfo.isEmpty {
@@ -719,7 +867,24 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Get the app block containing the selected frame
     public var selectedBlock: AppBlock? {
         guard let index = selectedFrameIndex else { return nil }
+        return getBlock(forFrameAt: index)
+    }
+
+    /// Get the app block containing a frame at the given index
+    public func getBlock(forFrameAt index: Int) -> AppBlock? {
         return appBlocks.first { index >= $0.startIndex && index <= $0.endIndex }
+    }
+
+    /// Get all unique segment IDs within a visible block
+    public func getSegmentIds(inBlock block: AppBlock) -> Set<SegmentID> {
+        var segmentIds = Set<SegmentID>()
+        for index in block.startIndex...block.endIndex {
+            if index < frames.count {
+                let segmentId = SegmentID(value: frames[index].frame.segmentID.value)
+                segmentIds.insert(segmentId)
+            }
+        }
+        return segmentIds
     }
 
     /// Get the number of frames in the selected segment
@@ -785,6 +950,513 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Tag Operations
+
+    /// Load all available tags from the database, and tags for the selected segment
+    public func loadTags() async {
+        do {
+            availableTags = try await coordinator.getAllTags()
+            Log.debug("[Tags] Loaded \(availableTags.count) tags: \(availableTags.map { $0.name })", category: .ui)
+
+            // Also load tags for the currently selected segment
+            Log.debug("[Tags] timelineContextMenuSegmentIndex = \(String(describing: timelineContextMenuSegmentIndex))", category: .ui)
+            if let index = timelineContextMenuSegmentIndex,
+               let segmentId = getSegmentId(forFrameAt: index) {
+                Log.debug("[Tags] Loading tags for segment \(segmentId.value) at frame index \(index)", category: .ui)
+                let segmentTags = try await coordinator.getTagsForSegment(segmentId: segmentId)
+                await MainActor.run {
+                    selectedSegmentTags = Set(segmentTags.map { $0.id })
+                }
+                Log.debug("[Tags] Segment \(segmentId.value) has \(segmentTags.count) tags: \(segmentTags.map { $0.name })", category: .ui)
+            } else {
+                Log.debug("[Tags] Could not get segment ID - index: \(String(describing: timelineContextMenuSegmentIndex)), frames.count: \(frames.count)", category: .ui)
+            }
+        } catch {
+            Log.error("[Tags] Failed to load tags: \(error)", category: .ui)
+        }
+    }
+
+    /// Load hidden segment IDs from the database
+    public func loadHiddenSegments() async {
+        do {
+            hiddenSegmentIds = try await coordinator.getHiddenSegmentIds()
+            Log.debug("[Tags] Loaded \(hiddenSegmentIds.count) hidden segments", category: .ui)
+        } catch {
+            Log.error("[Tags] Failed to load hidden segments: \(error)", category: .ui)
+        }
+    }
+
+    /// Get the segment ID for a frame at the given index (as SegmentID for database operations)
+    public func getSegmentId(forFrameAt index: Int) -> SegmentID? {
+        guard index >= 0 && index < frames.count else { return nil }
+        // Convert AppSegmentID to SegmentID (they have the same underlying value)
+        return SegmentID(value: frames[index].frame.segmentID.value)
+    }
+
+    /// Get the app segment ID for a frame at the given index (for UI comparisons)
+    private func getAppSegmentId(forFrameAt index: Int) -> AppSegmentID? {
+        guard index >= 0 && index < frames.count else { return nil }
+        return frames[index].frame.segmentID
+    }
+
+    /// Hide all segments in the visible block at the current timeline context menu selection
+    /// This hides all consecutive frames with the same bundleID as shown in the UI
+    public func hideSelectedTimelineSegment() {
+        guard let index = timelineContextMenuSegmentIndex,
+              let block = getBlock(forFrameAt: index) else {
+            dismissTimelineContextMenu()
+            return
+        }
+
+        // Get all unique segment IDs in this visible block
+        let segmentIds = getSegmentIds(inBlock: block)
+
+        // Add all to hidden set immediately (optimistic UI update)
+        for segmentId in segmentIds {
+            hiddenSegmentIds.insert(segmentId)
+        }
+
+        let removeCount = block.frameCount
+        let startIndex = block.startIndex
+
+        // Remove all frames in the block from the array
+        if block.endIndex < frames.count {
+            frames.removeSubrange(block.startIndex...block.endIndex)
+        }
+
+        // Clear cached blocks since frames changed
+        _cachedAppBlocks = nil
+
+        // Adjust current index
+        if currentIndex >= startIndex + removeCount {
+            // Current was after deleted block
+            currentIndex -= removeCount
+        } else if currentIndex >= startIndex {
+            // Current was within deleted block - move to start of where block was
+            currentIndex = max(0, min(startIndex, frames.count - 1))
+        }
+
+        // Load image for new current frame
+        loadImageIfNeeded()
+
+        dismissTimelineContextMenu()
+
+        Log.debug("[Tags] Hidden \(segmentIds.count) segments in block, removed \(removeCount) frames from UI", category: .ui)
+
+        // Persist to database in background
+        Task {
+            do {
+                try await coordinator.hideSegments(segmentIds: Array(segmentIds))
+                Log.debug("[Tags] \(segmentIds.count) segments hidden in database", category: .ui)
+            } catch {
+                Log.error("[Tags] Failed to hide segments in database: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Add a tag to all segments in the visible block
+    /// This affects all consecutive frames with the same bundleID as shown in the UI
+    public func addTagToSelectedSegment(tag: Tag) {
+        guard let index = timelineContextMenuSegmentIndex,
+              let block = getBlock(forFrameAt: index) else {
+            dismissTimelineContextMenu()
+            return
+        }
+
+        // Get all unique segment IDs in this visible block
+        let segmentIds = getSegmentIds(inBlock: block)
+
+        dismissTimelineContextMenu()
+
+        // Persist to database in background
+        Task {
+            do {
+                try await coordinator.addTagToSegments(segmentIds: Array(segmentIds), tagId: tag.id)
+                Log.debug("[Tags] Added tag '\(tag.name)' to \(segmentIds.count) segments in block", category: .ui)
+            } catch {
+                Log.error("[Tags] Failed to add tag to segments: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Toggle a tag on all segments in the visible block (add if not present, remove if present)
+    /// This affects all consecutive frames with the same bundleID as shown in the UI
+    public func toggleTagOnSelectedSegment(tag: Tag) {
+        guard let index = timelineContextMenuSegmentIndex,
+              let block = getBlock(forFrameAt: index) else {
+            return
+        }
+
+        // Get all unique segment IDs in this visible block
+        let segmentIds = getSegmentIds(inBlock: block)
+
+        let isCurrentlySelected = selectedSegmentTags.contains(tag.id)
+
+        // Update UI immediately
+        if isCurrentlySelected {
+            selectedSegmentTags.remove(tag.id)
+        } else {
+            selectedSegmentTags.insert(tag.id)
+        }
+
+        // Persist to database in background
+        Task {
+            do {
+                if isCurrentlySelected {
+                    try await coordinator.removeTagFromSegments(segmentIds: Array(segmentIds), tagId: tag.id)
+                    Log.debug("[Tags] Removed tag '\(tag.name)' from \(segmentIds.count) segments in block", category: .ui)
+                } else {
+                    try await coordinator.addTagToSegments(segmentIds: Array(segmentIds), tagId: tag.id)
+                    Log.debug("[Tags] Added tag '\(tag.name)' to \(segmentIds.count) segments in block", category: .ui)
+                }
+            } catch {
+                Log.error("[Tags] Failed to toggle tag on segments: \(error)", category: .ui)
+                // Revert UI on error
+                await MainActor.run {
+                    if isCurrentlySelected {
+                        selectedSegmentTags.insert(tag.id)
+                    } else {
+                        selectedSegmentTags.remove(tag.id)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Create a new tag and add it to all segments in the visible block
+    /// Keeps the menu open and shows optimistic UI update
+    public func createAndAddTag() {
+        let tagName = newTagName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tagName.isEmpty else {
+            return
+        }
+
+        guard let index = timelineContextMenuSegmentIndex,
+              let block = getBlock(forFrameAt: index) else {
+            return
+        }
+
+        // Get all unique segment IDs in this visible block
+        let segmentIds = getSegmentIds(inBlock: block)
+
+        // Clear the input
+        newTagName = ""
+
+        // Create tag and add to all segments in background
+        Task {
+            do {
+                let newTag = try await coordinator.createTag(name: tagName)
+                try await coordinator.addTagToSegments(segmentIds: Array(segmentIds), tagId: newTag.id)
+
+                // Optimistic UI update: add the new tag to availableTags and mark it as selected
+                await MainActor.run {
+                    // Add to available tags if not already present
+                    if !availableTags.contains(where: { $0.id == newTag.id }) {
+                        availableTags.append(newTag)
+                        availableTags.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    }
+                    // Mark it as selected on the current segment
+                    selectedSegmentTags.insert(newTag.id)
+                }
+
+                Log.debug("[Tags] Created tag '\(tagName)' and added to \(segmentIds.count) segments in block", category: .ui)
+            } catch {
+                Log.error("[Tags] Failed to create tag: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Request deletion from timeline context menu (shows confirmation dialog)
+    public func requestDeleteFromTimelineMenu() {
+        guard let index = timelineContextMenuSegmentIndex else {
+            dismissTimelineContextMenu()
+            return
+        }
+
+        // Set the selected frame to the clicked one and show delete confirmation
+        selectedFrameIndex = index
+        dismissTimelineContextMenu()
+        showDeleteConfirmation = true
+    }
+
+    // MARK: - Filter Operations
+
+    /// Check if a frame at a given index is in a hidden segment
+    public func isFrameHidden(at index: Int) -> Bool {
+        guard index >= 0 && index < frames.count else { return false }
+        let segmentId = SegmentID(value: frames[index].frame.segmentID.value)
+        return hiddenSegmentIds.contains(segmentId)
+    }
+
+    /// Group frames into app blocks (parameterized version for filtered frames)
+    private func groupFramesIntoBlocks(from frameList: [TimelineFrame]) -> [AppBlock] {
+        guard !frameList.isEmpty else { return [] }
+
+        var blocks: [AppBlock] = []
+        var currentBundleID: String? = nil
+        var blockStartIndex = 0
+
+        for (index, timelineFrame) in frameList.enumerated() {
+            let frameBundleID = timelineFrame.frame.metadata.appBundleID
+
+            if frameBundleID != currentBundleID {
+                // End previous block if exists
+                if index > 0 {
+                    blocks.append(AppBlock(
+                        bundleID: currentBundleID,
+                        appName: frameList[blockStartIndex].frame.metadata.appName,
+                        startIndex: blockStartIndex,
+                        endIndex: index - 1,
+                        frameCount: index - blockStartIndex
+                    ))
+                }
+
+                // Start new block
+                currentBundleID = frameBundleID
+                blockStartIndex = index
+            }
+        }
+
+        // Add final block
+        blocks.append(AppBlock(
+            bundleID: currentBundleID,
+            appName: frameList[blockStartIndex].frame.metadata.appName,
+            startIndex: blockStartIndex,
+            endIndex: frameList.count - 1,
+            frameCount: frameList.count - blockStartIndex
+        ))
+
+        return blocks
+    }
+
+    /// Load apps available for filtering
+    /// Phase 1: Instantly load installed apps from /Applications (synchronous)
+    /// Phase 2: Merge with apps from DB history (async)
+    public func loadAvailableAppsForFilter() async {
+        guard !isLoadingAppsForFilter else {
+            Log.debug("[Filter] loadAvailableAppsForFilter skipped - already loading", category: .ui)
+            return
+        }
+
+        // Skip if already loaded
+        guard availableAppsForFilter.isEmpty else {
+            Log.debug("[Filter] loadAvailableAppsForFilter skipped - already have \(availableAppsForFilter.count) apps", category: .ui)
+            return
+        }
+
+        isLoadingAppsForFilter = true
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Phase 1: Instant - get installed apps from /Applications folder
+        let installed = AppNameResolver.shared.getInstalledApps()
+        let installedBundleIDs = Set(installed.map { $0.bundleID })
+        var allApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+        Log.info("[Filter] Phase 1: Loaded \(allApps.count) installed apps in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
+
+        // Update UI immediately with installed apps
+        availableAppsForFilter = allApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+        // Phase 2: Load apps from DB that aren't installed (historical apps)
+        do {
+            let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
+            let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+            let historicalApps = dbApps
+                .filter { !installedBundleIDs.contains($0.bundleID) }
+                .map { (bundleID: $0.bundleID, name: $0.name) }
+
+            if !historicalApps.isEmpty {
+                otherAppsForFilter = historicalApps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                Log.info("[Filter] Phase 2: Added \(historicalApps.count) historical apps to otherAppsForFilter", category: .ui)
+            }
+        } catch {
+            Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
+        }
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+        Log.info("[Filter] Total: \(availableAppsForFilter.count) installed + \(otherAppsForFilter.count) other apps loaded in \(Int(totalTime * 1000))ms", category: .ui)
+        isLoadingAppsForFilter = false
+    }
+
+    /// Load segment-to-tags mapping for efficient tag filtering
+    public func loadSegmentTagsMap() async {
+        do {
+            segmentTagsMap = try await coordinator.getSegmentTagsMap()
+            Log.debug("[Filter] Loaded tags for \(segmentTagsMap.count) segments", category: .ui)
+        } catch {
+            Log.error("[Filter] Failed to load segment tags map: \(error)", category: .ui)
+        }
+    }
+
+    /// Toggle app filter selection (updates pending, not applied)
+    public func toggleAppFilter(_ bundleID: String) {
+        var apps = pendingFilterCriteria.selectedApps ?? []
+        if apps.contains(bundleID) {
+            apps.remove(bundleID)
+        } else {
+            apps.insert(bundleID)
+        }
+        pendingFilterCriteria.selectedApps = apps.isEmpty ? nil : apps
+        Log.debug("[Filter] Toggled app filter for \(bundleID), now \(apps.count) apps selected (pending)", category: .ui)
+    }
+
+    /// Toggle source filter selection (updates pending, not applied)
+    /// When nil (all sources), clicking deselects the clicked source (keeps the other)
+    /// When one is selected, clicking the other adds it (back to all)
+    /// When one is selected, clicking the same one does nothing (must have at least one)
+    public func toggleSourceFilter(_ source: FrameSource) {
+        if pendingFilterCriteria.selectedSources == nil {
+            // Currently showing all - clicking one deselects it (keeps only the other)
+            var sources: Set<FrameSource> = [.native, .rewind]
+            sources.remove(source)
+            pendingFilterCriteria.selectedSources = sources
+        } else {
+            var sources = pendingFilterCriteria.selectedSources!
+            if sources.contains(source) {
+                // Don't allow removing the last source
+                if sources.count > 1 {
+                    sources.remove(source)
+                    pendingFilterCriteria.selectedSources = sources
+                }
+            } else {
+                // Add the source back
+                sources.insert(source)
+                // If both are now selected, set to nil (all sources)
+                if sources.contains(.native) && sources.contains(.rewind) {
+                    pendingFilterCriteria.selectedSources = nil
+                } else {
+                    pendingFilterCriteria.selectedSources = sources
+                }
+            }
+        }
+        Log.debug("[Filter] Toggled source filter for \(source.rawValue)", category: .ui)
+    }
+
+    /// Toggle tag filter selection (updates pending, not applied)
+    public func toggleTagFilter(_ tagId: TagID) {
+        var tags = pendingFilterCriteria.selectedTags ?? []
+        if tags.contains(tagId.value) {
+            tags.remove(tagId.value)
+        } else {
+            tags.insert(tagId.value)
+        }
+        pendingFilterCriteria.selectedTags = tags.isEmpty ? nil : tags
+        Log.debug("[Filter] Toggled tag filter for \(tagId.value), now \(tags.count) tags selected (pending)", category: .ui)
+    }
+
+    /// Set hidden filter mode (updates pending, not applied)
+    public func setHiddenFilter(_ mode: HiddenFilter) {
+        pendingFilterCriteria.hiddenFilter = mode
+        Log.debug("[Filter] Set hidden filter to \(mode.rawValue) (pending)", category: .ui)
+    }
+
+    /// Set app filter mode (include/exclude) (updates pending, not applied)
+    public func setAppFilterMode(_ mode: AppFilterMode) {
+        pendingFilterCriteria.appFilterMode = mode
+        Log.debug("[Filter] Set app filter mode to \(mode.rawValue) (pending)", category: .ui)
+    }
+
+    /// Set tag filter mode (include/exclude) (updates pending, not applied)
+    public func setTagFilterMode(_ mode: TagFilterMode) {
+        pendingFilterCriteria.tagFilterMode = mode
+        Log.debug("[Filter] Set tag filter mode to \(mode.rawValue) (pending)", category: .ui)
+    }
+
+    /// Apply pending filters
+    public func applyFilters() {
+        Log.debug("[Filter] applyFilters() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), current.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+        filterCriteria = pendingFilterCriteria
+        Log.debug("[Filter] Applied filters - filterCriteria.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+        dismissFilterPanel()
+
+        // Save filter criteria to cache immediately
+        saveFilterCriteria()
+
+        // Reload timeline with filters
+        Task {
+            await loadMostRecentFrame()
+        }
+    }
+
+    /// Clear all pending filters
+    public func clearPendingFilters() {
+        pendingFilterCriteria = .none
+        Log.debug("[Filter] Cleared pending filters", category: .ui)
+    }
+
+    /// Clear all applied filters and reset pending
+    public func clearAllFilters() {
+        filterCriteria = .none
+        pendingFilterCriteria = .none
+        Log.debug("[Filter] Cleared all filters", category: .ui)
+
+        // Save (clear) filter criteria cache immediately
+        saveFilterCriteria()
+
+        // Reload timeline without filters
+        Task {
+            await loadMostRecentFrame()
+        }
+    }
+
+    /// Show "no results" message and provide option to clear filters
+    private func showNoResultsMessage() {
+        error = "No frames found matching the current filters. Clear filters to see all frames."
+    }
+
+    /// Dismiss filter panel (resets pending to match applied)
+    public func dismissFilterPanel() {
+        // Reset pending first, then animate the visibility change
+        pendingFilterCriteria = filterCriteria
+        withAnimation(.easeOut(duration: 0.15)) {
+            isFilterPanelVisible = false
+        }
+    }
+
+    /// Open filter panel and load necessary data
+    public func openFilterPanel() {
+        dismissContextMenu()
+        dismissTimelineContextMenu()
+        // Initialize pending with current applied filters
+        pendingFilterCriteria = filterCriteria
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            isFilterPanelVisible = true
+        }
+        // Delay data loading until after animation completes to prevent choppiness
+        Task {
+            try? await Task.sleep(nanoseconds: 400_000_000) // 0.4s - after animation
+            await loadAvailableAppsForFilter()
+            await loadTags()
+            await loadHiddenSegments()
+            await loadSegmentTagsMap()
+        }
+    }
+
+    // MARK: - Date Search Panel
+
+    /// Open the date search panel with animation
+    public func openDateSearch() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            isDateSearchActive = true
+        }
+    }
+
+    /// Close the date search panel with animation
+    public func closeDateSearch() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            isDateSearchActive = false
+        }
+        dateSearchText = ""
+    }
+
+    /// Toggle the date search panel with animation
+    public func toggleDateSearch() {
+        if isDateSearchActive {
+            closeDateSearch()
+        } else {
+            openDateSearch()
+        }
+    }
+
     // MARK: - Position Cache Methods
 
     /// Save the current playhead position AND frames to cache for instant restore
@@ -793,6 +1465,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Always save search results, even if timeline has no frames
         searchViewModel.saveSearchResults()
+
+        // Save filter criteria
+        saveFilterCriteria()
 
         guard let timestamp = currentTimestamp else { return }
         guard !frames.isEmpty else { return }
@@ -819,7 +1494,69 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)", category: .ui)
+        // Save hidden segment IDs for instant restore of hatch marks
+        let hiddenIds = Array(hiddenSegmentIds.map { $0.value })
+        UserDefaults.standard.set(hiddenIds, forKey: Self.cachedHiddenSegmentIdsKey)
+
+        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex), hiddenSegments: \(hiddenSegmentIds.count)", category: .ui)
+    }
+
+    /// Save filter criteria to cache
+    /// Saves pendingFilterCriteria so that in-progress filter changes are preserved
+    private func saveFilterCriteria() {
+        Log.debug("[FilterCache] saveFilterCriteria() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), pending.hasActiveFilters=\(pendingFilterCriteria.hasActiveFilters)", category: .ui)
+        // If no filters are active in pending, clear any cached filters to avoid restoring stale state
+        guard pendingFilterCriteria.hasActiveFilters else {
+            Log.debug("[FilterCache] No active pending filters, clearing cache", category: .ui)
+            clearCachedFilterCriteria()
+            return
+        }
+
+        do {
+            let data = try JSONEncoder().encode(pendingFilterCriteria)
+            UserDefaults.standard.set(data, forKey: Self.cachedFilterCriteriaKey)
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedFilterSavedAtKey)
+            Log.debug("[FilterCache] Saved pending filter criteria with selectedApps=\(String(describing: pendingFilterCriteria.selectedApps))", category: .ui)
+        } catch {
+            Log.warning("[FilterCache] Failed to save filter criteria: \(error)", category: .ui)
+        }
+    }
+
+    /// Restore filter criteria from cache
+    /// Restores to both filterCriteria and pendingFilterCriteria so UI and applied state are in sync
+    private func restoreCachedFilterCriteria() {
+        let savedAt = UserDefaults.standard.double(forKey: Self.cachedFilterSavedAtKey)
+        guard savedAt > 0 else {
+            Log.debug("[FilterCache] No saved filter cache found", category: .ui)
+            return
+        }
+
+        let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: savedAt))
+        guard elapsed < Self.cacheExpirationSeconds else {
+            Log.debug("[FilterCache] Cache expired, clearing", category: .ui)
+            clearCachedFilterCriteria()
+            return
+        }
+
+        guard let data = UserDefaults.standard.data(forKey: Self.cachedFilterCriteriaKey) else {
+            Log.debug("[FilterCache] No filter data in cache", category: .ui)
+            return
+        }
+
+        do {
+            let restored = try JSONDecoder().decode(FilterCriteria.self, from: data)
+            filterCriteria = restored
+            pendingFilterCriteria = restored
+            Log.debug("[FilterCache] Restored filter criteria (saved \(Int(elapsed))s ago) - selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+        } catch {
+            Log.warning("[FilterCache] Failed to restore filter criteria: \(error)", category: .ui)
+        }
+    }
+
+    /// Clear cached filter criteria
+    private func clearCachedFilterCriteria() {
+        UserDefaults.standard.removeObject(forKey: Self.cachedFilterCriteriaKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedFilterSavedAtKey)
     }
 
     /// Get the cached frames if they exist and haven't expired
@@ -838,6 +1575,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         if currentDataSourceVersion != cachedDataSourceVersion {
             Log.info("[PositionCache] Data source version changed (cached: \(cachedDataSourceVersion), current: \(currentDataSourceVersion)) - invalidating cache", category: .ui)
             clearCachedPosition()
+            return nil
+        }
+
+        // Check if filters have changed - don't use cache if filters are active
+        // (cached frames might not match current filter criteria)
+        if filterCriteria.hasActiveFilters {
+            Log.debug("[PositionCache] Filters are active - skipping frame cache", category: .ui)
             return nil
         }
 
@@ -905,9 +1649,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.cachedPositionSavedAtKey)
         UserDefaults.standard.removeObject(forKey: Self.cachedCurrentIndexKey)
         UserDefaults.standard.removeObject(forKey: Self.cachedDataSourceVersionKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedHiddenSegmentIdsKey)
 
         // Remove cached frames file
         try? FileManager.default.removeItem(at: Self.cachedFramesPath)
+    }
+
+    /// Restore cached hidden segment IDs for instant hatch mark display
+    private func restoreCachedHiddenSegmentIds() {
+        guard let cachedIds = UserDefaults.standard.array(forKey: Self.cachedHiddenSegmentIdsKey) as? [Int64] else {
+            return
+        }
+        hiddenSegmentIds = Set(cachedIds.map { SegmentID(value: $0) })
+        Log.debug("[PositionCache] Restored \(hiddenSegmentIds.count) cached hidden segment IDs", category: .ui)
     }
 
     /// Increment the data source version to invalidate any cached frames
@@ -944,6 +1698,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Also restore cached search results if any
             searchViewModel.restoreCachedSearchResults()
 
+            // Restore cached filter criteria if any
+            restoreCachedFilterCriteria()
+
+            // Restore cached hidden segment IDs for instant hatch mark display
+            restoreCachedHiddenSegmentIds()
+
+            // Also refresh from database in background to catch any changes
+            Task {
+                await loadHiddenSegments()
+            }
+
             // Load image if needed for current frame
             loadImageIfNeeded()
 
@@ -962,7 +1727,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let startDate = calendar.date(byAdding: .minute, value: -10, to: cachedPosition) ?? cachedPosition
                 let endDate = calendar.date(byAdding: .minute, value: 10, to: cachedPosition) ?? cachedPosition
 
-                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+                // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
 
                 if !framesWithVideoInfo.isEmpty {
                     // Convert to TimelineFrame - video info is already included from the JOIN
@@ -984,6 +1750,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Restore cached search results if any
                     searchViewModel.restoreCachedSearchResults()
 
+                    // Load hidden segment IDs for hatch mark display
+                    await loadHiddenSegments()
+
                     // Load image if needed for current frame
                     loadImageIfNeeded()
 
@@ -997,10 +1766,17 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // No cached position (or cache was empty) - load most recent frames
             // Uses optimized query that JOINs on video table - no N+1 queries!
-            let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: filterCriteria.selectedApps)), mode: \(filterCriteria.appFilterMode.rawValue)", category: .ui)
+            let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: filterCriteria)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found in any database"
+                // No frames found - check if filters are active
+                if filterCriteria.hasActiveFilters {
+                    showNoResultsMessage()
+                } else {
+                    error = "No frames found in any database"
+                }
                 isLoading = false
                 return
             }
@@ -1043,6 +1819,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Restore cached search results if any
             searchViewModel.restoreCachedSearchResults()
 
+            // Load hidden segment IDs for hatch mark display
+            await loadHiddenSegments()
+
             // Load image if needed for current frame
             loadImageIfNeeded()
 
@@ -1063,6 +1842,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard clampedIndex != currentIndex else { return }
 
         currentIndex = clampedIndex
+
+        // Clear selection when scrolling - highlight follows the playhead
+        selectedFrameIndex = nil
 
         // Keep zoom level consistent across frames (don't reset on navigation)
         // User can reset with Cmd+0 if needed
@@ -1124,7 +1906,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[SearchNavigation] Query range: \(df.string(from: startDate)) to \(df.string(from: endDate))", category: .ui)
 
             // Fetch all frames in the 20-minute window with video info (single optimized query)
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
             Log.debug("[SearchNavigation] Loaded \(framesWithVideoInfo.count) frames in time range", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -1548,8 +2331,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// End drag selection
     public func endDragSelection() {
         // Keep selection but clear drag points
-        dragStartPoint = nil
-        dragEndPoint = nil
+        // Keep drag points - they're used for rectangle-based column filtering
+        // They will be cleared when clearTextSelection() is called
     }
 
     /// Select the word at the given point (for double-click)
@@ -1853,57 +2636,166 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Find the character position (node ID, char index) closest to a normalized point
+    /// Uses reading-order-aware selection: when point is not inside any node,
+    /// finds the best node based on reading position (row then column).
     private func findCharacterPosition(at point: CGPoint) -> (nodeID: Int, charIndex: Int)? {
+        let yTolerance: CGFloat = 0.02  // ~2% of screen height for same-line detection
+
         // Sort nodes by reading order (top to bottom, left to right)
         let sortedNodes = ocrNodes.sorted { node1, node2 in
-            // Primary sort by Y (top to bottom), with tolerance for same-line text
-            let yTolerance: CGFloat = 0.02  // ~2% of screen height
             if abs(node1.y - node2.y) > yTolerance {
                 return node1.y < node2.y
             }
-            // Secondary sort by X (left to right)
             return node1.x < node2.x
         }
 
-        // Find which node contains the point, or the closest node
-        var bestNode: OCRNodeWithText?
-        var bestDistance: CGFloat = .infinity
-
+        // First, check if point is inside any node
         for node in sortedNodes {
-            // Check if point is inside the node
             if point.x >= node.x && point.x <= node.x + node.width &&
                point.y >= node.y && point.y <= node.y + node.height {
-                bestNode = node
-                break
-            }
-
-            // Calculate distance to node center
-            let centerX = node.x + node.width / 2
-            let centerY = node.y + node.height / 2
-            let distance = hypot(point.x - centerX, point.y - centerY)
-
-            if distance < bestDistance {
-                bestDistance = distance
-                bestNode = node
+                // Point is inside this node - calculate character position
+                let relativeX = (point.x - node.x) / node.width
+                let charIndex = Int(relativeX * CGFloat(node.text.count))
+                let clampedIndex = max(0, min(node.text.count, charIndex))
+                return (nodeID: node.id, charIndex: clampedIndex)
             }
         }
 
-        guard let node = bestNode else { return nil }
+        // Point is not inside any node - find the best node for reading order selection
+        // Strategy: Find which "row" the point is on, then find the appropriate node
 
-        // Calculate which character within the node
-        let relativeX = (point.x - node.x) / node.width
-        let charIndex = Int(relativeX * CGFloat(node.text.count))
-        let clampedIndex = max(0, min(node.text.count, charIndex))
+        // Group nodes by row (using Y tolerance)
+        var rows: [[OCRNodeWithText]] = []
+        var currentRow: [OCRNodeWithText] = []
+        var currentRowY: CGFloat?
 
-        return (nodeID: node.id, charIndex: clampedIndex)
+        for node in sortedNodes {
+            if let rowY = currentRowY, abs(node.y - rowY) <= yTolerance {
+                // Same row
+                currentRow.append(node)
+            } else {
+                // New row
+                if !currentRow.isEmpty {
+                    rows.append(currentRow)
+                }
+                currentRow = [node]
+                currentRowY = node.y
+            }
+        }
+        if !currentRow.isEmpty {
+            rows.append(currentRow)
+        }
+
+        guard !rows.isEmpty else { return nil }
+
+        // Find which row the point is closest to (by Y)
+        var bestRowIndex = 0
+        var bestRowDistance: CGFloat = .infinity
+
+        for (index, row) in rows.enumerated() {
+            guard let firstNode = row.first else { continue }
+            // Use the Y center of the row
+            let rowMinY = row.map { $0.y }.min() ?? firstNode.y
+            let rowMaxY = row.map { $0.y + $0.height }.max() ?? (firstNode.y + firstNode.height)
+            let rowCenterY = (rowMinY + rowMaxY) / 2
+
+            let distance = abs(point.y - rowCenterY)
+            if distance < bestRowDistance {
+                bestRowDistance = distance
+                bestRowIndex = index
+            }
+        }
+
+        let targetRow = rows[bestRowIndex]
+
+        // Within this row, find the node based on X position
+        // If point is to the left of all nodes, select start of first node
+        // If point is to the right of all nodes, select end of last node
+        // If point is between nodes, select the closer edge
+
+        let rowMinX = targetRow.map { $0.x }.min() ?? 0
+        let rowMaxX = targetRow.map { $0.x + $0.width }.max() ?? 1
+
+        if point.x <= rowMinX {
+            // Point is to the left - select start of first node in row
+            if let firstNode = targetRow.first {
+                return (nodeID: firstNode.id, charIndex: 0)
+            }
+        } else if point.x >= rowMaxX {
+            // Point is to the right - select end of last node in row
+            if let lastNode = targetRow.last {
+                return (nodeID: lastNode.id, charIndex: lastNode.text.count)
+            }
+        } else {
+            // Point is within the row's X range - find closest node edge
+            var bestNode: OCRNodeWithText?
+            var bestCharIndex = 0
+            var bestDistance: CGFloat = .infinity
+
+            for node in targetRow {
+                let nodeStart = node.x
+                let nodeEnd = node.x + node.width
+
+                // Distance to start of node
+                let distToStart = abs(point.x - nodeStart)
+                if distToStart < bestDistance {
+                    bestDistance = distToStart
+                    bestNode = node
+                    bestCharIndex = 0
+                }
+
+                // Distance to end of node
+                let distToEnd = abs(point.x - nodeEnd)
+                if distToEnd < bestDistance {
+                    bestDistance = distToEnd
+                    bestNode = node
+                    bestCharIndex = node.text.count
+                }
+
+                // If point is within node bounds, calculate precise character
+                if point.x >= nodeStart && point.x <= nodeEnd {
+                    let relativeX = (point.x - node.x) / node.width
+                    let charIndex = Int(relativeX * CGFloat(node.text.count))
+                    return (nodeID: node.id, charIndex: max(0, min(node.text.count, charIndex)))
+                }
+            }
+
+            if let node = bestNode {
+                return (nodeID: node.id, charIndex: bestCharIndex)
+            }
+        }
+
+        // Fallback: return first node
+        if let firstNode = sortedNodes.first {
+            return (nodeID: firstNode.id, charIndex: 0)
+        }
+
+        return nil
     }
 
     /// Get the selection range for a specific node (returns nil if node not in selection)
+    /// Uses reading order within the drag rectangle's X bounds - only nodes that overlap
+    /// horizontally with the selection area are considered for reading order.
     public func getSelectionRange(for nodeID: Int) -> (start: Int, end: Int)? {
         guard let start = selectionStart, let end = selectionEnd else { return nil }
+        guard let dragStart = dragStartPoint, let dragEnd = dragEndPoint else {
+            // Fallback for programmatic selection (Cmd+A, double-click, triple-click)
+            return getSelectionRangeFullScreen(for: nodeID)
+        }
 
-        // Sort nodes to determine order
-        let sortedNodes = ocrNodes.sorted { node1, node2 in
+        // Build the drag rectangle's X bounds
+        let rectMinX = min(dragStart.x, dragEnd.x)
+        let rectMaxX = max(dragStart.x, dragEnd.x)
+
+        // Filter nodes to only those that overlap with the drag rectangle's X range
+        let nodesInRect = ocrNodes.filter { node in
+            let nodeMinX = node.x
+            let nodeMaxX = node.x + node.width
+            return nodeMaxX > rectMinX && nodeMinX < rectMaxX
+        }
+
+        // Sort filtered nodes by reading order (top to bottom, left to right)
+        let sortedNodes = nodesInRect.sorted { node1, node2 in
             let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
                 return node1.y < node2.y
@@ -1966,6 +2858,74 @@ public class SimpleTimelineViewModel: ObservableObject {
             rangeStart = max(rangeStart, visibleRange.start)
             rangeEnd = min(rangeEnd, visibleRange.end)
             // Return nil if there's no overlap between selection and visible range
+            if rangeEnd <= rangeStart {
+                return nil
+            }
+        }
+
+        return (start: rangeStart, end: rangeEnd)
+    }
+
+    /// Fallback selection for programmatic selection (Cmd+A, double-click, triple-click)
+    /// Uses full-screen reading order without rectangle filtering
+    private func getSelectionRangeFullScreen(for nodeID: Int) -> (start: Int, end: Int)? {
+        guard let start = selectionStart, let end = selectionEnd else { return nil }
+
+        // Sort all nodes by reading order
+        let sortedNodes = ocrNodes.sorted { node1, node2 in
+            let yTolerance: CGFloat = 0.02
+            if abs(node1.y - node2.y) > yTolerance {
+                return node1.y < node2.y
+            }
+            return node1.x < node2.x
+        }
+
+        guard let startNodeIndex = sortedNodes.firstIndex(where: { $0.id == start.nodeID }),
+              let endNodeIndex = sortedNodes.firstIndex(where: { $0.id == end.nodeID }),
+              let thisNodeIndex = sortedNodes.firstIndex(where: { $0.id == nodeID }) else {
+            return nil
+        }
+
+        let (normalizedStartNodeIndex, normalizedEndNodeIndex, normalizedStartChar, normalizedEndChar): (Int, Int, Int, Int)
+        if startNodeIndex <= endNodeIndex {
+            normalizedStartNodeIndex = startNodeIndex
+            normalizedEndNodeIndex = endNodeIndex
+            normalizedStartChar = start.charIndex
+            normalizedEndChar = end.charIndex
+        } else {
+            normalizedStartNodeIndex = endNodeIndex
+            normalizedEndNodeIndex = startNodeIndex
+            normalizedStartChar = end.charIndex
+            normalizedEndChar = start.charIndex
+        }
+
+        guard thisNodeIndex >= normalizedStartNodeIndex && thisNodeIndex <= normalizedEndNodeIndex else {
+            return nil
+        }
+
+        let node = sortedNodes[thisNodeIndex]
+        let textLength = node.text.count
+
+        var rangeStart: Int
+        var rangeEnd: Int
+
+        if thisNodeIndex == normalizedStartNodeIndex && thisNodeIndex == normalizedEndNodeIndex {
+            rangeStart = min(normalizedStartChar, normalizedEndChar)
+            rangeEnd = max(normalizedStartChar, normalizedEndChar)
+        } else if thisNodeIndex == normalizedStartNodeIndex {
+            rangeStart = normalizedStartChar
+            rangeEnd = textLength
+        } else if thisNodeIndex == normalizedEndNodeIndex {
+            rangeStart = 0
+            rangeEnd = normalizedEndChar
+        } else {
+            rangeStart = 0
+            rangeEnd = textLength
+        }
+
+        if let visibleRange = getVisibleCharacterRange(for: node) {
+            rangeStart = max(rangeStart, visibleRange.start)
+            rangeEnd = min(rangeEnd, visibleRange.end)
             if rangeEnd <= rangeStart {
                 return nil
             }
@@ -2174,6 +3134,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        // Mark as actively scrolling (disables tape animation)
+        isActivelyScrolling = true
+        scrollDebounceTask?.cancel()
+
         // Accumulate scroll delta
         scrollAccumulator += delta
 
@@ -2182,7 +3146,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Scale sensitivity inversely with pixelsPerFrame to maintain consistent visual scroll speed
         // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
         // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
-        let baseSensitivity: CGFloat = 0.05
+        let baseSensitivity: CGFloat = 0.022
         let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
         let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
 
@@ -2199,6 +3163,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Clear search highlight when user manually scrolls
         if isShowingSearchHighlight {
             clearSearchHighlight()
+        }
+
+        // Debounce: re-enable animation after 100ms of no scroll events
+        scrollDebounceTask = Task {
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            if !Task.isCancelled {
+                await MainActor.run {
+                    self.isActivelyScrolling = false
+                }
+            }
         }
     }
 
@@ -2282,8 +3256,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific hour from the calendar picker
     public func navigateToHour(_ hour: Date) async {
-        isCalendarPickerVisible = false
-        isDateSearchActive = false
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            isCalendarPickerVisible = false
+            isDateSearchActive = false
+        }
         await navigateToDate(hour)
     }
 
@@ -2297,7 +3273,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
             let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
 
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
 
             guard !framesWithVideoInfo.isEmpty else {
                 error = "No frames found around \(targetDate)"
@@ -2370,7 +3347,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Fetch all frames in the 20-minute window
             // Uses optimized query that JOINs on video table - no N+1 queries!
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
             Log.debug("[DateSearch] Got \(framesWithVideoInfo.count) frames", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -2411,8 +3389,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             isLoading = false
-            isDateSearchActive = false
-            dateSearchText = ""
+            closeDateSearch()
 
         } catch {
             self.error = "Failed to search for date: \(error.localizedDescription)"
@@ -2444,7 +3421,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
 
             // Fetch all frames in the window
-            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000)
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
             Log.debug("[FrameIDSearch] Got \(framesWithVideoInfo.count) frames in window", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -2492,8 +3470,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             isLoading = false
-            isDateSearchActive = false
-            dateSearchText = ""
+            closeDateSearch()
 
             return true
 
@@ -2797,9 +3774,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         do {
             // Query frames before the oldest timestamp
             // Uses optimized query that JOINs on video table - no N+1 queries!
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
                 timestamp: oldestTimestamp,
-                limit: WindowConfig.loadBatchSize
+                limit: WindowConfig.loadBatchSize,
+                filters: filterCriteria
             )
 
             guard !framesWithVideoInfo.isEmpty else {
@@ -2858,9 +3837,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         do {
             // Query frames after the newest timestamp
             // Uses optimized query that JOINs on video table - no N+1 queries!
+            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
                 timestamp: newestTimestamp,
-                limit: WindowConfig.loadBatchSize
+                limit: WindowConfig.loadBatchSize,
+                filters: filterCriteria
             )
 
             guard !framesWithVideoInfo.isEmpty else {

@@ -11,6 +11,9 @@ public actor StorageManager: StorageProtocol {
     private let encoderConfig: VideoEncoderConfig
     private let walManager: WALManager
 
+    /// Counter to ensure unique segment IDs even if created within same millisecond
+    private var segmentCounter: Int = 0
+
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
         encoderConfig: VideoEncoderConfig = .default
@@ -41,9 +44,12 @@ public actor StorageManager: StorageProtocol {
         }
 
         // Generate a unique temporary ID based on current time (milliseconds since epoch)
-        // This will be replaced with the real database ID after finalization
+        // Add a counter to ensure uniqueness even if two writers are created in the same millisecond
+        // This prevents race conditions between recovery and main pipeline
         let now = Date()
-        let tempID = VideoSegmentID(value: Int64(now.timeIntervalSince1970 * 1000))
+        segmentCounter += 1
+        let baseID = Int64(now.timeIntervalSince1970 * 1000)
+        let tempID = VideoSegmentID(value: baseID + Int64(segmentCounter % 1000))
         let fileURL = try await directoryManager.segmentURL(for: tempID, date: now)
         let relative = await directoryManager.relativePath(from: fileURL)
 
@@ -70,10 +76,10 @@ public actor StorageManager: StorageProtocol {
         // Check if file is empty or too small to be a valid video
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
         if fileSize == 0 {
-            // File is empty - likely incomplete/interrupted write. Delete it and throw.
-            Log.warning("[StorageManager] Video file is empty (0 bytes), deleting: \(segmentURL.path)", category: .storage)
-            try? FileManager.default.removeItem(at: segmentURL)
-            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Video file is empty (incomplete write)")
+            // File is empty - likely still being written to (no fragments flushed yet)
+            // Do NOT delete - the encoder may still be writing to it
+            Log.warning("[StorageManager] Video file is empty (0 bytes), still being written: \(segmentURL.path)", category: .storage)
+            throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Video file is empty (still being written)")
         }
 
         // Determine the URL to use for AVFoundation

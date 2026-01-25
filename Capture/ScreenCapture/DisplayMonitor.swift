@@ -77,6 +77,15 @@ actor DisplayMonitor {
     /// Get the display ID of the currently active display and whether AX permission was granted
     /// Returns: (displayID, hasAXPermission)
     func getActiveDisplayIDWithPermissionStatus() -> (UInt32, Bool) {
+        // Check if we actually have accessibility permission using the proper API
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
+        let hasAXPermission = AXIsProcessTrustedWithOptions(options as CFDictionary)
+
+        // If we don't have permission, report it but still return main display
+        if !hasAXPermission {
+            return (CGMainDisplayID(), false)
+        }
+
         // Get the frontmost application
         guard let app = NSWorkspace.shared.frontmostApplication else {
             return (CGMainDisplayID(), true) // No app is fine, not a permission issue
@@ -93,23 +102,39 @@ actor DisplayMonitor {
             &focusedWindow
         )
 
-        // Check for permission denial
-        // Note: .cannotComplete typically indicates accessibility permissions are denied
-        if result == .apiDisabled || result == .cannotComplete {
-            // logger.warning("Accessibility permission denied - falling back to main display")
-            return (CGMainDisplayID(), false)
-        }
-
-        // If we got a focused window, get its position and size
-        if result == .success, let window = focusedWindow {
-            if let windowFrame = getWindowFrame(window as! AXUIElement) {
-                // Find which display contains the center of the window
-                let displayID = getDisplayContainingPoint(windowFrame.midX, windowFrame.midY)
-                return (displayID, true)
+        // Handle AX API errors
+        switch result {
+        case .success:
+            // Successfully got the focused window - get its position
+            if let window = focusedWindow {
+                if let windowFrame = getWindowFrame(window as! AXUIElement) {
+                    // Find which display contains the center of the window
+                    let displayID = getDisplayContainingPoint(windowFrame.midX, windowFrame.midY)
+                    return (displayID, true)
+                }
             }
+            // Got window but couldn't get frame - fall through to main display
+
+        case .apiDisabled:
+            // This specifically indicates accessibility is disabled system-wide (rare)
+            return (CGMainDisplayID(), false)
+
+        case .cannotComplete:
+            // App is activating but window not ready yet, or app has no windows
+            // This is normal and transient - permission is fine, just use main display
+            break
+
+        case .noValue:
+            // App has no focused window (e.g., menu bar only apps)
+            // This is normal - permission is fine, just use main display
+            break
+
+        default:
+            // Other errors - log for debugging but assume permission is OK
+            break
         }
 
-        // Fallback: return main display (not a permission issue, just couldn't get window)
+        // Fallback: return main display (permission OK, just couldn't determine active display)
         return (CGMainDisplayID(), true)
     }
 

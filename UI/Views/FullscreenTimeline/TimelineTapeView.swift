@@ -32,7 +32,7 @@ public struct TimelineTapeView: View {
                     viewModel.clearSelection()
                 }
 
-            // Scrollable tape content
+            // Scrollable tape content (right-click handled per-frame)
             tapeContent
 
             // Fixed center playhead (on top of everything)
@@ -69,7 +69,8 @@ public struct TimelineTapeView: View {
                 }
             }
             .offset(x: tapeOffset)
-            .animation(.interactiveSpring(response: 0.3, dampingFraction: 0.8), value: viewModel.currentIndex)
+            // Linear animation - constant speed without acceleration/deceleration for smooth scrubbing
+            // .animation(.linear(duration: 0.06), value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }
@@ -113,28 +114,13 @@ public struct TimelineTapeView: View {
     // MARK: - Frame Segment View
 
     private func frameSegment(at frameIndex: Int, in block: AppBlock) -> some View {
-        let isSelected = viewModel.selectedFrameIndex == frameIndex
-
-        return Rectangle()
-            .fill(Color.clear)
-            .frame(width: pixelsPerFrame, height: tapeHeight)
-            // .overlay(
-            //     // Selection highlight
-            //     isSelected ? RoundedRectangle(cornerRadius: 2)
-            //         .fill(Color.retraceAccent.opacity(0.4))
-            //         .padding(2) : nil
-            // )
-            .contentShape(Rectangle())
-            .onTapGesture {
-                viewModel.selectFrame(at: frameIndex)
-            }
-            .onHover { isHovering in
-                if isHovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
+        FrameSegmentView(
+            viewModel: viewModel,
+            frameIndex: frameIndex,
+            isHidden: viewModel.isFrameHidden(at: frameIndex),
+            pixelsPerFrame: pixelsPerFrame,
+            tapeHeight: tapeHeight
+        )
     }
 
     // MARK: - Helper Functions
@@ -205,44 +191,8 @@ public struct TimelineTapeView: View {
 
             ZStack {
                 // Datetime button (truly centered)
-                Button(action: {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                        viewModel.isDateSearchActive = true
-                    }
-                }) {
-                    HStack(spacing: TimelineScaleFactor.iconSpacing) {
-                        Text(viewModel.currentDateString)
-                            .font(.system(size: TimelineScaleFactor.fontCaption, weight: .medium))
-                            .foregroundColor(.white.opacity(0.7))
-
-                        Text(viewModel.currentTimeString)
-                            .font(.system(size: TimelineScaleFactor.fontMono, weight: .regular, design: .monospaced))
-                            .foregroundColor(.white)
-
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: TimelineScaleFactor.fontTiny, weight: .bold))
-                            .foregroundColor(.white.opacity(0.4))
-                    }
-                    .padding(.horizontal, TimelineScaleFactor.paddingH)
-                    .padding(.vertical, TimelineScaleFactor.paddingV)
-                    .background(
-                        Capsule()
-                            .fill(Color(white: 0.15))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                    )
-                }
-                .buttonStyle(.plain)
-                .onHover { isHovering in
-                    if isHovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
-                .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
+                DatetimeButton(viewModel: viewModel)
+                    .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
                 // Left side controls (hide UI + search)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
@@ -251,8 +201,9 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
-                // Right side controls (zoom + more options)
+                // Right side controls (filter + zoom + more options)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
+                    FilterButton(viewModel: viewModel)
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
@@ -274,27 +225,20 @@ public struct TimelineTapeView: View {
                             }
                         },
                         onCancel: {
-                            viewModel.isDateSearchActive = false
-                            viewModel.dateSearchText = ""
+                            viewModel.closeDateSearch()
                         },
                         enableFrameIDSearch: viewModel.enableFrameIDSearch,
                         viewModel: viewModel
                     )
                     .position(x: centerX, y: TimelineScaleFactor.searchPanelYOffset)
-                    .transition(.asymmetric(
-                        insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
-                        removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
-                    ))
+                    .transition(.opacity.combined(with: .offset(y: 10)))
                 }
 
                 // Calendar picker (appears when calendar button is clicked)
                 if viewModel.isCalendarPickerVisible {
                     CalendarPickerView(viewModel: viewModel)
                         .position(x: centerX, y: TimelineScaleFactor.calendarPickerYOffset)
-                        .transition(.asymmetric(
-                            insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)).combined(with: .offset(y: 10)),
-                            removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .bottom))
-                        ))
+                        .transition(.opacity.combined(with: .offset(y: 10)))
                 }
             }
         }
@@ -302,79 +246,243 @@ public struct TimelineTapeView: View {
 
 }
 
-// MARK: - Zoom Control
+// MARK: - Frame Segment View
 
-/// Zoom control that expands from a magnifier button to a slider
-struct ZoomControl: View {
+/// Individual frame segment in the timeline tape with hover effect
+struct FrameSegmentView: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let frameIndex: Int
+    let isHidden: Bool
+    let pixelsPerFrame: CGFloat
+    let tapeHeight: CGFloat
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(isHovering ? Color.white.opacity(0.2) : Color.clear)
+            .frame(width: pixelsPerFrame, height: tapeHeight)
+            .contentShape(Rectangle())
+            .overlay(
+                // Diagonal stripe pattern for hidden segments
+                Group {
+                    if isHidden {
+                        HiddenSegmentOverlay()
+                    }
+                }
+            )
+            .onTapGesture {
+                viewModel.selectFrame(at: frameIndex)
+            }
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .overlay(
+                FrameRightClickHandler(viewModel: viewModel, frameIndex: frameIndex)
+            )
+    }
+}
+
+// MARK: - Datetime Button
+
+/// Button showing current date/time that opens the date search panel
+struct DatetimeButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: TimelineScaleFactor.iconSpacing) {
-            // Zoom out icon (when expanded)
-            if viewModel.isZoomSliderExpanded {
-                Image(systemName: "minus.magnifyingglass")
-                    .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
-                    .foregroundColor(.white.opacity(0.5))
-                    .transition(.opacity.combined(with: .scale))
-            }
+        Button(action: {
+            viewModel.dismissContextMenu()
+            viewModel.toggleDateSearch()
+        }) {
+            HStack(spacing: TimelineScaleFactor.iconSpacing) {
+                Text(viewModel.currentDateString)
+                    .font(.system(size: TimelineScaleFactor.fontCaption, weight: .medium))
+                    .foregroundColor(isHovering ? .white : .white.opacity(0.7))
 
-            // Slider (when expanded)
-            if viewModel.isZoomSliderExpanded {
-                ZoomSlider(value: $viewModel.zoomLevel)
-                    .frame(width: TimelineScaleFactor.zoomSliderWidth)
-                    .transition(.opacity.combined(with: .scale(scale: 0.8, anchor: .trailing)))
-            }
+                Text(viewModel.currentTimeString)
+                    .font(.system(size: TimelineScaleFactor.fontMono, weight: .regular, design: .monospaced))
+                    .foregroundColor(.white)
 
-            // Zoom in icon (when expanded)
-            if viewModel.isZoomSliderExpanded {
-                Image(systemName: "plus.magnifyingglass")
-                    .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
-                    .foregroundColor(.white.opacity(0.5))
-                    .transition(.opacity.combined(with: .scale))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: TimelineScaleFactor.fontTiny, weight: .bold))
+                    .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.4))
             }
-
-            // Zoom button (always visible)
-            Button(action: {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    viewModel.isZoomSliderExpanded.toggle()
-                }
-            }) {
-                Image(systemName: "plus.magnifyingglass")
-                    .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
-                    .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
-                    .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                    .background(
-                        Circle()
-                            .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color(white: 0.15))
-                    )
-                    .overlay(
-                        Circle()
-                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                isHovering = hovering
-                if hovering { NSCursor.pointingHand.push() }
-                else { NSCursor.pop() }
+            .padding(.horizontal, TimelineScaleFactor.paddingH)
+            .padding(.vertical, TimelineScaleFactor.paddingV)
+            .background(
+                Capsule()
+                    .fill(isHovering ? Color(white: 0.2) : Color(white: 0.15))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
             }
         }
-        .padding(.horizontal, viewModel.isZoomSliderExpanded ? TimelineScaleFactor.buttonPaddingH : 0)
-        .padding(.vertical, viewModel.isZoomSliderExpanded ? TimelineScaleFactor.buttonPaddingV : 0)
-        .background(
-            Group {
-                if viewModel.isZoomSliderExpanded {
+    }
+}
+
+// MARK: - Zoom Control
+
+/// Zoom control that expands from a magnifier button to a slider (expands leftward)
+struct ZoomControl: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    /// Show tooltip only when hovering and slider is not expanded
+    private var showTooltip: Bool {
+        isHovering && !viewModel.isZoomSliderExpanded
+    }
+
+    var body: some View {
+        // Use overlay so the button position stays fixed and slider appears to its left
+        Button(action: {
+            viewModel.dismissContextMenu()
+            let animation: Animation = viewModel.isZoomSliderExpanded ? .easeOut(duration: 0.12) : .spring(response: 0.3, dampingFraction: 0.8)
+            withAnimation(animation) {
+                viewModel.isZoomSliderExpanded.toggle()
+            }
+        }) {
+            Image(systemName: "plus.magnifyingglass")
+                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
+                .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .background(
+                    Circle()
+                        .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color(white: 0.15))
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .overlay(alignment: .trailing) {
+            // Expanded slider panel - positioned to the left of the button
+            if viewModel.isZoomSliderExpanded {
+                HStack(spacing: TimelineScaleFactor.iconSpacing) {
+                    Image(systemName: "minus.magnifyingglass")
+                        .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+
+                    ZoomSlider(value: $viewModel.zoomLevel)
+                        .frame(width: TimelineScaleFactor.zoomSliderWidth)
+
+                    Image(systemName: "plus.magnifyingglass")
+                        .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+                }
+                .padding(.horizontal, TimelineScaleFactor.buttonPaddingH)
+                .padding(.vertical, TimelineScaleFactor.buttonPaddingV)
+                .background(
                     Capsule()
                         .fill(Color(white: 0.15))
                         .overlay(
                             Capsule()
                                 .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
                         )
+                )
+                .offset(x: -TimelineScaleFactor.controlButtonSize - 8) // Position to the left of the button
+                .transition(.opacity.combined(with: .offset(x: 20)))
+            }
+        }
+        .overlay(alignment: .top) {
+            if showTooltip {
+                Text("Zoom")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(Color.black)
+                    )
+                    .offset(y: -44)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
+// MARK: - Filter Button
+
+/// Filter button that shows active filter count badge
+struct FilterButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.dismissContextMenu()
+            if viewModel.isFilterPanelVisible {
+                viewModel.dismissFilterPanel()
+            } else {
+                viewModel.openFilterPanel()
+            }
+        }) {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "line.3.horizontal.decrease")
+                    .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
+                    .foregroundColor(isHovering || viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0
+                        ? .white
+                        : .white.opacity(0.6))
+                    .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                    .background(
+                        Circle()
+                            .fill(viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0
+                                ? Color.white.opacity(0.15)
+                                : Color(white: 0.15))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                    )
+
+                // Badge showing active filter count
+                if viewModel.activeFilterCount > 0 {
+                    Text("\(viewModel.activeFilterCount)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 16, height: 16)
+                        .background(Color.red)
+                        .clipShape(Circle())
+                        .offset(x: 4, y: -4)
                 }
             }
-        )
-        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isZoomSliderExpanded)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .instantTooltip("Filter", isVisible: $isHovering)
     }
 }
 
@@ -387,28 +495,32 @@ struct ControlsToggleButton: View {
 
     var body: some View {
         Button(action: {
+            viewModel.dismissContextMenu()
             viewModel.toggleControlsVisibility()
         }) {
-            Image(systemName: viewModel.areControlsHidden ? "rectangle.bottomhalf.inset.filled" : "rectangle.bottomhalf.filled")
-                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
+            Image(systemName: viewModel.areControlsHidden ? "menubar.arrow.up.rectangle" : "menubar.arrow.down.rectangle")
+                .font(.system(size: TimelineScaleFactor.fontMono, weight: .medium))
                 .foregroundColor(isHovering ? .white : .white.opacity(0.6))
-                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .padding(.horizontal, TimelineScaleFactor.paddingV)
+                .padding(.vertical, TimelineScaleFactor.paddingV)
                 .background(
-                    Circle()
+                    Capsule()
                         .fill(Color(white: 0.15))
                 )
                 .overlay(
-                    Circle()
+                    Capsule()
                         .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
                 )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            isHovering = hovering
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .help(viewModel.areControlsHidden ? "Show Controls (Cmd+.)" : "Hide Controls (Cmd+.)")
+        .instantTooltip(viewModel.areControlsHidden ? "Show" : "Hide", isVisible: $isHovering)
     }
 }
 
@@ -432,6 +544,8 @@ struct SearchButton: View {
 
     var body: some View {
         Button(action: {
+            // Dismiss right-click context menu if open
+            viewModel.dismissContextMenu()
             viewModel.clearSearchHighlight()
             viewModel.isSearchOverlayVisible = true
         }) {
@@ -448,7 +562,7 @@ struct SearchButton: View {
                 Spacer()
 
                 // Keyboard shortcut hint
-                Text("⌘K")
+                Text("⌘F")
                     .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
                     .padding(.horizontal, 6 * TimelineScaleFactor.current)
@@ -458,8 +572,8 @@ struct SearchButton: View {
                             .fill(isHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.1))
                     )
             }
-            .padding(.horizontal, TimelineScaleFactor.buttonPaddingH)
-            .padding(.vertical, TimelineScaleFactor.buttonPaddingV)
+            .padding(.horizontal, TimelineScaleFactor.paddingH)
+            .padding(.vertical, TimelineScaleFactor.paddingV)
             .frame(width: TimelineScaleFactor.searchButtonWidth)
             .background(
                 Capsule()
@@ -476,23 +590,26 @@ struct SearchButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .help("Search (Cmd+K)")
+        .help("Search (Cmd+F)")
     }
 }
 
 // MARK: - More Options Menu
 
-/// Three-dot menu button with dropdown options using SwiftUI popover
+/// Three-dot menu button with dropdown options
 struct MoreOptionsMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
-    @State private var isHovering = false
+    @State private var isButtonHovering = false
+    @State private var isMenuHovering = false
     @State private var showMenu = false
 
     var body: some View {
-        Button(action: { showMenu.toggle() }) {
+        Button(action: {
+            viewModel.dismissContextMenu()
+        }) {
             Image(systemName: "ellipsis")
                 .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
-                .foregroundColor(isHovering || showMenu ? .white : .white.opacity(0.6))
+                .foregroundColor(isButtonHovering || showMenu ? .white : .white.opacity(0.6))
                 .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                 .background(
                     Circle()
@@ -505,218 +622,77 @@ struct MoreOptionsMenu: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            isHovering = hovering
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
-        }
-        .popover(isPresented: $showMenu, attachmentAnchor: .point(.top), arrowEdge: .bottom) {
-            MoreOptionsPopoverContent(viewModel: viewModel, showMenu: $showMenu)
-        }
-    }
-}
-
-// MARK: - More Options Popover Content
-
-/// Custom styled popover content for more options menu
-struct MoreOptionsPopoverContent: View {
-    @ObservedObject var viewModel: SimpleTimelineViewModel
-    @Binding var showMenu: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            MenuRow(title: "Save Image", icon: "square.and.arrow.down") {
-                showMenu = false
-                saveImage()
-            }
-
-            MenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⇧⌘C") {
-                showMenu = false
-                copyImageToClipboard()
-            }
-
-            MenuRow(title: "Moment Deeplink", icon: "link") {
-                showMenu = false
-                // TODO: Implement moment deeplink
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.vertical, 4)
-
-            MenuRow(title: "Dashboard", icon: "square.grid.2x2") {
-                showMenu = false
-                openDashboard()
-            }
-
-            MenuRow(title: "Settings", icon: "gear") {
-                showMenu = false
-                openSettings()
-            }
-        }
-        .padding(8)
-        .background(Color.black.opacity(0.9))
-    }
-
-    // MARK: - Actions
-
-    private func saveImage() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-
-            let savePanel = NSSavePanel()
-            savePanel.allowedContentTypes = [.png]
-            savePanel.nameFieldStringValue = "retrace-\(formattedTimestamp()).png"
-            savePanel.level = .screenSaver + 1
-
-            savePanel.begin { response in
-                if response == .OK, let url = savePanel.url {
-                    if let tiffData = image.tiffRepresentation,
-                       let bitmap = NSBitmapImageRep(data: tiffData),
-                       let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        try? pngData.write(to: url)
+            isButtonHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+                showMenu = true
+            } else {
+                NSCursor.pop()
+                // Delay hiding to allow moving to menu
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    if !isMenuHovering && !isButtonHovering {
+                        showMenu = false
                     }
                 }
             }
         }
-    }
-
-    private func copyImageToClipboard() {
-        getCurrentFrameImage { image in
-            guard let image = image else { return }
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([image])
-        }
-    }
-
-    private func openDashboard() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openDashboard, object: nil)
-        }
-    }
-
-    private func openSettings() {
-        TimelineWindowController.shared.hide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            NotificationCenter.default.post(name: .openSettings, object: nil)
-        }
-    }
-
-    private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
-        if let image = viewModel.currentImage {
-            completion(image)
-            return
-        }
-
-        guard let videoInfo = viewModel.currentVideoInfo else {
-            completion(nil)
-            return
-        }
-
-        // Check if file exists (try both with and without .mp4 extension)
-        var actualVideoPath = videoInfo.videoPath
-        if !FileManager.default.fileExists(atPath: actualVideoPath) {
-            let pathWithExtension = actualVideoPath + ".mp4"
-            if FileManager.default.fileExists(atPath: pathWithExtension) {
-                actualVideoPath = pathWithExtension
-            } else {
-                completion(nil)
-                return
+        .overlay(alignment: .bottomTrailing) {
+            if showMenu {
+                ContextMenuContent(viewModel: viewModel, showMenu: $showMenu)
+                    .retraceMenuContainer()
+                    .frame(width: 200)
+                    .offset(y: -TimelineScaleFactor.controlButtonSize - 8)
+                    .onHover { hovering in
+                        isMenuHovering = hovering
+                        if !hovering {
+                            // Delay hiding to allow moving back to button
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                if !isMenuHovering && !isButtonHovering {
+                                    showMenu = false
+                                }
+                            }
+                        }
+                    }
+                    .transition(.opacity)
             }
         }
-
-        // Determine the URL to use - if file already has .mp4 extension, use directly
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
-        }
-        let asset = AVURLAsset(url: url)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceBefore = .zero
-        imageGenerator.requestedTimeToleranceAfter = .zero
-
-        // Use integer arithmetic to avoid floating point precision issues
-        let time = videoInfo.frameTimeCMTime
-
-        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
-            DispatchQueue.main.async {
-                if let cgImage = cgImage {
-                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
-                    completion(nsImage)
-                } else {
-                    completion(nil)
-                }
-            }
-        }
-    }
-
-    private func formattedTimestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+        .animation(.easeOut(duration: 0.12), value: showMenu)
     }
 }
 
-// MARK: - Menu Row
+// MARK: - Instant Tooltip
 
-/// Styled menu row for the popover
-struct MenuRow: View {
-    let title: String
-    let icon: String
-    var shortcut: String? = nil
-    let action: () -> Void
+/// Custom instant tooltip that appears above the view on hover
+struct InstantTooltip: ViewModifier {
+    let text: String
+    @Binding var isVisible: Bool
 
-    @State private var isHovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white.opacity(0.7))
-                    .frame(width: 18)
-
-                Text(title)
-                    .font(.retraceCaption)
-                    .foregroundColor(.white)
-
-                Spacer()
-
-                if let shortcut = shortcut {
-                    Text(shortcut)
-                        .font(.retraceCaption2)
-                        .foregroundColor(.white.opacity(0.4))
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .top) {
+                if isVisible {
+                    Text(text)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule()
+                                .fill(Color.black)
+                        )
+                        .offset(y: -44)
+                        .transition(.opacity)
+                        .allowsHitTesting(false)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
-            )
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovering = hovering
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
-        }
+    }
+}
+
+extension View {
+    func instantTooltip(_ text: String, isVisible: Binding<Bool>) -> some View {
+        modifier(InstantTooltip(text: text, isVisible: isVisible))
     }
 }
 
@@ -782,16 +758,13 @@ struct FloatingDateSearchPanel: View {
 
     @State private var isHovering = false
     @State private var isCalendarButtonHovering = false
+    @State private var isSubmitButtonHovering = false
     /// Accumulated position from completed drags
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
 
     private var placeholderText: String {
-        if enableFrameIDSearch {
-            return "e.g. 8 minutes ago"
-        } else {
-            return "e.g. 8 minutes ago"
-        }
+        "e.g. 8 min ago, or yesterday 2pm"
     }
 
     var body: some View {
@@ -859,20 +832,51 @@ struct FloatingDateSearchPanel: View {
                             .foregroundColor(.white.opacity(0.35))
                     }
                     .buttonStyle(.plain)
-                    .transition(.opacity.combined(with: .scale))
+                    .transition(.opacity)
+                }
+
+                // Submit button
+                Button(action: onSubmit) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(text.isEmpty ? .white.opacity(0.2) : (isSubmitButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8)))
+                }
+                .buttonStyle(.plain)
+                .disabled(text.isEmpty)
+                .onHover { hovering in
+                    isSubmitButtonHovering = hovering
+                    if hovering && !text.isEmpty { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 16)
+            .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
+            .padding(.vertical, RetraceMenuStyle.searchFieldPaddingV)
             .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color.white.opacity(0.06))
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
+                    .fill(RetraceMenuStyle.searchFieldBackground)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 16)
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
                     .stroke(Color.white.opacity(0.12), lineWidth: 1)
             )
             .padding(.horizontal, 20)
+
+            // OR divider
+            HStack(spacing: 12) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
+
+                Text("OR")
+                    .font(.retraceTinyBold)
+                    .foregroundColor(.white.opacity(0.4))
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.15))
+                    .frame(height: 1)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
 
             // Calendar button
             Button(action: {
@@ -889,22 +893,18 @@ struct FloatingDateSearchPanel: View {
                     Text("Browse Calendar")
                         .font(.retraceCaptionMedium)
                 }
-                .foregroundColor(isCalendarButtonHovering ? .white : .white.opacity(0.7))
+                .foregroundColor(.white)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(isCalendarButtonHovering ? Color.white.opacity(0.15) : Color.white.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(isCalendarButtonHovering ? 0.2 : 0.1), lineWidth: 0.5)
+                        .fill(isCalendarButtonHovering ? RetraceMenuStyle.actionBlue : RetraceMenuStyle.actionBlue.opacity(0.8))
                 )
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 20)
-            .padding(.top, 12)
+            .padding(.top, 10)
             .onHover { hovering in
                 withAnimation(.easeOut(duration: 0.15)) {
                     isCalendarButtonHovering = hovering
@@ -915,27 +915,11 @@ struct FloatingDateSearchPanel: View {
         }
         .padding(.bottom, 16)
         .frame(width: TimelineScaleFactor.searchPanelWidth)
+        .retraceMenuContainer(addPadding: false)
         .background(
             ZStack {
-                // Dark solid background
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(Color(white: 0.08))
-
-                // Subtle glass overlay
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.08),
-                                Color.white.opacity(0.02)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-
-                // Border
-                RoundedRectangle(cornerRadius: 20)
+                // Remove custom background - now using unified system
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
                     .stroke(
                         LinearGradient(
                             colors: [
@@ -1395,26 +1379,54 @@ struct DateSearchField: NSViewRepresentable {
         // Wire up Cmd+G to close the panel
         textField.onCancelCallback = onCancel
 
+        // Focus the text field immediately when created
+        // Use multiple dispatch levels to ensure focus happens after SwiftUI layout
+        focusTextField(textField)
+
         return textField
     }
 
     func updateNSView(_ textField: FocusableTextField, context: Context) {
         textField.stringValue = text
+        // No focus logic needed here - makeNSView handles initial focus
+    }
 
-        // Auto-focus when the field appears
-        if context.coordinator.shouldFocus {
-            DispatchQueue.main.async {
-                guard let window = textField.window else { return }
-                window.makeKey()
-                window.makeFirstResponder(textField)
-
-                // Ensure field editor is created for caret to appear
-                if window.fieldEditor(false, for: textField) == nil {
-                    _ = window.fieldEditor(true, for: textField)
-                    window.makeFirstResponder(textField)
+    /// Robustly focus the text field using multiple attempts
+    private func focusTextField(_ textField: FocusableTextField) {
+        // Attempt 1: Immediate focus on next run loop
+        DispatchQueue.main.async {
+            guard let window = textField.window else {
+                // Window not ready yet, retry
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                    self.performFocus(textField)
                 }
+                return
             }
-            context.coordinator.shouldFocus = false
+            self.performFocus(textField, in: window)
+        }
+    }
+
+    /// Actually perform the focus operation
+    private func performFocus(_ textField: FocusableTextField, in window: NSWindow? = nil) {
+        let targetWindow = window ?? textField.window
+        guard let window = targetWindow else { return }
+
+        // Make window key first
+        window.makeKey()
+
+        // Make text field first responder
+        let success = window.makeFirstResponder(textField)
+
+        // Ensure field editor exists for caret to appear
+        if window.fieldEditor(false, for: textField) == nil {
+            _ = window.fieldEditor(true, for: textField)
+        }
+
+        // If initial attempt failed, retry
+        if !success {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                window.makeFirstResponder(textField)
+            }
         }
     }
 
@@ -1426,7 +1438,6 @@ struct DateSearchField: NSViewRepresentable {
         @Binding var text: String
         let onSubmit: () -> Void
         let onCancel: () -> Void
-        var shouldFocus = true
 
         init(text: Binding<String>, onSubmit: @escaping () -> Void, onCancel: @escaping () -> Void) {
             self._text = text
@@ -1475,6 +1486,94 @@ class FocusableTextField: NSTextField {
 }
 
 
+// MARK: - Timeline Tape Right Click Handler
+
+/// Per-frame right-click handler - knows its exact frame index
+struct FrameRightClickHandler: NSViewRepresentable {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let frameIndex: Int
+
+    func makeNSView(context: Context) -> FrameRightClickNSView {
+        let view = FrameRightClickNSView()
+        view.viewModel = viewModel
+        view.frameIndex = frameIndex
+        return view
+    }
+
+    func updateNSView(_ nsView: FrameRightClickNSView, context: Context) {
+        nsView.viewModel = viewModel
+        nsView.frameIndex = frameIndex
+    }
+}
+
+/// Custom NSView that intercepts right-click events for a specific frame segment
+class FrameRightClickNSView: NSView {
+    weak var viewModel: SimpleTimelineViewModel?
+    var frameIndex: Int = 0
+
+    override func rightMouseDown(with event: NSEvent) {
+        handleRightClick(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Check for control-click (which macOS treats as right-click)
+        if event.modifierFlags.contains(.control) {
+            handleRightClick(with: event)
+        }
+        // Don't call super - let the event pass through to SwiftUI views underneath
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Only capture right-clicks and control-clicks
+        guard let event = NSApp.currentEvent else {
+            return nil
+        }
+
+        if event.type == .rightMouseDown {
+            return super.hitTest(point)
+        }
+
+        if event.type == .leftMouseDown && event.modifierFlags.contains(.control) {
+            return super.hitTest(point)
+        }
+
+        // Let all other events pass through to SwiftUI views underneath
+        return nil
+    }
+
+    private func handleRightClick(with event: NSEvent) {
+        guard let viewModel = viewModel else { return }
+
+        // Get the parent window's content view size for positioning the menu
+        guard let window = self.window,
+              let contentView = window.contentView else { return }
+
+        let windowPoint = event.locationInWindow
+
+        // Convert to coordinates relative to the full content area
+        let contentHeight = contentView.bounds.height
+        let menuLocation = CGPoint(
+            x: windowPoint.x,
+            y: contentHeight - windowPoint.y // Flip Y coordinate for SwiftUI
+        )
+
+        // Use the frame index this handler was created with - no offset calculation needed!
+        DispatchQueue.main.async {
+            // Reset submenu state when opening a new context menu
+            viewModel.showTagSubmenu = false
+            viewModel.isHoveringAddTagButton = false
+            viewModel.selectedSegmentTags = []
+
+            // Update to new location/frame
+            viewModel.timelineContextMenuSegmentIndex = self.frameIndex
+            viewModel.timelineContextMenuLocation = menuLocation
+            viewModel.selectedFrameIndex = self.frameIndex  // Highlight the right-clicked block
+            viewModel.showTimelineContextMenu = true
+            Task { await viewModel.loadTags() }
+        }
+    }
+}
+
 // MARK: - Preview
 
 #if DEBUG
@@ -1491,3 +1590,29 @@ struct TimelineTapeView_Previews: PreviewProvider {
     }
 }
 #endif
+
+// MARK: - Hidden Segment Overlay
+
+/// Visual indicator for hidden segments - diagonal stripe pattern
+struct HiddenSegmentOverlay: View {
+    var body: some View {
+        GeometryReader { geometry in
+            Canvas { context, size in
+                let stripeWidth: CGFloat = 3
+                let spacing: CGFloat = 6
+                let color = Color.white.opacity(0.3)
+
+                // Draw diagonal stripes from bottom-left to top-right
+                var x: CGFloat = -size.height
+                while x < size.width + size.height {
+                    var path = Path()
+                    path.move(to: CGPoint(x: x, y: size.height))
+                    path.addLine(to: CGPoint(x: x + size.height, y: 0))
+                    context.stroke(path, with: .color(color), lineWidth: stripeWidth)
+                    x += spacing + stripeWidth
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}

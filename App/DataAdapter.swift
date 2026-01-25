@@ -44,6 +44,7 @@ public actor DataAdapter {
     // MARK: - State
 
     private var isInitialized = false
+    private var cachedHiddenTagId: Int64?
 
     // MARK: - Initialization
 
@@ -89,12 +90,22 @@ public actor DataAdapter {
     /// Initialize the adapter
     public func initialize() async throws {
         isInitialized = true
+
+        // Cache the hidden tag ID
+        if let hiddenTag = try? await database.getTag(name: "hidden") {
+            cachedHiddenTagId = hiddenTag.id.value
+            Log.debug("[DataAdapter] Cached hidden tag ID: \(hiddenTag.id.value)", category: .app)
+        } else {
+            Log.warning("[DataAdapter] Hidden tag not found in database", category: .app)
+        }
+
         Log.info("[DataAdapter] Initialized with \(rewindConnection != nil ? "2" : "1") connection(s)", category: .app)
     }
 
     /// Shutdown the adapter
     public func shutdown() async {
         isInitialized = false
+        cachedHiddenTagId = nil
         Log.info("[DataAdapter] Shutdown complete", category: .app)
     }
 
@@ -110,17 +121,23 @@ public actor DataAdapter {
     // MARK: - Frame Retrieval
 
     /// Get frames with video info in a time range (optimized - single query with JOINs)
-    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
+            return try await getFramesInRangeWithFilters(from: startDate, to: endDate, limit: limit, filters: filters)
+        }
+
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind if timestamp is before cutoff
         if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
             let effectiveEnd = min(endDate, cutoff)
-            let frames = try queryFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit, connection: rewind, config: config)
+            let frames = try queryFramesWithVideoInfo(from: startDate, to: effectiveEnd, limit: limit, connection: rewind, config: config, filters: nil)
             allFrames.append(contentsOf: frames)
         }
 
@@ -130,7 +147,7 @@ public actor DataAdapter {
             retraceStart = max(startDate, cutoff)
         }
         if retraceStart < endDate {
-            let frames = try queryFramesWithVideoInfo(from: retraceStart, to: endDate, limit: limit, connection: retraceConnection, config: retraceConfig)
+            let frames = try queryFramesWithVideoInfo(from: retraceStart, to: endDate, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
             allFrames.append(contentsOf: frames)
         }
 
@@ -139,27 +156,83 @@ public actor DataAdapter {
         return Array(allFrames.prefix(limit))
     }
 
+    /// Optimized filtered query for date range - tries Retrace first, then Rewind
+    private func getFramesInRangeWithFilters(from startDate: Date, to endDate: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
+        var allFrames: [FrameWithVideoInfo] = []
+        var remaining = limit
+
+        // Check if we should exclude sources based on source filter
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+                            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+                           filters.selectedSources?.contains(.rewind) == false
+
+        // Step 1: Try Retrace first (unless excluded)
+        if !excludeRetrace {
+            var retraceStart = startDate
+            if let cutoff = cutoffDate {
+                retraceStart = max(startDate, cutoff)
+            }
+            if retraceStart < endDate {
+                let retraceFrames = try queryFramesInRangeWithFiltersOptimized(
+                    from: retraceStart,
+                    to: endDate,
+                    limit: limit,
+                    connection: retraceConnection,
+                    config: retraceConfig,
+                    filters: filters
+                )
+                allFrames.append(contentsOf: retraceFrames)
+                remaining = limit - retraceFrames.count
+            }
+        }
+
+        // Step 2: If we don't have enough frames, query Rewind (unless excluded)
+        if remaining > 0, !excludeRewind, let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, startDate < cutoff {
+            let effectiveEnd = min(endDate, cutoff)
+            let rewindFrames = try queryFramesInRangeWithFiltersOptimized(
+                from: startDate,
+                to: effectiveEnd,
+                limit: remaining,
+                connection: rewind,
+                config: config,
+                filters: filters
+            )
+            allFrames.append(contentsOf: rewindFrames)
+        }
+
+        // Sort by timestamp ascending (oldest first)
+        allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
+        return allFrames
+    }
+
     /// Get frames in a time range
-    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500) async throws -> [FrameReference] {
-        let framesWithVideo = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit)
+    public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
+        let framesWithVideo = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
         return framesWithVideo.map { $0.frame }
     }
 
     /// Get most recent frames with video info
-    public func getMostRecentFramesWithVideoInfo(limit: Int = 250) async throws -> [FrameWithVideoInfo] {
+    public func getMostRecentFramesWithVideoInfo(limit: Int = 250, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
+            return try await getMostRecentFramesWithFilters(limit: limit, filters: filters)
+        }
+
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Retrace
-        let retraceFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: retraceConnection, config: retraceConfig)
+        let retraceFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
         allFrames.append(contentsOf: retraceFrames)
 
         // Query Rewind
         if let rewind = rewindConnection, let config = rewindConfig {
-            let rewindFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: rewind, config: config)
+            let rewindFrames = try queryMostRecentFramesWithVideoInfo(limit: limit, connection: rewind, config: config, filters: nil)
             allFrames.append(contentsOf: rewindFrames)
         }
 
@@ -168,29 +241,81 @@ public actor DataAdapter {
         return Array(allFrames.prefix(limit))
     }
 
+    /// Optimized filtered query - tries Retrace first, then Rewind to get full limit
+    private func getMostRecentFramesWithFilters(limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
+        var allFrames: [FrameWithVideoInfo] = []
+        var remaining = limit
+
+        // Check if we should exclude sources based on source filter
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+                            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+                           filters.selectedSources?.contains(.rewind) == false
+
+        // Step 1: Try Retrace first (unless excluded)
+        if !excludeRetrace {
+            let retraceFrames = try queryMostRecentFramesWithFiltersOptimized(
+                limit: limit,
+                connection: retraceConnection,
+                config: retraceConfig,
+                filters: filters,
+                isRewindDatabase: false
+            )
+            allFrames.append(contentsOf: retraceFrames)
+            remaining = limit - retraceFrames.count
+            Log.debug("[Filter] Got \(retraceFrames.count) frames from Retrace, need \(remaining) more", category: .database)
+        }
+
+        // Step 2: If we don't have enough frames, query Rewind (unless excluded)
+        // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
+        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
+                           filters.hiddenFilter == .onlyHidden
+        if remaining > 0, !excludeRewind, !hasTagFilters, let rewind = rewindConnection, let config = rewindConfig {
+            let rewindFrames = try queryMostRecentFramesWithFiltersOptimized(
+                limit: remaining,
+                connection: rewind,
+                config: config,
+                filters: filters,
+                isRewindDatabase: true
+            )
+            allFrames.append(contentsOf: rewindFrames)
+            Log.debug("[Filter] Got \(rewindFrames.count) frames from Rewind", category: .database)
+        }
+
+        // Sort by timestamp descending (newest first)
+        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        return allFrames
+    }
+
     /// Get most recent frames
-    public func getMostRecentFrames(limit: Int = 250) async throws -> [FrameReference] {
-        let framesWithVideo = try await getMostRecentFramesWithVideoInfo(limit: limit)
+    public func getMostRecentFrames(limit: Int = 250, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
+        let framesWithVideo = try await getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
         return framesWithVideo.map { $0.frame }
     }
 
     /// Get frames with video info before a timestamp
-    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
+            return try await getFramesBeforeWithFilters(timestamp: timestamp, limit: limit, filters: filters)
+        }
+
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind
         if let rewind = rewindConnection, let config = rewindConfig {
             let effectiveTimestamp = cutoffDate != nil ? min(timestamp, cutoffDate!) : timestamp
-            let frames = try queryFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit, connection: rewind, config: config)
+            let frames = try queryFramesWithVideoInfoBefore(timestamp: effectiveTimestamp, limit: limit, connection: rewind, config: config, filters: nil)
             allFrames.append(contentsOf: frames)
         }
 
         // Query Retrace
-        let retraceFrames = try queryFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig)
+        let retraceFrames = try queryFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
         allFrames.append(contentsOf: retraceFrames)
 
         // Sort by timestamp descending (newest first) and take top N
@@ -198,28 +323,81 @@ public actor DataAdapter {
         return Array(allFrames.prefix(limit))
     }
 
+    /// Optimized filtered query for frames before timestamp - tries Retrace first, then Rewind
+    private func getFramesBeforeWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
+        var allFrames: [FrameWithVideoInfo] = []
+        var remaining = limit
+
+        // Check if we should exclude sources based on source filter
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+                            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+                           filters.selectedSources?.contains(.rewind) == false
+
+        // Step 1: Try Retrace first (unless excluded)
+        if !excludeRetrace {
+            let retraceFrames = try queryFramesBeforeWithFiltersOptimized(
+                timestamp: timestamp,
+                limit: limit,
+                connection: retraceConnection,
+                config: retraceConfig,
+                filters: filters,
+                isRewindDatabase: false
+            )
+            allFrames.append(contentsOf: retraceFrames)
+            remaining = limit - retraceFrames.count
+        }
+
+        // Step 2: If we don't have enough frames, query Rewind (unless excluded)
+        // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
+        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
+                           filters.hiddenFilter == .onlyHidden
+        if remaining > 0, !excludeRewind, !hasTagFilters, let rewind = rewindConnection, let config = rewindConfig {
+            let effectiveTimestamp = cutoffDate != nil ? min(timestamp, cutoffDate!) : timestamp
+            let rewindFrames = try queryFramesBeforeWithFiltersOptimized(
+                timestamp: effectiveTimestamp,
+                limit: remaining,
+                connection: rewind,
+                config: config,
+                filters: filters,
+                isRewindDatabase: true
+            )
+            allFrames.append(contentsOf: rewindFrames)
+        }
+
+        // Sort by timestamp descending (newest first)
+        allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        return allFrames
+    }
+
     /// Get frames before a timestamp
-    public func getFramesBefore(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
-        let framesWithVideo = try await getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit)
+    public func getFramesBefore(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
+        let framesWithVideo = try await getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, filters: filters)
         return framesWithVideo.map { $0.frame }
     }
 
     /// Get frames with video info after a timestamp
-    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameWithVideoInfo] {
+    public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameWithVideoInfo] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        // Use filtered query when filters are provided (always applies hidden filter by default)
+        if let filters = filters {
+            return try await getFramesAfterWithFilters(timestamp: timestamp, limit: limit, filters: filters)
+        }
+
+        // Original unfiltered logic (fast subquery approach) - only used when filters is nil
         var allFrames: [FrameWithVideoInfo] = []
 
         // Query Rewind (respecting cutoff)
         if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
-            let frames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: rewind, config: config)
+            let frames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: rewind, config: config, filters: nil)
             allFrames.append(contentsOf: frames)
         }
 
         // Query Retrace
-        let retraceFrames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig)
+        let retraceFrames = try queryFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, connection: retraceConnection, config: retraceConfig, filters: nil)
         allFrames.append(contentsOf: retraceFrames)
 
         // Sort by timestamp ascending (oldest first) and take top N
@@ -227,9 +405,55 @@ public actor DataAdapter {
         return Array(allFrames.prefix(limit))
     }
 
+    /// Optimized filtered query for frames after timestamp - tries Retrace first, then Rewind
+    private func getFramesAfterWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
+        var allFrames: [FrameWithVideoInfo] = []
+        var remaining = limit
+
+        // Check if we should exclude sources based on source filter
+        let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
+                            filters.selectedSources?.contains(.native) == false
+        let excludeRewind = filters.selectedSources?.contains(.native) == true &&
+                           filters.selectedSources?.contains(.rewind) == false
+
+        // Step 1: Try Retrace first (unless excluded)
+        if !excludeRetrace {
+            let retraceFrames = try queryFramesAfterWithFiltersOptimized(
+                timestamp: timestamp,
+                limit: limit,
+                connection: retraceConnection,
+                config: retraceConfig,
+                filters: filters,
+                isRewindDatabase: false
+            )
+            allFrames.append(contentsOf: retraceFrames)
+            remaining = limit - retraceFrames.count
+        }
+
+        // Step 2: If we don't have enough frames, query Rewind (unless excluded)
+        // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
+        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
+                           filters.hiddenFilter == .onlyHidden
+        if remaining > 0, !excludeRewind, !hasTagFilters, let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
+            let rewindFrames = try queryFramesAfterWithFiltersOptimized(
+                timestamp: timestamp,
+                limit: remaining,
+                connection: rewind,
+                config: config,
+                filters: filters,
+                isRewindDatabase: true
+            )
+            allFrames.append(contentsOf: rewindFrames)
+        }
+
+        // Sort by timestamp ascending (oldest first)
+        allFrames.sort { $0.frame.timestamp < $1.frame.timestamp }
+        return allFrames
+    }
+
     /// Get frames after a timestamp
-    public func getFramesAfter(timestamp: Date, limit: Int = 300) async throws -> [FrameReference] {
-        let framesWithVideo = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit)
+    public func getFramesAfter(timestamp: Date, limit: Int = 300, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
+        let framesWithVideo = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, filters: filters)
         return framesWithVideo.map { $0.frame }
     }
 
@@ -422,24 +646,32 @@ public actor DataAdapter {
     // MARK: - App Discovery
 
     /// Get all distinct apps from all data sources
-    public func getDistinctApps() async throws -> [AppInfo] {
+    /// Get distinct app bundle IDs from the database
+    /// Caller is responsible for resolving names (use AppNameResolver.shared.resolveAll)
+    public func getDistinctAppBundleIDs() async throws -> [String] {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
 
+        let startTime = CFAbsoluteTimeGetCurrent()
         var bundleIDs: [String] = []
 
         // Try Rewind first (more historical data)
         if let rewind = rewindConnection {
+            let queryStart = CFAbsoluteTimeGetCurrent()
             bundleIDs = try queryDistinctApps(connection: rewind)
+            Log.debug("[DataAdapter] Rewind query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
         }
 
         // If empty, try Retrace
         if bundleIDs.isEmpty {
+            let queryStart = CFAbsoluteTimeGetCurrent()
             bundleIDs = try queryDistinctApps(connection: retraceConnection)
+            Log.debug("[DataAdapter] Retrace query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
         }
 
-        return await AppNameResolver.resolveAll(bundleIDs: bundleIDs)
+        Log.debug("[DataAdapter] getDistinctAppBundleIDs total: \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .database)
+        return bundleIDs
     }
 
     // MARK: - URL Bounding Box Detection
@@ -608,10 +840,34 @@ public actor DataAdapter {
         to endDate: Date,
         limit: Int,
         connection: DatabaseConnection,
-        config: DatabaseConfig
+        config: DatabaseConfig,
+        filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
         let effectiveEndDate = config.applyCutoff(to: endDate)
         guard startDate < effectiveEndDate else { return [] }
+
+        // Build WHERE clause based on filters
+        var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
+        var bindIndex = 3 // 1 and 2 are for timestamps
+
+        // App filter (include or exclude mode)
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            let filterMode = filters?.appFilterMode ?? .include
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+        }
+
+        // Tag filter - need to join with segment_tag
+        let needsTagJoin = filters?.selectedTags != nil && !(filters?.selectedTags!.isEmpty ?? true)
+        let tagJoin = needsTagJoin ? """
+            INNER JOIN segment_tag st ON f.segmentId = st.segmentId
+            """ : ""
+
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("st.tagId IN (\(placeholders))")
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
 
         let sql = """
             SELECT
@@ -630,8 +886,9 @@ public actor DataAdapter {
                 v.height
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.createdAt >= ? AND f.createdAt <= ?
+            WHERE \(whereClause)
             ORDER BY f.createdAt ASC
             LIMIT ?;
             """
@@ -641,7 +898,24 @@ public actor DataAdapter {
 
         config.bindDate(startDate, to: statement, at: 1)
         config.bindDate(effectiveEndDate, to: statement, at: 2)
-        sqlite3_bind_int(statement, 3, Int32(limit))
+
+        // Bind app bundle IDs
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            bindIndex += apps.count
+        }
+
+        // Bind tag IDs
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            for (index, tagId) in tags.enumerated() {
+                sqlite3_bind_int64(statement, Int32(bindIndex + index), tagId)
+            }
+            bindIndex += tags.count
+        }
+
+        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -653,10 +927,12 @@ public actor DataAdapter {
         return frames
     }
 
+    /// Fast unfiltered query - uses subquery to limit before join
     private func queryMostRecentFramesWithVideoInfo(
         limit: Int,
         connection: DatabaseConnection,
-        config: DatabaseConfig
+        config: DatabaseConfig,
+        filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
@@ -688,13 +964,723 @@ public actor DataAdapter {
         return frames
     }
 
+    /// Optimized filtered query - joins first to use bundleID index, then filters
+    private func queryMostRecentFramesWithFiltersOptimized(
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        isRewindDatabase: Bool = false
+    ) throws -> [FrameWithVideoInfo] {
+        var whereClauses: [String] = []
+        var bindIndex = 1
+
+        // Build tag filter including hidden filter logic
+        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
+        var tagsToFilter = Set<Int64>()
+        let shouldApplyTagFilters = !isRewindDatabase
+
+        if shouldApplyTagFilters {
+            tagsToFilter = filters.selectedTags ?? Set<Int64>()
+
+            // Apply hidden filter logic
+            if let hiddenTagId = cachedHiddenTagId {
+                switch filters.hiddenFilter {
+                case .hide:
+                    // Exclude hidden: We'll use NOT EXISTS clause below
+                    break
+                case .onlyHidden:
+                    // Only show hidden: Set tags to only hidden tag
+                    tagsToFilter = [hiddenTagId]
+                case .showAll:
+                    // Show all: Don't modify tag filter
+                    break
+                }
+            }
+        }
+
+        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
+        let tagCTE: String
+        let tagJoin: String
+        let hasTagFilter = !tagsToFilter.isEmpty
+        let tagFilterMode = filters.tagFilterMode
+
+        if hasTagFilter {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            if tagFilterMode == .include {
+                // Include mode: Show only segments WITH selected tags
+                tagCTE = """
+                    WITH tagged_segments AS (
+                        SELECT DISTINCT segmentId
+                        FROM segment_tag
+                        WHERE tagId IN (\(tagPlaceholders))
+                    )
+                    """
+                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+            } else {
+                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
+                tagCTE = ""
+                tagJoin = ""
+            }
+        } else {
+            tagCTE = ""
+            tagJoin = ""
+        }
+
+        // App filter - uses index on segment.bundleID (include or exclude mode)
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Tag exclude filter: Exclude segments that have any of the selected tags
+        if hasTagFilter && tagFilterMode == .exclude {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+        }
+
+        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
+        // Only apply for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+        }
+
+        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
+
+        // CTE filters tags first (small set), then joins with frames using segmentId index
+        let sql = """
+            \(tagCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
+            LEFT JOIN video v ON f.videoId = v.id
+            \(whereClause)
+            ORDER BY f.createdAt DESC
+            LIMIT ?
+            """
+
+        Log.debug("[Filter] ====== QUERY DEBUG START ======", category: .database)
+        Log.debug("[Filter] Query SQL:\n\(sql)", category: .database)
+        Log.debug("[Filter] Apps filter: \(filters.selectedApps ?? []), mode: \(filters.appFilterMode.rawValue)", category: .database)
+        Log.debug("[Filter] Tags to filter: \(tagsToFilter), mode: \(tagFilterMode.rawValue)", category: .database)
+        Log.debug("[Filter] Hidden filter: \(filters.hiddenFilter.rawValue), cachedHiddenTagId: \(String(describing: cachedHiddenTagId))", category: .database)
+
+        let statement: OpaquePointer?
+        do {
+            statement = try connection.prepare(sql: sql)
+        } catch {
+            Log.error("[Filter] Failed to prepare SQL statement: \(error)", category: .database)
+            if let db = connection.getConnection(), let errMsg = sqlite3_errmsg(db) {
+                Log.error("[Filter] SQLite error: \(String(cString: errMsg))", category: .database)
+            }
+            return []
+        }
+        guard let stmt = statement else {
+            Log.error("[Filter] Statement is nil after prepare!", category: .database)
+            return []
+        }
+        defer { connection.finalize(stmt) }
+
+        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        if hasTagFilter && tagFilterMode == .include {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                Log.debug("[Filter] Binding tagId \(tagId) at index \(bindIndex + index)", category: .database)
+                sqlite3_bind_int64(stmt, Int32(bindIndex + index), tagId)
+            }
+            bindIndex += tagsToFilter.count
+        }
+
+        // Bind app bundle IDs
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                Log.debug("[Filter] Binding app '\(app)' at index \(bindIndex + index)", category: .database)
+                sqlite3_bind_text(stmt, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            bindIndex += apps.count
+        }
+
+        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
+        if hasTagFilter && tagFilterMode == .exclude {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                Log.debug("[Filter] Binding exclude tagId \(tagId) at index \(bindIndex + index)", category: .database)
+                sqlite3_bind_int64(stmt, Int32(bindIndex + index), tagId)
+            }
+            bindIndex += tagsToFilter.count
+        }
+
+        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
+        // Only bind for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            Log.debug("[Filter] Binding hiddenTagId \(hiddenTagId) at index \(bindIndex)", category: .database)
+            sqlite3_bind_int64(stmt, Int32(bindIndex), hiddenTagId)
+            bindIndex += 1
+        }
+
+        // Bind limit
+        Log.debug("[Filter] Binding limit \(limit) at index \(bindIndex)", category: .database)
+        sqlite3_bind_int(stmt, Int32(bindIndex), Int32(limit))
+        Log.debug("[Filter] ====== QUERY DEBUG END ======", category: .database)
+
+        var frames: [FrameWithVideoInfo] = []
+        var stepCount = 0
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            stepCount += 1
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: stmt, config: config) {
+                frames.append(frameWithVideo)
+            }
+            stepResult = sqlite3_step(stmt)
+        }
+
+        if stepResult != SQLITE_DONE {
+            Log.error("[Filter] sqlite3_step error code: \(stepResult)", category: .database)
+        }
+
+        Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
+
+        return frames
+    }
+
+    /// Optimized filtered query for frames before timestamp - joins first to use bundleID index
+    private func queryFramesBeforeWithFiltersOptimized(
+        timestamp: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        isRewindDatabase: Bool = false
+    ) throws -> [FrameWithVideoInfo] {
+        let effectiveTimestamp = config.applyCutoff(to: timestamp)
+
+        var whereClauses = ["f.createdAt < ?"]
+        var bindIndex = 1
+
+        // Build tag filter including hidden filter logic
+        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
+        var tagsToFilter = Set<Int64>()
+        let shouldApplyTagFilters = !isRewindDatabase
+
+        if shouldApplyTagFilters {
+            tagsToFilter = filters.selectedTags ?? Set<Int64>()
+
+            // Apply hidden filter logic
+            if let hiddenTagId = cachedHiddenTagId {
+                switch filters.hiddenFilter {
+                case .hide:
+                    // Exclude hidden: We'll use NOT EXISTS clause below
+                    break
+                case .onlyHidden:
+                    // Only show hidden: Set tags to only hidden tag
+                    tagsToFilter = [hiddenTagId]
+                case .showAll:
+                    // Show all: Don't modify tag filter
+                    break
+                }
+            }
+        }
+
+        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
+        let tagCTE: String
+        let tagJoin: String
+        let hasTagFilter = !tagsToFilter.isEmpty
+        let tagFilterMode = filters.tagFilterMode
+
+        if hasTagFilter {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            if tagFilterMode == .include {
+                // Include mode: Show only segments WITH selected tags
+                tagCTE = """
+                    WITH tagged_segments AS (
+                        SELECT DISTINCT segmentId
+                        FROM segment_tag
+                        WHERE tagId IN (\(tagPlaceholders))
+                    )
+                    """
+                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+                // Update bindIndex to account for tag parameters in CTE
+                bindIndex += tagsToFilter.count
+            } else {
+                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
+                tagCTE = ""
+                tagJoin = ""
+            }
+        } else {
+            tagCTE = ""
+            tagJoin = ""
+        }
+
+        // Now bind timestamp (after tag IDs in CTE, if any)
+        bindIndex += 1
+
+        // App filter - uses index on segment.bundleID (include or exclude mode)
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Tag exclude filter: Exclude segments that have any of the selected tags
+        if hasTagFilter && tagFilterMode == .exclude {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+        }
+
+        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
+        // Only apply for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
+
+        // CTE filters tags first (small set), then joins with frames using segmentId index
+        let sql = """
+            \(tagCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE \(whereClause)
+            ORDER BY f.createdAt DESC
+            LIMIT ?
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var currentBindIndex = 1
+
+        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        if hasTagFilter && tagFilterMode == .include {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind timestamp
+        config.bindDate(effectiveTimestamp, to: statement, at: Int32(currentBindIndex))
+        currentBindIndex += 1
+
+        // Bind app bundle IDs
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            currentBindIndex += apps.count
+        }
+
+        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
+        if hasTagFilter && tagFilterMode == .exclude {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
+        // Only bind for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
+            currentBindIndex += 1
+        }
+
+        // Bind limit
+        sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    /// Optimized filtered query for frames after timestamp - joins first to use bundleID index
+    private func queryFramesAfterWithFiltersOptimized(
+        timestamp: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        isRewindDatabase: Bool = false
+    ) throws -> [FrameWithVideoInfo] {
+        var whereClauses = ["f.createdAt > ?"]
+        var bindIndex = 1
+
+        // Build tag filter including hidden filter logic
+        // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
+        var tagsToFilter = Set<Int64>()
+        let shouldApplyTagFilters = !isRewindDatabase
+
+        if shouldApplyTagFilters {
+            tagsToFilter = filters.selectedTags ?? Set<Int64>()
+
+            // Apply hidden filter logic
+            if let hiddenTagId = cachedHiddenTagId {
+                switch filters.hiddenFilter {
+                case .hide:
+                    break
+                case .onlyHidden:
+                    tagsToFilter = [hiddenTagId]
+                case .showAll:
+                    break
+                }
+            }
+        }
+
+        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
+        let tagCTE: String
+        let tagJoin: String
+        let hasTagFilter = !tagsToFilter.isEmpty
+        let tagFilterMode = filters.tagFilterMode
+
+        if hasTagFilter {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            if tagFilterMode == .include {
+                // Include mode: Show only segments WITH selected tags
+                tagCTE = """
+                    WITH tagged_segments AS (
+                        SELECT DISTINCT segmentId
+                        FROM segment_tag
+                        WHERE tagId IN (\(tagPlaceholders))
+                    )
+                    """
+                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+                bindIndex += tagsToFilter.count
+            } else {
+                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
+                tagCTE = ""
+                tagJoin = ""
+            }
+        } else {
+            tagCTE = ""
+            tagJoin = ""
+        }
+
+        // Now bind timestamp (after tag IDs in CTE, if any)
+        bindIndex += 1
+
+        // App filter - uses index on segment.bundleID (include or exclude mode)
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Tag exclude filter: Exclude segments that have any of the selected tags
+        if hasTagFilter && tagFilterMode == .exclude {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+        }
+
+        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
+        // Only apply for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
+
+        // CTE filters tags first (small set), then joins with frames using segmentId index
+        let sql = """
+            \(tagCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE \(whereClause)
+            ORDER BY f.createdAt ASC
+            LIMIT ?
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var currentBindIndex = 1
+
+        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        if hasTagFilter && tagFilterMode == .include {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind timestamp
+        config.bindDate(timestamp, to: statement, at: Int32(currentBindIndex))
+        currentBindIndex += 1
+
+        // Bind app bundle IDs
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            currentBindIndex += apps.count
+        }
+
+        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
+        if hasTagFilter && tagFilterMode == .exclude {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
+        // Only bind for Retrace database (Rewind doesn't have segment_tag)
+        if shouldApplyTagFilters && filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
+            currentBindIndex += 1
+        }
+
+        // Bind limit
+        sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
+    /// Optimized filtered query for date range - joins first to use bundleID index
+    private func queryFramesInRangeWithFiltersOptimized(
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria
+    ) throws -> [FrameWithVideoInfo] {
+        let effectiveEndDate = config.applyCutoff(to: endDate)
+        guard startDate < effectiveEndDate else { return [] }
+
+        var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
+        var bindIndex = 1
+
+        // Build tag filter including hidden filter logic
+        var tagsToFilter = filters.selectedTags ?? Set<Int64>()
+
+        // Apply hidden filter logic
+        if let hiddenTagId = cachedHiddenTagId {
+            switch filters.hiddenFilter {
+            case .hide:
+                break
+            case .onlyHidden:
+                tagsToFilter = [hiddenTagId]
+            case .showAll:
+                break
+            }
+        }
+
+        // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
+        let tagCTE: String
+        let tagJoin: String
+        let hasTagFilter = !tagsToFilter.isEmpty
+        let tagFilterMode = filters.tagFilterMode
+
+        if hasTagFilter {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            if tagFilterMode == .include {
+                // Include mode: Show only segments WITH selected tags
+                tagCTE = """
+                    WITH tagged_segments AS (
+                        SELECT DISTINCT segmentId
+                        FROM segment_tag
+                        WHERE tagId IN (\(tagPlaceholders))
+                    )
+                    """
+                tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+                bindIndex += tagsToFilter.count
+            } else {
+                // Exclude mode: Show segments WITHOUT selected tags (via NOT EXISTS in WHERE)
+                tagCTE = ""
+                tagJoin = ""
+            }
+        } else {
+            tagCTE = ""
+            tagJoin = ""
+        }
+
+        // Now bind timestamps (after tag IDs in CTE, if any)
+        bindIndex += 2  // For startDate and endDate
+
+        // App filter - uses index on segment.bundleID (include or exclude mode)
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Tag exclude filter: Exclude segments that have any of the selected tags
+        if hasTagFilter && tagFilterMode == .exclude {
+            let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+        }
+
+        // Hidden filter: Exclude segments with hidden tag (when .hide mode)
+        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
+
+        // CTE filters tags first (small set), then joins with frames using segmentId index
+        let sql = """
+            \(tagCTE)
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE \(whereClause)
+            ORDER BY f.createdAt ASC
+            LIMIT ?
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var currentBindIndex = 1
+
+        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        if hasTagFilter && tagFilterMode == .include {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind timestamps
+        config.bindDate(startDate, to: statement, at: Int32(currentBindIndex))
+        currentBindIndex += 1
+        config.bindDate(effectiveEndDate, to: statement, at: Int32(currentBindIndex))
+        currentBindIndex += 1
+
+        // Bind app bundle IDs
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            currentBindIndex += apps.count
+        }
+
+        // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
+        if hasTagFilter && tagFilterMode == .exclude {
+            for (index, tagId) in tagsToFilter.enumerated() {
+                sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
+            }
+            currentBindIndex += tagsToFilter.count
+        }
+
+        // Bind hidden tag ID for NOT EXISTS clause (if applicable)
+        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
+            currentBindIndex += 1
+        }
+
+        // Bind limit
+        sqlite3_bind_int(statement, Int32(currentBindIndex), Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
+
+        return frames
+    }
+
     private func queryFramesWithVideoInfoBefore(
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
-        config: DatabaseConfig
+        config: DatabaseConfig,
+        filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
         let effectiveTimestamp = config.applyCutoff(to: timestamp)
+
+        // Build WHERE clause based on filters
+        var whereClauses = ["createdAt < ?"]
+        var bindIndex = 2 // 1 is for timestamp
+
+        // App filter (include or exclude mode)
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            let filterMode = filters?.appFilterMode ?? .include
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+        }
+
+        // Tag filter - need to join with segment_tag
+        let needsTagJoin = filters?.selectedTags != nil && !(filters?.selectedTags!.isEmpty ?? true)
+        let tagJoin = needsTagJoin ? """
+            INNER JOIN segment_tag st ON f.segmentId = st.segmentId
+            """ : ""
+
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("st.tagId IN (\(placeholders))")
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
@@ -703,11 +1689,12 @@ public actor DataAdapter {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
-                WHERE createdAt < ?
+                WHERE \(whereClause)
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
             LEFT JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             ORDER BY f.createdAt DESC
             """
@@ -715,8 +1702,27 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
+        // Bind timestamp
         config.bindDate(effectiveTimestamp, to: statement, at: 1)
-        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        // Bind app bundle IDs
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            bindIndex += apps.count
+        }
+
+        // Bind tag IDs
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            for (index, tagId) in tags.enumerated() {
+                sqlite3_bind_int64(statement, Int32(bindIndex + index), tagId)
+            }
+            bindIndex += tags.count
+        }
+
+        // Bind limit
+        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -732,8 +1738,32 @@ public actor DataAdapter {
         timestamp: Date,
         limit: Int,
         connection: DatabaseConnection,
-        config: DatabaseConfig
+        config: DatabaseConfig,
+        filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        // Build WHERE clause based on filters
+        var whereClauses = ["createdAt > ?"]
+        var bindIndex = 2 // 1 is for timestamp
+
+        // App filter (include or exclude mode)
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            let filterMode = filters?.appFilterMode ?? .include
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+        }
+
+        // Tag filter - need to join with segment_tag
+        let needsTagJoin = filters?.selectedTags != nil && !(filters?.selectedTags!.isEmpty ?? true)
+        let tagJoin = needsTagJoin ? """
+            INNER JOIN segment_tag st ON f.segmentId = st.segmentId
+            """ : ""
+
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
+            whereClauses.append("st.tagId IN (\(placeholders))")
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
+
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
@@ -741,11 +1771,12 @@ public actor DataAdapter {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
                 FROM frame
-                WHERE createdAt > ?
+                WHERE \(whereClause)
                 ORDER BY createdAt ASC
                 LIMIT ?
             ) f
             LEFT JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             ORDER BY f.createdAt ASC
             """
@@ -753,8 +1784,27 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
+        // Bind timestamp
         config.bindDate(timestamp, to: statement, at: 1)
-        sqlite3_bind_int(statement, 2, Int32(limit))
+
+        // Bind app bundle IDs
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            bindIndex += apps.count
+        }
+
+        // Bind tag IDs
+        if let tags = filters?.selectedTags, !tags.isEmpty {
+            for (index, tagId) in tags.enumerated() {
+                sqlite3_bind_int64(statement, Int32(bindIndex + index), tagId)
+            }
+            bindIndex += tags.count
+        }
+
+        // Bind limit
+        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -943,11 +1993,9 @@ public actor DataAdapter {
 
     private func queryDistinctApps(connection: DatabaseConnection) throws -> [String] {
         let sql = """
-            SELECT bundleID, COUNT(*) as usage_count
+            SELECT DISTINCT bundleID
             FROM segment
             WHERE bundleID IS NOT NULL AND bundleID != ''
-            GROUP BY bundleID
-            ORDER BY usage_count DESC
             LIMIT 100;
             """
 
@@ -1113,16 +2161,82 @@ public actor DataAdapter {
             outerBindValues.append(config.formatDate(endDate))
         }
 
+        // App include filter
         if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
             let appPlaceholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
             outerWhereConditions.append("s.bundleID IN (\(appPlaceholders))")
             outerBindValues.append(contentsOf: appBundleIDs)
         }
 
+        // App exclude filter
+        if let excludedAppBundleIDs = query.filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
+            let appPlaceholders = excludedAppBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            outerWhereConditions.append("s.bundleID NOT IN (\(appPlaceholders))")
+            outerBindValues.append(contentsOf: excludedAppBundleIDs)
+        }
+
+        // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
+        // When no tags selected, tagJoin is empty and no join happens
+        let hasTagIncludeFilter = query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
+        var tagJoinBindValues: [Int64] = []
+        let tagJoin: String
+        if let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
+            let tagPlaceholders = tagIds.map { _ in "?" }.joined(separator: ", ")
+            tagJoin = "INNER JOIN segment_tag st_include ON f.segmentId = st_include.segmentId AND st_include.tagId IN (\(tagPlaceholders))"
+            tagJoinBindValues = tagIds
+        } else {
+            tagJoin = ""
+        }
+
+        // Tag exclude filter - use NOT EXISTS
+        if let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
+            let tagPlaceholders = excludedTagIds.map { _ in "?" }.joined(separator: ", ")
+            outerWhereConditions.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+            outerBindValues.append(contentsOf: excludedTagIds)
+        }
+
+        // Hidden filter
+        switch query.filters.hiddenFilter {
+        case .hide:
+            // Exclude hidden segments
+            if let hiddenTagId = cachedHiddenTagId {
+                outerWhereConditions.append("""
+                    NOT EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                outerBindValues.append(hiddenTagId)
+            }
+        case .onlyHidden:
+            // Only show hidden segments
+            if let hiddenTagId = cachedHiddenTagId {
+                outerWhereConditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                outerBindValues.append(hiddenTagId)
+            }
+        case .showAll:
+            // No filter needed - show both hidden and visible
+            break
+        }
+
         let outerWhereClause = outerWhereConditions.isEmpty ? "" : "WHERE " + outerWhereConditions.joined(separator: " AND ")
 
         // Subquery approach: FTS with bm25 FIRST (limited), then join and filter
         // No snippet() - it's expensive and not needed (we get text from OCR nodes)
+        // Tag include uses INNER JOIN (more efficient than EXISTS in WHERE clause)
         let sql = """
             SELECT
                 fts.docid,
@@ -1146,13 +2260,14 @@ public actor DataAdapter {
             JOIN doc_segment ds ON fts.docid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
             \(outerWhereClause)
             ORDER BY fts.rank
             LIMIT ? OFFSET ?
         """
 
         Log.info("[DataAdapter.searchRelevant] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
-        Log.info("[DataAdapter.searchRelevant] Binds: ftsQuery='\(ftsQuery)', outerFilters=\(outerBindValues), limit=\(relevanceLimit), offset=\(query.offset)", category: .app)
+        Log.info("[DataAdapter.searchRelevant] Binds: ftsQuery='\(ftsQuery)', tagJoinValues=\(tagJoinBindValues), outerFilters=\(outerBindValues), limit=\(relevanceLimit), offset=\(query.offset)", category: .app)
 
         guard let statement = try? connection.prepare(sql: sql) else {
             return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
@@ -1166,9 +2281,15 @@ public actor DataAdapter {
         bindIndex += 1
 
         // Bind inner LIMIT (for FTS subquery) - fetch more to account for filtering
-        let innerLimit = outerWhereConditions.isEmpty ? relevanceLimit : relevanceLimit * 10
+        let innerLimit = (outerWhereConditions.isEmpty && tagJoinBindValues.isEmpty) ? relevanceLimit : relevanceLimit * 10
         sqlite3_bind_int(statement, bindIndex, Int32(innerLimit))
         bindIndex += 1
+
+        // Bind tag INNER JOIN values (these come before WHERE clause values)
+        for tagId in tagJoinBindValues {
+            sqlite3_bind_int64(statement, bindIndex, tagId)
+            bindIndex += 1
+        }
 
         // Bind outer WHERE values
         for value in outerBindValues {
@@ -1254,6 +2375,7 @@ public actor DataAdapter {
             bindValues.append(config.formatDate(endDate))
         }
 
+        // App include filter
         let hasAppFilter = query.filters.appBundleIDs != nil && !query.filters.appBundleIDs!.isEmpty
         if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
             if appBundleIDs.count == 1 {
@@ -1268,13 +2390,88 @@ public actor DataAdapter {
             }
         }
 
+        // App exclude filter
+        if let excludedAppBundleIDs = query.filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
+            if excludedAppBundleIDs.count == 1 {
+                whereConditions.append("s.bundleID != ?")
+                bindValues.append(excludedAppBundleIDs[0])
+            } else {
+                let placeholders = excludedAppBundleIDs.map { _ in "?" }.joined(separator: ", ")
+                whereConditions.append("s.bundleID NOT IN (\(placeholders))")
+                bindValues.append(contentsOf: excludedAppBundleIDs)
+            }
+        }
+
+        // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
+        // When no tags selected, tagJoin is empty and no join happens
+        let hasTagIncludeFilter = query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
+        var tagJoinBindValues: [Int64] = []
+        let tagJoin: String
+        if let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
+            let tagPlaceholders = tagIds.map { _ in "?" }.joined(separator: ", ")
+            tagJoin = "INNER JOIN segment_tag st_include ON f.segmentId = st_include.segmentId AND st_include.tagId IN (\(tagPlaceholders))"
+            tagJoinBindValues = tagIds
+        } else {
+            tagJoin = ""
+        }
+
+        // Tag exclude filter - use NOT EXISTS
+        if let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
+            let tagPlaceholders = excludedTagIds.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+            bindValues.append(contentsOf: excludedTagIds)
+        }
+
+        // Hidden filter
+        switch query.filters.hiddenFilter {
+        case .hide:
+            // Exclude hidden segments
+            if let hiddenTagId = cachedHiddenTagId {
+                whereConditions.append("""
+                    NOT EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                bindValues.append(hiddenTagId)
+            }
+        case .onlyHidden:
+            // Only show hidden segments
+            if let hiddenTagId = cachedHiddenTagId {
+                whereConditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                bindValues.append(hiddenTagId)
+            }
+        case .showAll:
+            // No filter needed - show both hidden and visible
+            break
+        }
+
+        // Determine if we need the segment table join (for app filter or tag/hidden filters)
+        let hasTagFilters = hasTagIncludeFilter ||
+            (query.filters.excludedTagIds != nil && !query.filters.excludedTagIds!.isEmpty) ||
+            query.filters.hiddenFilter != .showAll
+
         let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
 
         // CTE MATERIALIZED approach: Force SQLite to compute FTS results first
         // Without MATERIALIZED, SQLite may inline the CTE and optimize it poorly
+        // Tag include uses INNER JOIN (more efficient than EXISTS in WHERE clause)
         let sql: String
-        if hasAppFilter {
-            // With app filter: CTE MATERIALIZED for FTS first, then join all tables and filter
+        if hasAppFilter || hasTagFilters {
+            // With app/tag filter: CTE MATERIALIZED for FTS first, then join all tables and filter
             sql = """
                 WITH fts_matches AS MATERIALIZED (
                     SELECT rowid as docid FROM searchRanking WHERE searchRanking MATCH ?
@@ -1289,12 +2486,13 @@ public actor DataAdapter {
                 JOIN doc_segment ds ON fts.docid = ds.docid
                 JOIN frame f ON ds.frameId = f.id
                 JOIN segment s ON f.segmentId = s.id
+                \(tagJoin)
                 \(whereClause)
                 ORDER BY f.createdAt DESC
                 LIMIT ? OFFSET ?
             """
         } else {
-            // No app filter: use IN subquery with limit (faster for no-filter case)
+            // No app/tag filter: use IN subquery with limit (faster for no-filter case)
             let ftsLimit = query.limit + query.offset + 200
             let filterClause = whereConditions.isEmpty ? "" : "AND " + whereConditions.joined(separator: " AND ")
             sql = """
@@ -1315,7 +2513,7 @@ public actor DataAdapter {
         }
 
         Log.info("[DataAdapter.searchAll] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
-        Log.info("[DataAdapter.searchAll] Binds: ftsQuery='\(ftsQuery)', bindValues=\(bindValues), limit=\(query.limit), offset=\(query.offset)", category: .app)
+        Log.info("[DataAdapter.searchAll] Binds: ftsQuery='\(ftsQuery)', tagJoinValues=\(tagJoinBindValues), bindValues=\(bindValues), limit=\(query.limit), offset=\(query.offset)", category: .app)
 
         guard let statement = try? connection.prepare(sql: sql) else {
             Log.error("[DataAdapter.searchAll] Failed to prepare SQL statement", category: .app)
@@ -1329,7 +2527,13 @@ public actor DataAdapter {
         sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
         bindIndex += 1
 
-        // Bind WHERE clause values (cutoff, date filters, app filter)
+        // Bind tag INNER JOIN values (these come before WHERE clause values)
+        for tagId in tagJoinBindValues {
+            sqlite3_bind_int64(statement, bindIndex, tagId)
+            bindIndex += 1
+        }
+
+        // Bind WHERE clause values (cutoff, date filters, app filter, exclude tags, hidden)
         for value in bindValues {
             if let stringValue = value as? String {
                 sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
@@ -1440,6 +2644,14 @@ public actor DataAdapter {
             }
 
         return words.joined(separator: " ")
+    }
+
+    /// Build SQL clause for app filtering (IN or NOT IN based on filter mode)
+    /// Returns the SQL clause like "s.bundleID IN (?, ?, ?)" or "s.bundleID NOT IN (?, ?, ?)"
+    private func buildAppFilterClause(apps: Set<String>, mode: AppFilterMode, tableAlias: String = "s") -> String {
+        let placeholders = apps.map { _ in "?" }.joined(separator: ", ")
+        let operator_ = mode == .include ? "IN" : "NOT IN"
+        return "\(tableAlias).bundleID \(operator_) (\(placeholders))"
     }
 
     private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {

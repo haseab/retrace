@@ -3,6 +3,12 @@ import Combine
 import Shared
 import App
 
+/// Lightweight struct for caching app info to disk
+private struct CachedAppInfo: Codable {
+    let bundleID: String
+    let name: String
+}
+
 /// ViewModel for the Search view
 /// Handles search queries, filtering, and result management with debouncing
 @MainActor
@@ -17,17 +23,28 @@ public class SearchViewModel: ObservableObject {
     @Published public var error: String?
 
     // Filters
-    @Published public var selectedAppFilter: String?
+    @Published public var selectedAppFilters: Set<String>?  // nil = all apps, empty set also means all apps
+    @Published public var appFilterMode: AppFilterMode = .include  // include or exclude selected apps
     @Published public var startDate: Date?
     @Published public var endDate: Date?
     @Published public var contentType: ContentType = .all
+    @Published public var selectedTags: Set<Int64>?  // nil = all tags
+    @Published public var tagFilterMode: TagFilterMode = .include  // include or exclude selected tags
+    @Published public var hiddenFilter: HiddenFilter = .hide  // How to handle hidden segments
+    @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
 
     // Search mode (tabs)
     @Published public var searchMode: SearchMode = .relevant
 
-    // Available apps for filter dropdown
-    @Published public var availableApps: [AppInfo] = []
+    // Available apps for filter dropdown (installed apps shown first, then "other" apps from DB)
+    @Published public var installedApps: [AppInfo] = []
+    @Published public var otherApps: [AppInfo] = []  // Apps from DB that aren't currently installed
     @Published public var isLoadingApps = false
+
+    /// Combined list: installed apps + other apps (for backwards compatibility)
+    public var availableApps: [AppInfo] {
+        installedApps + otherApps
+    }
 
     // Selected result
     @Published public var selectedResult: SearchResult?
@@ -47,6 +64,13 @@ public class SearchViewModel: ObservableObject {
     // The committed search query (set when user presses Enter)
     // Used for thumbnail cache keys so thumbnails don't reload while typing
     @Published public var committedSearchQuery: String = ""
+
+    // Dropdown state - tracks whether any filter dropdown is open
+    // Used by parent views to handle Escape key properly (dismiss dropdown first, then overlay)
+    @Published public var isDropdownOpen = false
+
+    // Signal to close all dropdowns - incremented when Escape is pressed while dropdown is open
+    @Published public var closeDropdownsSignal: Int = 0
 
     // Flag to prevent re-search during cache restore
     private var isRestoringFromCache = false
@@ -84,10 +108,23 @@ public class SearchViewModel: ObservableObject {
     /// Key for storing the cached search mode
     private static let cachedSearchModeKey = "search.cachedSearchMode"
     /// Cache version - increment when data structure changes to invalidate old caches
-    private static let searchCacheVersion = 2  // v2: Added filters
+    private static let searchCacheVersion = 3  // v3: Multi-select app filters
     private static let searchCacheVersionKey = "search.cacheVersion"
     /// How long the cached search results remain valid (2 minutes)
     private static let searchCacheExpirationSeconds: TimeInterval = 120
+
+    // MARK: - Other Apps Cache (for uninstalled apps from DB)
+
+    /// Key for storing when the other apps cache was last refreshed
+    private static let otherAppsCacheSavedAtKey = "search.otherAppsCacheSavedAt"
+    /// How long the other apps cache remains valid (24 hours)
+    private static let otherAppsCacheExpirationSeconds: TimeInterval = 24 * 60 * 60
+
+    /// File path for cached other apps data
+    private static nonisolated var cachedOtherAppsPath: URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        return cacheDir.appendingPathComponent("other_apps_cache.json")
+    }
 
     /// File path for cached search results data
     private static nonisolated var cachedSearchResultsPath: URL {
@@ -122,12 +159,14 @@ public class SearchViewModel: ObservableObject {
             .store(in: &cancellables)
 
         // Re-search when filters change (skip during cache restore)
+        // Use CombineLatest to watch all filter properties
         Publishers.CombineLatest4(
-            $selectedAppFilter,
+            $selectedAppFilters,
             $startDate,
             $endDate,
             $contentType
         )
+        .combineLatest($selectedTags, $hiddenFilter)
         .dropFirst()  // Skip initial values
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -212,11 +251,49 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func buildSearchQuery(_ text: String, offset: Int = 0) -> SearchQuery {
+        // Convert Set to Array for the filter, nil if no apps selected (means all apps)
+        // Use appBundleIDs for include mode, excludedAppBundleIDs for exclude mode
+        let appBundleIDsArray: [String]?
+        let excludedAppBundleIDsArray: [String]?
+
+        if let apps = selectedAppFilters, !apps.isEmpty {
+            if appFilterMode == .include {
+                appBundleIDsArray = Array(apps)
+                excludedAppBundleIDsArray = nil
+            } else {
+                appBundleIDsArray = nil
+                excludedAppBundleIDsArray = Array(apps)
+            }
+        } else {
+            appBundleIDsArray = nil
+            excludedAppBundleIDsArray = nil
+        }
+
+        // Convert tag Set to Array, similar to apps
+        let selectedTagIdsArray: [Int64]?
+        let excludedTagIdsArray: [Int64]?
+
+        if let tags = selectedTags, !tags.isEmpty {
+            if tagFilterMode == .include {
+                selectedTagIdsArray = Array(tags)
+                excludedTagIdsArray = nil
+            } else {
+                selectedTagIdsArray = nil
+                excludedTagIdsArray = Array(tags)
+            }
+        } else {
+            selectedTagIdsArray = nil
+            excludedTagIdsArray = nil
+        }
+
         let filters = SearchFilters(
             startDate: startDate,
             endDate: endDate,
-            appBundleIDs: selectedAppFilter != nil ? [selectedAppFilter!] : nil,
-            excludedAppBundleIDs: nil
+            appBundleIDs: appBundleIDsArray,
+            excludedAppBundleIDs: excludedAppBundleIDsArray,
+            selectedTagIds: selectedTagIdsArray,
+            excludedTagIds: excludedTagIdsArray,
+            hiddenFilter: hiddenFilter
         )
 
         return SearchQuery(
@@ -303,22 +380,156 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Filters
 
     /// Load available apps for the filter dropdown
+    /// Phase 1: Instantly load installed apps from /Applications (synchronous)
+    /// Phase 2: Load "other" apps from cache (instant) or DB if cache expired
     public func loadAvailableApps() async {
-        guard !isLoadingApps else { return }
+        guard !isLoadingApps else {
+            Log.debug("[SearchViewModel] loadAvailableApps skipped - already loading", category: .ui)
+            return
+        }
+
+        // Skip if already loaded
+        guard installedApps.isEmpty else {
+            Log.debug("[SearchViewModel] loadAvailableApps skipped - already have \(installedApps.count) installed + \(otherApps.count) other apps", category: .ui)
+            return
+        }
 
         isLoadingApps = true
-        do {
-            let apps = try await coordinator.getDistinctApps()
-            availableApps = apps
-            Log.info("[SearchViewModel] Loaded \(apps.count) apps for filter", category: .ui)
-        } catch {
-            Log.error("[SearchViewModel] Failed to load apps: \(error)", category: .ui)
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        // Phase 1: Instant - get installed apps from /Applications folder
+        let installed = AppNameResolver.shared.getInstalledApps()
+        let installedBundleIDs = Set(installed.map { $0.bundleID })
+        installedApps = installed.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        Log.info("[SearchViewModel] Phase 1: Loaded \(installedApps.count) installed apps in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
+
+        // Phase 2: Load "other apps" from cache first (instant), refresh from DB if stale
+        let cacheStartTime = CFAbsoluteTimeGetCurrent()
+        let (cachedApps, cacheIsStale) = loadOtherAppsFromCache(installedBundleIDs: installedBundleIDs)
+
+        if !cachedApps.isEmpty {
+            otherApps = cachedApps
+            Log.info("[SearchViewModel] Phase 2: Loaded \(otherApps.count) other apps from cache in \(Int((CFAbsoluteTimeGetCurrent() - cacheStartTime) * 1000))ms (stale: \(cacheIsStale))", category: .ui)
         }
+
+        // If cache is stale or empty, refresh from DB in background
+        if cacheIsStale || cachedApps.isEmpty {
+            Task.detached { [weak self] in
+                await self?.refreshOtherAppsFromDB(installedBundleIDs: installedBundleIDs)
+            }
+        }
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+        Log.info("[SearchViewModel] Total: \(installedApps.count) installed + \(otherApps.count) other apps in \(Int(totalTime * 1000))ms", category: .ui)
         isLoadingApps = false
     }
 
+    // MARK: - Other Apps Cache
+
+    /// Load other apps from disk cache
+    /// Returns (apps, isStale) - apps may be empty if no cache exists
+    private func loadOtherAppsFromCache(installedBundleIDs: Set<String>) -> ([AppInfo], Bool) {
+        // Check if cache exists and is not expired
+        let savedAt = UserDefaults.standard.double(forKey: Self.otherAppsCacheSavedAtKey)
+        let now = Date().timeIntervalSince1970
+        let isStale = savedAt == 0 || (now - savedAt) > Self.otherAppsCacheExpirationSeconds
+
+        // Try to load from disk
+        guard FileManager.default.fileExists(atPath: Self.cachedOtherAppsPath.path) else {
+            return ([], true)
+        }
+
+        do {
+            let data = try Data(contentsOf: Self.cachedOtherAppsPath)
+            let allCachedApps = try JSONDecoder().decode([CachedAppInfo].self, from: data)
+
+            // Filter out apps that are now installed, and resolve names fresh via AppNameResolver
+            // (don't use cached names - they may be stale)
+            let uninstalledBundleIDs = allCachedApps
+                .map { $0.bundleID }
+                .filter { !installedBundleIDs.contains($0) }
+            let uninstalledApps = AppNameResolver.shared.resolveAll(bundleIDs: uninstalledBundleIDs)
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+            return (uninstalledApps, isStale)
+        } catch {
+            Log.error("[SearchViewModel] Failed to load other apps cache: \(error)", category: .ui)
+            return ([], true)
+        }
+    }
+
+    /// Refresh other apps from DB and save to cache (runs in background)
+    private func refreshOtherAppsFromDB(installedBundleIDs: Set<String>) async {
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        do {
+            let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
+            let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+
+            // Filter to only apps that aren't currently installed
+            let uninstalledApps = dbApps
+                .filter { !installedBundleIDs.contains($0.bundleID) }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+            // Update UI on main thread
+            await MainActor.run {
+                self.otherApps = uninstalledApps
+            }
+
+            // Save ALL apps from DB to cache (not just uninstalled - we filter on load)
+            // This way if an app gets uninstalled later, it will appear in "Other Apps"
+            saveOtherAppsToCache(dbApps)
+
+            Log.info("[SearchViewModel] Refreshed \(uninstalledApps.count) other apps from DB in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
+        } catch {
+            Log.error("[SearchViewModel] Failed to refresh other apps from DB: \(error)", category: .ui)
+        }
+    }
+
+    /// Save apps to disk cache
+    private func saveOtherAppsToCache(_ apps: [AppInfo]) {
+        do {
+            let cachedApps = apps.map { CachedAppInfo(bundleID: $0.bundleID, name: $0.name) }
+            let data = try JSONEncoder().encode(cachedApps)
+            try data.write(to: Self.cachedOtherAppsPath, options: .atomic)
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.otherAppsCacheSavedAtKey)
+            Log.debug("[SearchViewModel] Saved \(apps.count) apps to other apps cache", category: .ui)
+        } catch {
+            Log.error("[SearchViewModel] Failed to save other apps cache: \(error)", category: .ui)
+        }
+    }
+
+    /// Toggle an app in the filter - if bundleID is nil, clears all app filters
+    public func toggleAppFilter(_ bundleID: String?) {
+        guard let bundleID = bundleID else {
+            // Clear all app filters (select "All Apps")
+            selectedAppFilters = nil
+            return
+        }
+
+        if selectedAppFilters == nil {
+            // Currently showing all apps - start a new selection with just this app
+            selectedAppFilters = [bundleID]
+        } else if selectedAppFilters!.contains(bundleID) {
+            // Remove this app from selection
+            selectedAppFilters!.remove(bundleID)
+            // If no apps left, go back to "all apps"
+            if selectedAppFilters!.isEmpty {
+                selectedAppFilters = nil
+            }
+        } else {
+            // Add this app to selection
+            selectedAppFilters!.insert(bundleID)
+        }
+    }
+
+    /// Legacy single-select method for backward compatibility
     public func setAppFilter(_ appBundleID: String?) {
-        selectedAppFilter = appBundleID
+        if let bundleID = appBundleID {
+            selectedAppFilters = [bundleID]
+        } else {
+            selectedAppFilters = nil
+        }
     }
 
     public func setDateRange(start: Date?, end: Date?) {
@@ -331,21 +542,88 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func clearAllFilters() {
-        selectedAppFilter = nil
+        selectedAppFilters = nil
+        appFilterMode = .include
         startDate = nil
         endDate = nil
         contentType = .all
+        selectedTags = nil
+        tagFilterMode = .include
+        hiddenFilter = .hide
+    }
+
+    /// Set app filter mode (include/exclude)
+    public func setAppFilterMode(_ mode: AppFilterMode) {
+        appFilterMode = mode
+    }
+
+    // MARK: - Tag Filters
+
+    /// Load available tags for the filter dropdown
+    public func loadAvailableTags() async {
+        do {
+            let tags = try await coordinator.getAllTags()
+            await MainActor.run {
+                self.availableTags = tags
+            }
+            Log.debug("[SearchViewModel] Loaded \(tags.count) tags for filter", category: .ui)
+        } catch {
+            Log.error("[SearchViewModel] Failed to load tags: \(error)", category: .ui)
+        }
+    }
+
+    /// Toggle a tag in the filter - if tagId is nil, clears all tag filters
+    public func toggleTagFilter(_ tagId: TagID?) {
+        guard let tagId = tagId else {
+            // Clear all tag filters (select "All Tags")
+            selectedTags = nil
+            return
+        }
+
+        let tagIdValue = tagId.value
+        if selectedTags == nil {
+            // Currently showing all tags - start a new selection with just this tag
+            selectedTags = [tagIdValue]
+        } else if selectedTags!.contains(tagIdValue) {
+            // Remove this tag from selection
+            selectedTags!.remove(tagIdValue)
+            // If no tags left, go back to "all tags"
+            if selectedTags!.isEmpty {
+                selectedTags = nil
+            }
+        } else {
+            // Add this tag to selection
+            selectedTags!.insert(tagIdValue)
+        }
+    }
+
+    /// Set tag filter mode (include/exclude)
+    public func setTagFilterMode(_ mode: TagFilterMode) {
+        tagFilterMode = mode
+    }
+
+    /// Set hidden filter mode
+    public func setHiddenFilter(_ filter: HiddenFilter) {
+        hiddenFilter = filter
     }
 
     /// Check if any filters are active
     public var hasActiveFilters: Bool {
-        selectedAppFilter != nil || startDate != nil || endDate != nil
+        (selectedAppFilters != nil && !selectedAppFilters!.isEmpty) ||
+        startDate != nil || endDate != nil ||
+        (selectedTags != nil && !selectedTags!.isEmpty) ||
+        hiddenFilter != .hide
     }
 
-    /// Get the display name for the selected app filter
+    /// Get the display name for the selected app filter(s)
     public var selectedAppName: String? {
-        guard let bundleID = selectedAppFilter else { return nil }
-        return availableApps.first(where: { $0.bundleID == bundleID })?.name ?? bundleID.components(separatedBy: ".").last
+        guard let apps = selectedAppFilters, !apps.isEmpty else { return nil }
+        if apps.count == 1 {
+            let bundleID = apps.first!
+            return availableApps.first(where: { $0.bundleID == bundleID })?.name ?? bundleID.components(separatedBy: ".").last
+        } else {
+            return "\(apps.count) Apps"
+        }
     }
 
     // MARK: - Navigation
@@ -375,10 +653,12 @@ public class SearchViewModel: ObservableObject {
     // MARK: - Sharing
 
     public func generateShareLink(for result: SearchResult) -> URL? {
-        DeeplinkHandler.generateSearchLink(
+        // For share links, use the first selected app if any
+        let appBundleID = selectedAppFilters?.first
+        return DeeplinkHandler.generateSearchLink(
             query: searchQuery,
             timestamp: result.timestamp,
-            appBundleID: selectedAppFilter
+            appBundleID: appBundleID
         )
     }
 
@@ -428,8 +708,12 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.set(Self.searchCacheVersion, forKey: Self.searchCacheVersionKey)
         Log.debug("[SearchCache] Saved version=\(Self.searchCacheVersion) to key='\(Self.searchCacheVersionKey)'", category: .ui)
 
-        // Save filters
-        UserDefaults.standard.set(selectedAppFilter, forKey: Self.cachedAppFilterKey)
+        // Save filters - convert Set to Array for storage
+        if let apps = selectedAppFilters, !apps.isEmpty {
+            UserDefaults.standard.set(Array(apps), forKey: Self.cachedAppFilterKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedAppFilterKey)
+        }
         if let startDate = startDate {
             UserDefaults.standard.set(startDate.timeIntervalSince1970, forKey: Self.cachedStartDateKey)
         } else {
@@ -497,8 +781,12 @@ public class SearchViewModel: ObservableObject {
         // Load cached scroll position
         let cachedScrollPosition = UserDefaults.standard.double(forKey: Self.cachedScrollPositionKey)
 
-        // Load cached filters
-        let cachedAppFilter = UserDefaults.standard.string(forKey: Self.cachedAppFilterKey)
+        // Load cached filters - convert Array back to Set
+        let cachedAppFilters: Set<String>? = if let apps = UserDefaults.standard.stringArray(forKey: Self.cachedAppFilterKey), !apps.isEmpty {
+            Set(apps)
+        } else {
+            nil
+        }
         let cachedStartDateValue = UserDefaults.standard.double(forKey: Self.cachedStartDateKey)
         let cachedEndDateValue = UserDefaults.standard.double(forKey: Self.cachedEndDateKey)
         let cachedContentTypeRaw = UserDefaults.standard.string(forKey: Self.cachedContentTypeKey)
@@ -524,7 +812,7 @@ public class SearchViewModel: ObservableObject {
             searchGeneration += 1
 
             // Restore filters
-            selectedAppFilter = cachedAppFilter
+            selectedAppFilters = cachedAppFilters
             startDate = cachedStartDateValue > 0 ? Date(timeIntervalSince1970: cachedStartDateValue) : nil
             endDate = cachedEndDateValue > 0 ? Date(timeIntervalSince1970: cachedEndDateValue) : nil
             if let rawValue = cachedContentTypeRaw, let type = ContentType(rawValue: rawValue) {

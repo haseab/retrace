@@ -57,10 +57,10 @@ public struct ResultRow: View {
                     Text(result.source == .native ? "Retrace" : "Rewind")
                         .font(.retraceCaption2)
                         .fontWeight(.medium)
-                        .foregroundColor(result.source == .native ? .blue : .purple)
+                        .foregroundColor(result.source == .native ? RetraceMenuStyle.actionBlue : .purple)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(result.source == .native ? Color.blue.opacity(0.15) : Color.purple.opacity(0.15))
+                        .background(result.source == .native ? RetraceMenuStyle.actionBlue.opacity(0.15) : Color.purple.opacity(0.15))
                         .cornerRadius(4)
 
                     Spacer()

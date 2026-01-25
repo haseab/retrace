@@ -89,7 +89,8 @@ actor MigrationRunner {
         // New migrations should be added to this array
         [
             V1_InitialSchema(),
-            V2_UnfinalisedVideoTracking()
+            V2_UnfinalisedVideoTracking(),
+            V3_TagSystem()
         ]
     }
 

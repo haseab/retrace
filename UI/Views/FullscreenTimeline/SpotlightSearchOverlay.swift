@@ -5,7 +5,7 @@ import App
 private let searchLog = "[SpotlightSearch]"
 
 /// Spotlight-style search overlay that appears center-screen
-/// Triggered by Cmd+K or search icon click
+/// Triggered by Cmd+F or search icon click
 public struct SpotlightSearchOverlay: View {
 
     // MARK: - Properties
@@ -48,11 +48,15 @@ public struct SpotlightSearchOverlay: View {
 
     public var body: some View {
         ZStack {
-            // Backdrop
+            // Backdrop - also dismisses dropdowns if open
             Color.black.opacity(isVisible ? 0.6 : 0)
                 .ignoresSafeArea()
                 .onTapGesture {
-                    dismissOverlay()
+                    if viewModel.isDropdownOpen {
+                        viewModel.closeDropdownsSignal += 1
+                    } else {
+                        dismissOverlay()
+                    }
                 }
 
             // Search panel
@@ -62,30 +66,64 @@ public struct SpotlightSearchOverlay: View {
                 Divider()
                     .background(Color.white.opacity(0.1))
 
-                // Filter bar
-                SearchFilterBar(viewModel: viewModel)
+                // Filter bar and results in a ZStack so dropdowns can overlay results
+                ZStack(alignment: .top) {
+                    // Results area (bottom layer)
+                    VStack(spacing: 0) {
+                        // Spacer for the filter bar height (chips ~40px + vertical padding 24px = ~64px)
+                        Color.clear
+                            .frame(height: 56)
 
-                if hasResults {
-                    Divider()
-                        .background(Color.white.opacity(0.1))
+                        if hasResults {
+                            let _ = print("[SpotlightSearchOverlay] Rendering results area (zIndex=0)")
+                            // Small gap before divider to maintain visual spacing below filter bar
+                            Color.clear.frame(height: 4)
 
-                    resultsArea
+                            Divider()
+                                .background(Color.white.opacity(0.1))
+
+                            resultsArea
+                        }
+                    }
+                    .zIndex(0)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        // Dismiss dropdown when tapping on results area
+                        if viewModel.isDropdownOpen {
+                            viewModel.closeDropdownsSignal += 1
+                        }
+                    }
+                    .background(GeometryReader { geo in
+                        Color.clear.onAppear {
+                            print("[SpotlightSearchOverlay] Results VStack frame: \(geo.frame(in: .global))")
+                        }
+                    })
+
+                    // Filter bar (top layer, dropdowns will be above results)
+                    VStack(spacing: 0) {
+                        let _ = print("[SpotlightSearchOverlay] Rendering filter bar (zIndex=100)")
+                        SearchFilterBar(viewModel: viewModel)
+                    }
+                    .zIndex(100)
+                    .background(GeometryReader { geo in
+                        Color.clear.onAppear {
+                            print("[SpotlightSearchOverlay] FilterBar VStack frame: \(geo.frame(in: .global))")
+                        }
+                    })
                 }
+                .background(GeometryReader { geo in
+                    Color.clear.onAppear {
+                        print("[SpotlightSearchOverlay] Inner ZStack frame: \(geo.frame(in: .global))")
+                    }
+                })
             }
             .frame(width: panelWidth)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Color(white: 0.12).opacity(0.95))
-                    .background(
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(.ultraThinMaterial)
-                    )
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.5), radius: 30, x: 0, y: 15)
+            .retraceMenuContainer(addPadding: false)
+            .background(GeometryReader { geo in
+                Color.clear.onAppear {
+                    print("[SpotlightSearchOverlay] Outer panel frame (after retraceMenuContainer): \(geo.frame(in: .global))")
+                }
+            })
             .scaleEffect(isVisible ? 1.0 : 0.95)
             .opacity(isVisible ? 1.0 : 0)
         }
@@ -97,6 +135,10 @@ public struct SpotlightSearchOverlay: View {
             // Focus the search field immediately
             isSearchFocused = true
         }
+        .task {
+            // Preload available apps in background so they're ready when user clicks the filter
+            await viewModel.loadAvailableApps()
+        }
         .onChange(of: isVisible) { visible in
             // Ensure focus when overlay becomes visible
             if visible {
@@ -104,8 +146,13 @@ public struct SpotlightSearchOverlay: View {
             }
         }
         .onExitCommand {
-            Log.debug("\(searchLog) Exit command received", category: .ui)
-            dismissOverlay()
+            Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen)", category: .ui)
+            // If a dropdown is open, close it instead of dismissing the entire overlay
+            if viewModel.isDropdownOpen {
+                viewModel.closeDropdownsSignal += 1
+            } else {
+                dismissOverlay()
+            }
         }
         .onChange(of: viewModel.searchQuery) { newValue in
             Log.debug("\(searchLog) Query changed to: '\(newValue)'", category: .ui)
@@ -141,6 +188,13 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.submitSearch()
                     }
                 }
+                .onChange(of: isSearchFocused) { focused in
+                    // Dismiss any open dropdowns when search field gains focus
+                    if focused && viewModel.isDropdownOpen {
+                        print("[SpotlightSearchOverlay] TextField focused, closing dropdowns")
+                        viewModel.closeDropdownsSignal += 1
+                    }
+                }
 
             // Clear button when there's text
             if !viewModel.searchQuery.isEmpty && !viewModel.isSearching {
@@ -169,7 +223,7 @@ public struct SpotlightSearchOverlay: View {
                 }) {
                     Image(systemName: "arrow.right.circle.fill")
                         .font(.retraceMediumNumber)
-                        .foregroundColor(viewModel.searchQuery.isEmpty ? .white.opacity(0.2) : .blue)
+                        .foregroundColor(viewModel.searchQuery.isEmpty ? .white.opacity(0.2) : RetraceMenuStyle.actionBlue)
                 }
                 .buttonStyle(.plain)
                 .disabled(viewModel.searchQuery.isEmpty)
@@ -315,7 +369,7 @@ public struct SpotlightSearchOverlay: View {
                 .foregroundColor(.white.opacity(0.5))
 
             // Show slow query alert when filtering by app with "All" mode
-            if viewModel.selectedAppFilter != nil && viewModel.searchMode == .all {
+            if viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty && viewModel.searchMode == .all {
                 HStack(spacing: 6) {
                     Image(systemName: "info.circle.fill")
                         .font(.retraceCaption2)
@@ -740,10 +794,10 @@ private struct GalleryResultCard: View {
                             // Source badge
                             Text(result.source == .native ? "Retrace" : "Rewind")
                                 .font(.retraceTinyBold)
-                                .foregroundColor(result.source == .native ? .blue : .purple)
+                                .foregroundColor(result.source == .native ? RetraceMenuStyle.actionBlue : .purple)
                                 .padding(.horizontal, 5)
                                 .padding(.vertical, 2)
-                                .background(result.source == .native ? Color.blue.opacity(0.2) : Color.purple.opacity(0.2))
+                                .background(result.source == .native ? RetraceMenuStyle.actionBlue.opacity(0.2) : Color.purple.opacity(0.2))
                                 .cornerRadius(3)
                         }
 

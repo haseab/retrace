@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Shared
 
 /// Treemap visualization for app usage - apps shown as blocks proportional to usage time
@@ -86,6 +87,11 @@ struct AppUsageHardDriveView: View {
         .shadow(color: isHovered ? appColor.opacity(0.4) : .clear, radius: 12, x: 0, y: 4)
         .zIndex(isHovered ? 100 : 0)
         .onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
             withAnimation(.easeInOut(duration: 0.15)) {
                 hoveredApp = hovering ? item.app : nil
             }

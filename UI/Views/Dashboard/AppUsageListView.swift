@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Shared
 
 /// List-style view for app usage data (traditional top 10 ranking)
@@ -93,6 +94,11 @@ struct AppUsageListView: View {
         )
         .contentShape(Rectangle())
         .onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
             withAnimation(.easeInOut(duration: 0.15)) {
                 hoveredAppIndex = hovering ? index : nil
             }

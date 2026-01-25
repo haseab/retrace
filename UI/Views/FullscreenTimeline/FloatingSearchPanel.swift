@@ -56,15 +56,7 @@ public struct FloatingSearchPanel: View {
             }
         }
         .frame(width: panelWidth)
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(Color.black.opacity(0.85))
-                .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 10)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(Color.white.opacity(0.1), lineWidth: 1)
-        )
+        .retraceMenuContainer(addPadding: false)
         .offset(dragOffset)
         .gesture(
             DragGesture()
@@ -166,10 +158,12 @@ public struct FloatingSearchPanel: View {
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
             }
         }
-        .padding(.horizontal, .spacingM)
-        .padding(.vertical, .spacingM)
-        .background(Color.white.opacity(0.1))
-        .cornerRadius(10)
+        .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
+        .padding(.vertical, RetraceMenuStyle.searchFieldPaddingV)
+        .background(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.searchFieldCornerRadius)
+                .fill(RetraceMenuStyle.searchFieldBackground)
+        )
         .padding(.horizontal, .spacingM)
         .padding(.bottom, .spacingS)
     }

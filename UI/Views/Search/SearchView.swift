@@ -23,7 +23,7 @@ public struct SearchView: View {
             // Search bar
             SearchBar(
                 searchQuery: $viewModel.searchQuery,
-                selectedApp: $viewModel.selectedAppFilter,
+                selectedApps: $viewModel.selectedAppFilters,
                 startDate: $viewModel.startDate,
                 endDate: $viewModel.endDate,
                 contentType: $viewModel.contentType
