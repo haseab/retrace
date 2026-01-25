@@ -86,6 +86,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var menuBarManager: MenuBarManager?
     private var coordinatorWrapper: AppCoordinatorWrapper?
+    private var sleepWakeObservers: [NSObjectProtocol] = []
+    private var wasRecordingBeforeSleep = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prompt user to move app to Applications folder if not already there
@@ -146,6 +148,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Configure the pause reminder window controller
             PauseReminderWindowController.shared.configure(coordinator: wrapper.coordinator)
 
+            // Setup sleep/wake observers to properly handle segment tracking
+            setupSleepWakeObservers()
+
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
 
             // Show dashboard on first launch
@@ -159,6 +164,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    // MARK: - Sleep/Wake Handling
+
+    private func setupSleepWakeObservers() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+
+        let sleepObserver = workspaceCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.handleSystemSleep()
+            }
+        }
+        sleepWakeObservers.append(sleepObserver)
+
+        let wakeObserver = workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.handleSystemWake()
+            }
+        }
+        sleepWakeObservers.append(wakeObserver)
+
+        Log.info("[AppDelegate] Sleep/wake observers registered", category: .app)
+    }
+
+    @MainActor
+    private func handleSystemSleep() async {
+        guard let wrapper = coordinatorWrapper else { return }
+
+        wasRecordingBeforeSleep = await wrapper.coordinator.isCapturing()
+
+        if wasRecordingBeforeSleep {
+            Log.info("[AppDelegate] System going to sleep - stopping pipeline to finalize current segment", category: .app)
+            do {
+                try await wrapper.coordinator.stopPipeline(persistState: false)
+            } catch {
+                Log.error("[AppDelegate] Failed to stop pipeline on sleep: \(error)", category: .app)
+            }
+        }
+    }
+
+    @MainActor
+    private func handleSystemWake() async {
+        guard let wrapper = coordinatorWrapper else { return }
+
+        if wasRecordingBeforeSleep {
+            Log.info("[AppDelegate] System woke from sleep - resuming pipeline", category: .app)
+            do {
+                try await wrapper.coordinator.startPipeline()
+                await wrapper.refreshStatus()
+            } catch {
+                Log.error("[AppDelegate] Failed to resume pipeline on wake: \(error)", category: .app)
+            }
+        }
     }
 
     // MARK: - Recording Control
@@ -198,7 +264,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Cleanup
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        for observer in sleepWakeObservers {
+            workspaceCenter.removeObserver(observer)
+        }
+        sleepWakeObservers.removeAll()
+
         Log.info("[AppDelegate] Application terminating", category: .app)
     }
 
