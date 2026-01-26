@@ -148,8 +148,7 @@ public struct ResultRow: View {
                 Rectangle()
                     .fill(Color.retraceCard)
 
-                ProgressView()
-                    .scaleEffect(0.5)
+                SpinnerView(size: 16, lineWidth: 2)
             }
         }
     }

@@ -1501,7 +1501,7 @@ public struct OnboardingView: View {
                     case .failure:
                         creatorPlaceholder
                     case .empty:
-                        ProgressView()
+                        SpinnerView(size: 20, lineWidth: 2)
                             .frame(width: 70, height: 70)
                     @unknown default:
                         creatorPlaceholder

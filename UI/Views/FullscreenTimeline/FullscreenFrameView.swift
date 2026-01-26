@@ -82,9 +82,7 @@ public struct FullscreenFrameView: View {
 
     private var loadingView: some View {
         VStack(spacing: .spacingL) {
-            ProgressView()
-                .scaleEffect(1.5)
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            SpinnerView(size: 32, lineWidth: 3, color: .white)
 
             Text("Loading frame...")
                 .font(.retraceBody)

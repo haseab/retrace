@@ -29,6 +29,9 @@ public actor AppCoordinator {
     // Segment tracking (app focus sessions - Rewind compatible)
     private var currentSegmentID: Int64?
 
+    // Idle detection - track last frame timestamp to detect gaps
+    private var lastFrameTimestamp: Date?
+
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
 
@@ -629,8 +632,11 @@ public actor AppCoordinator {
     }
 
     /// Track app/window changes and create/close segments accordingly
+    /// Also handles idle detection - if no frames for longer than idleThresholdSeconds,
+    /// closes the current segment and creates a new one on the next frame
     private func trackSessionChange(frame: CapturedFrame) async throws {
         let metadata = frame.metadata
+        let captureConfig = await services.capture.getConfig()
 
         // Get current segment if exists
         var currentSegment: Segment? = nil
@@ -642,10 +648,30 @@ public actor AppCoordinator {
         let appChanged = currentSegment?.bundleID != metadata.appBundleID
         let windowChanged = currentSegment?.windowName != metadata.windowName
 
-        if appChanged || windowChanged || currentSegment == nil {
+        // Check for idle gap - if time since last frame exceeds threshold, treat as idle
+        var idleDetected = false
+        if let lastTimestamp = lastFrameTimestamp,
+           captureConfig.idleThresholdSeconds > 0,
+           currentSegment != nil {
+            let timeSinceLastFrame = frame.timestamp.timeIntervalSince(lastTimestamp)
+            if timeSinceLastFrame > captureConfig.idleThresholdSeconds {
+                idleDetected = true
+                Log.info("Idle detected: \(Int(timeSinceLastFrame))s gap (threshold: \(Int(captureConfig.idleThresholdSeconds))s)", category: .app)
+            }
+        }
+
+        if appChanged || windowChanged || currentSegment == nil || idleDetected {
             // Close previous segment
             if let segID = currentSegmentID {
-                try await services.database.updateSegmentEndDate(id: segID, endDate: frame.timestamp)
+                // For idle detection, set end date to last frame timestamp + a small buffer
+                // This prevents the segment from appearing to span the idle period
+                let segmentEndDate: Date
+                if idleDetected, let lastTimestamp = lastFrameTimestamp {
+                    segmentEndDate = lastTimestamp
+                } else {
+                    segmentEndDate = frame.timestamp
+                }
+                try await services.database.updateSegmentEndDate(id: segID, endDate: segmentEndDate)
                 Log.debug("Closed segment: \(currentSegment?.bundleID ?? "unknown") - \(currentSegment?.windowName ?? "nil")", category: .app)
             }
 
@@ -662,6 +688,9 @@ public actor AppCoordinator {
             currentSegmentID = newSegmentID
             Log.debug("Started segment: \(metadata.appBundleID ?? "unknown") - \(metadata.windowName ?? "nil")", category: .app)
         }
+
+        // Update last frame timestamp for idle detection
+        lastFrameTimestamp = frame.timestamp
     }
 
     /// Audio pipeline: AudioCapture → AudioProcessing (whisper.cpp) → Database
@@ -909,6 +938,45 @@ public actor AppCoordinator {
             limit: limit,
             offset: offset
         )
+    }
+
+    /// Get segments filtered by bundle ID, time range, and window name or domain with pagination
+    /// For browsers, filters by domain extracted from browserUrl; for other apps, filters by windowName
+    public func getSegments(
+        bundleID: String,
+        windowNameOrDomain: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) async throws -> [Segment] {
+        try await services.database.getSegments(
+            bundleID: bundleID,
+            windowNameOrDomain: windowNameOrDomain,
+            from: startDate,
+            to: endDate,
+            limit: limit,
+            offset: offset
+        )
+    }
+
+    /// Get aggregated app usage stats (duration and unique window/domain count) for a time range
+    /// For browsers, counts unique domains; for other apps, counts unique windowNames
+    public func getAppUsageStats(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
+        try await services.database.getAppUsageStats(from: startDate, to: endDate)
+    }
+
+    /// Get window usage aggregated by windowName for a specific app
+    /// Returns windows sorted by duration descending
+    public func getWindowUsageForApp(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, duration: TimeInterval)] {
+        try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate)
     }
 
     // MARK: - Tag Operations
@@ -1164,6 +1232,11 @@ public actor AppCoordinator {
         try await services.storage.getTotalStorageUsed()
     }
 
+    /// Get storage used for a specific date range
+    public func getStorageUsedForDateRange(from startDate: Date, to endDate: Date) async throws -> Int64 {
+        try await services.storage.getStorageUsedForDateRange(from: startDate, to: endDate)
+    }
+
     /// Get total captured duration across all Retrace segments in seconds
     /// Only counts time captured by Retrace (excludes imported Rewind data)
     public func getTotalCapturedDuration() async throws -> TimeInterval {
@@ -1178,6 +1251,47 @@ public actor AppCoordinator {
     /// Get distinct hours for a specific date that have frames
     public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
         try await services.database.getDistinctHoursForDate(date)
+    }
+
+    // MARK: - Daily Metrics
+
+    /// Record a single metric event (timeline open, search, text copy)
+    public func recordMetricEvent(
+        metricType: DailyMetricsQueries.MetricType,
+        timestamp: Date = Date(),
+        metadata: String? = nil
+    ) async throws {
+        try await services.database.recordMetricEvent(
+            metricType: metricType,
+            timestamp: timestamp,
+            metadata: metadata
+        )
+    }
+
+    /// Get daily counts for a metric type (for 7-day graphs)
+    /// Returns array of (date, count) tuples sorted by date ascending
+    public func getDailyMetrics(
+        metricType: DailyMetricsQueries.MetricType,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        try await services.database.getDailyMetrics(
+            metricType: metricType,
+            from: startDate,
+            to: endDate
+        )
+    }
+
+    /// Get daily screen time totals (for 7-day graphs)
+    /// Returns array of (date, totalSeconds) tuples sorted by date ascending
+    public func getDailyScreenTime(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        try await services.database.getDailyScreenTime(
+            from: startDate,
+            to: endDate
+        )
     }
 
     // MARK: - Statistics & Monitoring

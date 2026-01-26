@@ -638,6 +638,51 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    /// Get segments filtered by bundle ID, time range, and window name or domain
+    /// For browsers, filters by domain extracted from browserUrl; for other apps, filters by windowName
+    public func getSegments(
+        bundleID: String,
+        windowNameOrDomain: String,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        offset: Int
+    ) async throws -> [Segment] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getByBundleIDAndWindowName(
+            db: db,
+            bundleID: bundleID,
+            windowNameOrDomain: windowNameOrDomain,
+            from: startDate,
+            to: endDate,
+            limit: limit,
+            offset: offset
+        )
+    }
+
+    public func getAppUsageStats(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getAppUsageStats(db: db, from: startDate, to: endDate)
+    }
+
+    public func getWindowUsageForApp(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, duration: TimeInterval)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getWindowUsageForApp(db: db, bundleID: bundleID, from: startDate, to: endDate)
+    }
+
     public func deleteSegment(id: Int64) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -1001,6 +1046,76 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FTSQueries.deleteForFrame(db: db, frameId: frameId)
+    }
+
+    // MARK: - Daily Metrics Operations
+
+    /// Record a single metric event (timeline open, search, text copy)
+    public func recordMetricEvent(
+        metricType: DailyMetricsQueries.MetricType,
+        timestamp: Date = Date(),
+        metadata: String? = nil
+    ) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try DailyMetricsQueries.recordEvent(
+            db: db,
+            metricType: metricType,
+            timestamp: timestamp,
+            metadata: metadata
+        )
+    }
+
+    /// Get daily counts for a metric type (for graphs)
+    /// Returns array of (date, count) tuples sorted by date ascending
+    public func getDailyMetrics(
+        metricType: DailyMetricsQueries.MetricType,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DailyMetricsQueries.getDailyCounts(
+            db: db,
+            metricType: metricType,
+            from: startDate,
+            to: endDate
+        )
+    }
+
+    /// Get total count of a metric over a date range
+    public func getDailyMetricCount(
+        metricType: DailyMetricsQueries.MetricType,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> Int64 {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DailyMetricsQueries.getTotalCount(
+            db: db,
+            metricType: metricType,
+            from: startDate,
+            to: endDate
+        )
+    }
+
+    /// Get daily screen time totals (for graphs)
+    /// Returns array of (date, totalSeconds) tuples sorted by date ascending
+    public func getDailyScreenTime(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getDailyScreenTime(
+            db: db,
+            from: startDate,
+            to: endDate
+        )
     }
 
     // MARK: - Statistics

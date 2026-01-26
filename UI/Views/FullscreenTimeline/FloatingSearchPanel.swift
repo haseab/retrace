@@ -153,9 +153,7 @@ public struct FloatingSearchPanel: View {
             }
 
             if viewModel.isSearching {
-                ProgressView()
-                    .scaleEffect(0.7)
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                SpinnerView(size: 14, lineWidth: 2, color: .white)
             }
         }
         .padding(.horizontal, RetraceMenuStyle.searchFieldPaddingH)
@@ -267,8 +265,7 @@ public struct FloatingSearchPanel: View {
 
     private var searchingView: some View {
         VStack(spacing: .spacingM) {
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            SpinnerView(size: 24, lineWidth: 2, color: .white)
 
             Text("Searching...")
                 .font(.retraceCallout)

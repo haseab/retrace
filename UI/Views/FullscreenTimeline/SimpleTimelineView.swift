@@ -432,9 +432,7 @@ public struct SimpleTimelineView: View {
 
     private var loadingOverlay: some View {
         VStack(spacing: .spacingM) {
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                .scaleEffect(1.5)
+            SpinnerView(size: 32, lineWidth: 3, color: .white)
             Text("Loading...")
                 .font(.retraceBody)
                 .foregroundColor(.white.opacity(0.7))

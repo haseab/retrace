@@ -2144,9 +2144,7 @@ private struct QuickDeleteButton: View {
         Button(action: action) {
             Group {
                 if isThisDeleting {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.retraceDanger)
+                    SpinnerView(size: 14, lineWidth: 2, color: .retraceDanger)
                 } else {
                     Text(title)
                         .font(.retraceCaptionMedium)

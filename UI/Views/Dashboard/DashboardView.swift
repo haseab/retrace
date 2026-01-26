@@ -2,6 +2,145 @@ import SwiftUI
 import Shared
 import App
 
+// MARK: - Layout Size
+
+/// Responsive layout sizes for dashboard stat cards
+/// Scales up progressively as screen width increases
+private enum LayoutSize {
+    case normal      // < 1100px
+    case large       // 1100-1400px
+    case extraLarge  // 1400-1700px
+    case massive     // > 1700px
+
+    static func from(width: CGFloat) -> LayoutSize {
+        if width > 1700 {
+            return .massive
+        } else if width > 1400 {
+            return .extraLarge
+        } else if width > 1100 {
+            return .large
+        } else {
+            return .normal
+        }
+    }
+
+    // MARK: - Card Dimensions
+
+    var cardWidth: CGFloat {
+        switch self {
+        case .normal: return 280
+        case .large: return 340
+        case .extraLarge: return 400
+        case .massive: return 460
+        }
+    }
+
+    var graphHeight: CGFloat {
+        switch self {
+        case .normal: return 77
+        case .large: return 100
+        case .extraLarge: return 120
+        case .massive: return 140
+        }
+    }
+
+    // MARK: - Icon Sizes
+
+    var iconCircleSize: CGFloat {
+        switch self {
+        case .normal: return 44
+        case .large: return 52
+        case .extraLarge: return 60
+        case .massive: return 68
+        }
+    }
+
+    var iconFont: Font {
+        switch self {
+        case .normal: return .retraceHeadline
+        case .large: return .system(size: 20, weight: .semibold)
+        case .extraLarge: return .system(size: 24, weight: .semibold)
+        case .massive: return .system(size: 28, weight: .semibold)
+        }
+    }
+
+    // MARK: - Text Fonts
+
+    var titleFont: Font {
+        switch self {
+        case .normal: return .retraceCaption2Medium
+        case .large: return .retraceCaptionMedium
+        case .extraLarge: return .retraceCalloutMedium
+        case .massive: return .retraceBodyMedium
+        }
+    }
+
+    var valueFont: Font {
+        switch self {
+        case .normal: return .retraceMediumNumber
+        case .large: return .system(size: 28, weight: .bold, design: .rounded)
+        case .extraLarge: return .system(size: 34, weight: .bold, design: .rounded)
+        case .massive: return .system(size: 40, weight: .bold, design: .rounded)
+        }
+    }
+
+    var subtitleFont: Font {
+        switch self {
+        case .normal: return .retraceCaption2Medium
+        case .large: return .retraceCaptionMedium
+        case .extraLarge: return .retraceCalloutMedium
+        case .massive: return .retraceBodyMedium
+        }
+    }
+
+    // MARK: - Spacing & Padding
+
+    var iconSpacing: CGFloat {
+        switch self {
+        case .normal: return 14
+        case .large: return 16
+        case .extraLarge: return 18
+        case .massive: return 20
+        }
+    }
+
+    var textSpacing: CGFloat {
+        switch self {
+        case .normal: return 2
+        case .large: return 3
+        case .extraLarge: return 4
+        case .massive: return 5
+        }
+    }
+
+    var cardPadding: CGFloat {
+        switch self {
+        case .normal: return 16
+        case .large: return 20
+        case .extraLarge: return 24
+        case .massive: return 28
+        }
+    }
+
+    var graphHorizontalPadding: CGFloat {
+        switch self {
+        case .normal: return 12
+        case .large: return 16
+        case .extraLarge: return 20
+        case .massive: return 24
+        }
+    }
+
+    var graphBottomPadding: CGFloat {
+        switch self {
+        case .normal: return 8
+        case .large: return 12
+        case .extraLarge: return 16
+        case .massive: return 20
+        }
+    }
+}
+
 /// Main dashboard view - analytics and statistics
 /// Default landing screen
 public struct DashboardView: View {
@@ -15,6 +154,7 @@ public struct DashboardView: View {
     @State private var showFeedbackSheet = false
     @State private var usageViewMode: AppUsageViewMode = Self.loadSavedViewMode()
     @State private var selectedApp: AppUsageData? = nil
+    @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
 
     enum AppUsageViewMode: String, CaseIterable {
@@ -58,77 +198,103 @@ public struct DashboardView: View {
     // MARK: - Body
 
     public var body: some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                // Accessibility permission warning banner
-                if viewModel.showAccessibilityWarning {
-                    PermissionBanner(
-                        message: "Retrace needs Accessibility permission to detect display changes and exclude private/incognito windows and excluded apps.",
-                        actionTitle: "Open Settings",
-                        action: {
-                            SystemSettingsOpener.openAccessibilitySettings()
-                        },
-                        onDismiss: {
-                            viewModel.dismissAccessibilityWarning()
-                        }
-                    )
-                    .padding(.horizontal, 32)
-                    .padding(.top, 20)
-                }
-
-                // Screen recording permission warning banner
-                if viewModel.showScreenRecordingWarning {
-                    PermissionBanner(
-                        message: "Retrace needs Screen Recording permission to capture your screen.",
-                        actionTitle: "Open Settings",
-                        action: {
-                            SystemSettingsOpener.openScreenRecordingSettings()
-                        },
-                        onDismiss: {
-                            viewModel.dismissScreenRecordingWarning()
-                        }
-                    )
-                    .padding(.horizontal, 32)
-                    .padding(.top, viewModel.showAccessibilityWarning ? 12 : 20)
-                }
-
-                // Launch on login reminder banner
-                if launchOnLoginReminderManager.shouldShowReminder {
-                    PermissionBanner(
-                        message: "Retrace works best when it launches automatically on login so you never miss a moment.",
-                        actionTitle: "Launch on Login",
-                        action: {
-                            launchOnLoginReminderManager.enableLaunchAtLogin()
-                        },
-                        onDismiss: {
-                            launchOnLoginReminderManager.dismissReminder()
-                        }
-                    )
-                    .padding(.horizontal, 32)
-                    .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
-                }
-
-                // Header
-                header
-                    .padding(.horizontal, 32)
-                    .padding(.top, 28)
-                    .padding(.bottom, 32)
-
-                // Stats Cards Row
-                statsCardsRow
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 24)
-
-                // App Usage Section
-                appUsageSection
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 24)
-
-                // Footer
-                footer
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 24)
+        VStack(alignment: .leading, spacing: 0) {
+            // Accessibility permission warning banner
+            if viewModel.showAccessibilityWarning {
+                PermissionBanner(
+                    message: "Retrace needs Accessibility permission to detect display changes and exclude private/incognito windows and excluded apps.",
+                    actionTitle: "Open Settings",
+                    action: {
+                        SystemSettingsOpener.openAccessibilitySettings()
+                    },
+                    onDismiss: {
+                        viewModel.dismissAccessibilityWarning()
+                    }
+                )
+                .padding(.horizontal, 32)
+                .padding(.top, 20)
             }
+
+            // Screen recording permission warning banner
+            if viewModel.showScreenRecordingWarning {
+                PermissionBanner(
+                    message: "Retrace needs Screen Recording permission to capture your screen.",
+                    actionTitle: "Open Settings",
+                    action: {
+                        SystemSettingsOpener.openScreenRecordingSettings()
+                    },
+                    onDismiss: {
+                        viewModel.dismissScreenRecordingWarning()
+                    }
+                )
+                .padding(.horizontal, 32)
+                .padding(.top, viewModel.showAccessibilityWarning ? 12 : 20)
+            }
+
+            // Launch on login reminder banner
+            if launchOnLoginReminderManager.shouldShowReminder {
+                PermissionBanner(
+                    message: "Retrace works best when it launches automatically on login so you never miss a moment.",
+                    actionTitle: "Launch on Login",
+                    action: {
+                        launchOnLoginReminderManager.enableLaunchAtLogin()
+                    },
+                    onDismiss: {
+                        launchOnLoginReminderManager.dismissReminder()
+                    }
+                )
+                .padding(.horizontal, 32)
+                .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
+            }
+
+            // Header
+            header
+                .padding(.horizontal, 32)
+                .padding(.top, 28)
+                .padding(.bottom, 32)
+
+            // Two-column layout: metrics on left, app usage on right
+            // This section expands to fill remaining height
+            GeometryReader { geometry in
+                let layoutSize = LayoutSize.from(width: geometry.size.width)
+
+                HStack(alignment: .top, spacing: 24) {
+                    // Left column: Stats cards (single column, scales with screen size)
+                    ZStack {
+                        ScrollView(showsIndicators: false) {
+                            VStack(spacing: 16) {
+                                ForEach(statsCards) { card in
+                                    statCard(
+                                        icon: card.icon,
+                                        title: card.title,
+                                        value: card.value,
+                                        subtitle: card.subtitle,
+                                        graphData: card.graphData,
+                                        graphColor: card.graphColor,
+                                        theme: MilestoneCelebrationManager.getCurrentTheme(),
+                                        valueFormatter: card.valueFormatter,
+                                        layoutSize: layoutSize
+                                    )
+                                }
+                            }
+                            .padding(.bottom, 20) // Extra padding for scroll affordance
+                        }
+
+                        ScrollAffordance(height: 32, color: themeBaseBackground)
+                    }
+                    .frame(width: layoutSize.cardWidth)
+
+                    // Right column: App usage (scrolls internally)
+                    appUsageSection(layoutSize: layoutSize)
+                }
+            }
+            .padding(.horizontal, 32)
+            .padding(.bottom, 24)
+
+            // Footer
+            footer
+                .padding(.horizontal, 32)
+                .padding(.bottom, 24)
         }
         .background(
             ZStack {
@@ -142,21 +308,44 @@ public struct DashboardView: View {
         .task {
             await viewModel.loadStatistics()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
+            Task { await viewModel.loadStatistics() }
+        }
         .sheet(isPresented: $showSessionsSheet) {
             if let app = selectedApp {
-                AppSessionsDetailView(
-                    app: app,
-                    onOpenInTimeline: { date in
-                        openTimelineAt(date: date)
-                    },
-                    loadSessions: { offset, limit in
-                        await viewModel.getSessionsForApp(
-                            bundleID: app.appBundleID,
-                            offset: offset,
-                            limit: limit
-                        )
-                    }
-                )
+                if let window = selectedWindow {
+                    // Window-filtered sessions
+                    AppSessionsDetailView(
+                        app: app,
+                        onOpenInTimeline: { date in
+                            openTimelineAt(date: date)
+                        },
+                        loadSessions: { offset, limit in
+                            await viewModel.getSessionsForAppWindow(
+                                bundleID: app.appBundleID,
+                                windowNameOrDomain: window.displayName,
+                                offset: offset,
+                                limit: limit
+                            )
+                        },
+                        subtitle: window.displayName
+                    )
+                } else {
+                    // All sessions for app
+                    AppSessionsDetailView(
+                        app: app,
+                        onOpenInTimeline: { date in
+                            openTimelineAt(date: date)
+                        },
+                        loadSessions: { offset, limit in
+                            await viewModel.getSessionsForApp(
+                                bundleID: app.appBundleID,
+                                offset: offset,
+                                limit: limit
+                            )
+                        }
+                    )
+                }
             }
         }
         .overlay {
@@ -192,6 +381,13 @@ public struct DashboardView: View {
 
     private func handleAppTapped(_ app: AppUsageData) {
         selectedApp = app
+        selectedWindow = nil
+        showSessionsSheet = true
+    }
+
+    private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
+        selectedApp = app
+        selectedWindow = window
         showSessionsSheet = true
     }
 
@@ -231,13 +427,8 @@ public struct DashboardView: View {
                 recordingIndicator
 
                 // Action buttons
-                actionButton(icon: "arrow.clockwise", label: nil) {
-                    Task { await viewModel.loadStatistics() }
-                }
-
-                actionButton(icon: "gearshape", label: nil) {
-                    NotificationCenter.default.post(name: .openSettings, object: nil)
-                }
+                refreshButton
+                settingsButton
             }
         }
         .sheet(isPresented: $showFeedbackSheet) {
@@ -276,6 +467,89 @@ public struct DashboardView: View {
         }
     }
 
+    // MARK: - Action Button States
+
+    @State private var isHoveringRefresh = false
+    @State private var refreshRotation: Double = 0
+    @State private var isHoveringSettings = false
+    @State private var settingsRotation: Double = 0
+
+    // MARK: - Footer Hover States
+
+    @State private var isHoveringHaseab = false
+    @State private var isHoveringSupportMe = false
+    @State private var isHoveringFeedback = false
+
+    // MARK: - Refresh Button
+
+    private var refreshButton: some View {
+        Button(action: {
+            // Spin animation on click
+            withAnimation(.easeInOut(duration: 0.5)) {
+                refreshRotation += 360
+            }
+            Task { await viewModel.loadStatistics() }
+        }) {
+            Image(systemName: "arrow.clockwise")
+                .font(.retraceCalloutMedium)
+                .foregroundColor(.retraceSecondary)
+                .rotationEffect(.degrees(refreshRotation + (isHoveringRefresh ? 45 : 0)))
+                .animation(.easeInOut(duration: 0.2), value: isHoveringRefresh)
+                .padding(10)
+                .background(Color.white.opacity(0.05))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHoveringRefresh = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+
+    // MARK: - Settings Button
+
+    private var settingsButton: some View {
+        Button(action: {
+            // Quick spin on click
+            withAnimation(.easeInOut(duration: 0.3)) {
+                settingsRotation += 90
+            }
+            NotificationCenter.default.post(name: .openSettings, object: nil)
+        }) {
+            Image(systemName: "gearshape")
+                .font(.retraceCalloutMedium)
+                .foregroundColor(.retraceSecondary)
+                .rotationEffect(.degrees(settingsRotation + (isHoveringSettings ? 30 : 0)))
+                .animation(.easeInOut(duration: 0.2), value: isHoveringSettings)
+                .padding(10)
+                .background(Color.white.opacity(0.05))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHoveringSettings = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+    }
+
     // MARK: - Recording Indicator
 
     @State private var isHoveringRecordingIndicator = false
@@ -287,7 +561,13 @@ public struct DashboardView: View {
             }
         }) {
             HStack(spacing: 6) {
-                if !(viewModel.isRecording && isHoveringRecordingIndicator) {
+                if viewModel.isRecording && isHoveringRecordingIndicator {
+                    Image(systemName: "pause.fill")
+                        .font(.system(size: 8))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 6)
+                        .transition(.opacity)
+                } else {
                     Circle()
                         .fill(viewModel.isRecording ? Color.retraceDanger : Color.retraceSecondary.opacity(0.5))
                         .frame(width: 6, height: 6)
@@ -298,6 +578,7 @@ public struct DashboardView: View {
                     .font(.retraceCaptionMedium)
                     .foregroundColor(.retraceSecondary)
                     .contentTransition(.interpolate)
+                    .frame(width: 65, alignment: .center)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
@@ -331,78 +612,146 @@ public struct DashboardView: View {
 
     // MARK: - Stats Cards Row
 
-    private var statsCardsRow: some View {
-        let theme = MilestoneCelebrationManager.getCurrentTheme()
+    private struct StatCardData: Identifiable {
+        let id = UUID()
+        let icon: String
+        let title: String
+        let value: String
+        let subtitle: String
+        let graphData: [DailyDataPoint]?
+        let graphColor: Color
+        let valueFormatter: ((Int64) -> String)?
 
-        return HStack(spacing: 16) {
-            // Screen Time Card
-            statCard(
-                icon: "clock.fill",
-                title: "Screen Time",
-                value: formatTotalTime(viewModel.totalWeeklyTime),
-                subtitle: "This week",
-                theme: theme
-            )
-
-            // Storage Used Card
-            statCard(
-                icon: "externaldrive.fill",
-                title: "Storage Used",
-                value: formatStorageSize(viewModel.totalStorageBytes),
-                subtitle: "Total",
-                theme: theme
-            )
-
-            // Days Recorded Card
-            statCard(
-                icon: "calendar",
-                title: "Days Recorded",
-                value: formatDaysRecorded(viewModel.daysRecorded),
-                subtitle: "\(viewModel.daysRecorded) day\(viewModel.daysRecorded == 1 ? "" : "s") total",
-                theme: theme
-            )
+        init(icon: String, title: String, value: String, subtitle: String, graphData: [DailyDataPoint]? = nil, graphColor: Color = .retraceAccent, valueFormatter: ((Int64) -> String)? = nil) {
+            self.icon = icon
+            self.title = title
+            self.value = value
+            self.subtitle = subtitle
+            self.graphData = graphData
+            self.graphColor = graphColor
+            self.valueFormatter = valueFormatter
         }
     }
 
-    private func statCard(icon: String, title: String, value: String, subtitle: String, theme: MilestoneCelebrationManager.ColorTheme) -> some View {
+    private var statsCards: [StatCardData] {
+        [
+            StatCardData(
+                icon: "calendar",
+                title: "Total Days Recorded",
+                value: formatDaysRecorded(viewModel.daysRecorded),
+                subtitle: "\(viewModel.daysRecorded) day\(viewModel.daysRecorded == 1 ? "" : "s") total"
+            ),
+            StatCardData(
+                icon: "clock.fill",
+                title: "Screen Time",
+                value: formatScreenTimeFromDaily(viewModel.dailyScreenTimeData),
+                subtitle: "Last 7 days",
+                graphData: viewModel.dailyScreenTimeData.isEmpty ? nil : viewModel.dailyScreenTimeData,
+                graphColor: .blue,
+                valueFormatter: { milliseconds in
+                    let hours = Double(milliseconds) / 1000.0 / 3600.0
+                    return String(format: "%.1fh", hours)
+                }
+            ),
+            StatCardData(
+                icon: "externaldrive.fill",
+                title: "Total Storage Used",
+                value: formatStorageSize(viewModel.totalStorageBytes),
+                subtitle: formatStoragePerMonth(),
+                graphData: viewModel.dailyStorageData.isEmpty ? nil : viewModel.dailyStorageData,
+                graphColor: .cyan
+            ),
+            StatCardData(
+                icon: "timelapse",
+                title: "Timeline Opens",
+                value: "\(viewModel.timelineOpensThisWeek)",
+                subtitle: "Last 7 days",
+                graphData: viewModel.dailyTimelineOpensData.isEmpty ? nil : viewModel.dailyTimelineOpensData,
+                graphColor: .purple
+            ),
+            StatCardData(
+                icon: "magnifyingglass",
+                title: "Searches",
+                value: "\(viewModel.searchesThisWeek)",
+                subtitle: "Last 7 days",
+                graphData: viewModel.dailySearchesData.isEmpty ? nil : viewModel.dailySearchesData,
+                graphColor: .orange
+            ),
+            StatCardData(
+                icon: "doc.on.doc",
+                title: "Text Copies",
+                value: "\(viewModel.textCopiesThisWeek)",
+                subtitle: "Last 7 days",
+                graphData: viewModel.dailyTextCopiesData.isEmpty ? nil : viewModel.dailyTextCopiesData,
+                graphColor: .green
+            ),
+        ]
+    }
+
+    private func statCard(
+        icon: String,
+        title: String,
+        value: String,
+        subtitle: String,
+        graphData: [DailyDataPoint]?,
+        graphColor: Color,
+        theme: MilestoneCelebrationManager.ColorTheme,
+        valueFormatter: ((Int64) -> String)?,
+        layoutSize: LayoutSize = .normal
+    ) -> some View {
         // Use a consistent muted color for all icons
         let iconColor = Color.retraceSecondary
 
-        return HStack(spacing: 14) {
-            // Icon
-            ZStack {
-                Circle()
-                    .fill(iconColor.opacity(0.15))
-                    .frame(width: 44, height: 44)
+        return VStack(spacing: 0) {
+            HStack(spacing: layoutSize.iconSpacing) {
+                // Icon
+                ZStack {
+                    Circle()
+                        .fill(iconColor.opacity(0.10))
+                        .frame(width: layoutSize.iconCircleSize, height: layoutSize.iconCircleSize)
 
-                Image(systemName: icon)
-                    .font(.retraceHeadline)
-                    .foregroundColor(iconColor)
+                    Image(systemName: icon)
+                        .font(layoutSize.iconFont)
+                        .foregroundColor(iconColor)
+                }
+
+                VStack(alignment: .leading, spacing: layoutSize.textSpacing) {
+                    Text(title)
+                        .font(layoutSize.titleFont)
+                        .foregroundColor(.retraceSecondary)
+
+                    Text(value)
+                        .font(layoutSize.valueFont)
+                        .foregroundColor(.retracePrimary)
+
+                    Text(subtitle)
+                        .font(layoutSize.subtitleFont)
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                }
+
+                Spacer()
             }
+            .padding(layoutSize.cardPadding)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.retraceSecondary)
-
-                Text(value)
-                    .font(.retraceMediumNumber)
-                    .foregroundColor(.retracePrimary)
-
-                Text(subtitle)
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.retraceSecondary.opacity(0.7))
+            // Mini line graph (if data is available)
+            if let data = graphData, !data.isEmpty {
+                MiniLineGraphView(
+                    dataPoints: data,
+                    lineColor: graphColor,
+                    showGradientFill: true,
+                    valueFormatter: valueFormatter
+                )
+                .frame(height: layoutSize.graphHeight)
+                .padding(.horizontal, layoutSize.graphHorizontalPadding)
+                .padding(.bottom, layoutSize.graphBottomPadding)
             }
-
-            Spacer()
         }
-        .padding(16)
         .frame(maxWidth: .infinity)
-        .background(Color.white.opacity(0.03))
+        .background(Color.white.opacity(0.02))
         .cornerRadius(14)
         .overlay(
             RoundedRectangle(cornerRadius: 14)
-                .stroke(theme.controlBorderColor, lineWidth: 1)
+                .stroke(theme.controlBorderColor.opacity(0.6), lineWidth: 1)
         )
     }
 
@@ -415,6 +764,19 @@ public struct DashboardView: View {
             let mb = Double(bytes) / 1_000_000
             return String(format: "%.0f MB", mb)
         }
+    }
+
+    private func formatStoragePerMonth() -> String {
+        let dailyData = viewModel.dailyStorageData
+        guard !dailyData.isEmpty else { return "est. 0 GB/month" }
+
+        // Sum all daily values and extrapolate to 30 days
+        let totalBytes = dailyData.reduce(0) { $0 + $1.value }
+        let daysWithData = dailyData.count
+        let bytesPerDay = Double(totalBytes) / Double(daysWithData)
+        let bytesPerMonth = bytesPerDay * 30.0
+        let gbPerMonth = bytesPerMonth / 1_000_000_000
+        return String(format: "est. %.1f GB/month", gbPerMonth)
     }
 
     private func formatDaysRecorded(_ days: Int) -> String {
@@ -436,9 +798,21 @@ public struct DashboardView: View {
 
     // MARK: - App Usage Section
 
-    private var appUsageSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if viewModel.weeklyAppUsage.isEmpty {
+    private func appUsageSection(layoutSize: LayoutSize) -> some View {
+        // Convert LayoutSize to AppUsageLayoutSize
+        let appUsageLayout: AppUsageLayoutSize = {
+            switch layoutSize {
+            case .normal: return .normal
+            case .large: return .large
+            case .extraLarge: return .extraLarge
+            case .massive: return .massive
+            }
+        }()
+
+        return VStack(alignment: .leading, spacing: 0) {
+            if viewModel.isLoading && viewModel.weeklyAppUsage.isEmpty {
+                loadingStateView
+            } else if viewModel.weeklyAppUsage.isEmpty {
                 emptyStateView
             } else {
                 VStack(spacing: 0) {
@@ -450,7 +824,7 @@ public struct DashboardView: View {
 
                         Spacer()
 
-                        Text("\(viewModel.weeklyAppUsage.count) apps this week")
+                        Text("\(formatTotalTime(viewModel.weeklyAppUsage.reduce(0) { $0 + $1.duration }))  ·  Last 7 days")
                             .font(.retraceCaptionMedium)
                             .foregroundColor(.retraceSecondary)
 
@@ -468,8 +842,13 @@ public struct DashboardView: View {
                     case .list:
                         AppUsageListView(
                             apps: viewModel.weeklyAppUsage,
-                            onAppTapped: { app in
-                                handleAppTapped(app)
+                            totalTime: viewModel.totalWeeklyTime,
+                            layoutSize: appUsageLayout,
+                            loadWindowUsage: { bundleID in
+                                await viewModel.getWindowUsageForApp(bundleID: bundleID)
+                            },
+                            onWindowTapped: { app, window in
+                                handleWindowTapped(app, window)
                             }
                         )
                     case .hardDrive:
@@ -486,7 +865,7 @@ public struct DashboardView: View {
                 .cornerRadius(16)
                 .overlay(
                     RoundedRectangle(cornerRadius: 16)
-                        .stroke(themeBorderColor, lineWidth: 1)
+                        .stroke(themeBorderColor.opacity(1.2), lineWidth: 1.2)
                 )
             }
         }
@@ -652,6 +1031,23 @@ public struct DashboardView: View {
         )
     }
 
+    private var loadingStateView: some View {
+        VStack(spacing: 16) {
+            SpinnerView(size: 32, lineWidth: 3)
+
+            Text("Loading activity...")
+                .font(.retraceHeadline)
+                .foregroundColor(.retraceSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(themeBorderColor, lineWidth: 1)
+        )
+    }
+
     private var emptyStateView: some View {
         VStack(spacing: 16) {
             ZStack {
@@ -693,7 +1089,7 @@ public struct DashboardView: View {
             Spacer()
 
             HStack(spacing: 16) {
-                Link(destination: URL(string: "https://x.com/haseab_")!) {
+                Link(destination: URL(string: "https://dub.sh/haseab-twitter")!) {
                     HStack(spacing: 4) {
                         Text("Made with")
                             .foregroundColor(.retraceSecondary)
@@ -702,11 +1098,14 @@ public struct DashboardView: View {
                             .foregroundColor(.retraceSecondary)
                         Text("@haseab")
                             .foregroundColor(Color(red: 74/255, green: 144/255, blue: 226/255))  // Bright blue for link
+                            .scaleEffect(isHoveringHaseab ? 1.05 : 1.0)
+                            .animation(.easeInOut(duration: 0.15), value: isHoveringHaseab)
                     }
                     .font(.retraceCaption2Medium)
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
+                    isHoveringHaseab = hovering
                     if hovering {
                         NSCursor.pointingHand.push()
                     } else {
@@ -720,15 +1119,18 @@ public struct DashboardView: View {
 
                 Link(destination: URL(string: "https://dub.sh/support-haseab")!) {
                     HStack(spacing: 6) {
-                        Image(systemName: "coffee.fill")
+                        Image(systemName: "cup.and.saucer.fill")
                             .font(.retraceCaption2)
-                        Text("Support")
+                        Text("Support Me")
                     }
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
+                    .scaleEffect(isHoveringSupportMe ? 1.05 : 1.0)
+                    .animation(.easeInOut(duration: 0.15), value: isHoveringSupportMe)
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
+                    isHoveringSupportMe = hovering
                     if hovering {
                         NSCursor.pointingHand.push()
                     } else {
@@ -748,9 +1150,12 @@ public struct DashboardView: View {
                     }
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
+                    .scaleEffect(isHoveringFeedback ? 1.05 : 1.0)
+                    .animation(.easeInOut(duration: 0.15), value: isHoveringFeedback)
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
+                    isHoveringFeedback = hovering
                     if hovering {
                         NSCursor.pointingHand.push()
                     } else {
@@ -828,9 +1233,49 @@ public struct DashboardView: View {
         }
     }
 
+    private func formatScreenTimeFromDaily(_ data: [DailyDataPoint]) -> String {
+        // Data is in milliseconds, sum and convert to hours/minutes
+        let totalMs = data.reduce(0) { $0 + $1.value }
+        let totalMinutes = Int(totalMs / 1000 / 60)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+
+        if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else {
+            return "\(minutes)m"
+        }
+    }
+
 }
 
 // MARK: - Preview
+
+// MARK: - Scroll Affordance
+
+/// A subtle inner shadow at the bottom of a container that suggests scrollable content continues
+/// This is the Apple-favorite pattern for indicating scrollability
+private struct ScrollAffordance: View {
+    var height: CGFloat = 24
+    var color: Color = .black
+
+    var body: some View {
+        VStack {
+            Spacer()
+            LinearGradient(
+                colors: [
+                    color.opacity(0),
+                    color.opacity(0.4),
+                    color.opacity(0.6)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: height)
+            .allowsHitTesting(false)
+        }
+    }
+}
 
 // MARK: - Logo Triangle Shape
 

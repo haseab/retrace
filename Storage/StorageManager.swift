@@ -350,6 +350,40 @@ public actor StorageManager: StorageProtocol {
         return totalSize
     }
 
+    public func getStorageUsedForDateRange(from startDate: Date, to endDate: Date) async throws -> Int64 {
+        let chunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
+        let fileManager = FileManager.default
+        let calendar = Calendar.current
+
+        guard fileManager.fileExists(atPath: chunksURL.path) else { return 0 }
+
+        var totalSize: Int64 = 0
+        var currentDate = calendar.startOfDay(for: startDate)
+        let endDay = calendar.startOfDay(for: endDate)
+
+        // Iterate through each day in the range
+        while currentDate <= endDay {
+            let year = calendar.component(.year, from: currentDate)
+            let month = calendar.component(.month, from: currentDate)
+            let day = calendar.component(.day, from: currentDate)
+
+            let yearMonth = String(format: "%04d%02d", year, month)
+            let dayStr = String(format: "%02d", day)
+
+            let dayFolderURL = chunksURL
+                .appendingPathComponent(yearMonth, isDirectory: true)
+                .appendingPathComponent(dayStr, isDirectory: true)
+
+            if fileManager.fileExists(atPath: dayFolderURL.path) {
+                totalSize += calculateFolderSize(at: dayFolderURL)
+            }
+
+            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
+        }
+
+        return totalSize
+    }
+
     /// Recursively calculate the total size of a folder in bytes (actual disk allocation)
     private func calculateFolderSize(at url: URL) -> Int64 {
         let fileManager = FileManager.default

@@ -13,11 +13,11 @@ struct AppUsageHardDriveView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Treemap visualization
+            // Treemap visualization - fills all available space
             treemapVisualization
-                .frame(minHeight: 280)
+                .frame(maxHeight: .infinity)
 
-            // Hover tooltip (shown below)
+            // Hover tooltip (shown below treemap)
             if let app = hoveredApp {
                 tooltipView(for: app)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
@@ -130,7 +130,7 @@ struct AppUsageHardDriveView: View {
                     Text("•")
                         .foregroundColor(.retraceSecondary.opacity(0.5))
 
-                    Text("\(app.sessionCount) session\(app.sessionCount == 1 ? "" : "s")")
+                    Text(app.uniqueItemLabel)
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary)
                 }
@@ -418,15 +418,15 @@ struct AppUsageHardDriveView_Previews: PreviewProvider {
     static var previews: some View {
         AppUsageHardDriveView(
             apps: [
-                AppUsageData(appBundleID: "com.apple.Safari", appName: "Safari", duration: 7200, sessionCount: 15, percentage: 0.35),
-                AppUsageData(appBundleID: "com.microsoft.VSCode", appName: "VS Code", duration: 5400, sessionCount: 8, percentage: 0.26),
-                AppUsageData(appBundleID: "com.apple.MobileSMS", appName: "Messages", duration: 2400, sessionCount: 20, percentage: 0.12),
-                AppUsageData(appBundleID: "com.spotify.client", appName: "Spotify", duration: 1800, sessionCount: 5, percentage: 0.09),
-                AppUsageData(appBundleID: "com.apple.finder", appName: "Finder", duration: 1200, sessionCount: 30, percentage: 0.06),
-                AppUsageData(appBundleID: "com.apple.mail", appName: "Mail", duration: 900, sessionCount: 12, percentage: 0.04),
-                AppUsageData(appBundleID: "com.slack.Slack", appName: "Slack", duration: 600, sessionCount: 8, percentage: 0.03),
-                AppUsageData(appBundleID: "com.apple.Notes", appName: "Notes", duration: 500, sessionCount: 5, percentage: 0.025),
-                AppUsageData(appBundleID: "com.apple.Terminal", appName: "Terminal", duration: 400, sessionCount: 10, percentage: 0.02),
+                AppUsageData(appBundleID: "com.apple.Safari", appName: "Safari", duration: 7200, uniqueItemCount: 15, percentage: 0.35),
+                AppUsageData(appBundleID: "com.microsoft.VSCode", appName: "VS Code", duration: 5400, uniqueItemCount: 8, percentage: 0.26),
+                AppUsageData(appBundleID: "com.apple.MobileSMS", appName: "Messages", duration: 2400, uniqueItemCount: 20, percentage: 0.12),
+                AppUsageData(appBundleID: "com.spotify.client", appName: "Spotify", duration: 1800, uniqueItemCount: 5, percentage: 0.09),
+                AppUsageData(appBundleID: "com.apple.finder", appName: "Finder", duration: 1200, uniqueItemCount: 30, percentage: 0.06),
+                AppUsageData(appBundleID: "com.apple.mail", appName: "Mail", duration: 900, uniqueItemCount: 12, percentage: 0.04),
+                AppUsageData(appBundleID: "com.slack.Slack", appName: "Slack", duration: 600, uniqueItemCount: 8, percentage: 0.03),
+                AppUsageData(appBundleID: "com.apple.Notes", appName: "Notes", duration: 500, uniqueItemCount: 5, percentage: 0.025),
+                AppUsageData(appBundleID: "com.apple.Terminal", appName: "Terminal", duration: 400, uniqueItemCount: 10, percentage: 0.02),
             ],
             totalTime: 20000
         )

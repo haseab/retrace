@@ -180,8 +180,7 @@ public struct SearchView: View {
 
     private var searchingView: some View {
         VStack(spacing: .spacingL) {
-            ProgressView()
-                .scaleEffect(1.5)
+            SpinnerView(size: 32, lineWidth: 3)
 
             Text("Searching...")
                 .font(.retraceBody)

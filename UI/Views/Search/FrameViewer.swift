@@ -238,8 +238,7 @@ public struct FrameViewer: View {
 
     private var loadingView: some View {
         VStack(spacing: .spacingL) {
-            ProgressView()
-                .scaleEffect(1.5)
+            SpinnerView(size: 32, lineWidth: 3)
 
             Text("Loading frame...")
                 .font(.retraceBody)

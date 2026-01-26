@@ -111,6 +111,9 @@ public class TimelineWindowController: NSObject {
 
         isVisible = true
 
+        // Track timeline open event
+        DashboardViewModel.recordTimelineOpen(coordinator: coordinator)
+
         // Setup keyboard monitoring
         setupEventMonitors()
 

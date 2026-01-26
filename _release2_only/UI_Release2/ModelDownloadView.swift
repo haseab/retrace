@@ -85,8 +85,7 @@ struct ModelDownloadView: View {
                 }) {
                     HStack {
                         if viewModel.isDownloading {
-                            ProgressView()
-                                .scaleEffect(0.8)
+                            SpinnerView(size: 14, lineWidth: 2, color: .white)
                                 .frame(width: 16, height: 16)
                         } else {
                             Image(systemName: "arrow.down.circle.fill")

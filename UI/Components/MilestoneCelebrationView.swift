@@ -101,7 +101,7 @@ struct MilestoneCelebrationView: View {
                     .offset(y: -20) // Slight offset to center on icon
             }
 
-            VStack(spacing: 16) {
+            VStack(spacing: 8) {
                 if milestone == .tenHours {
                     // Simple title for 10h
                     Text(milestone.title)
@@ -193,7 +193,7 @@ struct MilestoneCelebrationView: View {
                 case .failure:
                     fallbackProfileImage
                 case .empty:
-                    ProgressView()
+                    SpinnerView(size: 16, lineWidth: 2)
                         .frame(width: 40, height: 40)
                 @unknown default:
                     fallbackProfileImage

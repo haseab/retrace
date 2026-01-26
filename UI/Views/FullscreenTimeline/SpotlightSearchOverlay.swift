@@ -210,9 +210,7 @@ public struct SpotlightSearchOverlay: View {
 
             // Search button
             if viewModel.isSearching {
-                ProgressView()
-                    .scaleEffect(0.8)
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                SpinnerView(size: 20, lineWidth: 2, color: .white)
                     .frame(width: 32, height: 32)
             } else {
                 Button(action: {
@@ -333,9 +331,7 @@ public struct SpotlightSearchOverlay: View {
                 if viewModel.isLoadingMore {
                     HStack {
                         Spacer()
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(0.8)
+                        SpinnerView(size: 16, lineWidth: 2, color: .white)
                         Text("Loading more...")
                             .font(.retraceCaption2)
                             .foregroundColor(.white.opacity(0.5))
@@ -365,9 +361,7 @@ public struct SpotlightSearchOverlay: View {
 
     private var searchingView: some View {
         VStack(spacing: 12) {
-            ProgressView()
-                .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                .scaleEffect(1.2)
+            SpinnerView(size: 28, lineWidth: 3, color: .white)
 
             Text("Searching...")
                 .font(.retraceCallout)
@@ -861,9 +855,7 @@ private struct GalleryResultCard: View {
                     .frame(width: thumbnailSize.width, height: thumbnailSize.height)
                     .clipped()
             } else {
-                ProgressView()
-                    .scaleEffect(0.8)
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white.opacity(0.4)))
+                SpinnerView(size: 16, lineWidth: 2, color: .white.opacity(0.4))
             }
         }
         .frame(width: thumbnailSize.width, height: thumbnailSize.height)

@@ -302,8 +302,7 @@ public struct FeedbackFormView: View {
                         .frame(maxHeight: 100)
                 } else {
                     HStack {
-                        ProgressView()
-                            .scaleEffect(0.7)
+                        SpinnerView(size: 16, lineWidth: 2)
                         Text("Loading diagnostics...")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary)
@@ -486,9 +485,7 @@ public struct FeedbackFormView: View {
             Button(action: { Task { await viewModel.submit() } }) {
                 HStack(spacing: 8) {
                     if viewModel.isSubmitting {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        SpinnerView(size: 14, lineWidth: 2, color: .white)
                     }
                     Text(viewModel.isSubmitting ? "Sending..." : "Send Feedback")
                         .font(.retraceCalloutBold)

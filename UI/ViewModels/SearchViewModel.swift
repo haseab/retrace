@@ -186,8 +186,15 @@ public class SearchViewModel: ObservableObject {
     public func submitSearch() {
         // Cancel any existing search before starting a new one
         currentSearchTask?.cancel()
+
+        // Track search event only on explicit submit (Enter key)
+        let query = searchQuery
+        if !query.isEmpty {
+            DashboardViewModel.recordSearch(coordinator: coordinator, query: query)
+        }
+
         currentSearchTask = Task {
-            await performSearch(query: searchQuery)
+            await performSearch(query: query)
         }
     }
 
@@ -202,6 +209,7 @@ public class SearchViewModel: ObservableObject {
         Log.info("[SearchViewModel] Performing search for: '\(query)'", category: .ui)
         isSearching = true
         error = nil
+
         results = nil  // Clear old results immediately to prevent stale thumbnail loads
         savedScrollPosition = 0  // Reset scroll position for new search
         thumbnailCache.removeAll()  // Clear thumbnail cache for new search

@@ -30,8 +30,15 @@ struct AppInfoProvider: Sendable {
             return FrameMetadata(displayID: CGMainDisplayID())
         }
 
-        let bundleID = frontApp.bundleIdentifier
-        let appName = frontApp.localizedName
+        // Use bundleIdentifier if available, otherwise check if it's the current app (dev build)
+        var bundleID = frontApp.bundleIdentifier
+        var appName = frontApp.localizedName
+
+        // Dev build fix: if bundleID is nil but this is Retrace (same PID), use known bundle ID
+        if bundleID == nil && frontApp.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            bundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
+            appName = appName ?? "Retrace"
+        }
 
         // Get window title via Accessibility API
         let windowName = getWindowTitle(for: frontApp.processIdentifier)

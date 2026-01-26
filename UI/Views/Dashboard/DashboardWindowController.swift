@@ -164,7 +164,8 @@ extension DashboardWindowController: NSWindowDelegate {
     }
 
     public func windowDidBecomeKey(_ notification: Notification) {
-        // Window is now active
+        // Post notification so dashboard can refresh its stats
+        NotificationCenter.default.post(name: .dashboardDidBecomeKey, object: nil)
     }
 }
 
@@ -279,4 +280,5 @@ extension Notification.Name {
     static let dashboardDidOpen = Notification.Name("dashboardDidOpen")
     static let dashboardDidClose = Notification.Name("dashboardDidClose")
     static let dashboardShowSettings = Notification.Name("dashboardShowSettings")
+    static let dashboardDidBecomeKey = Notification.Name("dashboardDidBecomeKey")
 }

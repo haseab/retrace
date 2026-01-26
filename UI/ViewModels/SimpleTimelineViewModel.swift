@@ -3155,6 +3155,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+
+        // Track text copy event with the copied text
+        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
     }
 
     /// Copy the zoomed region as an image to clipboard

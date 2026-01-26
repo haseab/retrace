@@ -6,26 +6,35 @@ struct AppSessionsDetailView: View {
     let app: AppUsageData
     let onOpenInTimeline: (Date) -> Void
     let loadSessions: (Int, Int) async -> [AppSessionDetail]  // (offset, limit) -> sessions
+    let subtitle: String?  // Optional subtitle (e.g., window name filter)
+    let initialSessionCount: Int?  // Optional override for initial session count
 
     @Environment(\.dismiss) private var dismiss
     @State private var sessions: [AppSessionDetail] = []
     @State private var hoveredSessionID: Int64? = nil
-    @State private var isLoading = false
+    @State private var isLoading = true
     @State private var isLoadingMore = false
     @State private var hasMoreToLoad = true
     @State private var totalSessionCount: Int
 
-    private let pageSize = 30
+    private let pageSize = 10
 
     init(
         app: AppUsageData,
         onOpenInTimeline: @escaping (Date) -> Void,
-        loadSessions: @escaping (Int, Int) async -> [AppSessionDetail]
+        loadSessions: @escaping (Int, Int) async -> [AppSessionDetail],
+        subtitle: String? = nil,
+        initialSessionCount: Int? = nil
     ) {
         self.app = app
         self.onOpenInTimeline = onOpenInTimeline
         self.loadSessions = loadSessions
-        self._totalSessionCount = State(initialValue: app.sessionCount)
+        self.subtitle = subtitle
+        self.initialSessionCount = initialSessionCount
+        // When filtering (subtitle provided), start with 0 and update after loading
+        // Otherwise use the provided count or app's count
+        let startCount = initialSessionCount ?? (subtitle != nil ? 0 : app.uniqueItemCount)
+        self._totalSessionCount = State(initialValue: startCount)
     }
 
     var body: some View {
@@ -63,12 +72,27 @@ struct AppSessionsDetailView: View {
             AppIconView(bundleID: app.appBundleID, size: 48)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(app.appName)
-                    .font(.retraceTitle3)
-                    .foregroundColor(.retracePrimary)
+                HStack(spacing: 8) {
+                    Text(app.appName)
+                        .font(.retraceTitle3)
+                        .foregroundColor(.retracePrimary)
+
+                    if let subtitle = subtitle {
+                        Text("·")
+                            .font(.retraceTitle3)
+                            .foregroundColor(.retraceSecondary)
+                        Text(subtitle)
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retraceSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
 
                 HStack(spacing: 12) {
-                    Label(formatDuration(app.duration), systemImage: "clock")
+                    if subtitle == nil {
+                        Label(formatDuration(app.duration), systemImage: "clock")
+                    }
                     Label("\(totalSessionCount) session\(totalSessionCount == 1 ? "" : "s")", systemImage: "rectangle.stack")
                 }
                 .font(.retraceCaptionMedium)
@@ -107,8 +131,7 @@ struct AppSessionsDetailView: View {
                 // Loading indicator at bottom
                 if isLoadingMore {
                     HStack {
-                        ProgressView()
-                            .scaleEffect(0.8)
+                        SpinnerView(size: 16, lineWidth: 2)
                         Text("Loading more...")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary)
@@ -221,8 +244,7 @@ struct AppSessionsDetailView: View {
 
     private var loadingState: some View {
         VStack(spacing: 16) {
-            ProgressView()
-                .scaleEffect(1.2)
+            SpinnerView(size: 24, lineWidth: 3)
 
             Text("Loading sessions...")
                 .font(.retraceCalloutMedium)
@@ -249,9 +271,6 @@ struct AppSessionsDetailView: View {
     // MARK: - Data Loading
 
     private func loadInitialSessions() async {
-        guard !isLoading else { return }
-
-        isLoading = true
         let loaded = await loadSessions(0, pageSize)
         await MainActor.run {
             sessions = loaded
@@ -349,7 +368,7 @@ struct AppSessionsDetailView_Previews: PreviewProvider {
                 appBundleID: "com.apple.Safari",
                 appName: "Safari",
                 duration: 7200,
-                sessionCount: 50,
+                uniqueItemCount: 50,
                 percentage: 0.35
             ),
             onOpenInTimeline: { _ in },
