@@ -178,6 +178,12 @@ struct DashboardContentView: View {
     /// Wrapper for coordinator to inject as environment object for child views
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
 
+    /// Manager for launch on login reminder
+    @StateObject private var launchOnLoginReminderManager: LaunchOnLoginReminderManager
+
+    /// Manager for milestone celebrations
+    @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
+
     @State private var selectedView: DashboardSelectedView = .dashboard
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
@@ -185,6 +191,8 @@ struct DashboardContentView: View {
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+        self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
+        self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
     }
 
     var body: some View {
@@ -204,7 +212,11 @@ struct DashboardContentView: View {
                     Group {
                         switch selectedView {
                         case .dashboard:
-                            DashboardView(coordinator: coordinator)
+                            DashboardView(
+                                coordinator: coordinator,
+                                launchOnLoginReminderManager: launchOnLoginReminderManager,
+                                milestoneCelebrationManager: milestoneCelebrationManager
+                            )
 
                         case .settings:
                             SettingsView()
@@ -231,6 +243,11 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
             selectedView = .settings
             DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
+            selectedView = .settings
+            DashboardWindowController.shared.show()
+            // General tab contains Appearance settings - it's the default tab
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFeedback)) { _ in
             showFeedbackSheet = true

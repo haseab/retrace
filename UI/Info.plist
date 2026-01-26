@@ -63,7 +63,7 @@
     <!-- LSUIElement: Run as menu bar app (no dock icon) -->
     <!-- Set to false if you want the app in the Dock -->
     <key>LSUIElement</key>
-    <false/>
+    <true/>
 
     <!-- Support for Dark Mode -->
     <key>NSRequiresAquaSystemAppearance</key>

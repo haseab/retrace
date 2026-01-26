@@ -315,14 +315,7 @@ struct DatetimeButton: View {
             }
             .padding(.horizontal, TimelineScaleFactor.paddingH)
             .padding(.vertical, TimelineScaleFactor.paddingV)
-            .background(
-                Capsule()
-                    .fill(isHovering ? Color(white: 0.2) : Color(white: 0.15))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-            )
+            .themeAwareCapsuleStyle(isHovering: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -361,14 +354,7 @@ struct ZoomControl: View {
                 .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                 .foregroundColor(isHovering || viewModel.isZoomSliderExpanded ? .white : .white.opacity(0.6))
                 .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                .background(
-                    Circle()
-                        .fill(viewModel.isZoomSliderExpanded ? Color.white.opacity(0.15) : Color(white: 0.15))
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
+                .themeAwareCircleStyle(isActive: viewModel.isZoomSliderExpanded, isHovering: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -451,16 +437,7 @@ struct FilterButton: View {
                         ? .white
                         : .white.opacity(0.6))
                     .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                    .background(
-                        Circle()
-                            .fill(viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0
-                                ? Color.white.opacity(0.15)
-                                : Color(white: 0.15))
-                    )
-                    .overlay(
-                        Circle()
-                            .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                    )
+                    .themeAwareCircleStyle(isActive: viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0, isHovering: isHovering)
 
                 // Badge showing active filter count
                 if viewModel.activeFilterCount > 0 {
@@ -503,14 +480,7 @@ struct ControlsToggleButton: View {
                 .foregroundColor(isHovering ? .white : .white.opacity(0.6))
                 .padding(.horizontal, TimelineScaleFactor.paddingV)
                 .padding(.vertical, TimelineScaleFactor.paddingV)
-                .background(
-                    Capsule()
-                        .fill(Color(white: 0.15))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
+                .themeAwareCapsuleStyle(isHovering: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -575,14 +545,7 @@ struct SearchButton: View {
             .padding(.horizontal, TimelineScaleFactor.paddingH)
             .padding(.vertical, TimelineScaleFactor.paddingV)
             .frame(width: TimelineScaleFactor.searchButtonWidth)
-            .background(
-                Capsule()
-                    .fill(Color(white: 0.15))
-            )
-            .overlay(
-                Capsule()
-                    .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-            )
+            .themeAwareCapsuleStyle(isHovering: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -611,14 +574,7 @@ struct MoreOptionsMenu: View {
                 .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                 .foregroundColor(isButtonHovering || showMenu ? .white : .white.opacity(0.6))
                 .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                .background(
-                    Circle()
-                        .fill(showMenu ? Color.white.opacity(0.15) : Color(white: 0.15))
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
+                .themeAwareCircleStyle(isActive: showMenu, isHovering: isButtonHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
@@ -839,7 +795,7 @@ struct FloatingDateSearchPanel: View {
                 Button(action: onSubmit) {
                     ZStack {
                         Circle()
-                            .fill(text.isEmpty ? Color.white.opacity(0.2) : Color(hex: "#0b336c").opacity(isSubmitButtonHovering ? 1.0 : 0.8))
+                            .fill(text.isEmpty ? Color.white.opacity(0.2) : Color.retraceAccent.opacity(isSubmitButtonHovering ? 1.0 : 0.8))
                         Image(systemName: "arrow.right")
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(.white)
@@ -1619,5 +1575,74 @@ struct HiddenSegmentOverlay: View {
             }
         }
         .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Theme-aware Control Button Style
+
+/// Shared UserDefaults store for accessing settings
+private let timelineSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+
+/// View modifier that applies theme-based border styling to circular control buttons
+struct ThemeAwareCircleButtonStyle: ViewModifier {
+    let isActive: Bool
+    let isHovering: Bool
+
+    private var theme: MilestoneCelebrationManager.ColorTheme {
+        MilestoneCelebrationManager.getCurrentTheme()
+    }
+
+    private var showColoredBorders: Bool {
+        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                Circle()
+                    .fill(isActive ? Color.white.opacity(0.15) : Color(white: 0.15))
+            )
+            .overlay(
+                Circle()
+                    .stroke(showColoredBorders ? theme.controlBorderColor : Color.white.opacity(0.15), lineWidth: 1.0)
+            )
+    }
+}
+
+/// View modifier that applies theme-based border styling to capsule control buttons
+struct ThemeAwareCapsuleButtonStyle: ViewModifier {
+    let isActive: Bool
+    let isHovering: Bool
+
+    private var theme: MilestoneCelebrationManager.ColorTheme {
+        MilestoneCelebrationManager.getCurrentTheme()
+    }
+
+    private var showColoredBorders: Bool {
+        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                Capsule()
+                    .fill(isActive || isHovering ? Color(white: 0.2) : Color(white: 0.15))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(showColoredBorders ? theme.controlBorderColor : Color.white.opacity(0.15), lineWidth: 1.0)
+            )
+    }
+}
+
+extension View {
+    /// Apply theme-based styling to circular control buttons
+    func themeAwareCircleStyle(isActive: Bool = false, isHovering: Bool = false) -> some View {
+        modifier(ThemeAwareCircleButtonStyle(isActive: isActive, isHovering: isHovering))
+    }
+
+    /// Apply theme-based styling to capsule control buttons
+    func themeAwareCapsuleStyle(isActive: Bool = false, isHovering: Bool = false) -> some View {
+        modifier(ThemeAwareCapsuleButtonStyle(isActive: isActive, isHovering: isHovering))
     }
 }

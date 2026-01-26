@@ -283,6 +283,61 @@ enum AppSegmentQueries {
 
     // MARK: - Statistics
 
+    /// Get total captured duration in seconds (sum of all segment durations)
+    static func getTotalCapturedDuration(db: OpaquePointer) throws -> TimeInterval {
+        // endDate and startDate are stored as milliseconds since epoch
+        let sql = "SELECT COALESCE(SUM(endDate - startDate), 0) FROM segment;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return 0
+        }
+
+        // Result is in milliseconds, convert to seconds
+        let milliseconds = sqlite3_column_int64(statement, 0)
+        return TimeInterval(milliseconds) / 1000.0
+    }
+
+    /// Get total captured duration in seconds for segments starting after a given date
+    static func getCapturedDurationAfter(db: OpaquePointer, date: Date) throws -> TimeInterval {
+        // endDate and startDate are stored as milliseconds since epoch
+        let sql = "SELECT COALESCE(SUM(endDate - startDate), 0) FROM segment WHERE startDate > ?;"
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        // Bind date as milliseconds
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return 0
+        }
+
+        // Result is in milliseconds, convert to seconds
+        let milliseconds = sqlite3_column_int64(statement, 0)
+        return TimeInterval(milliseconds) / 1000.0
+    }
+
     static func getCount(db: OpaquePointer) throws -> Int {
         let sql = "SELECT COUNT(*) FROM segment;"
 

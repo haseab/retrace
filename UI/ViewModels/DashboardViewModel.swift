@@ -2,6 +2,7 @@ import SwiftUI
 import Combine
 import Shared
 import App
+import ApplicationServices
 
 /// ViewModel for the Dashboard view
 /// Manages weekly app usage statistics from the database
@@ -28,6 +29,14 @@ public class DashboardViewModel: ObservableObject {
 
     // Permission warnings
     @Published public var showAccessibilityWarning = false
+    @Published public var showScreenRecordingWarning = false
+
+    // Track user dismissals — re-nag after 30 minutes
+    private var accessibilityDismissedUntil: Date?
+    private var screenRecordingDismissedUntil: Date?
+
+    /// How long to suppress a permission warning after the user dismisses it
+    private static let dismissSnoozeInterval: TimeInterval = 30 * 60 // 30 minutes
 
     // MARK: - Dependencies
 
@@ -40,22 +49,70 @@ public class DashboardViewModel: ObservableObject {
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         setupAutoRefresh()
-        setupAccessibilityWarningCallback()
+        // Check permissions immediately on init
+        checkPermissions()
     }
 
     // MARK: - Setup
 
     private func setupAutoRefresh() {
-        // Refresh stats every 30 seconds, recording status every 2 seconds
+        // Refresh recording status and permissions every 2 seconds
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.updateRecordingStatus()
+                self?.checkPermissions()
             }
         }
     }
 
     private func updateRecordingStatus() async {
         isRecording = await coordinator.isCapturing()
+    }
+
+    /// Polls accessibility and screen recording permissions and updates warning states.
+    /// Shows warnings when a permission is missing and the user is recording OR trying to record
+    /// (i.e. the pipeline can't start because of a missing permission).
+    /// Only hides warnings when the user is voluntarily not recording AND all permissions are granted.
+    /// If the user dismisses a warning, it's snoozed for 30 minutes then re-shown.
+    private func checkPermissions() {
+        let hasAccessibility = AXIsProcessTrusted()
+        let hasScreenRecording = CGPreflightScreenCaptureAccess()
+        let permissionsMissing = !hasAccessibility || !hasScreenRecording
+        let now = Date()
+
+        // Don't nag if the user voluntarily stopped recording and all permissions are fine.
+        // But if a permission is missing, always warn — the user may be unable to start recording.
+        if !isRecording && !permissionsMissing {
+            showAccessibilityWarning = false
+            showScreenRecordingWarning = false
+            return
+        }
+
+        // Accessibility
+        if hasAccessibility {
+            showAccessibilityWarning = false
+            accessibilityDismissedUntil = nil
+        } else if let snoozeEnd = accessibilityDismissedUntil {
+            if now >= snoozeEnd {
+                accessibilityDismissedUntil = nil
+                showAccessibilityWarning = true
+            }
+        } else {
+            showAccessibilityWarning = true
+        }
+
+        // Screen recording
+        if hasScreenRecording {
+            showScreenRecordingWarning = false
+            screenRecordingDismissedUntil = nil
+        } else if let snoozeEnd = screenRecordingDismissedUntil {
+            if now >= snoozeEnd {
+                screenRecordingDismissedUntil = nil
+                showScreenRecordingWarning = true
+            }
+        } else {
+            showScreenRecordingWarning = true
+        }
     }
 
     public func toggleRecording(to newValue: Bool) async {
@@ -74,18 +131,14 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
-    private func setupAccessibilityWarningCallback() {
-        Task {
-            await coordinator.setupAccessibilityWarningCallback { [weak self] in
-                Task { @MainActor in
-                    self?.showAccessibilityWarning = true
-                }
-            }
-        }
-    }
-
     public func dismissAccessibilityWarning() {
         showAccessibilityWarning = false
+        accessibilityDismissedUntil = Date().addingTimeInterval(Self.dismissSnoozeInterval)
+    }
+
+    public func dismissScreenRecordingWarning() {
+        showScreenRecordingWarning = false
+        screenRecordingDismissedUntil = Date().addingTimeInterval(Self.dismissSnoozeInterval)
     }
 
     // MARK: - Data Loading

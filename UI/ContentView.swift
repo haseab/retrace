@@ -10,6 +10,8 @@ public struct ContentView: View {
     @State private var showOnboarding: Bool? = nil  // nil = loading, true = show onboarding, false = show main app
     @State private var showFeedbackSheet = false
     @StateObject private var deeplinkHandler = DeeplinkHandler()
+    @StateObject private var launchOnLoginReminderManager: LaunchOnLoginReminderManager
+    @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
 
     private let coordinator: AppCoordinator
 
@@ -17,6 +19,8 @@ public struct ContentView: View {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
+        self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
     }
 
     // MARK: - Body
@@ -39,7 +43,11 @@ public struct ContentView: View {
                     Group {
                         switch selectedView {
                         case .dashboard:
-                            DashboardView(coordinator: coordinator)
+                            DashboardView(
+                                coordinator: coordinator,
+                                launchOnLoginReminderManager: launchOnLoginReminderManager,
+                                milestoneCelebrationManager: milestoneCelebrationManager
+                            )
 
                         case .settings:
                             SettingsView()

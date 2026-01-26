@@ -592,11 +592,27 @@ public class AppIconColorCache {
 
 extension Color {
     // MARK: Brand Colors (matching retrace-frontend design)
-    // Deep blue background: hsl(222, 47%, 4%) = #040b1a
-    public static let retraceDeepBlue = Color(red: 4/255, green: 11/255, blue: 26/255)
+    // Deep blue background: #051127
+    public static let retraceDeepBlue = Color(red: 5/255, green: 17/255, blue: 39/255)
 
-    // Primary blue: Retrace official brand color #0b336c
-    public static let retraceAccent = Color(red: 11/255, green: 51/255, blue: 108/255)
+    // Primary accent color - adapts based on user's color theme preference
+    // Blue: Retrace official brand color #0b336c
+    // Gold: Warm gold accent
+    // Purple: Royal purple accent
+    public static var retraceAccent: Color {
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        switch theme {
+        case .blue:
+            return Color(red: 11/255, green: 51/255, blue: 108/255)  // #0b336c - default blue
+        case .gold:
+            return Color(red: 255/255, green: 200/255, blue: 0/255)  // Gold
+        case .purple:
+            return Color(red: 160/255, green: 100/255, blue: 255/255)  // Purple
+        }
+    }
+
+    // Original brand blue (for cases where we always want blue)
+    public static let retraceBrandBlue = Color(red: 11/255, green: 51/255, blue: 108/255)
 
     // Card background: hsl(222, 47%, 7%)
     public static let retraceCard = Color(red: 9/255, green: 18/255, blue: 38/255)
@@ -853,10 +869,45 @@ extension View {
 // MARK: - Gradient Backgrounds
 
 extension LinearGradient {
-    public static let retraceAccentGradient = LinearGradient(
+    // Accent gradient - adapts based on user's color theme preference
+    public static var retraceAccentGradient: LinearGradient {
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        switch theme {
+        case .blue:
+            return LinearGradient(
+                colors: [
+                    Color(red: 60/255, green: 130/255, blue: 220/255),   // Bright blue
+                    Color(red: 90/255, green: 160/255, blue: 240/255)    // Lighter blue
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        case .gold:
+            return LinearGradient(
+                colors: [
+                    Color(red: 255/255, green: 215/255, blue: 0/255),    // Gold
+                    Color(red: 255/255, green: 180/255, blue: 0/255)     // Darker gold
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        case .purple:
+            return LinearGradient(
+                colors: [
+                    Color(red: 180/255, green: 130/255, blue: 255/255),  // Light purple
+                    Color(red: 138/255, green: 43/255, blue: 226/255)    // Blue violet
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+
+    // Original blue gradient (for cases where we always want blue)
+    public static let retraceBrandGradient = LinearGradient(
         colors: [
-            Color(red: 60/255, green: 130/255, blue: 220/255),   // Bright blue for visibility
-            Color(red: 90/255, green: 160/255, blue: 240/255)    // Lighter blue
+            Color(red: 60/255, green: 130/255, blue: 220/255),
+            Color(red: 90/255, green: 160/255, blue: 240/255)
         ],
         startPoint: .topLeading,
         endPoint: .bottomTrailing
@@ -1223,8 +1274,10 @@ public struct RetraceMenuStyle {
     /// Chevron size
     public static let chevronSize: CGFloat = 10
 
-    /// Action button blue color (used for all primary action buttons) - Retrace official
-    public static let actionBlue = Color(hex: "#0b336c")
+    /// Action button color (used for all primary action buttons) - adapts based on user tier
+    public static var actionBlue: Color {
+        Color.retraceAccent
+    }
 
     // MARK: - Search Field Styling (within menus)
 
@@ -1331,10 +1384,26 @@ public struct RetraceMenuButton: View {
     }
 }
 
+/// Shared UserDefaults store for accessing settings
+private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+
 /// Standardized menu container modifier
 /// Applies consistent background, border, and shadow to any menu/popover content
+/// Border color adapts based on user's color theme preference
 public struct RetraceMenuContainer: ViewModifier {
     var addPadding: Bool = true
+
+    private var showColoredBorders: Bool {
+        menuContainerSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+    }
+
+    private var borderColor: Color {
+        guard showColoredBorders else {
+            return Color.white.opacity(0.15)
+        }
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        return theme.controlBorderColor
+    }
 
     public func body(content: Content) -> some View {
         Group {
@@ -1355,7 +1424,7 @@ public struct RetraceMenuContainer: ViewModifier {
         )
         .overlay(
             RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
-                .stroke(RetraceMenuStyle.borderColor, lineWidth: RetraceMenuStyle.borderWidth)
+                .stroke(borderColor, lineWidth: RetraceMenuStyle.borderWidth)
         )
     }
 }

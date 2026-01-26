@@ -1142,13 +1142,13 @@ struct ZoomUnifiedOverlay<Content: View>: View {
 
 // MARK: - Pure Blur View
 
-/// A pure blur view that blurs content behind it using withinWindow blending
+/// A pure blur view that blurs content behind it using behindWindow blending
 struct PureBlurView: NSViewRepresentable {
     let radius: CGFloat
 
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
-        view.blendingMode = .withinWindow
+        view.blendingMode = .behindWindow
         view.material = .hudWindow
         view.state = .active
         view.wantsLayer = true
@@ -1165,7 +1165,7 @@ struct PureBlurView: NSViewRepresentable {
 struct ZoomBackgroundOverlay: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let blurView = NSVisualEffectView()
-        blurView.blendingMode = .withinWindow
+        blurView.blendingMode = .behindWindow
         blurView.material = .hudWindow
         blurView.state = .active
         blurView.wantsLayer = true
@@ -3097,11 +3097,24 @@ struct TagSubmenuRow: View {
 // MARK: - Filter Panel
 
 /// Floating vertical card panel for timeline filtering
+/// Shared UserDefaults store for accessing settings
+private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
+
+    /// Whether colored borders are enabled
+    private var showColoredBorders: Bool {
+        filterPanelSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+    }
+
+    /// Border color based on user's color theme (or neutral if disabled)
+    private var themeBorderColor: Color {
+        showColoredBorders ? MilestoneCelebrationManager.getCurrentTheme().controlBorderColor : Color.white.opacity(0.15)
+    }
 
     /// Label for apps filter chip (uses pending criteria)
     private var appsLabel: String {
@@ -3375,7 +3388,7 @@ struct FilterPanel: View {
                 .fill(Color(white: 0.12))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                        .stroke(themeBorderColor, lineWidth: 1)
                 )
         )
         .shadow(color: .black.opacity(0.4), radius: 30, y: 15)

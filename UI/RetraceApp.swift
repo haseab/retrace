@@ -96,9 +96,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // CRITICAL FIX: Ensure bundle identifier is set
         // When running from Xcode/SPM, the bundle ID might not be set correctly
         if Bundle.main.bundleIdentifier == nil {
-            // Set activation policy to regular (shows in Dock and can be activated)
+            // Set activation policy to accessory (menu bar app, no dock icon)
             // This is required when running without a proper bundle ID
-            NSApp.setActivationPolicy(.regular)
+            NSApp.setActivationPolicy(.accessory)
         }
 
         // Check if another instance is already running

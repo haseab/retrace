@@ -195,9 +195,12 @@ public class MenuBarManager: ObservableObject {
         leftTriangle.close()
 
         if recording {
-            // Filled when recording
+            // Filled with border when recording
             NSColor.white.setFill()
             leftTriangle.fill()
+            NSColor.white.setStroke()
+            leftTriangle.lineWidth = 1.2
+            leftTriangle.stroke()
         } else {
             // Outlined when not recording
             NSColor.white.setStroke()
@@ -415,6 +418,7 @@ extension Notification.Name {
     static let openDashboard = Notification.Name("openDashboard")
     static let toggleDashboard = Notification.Name("toggleDashboard")
     static let openSettings = Notification.Name("openSettings")
+    static let openSettingsAppearance = Notification.Name("openSettingsAppearance")
     static let openFeedback = Notification.Name("openFeedback")
     static let dataSourceDidChange = Notification.Name("dataSourceDidChange")
 }

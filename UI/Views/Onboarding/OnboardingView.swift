@@ -3,13 +3,14 @@ import AppKit
 import App
 import Database
 import Shared
+import ServiceManagement
 
-/// Main onboarding flow with 8 steps
+/// Main onboarding flow with 9 steps
 /// Step 1: Welcome
 /// Step 2: Creator features
-/// Step 3: Permissions
-/// Step 4: Screen Recording Indicator Info (starts recording on continue) - COMMENTED OUT
-/// Step 5: Encryption choice - COMMENTED OUT
+/// Step 3: Permissions (starts recording on continue)
+/// Step 4: Menu Bar Icon info
+/// Step 5: Launch at Login option
 /// Step 6: Rewind data decision
 /// Step 7: Keyboard shortcuts
 /// Step 8: Early Alpha / Safety info
@@ -65,10 +66,13 @@ public struct OnboardingView: View {
     // Encryption
     @State private var encryptionEnabled: Bool? = false
 
+    // Launch at login - defaults to true (recommended)
+    @State private var launchAtLogin: Bool = true
+
     let coordinator: AppCoordinator
     let onComplete: () -> Void
 
-    private let totalSteps = 8
+    private let totalSteps = 9
 
     // MARK: - Body
 
@@ -212,14 +216,14 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
 
         case 3:
-            // Permissions - requires both permissions, skips indicator step (step 4) and encryption step (step 5), goes to Rewind data
+            // Permissions - requires both permissions, then shows menu bar icon step
             Button(action: {
                 stopPermissionMonitoring()
-                // Start recording pipeline here (was previously in step 4)
+                // Start recording pipeline here
                 Task {
                     try? await coordinator.startPipeline()
                 }
-                withAnimation { currentStep = 6 }  // Skip step 4 (indicator step) and step 5 (encryption step)
+                withAnimation { currentStep = 4 }  // Go to menu bar icon step
             }) {
                 Text("Continue")
                     .font(.retraceHeadline)
@@ -232,61 +236,39 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
             .disabled(!hasScreenRecordingPermission || !hasAccessibilityPermission)
 
-        // case 4: - COMMENTED OUT - Screen Recording Indicator step not needed for now
-        //     // Screen Recording Indicator - starts recording when user continues
-        //     Button(action: {
-        //         Task {
-        //             try? await coordinator.startPipeline()
-        //         }
-        //         withAnimation { currentStep = 5 }
-        //     }) {
-        //         Text("Continue")
-        //             .font(.retraceHeadline)
-        //             .foregroundColor(.white)
-        //             .padding(.horizontal, .spacingL)
-        //             .padding(.vertical, .spacingM)
-        //             .background(Color.retraceAccent)
-        //             .cornerRadius(.cornerRadiusM)
-        //     }
-        //     .buttonStyle(.plain)
+        case 4:
+            // Menu bar icon info
+            Button(action: { withAnimation { currentStep = 5 } }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
 
-        // case 5: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
-        //     // Encryption - requires selection
-        //     Button(action: {
-        //         print("[ONBOARDING] Encryption step - Continue button clicked")
-        //         print("[ONBOARDING] encryptionEnabled = \(encryptionEnabled ?? false)")
-        //
-        //         UserDefaults.standard.set(encryptionEnabled ?? false, forKey: "encryptionEnabled")
-        //
-        //         if encryptionEnabled == true {
-        //             print("[ONBOARDING] Setting up encryption keychain...")
-        //             do {
-        //                 try DatabaseManager.setupEncryptionKeychain()
-        //                 print("[ONBOARDING] Keychain setup complete, now verifying...")
-        //
-        //                 // Immediately verify we can read it back
-        //                 // This triggers the keychain access prompt in context, right after enabling encryption
-        //                 _ = try DatabaseManager.verifyEncryptionKeychain()
-        //                 print("[ONBOARDING] ✅ Encryption keychain setup and verified successfully")
-        //             } catch {
-        //                 print("[ONBOARDING] ❌ Failed to setup encryption keychain: \(error)")
-        //             }
-        //         } else {
-        //             print("[ONBOARDING] Encryption disabled, skipping keychain setup")
-        //         }
-        //
-        //         withAnimation { currentStep = 6 }
-        //     }) {
-        //         Text("Continue")
-        //             .font(.retraceHeadline)
-        //             .foregroundColor(.white)
-        //             .padding(.horizontal, .spacingL)
-        //             .padding(.vertical, .spacingM)
-        //             .background(encryptionEnabled != nil ? Color.retraceAccent : Color.retraceSecondaryColor)
-        //             .cornerRadius(.cornerRadiusM)
-        //     }
-        //     .buttonStyle(.plain)
-        //     .disabled(encryptionEnabled == nil)
+        case 5:
+            // Launch at login - save setting and continue
+            Button(action: {
+                setLaunchAtLogin(enabled: launchAtLogin)
+                let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+                defaults.set(launchAtLogin, forKey: "launchAtLogin")
+                withAnimation { currentStep = 6 }
+            }) {
+                Text("Continue")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, .spacingL)
+                    .padding(.vertical, .spacingM)
+                    .background(Color.retraceAccent)
+                    .cornerRadius(.cornerRadiusM)
+            }
+            .buttonStyle(.plain)
+
+        // case 6: - COMMENTED OUT - Screen Recording Indicator step not needed for now
+        // case 7: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
 
         case 6:
             // Rewind data - requires selection if data exists
@@ -340,7 +322,7 @@ public struct OnboardingView: View {
             .buttonStyle(.plain)
 
         case 9:
-            // Completion - Just finish onboarding (recording already started at step 4)
+            // Completion - Just finish onboarding (recording already started at step 3)
             Button(action: {
                 // Clear saved step since onboarding is complete
                 UserDefaults.standard.removeObject(forKey: Self.onboardingStepKey)
@@ -397,9 +379,13 @@ public struct OnboardingView: View {
             creatorFeaturesStep
         case 3:
             permissionsStep
-        // case 4: - COMMENTED OUT - Screen Recording Indicator step not needed for now
+        case 4:
+            menuBarIconStep
+        case 5:
+            launchAtLoginStep
+        // case 6: - COMMENTED OUT - Screen Recording Indicator step not needed for now
         //     screenRecordingIndicatorStep
-        // case 5: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
+        // case 7: - COMMENTED OUT - Encryption step removed (no reliable encrypt/decrypt migration)
         //     encryptionStep
         case 6:
             rewindDataStep
@@ -637,6 +623,224 @@ public struct OnboardingView: View {
             }
             .padding(.horizontal, .spacingXL)
             .frame(maxWidth: 500)
+
+            Spacer()
+        }
+    }
+
+    // MARK: - Menu Bar Icon Step
+
+    private var menuBarIconStep: some View {
+        VStack(spacing: .spacingXL) {
+            Spacer()
+
+            Text("Menu Bar Icon")
+                .font(.retraceDisplay3)
+                .foregroundColor(.retracePrimary)
+
+            Text("Look for this icon in your menu bar")
+                .font(.retraceBody)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
+
+            // Menu bar mockup
+            menuBarMockup
+                .frame(height: 100)
+                .padding(.horizontal, .spacingXL)
+
+            VStack(spacing: .spacingM) {
+                Text("The Retrace icon lives in your menu bar while the app is running.")
+                    .font(.retraceBody)
+                    .foregroundColor(.retracePrimary)
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: .spacingM) {
+                    // Recording state indicator
+                    HStack(spacing: .spacingS) {
+                        menuBarIconView(recording: true)
+                            .frame(width: 30, height: 20)
+                        Text("Recording")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                    }
+
+                    Text("•")
+                        .foregroundColor(.retraceSecondary)
+
+                    // Paused state indicator
+                    HStack(spacing: .spacingS) {
+                        menuBarIconView(recording: false)
+                            .frame(width: 30, height: 20)
+                        Text("Paused")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                    }
+                }
+                .padding(.top, .spacingS)
+
+                Text("The left triangle fills in when recording is active.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, .spacingXL)
+            .frame(maxWidth: 500)
+
+            Spacer()
+        }
+    }
+
+    /// Mockup of the macOS menu bar with the Retrace icon
+    private var menuBarMockup: some View {
+        VStack(spacing: 0) {
+            // Menu bar background
+            HStack(spacing: .spacingM) {
+                Spacer()
+
+                // Other menu bar icons (mockup)
+                Image(systemName: "wifi")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
+
+                Image(systemName: "battery.75")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
+
+                // Retrace icon - highlighted
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.retraceAccent.opacity(0.2))
+                        .frame(width: 36, height: 24)
+
+                    menuBarIconView(recording: true)
+                        .frame(width: 26, height: 18)
+                }
+
+                // Clock mockup
+                Text("12:34")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
+
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
+            }
+            .padding(.horizontal, .spacingL)
+            .padding(.vertical, .spacingS)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.retraceSecondaryBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(Color.retraceBorder, lineWidth: 1)
+                    )
+            )
+
+            // Arrow pointing to the icon
+            Image(systemName: "arrow.up")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(.retraceAccent)
+                .padding(.top, .spacingS)
+        }
+    }
+
+    /// SwiftUI recreation of the menu bar icon (matching MenuBarManager)
+    private func menuBarIconView(recording: Bool) -> some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let height = geometry.size.height
+            let triangleHeight = height * 0.75
+            let triangleWidth = width * 0.36
+            let verticalCenter = height / 2
+            let gap = width * 0.14
+
+            // Left triangle - Points left ◁ (recording indicator)
+            Path { path in
+                let leftTip = width * 0.09
+                let leftBase = leftTip + triangleWidth
+                path.move(to: CGPoint(x: leftTip, y: verticalCenter))
+                path.addLine(to: CGPoint(x: leftBase, y: verticalCenter - triangleHeight / 2))
+                path.addLine(to: CGPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
+                path.closeSubpath()
+            }
+            .fill(recording ? Color.retracePrimary : Color.clear)
+            .overlay(
+                Path { path in
+                    let leftTip = width * 0.09
+                    let leftBase = leftTip + triangleWidth
+                    path.move(to: CGPoint(x: leftTip, y: verticalCenter))
+                    path.addLine(to: CGPoint(x: leftBase, y: verticalCenter - triangleHeight / 2))
+                    path.addLine(to: CGPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
+                    path.closeSubpath()
+                }
+                .stroke(Color.retracePrimary, lineWidth: 1.2)
+            )
+
+            // Right triangle - Points right ▷ (always outlined)
+            Path { path in
+                let leftTip = width * 0.09
+                let leftBase = leftTip + triangleWidth
+                let rightBase = leftBase + gap
+                let rightTip = rightBase + triangleWidth
+                path.move(to: CGPoint(x: rightTip, y: verticalCenter))
+                path.addLine(to: CGPoint(x: rightBase, y: verticalCenter - triangleHeight / 2))
+                path.addLine(to: CGPoint(x: rightBase, y: verticalCenter + triangleHeight / 2))
+                path.closeSubpath()
+            }
+            .stroke(Color.retracePrimary, lineWidth: 1.2)
+        }
+    }
+
+    // MARK: - Step 5: Launch at Login
+
+    private var launchAtLoginStep: some View {
+        VStack(spacing: .spacingXL) {
+            Spacer()
+
+            // Icon
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.retraceAccent.opacity(0.3), Color.retraceDeepBlue],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 100, height: 100)
+
+                Image(systemName: "power")
+                    .font(.system(size: 40, weight: .medium))
+                    .foregroundColor(.retracePrimary)
+            }
+
+            Text("Launch at Login")
+                .font(.retraceDisplay3)
+                .foregroundColor(.retracePrimary)
+
+            Text("We recommend launching Retrace at login so it's always running in the background, but you can turn this off if you prefer.")
+                .font(.retraceBody)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, .spacingXL)
+                .frame(maxWidth: 500)
+
+            // Toggle
+            HStack(spacing: .spacingM) {
+                Toggle("", isOn: $launchAtLogin)
+                    .toggleStyle(SwitchToggleStyle(tint: Color.retraceAccent))
+                    .labelsHidden()
+
+                Text(launchAtLogin ? "Launch at login enabled" : "Launch at login disabled")
+                    .font(.retraceBody)
+                    .foregroundColor(launchAtLogin ? .retracePrimary : .retraceSecondary)
+            }
+            .padding(.vertical, .spacingM)
+
+            Text("You can always change this later in Settings.")
+                .font(.retraceCaption)
+                .foregroundColor(.retraceSecondary)
+                .multilineTextAlignment(.center)
 
             Spacer()
         }
@@ -1439,6 +1643,27 @@ public struct OnboardingView: View {
             Image(systemName: "rectangle.inset.filled.and.person.filled")
                 .font(.retraceDisplay2)
                 .foregroundColor(.white)
+        }
+    }
+
+    // MARK: - Helper Functions
+
+    /// Enable or disable launch at login using SMAppService (macOS 13+)
+    private func setLaunchAtLogin(enabled: Bool) {
+        do {
+            if enabled {
+                if SMAppService.mainApp.status == .enabled {
+                    return
+                }
+                try SMAppService.mainApp.register()
+            } else {
+                guard case SMAppService.Status.enabled = SMAppService.mainApp.status else {
+                    return
+                }
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            Log.error("[OnboardingView] Failed to \(enabled ? "enable" : "disable") launch at login: \(error)", category: .ui)
         }
     }
 

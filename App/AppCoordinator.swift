@@ -1164,6 +1164,17 @@ public actor AppCoordinator {
         try await services.storage.getTotalStorageUsed()
     }
 
+    /// Get total captured duration across all Retrace segments in seconds
+    /// Only counts time captured by Retrace (excludes imported Rewind data)
+    public func getTotalCapturedDuration() async throws -> TimeInterval {
+        try await services.database.getTotalCapturedDuration()
+    }
+
+    /// Get captured duration for Retrace segments starting after a given date
+    public func getCapturedDurationAfter(date: Date) async throws -> TimeInterval {
+        try await services.database.getCapturedDurationAfter(date: date)
+    }
+
     /// Get distinct hours for a specific date that have frames
     public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
         try await services.database.getDistinctHoursForDate(date)

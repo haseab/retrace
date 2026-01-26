@@ -18,6 +18,8 @@ public struct SettingsView: View {
     @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = false
     @AppStorage("showMenuBarIcon", store: settingsStore) private var showMenuBarIcon = true
     @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = .auto
+    @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = "blue"
+    @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = true
 
     // Keyboard shortcuts
     @State private var timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
@@ -35,6 +37,7 @@ public struct SettingsView: View {
 
     // Storage settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = 0 // 0 = forever
+    @State private var retentionSettingChanged = false
     @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = 50.0
     @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = true
@@ -118,7 +121,7 @@ public struct SettingsView: View {
         .frame(minWidth: 900, minHeight: 650)
         .background(
             ZStack {
-                Color.retraceBackground
+                themeBaseBackground
 
                 // Subtle gradient orb
                 Circle()
@@ -135,6 +138,21 @@ public struct SettingsView: View {
                     .blur(radius: 80)
             }
         )
+    }
+
+    /// Theme-aware base background color
+    /// Gold theme uses a warmer, darker tone that complements gold better than blue
+    private var themeBaseBackground: Color {
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+
+        switch theme {
+        case .gold:
+            // Warm dark brown/slate that complements gold
+            return Color(red: 15/255, green: 12/255, blue: 8/255)
+        default:
+            // Default deep blue for all other themes
+            return Color.retraceBackground
+        }
     }
 
     // MARK: - Sidebar
@@ -249,6 +267,8 @@ public struct SettingsView: View {
                         captureSettings
                     case .storage:
                         storageSettings
+                    case .exportData:
+                        exportDataSettings
                     case .privacy:
                         privacySettings
                     case .advanced:
@@ -401,21 +421,58 @@ public struct SettingsView: View {
             }
 
             ModernSettingsCard(title: "Appearance", icon: "paintbrush") {
-                VStack(alignment: .leading, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Font Style")
-                            .font(.retraceCalloutMedium)
-                            .foregroundColor(.retracePrimary)
+                VStack(alignment: .leading, spacing: 24) {
+                    // Font Style Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Font Style")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
 
-                        Text("Changes require restarting the app to fully apply")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
+                            Text("Changes require restarting the app to fully apply")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        FontStylePicker(selection: Binding(
+                            get: { RetraceFont.currentStyle },
+                            set: { RetraceFont.currentStyle = $0 }
+                        ))
                     }
 
-                    FontStylePicker(selection: Binding(
-                        get: { RetraceFont.currentStyle },
-                        set: { RetraceFont.currentStyle = $0 }
-                    ))
+                    Divider()
+                        .background(Color.retraceBorder)
+
+                    // Tier Theme Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Accent Color")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+
+                            Text("Choose your preferred color theme")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        ColorThemePicker(
+                            selection: Binding(
+                                get: {
+                                    MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
+                                },
+                                set: { newValue in
+                                    colorThemePreference = newValue.rawValue
+                                    MilestoneCelebrationManager.setColorThemePreference(newValue)
+                                }
+                            )
+                        )
+                    }
+
+                    ModernToggleRow(
+                        title: "Timeline colored button borders",
+                        subtitle: "Show accent-colored borders on timeline control buttons",
+                        isOn: $timelineColoredBorders
+                    )
                 }
             }
         }
@@ -644,9 +701,19 @@ public struct SettingsView: View {
             ModernSettingsCard(title: "Retention Policy", icon: "calendar.badge.clock") {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
-                        Text("Keep recordings for")
-                            .font(.retraceCalloutMedium)
-                            .foregroundColor(.retracePrimary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Keep recordings for")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            if useRewindData {
+                                (Text("Only applies to Retrace data, not Rewind data. To remove Rewind data, go to ")
+                                    .foregroundColor(.retraceSecondary) +
+                                Text("Export & Data")
+                                    .foregroundColor(.retraceAccent)
+                                    .underline())
+                                    .font(.retraceCaption)
+                            }
+                        }
                         Spacer()
                         Text(retentionDisplayText)
                             .font(.retraceCalloutBold)
@@ -658,6 +725,24 @@ public struct SettingsView: View {
                     }
 
                     RetentionPolicyPicker(selectedDays: $retentionDays)
+                        .onChange(of: retentionDays) { _ in
+                            retentionSettingChanged = true
+                        }
+
+                    if retentionSettingChanged {
+                        HStack {
+                            Text("Restart the app to apply changes")
+                                .font(.retraceCaption)
+                                .foregroundColor(.retraceSecondary)
+                            Spacer()
+                            Button("Restart") {
+                                restartApp()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.retraceAccent)
+                            .controlSize(.small)
+                        }
+                    }
                 }
             }
 
@@ -731,6 +816,14 @@ public struct SettingsView: View {
                     updateDeduplicationSetting(enabled: newValue)
                 }
             }
+        }
+    }
+
+    // MARK: - Export & Data Settings
+
+    private var exportDataSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // TODO: Add export and data management options
         }
     }
 
@@ -1579,6 +1672,55 @@ private struct FontStylePicker: View {
     }
 }
 
+// MARK: - Color Theme Picker
+
+private struct ColorThemePicker: View {
+    @Binding var selection: MilestoneCelebrationManager.ColorTheme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(MilestoneCelebrationManager.ColorTheme.allCases) { theme in
+                themeOptionButton(for: theme)
+            }
+        }
+        .padding(6)
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(12)
+    }
+
+    @ViewBuilder
+    private func themeOptionButton(for theme: MilestoneCelebrationManager.ColorTheme) -> some View {
+        let isSelected = selection == theme
+
+        Button(action: {
+            selection = theme
+        }) {
+            VStack(spacing: 8) {
+                // Color swatch preview
+                Circle()
+                    .fill(theme.glowColor)
+                    .frame(width: 32, height: 32)
+
+                Text(theme.displayName)
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(isSelected ? .retracePrimary : .retraceSecondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isSelected ? Color.white.opacity(0.08) : Color.clear)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isSelected ? theme.glowColor.opacity(0.5) : Color.clear, lineWidth: 1.5)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Capture Interval Picker
 
 private struct CaptureIntervalPicker: View {
@@ -1779,6 +1921,16 @@ extension SettingsView {
         }
     }
 
+    func restartApp() {
+        let url = URL(fileURLWithPath: Bundle.main.resourcePath!)
+        let path = url.deletingLastPathComponent().deletingLastPathComponent().absoluteString
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = [path]
+        task.launch()
+        NSApp.terminate(nil)
+    }
+
     func resetAllSettings() {
         // Reset all UserDefaults to their default values
         let domain = "io.retrace.app"
@@ -1835,6 +1987,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
     case capture = "Capture"
     case storage = "Storage"
+    case exportData = "Export & Data"
     case privacy = "Privacy"
     // case search = "Search"  // TODO: Add Search settings later
     case advanced = "Advanced"
@@ -1846,6 +1999,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return "gearshape"
         case .capture: return "video"
         case .storage: return "externaldrive"
+        case .exportData: return "square.and.arrow.up"
         case .privacy: return "lock.shield"
         // case .search: return "magnifyingglass"
         case .advanced: return "wrench.and.screwdriver"
@@ -1857,6 +2011,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return "Startup, appearance, and shortcuts"
         case .capture: return "Frame rate, resolution, and display options"
         case .storage: return "Retention, limits, and compression"
+        case .exportData: return "Export and manage your data"
         case .privacy: return "Encryption, exclusions, and permissions"
         // case .search: return "Search behavior and ranking"
         case .advanced: return "Database, encoding, and developer tools"
@@ -1868,6 +2023,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: return .retraceAccentGradient
         case .capture: return .retracePurpleGradient
         case .storage: return .retraceOrangeGradient
+        case .exportData: return .retraceAccentGradient
         case .privacy: return .retraceGreenGradient
         // case .search: return .retraceAccentGradient
         case .advanced: return .retracePurpleGradient

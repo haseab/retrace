@@ -645,6 +645,22 @@ public actor DatabaseManager: DatabaseProtocol {
         try AppSegmentQueries.delete(db: db, id: id)
     }
 
+    /// Get total captured duration across all segments in seconds
+    public func getTotalCapturedDuration() async throws -> TimeInterval {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getTotalCapturedDuration(db: db)
+    }
+
+    /// Get captured duration for segments starting after a given date
+    public func getCapturedDurationAfter(date: Date) async throws -> TimeInterval {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getCapturedDurationAfter(db: db, date: date)
+    }
+
     // MARK: - Tag Operations
 
     /// Get all tags
