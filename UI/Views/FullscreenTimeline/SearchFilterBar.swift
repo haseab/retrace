@@ -185,12 +185,17 @@ public struct SearchFilterBar: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .task {
-            // Load available apps and tags when the filter bar appears
-            await viewModel.loadAvailableApps()
+            // Load available tags when the filter bar appears (lightweight)
             await viewModel.loadAvailableTags()
         }
-        .onChange(of: showAppsDropdown) { _ in
+        .onChange(of: showAppsDropdown) { isOpen in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+            // Lazy load apps only when dropdown is opened
+            if isOpen {
+                Task {
+                    await viewModel.loadAvailableApps()
+                }
+            }
         }
         .onChange(of: showDatePopover) { _ in
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown

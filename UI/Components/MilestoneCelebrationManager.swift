@@ -117,7 +117,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
                 Now that we've been acquainted for 3 years, please dm me on twitter. I wanna know your name. I wanna chat about what got into you to want to use this product for 3+ years.
 
-                You dropped your crown king 🫴👑
+                You dropped your crown, king 🫴👑
                 """
             }
         }

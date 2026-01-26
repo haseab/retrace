@@ -430,11 +430,14 @@ public class TimelineWindowController: NSObject {
         // Cmd+F to toggle search overlay
         if event.keyCode == 3 && modifiers == [.command] { // F key with Command
             if let viewModel = timelineViewModel {
-                // Clear search highlight when opening search overlay
-                if !viewModel.isSearchOverlayVisible {
-                    viewModel.clearSearchHighlight()
-                }
+                let wasVisible = viewModel.isSearchOverlayVisible
                 viewModel.isSearchOverlayVisible.toggle()
+                // Clear search highlight asynchronously when opening search overlay
+                if !wasVisible {
+                    Task { @MainActor in
+                        viewModel.clearSearchHighlight()
+                    }
+                }
             }
             return true
         }

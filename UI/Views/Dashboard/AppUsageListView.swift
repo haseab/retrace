@@ -232,11 +232,13 @@ struct AppUsageListView: View {
                         VStack(spacing: 0) {
                             appUsageRow(index: index, app: app, layoutSize: layoutSize)
 
-                            // Expandable window rows
+                            // Expandable window rows - content clips within its container
                             if expandedAppBundleID == app.appBundleID {
                                 windowRowsSection(for: app, layoutSize: layoutSize)
+                                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                             }
                         }
+                        .clipped()
                     }
 
                     // Load More button (only show if there are more apps to display)
@@ -298,7 +300,7 @@ struct AppUsageListView: View {
         }
         .padding(.top, 4)
         .padding(.bottom, 8)
-        .transition(.opacity.combined(with: .move(edge: .top)))
+        .clipped()
     }
 
     // MARK: - Window Load More Button

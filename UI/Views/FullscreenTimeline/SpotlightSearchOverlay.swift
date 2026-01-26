@@ -132,12 +132,7 @@ public struct SpotlightSearchOverlay: View {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                 isVisible = true
             }
-            // Focus the search field immediately
             isSearchFocused = true
-        }
-        .task {
-            // Preload available apps in background so they're ready when user clicks the filter
-            await viewModel.loadAvailableApps()
         }
         .onChange(of: isVisible) { visible in
             // Ensure focus when overlay becomes visible

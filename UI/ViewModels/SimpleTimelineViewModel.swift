@@ -1424,11 +1424,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Dismiss filter panel (resets pending to match applied)
     public func dismissFilterPanel() {
-        // Reset pending first, then animate the visibility change
+        // Reset pending first - animation is handled by the View
         pendingFilterCriteria = filterCriteria
-        withAnimation(.easeOut(duration: 0.15)) {
-            isFilterPanelVisible = false
-        }
+        isFilterPanelVisible = false
     }
 
     /// Open filter panel and load necessary data
@@ -1437,12 +1435,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         dismissTimelineContextMenu()
         // Initialize pending with current applied filters
         pendingFilterCriteria = filterCriteria
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            isFilterPanelVisible = true
-        }
-        // Delay data loading until after animation completes to prevent choppiness
+        // Set visible immediately - animation is handled by the View
+        isFilterPanelVisible = true
+        // Load data asynchronously to avoid blocking UI
         Task {
-            try? await Task.sleep(nanoseconds: 400_000_000) // 0.4s - after animation
             await loadAvailableAppsForFilter()
             await loadTags()
             await loadHiddenSegments()

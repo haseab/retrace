@@ -514,10 +514,12 @@ struct SearchButton: View {
 
     var body: some View {
         Button(action: {
-            // Dismiss right-click context menu if open
             viewModel.dismissContextMenu()
-            viewModel.clearSearchHighlight()
+            // Set overlay visible immediately, clear highlight asynchronously to avoid blocking
             viewModel.isSearchOverlayVisible = true
+            Task { @MainActor in
+                viewModel.clearSearchHighlight()
+            }
         }) {
             HStack(spacing: TimelineScaleFactor.iconSpacing) {
                 Image(systemName: "magnifyingglass")

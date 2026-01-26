@@ -140,7 +140,7 @@ struct MilestoneCelebrationView: View {
                         .scaleEffect(showTitle ? 1 : 0.8)
                 }
             }
-            .padding(.vertical, milestone == .tenThousandHours ? 32 : (milestone == .thousandHours ? 24 : 0))
+            .padding(.vertical, milestone == .tenThousandHours ? 16 : (milestone == .thousandHours ? 24 : 0))
             .offset(y: milestone == .tenThousandHours ? -10 : 0)
         }
         .animation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true), value: glowPulse)

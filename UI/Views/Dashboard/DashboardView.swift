@@ -606,7 +606,7 @@ public struct DashboardView: View {
         if viewModel.isRecording {
             return isHoveringRecordingIndicator ? "Pause" : "Recording"
         } else {
-            return isHoveringRecordingIndicator ? "Start Recording" : "Off"
+            return isHoveringRecordingIndicator ? "Start Rec." : "Off"
         }
     }
 
