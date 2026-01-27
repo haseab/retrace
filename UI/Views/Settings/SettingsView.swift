@@ -685,10 +685,9 @@ public struct SettingsView: View {
                                     // Increment data source version to invalidate timeline cache
                                     // This ensures any cached frames are discarded when timeline reopens
                                     await MainActor.run {
-                                        SimpleTimelineViewModel.incrementDataSourceVersion()
-                                        // Also clear persisted search cache so search results are cleared
+                                        // Clear persisted search cache so search results are cleared
                                         SearchViewModel.clearPersistedSearchCache()
-                                        // Also notify any live timeline instances
+                                        // Notify any live timeline instances to reload
                                         NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
                                         Log.debug("[SettingsView] dataSourceDidChange notification posted", category: .ui)
                                     }
@@ -2189,8 +2188,8 @@ extension SettingsView {
                             success: true,
                             message: "Deleted \(result.deletedFrames) frames from the \(option.displayName)"
                         )
-                        // Invalidate timeline cache so deleted frames don't appear
-                        SimpleTimelineViewModel.incrementDataSourceVersion()
+                        // Notify timeline to reload so deleted frames don't appear
+                        NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
                     } else {
                         deleteResult = DeleteResultInfo(
                             success: true,

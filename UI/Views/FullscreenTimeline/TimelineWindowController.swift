@@ -363,8 +363,9 @@ public class TimelineWindowController: NSObject {
                 self?.startBackgroundRefreshTimer()
 
                 // Immediately refresh frame data so next open has fresh data
+                // Use navigateToNewest: false to preserve user's position within the 2-minute grace period
                 if let viewModel = self?.timelineViewModel {
-                    await viewModel.refreshFrameData()
+                    await viewModel.refreshFrameData(navigateToNewest: false)
                 }
 
                 self?.onClose?()
@@ -445,17 +446,17 @@ public class TimelineWindowController: NSObject {
     }
 
 
-    /// Save the current position for cross-session persistence (call on app termination)
-    public func savePositionForTermination() {
-        Log.info("[TIMELINE-PRERENDER] 💾 savePositionForTermination() called", category: .ui)
-        timelineViewModel?.savePosition()
+    /// Save state for cross-session persistence (call on app termination)
+    public func saveStateForTermination() {
+        Log.info("[TIMELINE-PRERENDER] 💾 saveStateForTermination() called", category: .ui)
+        timelineViewModel?.saveState()
     }
 
     /// Completely destroy the pre-rendered window (call when memory pressure is high or app is terminating)
     public func destroyPreparedWindow() {
         Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
-        // Save position before destroying for cross-session persistence
-        timelineViewModel?.savePosition()
+        // Save state before destroying for cross-session persistence
+        timelineViewModel?.saveState()
 
         window?.orderOut(nil)
         hostingView?.removeFromSuperview()

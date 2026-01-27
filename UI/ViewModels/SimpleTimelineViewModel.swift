@@ -651,39 +651,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var navigationCounter: Int = 0
     private static let memoryLogInterval = 50  // Log memory state every 50 navigations
 
-    // MARK: - Position Cache (for restoring position on reopen)
-
-    /// Key for storing cached position timestamp in UserDefaults
-    private static let cachedPositionTimestampKey = "timeline.cachedPositionTimestamp"
-    /// Key for storing when the cache was saved
-    private static let cachedPositionSavedAtKey = "timeline.cachedPositionSavedAt"
-    /// Key for storing the cached current index
-    private static let cachedCurrentIndexKey = "timeline.cachedCurrentIndex"
-    /// Cache version - increment when data structure changes to invalidate old caches
-    private static let cacheVersion = 2  // v2: Added optimized frame queries with video info
-    private static let cacheVersionKey = "timeline.cacheVersion"
-    /// Key for tracking data source changes (Rewind toggle, etc.)
-    private static let dataSourceVersionKey = "timeline.dataSourceVersion"
-    /// Key for tracking when data was last cached (to compare with data source version)
-    private static let cachedDataSourceVersionKey = "timeline.cachedDataSourceVersion"
-    /// How long the cached position remains valid (2 minutes)
-    private static let cacheExpirationSeconds: TimeInterval = 120
-
-    /// File path for cached frames data
-    private static nonisolated var cachedFramesPath: URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        return cacheDir.appendingPathComponent("timeline_frames_cache.json")
-    }
-
-    /// Key for storing cached hidden segment IDs
-    private static let cachedHiddenSegmentIdsKey = "timeline.cachedHiddenSegmentIds"
-
     // MARK: - Filter Cache Keys
 
     /// Key for storing cached filter criteria
     private static let cachedFilterCriteriaKey = "timeline.cachedFilterCriteria"
     /// Key for storing when filter cache was saved
     private static let cachedFilterSavedAtKey = "timeline.cachedFilterSavedAt"
+    /// How long the cached filter criteria remains valid (2 minutes)
+    private static let filterCacheExpirationSeconds: TimeInterval = 120
 
     // MARK: - Dependencies
 
@@ -725,10 +700,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         let hadAppBlocks = _cachedAppBlocks != nil
         _cachedAppBlocks = nil
         Log.debug("[DataSourceChange] Cleared app blocks cache (had cached: \(hadAppBlocks))", category: .ui)
-
-        // Clear position cache
-        clearCachedPosition()
-        Log.debug("[DataSourceChange] Cleared position cache", category: .ui)
 
         // Clear search results (data source changed, results may no longer be valid)
         Log.debug("[DataSourceChange] Clearing search results", category: .ui)
@@ -1588,54 +1559,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Position Cache Methods
+    // MARK: - State Cache Methods
 
-    /// Save the current playhead position AND frames to cache for instant restore
-    public func savePosition() {
-        Log.debug("[PositionCache] savePosition() called", category: .ui)
+    /// Save search and filter state for app termination
+    public func saveState() {
+        Log.debug("[StateCache] saveState() called", category: .ui)
 
-        // Always save search results, even if timeline has no frames
+        // Save search results
         searchViewModel.saveSearchResults()
 
         // Save filter criteria
         saveFilterCriteria()
-
-        guard let timestamp = currentTimestamp else { return }
-        guard !frames.isEmpty else { return }
-
-        // Don't cache frames if viewing hidden segments (non-default filter)
-        // These frames wouldn't match the default view on next launch
-        let isViewingHiddenSegments = filterCriteria.hiddenFilter != .hide
-        if isViewingHiddenSegments {
-            Log.debug("[PositionCache] Skipping frame cache - viewing hidden segments (filter: \(filterCriteria.hiddenFilter.rawValue))", category: .ui)
-            // Clear any existing cached frames to avoid stale data
-            clearCachedFrames()
-            return
-        }
-
-        // Save timestamp, index, and version to UserDefaults
-        UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
-        UserDefaults.standard.set(currentIndex, forKey: Self.cachedCurrentIndexKey)
-        UserDefaults.standard.set(Self.cacheVersion, forKey: Self.cacheVersionKey)
-        // Save current data source version so we can detect changes
-        let currentDataSourceVersion = UserDefaults.standard.integer(forKey: Self.dataSourceVersionKey)
-        UserDefaults.standard.set(currentDataSourceVersion, forKey: Self.cachedDataSourceVersionKey)
-
-        // Save frames to disk (JSON file) - do this async to not block the main thread
-        Task.detached(priority: .utility) { [frames] in
-            do {
-                // Convert TimelineFrame to FrameWithVideoInfo for encoding
-                let framesWithVideoInfo = frames.map { FrameWithVideoInfo(frame: $0.frame, videoInfo: $0.videoInfo) }
-                let data = try JSONEncoder().encode(framesWithVideoInfo)
-                try data.write(to: Self.cachedFramesPath)
-                Log.debug("[PositionCache] Saved \(frames.count) frames to cache (\(data.count / 1024)KB)", category: .ui)
-            } catch {
-                Log.warning("[PositionCache] Failed to save frames: \(error)", category: .ui)
-            }
-        }
-
-        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)", category: .ui)
     }
 
     /// Save filter criteria to cache
@@ -1669,8 +1603,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: savedAt))
-        guard elapsed < Self.cacheExpirationSeconds else {
-            Log.info("[FilterCache] Cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s), clearing", category: .ui)
+        guard elapsed < Self.filterCacheExpirationSeconds else {
+            Log.info("[FilterCache] Cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.filterCacheExpirationSeconds))s), clearing", category: .ui)
             clearCachedFilterCriteria()
             return
         }
@@ -1696,210 +1630,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.cachedFilterSavedAtKey)
     }
 
-    /// Get the cached frames if they exist and haven't expired
-    private func getCachedFrames() -> (frames: [TimelineFrame], currentIndex: Int)? {
-        // Check cache version first - invalidate if version mismatch
-        let cachedVersion = UserDefaults.standard.integer(forKey: Self.cacheVersionKey)
-        if cachedVersion != Self.cacheVersion {
-            Log.debug("[PositionCache] Cache version mismatch (cached: \(cachedVersion), current: \(Self.cacheVersion)) - invalidating", category: .ui)
-            clearCachedPosition()
-            return nil
-        }
-
-        // Check if data source changed since cache was saved (e.g., Rewind toggled)
-        let currentDataSourceVersion = UserDefaults.standard.integer(forKey: Self.dataSourceVersionKey)
-        let cachedDataSourceVersion = UserDefaults.standard.integer(forKey: Self.cachedDataSourceVersionKey)
-        if currentDataSourceVersion != cachedDataSourceVersion {
-            Log.info("[PositionCache] Data source version changed (cached: \(cachedDataSourceVersion), current: \(currentDataSourceVersion)) - invalidating cache", category: .ui)
-            clearCachedPosition()
-            return nil
-        }
-
-        // Check if filters have changed - don't use cache if filters are active
-        // (cached frames might not match current filter criteria)
-        if filterCriteria.hasActiveFilters {
-            Log.debug("[PositionCache] Filters are active - skipping frame cache", category: .ui)
-            return nil
-        }
-
-        let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
-        guard savedAt > 0 else { return nil }
-
-        let savedAtDate = Date(timeIntervalSince1970: savedAt)
-        let elapsed = Date().timeIntervalSince(savedAtDate)
-
-        // Check if cache has expired
-        if elapsed > Self.cacheExpirationSeconds {
-            Log.info("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s)", category: .ui)
-            clearCachedPosition()
-            return nil
-        }
-
-        // Load cached current index
-        let cachedIndex = UserDefaults.standard.integer(forKey: Self.cachedCurrentIndexKey)
-
-        // Load cached frames from disk
-        do {
-            let data = try Data(contentsOf: Self.cachedFramesPath)
-            let framesWithVideoInfo = try JSONDecoder().decode([FrameWithVideoInfo].self, from: data)
-
-            guard !framesWithVideoInfo.isEmpty else { return nil }
-
-            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
-            let validIndex = max(0, min(cachedIndex, timelineFrames.count - 1))
-
-            Log.debug("[PositionCache] Loaded \(timelineFrames.count) cached frames (saved \(Int(elapsed))s ago)", category: .ui)
-            return (frames: timelineFrames, currentIndex: validIndex)
-        } catch {
-            Log.warning("[PositionCache] Failed to load cached frames: \(error)", category: .ui)
-            return nil
-        }
-    }
-
-    /// Get the cached position (timestamp only) if it exists and hasn't expired
-    /// This is the fallback if frame cache is not available
-    private func getCachedPosition() -> Date? {
-        let savedAt = UserDefaults.standard.double(forKey: Self.cachedPositionSavedAtKey)
-        guard savedAt > 0 else { return nil }
-
-        let savedAtDate = Date(timeIntervalSince1970: savedAt)
-        let elapsed = Date().timeIntervalSince(savedAtDate)
-
-        // Check if cache has expired
-        if elapsed > Self.cacheExpirationSeconds {
-            Log.info("[PositionCache] Timestamp cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s)", category: .ui)
-            clearCachedPosition()
-            return nil
-        }
-
-        let cachedTimestamp = UserDefaults.standard.double(forKey: Self.cachedPositionTimestampKey)
-        guard cachedTimestamp > 0 else { return nil }
-
-        let position = Date(timeIntervalSince1970: cachedTimestamp)
-        Log.debug("[PositionCache] Found valid cached position: \(position) (saved \(Int(elapsed))s ago)", category: .ui)
-        return position
-    }
-
-    /// Clear the cached position and frames
-    private func clearCachedPosition() {
-        UserDefaults.standard.removeObject(forKey: Self.cachedPositionTimestampKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedPositionSavedAtKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedCurrentIndexKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedDataSourceVersionKey)
-        UserDefaults.standard.removeObject(forKey: Self.cachedHiddenSegmentIdsKey)
-
-        // Remove cached frames file
-        try? FileManager.default.removeItem(at: Self.cachedFramesPath)
-    }
-
-    /// Clear only the cached frames file (keeps other cache metadata)
-    private func clearCachedFrames() {
-        try? FileManager.default.removeItem(at: Self.cachedFramesPath)
-    }
-
-    /// Restore cached hidden segment IDs for instant hatch mark display
-    private func restoreCachedHiddenSegmentIds() {
-        guard let cachedIds = UserDefaults.standard.array(forKey: Self.cachedHiddenSegmentIdsKey) as? [Int64] else {
-            return
-        }
-        hiddenSegmentIds = Set(cachedIds.map { SegmentID(value: $0) })
-        Log.debug("[PositionCache] Restored \(hiddenSegmentIds.count) cached hidden segment IDs", category: .ui)
-    }
-
-    /// Increment the data source version to invalidate any cached frames
-    /// Call this when data sources change (e.g., Rewind data toggled)
-    public static func incrementDataSourceVersion() {
-        let current = UserDefaults.standard.integer(forKey: dataSourceVersionKey)
-        let newVersion = current + 1
-        UserDefaults.standard.set(newVersion, forKey: dataSourceVersionKey)
-        Log.info("[PositionCache] Data source version incremented: \(current) -> \(newVersion)", category: .ui)
-    }
-
     // MARK: - Initial Load
 
-    /// Load the most recent frame on startup, or restore to cached position if available
+    /// Load the most recent frame on startup
     public func loadMostRecentFrame() async {
         isLoading = true
         error = nil
 
-        // FIRST: Try to restore from cached frames (instant restore - no database query!)
-        if let cached = getCachedFrames() {
-            Log.debug("[PositionCache] INSTANT RESTORE: Using \(cached.frames.count) cached frames, index: \(cached.currentIndex)", category: .ui)
-
-            frames = cached.frames
-            currentIndex = cached.currentIndex
-
-            // Initialize window boundary timestamps for infinite scroll
-            updateWindowBoundaries()
-            hasMoreOlder = true
-            hasMoreNewer = true
-
-            // Clear the cache after restoring
-            clearCachedPosition()
-
-            // Also restore cached search results if any
-            searchViewModel.restoreCachedSearchResults()
-
-            // Restore cached filter criteria if any
-            restoreCachedFilterCriteria()
-
-            // NOTE: Skip restoring/loading hiddenSegmentIds - hidden segments already excluded from query
-
-            // Load image if needed for current frame
-            loadImageIfNeeded()
-
-            isLoading = false
-            return
-        }
-
         do {
-            // SECOND: Try cached position (timestamp only) - requires database query
-            if let cachedPosition = getCachedPosition() {
-                Log.debug("[PositionCache] Found cached position: \(cachedPosition), loading frames around it", category: .ui)
-
-                // Load frames around the cached position (±10 minutes window, like date search)
-                // Uses optimized query that JOINs on video table - no N+1 queries!
-                let calendar = Calendar.current
-                let startDate = calendar.date(byAdding: .minute, value: -10, to: cachedPosition) ?? cachedPosition
-                let endDate = calendar.date(byAdding: .minute, value: 10, to: cachedPosition) ?? cachedPosition
-
-                // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
-                let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
-
-                if !framesWithVideoInfo.isEmpty {
-                    // Convert to TimelineFrame - video info is already included from the JOIN
-                    frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
-
-                    // Initialize window boundary timestamps for infinite scroll
-                    updateWindowBoundaries()
-                    hasMoreOlder = true
-                    hasMoreNewer = true
-
-                    // Find the frame closest to the cached position
-                    let closestIndex = findClosestFrameIndex(to: cachedPosition)
-                    currentIndex = closestIndex
-                    Log.debug("[PositionCache] Restored to cached position, index: \(closestIndex), frame count: \(frames.count)", category: .ui)
-
-                    // Clear the cache after restoring
-                    clearCachedPosition()
-
-                    // Restore cached search results if any
-                    searchViewModel.restoreCachedSearchResults()
-
-                    // NOTE: Skip loading hiddenSegmentIds - hidden segments already excluded from query
-
-                    // Load image if needed for current frame
-                    loadImageIfNeeded()
-
-                    isLoading = false
-                    return
-                } else {
-                    Log.debug("[PositionCache] No frames found around cached position, falling back to most recent", category: .ui)
-                    clearCachedPosition()
-                }
-            }
-
-            // No cached position (or cache was empty) - load most recent frames
+            // Load most recent frames
             // Uses optimized query that JOINs on video table - no N+1 queries!
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: filterCriteria.selectedApps)), mode: \(filterCriteria.appFilterMode.rawValue)", category: .ui)

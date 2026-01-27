@@ -25,15 +25,15 @@ public struct TimelineTapeView: View {
         -(TimelineScaleFactor.controlButtonSize * 3 + TimelineScaleFactor.controlSpacing)
     }
 
-    // MARK: - Body
+    // MARK: - Body 
 
-    public var body: some View {
+    public var body: some View { 
         ZStack {
             // Background (tap to clear selection)
             Rectangle()
                 .fill(Color.clear)
                 .contentShape(Rectangle())
-                .onTapGesture {
+                .onTapGesture { 
                     viewModel.clearSelection()
                 }
 
