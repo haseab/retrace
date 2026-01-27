@@ -12,6 +12,44 @@ public class TimelineWindowController: NSObject {
 
     public static let shared = TimelineWindowController()
 
+    // MARK: - Performance Tracking
+
+    /// Tracks timing from hotkey press to animation complete
+    private var showStartTime: CFAbsoluteTime = 0
+
+    /// Path to the performance log file
+    private static let perfLogPath = URL(fileURLWithPath: "/tmp/retrace_timeline_perf.log")
+
+    /// Log detailed timing breakdown for timeline show (writes to temp file)
+    private func logShowTiming(_ checkpoint: String) {
+        guard showStartTime > 0 else { return }
+        let elapsed = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(checkpoint): \(String(format: "%.1f", elapsed))ms\n"
+
+        // Append to file
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: Self.perfLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: Self.perfLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: Self.perfLogPath)
+            }
+        }
+    }
+
+    /// Start a new performance trace (clears previous entries and logs header)
+    private func startPerfTrace() {
+        showStartTime = CFAbsoluteTimeGetCurrent()
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let header = "\n--- Timeline Show @ \(timestamp) ---\n"
+        try? header.data(using: .utf8)?.write(to: Self.perfLogPath)
+        Log.info("[TIMELINE-PERF] ⏱️ Logging to: \(Self.perfLogPath.path)", category: .ui)
+    }
+
     // MARK: - Properties
 
     private var window: NSWindow?
@@ -24,14 +62,11 @@ public class TimelineWindowController: NSObject {
     /// Whether the window has been pre-rendered and is ready to show
     private var isPrepared = false
 
-    /// The screen the pre-rendered window was created for
-    private var preparedScreen: NSScreen?
-
     /// When the timeline was last hidden (for cache expiry check)
     private var lastHiddenAt: Date?
 
-    /// Cache expiration threshold (2 minutes) - matches SimpleTimelineViewModel
-    private static let cacheExpirationSeconds: TimeInterval = 120
+    /// Timer that periodically refreshes timeline data in the background
+    private var backgroundRefreshTimer: Timer?
 
     /// Whether the timeline overlay is currently visible
     public private(set) var isVisible = false
@@ -76,6 +111,19 @@ public class TimelineWindowController: NSObject {
             try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
             prepareWindow()
         }
+
+        // Listen for display changes to reposition the hidden window
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDisplayChange(_:)),
+            name: .activeDisplayDidChange,
+            object: nil
+        )
+    }
+
+    /// Handle active display change - move hidden window to new screen
+    @objc private func handleDisplayChange(_ notification: Notification) {
+        moveWindowToMouseScreen()
     }
 
     // MARK: - Pre-rendering
@@ -97,7 +145,7 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        // Get the main screen for pre-rendering (will check mouse location on actual show)
+        // Get the main screen for pre-rendering (will move to target screen on show)
         guard let screen = NSScreen.main else {
             Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no main screen", category: .ui)
             return
@@ -135,10 +183,8 @@ public class TimelineWindowController: NSObject {
         // Store references
         self.window = window
         self.hostingView = hostingView
-        self.preparedScreen = screen
 
         // Trigger initial layout pass to pre-render the SwiftUI view hierarchy
-        // This is the key step that eliminates the delay on show()
         hostingView.layoutSubtreeIfNeeded()
         Log.info("[TIMELINE-PRERENDER] 🔄 Initial layout completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
@@ -156,9 +202,13 @@ public class TimelineWindowController: NSObject {
 
     /// Show the timeline overlay on the current screen
     public func show() {
+        // Start performance tracking
+        startPerfTrace()
+
         guard !isVisible, let coordinator = coordinator else {
             return
         }
+        logShowTiming("guard passed")
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -169,35 +219,38 @@ public class TimelineWindowController: NSObject {
         guard let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main else {
             return
         }
+        logShowTiming("screen detected")
+
+        // Don't stop the background refresh timer - let it keep running
+        // The timer callback checks isVisible and skips refresh while timeline is open
 
         // Check if we have a pre-rendered window ready
-        if isPrepared, window != nil, let viewModel = timelineViewModel {
-            // Check if we need to move to a different screen
-            let needsScreenChange = preparedScreen?.frame != targetScreen.frame
-            if needsScreenChange {
-                // Recreate the window on the correct screen
-                recreateWindowForScreen(targetScreen)
+        if isPrepared, let window = window, timelineViewModel != nil {
+            logShowTiming("using prerendered window")
+
+            // Move window to target screen if needed (instant, no recreation)
+            if window.frame != targetScreen.frame {
+                window.setFrame(targetScreen.frame, display: false)
+                logShowTiming("moved window to target screen")
             }
 
-            // Check if cache has expired (2 minutes since last hide)
-            // If expired, refresh frame data to show current state
-            // If not expired, preserve the exact playhead position
+            // Log cache state
             if let lastHidden = lastHiddenAt {
                 let elapsed = Date().timeIntervalSince(lastHidden)
-                if elapsed > Self.cacheExpirationSeconds {
-                    Task { @MainActor in
-                        await viewModel.refreshFrameData()
-                    }
-                }
+                Log.info("[TIMELINE-SHOW] Using prerendered view (hidden \(Int(elapsed))s ago)", category: .ui)
+            } else {
+                Log.info("[TIMELINE-SHOW] First show after prerender", category: .ui)
             }
 
             // Show the pre-rendered window
             showPreparedWindow(coordinator: coordinator)
             return
         }
+        logShowTiming("no prerendered window, creating new")
 
         // Fallback: Create window from scratch (original behavior)
-        let window = createWindow(for: targetScreen)
+        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
+        let newWindow = createWindow(for: targetScreen)
 
         // Create and store the view model so we can forward scroll events
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
@@ -214,14 +267,13 @@ public class TimelineWindowController: NSObject {
 
         // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
         let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = window.contentView?.bounds ?? .zero
+        hostingView.frame = newWindow.contentView?.bounds ?? .zero
         hostingView.autoresizingMask = [.width, .height]
-        window.contentView?.addSubview(hostingView)
+        newWindow.contentView?.addSubview(hostingView)
 
         // Store references
-        self.window = window
+        self.window = newWindow
         self.hostingView = hostingView
-        self.preparedScreen = targetScreen
         self.isPrepared = true
 
         // Show the window
@@ -230,19 +282,40 @@ public class TimelineWindowController: NSObject {
 
     /// Show the prepared window with animation and setup event monitors
     private func showPreparedWindow(coordinator: AppCoordinator) {
+        logShowTiming("showPreparedWindow started")
         guard let window = window else { return }
 
+        // Log current view model state before showing
+        if let viewModel = timelineViewModel {
+            let currentVideoInfo = viewModel.currentVideoInfo
+            Log.info("[TIMELINE-SHOW] 🎬 About to show window - currentIndex=\(viewModel.currentIndex), frames.count=\(viewModel.frames.count), videoPath=\(currentVideoInfo?.videoPath.suffix(30) ?? "nil"), frameIndex=\(currentVideoInfo?.frameIndex ?? -1)", category: .ui)
+        }
+
+        // Force video reload BEFORE showing window to avoid flicker
+        // This ensures AVPlayer loads fresh video data with any new frames
+        if let viewModel = timelineViewModel, viewModel.frames.count > 1 {
+            viewModel.forceVideoReload = true
+            let original = viewModel.currentIndex
+            viewModel.currentIndex = max(0, original - 1)
+            viewModel.currentIndex = original
+        }
+        logShowTiming("video reload triggered")
+
+        Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         window.makeKeyAndOrderFront(nil)
+        logShowTiming("makeKeyAndOrderFront")
 
         // Animate in
         window.alphaValue = 0
-        NSAnimationContext.runAnimationGroup({ context in
+        isVisible = true  // Set before animation so window.isVisible check works
+        NSAnimationContext.runAnimationGroup({ [weak self] context in
             context.duration = 0.2
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 1
+        }, completionHandler: { [weak self] in
+            self?.logShowTiming("✅ animation complete")
+            self?.showStartTime = 0  // Reset for next show
         })
-
-        isVisible = true
 
         // Track timeline open event
         DashboardViewModel.recordTimelineOpen(coordinator: coordinator)
@@ -257,50 +330,6 @@ public class TimelineWindowController: NSObject {
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
-    }
-
-    /// Recreate the window on a different screen (for multi-monitor support)
-    private func recreateWindowForScreen(_ screen: NSScreen) {
-        guard let coordinator = coordinator else { return }
-
-        // Clean up old window
-        window?.orderOut(nil)
-        hostingView?.removeFromSuperview()
-
-        // Create new window on the target screen
-        let newWindow = createWindow(for: screen)
-        newWindow.alphaValue = 0
-        newWindow.orderOut(nil)
-
-        // Create the view model if needed
-        if timelineViewModel == nil {
-            timelineViewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        }
-
-        guard let viewModel = timelineViewModel else { return }
-
-        // Create new SwiftUI view
-        let timelineView = SimpleTimelineView(
-            coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
-        )
-
-        // Host the SwiftUI view
-        let newHostingView = FirstMouseHostingView(rootView: timelineView)
-        newHostingView.frame = newWindow.contentView?.bounds ?? .zero
-        newHostingView.autoresizingMask = [.width, .height]
-        newWindow.contentView?.addSubview(newHostingView)
-
-        // Trigger layout
-        newHostingView.layoutSubtreeIfNeeded()
-
-        // Store references
-        self.window = newWindow
-        self.hostingView = newHostingView
-        self.preparedScreen = screen
     }
 
     /// Hide the timeline overlay
@@ -330,7 +359,14 @@ public class TimelineWindowController: NSObject {
                 // This is the key optimization - we don't destroy the window or view model
                 window.orderOut(nil)
                 self?.isVisible = false
-                self?.lastHiddenAt = Date()  // Track when hidden for cache expiry
+                self?.lastHiddenAt = Date()
+                self?.startBackgroundRefreshTimer()
+
+                // Immediately refresh frame data so next open has fresh data
+                if let viewModel = self?.timelineViewModel {
+                    await viewModel.refreshFrameData()
+                }
+
                 self?.onClose?()
 
                 // Reset the cached scale factor so it recalculates for next window
@@ -346,6 +382,57 @@ public class TimelineWindowController: NSObject {
             }
         })
     }
+
+    // MARK: - Background Refresh Timer
+
+    /// Move the hidden window to the screen where the mouse is (for instant show on any screen)
+    private func moveWindowToMouseScreen() {
+        guard let window = window, !isVisible else { return }
+
+        let mouseLocation = NSEvent.mouseLocation
+        guard let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main else {
+            return
+        }
+
+        if window.frame != targetScreen.frame {
+            window.setFrame(targetScreen.frame, display: false)
+            Log.debug("[TIMELINE-CACHE] Moved window to screen: \(targetScreen.frame)", category: .ui)
+        }
+    }
+
+    /// Start a repeating timer that keeps timeline data fresh while hidden
+    private func startBackgroundRefreshTimer() {
+        // Don't restart if already running
+        guard backgroundRefreshTimer == nil else {
+            Log.debug("[TIMELINE-CACHE] Timer already running, not restarting", category: .ui)
+            return
+        }
+
+        let refreshInterval: TimeInterval = 10
+        Log.info("[TIMELINE-CACHE] ⏱️ Starting background refresh timer (every \(Int(refreshInterval))s)", category: .ui)
+
+        backgroundRefreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self,
+                      !self.isVisible,
+                      let viewModel = self.timelineViewModel,
+                      let coordinator = self.coordinator else { return }
+
+                // Only refresh if capture is active (no point refreshing if not recording)
+                guard await coordinator.isCapturing() else {
+                    Log.debug("[TIMELINE-CACHE] ⏸️ Skipping background refresh (not capturing)", category: .ui)
+                    return
+                }
+
+                Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered", category: .ui)
+                await viewModel.refreshFrameData()
+                // Force video reload so AVPlayer picks up new frames appended to the video file
+                viewModel.forceVideoReload = true
+                Log.info("[TIMELINE-CACHE] ✅ Background refresh complete", category: .ui)
+            }
+        }
+    }
+
 
     /// Save the current position for cross-session persistence (call on app termination)
     public func savePositionForTermination() {
@@ -365,7 +452,6 @@ public class TimelineWindowController: NSObject {
         hostingView = nil
         timelineViewModel = nil
         isPrepared = false
-        preparedScreen = nil
     }
 
     /// Toggle timeline visibility
@@ -454,7 +540,14 @@ public class TimelineWindowController: NSObject {
                 // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
 
-                // Cmd+F to toggle search overlay
+                // Cmd+K to toggle search overlay
+                if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
+                // Cmd+F to toggle filter panel
                 if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
                     if self?.handleKeyEvent(event) == true {
                         return nil // Consume the event
@@ -628,8 +721,8 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Cmd+F to toggle search overlay
-        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
+        // Cmd+K to toggle search overlay
+        if event.keyCode == 40 && modifiers == [.command] { // K key with Command
             if let viewModel = timelineViewModel {
                 let wasVisible = viewModel.isSearchOverlayVisible
                 viewModel.isSearchOverlayVisible.toggle()
@@ -638,6 +731,20 @@ public class TimelineWindowController: NSObject {
                     Task { @MainActor in
                         viewModel.clearSearchHighlight()
                     }
+                }
+            }
+            return true
+        }
+
+        // Cmd+F to toggle filter panel
+        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
+            if let viewModel = timelineViewModel {
+                if viewModel.isFilterPanelVisible {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterPanel()
+                    }
+                } else {
+                    viewModel.openFilterPanel()
                 }
             }
             return true
@@ -694,8 +801,8 @@ public class TimelineWindowController: NSObject {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex - step)
-                return true
             }
+            return true // Always consume arrow keys to prevent system "bonk" sound
         }
 
         // Right arrow key - navigate to next frame (Option = 3x speed)
@@ -703,8 +810,8 @@ public class TimelineWindowController: NSObject {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex + step)
-                return true
             }
+            return true // Always consume arrow keys to prevent system "bonk" sound
         }
 
         // Ctrl+0 to reset frame zoom to 100%

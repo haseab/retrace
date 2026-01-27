@@ -270,12 +270,16 @@ public struct SimpleTimelineView: View {
                             }
                         }
 
-                    FilterPanel(viewModel: viewModel)
-                        .position(
-                            x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - 100,
-                            y: geometry.size.height - TimelineScaleFactor.tapeBottomPadding - TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset - 300
-                        )
-                        .transition(.opacity.combined(with: .offset(y: 15)))
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            FilterPanel(viewModel: viewModel)
+                        }
+                    }
+                    .padding(.trailing, TimelineScaleFactor.rightControlsXOffset + 20)
+                    .padding(.bottom, TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + 75)
+                    .transition(.opacity.combined(with: .offset(y: 15)))
 
                     // Filter dropdowns - rendered at top level to avoid clipping issues
                     FilterDropdownOverlay(viewModel: viewModel)
@@ -330,7 +334,10 @@ public struct SimpleTimelineView: View {
 
             if fileReady {
                 FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                    SimpleVideoFrameView(videoInfo: videoInfo)
+                    SimpleVideoFrameView(videoInfo: videoInfo, forceReload: .init(
+                        get: { viewModel.forceVideoReload },
+                        set: { viewModel.forceVideoReload = $0 }
+                    ))
                 }
             } else {
                 let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet), showing placeholder", category: .ui)
@@ -556,6 +563,7 @@ struct ResetZoomButton: View {
 /// Optimized to only reload video when path changes, just seek when frame changes
 struct SimpleVideoFrameView: NSViewRepresentable {
     let videoInfo: FrameVideoInfo
+    @Binding var forceReload: Bool
 
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = AVPlayerView()
@@ -587,32 +595,42 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         let currentPath = context.coordinator.currentVideoPath
         let currentFrameIdx = context.coordinator.currentFrameIndex
+        let isWindowVisible = playerView.window?.isVisible ?? false
+        let needsForceReload = forceReload
 
-        Log.debug("[VideoView] updateNSView: frameIndex=\(videoInfo.frameIndex), coordFrameIdx=\(currentFrameIdx ?? -1)", category: .ui)
+        // If forceReload is set, clear the cached path to trigger a full video reload
+        // This is needed because AVPlayer caches video metadata and won't see new frames
+        // that were appended to the video file while the window was hidden
+        if needsForceReload {
+            context.coordinator.currentVideoPath = nil
+            context.coordinator.currentFrameIndex = nil
+            DispatchQueue.main.async {
+                self.forceReload = false
+            }
+        }
+
+        // Re-read after potential clear
+        let effectivePath = context.coordinator.currentVideoPath
+        let effectiveFrameIdx = context.coordinator.currentFrameIndex
 
         // If same video and same frame, nothing to do
-        if currentPath == videoInfo.videoPath && currentFrameIdx == videoInfo.frameIndex {
-            Log.debug("[VideoView] Same video and frame, skipping", category: .ui)
+        if effectivePath == videoInfo.videoPath && effectiveFrameIdx == videoInfo.frameIndex {
             return
         }
 
-        // Update coordinator state
-        context.coordinator.currentFrameIndex = videoInfo.frameIndex
+        // Only update coordinator state if window is visible (seeks are unreliable when hidden)
+        if isWindowVisible {
+            context.coordinator.currentFrameIndex = videoInfo.frameIndex
+        }
 
         // If same video, just seek (fast path - no flickering)
-        if currentPath == videoInfo.videoPath {
-            Log.debug("[VideoView] Same video, SEEKING to frame \(videoInfo.frameIndex)", category: .ui)
-            // Use integer arithmetic to avoid floating point precision issues
+        if effectivePath == videoInfo.videoPath {
             let time = videoInfo.frameTimeCMTime
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
-                let actualTime = player.currentTime().seconds
-                let actualFrame = Int(actualTime * 30.0)
-                Log.debug("[VideoView] Seek completed: finished=\(finished), targetFrame=\(self.videoInfo.frameIndex), actualTime=\(actualTime)s, actualFrame=\(actualFrame)", category: .ui)
-            }
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
             return
         }
 
-        Log.debug("[VideoView] LOADING NEW VIDEO: \(videoInfo.videoPath.suffix(30))", category: .ui)
+        Log.debug("[VideoView] Loading new video: \(videoInfo.videoPath.suffix(30))", category: .ui)
 
         // Different video - need to load new player item
         context.coordinator.currentVideoPath = videoInfo.videoPath
@@ -3159,12 +3177,29 @@ struct FilterPanel: View {
         }
     }
 
+    /// Label for date range filter
+    private var dateRangeLabel: String {
+        let startDate = viewModel.pendingFilterCriteria.startDate
+        let endDate = viewModel.pendingFilterCriteria.endDate
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d"
+
+        if let start = startDate, let end = endDate {
+            return "\(formatter.string(from: start)) - \(formatter.string(from: end))"
+        } else if let start = startDate {
+            return "From \(formatter.string(from: start))"
+        } else if let end = endDate {
+            return "Until \(formatter.string(from: end))"
+        }
+        return "Any Time"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack {
                 Text("Filter Timeline")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
 
                 Spacer()
@@ -3183,9 +3218,9 @@ struct FilterPanel: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 18)
-            .padding(.bottom, 16)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0, coordinateSpace: .global)
@@ -3202,21 +3237,19 @@ struct FilterPanel: View {
                 else { NSCursor.pop() }
             }
 
-            // Source section
-            VStack(alignment: .leading, spacing: 12) {
+            // Source section (compact)
+            VStack(alignment: .leading, spacing: 8) {
                 Text("SOURCE")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white.opacity(0.4))
                     .tracking(0.5)
 
-                HStack(spacing: 10) {
-                    // When selectedSources is nil, show both as selected (all sources)
-                    // When it's set, only show selected ones
+                HStack(spacing: 8) {
                     let sources = viewModel.pendingFilterCriteria.selectedSources
                     let retraceSelected = sources == nil || sources!.contains(.native)
                     let rewindSelected = sources == nil || sources!.contains(.rewind)
 
-                    FilterToggleChip(
+                    FilterToggleChipCompact(
                         label: "Retrace",
                         icon: "desktopcomputer",
                         isSelected: retraceSelected
@@ -3224,7 +3257,7 @@ struct FilterPanel: View {
                         viewModel.toggleSourceFilter(.native)
                     }
 
-                    FilterToggleChip(
+                    FilterToggleChipCompact(
                         label: "Rewind",
                         icon: "arrow.counterclockwise",
                         isSelected: rewindSelected
@@ -3233,122 +3266,110 @@ struct FilterPanel: View {
                     }
                 }
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 20)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
 
             // Divider
             Rectangle()
                 .fill(Color.white.opacity(0.08))
                 .frame(height: 1)
-                .padding(.horizontal, 20)
+                .padding(.horizontal, 16)
 
-            // Apps section
-            VStack(alignment: .leading, spacing: 12) {
-                Text("APPS")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
-                    .tracking(0.5)
-
-                GeometryReader { geo in
-                    let localFrame = geo.frame(in: .named("timelineContent"))
-                    FilterDropdownButton(
-                        label: appsLabel,
+            // Two-column grid for Apps, Tags, Visibility, Date Range
+            HStack(alignment: .top, spacing: 12) {
+                // Left column: Apps and Visibility
+                VStack(alignment: .leading, spacing: 12) {
+                    // Apps
+                    CompactFilterDropdown(
+                        label: "APPS",
+                        value: appsLabel,
                         icon: "square.grid.2x2",
                         isActive: viewModel.pendingFilterCriteria.selectedApps != nil && !viewModel.pendingFilterCriteria.selectedApps!.isEmpty
-                    ) {
+                    ) { frame in
                         withAnimation(.easeOut(duration: 0.15)) {
                             if viewModel.activeFilterDropdown == .apps {
                                 viewModel.dismissFilterDropdown()
                             } else {
-                                viewModel.showFilterDropdown(.apps, anchorFrame: localFrame)
+                                viewModel.showFilterDropdown(.apps, anchorFrame: frame)
                             }
                         }
                     }
-                }
-                .frame(height: 40)
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-            .padding(.bottom, 20)
 
-            // Divider
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(height: 1)
-                .padding(.horizontal, 20)
-
-            // Tags section
-            VStack(alignment: .leading, spacing: 12) {
-                Text("TAGS")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
-                    .tracking(0.5)
-
-                GeometryReader { geo in
-                    let localFrame = geo.frame(in: .named("timelineContent"))
-                    FilterDropdownButton(
-                        label: tagsLabel,
-                        icon: "tag",
-                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty
-                    ) {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .tags {
-                                viewModel.dismissFilterDropdown()
-                            } else {
-                                viewModel.showFilterDropdown(.tags, anchorFrame: localFrame)
-                            }
-                        }
-                    }
-                }
-                .frame(height: 40)
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-            .padding(.bottom, 20)
-
-            // Divider
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(height: 1)
-                .padding(.horizontal, 20)
-
-            // Hidden segments section with dropdown
-            VStack(alignment: .leading, spacing: 12) {
-                Text("VISIBILITY")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
-                    .tracking(0.5)
-
-                GeometryReader { geo in
-                    let localFrame = geo.frame(in: .named("timelineContent"))
-                    FilterDropdownButton(
-                        label: hiddenFilterLabel,
+                    // Visibility
+                    CompactFilterDropdown(
+                        label: "VISIBILITY",
+                        value: hiddenFilterLabel,
                         icon: "eye",
                         isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide
-                    ) {
+                    ) { frame in
                         withAnimation(.easeOut(duration: 0.15)) {
                             if viewModel.activeFilterDropdown == .visibility {
                                 viewModel.dismissFilterDropdown()
                             } else {
-                                viewModel.showFilterDropdown(.visibility, anchorFrame: localFrame)
+                                viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
                             }
                         }
                     }
                 }
-                .frame(height: 40)
+                .frame(maxWidth: .infinity)
+
+                // Right column: Tags and Date Range
+                VStack(alignment: .leading, spacing: 12) {
+                    // Tags
+                    CompactFilterDropdown(
+                        label: "TAGS",
+                        value: tagsLabel,
+                        icon: "tag",
+                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty
+                    ) { frame in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .tags {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.tags, anchorFrame: frame)
+                            }
+                        }
+                    }
+
+                    // Date Range
+                    CompactFilterDropdown(
+                        label: "DATE",
+                        value: dateRangeLabel,
+                        icon: "calendar",
+                        isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil
+                    ) { frame in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .dateRange {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity)
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 20)
-            .padding(.bottom, 20)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 12)
+
+            // Divider
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+                .padding(.horizontal, 16)
+
+            // Advanced filters section (collapsible)
+            AdvancedFiltersSection(viewModel: viewModel)
 
             // Divider before apply button
             Rectangle()
                 .fill(Color.white.opacity(0.08))
                 .frame(height: 1)
-                .padding(.horizontal, 20)
+                .padding(.horizontal, 16)
 
             // Action buttons
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 // Clear button (only when pending filters are active)
                 if viewModel.pendingFilterCriteria.hasActiveFilters {
                     Button(action: { viewModel.clearPendingFilters() }) {
@@ -3356,9 +3377,9 @@ struct FilterPanel: View {
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
+                            .padding(.vertical, 11)
                             .background(
-                                RoundedRectangle(cornerRadius: 10)
+                                RoundedRectangle(cornerRadius: 8)
                                     .fill(Color.white.opacity(0.1))
                             )
                     }
@@ -3375,19 +3396,19 @@ struct FilterPanel: View {
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+                        .padding(.vertical, 11)
                         .background(
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: 8)
                                 .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
                         )
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 16)
-            .padding(.bottom, 20)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
         }
-        .frame(width: 280)
+        .frame(width: 360)
         .background(
             RoundedRectangle(cornerRadius: 16)
                 .fill(Color(white: 0.12))
@@ -3431,6 +3452,223 @@ struct FilterPanel: View {
     }
 }
 
+// MARK: - Advanced Filters Section
+
+/// Collapsible section for advanced text filters (Window Name and Browser URL)
+struct AdvancedFiltersSection: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isExpanded: Bool = false
+
+    /// Whether any advanced filter is active
+    private var hasActiveAdvancedFilters: Bool {
+        viewModel.pendingFilterCriteria.hasAdvancedFilters
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Toggle header
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            }) {
+                HStack {
+                    Text("ADVANCED")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.4))
+                        .tracking(0.5)
+
+                    if hasActiveAdvancedFilters {
+                        Circle()
+                            .fill(RetraceMenuStyle.actionBlue)
+                            .frame(width: 6, height: 6)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, isExpanded ? 8 : 12)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 12) {
+                    // Window Name filter
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Window Name")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+
+                        TextField("Search titles...", text: Binding(
+                            get: { viewModel.pendingFilterCriteria.windowNameFilter ?? "" },
+                            set: { viewModel.pendingFilterCriteria.windowNameFilter = $0.isEmpty ? nil : $0 }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(
+                                    viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
+                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
+                                        : Color.white.opacity(0.1),
+                                    lineWidth: 1
+                                )
+                        )
+                    }
+
+                    // Browser URL filter
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Browser URL")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+
+                        TextField("Search URLs...", text: Binding(
+                            get: { viewModel.pendingFilterCriteria.browserUrlFilter ?? "" },
+                            set: { viewModel.pendingFilterCriteria.browserUrlFilter = $0.isEmpty ? nil : $0 }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(
+                                    viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
+                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
+                                        : Color.white.opacity(0.1),
+                                    lineWidth: 1
+                                )
+                        )
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 14)
+            }
+        }
+        .onAppear {
+            // Auto-expand if there are active advanced filters
+            if hasActiveAdvancedFilters {
+                isExpanded = true
+            }
+        }
+    }
+}
+
+// MARK: - Compact Filter Components
+
+/// Compact filter dropdown for two-column layout
+struct CompactFilterDropdown: View {
+    let label: String
+    let value: String
+    let icon: String
+    let isActive: Bool
+    let onTap: (CGRect) -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.4))
+                .tracking(0.5)
+
+            GeometryReader { geo in
+                let localFrame = geo.frame(in: .named("timelineContent"))
+                Button(action: { onTap(localFrame) }) {
+                    HStack(spacing: 7) {
+                        Image(systemName: icon)
+                            .font(.system(size: 11))
+                            .foregroundColor(isActive ? RetraceMenuStyle.actionBlue : .white.opacity(0.5))
+
+                        Text(value)
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.9))
+                            .lineLimit(1)
+
+                        Spacer(minLength: 2)
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 9)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isActive ? RetraceMenuStyle.actionBlue.opacity(0.4) : Color.white.opacity(0.1), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.1)) {
+                        isHovered = hovering
+                    }
+                }
+            }
+            .frame(height: 38)
+        }
+    }
+}
+
+/// Compact toggle chip for source filters
+struct FilterToggleChipCompact: View {
+    let label: String
+    let icon: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 11))
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(isSelected ? .white : .white.opacity(0.5))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+}
+
 // MARK: - Filter Dropdown Overlay
 
 /// Renders filter dropdowns at the top level of SimpleTimelineView to avoid clipping issues
@@ -3456,37 +3694,69 @@ struct FilterDropdownOverlay: View {
                             }
                         }
 
-                    // Use VStack with Spacer to position dropdown at the correct Y
-                    // Then use HStack with Spacer to position at the correct X
-                    VStack(spacing: 0) {
-                        // Top spacer to push content down to anchor.maxY + gap
-                        Spacer()
-                            .frame(height: anchor.maxY + 8)
-
-                        HStack(spacing: 0) {
-                            // Left spacer to push content to anchor.minX
+                    // Date range dropdown opens upward, others open downward
+                    if viewModel.activeFilterDropdown == .dateRange {
+                        // Position dropdown above the anchor (opens upward)
+                        VStack(spacing: 0) {
                             Spacer()
-                                .frame(width: anchor.minX)
 
-                            // The actual dropdown content
-                            // Scroll events are handled at TimelineWindowController level
-                            dropdownContent
-                                .background(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .fill(Color(white: 0.12))
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                )
-                                .fixedSize()
+                            HStack(spacing: 0) {
+                                Spacer()
+                                    .frame(width: anchor.minX)
+
+                                dropdownContent
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .fill(Color(white: 0.12))
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .shadow(color: .black.opacity(0.5), radius: 15, y: -8)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                    )
+                                    .fixedSize()
+
+                                Spacer()
+                            }
+
+                            // Bottom spacer to push content up above the anchor
+                            Spacer()
+                                .frame(height: max(0, NSScreen.main?.frame.height ?? 800) - anchor.minY + 8)
+                        }
+                    } else {
+                        // Use VStack with Spacer to position dropdown at the correct Y
+                        // Then use HStack with Spacer to position at the correct X
+                        VStack(spacing: 0) {
+                            // Top spacer to push content down to anchor.maxY + gap
+                            Spacer()
+                                .frame(height: anchor.maxY + 8)
+
+                            HStack(spacing: 0) {
+                                // Left spacer to push content to anchor.minX
+                                Spacer()
+                                    .frame(width: anchor.minX)
+
+                                // The actual dropdown content
+                                // Scroll events are handled at TimelineWindowController level
+                                dropdownContent
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .fill(Color(white: 0.12))
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                    )
+                                    .fixedSize()
+
+                                Spacer()
+                            }
 
                             Spacer()
                         }
-
-                        Spacer()
                     }
                 }
                 .transition(.opacity)
@@ -3541,6 +3811,22 @@ struct FilterDropdownOverlay: View {
                 currentFilter: viewModel.pendingFilterCriteria.hiddenFilter,
                 onSelect: { filter in
                     viewModel.setHiddenFilter(filter)
+                },
+                onDismiss: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                }
+            )
+        case .dateRange:
+            DateRangeFilterPopover(
+                startDate: viewModel.pendingFilterCriteria.startDate,
+                endDate: viewModel.pendingFilterCriteria.endDate,
+                onApply: { start, end in
+                    viewModel.setDateRange(start: start, end: end)
+                },
+                onClear: {
+                    viewModel.setDateRange(start: nil, end: nil)
                 },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {

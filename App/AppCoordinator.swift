@@ -315,16 +315,14 @@ public actor AppCoordinator {
         var isReadable: Bool
         var pendingFrames: [BufferedFrame]
         /// Buffer for recently captured frames that haven't been enqueued for OCR yet
-        /// We store both frameID and CapturedFrame so OCR can use the original pixels
-        /// instead of extracting from video (avoids B-frame timing issues)
+        /// Legacy: was needed when OCR extracted frames from video; now OCR uses original pixels directly
         var recentFrameBuffer: [BufferedFrame] = []
         var width: Int
         var height: Int
     }
 
     /// Number of frames to buffer before enqueueing for OCR
-    /// This accounts for AVAssetWriter's movieFragmentInterval buffering
-    /// At 30fps with 0.1s fragment interval = ~3 frames buffered
+    /// Legacy: was needed when OCR extracted frames from video; now OCR uses original pixels directly
     private let ocrFrameBufferSize = 4
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
@@ -450,7 +448,7 @@ public actor AppCoordinator {
                     // Keep the most recent ocrFrameBufferSize frames in buffer
                     while writerState.recentFrameBuffer.count > ocrFrameBufferSize {
                         let frameToEnqueue = writerState.recentFrameBuffer.removeFirst()
-                        // Pass the captured frame data to avoid B-frame timing issues
+                        // Pass the original captured frame pixels directly to OCR
                         try await processingQueue.enqueue(frameID: frameToEnqueue.frameID, capturedFrame: frameToEnqueue.capturedFrame)
                     }
                 } else {
@@ -1240,15 +1238,74 @@ public actor AppCoordinator {
     // MARK: - Calendar Support
 
     /// Get all distinct dates that have frames (for calendar display)
+    /// Uses filesystem (chunks folder structure) instead of slow database queries
     public func getDistinctDates() async throws -> [Date] {
-        try await services.database.getDistinctDates()
+        var allDates = Set<Date>()
+
+        // Get dates from Retrace chunks folder
+        let retraceRoot = await services.storage.getStorageDirectory()
+        let retraceDates = getDatesFromChunksFolder(at: retraceRoot.appendingPathComponent("chunks"))
+        allDates.formUnion(retraceDates)
+
+        // Get dates from Rewind chunks folder if connected
+        if let adapter = await services.dataAdapter,
+           let rewindPath = await adapter.rewindStorageRootPath {
+            let rewindChunks = URL(fileURLWithPath: rewindPath).appendingPathComponent("chunks")
+            let rewindDates = getDatesFromChunksFolder(at: rewindChunks)
+            allDates.formUnion(rewindDates)
+        }
+
+        return Array(allDates).sorted { $0 > $1 }
+    }
+
+    /// Extract dates from chunks folder structure (chunks/YYYYMM/DD/)
+    private func getDatesFromChunksFolder(at chunksURL: URL) -> Set<Date> {
+        var dates = Set<Date>()
+        let fileManager = FileManager.default
+        let calendar = Calendar.current
+
+        guard let yearMonthFolders = try? fileManager.contentsOfDirectory(
+            at: chunksURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return dates
+        }
+
+        for yearMonthFolder in yearMonthFolders {
+            let yearMonthStr = yearMonthFolder.lastPathComponent
+            guard yearMonthStr.count == 6,
+                  let year = Int(yearMonthStr.prefix(4)),
+                  let month = Int(yearMonthStr.suffix(2)) else {
+                continue
+            }
+
+            guard let dayFolders = try? fileManager.contentsOfDirectory(
+                at: yearMonthFolder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for dayFolder in dayFolders {
+                let dayStr = dayFolder.lastPathComponent
+                guard let day = Int(dayStr) else { continue }
+
+                if let date = calendar.date(from: DateComponents(year: year, month: month, day: day)) {
+                    dates.insert(date)
+                }
+            }
+        }
+
+        return dates
     }
 
     // MARK: - Storage Statistics
 
-    /// Get total storage used in bytes
+    /// Get total storage used in bytes (Retrace + Rewind)
     public func getTotalStorageUsed() async throws -> Int64 {
-        try await services.storage.getTotalStorageUsed()
+        return try await services.storage.getTotalStorageUsed()
     }
 
     /// Get storage used for a specific date range

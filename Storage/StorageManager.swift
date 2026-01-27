@@ -325,28 +325,35 @@ public actor StorageManager: StorageProtocol {
     }
 
     public func getTotalStorageUsed() async throws -> Int64 {
-        // Calculate size of chunks/ folder and retrace.db only
-        let chunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
-        let dbURL = storageRootURL.appendingPathComponent("retrace.db")
-
-        Log.debug("[StorageManager] Calculating storage - root: \(storageRootURL.path)", category: .storage)
-        Log.debug("[StorageManager] Chunks URL: \(chunksURL.path)", category: .storage)
-        Log.debug("[StorageManager] DB URL: \(dbURL.path)", category: .storage)
-
         var totalSize: Int64 = 0
-        let chunksSize = calculateFolderSize(at: chunksURL)
-        totalSize += chunksSize
-        Log.debug("[StorageManager] Chunks size: \(chunksSize) bytes (\(Double(chunksSize) / 1_000_000_000) GB)", category: .storage)
 
-        // Add database file size (actual disk allocation)
-        if let dbSize = try? dbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
+        // Retrace storage: chunks/ folder + retrace.db
+        let retraceChunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
+        let retraceDbURL = storageRootURL.appendingPathComponent("retrace.db")
+        let retraceChunksSize = calculateFolderSize(at: retraceChunksURL)
+        totalSize += retraceChunksSize
+        print("[Storage] Retrace chunks: \(Double(retraceChunksSize) / 1_000_000_000) GB")
+
+        if let dbSize = try? retraceDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
             totalSize += Int64(dbSize)
-            Log.debug("[StorageManager] DB size: \(dbSize) bytes (\(Double(dbSize) / 1_000_000_000) GB)", category: .storage)
-        } else {
-            Log.debug("[StorageManager] Could not get DB size", category: .storage)
+            print("[Storage] Retrace db: \(Double(dbSize) / 1_000_000_000) GB")
         }
 
-        Log.debug("[StorageManager] Total storage: \(totalSize) bytes (\(Double(totalSize) / 1_000_000_000) GB)", category: .storage)
+        // Rewind storage: chunks/ folder + db-enc.sqlite3
+        let rewindURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/com.memoryvault.MemoryVault")
+        let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
+        let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
+        let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
+        totalSize += rewindChunksSize
+        print("[Storage] Rewind chunks: \(Double(rewindChunksSize) / 1_000_000_000) GB")
+
+        if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
+            totalSize += Int64(dbSize)
+            print("[Storage] Rewind db: \(Double(dbSize) / 1_000_000_000) GB")
+        }
+
+        print("[Storage] TOTAL: \(Double(totalSize) / 1_000_000_000) GB")
         return totalSize
     }
 

@@ -673,8 +673,8 @@ public struct DashboardView: View {
             StatCardData(
                 icon: "calendar",
                 title: "Total Days Recorded",
-                value: formatDaysRecorded(viewModel.daysRecorded),
-                subtitle: "\(viewModel.daysRecorded) day\(viewModel.daysRecorded == 1 ? "" : "s") total"
+                value: "\(viewModel.daysRecorded) days",
+                subtitle: formatOldestDateSubtitle(viewModel.oldestRecordedDate)
             ),
             StatCardData(
                 icon: "clock.fill",
@@ -814,21 +814,11 @@ public struct DashboardView: View {
         return String(format: "est. %.1f GB/month", gbPerMonth)
     }
 
-    private func formatDaysRecorded(_ days: Int) -> String {
-        if days == 0 {
-            return "0"
-        } else if days < 7 {
-            return "\(days) day\(days == 1 ? "" : "s")"
-        } else if days < 30 {
-            let weeks = days / 7
-            return "\(weeks) week\(weeks == 1 ? "" : "s")"
-        } else if days < 365 {
-            let months = days / 30
-            return "\(months) month\(months == 1 ? "" : "s")"
-        } else {
-            let years = days / 365
-            return "\(years) year\(years == 1 ? "" : "s")"
-        }
+    private func formatOldestDateSubtitle(_ date: Date?) -> String {
+        guard let date = date else { return "" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM yyyy"
+        return "since \(formatter.string(from: date))"
     }
 
     // MARK: - App Usage Section

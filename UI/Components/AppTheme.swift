@@ -1483,7 +1483,7 @@ public struct RetraceMenuStyle {
     public static let itemPaddingH: CGFloat = 12
 
     /// Vertical padding for menu items
-    public static let itemPaddingV: CGFloat = 8
+    public static let itemPaddingV: CGFloat = 6
 
     /// Spacing between items
     public static let itemSpacing: CGFloat = 0
@@ -1539,8 +1539,8 @@ public struct RetraceMenuStyle {
     public static let searchFieldCornerRadius: CGFloat = 8
 
     /// Search field padding
-    public static let searchFieldPaddingH: CGFloat = 12
-    public static let searchFieldPaddingV: CGFloat = 8
+    public static let searchFieldPaddingH: CGFloat = 10
+    public static let searchFieldPaddingV: CGFloat = 6
 
     // MARK: - Animation
 

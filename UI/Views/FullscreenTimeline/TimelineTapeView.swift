@@ -190,8 +190,18 @@ public struct TimelineTapeView: View {
             let centerX = geometry.size.width / 2
 
             ZStack {
-                // Datetime button (truly centered)
+                // Datetime button (truly centered) with Go to Now button overlay
                 DatetimeButton(viewModel: viewModel)
+                    .overlay(alignment: .trailing) {
+                        // Go to Now button - fades in when not at most recent frame
+                        // Positioned to the right of the datetime button without shifting it
+                        if viewModel.shouldShowGoToNow {
+                            GoToNowButton(viewModel: viewModel)
+                                .offset(x: TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing)
+                                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                        }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: viewModel.shouldShowGoToNow)
                     .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
                 // Left side controls (hide UI + search)
@@ -326,6 +336,37 @@ struct DatetimeButton: View {
                 NSCursor.pop()
             }
         }
+    }
+}
+
+// MARK: - Go To Now Button
+
+/// Button to quickly jump to the most recent frame
+/// Fades in when not viewing the most recent frame
+struct GoToNowButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.dismissContextMenu()
+            viewModel.goToNow()
+        }) {
+            Image(systemName: "forward.end.fill")
+                .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
+                .foregroundColor(isHovering ? .white : .white.opacity(0.7))
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .themeAwareCircleStyle(isHovering: isHovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .instantTooltip("Go to Now", isVisible: $isHovering)
     }
 }
 

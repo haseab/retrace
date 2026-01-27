@@ -163,6 +163,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the mouse is currently hovering over the URL bounding box
     @Published public var isHoveringURL: Bool = false
 
+    /// Flag to force video reload on next updateNSView (clears AVPlayer's stale cache)
+    /// Set this when window becomes visible after background refresh
+    public var forceVideoReload: Bool = false
+
     // MARK: - Text Selection State
 
     /// All OCR nodes for the current frame (used for text selection)
@@ -443,6 +447,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         case apps
         case tags
         case visibility
+        case dateRange
     }
 
     /// The currently active filter dropdown
@@ -1383,6 +1388,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.debug("[Filter] Set tag filter mode to \(mode.rawValue) (pending)", category: .ui)
     }
 
+    /// Set date range filter (updates pending, not applied)
+    public func setDateRange(start: Date?, end: Date?) {
+        pendingFilterCriteria.startDate = start
+        pendingFilterCriteria.endDate = end
+        Log.debug("[Filter] Set date range to \(String(describing: start)) - \(String(describing: end)) (pending)", category: .ui)
+    }
+
     /// Apply pending filters
     public func applyFilters() {
         Log.debug("[Filter] applyFilters() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), current.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
@@ -1638,7 +1650,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let elapsed = Date().timeIntervalSince(Date(timeIntervalSince1970: savedAt))
         guard elapsed < Self.cacheExpirationSeconds else {
-            Log.debug("[FilterCache] Cache expired, clearing", category: .ui)
+            Log.info("[FilterCache] Cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s), clearing", category: .ui)
             clearCachedFilterCriteria()
             return
         }
@@ -1698,7 +1710,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if cache has expired
         if elapsed > Self.cacheExpirationSeconds {
-            Log.debug("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)", category: .ui)
+            Log.info("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s)", category: .ui)
             clearCachedPosition()
             return nil
         }
@@ -1735,7 +1747,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if cache has expired
         if elapsed > Self.cacheExpirationSeconds {
-            Log.debug("[PositionCache] Cache expired (elapsed: \(Int(elapsed))s)", category: .ui)
+            Log.info("[PositionCache] Timestamp cache expired (elapsed: \(Int(elapsed))s, threshold: \(Int(Self.cacheExpirationSeconds))s)", category: .ui)
             clearCachedPosition()
             return nil
         }
@@ -1968,11 +1980,21 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Update boundaries
                         updateWindowBoundaries()
 
-                        // Optionally navigate to the newest frame
+                        // Navigate to the newest frame
+                        let oldIndex = currentIndex
                         currentIndex = frames.count - 1
+
+                        // Log the new video info for debugging
+                        if let newVideoInfo = frames.last?.videoInfo {
+                            Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), newVideoPath=\(newVideoInfo.videoPath.suffix(30)), newFrameIndex=\(newVideoInfo.frameIndex)", category: .ui)
+                        } else {
+                            Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), NO VIDEO INFO", category: .ui)
+                        }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
                         trimWindowIfNeeded(preserveDirection: .newer)
+                    } else {
+                        Log.info("[TIMELINE-REFRESH] 🔄 No new frames found (all 50 queried frames already cached)", category: .ui)
                     }
                 } catch {
                     Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
@@ -1980,6 +2002,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Load the current image
+            Log.info("[TIMELINE-REFRESH] 🔄 Calling loadImageIfNeeded() for currentIndex=\(currentIndex)", category: .ui)
             loadImageIfNeeded()
             Log.info("[TIMELINE-REFRESH] 🔄 refreshFrameData() completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - refreshStartTime) * 1000))ms", category: .ui)
             return
@@ -3507,6 +3530,40 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Total number of frames (for tape view)
     public var frameCount: Int {
         frames.count
+    }
+
+    /// Whether the timeline is currently showing the most recent frame
+    /// Returns true only when at the last frame and no newer frames exist
+    public var isAtMostRecentFrame: Bool {
+        guard !frames.isEmpty else { return true }
+        // Show "Go to Now" button if not at the last loaded frame OR if there are more newer frames available
+        return currentIndex >= frames.count - 1 && !hasMoreNewer
+    }
+
+    /// Whether to show the "Go to Now" button
+    /// Shows when not viewing the most recent available frame
+    public var shouldShowGoToNow: Bool {
+        guard !frames.isEmpty else { return false }
+        // Show if not at the end of loaded frames, or if there are newer frames to load
+        return currentIndex < frames.count - 1 || hasMoreNewer
+    }
+
+    /// Navigate to the most recent frame (now), clearing filters only if any are set
+    public func goToNow() {
+        // Only clear filters if any are active
+        if activeFilterCount > 0 {
+            clearAllFilters()
+        }
+
+        // Navigate to the most recent frame
+        if !frames.isEmpty {
+            navigateToFrame(frames.count - 1)
+        }
+
+        // TODO: Uncomment if we want to also fetch newest frames from database
+        // Task {
+        //     await refreshFrameData()
+        // }
     }
 
     // MARK: - Date Search

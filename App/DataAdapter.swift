@@ -999,6 +999,17 @@ public actor DataAdapter {
             }
         }
 
+        // Build CTE for window name FTS filter (if provided) - searches title column
+        // Note: FTS is only available in Retrace database, not Rewind
+        let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
+        var windowNameFTSCTE = ""
+        var windowNameFTSJoin = ""
+        if hasWindowNameFilter {
+            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
+            windowNameFTSCTE = ftsFilter.cte
+            windowNameFTSJoin = ftsFilter.join
+        }
+
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
         let tagJoin: String
@@ -1010,7 +1021,7 @@ public actor DataAdapter {
             if tagFilterMode == .include {
                 // Include mode: Show only segments WITH selected tags
                 tagCTE = """
-                    WITH tagged_segments AS (
+                    tagged_segments AS (
                         SELECT DISTINCT segmentId
                         FROM segment_tag
                         WHERE tagId IN (\(tagPlaceholders))
@@ -1027,9 +1038,33 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
+        // Combine CTEs
+        var ctes: [String] = []
+        if hasWindowNameFilter {
+            ctes.append(windowNameFTSCTE)
+        }
+        if !tagCTE.isEmpty {
+            ctes.append(tagCTE)
+        }
+        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+
         // App filter - uses index on segment.bundleID (include or exclude mode)
         if let apps = filters.selectedApps, !apps.isEmpty {
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Browser URL filter - partial string match
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
+            whereClauses.append(urlFilter.clause)
+        }
+
+        // Date range filter
+        if filters.startDate != nil {
+            whereClauses.append("f.createdAt >= ?")
+        }
+        if filters.endDate != nil {
+            whereClauses.append("f.createdAt <= ?")
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1060,12 +1095,13 @@ public actor DataAdapter {
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(tagCTE)
+            \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
+            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             \(whereClause)
@@ -1078,6 +1114,9 @@ public actor DataAdapter {
         Log.debug("[Filter] Apps filter: \(filters.selectedApps ?? []), mode: \(filters.appFilterMode.rawValue)", category: .database)
         Log.debug("[Filter] Tags to filter: \(tagsToFilter), mode: \(tagFilterMode.rawValue)", category: .database)
         Log.debug("[Filter] Hidden filter: \(filters.hiddenFilter.rawValue), cachedHiddenTagId: \(String(describing: cachedHiddenTagId))", category: .database)
+        Log.debug("[Filter] Window name filter: \(filters.windowNameFilter ?? "nil")", category: .database)
+        Log.debug("[Filter] Browser URL filter: \(filters.browserUrlFilter ?? "nil")", category: .database)
+        Log.debug("[Filter] Date range: \(String(describing: filters.startDate)) - \(String(describing: filters.endDate))", category: .database)
 
         let statement: OpaquePointer?
         do {
@@ -1095,7 +1134,15 @@ public actor DataAdapter {
         }
         defer { connection.finalize(stmt) }
 
-        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        // Bind window name FTS query FIRST (appears in the first CTE)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let ftsQuery = buildWindowNameFTSQueryString(windowName)
+            Log.debug("[Filter] Binding window name FTS query '\(ftsQuery)' at index \(bindIndex)", category: .database)
+            sqlite3_bind_text(stmt, Int32(bindIndex), (ftsQuery as NSString).utf8String, -1, nil)
+            bindIndex += 1
+        }
+
+        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
             for (index, tagId) in tagsToFilter.enumerated() {
                 Log.debug("[Filter] Binding tagId \(tagId) at index \(bindIndex + index)", category: .database)
@@ -1111,6 +1158,26 @@ public actor DataAdapter {
                 sqlite3_bind_text(stmt, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
             }
             bindIndex += apps.count
+        }
+
+        // Bind browser URL pattern
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let pattern = "%\(browserUrlPattern)%"
+            Log.debug("[Filter] Binding browser URL pattern '\(pattern)' at index \(bindIndex)", category: .database)
+            sqlite3_bind_text(stmt, Int32(bindIndex), (pattern as NSString).utf8String, -1, nil)
+            bindIndex += 1
+        }
+
+        // Bind date range
+        if let startDate = filters.startDate {
+            Log.debug("[Filter] Binding startDate at index \(bindIndex)", category: .database)
+            config.bindDate(startDate, to: stmt, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+        if let endDate = filters.endDate {
+            Log.debug("[Filter] Binding endDate at index \(bindIndex)", category: .database)
+            config.bindDate(endDate, to: stmt, at: Int32(bindIndex))
+            bindIndex += 1
         }
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
@@ -1193,6 +1260,16 @@ public actor DataAdapter {
             }
         }
 
+        // Build CTE for window name FTS filter (if provided) - searches title column
+        let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
+        var windowNameFTSCTE = ""
+        var windowNameFTSJoin = ""
+        if hasWindowNameFilter {
+            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
+            windowNameFTSCTE = ftsFilter.cte
+            windowNameFTSJoin = ftsFilter.join
+        }
+
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
         let tagJoin: String
@@ -1204,7 +1281,7 @@ public actor DataAdapter {
             if tagFilterMode == .include {
                 // Include mode: Show only segments WITH selected tags
                 tagCTE = """
-                    WITH tagged_segments AS (
+                    tagged_segments AS (
                         SELECT DISTINCT segmentId
                         FROM segment_tag
                         WHERE tagId IN (\(tagPlaceholders))
@@ -1223,12 +1300,36 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
+        // Combine CTEs
+        var ctes: [String] = []
+        if hasWindowNameFilter {
+            ctes.append(windowNameFTSCTE)
+        }
+        if !tagCTE.isEmpty {
+            ctes.append(tagCTE)
+        }
+        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+
         // Now bind timestamp (after tag IDs in CTE, if any)
         bindIndex += 1
 
         // App filter - uses index on segment.bundleID (include or exclude mode)
         if let apps = filters.selectedApps, !apps.isEmpty {
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Browser URL filter - partial string match
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
+            whereClauses.append(urlFilter.clause)
+        }
+
+        // Date range filter - additional constraints beyond the timestamp
+        if filters.startDate != nil {
+            whereClauses.append("f.createdAt >= ?")
+        }
+        if filters.endDate != nil {
+            whereClauses.append("f.createdAt <= ?")
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1259,12 +1360,13 @@ public actor DataAdapter {
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(tagCTE)
+            \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
+            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1277,7 +1379,14 @@ public actor DataAdapter {
 
         var currentBindIndex = 1
 
-        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        // Bind window name FTS query FIRST (appears in the first CTE)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let ftsQuery = buildWindowNameFTSQueryString(windowName)
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
             for (index, tagId) in tagsToFilter.enumerated() {
                 sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
@@ -1295,6 +1404,23 @@ public actor DataAdapter {
                 sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
             }
             currentBindIndex += apps.count
+        }
+
+        // Bind browser URL pattern
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind date range
+        if let startDate = filters.startDate {
+            config.bindDate(startDate, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
+        }
+        if let endDate = filters.endDate {
+            config.bindDate(endDate, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
         }
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
@@ -1358,6 +1484,16 @@ public actor DataAdapter {
             }
         }
 
+        // Build CTE for window name FTS filter (if provided) - searches title column
+        let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
+        var windowNameFTSCTE = ""
+        var windowNameFTSJoin = ""
+        if hasWindowNameFilter {
+            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
+            windowNameFTSCTE = ftsFilter.cte
+            windowNameFTSJoin = ftsFilter.join
+        }
+
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
         let tagJoin: String
@@ -1369,7 +1505,7 @@ public actor DataAdapter {
             if tagFilterMode == .include {
                 // Include mode: Show only segments WITH selected tags
                 tagCTE = """
-                    WITH tagged_segments AS (
+                    tagged_segments AS (
                         SELECT DISTINCT segmentId
                         FROM segment_tag
                         WHERE tagId IN (\(tagPlaceholders))
@@ -1387,12 +1523,36 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
+        // Combine CTEs
+        var ctes: [String] = []
+        if hasWindowNameFilter {
+            ctes.append(windowNameFTSCTE)
+        }
+        if !tagCTE.isEmpty {
+            ctes.append(tagCTE)
+        }
+        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+
         // Now bind timestamp (after tag IDs in CTE, if any)
         bindIndex += 1
 
         // App filter - uses index on segment.bundleID (include or exclude mode)
         if let apps = filters.selectedApps, !apps.isEmpty {
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Browser URL filter - partial string match
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
+            whereClauses.append(urlFilter.clause)
+        }
+
+        // Date range filter - additional constraints beyond the timestamp
+        if filters.startDate != nil {
+            whereClauses.append("f.createdAt >= ?")
+        }
+        if filters.endDate != nil {
+            whereClauses.append("f.createdAt <= ?")
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1423,12 +1583,13 @@ public actor DataAdapter {
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(tagCTE)
+            \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
+            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1441,7 +1602,14 @@ public actor DataAdapter {
 
         var currentBindIndex = 1
 
-        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        // Bind window name FTS query FIRST (appears in the first CTE)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let ftsQuery = buildWindowNameFTSQueryString(windowName)
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
             for (index, tagId) in tagsToFilter.enumerated() {
                 sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
@@ -1459,6 +1627,23 @@ public actor DataAdapter {
                 sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
             }
             currentBindIndex += apps.count
+        }
+
+        // Bind browser URL pattern
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind date range
+        if let startDate = filters.startDate {
+            config.bindDate(startDate, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
+        }
+        if let endDate = filters.endDate {
+            config.bindDate(endDate, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
         }
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
@@ -1519,6 +1704,16 @@ public actor DataAdapter {
             }
         }
 
+        // Build CTE for window name FTS filter (if provided) - searches title column
+        let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
+        var windowNameFTSCTE = ""
+        var windowNameFTSJoin = ""
+        if hasWindowNameFilter {
+            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
+            windowNameFTSCTE = ftsFilter.cte
+            windowNameFTSJoin = ftsFilter.join
+        }
+
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
         let tagJoin: String
@@ -1530,7 +1725,7 @@ public actor DataAdapter {
             if tagFilterMode == .include {
                 // Include mode: Show only segments WITH selected tags
                 tagCTE = """
-                    WITH tagged_segments AS (
+                    tagged_segments AS (
                         SELECT DISTINCT segmentId
                         FROM segment_tag
                         WHERE tagId IN (\(tagPlaceholders))
@@ -1548,12 +1743,28 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
+        // Combine CTEs
+        var ctes: [String] = []
+        if hasWindowNameFilter {
+            ctes.append(windowNameFTSCTE)
+        }
+        if !tagCTE.isEmpty {
+            ctes.append(tagCTE)
+        }
+        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+
         // Now bind timestamps (after tag IDs in CTE, if any)
         bindIndex += 2  // For startDate and endDate
 
         // App filter - uses index on segment.bundleID (include or exclude mode)
         if let apps = filters.selectedApps, !apps.isEmpty {
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode))
+        }
+
+        // Browser URL filter - partial string match
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
+            whereClauses.append(urlFilter.clause)
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1583,12 +1794,13 @@ public actor DataAdapter {
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
-            \(tagCTE)
+            \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
+            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1601,7 +1813,14 @@ public actor DataAdapter {
 
         var currentBindIndex = 1
 
-        // Bind tag IDs FIRST (they appear in the CTE at the top of the query) - ONLY for include mode
+        // Bind window name FTS query FIRST (appears in the first CTE)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let ftsQuery = buildWindowNameFTSQueryString(windowName)
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
             for (index, tagId) in tagsToFilter.enumerated() {
                 sqlite3_bind_int64(statement, Int32(currentBindIndex + index), tagId)
@@ -1621,6 +1840,13 @@ public actor DataAdapter {
                 sqlite3_bind_text(statement, Int32(currentBindIndex + index), (app as NSString).utf8String, -1, nil)
             }
             currentBindIndex += apps.count
+        }
+
+        // Bind browser URL pattern
+        if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
         }
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
@@ -2654,6 +2880,62 @@ public actor DataAdapter {
         return "\(tableAlias).bundleID \(operator_) (\(placeholders))"
     }
 
+    /// Build SQL clause for browser URL partial string matching
+    /// Returns the SQL clause like "s.browserUrl LIKE ?" and the pattern to bind
+    private func buildBrowserUrlFilterClause(urlPattern: String, tableAlias: String = "s") -> (clause: String, pattern: String) {
+        // Use LIKE with wildcards for partial matching
+        let pattern = "%\(urlPattern)%"
+        return (clause: "\(tableAlias).browserUrl LIKE ?", pattern: pattern)
+    }
+
+    /// Build SQL clause and subquery for window name FTS search (searches title/c2 column)
+    /// Returns the CTE for FTS matching and the join clause
+    private func buildWindowNameFTSFilter(windowNameQuery: String) -> (cte: String, join: String) {
+        // FTS5 query on title column (c2) - use prefix search for partial matches
+        // The FTS MATCH clause expects the full query as a single bound parameter
+        let cte = """
+            fts_matched_frames AS (
+                SELECT DISTINCT ds.frameId
+                FROM searchRanking
+                JOIN doc_segment ds ON searchRanking.rowid = ds.docid
+                WHERE searchRanking MATCH ?
+            )
+            """
+        let join = "INNER JOIN fts_matched_frames fmf ON f.id = fmf.frameId"
+        return (cte: cte, join: join)
+    }
+
+    /// Build the full FTS5 query string for window name search
+    /// Returns a query like: title:"search term"* for prefix matching on the title column
+    private func buildWindowNameFTSQueryString(_ text: String) -> String {
+        // Escape FTS5 special characters and wrap in quotes for exact phrase matching
+        let escaped = text
+            .replacingOccurrences(of: "\"", with: "\"\"")
+            .replacingOccurrences(of: "*", with: "")
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+            .trimmingCharacters(in: .whitespaces)
+
+        // Use title column with quoted phrase and prefix wildcard
+        // Format: title:"escaped term"*
+        return "title:\"\(escaped)\"*"
+    }
+
+    /// Escape a window name query for FTS5 MATCH - handles special characters
+    private func escapeFTSQuery(_ text: String) -> String {
+        // Remove or escape FTS5 special characters that could break the query
+        let escaped = text
+            .replacingOccurrences(of: "\"", with: "\"\"")
+            .replacingOccurrences(of: "*", with: "")
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+            .replacingOccurrences(of: "-", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        return escaped
+    }
+
     private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
         let countSQL = """
             SELECT COUNT(*)
@@ -2854,6 +3136,73 @@ public actor DataAdapter {
         guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
         guard let cString = sqlite3_column_text(statement, column) else { return nil }
         return String(cString: cString)
+    }
+
+    // MARK: - Combined Statistics (Retrace + Rewind)
+
+    /// Get distinct dates that have frames from both Retrace and Rewind sources
+    /// Returns dates sorted in descending order (newest first)
+    public func getDistinctDates() throws -> [Date] {
+        var allDates = Set<Date>()
+        let calendar = Calendar.current
+
+        // Get dates from Retrace
+        let retraceDates = try queryDistinctDates(connection: retraceConnection)
+        for date in retraceDates {
+            allDates.insert(calendar.startOfDay(for: date))
+        }
+
+        // Get dates from Rewind if connected
+        if let rewind = rewindConnection {
+            let rewindDates = try queryDistinctDates(connection: rewind)
+            for date in rewindDates {
+                allDates.insert(calendar.startOfDay(for: date))
+            }
+        }
+
+        return Array(allDates).sorted { $0 > $1 }
+    }
+
+    /// Query distinct dates from a specific connection
+    private func queryDistinctDates(connection: DatabaseConnection) throws -> [Date] {
+        let sql = """
+            SELECT MIN(createdAt) as dayTimestamp
+            FROM frame
+            GROUP BY date(createdAt / 1000, 'unixepoch', 'localtime')
+            ORDER BY dayTimestamp DESC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var dates: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let timestamp = sqlite3_column_int64(statement, 0)
+            let date = Date(timeIntervalSince1970: Double(timestamp) / 1000.0)
+            dates.append(date)
+        }
+
+        return dates
+    }
+
+    /// Check if Rewind source is connected
+    public var isRewindConnected: Bool {
+        rewindConnection != nil
+    }
+
+    /// Get distinct dates from Rewind only (for parallel loading)
+    public func getRewindDistinctDates() throws -> [Date] {
+        guard let rewind = rewindConnection else { return [] }
+        return try queryDistinctDates(connection: rewind)
+    }
+
+    /// Get Rewind storage root path for storage calculations (returns nil if Rewind not connected)
+    public var rewindStorageRootPath: String? {
+        guard rewindConnection != nil else { return nil }
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
+        return "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault"
     }
 }
 

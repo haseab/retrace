@@ -559,7 +559,7 @@ public struct AppsFilterPopover: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 300)
+                .frame(maxHeight: 240)
                 .onChange(of: highlightedItemID) { newID in
                     // Scroll to highlighted item
                     if isAllAppsHighlighted {
@@ -892,7 +892,7 @@ public struct TagsFilterPopover: View {
                         }
                         .padding(.vertical, 4)
                     }
-                    .frame(maxHeight: 250)
+                    .frame(maxHeight: 200)
                     .onChange(of: highlightedTagID) { newID in
                         // Scroll to highlighted item
                         if isAllTagsHighlighted {
@@ -1020,7 +1020,7 @@ public struct VisibilityFilterPopover: View {
                 }
                 .padding(.vertical, 4)
             }
-            .frame(maxHeight: 200)
+            .frame(maxHeight: 160)
         }
         .focusable()
         .focused($isFocused)
@@ -1124,5 +1124,430 @@ public extension View {
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
         modifier(DropdownOverlayModifier(isPresented: isPresented, yOffset: yOffset, opensUpward: opensUpward, dropdownContent: content))
+    }
+}
+
+// MARK: - Date Range Filter Popover
+
+/// Popover for selecting date range filter with Start/End rows, inline calendar, and quick presets
+/// Matches the design from SearchFilterBar's DateFilterPopover
+public struct DateRangeFilterPopover: View {
+    let startDate: Date?
+    let endDate: Date?
+    let onApply: (Date?, Date?) -> Void
+    let onClear: () -> Void
+    var onDismiss: (() -> Void)?
+
+    @State private var localStartDate: Date
+    @State private var localEndDate: Date
+    @State private var editingDate: EditingDate? = nil
+    @State private var displayedMonth: Date = Date()
+
+    private let calendar = Calendar.current
+    private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+
+    private enum EditingDate {
+        case start
+        case end
+    }
+
+    private enum DatePreset {
+        case anytime
+        case today
+        case lastWeek
+        case lastMonth
+    }
+
+    public init(
+        startDate: Date?,
+        endDate: Date?,
+        onApply: @escaping (Date?, Date?) -> Void,
+        onClear: @escaping () -> Void,
+        onDismiss: (() -> Void)? = nil
+    ) {
+        self.startDate = startDate
+        self.endDate = endDate
+        self.onApply = onApply
+        self.onClear = onClear
+        self.onDismiss = onDismiss
+
+        let now = Date()
+        _localStartDate = State(initialValue: startDate ?? calendar.date(byAdding: .day, value: -7, to: now)!)
+        _localEndDate = State(initialValue: endDate ?? now)
+        _displayedMonth = State(initialValue: endDate ?? now)
+    }
+
+    public var body: some View {
+        FilterPopoverContainer(width: 260) {
+            // Header
+            HStack {
+                Text("Date Range")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if startDate != nil || endDate != nil {
+                    Button("Clear") {
+                        onClear()
+                        onDismiss?()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(RetraceMenuStyle.actionBlue)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Date selection rows
+            VStack(spacing: 6) {
+                dateRow(label: "Start", date: localStartDate, isEditing: editingDate == .start) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        editingDate = editingDate == .start ? nil : .start
+                        displayedMonth = localStartDate
+                    }
+                }
+                dateRow(label: "End", date: localEndDate, isEditing: editingDate == .end) {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        editingDate = editingDate == .end ? nil : .end
+                        displayedMonth = localEndDate
+                    }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            // Inline calendar (shown when editing)
+            if editingDate != nil {
+                Divider()
+                    .background(Color.white.opacity(0.1))
+
+                inlineCalendar
+                    .padding(10)
+                    .contentShape(Rectangle())
+                    .onTapGesture { } // Prevent tap from bubbling up
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Quick presets (horizontal chips)
+            HStack(spacing: 6) {
+                presetChip("All", preset: .anytime)
+                presetChip("Today", preset: .today)
+                presetChip("7d", preset: .lastWeek)
+                presetChip("30d", preset: .lastMonth)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            // Apply button
+            Button(action: applyCustomRange) {
+                Text("Apply")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(RetraceMenuStyle.actionBlue)
+                    .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .padding(10)
+        }
+        .onAppear {
+            // Initialize dates from props
+            let now = Date()
+            localStartDate = startDate ?? calendar.date(byAdding: .day, value: -7, to: now)!
+            localEndDate = endDate ?? now
+            displayedMonth = localEndDate
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Collapse calendar when tapping outside of it
+            if editingDate != nil {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    editingDate = nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Date Row
+
+    private func dateRow(label: String, date: Date, isEditing: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "calendar")
+                    .font(.system(size: 12))
+                    .foregroundColor(isEditing ? RetraceMenuStyle.actionBlue : .white.opacity(0.5))
+                    .frame(width: 18)
+
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                    .frame(width: 32, alignment: .leading)
+
+                Spacer()
+
+                Text(formatDate(date))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(isEditing ? RetraceMenuStyle.actionBlue : .white)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isEditing ? RetraceMenuStyle.actionBlue.opacity(0.1) : Color.white.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isEditing ? RetraceMenuStyle.actionBlue.opacity(0.5) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { h in
+            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    // MARK: - Inline Calendar
+
+    private var inlineCalendar: some View {
+        VStack(spacing: 6) {
+            // Month navigation
+            HStack {
+                Button(action: { changeMonth(by: -1) }) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+
+                Spacer()
+
+                Text(monthYearString)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.8))
+
+                Spacer()
+
+                Button(action: { changeMonth(by: 1) }) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+            }
+
+            // Weekday headers
+            HStack(spacing: 0) {
+                ForEach(weekdaySymbols, id: \.self) { day in
+                    Text(day)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white.opacity(0.4))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+
+            // Calendar grid
+            let days = daysInMonth()
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
+                ForEach(days.indices, id: \.self) { index in
+                    dayCell(for: days[index])
+                }
+            }
+        }
+    }
+
+    // MARK: - Day Cell
+
+    private func dayCell(for day: Date?) -> some View {
+        Group {
+            if let day = day {
+                let isToday = calendar.isDateInToday(day)
+                let isSelected = isDateSelected(day)
+                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
+                let isFuture = day > Date()
+
+                Button(action: {
+                    selectDay(day)
+                }) {
+                    Text("\(calendar.component(.day, from: day))")
+                        .font(.system(size: 11, weight: isToday ? .semibold : .regular))
+                        .foregroundColor(
+                            isFuture
+                                ? .white.opacity(0.2)
+                                : (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.8 : 0.3))
+                        )
+                        .frame(width: 26, height: 26)
+                        .background(
+                            ZStack {
+                                if isSelected {
+                                    Circle()
+                                        .fill(RetraceMenuStyle.actionBlue)
+                                } else if isToday {
+                                    Circle()
+                                        .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1)
+                                }
+                            }
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(isFuture)
+                .onHover { h in
+                    if !isFuture {
+                        if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                    }
+                }
+            } else {
+                Color.clear
+                    .frame(width: 26, height: 26)
+            }
+        }
+    }
+
+    // MARK: - Preset Chip
+
+    private func presetChip(_ label: String, preset: DatePreset) -> some View {
+        Button(action: {
+            applyPreset(preset)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white.opacity(0.8))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered in
+            if isHovered { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func formatDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d, yyyy"
+        return formatter.string(from: date)
+    }
+
+    private var monthYearString: String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
+        return formatter.string(from: displayedMonth)
+    }
+
+    private func changeMonth(by value: Int) {
+        if let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                displayedMonth = newMonth
+            }
+        }
+    }
+
+    private func daysInMonth() -> [Date?] {
+        var days: [Date?] = []
+
+        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
+              let monthFirstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
+            return days
+        }
+
+        var currentDate = monthFirstWeek.start
+
+        for _ in 0..<42 {
+            days.append(currentDate)
+            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
+        }
+
+        return days
+    }
+
+    private func isDateSelected(_ day: Date) -> Bool {
+        switch editingDate {
+        case .start:
+            return calendar.isDate(day, inSameDayAs: localStartDate)
+        case .end:
+            return calendar.isDate(day, inSameDayAs: localEndDate)
+        case .none:
+            return false
+        }
+    }
+
+    private func selectDay(_ day: Date) {
+        switch editingDate {
+        case .start:
+            localStartDate = day
+            if localStartDate > localEndDate {
+                localEndDate = localStartDate
+            }
+        case .end:
+            localEndDate = day
+            if localEndDate < localStartDate {
+                localStartDate = localEndDate
+            }
+        case .none:
+            break
+        }
+
+        // Close the calendar after selecting a date
+        withAnimation(.easeOut(duration: 0.15)) {
+            editingDate = nil
+        }
+    }
+
+    private func applyCustomRange() {
+        let start = calendar.startOfDay(for: localStartDate)
+        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: localEndDate) ?? localEndDate
+
+        onApply(start, end)
+        onDismiss?()
+    }
+
+    private func applyPreset(_ preset: DatePreset) {
+        let now = Date()
+
+        switch preset {
+        case .anytime:
+            onClear()
+            onDismiss?()
+        case .today:
+            let start = calendar.startOfDay(for: now)
+            let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
+            onApply(start, end)
+            onDismiss?()
+        case .lastWeek:
+            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
+                let start = calendar.startOfDay(for: weekAgo)
+                onApply(start, now)
+                onDismiss?()
+            }
+        case .lastMonth:
+            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
+                let start = calendar.startOfDay(for: monthAgo)
+                onApply(start, now)
+                onDismiss?()
+            }
+        }
     }
 }

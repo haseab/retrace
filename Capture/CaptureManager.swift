@@ -196,6 +196,15 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Handle display switch by restarting capture on the new display
     private func handleDisplaySwitch(from oldDisplayID: UInt32, to newDisplayID: UInt32) async {
+        // Notify listeners that display switched (used by TimelineWindowController to reposition window)
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .activeDisplayDidChange,
+                object: nil,
+                userInfo: ["displayID": newDisplayID]
+            )
+        }
+
         guard _isCapturing else { return }
 
         do {
@@ -336,4 +345,11 @@ public actor CaptureManager: CaptureProtocol {
             metadata: metadata
         )
     }
+}
+
+// MARK: - Notification Names
+
+public extension Notification.Name {
+    /// Posted when the active display changes (user switched to app on different monitor)
+    static let activeDisplayDidChange = Notification.Name("activeDisplayDidChange")
 }

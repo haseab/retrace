@@ -25,6 +25,7 @@ public class DashboardViewModel: ObservableObject {
     @Published public var totalStorageBytes: Int64 = 0
     @Published public var weeklyStorageBytes: Int64 = 0
     @Published public var daysRecorded: Int = 0
+    @Published public var oldestRecordedDate: Date?
 
     // Weekly engagement metrics (aggregated from daily data)
     @Published public var timelineOpensThisWeek: Int64 = 0
@@ -158,18 +159,35 @@ public class DashboardViewModel: ObservableObject {
 
     // MARK: - Data Loading
 
+    // Helper to write timing logs to /tmp/dashboard_timing.log
+    private func logTiming(_ message: String) {
+        let logPath = "/tmp/dashboard_timing.log"
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let line = "[\(timestamp)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if let handle = FileHandle(forWritingAtPath: logPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: logPath))
+            }
+        }
+    }
+
     public func loadStatistics() async {
         isLoading = true
         error = nil
+
+        // Clear the log file at the start
+        try? "".write(toFile: "/tmp/dashboard_timing.log", atomically: true, encoding: .utf8)
+        logTiming("=== loadStatistics START ===")
 
         // Update recording status
         await updateRecordingStatus()
 
         do {
-            // Load overall statistics
-            totalStorageBytes = try await coordinator.getTotalStorageUsed()
-            let allDates = try await coordinator.getDistinctDates()
-            daysRecorded = allDates.count
+            let loadStart = CFAbsoluteTimeGetCurrent()
 
             // Calculate last 7 days date range
             let calendar = Calendar.current
@@ -178,23 +196,44 @@ public class DashboardViewModel: ObservableObject {
             let weekStart = sevenDaysAgo
             let weekEnd = now
 
-            // Load weekly storage
-            weeklyStorageBytes = try await coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
-
             // Format the date range string
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM d"
             weekDateRange = "\(formatter.string(from: weekStart)) - \(formatter.string(from: weekEnd))"
 
-            // Load app usage stats from database (aggregated in SQL with proper session counting)
-            let appStats = try await coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
+            // Fire slow queries (storage + dates) in background - don't block
+            Task {
+                var t0 = CFAbsoluteTimeGetCurrent()
+                if let storage = try? await coordinator.getTotalStorageUsed() {
+                    await MainActor.run { self.totalStorageBytes = storage }
+                }
+                logTiming("getTotalStorageUsed: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
 
-            // Calculate total time
-            totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
+                t0 = CFAbsoluteTimeGetCurrent()
+                if let allDates = try? await coordinator.getDistinctDates() {
+                    await MainActor.run {
+                        self.daysRecorded = allDates.count
+                        self.oldestRecordedDate = allDates.last // sorted descending, so last is oldest
+                    }
+                }
+                logTiming("getDistinctDates: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+            }
 
-            // Calculate today's screen time
+            // Fire all queries in parallel
             let todayStart = calendar.startOfDay(for: now)
-            let todayStats = try await coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
+            var t0 = CFAbsoluteTimeGetCurrent()
+
+            async let weeklyStorageTask = coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
+            async let appStatsTask = coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
+            async let todayStatsTask = coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
+            async let dailyGraphTask: () = loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
+
+            // Await all results
+            let (weeklyStorage, appStats, todayStats, _) = try await (weeklyStorageTask, appStatsTask, todayStatsTask, dailyGraphTask)
+            logTiming("parallel queries: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+
+            weeklyStorageBytes = weeklyStorage
+            totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
             totalDailyTime = todayStats.reduce(0) { $0 + $1.duration }
 
             // Convert to AppUsageData and sort by duration
@@ -209,11 +248,11 @@ public class DashboardViewModel: ObservableObject {
             }
             .sorted { $0.duration > $1.duration }
 
-            // Load 7-day daily data for graphs
-            await loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
+            logTiming("=== TOTAL (non-blocking): \(Int((CFAbsoluteTimeGetCurrent() - loadStart) * 1000))ms ===")
 
             isLoading = false
         } catch {
+            logTiming("ERROR: \(error.localizedDescription)")
             self.error = "Failed to load statistics: \(error.localizedDescription)"
             isLoading = false
         }
