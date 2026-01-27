@@ -202,11 +202,6 @@ private struct ScrollAffordance: View {
     }
 }
 
-/// Browser breakdown view mode
-enum BrowserBreakdownMode: String, CaseIterable {
-    case tabs = "Tabs"
-    case websites = "Websites"
-}
 
 /// List-style view for app usage data with expandable window details
 struct AppUsageListView: View {
@@ -214,7 +209,6 @@ struct AppUsageListView: View {
     let totalTime: TimeInterval
     var layoutSize: AppUsageLayoutSize = .normal
     var loadWindowUsage: ((String) async -> [WindowUsageData])? = nil  // For websites (domain aggregation)
-    var loadTabUsage: ((String) async -> [WindowUsageData])? = nil     // For tabs (windowName with URL)
     var loadTabsForDomain: ((String, String) async -> [WindowUsageData])? = nil  // (bundleID, domain) -> tabs for that domain
     var onWindowTapped: ((AppUsageData, WindowUsageData) -> Void)? = nil
 
@@ -224,15 +218,12 @@ struct AppUsageListView: View {
     @State private var isHoveringLoadMore: Bool = false
     @State private var expandedAppBundleID: String? = nil
     @State private var windowUsageCache: [String: [WindowUsageData]] = [:]  // Website/domain data
-    @State private var tabUsageCache: [String: [WindowUsageData]] = [:]     // Tab data (windowName + URL)
     @State private var domainTabsCache: [String: [WindowUsageData]] = [:]   // Domain-specific tabs (key: "bundleID_domain")
     @State private var loadingWindows: Set<String> = []
-    @State private var loadingTabs: Set<String> = []
     @State private var loadingDomainTabs: Set<String> = []  // Loading state for domain tabs
     @State private var displayedWindowCounts: [String: Int] = [:]
     @State private var displayedDomainTabCounts: [String: Int] = [:]  // Display count for domain tabs
     @State private var isHoveringWindowLoadMore: String? = nil
-    @State private var browserBreakdownMode: [String: BrowserBreakdownMode] = [:]  // Per-browser view mode
     @State private var expandedDomainKey: String? = nil  // Track which domain is expanded (key: "bundleID_domain")
 
     private let loadMoreIncrement: Int = 10
@@ -273,27 +264,17 @@ struct AppUsageListView: View {
 
     // MARK: - Window Rows Section
 
-    /// Get the appropriate data source for browser breakdown
+    /// Get the appropriate data source for browser breakdown (always websites view for browsers)
     private func getWindowData(for app: AppUsageData) -> (windows: [WindowUsageData], isLoading: Bool, showAsTab: Bool) {
-        let currentMode = browserBreakdownMode[app.appBundleID] ?? .tabs
-        if app.isBrowser && currentMode == .tabs {
-            return (
-                windows: tabUsageCache[app.appBundleID] ?? [],
-                isLoading: loadingTabs.contains(app.appBundleID),
-                showAsTab: true
-            )
-        } else {
-            return (
-                windows: windowUsageCache[app.appBundleID] ?? [],
-                isLoading: loadingWindows.contains(app.appBundleID),
-                showAsTab: false
-            )
-        }
+        return (
+            windows: windowUsageCache[app.appBundleID] ?? [],
+            isLoading: loadingWindows.contains(app.appBundleID),
+            showAsTab: false
+        )
     }
 
     @ViewBuilder
     private func windowRowsSection(for app: AppUsageData, layoutSize: AppUsageLayoutSize, isBrowser: Bool = false) -> some View {
-        let currentMode = browserBreakdownMode[app.appBundleID] ?? .tabs
         let data = getWindowData(for: app)
         let windows = data.windows
         let isLoading = data.isLoading
@@ -305,11 +286,6 @@ struct AppUsageListView: View {
         let hasMoreWindows = windows.count > displayedWindowCount
 
         VStack(spacing: 4) {
-            // Segmented control for browsers
-            if isBrowser {
-                browserBreakdownPicker(for: app, layoutSize: layoutSize)
-            }
-
             if isLoading {
                 HStack {
                     Spacer()
@@ -320,7 +296,7 @@ struct AppUsageListView: View {
                 .padding(.leading, layoutSize.windowRowIndent)
             } else if windows.isEmpty {
                 HStack {
-                    Text(isBrowser && currentMode == .tabs ? "No tab data available" : "No window data available")
+                    Text("No window data available")
                         .font(layoutSize.windowNameFont)
                         .foregroundColor(.retraceSecondary.opacity(0.6))
                         .italic()
@@ -329,8 +305,8 @@ struct AppUsageListView: View {
                 .padding(.leading, layoutSize.windowRowIndent)
             } else {
                 ForEach(Array(displayedWindows.enumerated()), id: \.element.id) { index, window in
-                    // In Websites mode for browsers, make rows expandable to show tabs for that domain
-                    if isBrowser && currentMode == .websites {
+                    // For browsers, show websites view with expandable rows for domain tabs
+                    if isBrowser {
                         VStack(spacing: 0) {
                             websiteRow(
                                 window: window,
@@ -371,51 +347,6 @@ struct AppUsageListView: View {
         .clipped()
     }
 
-    // MARK: - Browser Breakdown Picker
-
-    private func browserBreakdownPicker(for app: AppUsageData, layoutSize: AppUsageLayoutSize) -> some View {
-        let currentMode = browserBreakdownMode[app.appBundleID] ?? .tabs
-
-        return HStack(spacing: 0) {
-            ForEach(BrowserBreakdownMode.allCases, id: \.self) { mode in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        browserBreakdownMode[app.appBundleID] = mode
-                        // Reset displayed count when switching modes
-                        displayedWindowCounts[app.appBundleID] = initialWindowCount
-                    }
-                    // Load tab data if needed
-                    if mode == .tabs && tabUsageCache[app.appBundleID] == nil && !loadingTabs.contains(app.appBundleID) {
-                        loadTabData(for: app)
-                    }
-                }) {
-                    Text(mode.rawValue)
-                        .font(.system(size: 11, weight: currentMode == mode ? .semibold : .medium))
-                        .foregroundColor(currentMode == mode ? .retracePrimary : .retraceSecondary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(currentMode == mode ? Color.white.opacity(0.1) : Color.clear)
-                        )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(3)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.04))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-        )
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.leading, layoutSize.windowRowIndent)
-        .padding(.top, 8)
-        .padding(.bottom, 4)
-    }
 
     // MARK: - Window Load More Button
 
@@ -930,10 +861,6 @@ struct AppUsageListView: View {
                 if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
                     loadWindowData(for: app)
                 }
-                // Also preload tab data for browsers
-                if app.isBrowser && tabUsageCache[app.appBundleID] == nil && !loadingTabs.contains(app.appBundleID) {
-                    loadTabData(for: app)
-                }
             } else {
                 NSCursor.arrow.set()
             }
@@ -984,28 +911,6 @@ struct AppUsageListView: View {
                 if app.isBrowser {
                     for window in windows {
                         FaviconProvider.shared.fetchFaviconIfNeeded(for: window.displayName) { _ in }
-                    }
-                }
-            }
-        }
-    }
-
-    private func loadTabData(for app: AppUsageData) {
-        guard let loader = loadTabUsage else { return }
-
-        loadingTabs.insert(app.appBundleID)
-
-        Task {
-            let tabs = await loader(app.appBundleID)
-            await MainActor.run {
-                tabUsageCache[app.appBundleID] = tabs
-                loadingTabs.remove(app.appBundleID)
-
-                // Preload favicons for browser URLs from tab data
-                for tab in tabs {
-                    if let url = tab.browserUrl, !url.isEmpty,
-                       let urlObj = URL(string: url), let host = urlObj.host {
-                        FaviconProvider.shared.fetchFaviconIfNeeded(for: host) { _ in }
                     }
                 }
             }

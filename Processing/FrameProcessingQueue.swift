@@ -173,10 +173,17 @@ public actor FrameProcessingQueue {
 
                 } catch {
                     totalFailed += 1
-                    Log.error("[Queue-DIAG] Worker \(id) FAILED frame \(queuedFrame.frameID): \(error)", category: .processing)
 
-                    // Retry if under limit
-                    if queuedFrame.retryCount < config.maxRetryAttempts {
+                    // Check if this is an unrecoverable error (damaged/missing video file)
+                    // These errors won't be fixed by retrying, so fail immediately
+                    let isUnrecoverableError = isUnrecoverableVideoError(error)
+
+                    if isUnrecoverableError {
+                        // Expected for frames still being written - use warning, not error
+                        Log.warning("[Queue] Frame \(queuedFrame.frameID) skipped (video not ready)", category: .processing)
+                        try await markFrameAsFailed(queuedFrame.frameID, error: error, skipRetries: true)
+                    } else if queuedFrame.retryCount < config.maxRetryAttempts {
+                        // Retry if under limit for recoverable errors
                         try await retryFrame(queuedFrame, error: error)
                     } else {
                         // Mark as failed permanently
@@ -364,19 +371,110 @@ public actor FrameProcessingQueue {
     }
 
     /// Mark frame as permanently failed
-    private func markFrameAsFailed(_ frameID: Int64, error: Error) async throws {
+    private func markFrameAsFailed(_ frameID: Int64, error: Error, skipRetries: Bool = false) async throws {
         try await updateFrameProcessingStatus(frameID, status: .failed)
-        Log.error("[Queue] Frame \(frameID) marked as failed after max retries: \(error)", category: .processing)
+        if skipRetries {
+            Log.debug("[Queue] Frame \(frameID) marked as failed (video not ready)", category: .processing)
+        } else {
+            Log.error("[Queue] Frame \(frameID) marked as failed after max retries: \(error)", category: .processing)
+        }
     }
 
     /// Re-enqueue frames that were processing during a crash
+    /// Only re-enqueues frames whose video files are readable (finalized)
     public func requeueCrashedFrames() async throws {
         let frameIDs = try await databaseManager.getCrashedProcessingFrameIDs()
 
-        if !frameIDs.isEmpty {
-            Log.warning("[Queue] Re-enqueueing \(frameIDs.count) frames that crashed during processing", category: .processing)
-            try await enqueueBatch(frameIDs: frameIDs)
+        guard !frameIDs.isEmpty else { return }
+
+        Log.warning("[Queue] Found \(frameIDs.count) frames that crashed during processing, verifying video files...", category: .processing)
+
+        var validFrameIDs: [Int64] = []
+        var invalidFrameIDs: [Int64] = []
+
+        for frameID in frameIDs {
+            // Get the frame reference to find its video segment
+            guard let frameRef = try await databaseManager.getFrame(id: FrameID(value: frameID)) else {
+                Log.warning("[Queue] Crashed frame \(frameID) not found in database, marking as failed", category: .processing)
+                invalidFrameIDs.append(frameID)
+                continue
+            }
+
+            // Get the video segment to check if the file is readable
+            guard let videoSegment = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
+                Log.warning("[Queue] Video segment \(frameRef.videoID.value) not found for crashed frame \(frameID), marking as failed", category: .processing)
+                invalidFrameIDs.append(frameID)
+                continue
+            }
+
+            // Check if the video file exists and is readable
+            // Extract the actual segment ID from the path (last path component is the timestamp-based ID)
+            let pathComponents = videoSegment.relativePath.split(separator: "/")
+            guard let lastComponent = pathComponents.last,
+                  let actualSegmentID = Int64(lastComponent) else {
+                Log.warning("[Queue] Invalid video path for crashed frame \(frameID): \(videoSegment.relativePath), marking as failed", category: .processing)
+                invalidFrameIDs.append(frameID)
+                continue
+            }
+
+            // Try to verify the video file exists and is accessible
+            let videoExists = try await storage.segmentExists(id: VideoSegmentID(value: actualSegmentID))
+            if !videoExists {
+                Log.warning("[Queue] Video file missing for crashed frame \(frameID) (segment \(actualSegmentID)), marking as failed", category: .processing)
+                invalidFrameIDs.append(frameID)
+                continue
+            }
+
+            validFrameIDs.append(frameID)
         }
+
+        // Mark invalid frames as failed (they can't be processed without valid video)
+        for frameID in invalidFrameIDs {
+            try await updateFrameProcessingStatus(frameID, status: .failed)
+        }
+
+        if !invalidFrameIDs.isEmpty {
+            Log.warning("[Queue] Marked \(invalidFrameIDs.count) crashed frames as failed (video files missing/unreadable)", category: .processing)
+        }
+
+        if !validFrameIDs.isEmpty {
+            Log.info("[Queue] Re-enqueueing \(validFrameIDs.count) crashed frames with valid video files", category: .processing)
+            try await enqueueBatch(frameIDs: validFrameIDs)
+        }
+    }
+
+    /// Check if an error indicates an unrecoverable video file issue
+    /// These errors (damaged/missing files) won't be fixed by retrying
+    private func isUnrecoverableVideoError(_ error: Error) -> Bool {
+        let errorDescription = error.localizedDescription.lowercased()
+        let nsError = error as NSError
+
+        // AVFoundation error codes for damaged/unreadable media
+        // -11829 = AVErrorFileFormatNotRecognized / Cannot Open
+        // -12848 = NSOSStatusErrorDomain - file format issue
+        if nsError.domain == "AVFoundationErrorDomain" && nsError.code == -11829 {
+            return true
+        }
+
+        // Check error message for common indicators
+        if errorDescription.contains("cannot open") ||
+           errorDescription.contains("media may be damaged") ||
+           errorDescription.contains("file not found") ||
+           errorDescription.contains("no such file") {
+            return true
+        }
+
+        // Check for StorageError.fileNotFound
+        if let storageError = error as? StorageError {
+            switch storageError {
+            case .fileNotFound, .fileReadFailed:
+                return true
+            default:
+                break
+            }
+        }
+
+        return false
     }
 
     // MARK: - Statistics
