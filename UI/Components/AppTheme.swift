@@ -323,6 +323,257 @@ public class AppIconProvider {
     }
 }
 
+// MARK: - Favicon Provider
+
+/// Provides website favicons using Google's favicon API with caching
+public class FaviconProvider {
+    public static let shared = FaviconProvider()
+
+    private var cache: [String: NSImage] = [:]
+    private var pendingRequests: Set<String> = []
+    private let lock = NSLock()
+    private let cacheFileURL: URL
+    private var diskCache: [String: Data] = [:]
+
+    private init() {
+        // Store favicon cache in Application Support/Retrace/
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let retraceDir = appSupport.appendingPathComponent("Retrace", isDirectory: true)
+        try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
+        cacheFileURL = retraceDir.appendingPathComponent("favicon_cache")
+
+        // Create favicon cache directory
+        try? FileManager.default.createDirectory(at: cacheFileURL, withIntermediateDirectories: true)
+
+        // Load existing cache from disk
+        loadFromDisk()
+    }
+
+    /// Get the favicon for a domain synchronously (returns cached image or nil)
+    public func favicon(for domain: String) -> NSImage? {
+        let normalizedDomain = normalizeDomain(domain)
+        guard !normalizedDomain.isEmpty else { return nil }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Return from memory cache if available
+        if let cached = cache[normalizedDomain] {
+            return cached
+        }
+
+        // Return from disk cache if available
+        if let imageData = diskCache[normalizedDomain],
+           let image = NSImage(data: imageData) {
+            cache[normalizedDomain] = image
+            return image
+        }
+
+        return nil
+    }
+
+    /// Fetch favicon asynchronously if not cached
+    public func fetchFaviconIfNeeded(for domain: String, completion: @escaping (NSImage?) -> Void) {
+        let normalizedDomain = normalizeDomain(domain)
+        guard !normalizedDomain.isEmpty else {
+            completion(nil)
+            return
+        }
+
+        lock.lock()
+
+        // Already cached in memory
+        if let cached = cache[normalizedDomain] {
+            lock.unlock()
+            completion(cached)
+            return
+        }
+
+        // Already cached on disk
+        if let imageData = diskCache[normalizedDomain],
+           let image = NSImage(data: imageData) {
+            cache[normalizedDomain] = image
+            lock.unlock()
+            completion(image)
+            return
+        }
+
+        // Already fetching
+        if pendingRequests.contains(normalizedDomain) {
+            lock.unlock()
+            completion(nil)
+            return
+        }
+
+        pendingRequests.insert(normalizedDomain)
+        lock.unlock()
+
+        // Fetch from Google's favicon API
+        // Using size 64 for good quality on retina displays
+        let urlString = "https://www.google.com/s2/favicons?domain=\(normalizedDomain)&sz=64"
+        guard let url = URL(string: urlString) else {
+            lock.lock()
+            pendingRequests.remove(normalizedDomain)
+            lock.unlock()
+            completion(nil)
+            return
+        }
+
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            self.lock.lock()
+            self.pendingRequests.remove(normalizedDomain)
+
+            guard let data = data,
+                  let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200,
+                  let image = NSImage(data: data) else {
+                self.lock.unlock()
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
+            // Cache in memory and disk
+            self.cache[normalizedDomain] = image
+            self.diskCache[normalizedDomain] = data
+            self.lock.unlock()
+
+            // Save to disk asynchronously
+            self.saveToDiskAsync(domain: normalizedDomain, data: data)
+
+            DispatchQueue.main.async { completion(image) }
+        }.resume()
+    }
+
+    /// Normalize domain name (remove protocol, www, and path)
+    private func normalizeDomain(_ domain: String) -> String {
+        var normalized = domain.lowercased()
+
+        // Remove protocol
+        if let range = normalized.range(of: "://") {
+            normalized = String(normalized[range.upperBound...])
+        }
+
+        // Remove www.
+        if normalized.hasPrefix("www.") {
+            normalized = String(normalized.dropFirst(4))
+        }
+
+        // Remove path
+        if let slashIndex = normalized.firstIndex(of: "/") {
+            normalized = String(normalized[..<slashIndex])
+        }
+
+        // Remove port
+        if let colonIndex = normalized.firstIndex(of: ":") {
+            normalized = String(normalized[..<colonIndex])
+        }
+
+        return normalized.trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: - Disk Persistence
+
+    private func loadFromDisk() {
+        guard FileManager.default.fileExists(atPath: cacheFileURL.path) else { return }
+
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(at: cacheFileURL, includingPropertiesForKeys: nil)
+            for fileURL in contents {
+                let domain = fileURL.deletingPathExtension().lastPathComponent
+                if let data = try? Data(contentsOf: fileURL) {
+                    diskCache[domain] = data
+                }
+            }
+        } catch {
+            // Silently fail - will re-fetch as needed
+        }
+    }
+
+    private func saveToDiskAsync(domain: String, data: Data) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+
+            let fileURL = self.cacheFileURL.appendingPathComponent("\(domain).png")
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    /// Clear all cached favicons
+    public func clearCache() {
+        lock.lock()
+        cache.removeAll()
+        diskCache.removeAll()
+        lock.unlock()
+
+        // Delete disk cache
+        try? FileManager.default.removeItem(at: cacheFileURL)
+        try? FileManager.default.createDirectory(at: cacheFileURL, withIntermediateDirectories: true)
+    }
+
+    /// Debug: Get current cache size
+    public var cacheCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache.count
+    }
+}
+
+/// SwiftUI view that displays a favicon for a website domain
+public struct FaviconView: View {
+    let domain: String
+    let size: CGFloat
+    let fallbackColor: Color
+
+    @State private var favicon: NSImage? = nil
+    @State private var hasFetched: Bool = false
+
+    public init(domain: String, size: CGFloat = 16, fallbackColor: Color = .retraceSecondary) {
+        self.domain = domain
+        self.size = size
+        self.fallbackColor = fallbackColor
+    }
+
+    public var body: some View {
+        Group {
+            if let favicon = favicon {
+                Image(nsImage: favicon)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.15))
+                    .frame(width: size * 0.85, height: size * 0.85) // Scale down to match app icon visual size
+            } else {
+                // Fallback: colored circle (same as current dot indicator)
+                Circle()
+                    .fill(fallbackColor.opacity(0.5))
+                    .frame(width: size * 0.4, height: size * 0.4)
+            }
+        }
+        .frame(width: size, height: size)
+        .onAppear {
+            loadFavicon()
+        }
+    }
+
+    private func loadFavicon() {
+        // First try synchronous cache lookup
+        if let cached = FaviconProvider.shared.favicon(for: domain) {
+            self.favicon = cached
+            return
+        }
+
+        // Then fetch asynchronously if not already fetched
+        guard !hasFetched else { return }
+        hasFetched = true
+
+        FaviconProvider.shared.fetchFaviconIfNeeded(for: domain) { image in
+            self.favicon = image
+        }
+    }
+}
+
 /// SwiftUI view that displays an app icon for a bundle ID
 public struct AppIconView: View {
     let bundleID: String

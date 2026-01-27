@@ -979,6 +979,25 @@ public actor AppCoordinator {
         try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate)
     }
 
+    /// Get browser tab usage aggregated by windowName (tab title) with full URL
+    /// Returns tabs sorted by duration descending
+    public func getBrowserTabUsage(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        try await services.database.getBrowserTabUsage(bundleID: bundleID, from: startDate, to: endDate)
+    }
+
+    public func getBrowserTabUsageForDomain(
+        bundleID: String,
+        domain: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        try await services.database.getBrowserTabUsageForDomain(bundleID: bundleID, domain: domain, from: startDate, to: endDate)
+    }
+
     // MARK: - Tag Operations
 
     /// Get all tags

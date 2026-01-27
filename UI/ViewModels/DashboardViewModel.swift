@@ -354,7 +354,7 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
-    /// Fetch window usage data for a specific app (aggregated by windowName)
+    /// Fetch window usage data for a specific app (aggregated by windowName or domain for browsers)
     /// - Parameter bundleID: The app's bundle identifier
     /// - Returns: Array of window usage sorted by duration descending
     public func getWindowUsageForApp(bundleID: String) async -> [WindowUsageData] {
@@ -382,6 +382,70 @@ public class DashboardViewModel: ObservableObject {
             }
         } catch {
             Log.error("[DashboardViewModel] Failed to fetch window usage for app: \(error)", category: .ui)
+            return []
+        }
+    }
+
+    /// Fetch browser tab usage data (aggregated by tab title/windowName with full URL)
+    /// - Parameter bundleID: The browser's bundle identifier
+    /// - Returns: Array of tab usage sorted by duration descending, with full URLs for subtitle display
+    public func getBrowserTabUsage(bundleID: String) async -> [WindowUsageData] {
+        do {
+            let calendar = Calendar.current
+            let now = Date()
+            // Use rolling 7-day window (same as main dashboard app usage)
+            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+
+            let tabStats = try await coordinator.getBrowserTabUsage(
+                bundleID: bundleID,
+                from: weekStart,
+                to: now
+            )
+
+            // Calculate total duration for percentage calculation
+            let totalDuration = tabStats.reduce(0) { $0 + $1.duration }
+
+            return tabStats.map { stat in
+                WindowUsageData(
+                    windowName: stat.windowName,
+                    browserUrl: stat.browserUrl,
+                    duration: stat.duration,
+                    percentage: totalDuration > 0 ? stat.duration / totalDuration : 0
+                )
+            }
+        } catch {
+            Log.error("[DashboardViewModel] Failed to fetch browser tab usage: \(error)", category: .ui)
+            return []
+        }
+    }
+
+    /// Fetch browser tabs filtered by a specific domain (for nested website breakdown)
+    public func getBrowserTabsForDomain(bundleID: String, domain: String) async -> [WindowUsageData] {
+        do {
+            let calendar = Calendar.current
+            let now = Date()
+            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+
+            let tabStats = try await coordinator.getBrowserTabUsageForDomain(
+                bundleID: bundleID,
+                domain: domain,
+                from: weekStart,
+                to: now
+            )
+
+            // Calculate total duration for percentage calculation
+            let totalDuration = tabStats.reduce(0) { $0 + $1.duration }
+
+            return tabStats.map { stat in
+                WindowUsageData(
+                    windowName: stat.windowName,
+                    browserUrl: stat.browserUrl,
+                    duration: stat.duration,
+                    percentage: totalDuration > 0 ? stat.duration / totalDuration : 0
+                )
+            }
+        } catch {
+            Log.error("[DashboardViewModel] Failed to fetch browser tabs for domain: \(error)", category: .ui)
             return []
         }
     }
@@ -465,14 +529,8 @@ public class DashboardViewModel: ObservableObject {
 
 // MARK: - Supporting Types
 
-/// Browser bundle IDs that show "websites" instead of "windows"
-private let browserBundleIDs: Set<String> = [
-    "com.apple.Safari",
-    "com.google.Chrome",
-    "com.microsoft.edgemac",
-    "com.brave.Browser",
-    "company.thebrowser.Browser"  // Arc
-]
+/// Browser bundle IDs that show "websites" instead of "windows" (references shared list)
+private var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
 
 public struct AppUsageData: Identifiable {
     public let id = UUID()
@@ -487,9 +545,9 @@ public struct AppUsageData: Identifiable {
         browserBundleIDs.contains(appBundleID)
     }
 
-    /// Display label for the unique item count (e.g. "42 websites" or "15 windows")
+    /// Display label for the unique item count (e.g. "42 websites" or "15 tabs")
     public var uniqueItemLabel: String {
-        let itemType = isBrowser ? "website" : "window"
+        let itemType = isBrowser ? "website" : "tab"
         let plural = uniqueItemCount == 1 ? "" : "s"
         return "\(uniqueItemCount) \(itemType)\(plural)"
     }
@@ -513,8 +571,16 @@ public struct AppSessionDetail: Identifiable {
 public struct WindowUsageData: Identifiable {
     public let id = UUID()
     public let windowName: String?
+    public let browserUrl: String?  // Full URL for browser tabs (optional)
     public let duration: TimeInterval
     public let percentage: Double
+
+    public init(windowName: String?, browserUrl: String? = nil, duration: TimeInterval, percentage: Double) {
+        self.windowName = windowName
+        self.browserUrl = browserUrl
+        self.duration = duration
+        self.percentage = percentage
+    }
 
     /// Display name for the window (handles nil/empty cases)
     public var displayName: String {

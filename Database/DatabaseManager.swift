@@ -683,6 +683,29 @@ public actor DatabaseManager: DatabaseProtocol {
         return try AppSegmentQueries.getWindowUsageForApp(db: db, bundleID: bundleID, from: startDate, to: endDate)
     }
 
+    public func getBrowserTabUsage(
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getBrowserTabUsage(db: db, bundleID: bundleID, from: startDate, to: endDate)
+    }
+
+    public func getBrowserTabUsageForDomain(
+        bundleID: String,
+        domain: String,
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try AppSegmentQueries.getBrowserTabUsageForDomain(db: db, bundleID: bundleID, domain: domain, from: startDate, to: endDate)
+    }
+
     public func deleteSegment(id: Int64) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")

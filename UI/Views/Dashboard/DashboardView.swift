@@ -882,6 +882,12 @@ public struct DashboardView: View {
                             loadWindowUsage: { bundleID in
                                 await viewModel.getWindowUsageForApp(bundleID: bundleID)
                             },
+                            loadTabUsage: { bundleID in
+                                await viewModel.getBrowserTabUsage(bundleID: bundleID)
+                            },
+                            loadTabsForDomain: { bundleID, domain in
+                                await viewModel.getBrowserTabsForDomain(bundleID: bundleID, domain: domain)
+                            },
                             onWindowTapped: { app, window in
                                 handleWindowTapped(app, window)
                             }

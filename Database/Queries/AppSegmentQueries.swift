@@ -497,15 +497,8 @@ enum AppSegmentQueries {
         return results
     }
 
-    /// Browser bundle IDs that should show domain aggregation instead of window names
-    private static let browserBundleIDs: Set<String> = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "company.thebrowser.Browser",  // Arc
-        "org.mozilla.firefox"
-    ]
+    /// Browser bundle IDs that should show domain aggregation instead of window names (references shared list)
+    private static var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
 
     /// Get aggregated app usage stats (duration, session count, and unique window/domain count) for a time range
     /// Calculates actual screen time from frame gaps, attributing each gap to the PREVIOUS frame's app
@@ -636,7 +629,8 @@ enum AppSegmentQueries {
         // 5. Cap gaps at 2 minutes and sum per window/domain
         let sql: String
         if isBrowser {
-            // For browsers: extract domain from browserUrl, fall back to windowName if URL not available
+            // For browsers: extract domain from browserUrl only (no fallback to windowName)
+            // This ensures "Websites" view shows only entries with actual URL data
             sql = """
                 WITH all_frames AS (
                     SELECT
@@ -659,7 +653,7 @@ enum AppSegmentQueries {
                                         END
                                     ELSE s.browserUrl
                                 END
-                            ELSE s.windowName
+                            ELSE NULL
                         END as item_name
                     FROM frame f
                     JOIN segment s ON f.segmentId = s.id
@@ -762,6 +756,217 @@ enum AppSegmentQueries {
 
             results.append((
                 windowName: windowName,
+                duration: TimeInterval(durationMs) / 1000.0
+            ))
+        }
+        return results
+    }
+
+    /// Get browser tab usage aggregated by windowName (tab title) for a specific browser app
+    /// Returns tabs sorted by duration descending, with full URL available for subtitle display
+    /// Uses frame-based calculation with 2-minute idle cap
+    static func getBrowserTabUsage(
+        db: OpaquePointer,
+        bundleID: String,
+        from startDate: Date,
+        to endDate: Date
+    ) throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        let maxGapMs: Int64 = 120_000  // 2 minutes
+
+        // For browsers: aggregate by windowName (tab title), include browserUrl for display
+        let sql = """
+            WITH all_frames AS (
+                SELECT
+                    f.createdAt,
+                    s.bundleID,
+                    s.id as segmentId,
+                    s.windowName as tab_name,
+                    s.browserUrl as url
+                FROM frame f
+                JOIN segment s ON f.segmentId = s.id
+                WHERE f.createdAt >= ? AND f.createdAt <= ?
+            ),
+            frame_gaps AS (
+                SELECT
+                    LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
+                    LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
+                    LAG(tab_name) OVER (ORDER BY createdAt) as prev_tab,
+                    LAG(url) OVER (ORDER BY createdAt) as prev_url,
+                    createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
+                FROM all_frames
+            )
+            SELECT
+                prev_tab as tab_name,
+                prev_url as url,
+                SUM(CASE
+                    WHEN gap_ms IS NULL THEN 0
+                    WHEN gap_ms > ? THEN ?
+                    ELSE gap_ms
+                END) as duration_ms
+            FROM frame_gaps
+            WHERE prev_bundleID = ?
+                AND prev_tab IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                )
+            GROUP BY prev_tab, prev_url
+            HAVING duration_ms >= 1000
+            ORDER BY duration_ms DESC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
+        sqlite3_bind_int64(statement, 3, maxGapMs)
+        sqlite3_bind_int64(statement, 4, maxGapMs)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+
+        var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let windowName: String?
+            if sqlite3_column_type(statement, 0) == SQLITE_NULL {
+                windowName = nil
+            } else {
+                windowName = String(cString: sqlite3_column_text(statement, 0))
+            }
+            let browserUrl: String?
+            if sqlite3_column_type(statement, 1) == SQLITE_NULL {
+                browserUrl = nil
+            } else {
+                browserUrl = String(cString: sqlite3_column_text(statement, 1))
+            }
+            let durationMs = sqlite3_column_int64(statement, 2)
+
+            results.append((
+                windowName: windowName,
+                browserUrl: browserUrl,
+                duration: TimeInterval(durationMs) / 1000.0
+            ))
+        }
+        return results
+    }
+
+    /// Get browser tab usage filtered by domain (for nested website breakdown)
+    /// Returns tabs (windowName + browserUrl) where the domain matches the specified domain
+    static func getBrowserTabUsageForDomain(
+        db: OpaquePointer,
+        bundleID: String,
+        domain: String,
+        from startDate: Date,
+        to endDate: Date
+    ) throws -> [(windowName: String?, browserUrl: String?, duration: TimeInterval)] {
+        let maxGapMs: Int64 = 120_000  // 2 minutes
+
+        // For browsers: aggregate by windowName (tab title), filtered by domain extracted from browserUrl
+        let sql = """
+            WITH all_frames AS (
+                SELECT
+                    f.createdAt,
+                    s.bundleID,
+                    s.id as segmentId,
+                    s.windowName as tab_name,
+                    s.browserUrl as url,
+                    CASE
+                        WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
+                            CASE
+                                WHEN INSTR(s.browserUrl, '://') > 0 THEN
+                                    CASE
+                                        WHEN INSTR(SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3), '/') > 0 THEN
+                                            SUBSTR(
+                                                s.browserUrl,
+                                                INSTR(s.browserUrl, '://') + 3,
+                                                INSTR(SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3), '/') - 1
+                                            )
+                                        ELSE
+                                            SUBSTR(s.browserUrl, INSTR(s.browserUrl, '://') + 3)
+                                    END
+                                ELSE s.browserUrl
+                            END
+                        ELSE NULL
+                    END as domain
+                FROM frame f
+                JOIN segment s ON f.segmentId = s.id
+                WHERE f.createdAt >= ? AND f.createdAt <= ?
+            ),
+            frame_gaps AS (
+                SELECT
+                    LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
+                    LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
+                    LAG(tab_name) OVER (ORDER BY createdAt) as prev_tab,
+                    LAG(url) OVER (ORDER BY createdAt) as prev_url,
+                    LAG(domain) OVER (ORDER BY createdAt) as prev_domain,
+                    createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
+                FROM all_frames
+            )
+            SELECT
+                prev_tab as tab_name,
+                prev_url as url,
+                SUM(CASE
+                    WHEN gap_ms IS NULL THEN 0
+                    WHEN gap_ms > ? THEN ?
+                    ELSE gap_ms
+                END) as duration_ms
+            FROM frame_gaps
+            WHERE prev_bundleID = ?
+                AND prev_domain = ?
+                AND prev_tab IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM segment_tag st
+                    JOIN tag t ON st.tagId = t.id
+                    WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                )
+            GROUP BY prev_tab, prev_url
+            HAVING duration_ms >= 1000
+            ORDER BY duration_ms DESC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
+        sqlite3_bind_int64(statement, 3, maxGapMs)
+        sqlite3_bind_int64(statement, 4, maxGapMs)
+        sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 6, (domain as NSString).utf8String, -1, nil)
+
+        var results: [(windowName: String?, browserUrl: String?, duration: TimeInterval)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let windowName: String?
+            if sqlite3_column_type(statement, 0) == SQLITE_NULL {
+                windowName = nil
+            } else {
+                windowName = String(cString: sqlite3_column_text(statement, 0))
+            }
+            let browserUrl: String?
+            if sqlite3_column_type(statement, 1) == SQLITE_NULL {
+                browserUrl = nil
+            } else {
+                browserUrl = String(cString: sqlite3_column_text(statement, 1))
+            }
+            let durationMs = sqlite3_column_int64(statement, 2)
+
+            results.append((
+                windowName: windowName,
+                browserUrl: browserUrl,
                 duration: TimeInterval(durationMs) / 1000.0
             ))
         }

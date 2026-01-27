@@ -156,12 +156,12 @@ public struct AppInfo: Identifiable, Hashable, Sendable {
         self.browserURL = browserURL
     }
 
-    /// Known browser bundle IDs
+    /// Known browser bundle IDs (used for URL extraction and dashboard display)
+    /// Firefox excluded as it doesn't support URL extraction via accessibility APIs
     public static let browserBundleIDs: Set<String> = [
         "com.apple.Safari",
         "com.google.Chrome",
         "com.microsoft.edgemac",
-        "org.mozilla.firefox",
         "com.brave.Browser",
         "com.operasoftware.Opera",
         "com.vivaldi.Vivaldi",

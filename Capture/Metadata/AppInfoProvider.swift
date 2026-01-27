@@ -8,17 +8,8 @@ struct AppInfoProvider: Sendable {
 
     // MARK: - Constants
 
-    /// Known browser bundle identifiers for URL extraction
-    static let browserBundleIDs: Set<String> = [
-        "com.apple.Safari",
-        "com.google.Chrome",
-        "com.microsoft.edgemac",
-        "com.brave.Browser",
-        "org.mozilla.firefox",
-        "com.operasoftware.Opera",
-        "com.vivaldi.Vivaldi",
-        "company.thebrowser.Browser"  // Arc
-    ]
+    /// Known browser bundle identifiers for URL extraction (references shared list)
+    static var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
 
     // MARK: - App Info Retrieval
 
