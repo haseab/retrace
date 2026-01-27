@@ -16,7 +16,8 @@ struct AppInfoProvider: Sendable {
         "com.brave.Browser",
         "org.mozilla.firefox",
         "com.operasoftware.Opera",
-        "com.vivaldi.Vivaldi"
+        "com.vivaldi.Vivaldi",
+        "company.thebrowser.Browser"  // Arc
     ]
 
     // MARK: - App Info Retrieval

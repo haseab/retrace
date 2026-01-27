@@ -5,10 +5,20 @@ import Shared
 
 /// Interactive test to inspect accessibility data from the active window
 /// Shows what metadata Retrace can capture for segments and FTS indexing
+///
+/// Browser URL Extraction Strategy:
+/// 1. Safari: AXToolbar → AXTextField (address bar)
+/// 2. Chrome/Edge/Brave/Vivaldi: AXDocument on window + AXManualAccessibility toggle
+/// 3. Arc: AppleScript (Chromium but AX tree often incomplete)
+/// 4. Firefox: AppleScript (Gecko doesn't expose URL via AX)
+/// 5. Generic fallback: Find AXWebArea and read AXURL attribute
 final class AccessibilityInspectorTest: XCTestCase {
 
     // File handle for logging - make it an instance variable so other methods can access it
     private var logFileHandle: FileHandle?
+
+    // Set to true to see detailed extraction attempts (noisy)
+    private var verboseLogging = false
 
     /// Run this test and switch between different apps/windows to see what data is captured
     func testShowAccessibilityDataDialog() async throws {
@@ -26,12 +36,14 @@ final class AccessibilityInspectorTest: XCTestCase {
         log("\n╔══════════════════════════════════════════════════════════════════════════════╗")
         log("║                    ACCESSIBILITY INSPECTOR TEST                              ║")
         log("║                                                                              ║")
-        log("║  This test will monitor the active window for 30 seconds.                   ║")
+        log("║  This test will monitor the active window indefinitely.                     ║")
         log("║  Switch between different apps to see what data is captured:                ║")
         log("║    - App Bundle ID (for segment tracking)                                   ║")
         log("║    - App Name                                                               ║")
         log("║    - Window Title (FTS c2)                                                  ║")
         log("║    - Browser URL (if applicable)                                            ║")
+        log("║                                                                              ║")
+        log("║  Supported browsers: Safari, Chrome, Edge, Brave, Arc, Firefox, Vivaldi     ║")
         log("║                                                                              ║")
         log("║  Output file: \(outputPath)                                 ║")
         log("║  Run: tail -f \(outputPath)                                 ║")
@@ -63,18 +75,23 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         var lastAppBundleID = ""
         var lastWindowTitle = ""
+        var lastBrowserURL = ""
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
         while true {
             if let data = captureActiveWindowData() {
                 // Only print when something changes
-                if data.appBundleID != lastAppBundleID || data.windowTitle != lastWindowTitle {
+                let currentURL = data.browserURL ?? ""
+                if data.appBundleID != lastAppBundleID || data.windowTitle != lastWindowTitle || currentURL != lastBrowserURL {
                     log("\n⏱  \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
                     log("🪟 Window Title:   \(data.windowTitle ?? "(none)")")
-                    log("🌐 Browser URL:    \(data.browserURL ?? "(none)")")
+                    log("🌐 Browser URL:    \(data.browserURL ?? "(not a browser / URL not found)")")
+                    if let method = data.urlExtractionMethod {
+                        log("   └─ Method:      \(method)")
+                    }
                     log("")
                     log("FTS Mapping:")
                     log("  c0 (main text):   [OCR text would go here]")
@@ -84,6 +101,7 @@ final class AccessibilityInspectorTest: XCTestCase {
 
                     lastAppBundleID = data.appBundleID
                     lastWindowTitle = data.windowTitle ?? ""
+                    lastBrowserURL = currentURL
                 }
             }
 
@@ -110,6 +128,7 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         var windowTitle: String?
         var browserURL: String?
+        var urlMethod: String?
         var chromeText: String?
 
         // Get focused window
@@ -117,13 +136,11 @@ final class AccessibilityInspectorTest: XCTestCase {
             // Get window title
             windowTitle = getAttributeValue(focusedWindow, attribute: kAXTitleAttribute as CFString)
 
-            // Try to get browser URL (Chrome, Safari, Firefox patterns)
+            // Try to get browser URL
             if isBrowserApp(appBundleID) {
-                browserURL = getBrowserURL(appElement: appElement, bundleID: appBundleID)
-                // Debug: log if we failed to get URL for a browser
-                if browserURL == nil {
-                    print("[DEBUG] Failed to get URL for browser: \(appBundleID)")
-                }
+                let result = getBrowserURL(appElement: appElement, window: focusedWindow, bundleID: appBundleID)
+                browserURL = result.url
+                urlMethod = result.method
             }
 
             // Try to get status bar / menu bar text (chrome text)
@@ -135,6 +152,7 @@ final class AccessibilityInspectorTest: XCTestCase {
             appName: appName,
             windowTitle: windowTitle,
             browserURL: browserURL,
+            urlExtractionMethod: urlMethod,
             chromeText: chromeText
         )
     }
@@ -158,85 +176,334 @@ final class AccessibilityInspectorTest: XCTestCase {
             "com.microsoft.edgemac",
             "com.brave.Browser",
             "com.vivaldi.Vivaldi",
+            "com.operasoftware.Opera",
             "company.thebrowser.Browser"  // Arc
         ]
         return browsers.contains(bundleID)
     }
 
-    private func getBrowserURL(appElement: AXUIElement, bundleID: String) -> String? {
-        // Strategy: Use accessibility API for Chrome/Safari, AppleScript for Firefox/Arc
+    // MARK: - Browser URL Extraction
 
-        // For Firefox and Arc, use AppleScript (requires automation permission during onboarding)
-        if bundleID == "org.mozilla.firefox" {
-            debugLog("[DEBUG] Firefox detected - trying AppleScript")
-            if let url = getFirefoxURLViaAppleScript() {
-                debugLog("[DEBUG] ✅ Got URL via AppleScript for Firefox")
+    private func getBrowserURL(appElement: AXUIElement, window: AXUIElement, bundleID: String) -> (url: String?, method: String?) {
+        // Strategy varies by browser type
+
+        switch bundleID {
+        case "com.apple.Safari":
+            return getSafariURL(appElement: appElement, window: window)
+
+        case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi":
+            return getChromiumURL(appElement: appElement, window: window, bundleID: bundleID)
+
+        case "company.thebrowser.Browser":  // Arc
+            return getArcURL(appElement: appElement, window: window)
+
+        case "org.mozilla.firefox":
+            return getFirefoxURL()
+
+        default:
+            // Generic fallback for unknown browsers
+            return getGenericBrowserURL(appElement: appElement, window: window)
+        }
+    }
+
+    // MARK: - Safari
+
+    private func getSafariURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
+        debugLog("[Safari] Attempting URL extraction...")
+
+        // Method 1: Toolbar → TextField approach
+        if let toolbar: AXUIElement = getAttributeValue(window, attribute: "AXToolbar" as CFString),
+           let children: [AXUIElement] = getAttributeValue(toolbar, attribute: kAXChildrenAttribute as CFString) {
+            for child in children {
+                if let role: String = getAttributeValue(child, attribute: kAXRoleAttribute as CFString),
+                   role == kAXTextFieldRole as String,
+                   let url: String = getAttributeValue(child, attribute: kAXValueAttribute as CFString),
+                   !url.isEmpty {
+                    debugLog("[Safari] ✅ Got URL via toolbar text field")
+                    return (url, "Safari: AXToolbar → AXTextField")
+                }
+            }
+        }
+
+        // Method 2: AXWebArea → AXURL
+        if let url = findURLInWebArea(window) {
+            debugLog("[Safari] ✅ Got URL via AXWebArea")
+            return (url, "Safari: AXWebArea → AXURL")
+        }
+
+        // Method 3: Deep search
+        if let url = findURLInElement(window, depth: 0, maxDepth: 10) {
+            debugLog("[Safari] ✅ Got URL via deep search")
+            return (url, "Safari: Deep UI search")
+        }
+
+        debugLog("[Safari] ❌ All methods failed")
+        return (nil, nil)
+    }
+
+    // MARK: - Chromium Browsers (Chrome, Edge, Brave, Vivaldi)
+
+    private func getChromiumURL(appElement: AXUIElement, window: AXUIElement, bundleID: String) -> (url: String?, method: String?) {
+        let browserName = bundleID.components(separatedBy: ".").last ?? "Chromium"
+        debugLog("[\(browserName)] Attempting URL extraction...")
+
+        // Enable accessibility on Chromium/Electron apps
+        enableChromiumAccessibility(appElement)
+
+        // Method 1: AXDocument on window (most reliable for Chrome)
+        if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
+            debugLog("[\(browserName)] ✅ Got URL via AXDocument on window")
+            return (url, "\(browserName): AXDocument on window")
+        }
+
+        // Method 2: AXWebArea → AXURL
+        if let url = findURLInWebArea(window) {
+            debugLog("[\(browserName)] ✅ Got URL via AXWebArea")
+            return (url, "\(browserName): AXWebArea → AXURL")
+        }
+
+        // Method 3: Focused element attributes
+        if let focused: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedUIElementAttribute as CFString) {
+            if let url: String = getAttributeValue(focused, attribute: kAXURLAttribute as CFString), !url.isEmpty {
+                debugLog("[\(browserName)] ✅ Got URL via focused element AXURL")
+                return (url, "\(browserName): Focused element AXURL")
+            }
+            if let url: String = getAttributeValue(focused, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
+                debugLog("[\(browserName)] ✅ Got URL via focused element AXDocument")
+                return (url, "\(browserName): Focused element AXDocument")
+            }
+        }
+
+        // Method 4: Deep search for address bar
+        if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
+            debugLog("[\(browserName)] ✅ Got URL via deep search")
+            return (url, "\(browserName): Deep UI search")
+        }
+
+        debugLog("[\(browserName)] ❌ All methods failed")
+        inspectAllAttributes(window)
+        return (nil, nil)
+    }
+
+    /// Enable accessibility on Chromium/Electron apps by setting AXManualAccessibility
+    private func enableChromiumAccessibility(_ appElement: AXUIElement) {
+        // Set AXManualAccessibility = true to force Chromium to expose the AX tree
+        let result = AXUIElementSetAttributeValue(
+            appElement,
+            "AXManualAccessibility" as CFString,
+            kCFBooleanTrue
+        )
+
+        if result == .success {
+            debugLog("[Chromium] Set AXManualAccessibility = true")
+        }
+    }
+
+    // MARK: - Arc Browser
+
+    private func getArcURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
+        debugLog("[Arc] Attempting URL extraction...")
+
+        // Method 1: AppleScript (most reliable for Arc)
+        if let url = getArcURLViaAppleScript() {
+            debugLog("[Arc] ✅ Got URL via AppleScript")
+            return (url, "Arc: AppleScript")
+        }
+
+        // Method 2: Fall back to Chromium approach
+        enableChromiumAccessibility(appElement)
+
+        if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
+            debugLog("[Arc] ✅ Got URL via AXDocument")
+            return (url, "Arc: AXDocument on window")
+        }
+
+        if let url = findURLInWebArea(window) {
+            debugLog("[Arc] ✅ Got URL via AXWebArea")
+            return (url, "Arc: AXWebArea → AXURL")
+        }
+
+        debugLog("[Arc] ❌ All methods failed")
+        return (nil, nil)
+    }
+
+    // MARK: - Firefox
+
+    private func getFirefoxURL() -> (url: String?, method: String?) {
+        debugLog("[Firefox] Attempting URL extraction via AppleScript...")
+
+        if let url = getFirefoxURLViaAppleScript() {
+            debugLog("[Firefox] ✅ Got URL via AppleScript")
+            return (url, "Firefox: AppleScript")
+        }
+
+        debugLog("[Firefox] ❌ AppleScript failed (check Automation permissions)")
+        return (nil, nil)
+    }
+
+    // MARK: - Generic Browser Fallback
+
+    private func getGenericBrowserURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
+        debugLog("[Generic] Attempting URL extraction...")
+
+        // Try AXWebArea approach
+        if let url = findURLInWebArea(window) {
+            debugLog("[Generic] ✅ Got URL via AXWebArea")
+            return (url, "Generic: AXWebArea → AXURL")
+        }
+
+        // Try AXDocument on window
+        if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
+            debugLog("[Generic] ✅ Got URL via AXDocument")
+            return (url, "Generic: AXDocument on window")
+        }
+
+        // Deep search
+        if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
+            debugLog("[Generic] ✅ Got URL via deep search")
+            return (url, "Generic: Deep UI search")
+        }
+
+        debugLog("[Generic] ❌ All methods failed")
+        return (nil, nil)
+    }
+
+    // MARK: - AXWebArea Approach (Generic)
+
+    /// Find URL by locating AXWebArea element and reading AXURL
+    /// This is Apple's documented approach for web content
+    private func findURLInWebArea(_ element: AXUIElement, depth: Int = 0) -> String? {
+        guard depth < 15 else { return nil }
+
+        // Check if this element is a web area
+        if let role: String = getAttributeValue(element, attribute: kAXRoleAttribute as CFString),
+           role == "AXWebArea" {
+            // Try AXURL attribute (the documented way)
+            if let url: String = getAttributeValue(element, attribute: kAXURLAttribute as CFString), !url.isEmpty {
+                return url
+            }
+            // Also try AXDocument as fallback
+            if let url: String = getAttributeValue(element, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
                 return url
             }
         }
 
-        if bundleID == "company.thebrowser.Browser" {
-            debugLog("[DEBUG] Arc detected - trying AppleScript")
-            if let url = getArcURLViaAppleScript() {
-                debugLog("[DEBUG] ✅ Got URL via AppleScript for Arc")
-                return url
-            }
+        // Recurse into children
+        guard let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) else {
+            return nil
         }
 
-        // For Chrome and Safari, use accessibility API (no extra permissions needed)
-        // Method 1: Try accessibility API first (works for Safari, Chrome)
-        if let focusedElement: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedUIElementAttribute as CFString) {
-            if let url: String = getAttributeValue(focusedElement, attribute: kAXURLAttribute as CFString) {
-                debugLog("[DEBUG] ✅ Got URL via kAXURLAttribute on focused element")
+        for child in children {
+            if let url = findURLInWebArea(child, depth: depth + 1) {
                 return url
             }
-
-            // Also try AXDocument attribute on focused element
-            if let url: String = getAttributeValue(focusedElement, attribute: "AXDocument" as CFString) {
-                debugLog("[DEBUG] ✅ Got URL via AXDocument on focused element")
-                return url
-            }
-        }
-
-        // Method 2: Try to get URL from window (works for Chrome)
-        if let focusedWindow: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
-            // Try AXDocument on window (works for Chrome)
-            if let url: String = getAttributeValue(focusedWindow, attribute: "AXDocument" as CFString) {
-                debugLog("[DEBUG] ✅ Got URL via AXDocument on window")
-                return url
-            }
-
-            // Try kAXURLAttribute on window
-            if let url: String = getAttributeValue(focusedWindow, attribute: kAXURLAttribute as CFString) {
-                debugLog("[DEBUG] ✅ Got URL via kAXURLAttribute on window")
-                return url
-            }
-
-            // Method 3: Deep search through UI hierarchy as fallback (works for Safari)
-            debugLog("[DEBUG] URL not found via simple attributes for \(bundleID), trying deep search:")
-
-            if let url = findURLInElement(focusedWindow, depth: 0, maxDepth: 8) {
-                debugLog("[DEBUG] ✅ Got URL via deep UI hierarchy search")
-                return url
-            }
-
-            // Debug: inspect attributes when all methods fail
-            debugLog("[DEBUG] All methods failed, inspecting window attributes:")
-            inspectAllAttributes(focusedWindow)
         }
 
         return nil
     }
 
-    private func findURLInWindowHierarchy(_ window: AXUIElement) -> String? {
-        // First, inspect ALL available attributes on the window
-        debugLog("[DEBUG] Inspecting all attributes on window:")
-        inspectAllAttributes(window)
+    // MARK: - AppleScript Methods
 
-        // Search more thoroughly through the window's UI hierarchy
-        // Chrome and Arc store the URL in a text field somewhere deep in the toolbar
-        return findURLInElement(window, depth: 0, maxDepth: 8)
+    private func getFirefoxURLViaAppleScript() -> String? {
+        // Method 1: Try direct AppleScript API
+        if let url = runAppleScript("""
+            tell application "Firefox"
+                if (count of windows) > 0 then
+                    get URL of active tab of front window
+                end if
+            end tell
+            """) {
+            return url
+        }
+
+        // Method 2: Clipboard hack via System Events (Cmd+L, Cmd+C)
+        return runAppleScript("""
+            set theClipboard to (the clipboard as record)
+            set the clipboard to ""
+
+            tell application "System Events"
+                set frontmost of application process "firefox" to true
+                keystroke "l" using {command down}
+                delay 0.05
+                keystroke "c" using {command down}
+            end tell
+
+            delay 0.1
+            set theURL to (the clipboard)
+            set the clipboard to theClipboard
+            return theURL
+            """)
     }
+
+    private func getArcURLViaAppleScript() -> String? {
+        // Try method 1: Standard AppleScript
+        if let url = runAppleScript("""
+            tell application "Arc"
+                if (count of windows) > 0 then
+                    get URL of active tab of front window
+                end if
+            end tell
+            """) {
+            return url
+        }
+
+        // Try method 2: Alternative syntax
+        return runAppleScript("""
+            tell application "Arc"
+                if (count of windows) > 0 then
+                    get URL of current tab of window 1
+                end if
+            end tell
+            """)
+    }
+
+    private func runAppleScript(_ source: String) -> String? {
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return nil }
+        let result = script.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return result.stringValue
+    }
+
+    // MARK: - Deep Search Helpers
+
+    private func findURLInElement(_ element: AXUIElement, depth: Int, maxDepth: Int) -> String? {
+        guard depth < maxDepth else { return nil }
+
+        // Check if this element has a URL attribute
+        if let url: String = getAttributeValue(element, attribute: kAXURLAttribute as CFString), !url.isEmpty {
+            return url
+        }
+
+        // Check if this is a text field that might contain the URL
+        if let role: String = getAttributeValue(element, attribute: kAXRoleAttribute as CFString),
+           role == kAXTextFieldRole as String,
+           let value: String = getAttributeValue(element, attribute: kAXValueAttribute as CFString),
+           looksLikeURL(value) {
+            return value
+        }
+
+        // Recursively check children
+        if let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) {
+            for child in children.prefix(25) {
+                if let url = findURLInElement(child, depth: depth + 1, maxDepth: maxDepth) {
+                    return url
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private func looksLikeURL(_ string: String) -> Bool {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("http://") ||
+               trimmed.hasPrefix("https://") ||
+               trimmed.hasPrefix("file://") ||
+               (trimmed.contains(".") && !trimmed.contains(" ") && trimmed.count > 4)
+    }
+
+    // MARK: - Debug Helpers
 
     private func inspectAllAttributes(_ element: AXUIElement) {
         var attributeNames: CFArray?
@@ -256,131 +523,12 @@ final class AccessibilityInspectorTest: XCTestCase {
                 let valueStr = String(describing: val)
                 let truncated = valueStr.prefix(100)
                 debugLog("    \(attr) = \(truncated)")
-            } else {
-                debugLog("    \(attr) = <unavailable>")
             }
         }
-    }
-
-    private func getFirefoxURLViaAppleScript() -> String? {
-        let script = """
-        tell application "Firefox"
-            if (count of windows) > 0 then
-                get URL of active tab of front window
-            end if
-        end tell
-        """
-
-        var error: NSDictionary?
-        let appleScript = NSAppleScript(source: script)
-        let result = appleScript?.executeAndReturnError(&error)
-
-        if let error = error {
-            debugLog("[DEBUG] Firefox AppleScript error: \(error)")
-            return nil
-        }
-
-        return result?.stringValue
-    }
-
-    private func getChromeURLViaAppleScript() -> String? {
-        let script = """
-        tell application "Google Chrome"
-            if (count of windows) > 0 then
-                get URL of active tab of front window
-            end if
-        end tell
-        """
-
-        var error: NSDictionary?
-        let appleScript = NSAppleScript(source: script)
-        let result = appleScript?.executeAndReturnError(&error)
-
-        if let error = error {
-            debugLog("[DEBUG] AppleScript error: \(error)")
-            return nil
-        }
-
-        return result?.stringValue
-    }
-
-    private func getArcURLViaAppleScript() -> String? {
-        // Try method 1: Standard AppleScript
-        let script1 = """
-        tell application "Arc"
-            if (count of windows) > 0 then
-                get URL of active tab of front window
-            end if
-        end tell
-        """
-
-        var error: NSDictionary?
-        let appleScript = NSAppleScript(source: script1)
-        let result = appleScript?.executeAndReturnError(&error)
-
-        if let error = error {
-            debugLog("[DEBUG] Arc AppleScript method 1 error: \(error)")
-
-            // Try method 2: Alternative syntax (some browsers use different terminology)
-            let script2 = """
-            tell application "Arc"
-                if (count of windows) > 0 then
-                    get URL of current tab of window 1
-                end if
-            end tell
-            """
-
-            var error2: NSDictionary?
-            let appleScript2 = NSAppleScript(source: script2)
-            let result2 = appleScript2?.executeAndReturnError(&error2)
-
-            if let error2 = error2 {
-                debugLog("[DEBUG] Arc AppleScript method 2 error: \(error2)")
-                return nil
-            }
-
-            return result2?.stringValue
-        }
-
-        return result?.stringValue
-    }
-
-    private func getSafariURLViaAppleScript() -> String? {
-        let script = """
-        tell application "Safari"
-            if (count of windows) > 0 then
-                get URL of current tab of front window
-            end if
-        end tell
-        """
-
-        var error: NSDictionary?
-        let appleScript = NSAppleScript(source: script)
-        let result = appleScript?.executeAndReturnError(&error)
-
-        if let error = error {
-            debugLog("[DEBUG] Safari AppleScript error: \(error)")
-            return nil
-        }
-
-        return result?.stringValue
-    }
-
-    private func getChromeURLFromWindow(_ window: AXUIElement) -> String? {
-        // Chrome's URL is typically in a text field with role "AXTextField" in the toolbar
-        // We need to recursively search the window's UI hierarchy
-
-        // Debug: Print the window's accessibility tree to the log file
-        debugLog("[DEBUG] Chrome window accessibility tree:")
-        debugPrintElement(window, depth: 0, maxDepth: 3)
-
-        if let url = findURLInElement(window, depth: 0, maxDepth: 5) {
-            return url
-        }
-        return nil
     }
 
     private func debugLog(_ message: String) {
+        guard verboseLogging else { return }
         let line = message + "\n"
         logFileHandle?.write(line.data(using: .utf8)!)
     }
@@ -395,18 +543,11 @@ final class AccessibilityInspectorTest: XCTestCase {
         let description: String? = getAttributeValue(element, attribute: kAXDescriptionAttribute as CFString)
 
         var output = "\(indent)[\(role)]"
-        if let title = title {
-            output += " title=\"\(title.prefix(30))\""
-        }
-        if let value = value {
-            output += " value=\"\(value.prefix(50))\""
-        }
-        if let description = description {
-            output += " desc=\"\(description.prefix(30))\""
-        }
+        if let title = title { output += " title=\"\(title.prefix(30))\"" }
+        if let value = value { output += " value=\"\(value.prefix(50))\"" }
+        if let description = description { output += " desc=\"\(description.prefix(30))\"" }
         debugLog(output)
 
-        // Recursively print children
         if let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) {
             for child in children.prefix(15).enumerated() {
                 debugPrintElement(child.element, depth: depth + 1, maxDepth: maxDepth)
@@ -414,38 +555,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         }
     }
 
-    private func findURLInElement(_ element: AXUIElement, depth: Int, maxDepth: Int) -> String? {
-        guard depth < maxDepth else { return nil }
-
-        // Check if this element has a URL
-        if let url: String = getAttributeValue(element, attribute: kAXURLAttribute as CFString) {
-            return url
-        }
-
-        // Check if this is a text field that might contain the URL
-        if let role: String = getAttributeValue(element, attribute: kAXRoleAttribute as CFString) {
-            if role == kAXTextFieldRole as String {
-                // Check for value which might be the URL
-                if let value: String = getAttributeValue(element, attribute: kAXValueAttribute as CFString) {
-                    // Basic check if it looks like a URL
-                    if value.hasPrefix("http://") || value.hasPrefix("https://") {
-                        return value
-                    }
-                }
-            }
-        }
-
-        // Recursively check children
-        if let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) {
-            for child in children.prefix(20) {  // Check first 20 children at each level
-                if let url = findURLInElement(child, depth: depth + 1, maxDepth: maxDepth) {
-                    return url
-                }
-            }
-        }
-
-        return nil
-    }
+    // MARK: - Chrome Text Extraction
 
     private func getChromeText(windowElement: AXUIElement) -> String? {
         // Try to get status bar or toolbar text
@@ -476,5 +586,6 @@ private struct AccessibilityData {
     let appName: String
     let windowTitle: String?
     let browserURL: String?
+    let urlExtractionMethod: String?
     let chromeText: String?
 }
