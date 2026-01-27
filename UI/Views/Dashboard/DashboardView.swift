@@ -419,11 +419,12 @@ public struct DashboardView: View {
     }
 
     private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
-        selectedApp = app
-        selectedWindow = window
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-            showSessionsSheet = true
-        }
+        // Launch filtered timeline instantly instead of showing sessions dialog
+        TimelineWindowController.shared.showWithFilter(
+            bundleID: app.appBundleID,
+            windowName: window.windowName,
+            browserUrl: window.browserUrl
+        )
     }
 
     private func openTimelineAt(date: Date) {

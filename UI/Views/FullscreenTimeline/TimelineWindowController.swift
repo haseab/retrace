@@ -424,8 +424,19 @@ public class TimelineWindowController: NSObject {
                     return
                 }
 
-                Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered", category: .ui)
-                await viewModel.refreshFrameData()
+                // Check if position cache has expired (2 minutes)
+                // If expired, navigate to newest; if not expired, preserve user's position
+                let cacheExpirationSeconds: TimeInterval = 120
+                let cacheExpired: Bool
+                if let lastHidden = self.lastHiddenAt {
+                    cacheExpired = Date().timeIntervalSince(lastHidden) > cacheExpirationSeconds
+                } else {
+                    cacheExpired = true // No lastHiddenAt means first show, navigate to newest
+                }
+
+                Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered (cacheExpired: \(cacheExpired))", category: .ui)
+                // Only preserve position if cache hasn't expired; after 2 minutes, navigate to newest
+                await viewModel.refreshFrameData(navigateToNewest: cacheExpired)
                 // Force video reload so AVPlayer picks up new frames appended to the video file
                 viewModel.forceVideoReload = true
                 Log.info("[TIMELINE-CACHE] ✅ Background refresh complete", category: .ui)
@@ -471,6 +482,40 @@ public class TimelineWindowController: NSObject {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
             await timelineViewModel?.navigateToHour(date)
+        }
+    }
+
+    /// Show the timeline with a pre-applied filter for an app and window name
+    /// This instantly opens a filtered timeline view without showing a dialog
+    public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil) {
+        show()
+
+        // Apply filter after a brief delay to allow the view to initialize
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            guard let viewModel = timelineViewModel else { return }
+
+            // Build the filter criteria
+            var criteria = FilterCriteria()
+            criteria.selectedApps = Set([bundleID])
+            criteria.appFilterMode = .include
+
+            // For window filtering, use windowNameFilter if we have a window name
+            // For browser URLs, use browserUrlFilter
+            if let url = browserUrl, !url.isEmpty {
+                criteria.browserUrlFilter = url
+            } else if let window = windowName, !window.isEmpty {
+                criteria.windowNameFilter = window
+            }
+
+            // Apply the filter directly (skip the pending state)
+            viewModel.filterCriteria = criteria
+            viewModel.pendingFilterCriteria = criteria
+
+            // Reload the timeline with the new filter
+            await viewModel.loadMostRecentFrame()
+
+            Log.info("[TIMELINE-FILTER] Applied filter for bundleID=\(bundleID), windowName=\(windowName ?? "nil"), browserUrl=\(browserUrl ?? "nil")", category: .ui)
         }
     }
 

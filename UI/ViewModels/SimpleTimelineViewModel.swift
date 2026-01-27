@@ -1398,6 +1398,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Apply pending filters
     public func applyFilters() {
         Log.debug("[Filter] applyFilters() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), current.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+
+        // Capture current timestamp before applying filters to preserve position
+        let timestampToPreserve = currentTimestamp
+
         filterCriteria = pendingFilterCriteria
         Log.debug("[Filter] Applied filters - filterCriteria.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
         dismissFilterPanel()
@@ -1405,9 +1409,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Save filter criteria to cache immediately
         saveFilterCriteria()
 
-        // Reload timeline with filters
+        // Reload timeline with filters, preserving current position if possible
         Task {
-            await loadMostRecentFrame()
+            if let timestamp = timestampToPreserve {
+                // Try to reload frames around the same timestamp (with new filters)
+                // If no frames match, reloadFramesAroundTimestamp will fall back to loadMostRecentFrame
+                await reloadFramesAroundTimestamp(timestamp)
+            } else {
+                // No current position, fall back to most recent
+                await loadMostRecentFrame()
+            }
         }
     }
 
@@ -1419,6 +1430,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear all applied filters and reset pending
     public func clearAllFilters() {
+        // Capture current timestamp before clearing filters to preserve position
+        let timestampToPreserve = currentTimestamp
+
         filterCriteria = .none
         pendingFilterCriteria = .none
         Log.debug("[Filter] Cleared all filters", category: .ui)
@@ -1426,9 +1440,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Save (clear) filter criteria cache immediately
         saveFilterCriteria()
 
-        // Reload timeline without filters
+        // Reload timeline without filters, preserving current position
         Task {
-            await loadMostRecentFrame()
+            if let timestamp = timestampToPreserve {
+                // Reload frames around the same timestamp (without filters)
+                await reloadFramesAroundTimestamp(timestamp)
+            } else {
+                // No current position, fall back to most recent
+                await loadMostRecentFrame()
+            }
         }
     }
 
@@ -1953,9 +1973,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Refresh frame data when showing the pre-rendered timeline
     /// This is a lightweight refresh that only loads the most recent frame if needed,
     /// rather than doing a full reload. The goal is to show fresh data quickly.
-    public func refreshFrameData() async {
+    /// - Parameter navigateToNewest: If true, automatically navigate to the newest frame when new frames are found.
+    ///                               If false, preserve the current position (useful for background refresh).
+    public func refreshFrameData(navigateToNewest: Bool = true) async {
         let refreshStartTime = CFAbsoluteTimeGetCurrent()
-        Log.info("[TIMELINE-REFRESH] 🔄 refreshFrameData() started", category: .ui)
+        Log.info("[TIMELINE-REFRESH] 🔄 refreshFrameData(navigateToNewest: \(navigateToNewest)) started", category: .ui)
 
         // If we have frames and a current position, just refresh the current image
         if !frames.isEmpty {
@@ -1980,15 +2002,19 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Update boundaries
                         updateWindowBoundaries()
 
-                        // Navigate to the newest frame
-                        let oldIndex = currentIndex
-                        currentIndex = frames.count - 1
+                        // Only navigate to newest if requested (preserve position during background refresh)
+                        if navigateToNewest {
+                            let oldIndex = currentIndex
+                            currentIndex = frames.count - 1
 
-                        // Log the new video info for debugging
-                        if let newVideoInfo = frames.last?.videoInfo {
-                            Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), newVideoPath=\(newVideoInfo.videoPath.suffix(30)), newFrameIndex=\(newVideoInfo.frameIndex)", category: .ui)
+                            // Log the new video info for debugging
+                            if let newVideoInfo = frames.last?.videoInfo {
+                                Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), newVideoPath=\(newVideoInfo.videoPath.suffix(30)), newFrameIndex=\(newVideoInfo.frameIndex)", category: .ui)
+                            } else {
+                                Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), NO VIDEO INFO", category: .ui)
+                            }
                         } else {
-                            Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), NO VIDEO INFO", category: .ui)
+                            Log.info("[TIMELINE-REFRESH] 🔄 Preserving position at currentIndex=\(currentIndex), frames.count=\(frames.count) (navigateToNewest=false)", category: .ui)
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)

@@ -20,6 +20,11 @@ public struct TimelineTapeView: View {
     private var iconDisplayThreshold: CGFloat { TimelineScaleFactor.iconDisplayThreshold }
     private var pixelsPerFrame: CGFloat { viewModel.pixelsPerFrame }
 
+    /// Fixed offset for the app badge - positioned to the left of the datetime button
+    private var currentAppBadgeOffset: CGFloat {
+        -(TimelineScaleFactor.controlButtonSize * 3 + TimelineScaleFactor.controlSpacing)
+    }
+
     // MARK: - Body
 
     public var body: some View {
@@ -190,8 +195,14 @@ public struct TimelineTapeView: View {
             let centerX = geometry.size.width / 2
 
             ZStack {
-                // Datetime button (truly centered) with Go to Now button overlay
+                // Datetime button (truly centered) with app badge and Go to Now button overlays
                 DatetimeButton(viewModel: viewModel)
+                    .overlay(alignment: .leading) {
+                        // Current app badge - shows the active app's icon
+                        // Positioned to the left of the datetime button without shifting it
+                        CurrentAppBadge(viewModel: viewModel)
+                            .offset(x: currentAppBadgeOffset)
+                    }
                     .overlay(alignment: .trailing) {
                         // Go to Now button - fades in when not at most recent frame
                         // Positioned to the right of the datetime button without shifting it
@@ -370,6 +381,187 @@ struct GoToNowButton: View {
     }
 }
 
+// MARK: - Current App Badge
+
+/// Circular badge showing the current app's icon
+/// Positioned to the left of the datetime button
+/// Shows "Open" button when hovering on a browser URL frame
+struct CurrentAppBadge: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+    @State private var isExpanded = false
+    @State private var expandTask: Task<Void, Never>?
+
+    private let buttonSize = TimelineScaleFactor.controlButtonSize * 1.125
+    private let iconSize = TimelineScaleFactor.controlButtonSize * 0.95
+
+    /// Get the bundle ID of the current frame's app
+    private var currentBundleID: String? {
+        viewModel.currentFrame?.metadata.appBundleID
+    }
+
+    /// Get the app name for tooltip using AppNameResolver
+    private var currentAppName: String? {
+        guard let bundleID = currentBundleID else { return nil }
+        return AppNameResolver.shared.displayName(for: bundleID)
+    }
+
+    /// Get the browser URL if available
+    private var currentBrowserURL: String? {
+        viewModel.currentFrame?.metadata.browserURL
+    }
+
+    /// Check if we have a valid URL to open
+    var hasOpenableURL: Bool {
+        guard let urlString = currentBrowserURL, !urlString.isEmpty else { return false }
+        return URL(string: urlString) != nil
+    }
+
+    /// Whether to show the expanded "Open" state
+    private var shouldShowExpanded: Bool {
+        (isExpanded || isHovering) && hasOpenableURL && !viewModel.isActivelyScrolling
+    }
+
+    private var expandedWidth: CGFloat {
+        TimelineScaleFactor.controlButtonSize * 3.0
+    }
+
+    var body: some View {
+        Group {
+            if let bundleID = currentBundleID {
+                Button(action: {
+                    if hasOpenableURL, let urlString = currentBrowserURL, let url = URL(string: urlString) {
+                        TimelineWindowController.shared.hide()
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    // Fixed-size container with trailing alignment - pill expands leftward
+                    ZStack(alignment: .trailing) {
+                        // Invisible spacer to maintain hit area
+                        Color.clear
+                            .frame(width: expandedWidth, height: buttonSize)
+
+                        // Animated button content pinned to right edge (expands left)
+                        HStack(spacing: 8) {
+                            if shouldShowExpanded {
+                                Text("Open")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                            }
+                            appIconView(for: bundleID)
+                                .frame(width: iconSize, height: iconSize)
+                        }
+                        .frame(height: buttonSize)
+                        .padding(.leading, shouldShowExpanded ? 12 : 0)
+                        .padding(.trailing, shouldShowExpanded ? 10 : 0)
+                        .background(
+                            Group {
+                                if shouldShowExpanded {
+                                    Capsule()
+                                        .fill(Color(white: 0.15))
+                                        .overlay(
+                                            Capsule()
+                                                .stroke(Color.white.opacity(0.15), lineWidth: 1.0)
+                                        )
+                                }
+                            }
+                        )
+                        .animation(.spring(response: 0.4, dampingFraction: 0.75), value: shouldShowExpanded)
+                    }
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        isHovering = hovering
+                    }
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+                .instantTooltip(hasOpenableURL ? "Open in browser" : (currentAppName ?? "App"), isVisible: .constant(isHovering && !shouldShowExpanded))
+                .id(bundleID)
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: shouldShowExpanded)
+        .animation(.easeInOut(duration: 0.2), value: currentBundleID)
+        .onChange(of: viewModel.isActivelyScrolling) { isScrolling in
+            if isScrolling {
+                // Collapse immediately when scrolling starts
+                expandTask?.cancel()
+                withAnimation(.easeOut(duration: 0.15)) {
+                    isExpanded = false
+                }
+            } else if hasOpenableURL {
+                // Expand after a short delay when scrolling stops on a browser frame
+                expandTask?.cancel()
+                expandTask = Task {
+                    try? await Task.sleep(nanoseconds: 650_000_000) // 650ms delay
+                    if !Task.isCancelled && !viewModel.isActivelyScrolling && hasOpenableURL {
+                        await MainActor.run {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                isExpanded = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .onChange(of: hasOpenableURL) { hasURL in
+            if !hasURL {
+                // Collapse when navigating away from a browser frame
+                expandTask?.cancel()
+                isExpanded = false
+            } else if !viewModel.isActivelyScrolling {
+                // Schedule expand when landing on a browser frame
+                expandTask?.cancel()
+                expandTask = Task {
+                    try? await Task.sleep(nanoseconds: 650_000_000)
+                    if !Task.isCancelled && !viewModel.isActivelyScrolling && hasOpenableURL {
+                        await MainActor.run {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                isExpanded = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear {
+            // If we appear on a browser frame (not scrolling), expand after delay
+            if hasOpenableURL && !viewModel.isActivelyScrolling {
+                expandTask = Task {
+                    try? await Task.sleep(nanoseconds: 650_000_000)
+                    if !Task.isCancelled {
+                        await MainActor.run {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                isExpanded = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func appIconView(for bundleID: String) -> some View {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
+            Image(nsImage: appIcon)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(systemName: "app.fill")
+                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
+                .foregroundColor(.white.opacity(0.7))
+        }
+    }
+}
+
 // MARK: - Zoom Control
 
 /// Zoom control that expands from a magnifier button to a slider (expands leftward)
@@ -461,21 +653,22 @@ struct ZoomControl: View {
 struct FilterButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isHovering = false
+    @State private var isBadgeHovering = false
 
     var body: some View {
-        Button(action: {
-            viewModel.dismissContextMenu()
-            if viewModel.isFilterPanelVisible {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    viewModel.dismissFilterPanel()
+        ZStack(alignment: .topTrailing) {
+            Button(action: {
+                viewModel.dismissContextMenu()
+                if viewModel.isFilterPanelVisible {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterPanel()
+                    }
+                } else {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.openFilterPanel()
+                    }
                 }
-            } else {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    viewModel.openFilterPanel()
-                }
-            }
-        }) {
-            ZStack(alignment: .topTrailing) {
+            }) {
                 Image(systemName: "line.3.horizontal.decrease")
                     .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
                     .foregroundColor(isHovering || viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0
@@ -483,28 +676,50 @@ struct FilterButton: View {
                         : .white.opacity(0.6))
                     .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                     .themeAwareCircleStyle(isActive: viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0, isHovering: isHovering)
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    isHovering = hovering
+                }
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
 
-                // Badge showing active filter count
-                if viewModel.activeFilterCount > 0 {
-                    Text("\(viewModel.activeFilterCount)")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.white)
-                        .frame(width: 16, height: 16)
-                        .background(Color.red)
-                        .clipShape(Circle())
-                        .offset(x: 4, y: -4)
+            // Badge showing active filter count (or X on hover to clear)
+            if viewModel.activeFilterCount > 0 {
+                Button(action: {
+                    // Clear all filters when clicking the badge
+                    viewModel.clearAllFilters()
+                }) {
+                    Group {
+                        if isBadgeHovering {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(.white)
+                        } else {
+                            Text("\(viewModel.activeFilterCount)")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(.white)
+                        }
+                    }
+                    .frame(width: 16, height: 16)
+                    .background(Color.red)
+                    .clipShape(Circle())
+                    .scaleEffect(isBadgeHovering ? 1.15 : 1.0)
+                }
+                .buttonStyle(.plain)
+                .offset(x: 4, y: -4)
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        isBadgeHovering = hovering
+                    }
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
                 }
             }
         }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.1)) {
-                isHovering = hovering
-            }
-            if hovering { NSCursor.pointingHand.push() }
-            else { NSCursor.pop() }
-        }
-        .instantTooltip("Filter", isVisible: $isHovering)
+        .instantTooltip(viewModel.activeFilterCount > 0 && isBadgeHovering ? "Clear filters" : "Filter", isVisible: .constant(isHovering || isBadgeHovering))
     }
 }
 
@@ -1686,8 +1901,13 @@ struct ThemeAwareCapsuleButtonStyle: ViewModifier {
 
 extension View {
     /// Apply theme-based styling to circular control buttons
-    func themeAwareCircleStyle(isActive: Bool = false, isHovering: Bool = false) -> some View {
-        modifier(ThemeAwareCircleButtonStyle(isActive: isActive, isHovering: isHovering))
+    /// Set useCapsule to true to use capsule shape instead of circle (for expandable buttons)
+    func themeAwareCircleStyle(isActive: Bool = false, isHovering: Bool = false, useCapsule: Bool = false) -> some View {
+        if useCapsule {
+            return AnyView(modifier(ThemeAwareCapsuleButtonStyle(isActive: isActive, isHovering: isHovering)))
+        } else {
+            return AnyView(modifier(ThemeAwareCircleButtonStyle(isActive: isActive, isHovering: isHovering)))
+        }
     }
 
     /// Apply theme-based styling to capsule control buttons
