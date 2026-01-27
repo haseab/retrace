@@ -561,7 +561,7 @@ enum AppSegmentQueries {
                                             END
                                         ELSE browserUrl
                                     END
-                                ELSE NULL
+                                ELSE windowName
                             END
                         ELSE windowName
                     END) as unique_count
@@ -636,7 +636,7 @@ enum AppSegmentQueries {
         // 5. Cap gaps at 2 minutes and sum per window/domain
         let sql: String
         if isBrowser {
-            // For browsers: extract domain from browserUrl
+            // For browsers: extract domain from browserUrl, fall back to windowName if URL not available
             sql = """
                 WITH all_frames AS (
                     SELECT
@@ -659,7 +659,7 @@ enum AppSegmentQueries {
                                         END
                                     ELSE s.browserUrl
                                 END
-                            ELSE NULL
+                            ELSE s.windowName
                         END as item_name
                     FROM frame f
                     JOIN segment s ON f.segmentId = s.id
