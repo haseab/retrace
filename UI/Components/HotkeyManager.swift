@@ -201,6 +201,7 @@ public class HotkeyManager: NSObject {
             if keysMatch && modifiersMatch {
                 // Execute callback on main thread
                 let callback = hotkey.callback
+
                 DispatchQueue.main.async {
                     callback()
                 }

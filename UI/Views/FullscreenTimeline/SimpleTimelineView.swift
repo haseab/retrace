@@ -254,33 +254,32 @@ public struct SimpleTimelineView: View {
                 }
 
                 // Filter panel (floating, anchored to filter button position)
-                Group {
-                    if viewModel.isFilterPanelVisible {
-                        // Dismiss overlay for filter panel and any open dropdown
-                        Color.black.opacity(0.001)
-                            .ignoresSafeArea()
-                            .onTapGesture {
-                                if viewModel.activeFilterDropdown != .none {
-                                    withAnimation(.easeOut(duration: 0.15)) {
-                                        viewModel.dismissFilterDropdown()
-                                    }
-                                } else {
+                if viewModel.isFilterPanelVisible {
+                    // Dismiss overlay for filter panel and any open dropdown
+                    Color.black.opacity(0.001)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            if viewModel.activeFilterDropdown != .none {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    viewModel.dismissFilterDropdown()
+                                }
+                            } else {
+                                withAnimation(.easeOut(duration: 0.15)) {
                                     viewModel.dismissFilterPanel()
                                 }
                             }
+                        }
 
-                        FilterPanel(viewModel: viewModel)
-                            .position(
-                                x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - 100,
-                                y: geometry.size.height - TimelineScaleFactor.tapeBottomPadding - TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset - 300
-                            )
-                            .transition(.opacity.combined(with: .offset(y: 15)))
+                    FilterPanel(viewModel: viewModel)
+                        .position(
+                            x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - 100,
+                            y: geometry.size.height - TimelineScaleFactor.tapeBottomPadding - TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset - 300
+                        )
+                        .transition(.opacity.combined(with: .offset(y: 15)))
 
-                        // Filter dropdowns - rendered at top level to avoid clipping issues
-                        FilterDropdownOverlay(viewModel: viewModel)
-                    }
+                    // Filter dropdowns - rendered at top level to avoid clipping issues
+                    FilterDropdownOverlay(viewModel: viewModel)
                 }
-                .animation(.easeOut(duration: 0.15), value: viewModel.isFilterPanelVisible)
 
                 // Timeline segment context menu (for right-click on timeline tape)
                 // Placed at the end of ZStack to ensure it renders above all other content
@@ -3170,7 +3169,11 @@ struct FilterPanel: View {
 
                 Spacer()
 
-                Button(action: { viewModel.dismissFilterPanel() }) {
+                Button(action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterPanel()
+                    }
+                }) {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white.opacity(0.4))
@@ -3363,7 +3366,11 @@ struct FilterPanel: View {
                 }
 
                 // Apply button
-                Button(action: { viewModel.applyFilters() }) {
+                Button(action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.applyFilters()
+                    }
+                }) {
                     Text("Apply Filters")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
@@ -3406,7 +3413,9 @@ struct FilterPanel: View {
                         return nil // Consume the event
                     }
                     // No dropdowns open - close the filter panel and consume event
-                    viewModel.dismissFilterPanel()
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterPanel()
+                    }
                     return nil
                 }
                 return event

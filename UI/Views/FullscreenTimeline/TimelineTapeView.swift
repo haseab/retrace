@@ -90,7 +90,7 @@ public struct TimelineTapeView: View {
                 .frame(width: blockWidth, height: tapeHeight)
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
-                        .stroke(isSelectedBlock ? Color.retraceAccent : (isCurrentBlock ? Color.white : Color.clear), lineWidth: isSelectedBlock ? 2 : 1.5)
+                        .stroke(isSelectedBlock ? Color.blue : (isCurrentBlock ? Color.white : Color.clear), lineWidth: isSelectedBlock ? 2 : 1.5)
                 )
                 .opacity(isCurrentBlock || isSelectedBlock ? 1.0 : 0.7)
 
@@ -425,9 +425,13 @@ struct FilterButton: View {
         Button(action: {
             viewModel.dismissContextMenu()
             if viewModel.isFilterPanelVisible {
-                viewModel.dismissFilterPanel()
+                withAnimation(.easeOut(duration: 0.15)) {
+                    viewModel.dismissFilterPanel()
+                }
             } else {
-                viewModel.openFilterPanel()
+                withAnimation(.easeOut(duration: 0.15)) {
+                    viewModel.openFilterPanel()
+                }
             }
         }) {
             ZStack(alignment: .topTrailing) {
@@ -598,8 +602,9 @@ struct MoreOptionsMenu: View {
             if showMenu {
                 ContextMenuContent(viewModel: viewModel, showMenu: $showMenu)
                     .retraceMenuContainer()
-                    .frame(width: 200)
-                    .offset(y: -TimelineScaleFactor.controlButtonSize - 8)
+                    .frame(width: 205)
+                    .clipped()
+                    .contentShape(Rectangle())
                     .onHover { hovering in
                         isMenuHovering = hovering
                         if !hovering {
@@ -612,6 +617,7 @@ struct MoreOptionsMenu: View {
                         }
                     }
                     .transition(.opacity)
+                    .offset(y: -TimelineScaleFactor.controlButtonSize - 8)
             }
         }
         .animation(.easeOut(duration: 0.12), value: showMenu)

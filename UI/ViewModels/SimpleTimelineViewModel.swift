@@ -137,6 +137,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the zoom slider is expanded/visible
     @Published public var isZoomSliderExpanded = false
 
+    /// Whether the more options menu is visible
+    @Published public var isMoreOptionsMenuVisible = false
+
     /// Whether the user is actively scrolling (disables tape animation during rapid scrolling)
     @Published public var isActivelyScrolling = false
 
@@ -1437,12 +1440,93 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingFilterCriteria = filterCriteria
         // Set visible immediately - animation is handled by the View
         isFilterPanelVisible = true
-        // Load data asynchronously to avoid blocking UI
+        // Load data asynchronously - delay slightly to let animation complete first
         Task {
-            await loadAvailableAppsForFilter()
-            await loadTags()
-            await loadHiddenSegments()
-            await loadSegmentTagsMap()
+            // Small delay to let the panel animation complete before loading data
+            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            await loadFilterPanelDataBatched()
+        }
+    }
+
+    /// Load all filter panel data in a single batch to minimize re-renders
+    private func loadFilterPanelDataBatched() async {
+        // Skip if already loaded
+        let needsApps = availableAppsForFilter.isEmpty
+        let needsTags = availableTags.isEmpty
+        let needsHidden = hiddenSegmentIds.isEmpty
+        let needsTagsMap = segmentTagsMap.isEmpty
+
+        guard needsApps || needsTags || needsHidden || needsTagsMap else {
+            return
+        }
+
+        // Collect all data first without updating @Published properties
+        var newApps: [(bundleID: String, name: String)] = []
+        var newOtherApps: [(bundleID: String, name: String)] = []
+        var newTags: [Tag] = []
+        var newHiddenSegmentIds: Set<SegmentID> = []
+        var newSegmentTagsMap: [Int64: Set<Int64>] = [:]
+
+        // Load apps
+        if needsApps {
+            let installed = AppNameResolver.shared.getInstalledApps()
+            let installedBundleIDs = Set(installed.map { $0.bundleID })
+            newApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+            // Load historical apps from DB
+            do {
+                let bundleIDs = try await coordinator.getDistinctAppBundleIDs()
+                let dbApps = AppNameResolver.shared.resolveAll(bundleIDs: bundleIDs)
+                newOtherApps = dbApps
+                    .filter { !installedBundleIDs.contains($0.bundleID) }
+                    .map { (bundleID: $0.bundleID, name: $0.name) }
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            } catch {
+                Log.error("[Filter] Failed to load apps from DB: \(error)", category: .ui)
+            }
+        }
+
+        // Load tags
+        if needsTags {
+            do {
+                newTags = try await coordinator.getAllTags()
+            } catch {
+                Log.error("[Filter] Failed to load tags: \(error)", category: .ui)
+            }
+        }
+
+        // Load hidden segments
+        if needsHidden {
+            do {
+                newHiddenSegmentIds = try await coordinator.getHiddenSegmentIds()
+            } catch {
+                Log.error("[Filter] Failed to load hidden segments: \(error)", category: .ui)
+            }
+        }
+
+        // Load segment tags map
+        if needsTagsMap {
+            do {
+                newSegmentTagsMap = try await coordinator.getSegmentTagsMap()
+            } catch {
+                Log.error("[Filter] Failed to load segment tags map: \(error)", category: .ui)
+            }
+        }
+
+        // Now update all @Published properties in one batch
+        if needsApps {
+            availableAppsForFilter = newApps
+            otherAppsForFilter = newOtherApps
+        }
+        if needsTags {
+            availableTags = newTags
+        }
+        if needsHidden {
+            hiddenSegmentIds = newHiddenSegmentIds
+        }
+        if needsTagsMap {
+            segmentTagsMap = newSegmentTagsMap
         }
     }
 
@@ -1487,6 +1571,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let timestamp = currentTimestamp else { return }
         guard !frames.isEmpty else { return }
 
+        // Don't cache frames if viewing hidden segments (non-default filter)
+        // These frames wouldn't match the default view on next launch
+        let isViewingHiddenSegments = filterCriteria.hiddenFilter != .hide
+        if isViewingHiddenSegments {
+            Log.debug("[PositionCache] Skipping frame cache - viewing hidden segments (filter: \(filterCriteria.hiddenFilter.rawValue))", category: .ui)
+            // Clear any existing cached frames to avoid stale data
+            clearCachedFrames()
+            return
+        }
+
         // Save timestamp, index, and version to UserDefaults
         UserDefaults.standard.set(timestamp.timeIntervalSince1970, forKey: Self.cachedPositionTimestampKey)
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedPositionSavedAtKey)
@@ -1509,11 +1603,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        // Save hidden segment IDs for instant restore of hatch marks
-        let hiddenIds = Array(hiddenSegmentIds.map { $0.value })
-        UserDefaults.standard.set(hiddenIds, forKey: Self.cachedHiddenSegmentIdsKey)
-
-        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex), hiddenSegments: \(hiddenSegmentIds.count)", category: .ui)
+        Log.debug("[PositionCache] Saved position: \(timestamp), index: \(currentIndex)", category: .ui)
     }
 
     /// Save filter criteria to cache
@@ -1670,6 +1760,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         try? FileManager.default.removeItem(at: Self.cachedFramesPath)
     }
 
+    /// Clear only the cached frames file (keeps other cache metadata)
+    private func clearCachedFrames() {
+        try? FileManager.default.removeItem(at: Self.cachedFramesPath)
+    }
+
     /// Restore cached hidden segment IDs for instant hatch mark display
     private func restoreCachedHiddenSegmentIds() {
         guard let cachedIds = UserDefaults.standard.array(forKey: Self.cachedHiddenSegmentIdsKey) as? [Int64] else {
@@ -1716,13 +1811,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Restore cached filter criteria if any
             restoreCachedFilterCriteria()
 
-            // Restore cached hidden segment IDs for instant hatch mark display
-            restoreCachedHiddenSegmentIds()
-
-            // Also refresh from database in background to catch any changes
-            Task {
-                await loadHiddenSegments()
-            }
+            // NOTE: Skip restoring/loading hiddenSegmentIds - hidden segments already excluded from query
 
             // Load image if needed for current frame
             loadImageIfNeeded()
@@ -1765,8 +1854,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Restore cached search results if any
                     searchViewModel.restoreCachedSearchResults()
 
-                    // Load hidden segment IDs for hatch mark display
-                    await loadHiddenSegments()
+                    // NOTE: Skip loading hiddenSegmentIds - hidden segments already excluded from query
 
                     // Load image if needed for current frame
                     loadImageIfNeeded()
@@ -1834,8 +1922,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Restore cached search results if any
             searchViewModel.restoreCachedSearchResults()
 
-            // Load hidden segment IDs for hatch mark display
-            await loadHiddenSegments()
+            // NOTE: We skip loading hiddenSegmentIds here because:
+            // 1. Hidden segments are already EXCLUDED from the query (via NOT EXISTS clause)
+            // 2. The hatch marks only matter when viewing hidden segments via filter
+            // 3. loadHiddenSegments will be called lazily when filter panel opens
 
             // Load image if needed for current frame
             loadImageIfNeeded()
@@ -1846,6 +1936,59 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.error = "Failed to load frames: \(error.localizedDescription)"
             isLoading = false
         }
+    }
+
+    /// Refresh frame data when showing the pre-rendered timeline
+    /// This is a lightweight refresh that only loads the most recent frame if needed,
+    /// rather than doing a full reload. The goal is to show fresh data quickly.
+    public func refreshFrameData() async {
+        let refreshStartTime = CFAbsoluteTimeGetCurrent()
+        Log.info("[TIMELINE-REFRESH] 🔄 refreshFrameData() started", category: .ui)
+
+        // If we have frames and a current position, just refresh the current image
+        if !frames.isEmpty {
+            Log.info("[TIMELINE-REFRESH] 🔄 Have \(frames.count) cached frames, refreshing current image", category: .ui)
+
+            // Check if there are newer frames available
+            if let newestCachedTimestamp = frames.last?.frame.timestamp {
+                do {
+                    // Query for frames newer than our newest cached frame
+                    let newerFrames = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 50, filters: filterCriteria)
+
+                    // Filter to only truly new frames
+                    let newFrames = newerFrames.filter { $0.frame.timestamp > newestCachedTimestamp }
+
+                    if !newFrames.isEmpty {
+                        Log.info("[TIMELINE-REFRESH] 🔄 Found \(newFrames.count) new frames since last view", category: .ui)
+
+                        // Add new frames to the end (they're newer, so they go at the end)
+                        let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+                        frames.append(contentsOf: newTimelineFrames)
+
+                        // Update boundaries
+                        updateWindowBoundaries()
+
+                        // Optionally navigate to the newest frame
+                        currentIndex = frames.count - 1
+
+                        // Trim if we've exceeded max frames (preserve newer since we just added new frames)
+                        trimWindowIfNeeded(preserveDirection: .newer)
+                    }
+                } catch {
+                    Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
+                }
+            }
+
+            // Load the current image
+            loadImageIfNeeded()
+            Log.info("[TIMELINE-REFRESH] 🔄 refreshFrameData() completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - refreshStartTime) * 1000))ms", category: .ui)
+            return
+        }
+
+        // No cached frames - do a full load
+        Log.info("[TIMELINE-REFRESH] 🔄 No cached frames, doing full load", category: .ui)
+        await loadMostRecentFrame()
+        Log.info("[TIMELINE-REFRESH] 🔄 Full load completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - refreshStartTime) * 1000))ms", category: .ui)
     }
 
     // MARK: - Frame Navigation
@@ -2099,7 +2242,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
-        guard let timelineFrame = currentTimelineFrame else { return }
+        guard let timelineFrame = currentTimelineFrame else {
+            return
+        }
 
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {

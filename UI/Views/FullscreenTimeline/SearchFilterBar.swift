@@ -185,7 +185,8 @@ public struct SearchFilterBar: View {
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
         .task {
-            // Load available tags when the filter bar appears (lightweight)
+            // Delay loading until after animation completes to avoid choppy animation
+            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in

@@ -311,41 +311,72 @@ public struct DashboardView: View {
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
             Task { await viewModel.loadStatistics() }
         }
-        .sheet(isPresented: $showSessionsSheet) {
-            if let app = selectedApp {
-                if let window = selectedWindow {
-                    // Window-filtered sessions
-                    AppSessionsDetailView(
-                        app: app,
-                        onOpenInTimeline: { date in
-                            openTimelineAt(date: date)
-                        },
-                        loadSessions: { offset, limit in
-                            await viewModel.getSessionsForAppWindow(
-                                bundleID: app.appBundleID,
-                                windowNameOrDomain: window.displayName,
-                                offset: offset,
-                                limit: limit
+        .overlay {
+            // Sessions detail overlay (replaces .sheet for faster presentation)
+            if showSessionsSheet, let app = selectedApp {
+                ZStack {
+                    // Dimmed background
+                    Color.black.opacity(0.6)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                showSessionsSheet = false
+                            }
+                        }
+
+                    // Sessions detail dialog
+                    Group {
+                        if let window = selectedWindow {
+                            // Window-filtered sessions
+                            AppSessionsDetailView(
+                                app: app,
+                                onOpenInTimeline: { date in
+                                    showSessionsSheet = false
+                                    openTimelineAt(date: date)
+                                },
+                                loadSessions: { offset, limit in
+                                    await viewModel.getSessionsForAppWindow(
+                                        bundleID: app.appBundleID,
+                                        windowNameOrDomain: window.displayName,
+                                        offset: offset,
+                                        limit: limit
+                                    )
+                                },
+                                subtitle: window.displayName,
+                                onDismiss: {
+                                    withAnimation(.easeOut(duration: 0.15)) {
+                                        showSessionsSheet = false
+                                    }
+                                }
                             )
-                        },
-                        subtitle: window.displayName
-                    )
-                } else {
-                    // All sessions for app
-                    AppSessionsDetailView(
-                        app: app,
-                        onOpenInTimeline: { date in
-                            openTimelineAt(date: date)
-                        },
-                        loadSessions: { offset, limit in
-                            await viewModel.getSessionsForApp(
-                                bundleID: app.appBundleID,
-                                offset: offset,
-                                limit: limit
+                        } else {
+                            // All sessions for app
+                            AppSessionsDetailView(
+                                app: app,
+                                onOpenInTimeline: { date in
+                                    showSessionsSheet = false
+                                    openTimelineAt(date: date)
+                                },
+                                loadSessions: { offset, limit in
+                                    await viewModel.getSessionsForApp(
+                                        bundleID: app.appBundleID,
+                                        offset: offset,
+                                        limit: limit
+                                    )
+                                },
+                                onDismiss: {
+                                    withAnimation(.easeOut(duration: 0.15)) {
+                                        showSessionsSheet = false
+                                    }
+                                }
                             )
                         }
-                    )
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .shadow(color: .black.opacity(0.5), radius: 30, x: 0, y: 10)
+                    .transition(.scale.combined(with: .opacity))
                 }
+                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showSessionsSheet)
             }
         }
         .overlay {
@@ -382,13 +413,17 @@ public struct DashboardView: View {
     private func handleAppTapped(_ app: AppUsageData) {
         selectedApp = app
         selectedWindow = nil
-        showSessionsSheet = true
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showSessionsSheet = true
+        }
     }
 
     private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
         selectedApp = app
         selectedWindow = window
-        showSessionsSheet = true
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showSessionsSheet = true
+        }
     }
 
     private func openTimelineAt(date: Date) {

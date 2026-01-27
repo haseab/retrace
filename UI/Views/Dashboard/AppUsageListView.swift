@@ -271,9 +271,6 @@ struct AppUsageListView: View {
                 HStack {
                     Spacer()
                     SpinnerView(size: 14, lineWidth: 2, color: .retraceSecondary)
-                    Text("Loading windows...")
-                        .font(layoutSize.windowNameFont)
-                        .foregroundColor(.retraceSecondary)
                     Spacer()
                 }
                 .padding(.vertical, 8)
@@ -288,8 +285,8 @@ struct AppUsageListView: View {
                 .padding(.vertical, 8)
                 .padding(.leading, layoutSize.windowRowIndent)
             } else {
-                ForEach(displayedWindows) { window in
-                    windowRow(window: window, app: app, appColor: appColor, layoutSize: layoutSize)
+                ForEach(Array(displayedWindows.enumerated()), id: \.element.id) { index, window in
+                    windowRow(window: window, app: app, appColor: appColor, layoutSize: layoutSize, rowIndex: index)
                 }
 
                 // Load More Windows button
@@ -350,25 +347,20 @@ struct AppUsageListView: View {
 
     // MARK: - Window Row
 
-    private func windowRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize) -> some View {
+    private func windowRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, rowIndex: Int) -> some View {
         let windowKey = "\(app.appBundleID)_\(window.id)"
         let isHovered = hoveredWindowKey == windowKey
 
         return HStack(spacing: layoutSize.rowSpacing) {
-            // Indent spacer + tree connector visual
-            HStack(spacing: 4) {
+            // Indent spacer + subtle dot indicator
+            HStack(spacing: 8) {
                 Spacer()
                     .frame(width: layoutSize.rankWidth)
 
-                // Vertical line connector
-                Rectangle()
-                    .fill(appColor.opacity(0.3))
-                    .frame(width: 2, height: 16)
-
-                // Horizontal connector
-                Rectangle()
-                    .fill(appColor.opacity(0.3))
-                    .frame(width: 8, height: 2)
+                // Small colored dot
+                Circle()
+                    .fill(appColor.opacity(0.5))
+                    .frame(width: 6, height: 6)
             }
 
             // Window name
@@ -412,6 +404,8 @@ struct AppUsageListView: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(isHovered ? Color.white.opacity(0.03) : Color.clear)
         )
+        .scaleEffect(isHovered ? 1.01 : 1.0)
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
         .contentShape(Rectangle())
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.1)) {
@@ -474,10 +468,12 @@ struct AppUsageListView: View {
 
         return HStack(spacing: layoutSize.rowSpacing) {
             // Expand/collapse chevron
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+            Image(systemName: "chevron.right")
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundColor(.retraceSecondary.opacity(0.6))
                 .frame(width: 12)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .animation(.easeInOut(duration: 0.2), value: isExpanded)
 
             // App icon
             AppIconView(bundleID: app.appBundleID, size: layoutSize.appIconSize)
@@ -541,6 +537,10 @@ struct AppUsageListView: View {
         .onHover { hovering in
             if hovering {
                 NSCursor.pointingHand.set()
+                // Preload window data on hover so it's ready when user clicks
+                if windowUsageCache[app.appBundleID] == nil && !loadingWindows.contains(app.appBundleID) {
+                    loadWindowData(for: app)
+                }
             } else {
                 NSCursor.arrow.set()
             }

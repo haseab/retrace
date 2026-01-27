@@ -270,6 +270,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         sleepWakeObservers.removeAll()
 
+        // Save timeline position for cross-session persistence
+        TimelineWindowController.shared.savePositionForTermination()
+
         Log.info("[AppDelegate] Application terminating", category: .app)
     }
 

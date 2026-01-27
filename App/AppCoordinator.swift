@@ -1029,7 +1029,7 @@ public actor AppCoordinator {
 
     /// Get all segment IDs that have the "hidden" tag
     public func getHiddenSegmentIds() async throws -> Set<SegmentID> {
-        try await services.database.getHiddenSegmentIds()
+        return try await services.database.getHiddenSegmentIds()
     }
 
     /// Get a map of segment IDs to their tag IDs for efficient filtering

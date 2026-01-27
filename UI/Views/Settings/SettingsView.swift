@@ -174,6 +174,7 @@ public struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+                .keyboardShortcut("[", modifiers: .command)
 
                 Text("Settings")
                     .font(.retraceTitle3)

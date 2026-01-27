@@ -8,6 +8,7 @@ struct AppSessionsDetailView: View {
     let loadSessions: (Int, Int) async -> [AppSessionDetail]  // (offset, limit) -> sessions
     let subtitle: String?  // Optional subtitle (e.g., window name filter)
     let initialSessionCount: Int?  // Optional override for initial session count
+    let onDismiss: (() -> Void)?  // Optional dismiss callback for overlay presentation
 
     @Environment(\.dismiss) private var dismiss
     @State private var sessions: [AppSessionDetail] = []
@@ -24,17 +25,28 @@ struct AppSessionsDetailView: View {
         onOpenInTimeline: @escaping (Date) -> Void,
         loadSessions: @escaping (Int, Int) async -> [AppSessionDetail],
         subtitle: String? = nil,
-        initialSessionCount: Int? = nil
+        initialSessionCount: Int? = nil,
+        onDismiss: (() -> Void)? = nil
     ) {
         self.app = app
         self.onOpenInTimeline = onOpenInTimeline
         self.loadSessions = loadSessions
         self.subtitle = subtitle
         self.initialSessionCount = initialSessionCount
+        self.onDismiss = onDismiss
         // When filtering (subtitle provided), start with 0 and update after loading
         // Otherwise use the provided count or app's count
         let startCount = initialSessionCount ?? (subtitle != nil ? 0 : app.uniqueItemCount)
         self._totalSessionCount = State(initialValue: startCount)
+    }
+
+    /// Dismisses the view using the provided callback or environment dismiss
+    private func dismissView() {
+        if let onDismiss = onDismiss {
+            onDismiss()
+        } else {
+            dismiss()
+        }
     }
 
     var body: some View {
@@ -101,7 +113,7 @@ struct AppSessionsDetailView: View {
 
             Spacer()
 
-            Button(action: { dismiss() }) {
+            Button(action: { dismissView() }) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.retraceMediumNumber)
                     .foregroundColor(.retraceSecondary.opacity(0.6))
@@ -200,7 +212,7 @@ struct AppSessionsDetailView: View {
             // Open in Timeline button
             Button(action: {
                 onOpenInTimeline(session.startDate)
-                dismiss()
+                dismissView()
             }) {
                 HStack(spacing: 6) {
                     Image(systemName: "play.circle.fill")
@@ -272,6 +284,7 @@ struct AppSessionsDetailView: View {
 
     private func loadInitialSessions() async {
         let loaded = await loadSessions(0, pageSize)
+
         await MainActor.run {
             sessions = loaded
             hasMoreToLoad = loaded.count >= pageSize
