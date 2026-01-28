@@ -132,12 +132,17 @@ public struct SimpleTimelineView: View {
                     .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))
                 }
 
-                // Debug frame ID badge (top-left)
+                // Debug frame ID badge, OCR status indicator, and developer actions menu (top-left)
                 VStack {
-                    HStack {
+                    HStack(spacing: 8) {
                         if viewModel.showFrameIDs {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
+                        // OCR status indicator (only visible when OCR is in progress)
+                        OCRStatusIndicator(viewModel: viewModel)
+                        #if DEBUG
+                        DeveloperActionsMenu(viewModel: viewModel)
+                        #endif
                         Spacer()
                             .allowsHitTesting(false)
                     }
@@ -202,37 +207,11 @@ public struct SimpleTimelineView: View {
                     )
                 }
 
-                // Search overlay (Cmd+F) - uses persistent searchViewModel to preserve results
-                if viewModel.isSearchOverlayVisible {
-                    SpotlightSearchOverlay(
-                        coordinator: coordinator,
-                        viewModel: viewModel.searchViewModel,
-                        onResultSelected: { result, query in
-                            Task {
-                                await viewModel.navigateToSearchResult(
-                                    frameID: result.id,
-                                    timestamp: result.timestamp,
-                                    highlightQuery: query
-                                )
-                            }
-                        },
-                        onDismiss: {
-                            viewModel.isSearchOverlayVisible = false
-                        }
-                    )
-                }
+                // Search overlay (Cmd+K) - uses persistent searchViewModel to preserve results
+                searchOverlay
 
                 // Search highlight overlay
-                if viewModel.isShowingSearchHighlight {
-                    SearchHighlightOverlay(
-                        viewModel: viewModel,
-                        containerSize: geometry.size,
-                        actualFrameRect: actualFrameRect
-                    )
-                    // Apply the same zoom transformations as the frame content
-                    .scaleEffect(viewModel.frameZoomScale)
-                    .offset(viewModel.frameZoomOffset)
-                }
+                searchHighlightOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
                 // Text selection hint toast (top center)
                 if viewModel.showTextSelectionHint {
@@ -276,6 +255,7 @@ public struct SimpleTimelineView: View {
                             Spacer()
                             FilterPanel(viewModel: viewModel)
                         }
+
                     }
                     .padding(.trailing, TimelineScaleFactor.rightControlsXOffset + 20)
                     .padding(.bottom, TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + 75)
@@ -310,6 +290,43 @@ public struct SimpleTimelineView: View {
             }
             // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
+        }
+    }
+
+    // MARK: - Search Overlay
+
+    @ViewBuilder
+    private var searchOverlay: some View {
+        if viewModel.isSearchOverlayVisible {
+            SpotlightSearchOverlay(
+                coordinator: coordinator,
+                viewModel: viewModel.searchViewModel,
+                onResultSelected: { result, query in
+                    Task {
+                        await viewModel.navigateToSearchResult(
+                            frameID: result.id,
+                            timestamp: result.timestamp,
+                            highlightQuery: query
+                        )
+                    }
+                },
+                onDismiss: {
+                    viewModel.isSearchOverlayVisible = false
+                }
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func searchHighlightOverlay(containerSize: CGSize, actualFrameRect: CGRect) -> some View {
+        if viewModel.isShowingSearchHighlight {
+            SearchHighlightOverlay(
+                viewModel: viewModel,
+                containerSize: containerSize,
+                actualFrameRect: actualFrameRect
+            )
+            .scaleEffect(viewModel.frameZoomScale)
+            .offset(viewModel.frameZoomOffset)
         }
     }
 
@@ -2302,14 +2319,173 @@ struct SearchHighlightOverlay: View {
 // MARK: - Debug Frame ID Badge
 
 /// Debug badge showing the current frame ID with click-to-copy functionality
-/// and reprocess OCR button that appears on hover
 /// Only visible when "Show frame IDs in UI" is enabled in Settings > Advanced
 struct DebugFrameIDBadge: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var showCopiedFeedback = false
-    @State private var showReprocessFeedback = false
     @State private var isHovering = false
-    @State private var isHoveringReprocess = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.copyCurrentFrameID()
+            showCopiedFeedback = true
+
+            // Reset feedback after 1.5 seconds
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                showCopiedFeedback = false
+            }
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
+                    .font(.retraceTinyMedium)
+                    .foregroundColor(showCopiedFeedback ? .green : .white.opacity(0.7))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Frame ID")
+                        .font(.retraceTinyMedium)
+                        .foregroundColor(.white.opacity(0.5))
+
+                    if let frame = viewModel.currentFrame {
+                        Text(showCopiedFeedback ? "Copied!" : String(frame.id.value))
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(showCopiedFeedback ? .green : .white)
+                    } else {
+                        Text("--")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+
+                    // Debug: Show video frame index being requested
+                    if let videoInfo = viewModel.currentVideoInfo {
+                        Text("VidIdx: \(videoInfo.frameIndex)")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(.orange.opacity(0.8))
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(white: 0.15).opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .help("Click to copy frame ID")
+    }
+}
+
+// MARK: - OCR Status Indicator
+
+/// Shows the OCR processing status for the current frame
+/// Displays when OCR is pending, queued, or processing (not shown when completed)
+struct OCRStatusIndicator: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var rotationAngle: Double = 0
+
+    /// Whether the indicator should be visible
+    /// Only shows for in-progress states (pending, queued, processing)
+    private var shouldShow: Bool {
+        viewModel.ocrStatus.isInProgress
+    }
+
+    /// Icon for the current status
+    private var statusIcon: String {
+        switch viewModel.ocrStatus.state {
+        case .pending:
+            return "clock"
+        case .queued:
+            return "tray.and.arrow.down"
+        case .processing:
+            return "gearshape.2"
+        default:
+            return "doc.text"
+        }
+    }
+
+    /// Color for the current status
+    private var statusColor: Color {
+        switch viewModel.ocrStatus.state {
+        case .pending:
+            return .gray
+        case .queued:
+            return .orange
+        case .processing:
+            return .blue
+        case .failed:
+            return .red
+        default:
+            return .gray
+        }
+    }
+
+    var body: some View {
+        if shouldShow {
+            HStack(spacing: 6) {
+                // Icon with rotation animation for processing state
+                Image(systemName: statusIcon)
+                    .font(.retraceTinyMedium)
+                    .foregroundColor(statusColor)
+                    .rotationEffect(.degrees(viewModel.ocrStatus.state == .processing ? rotationAngle : 0))
+                    .onAppear {
+                        if viewModel.ocrStatus.state == .processing {
+                            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
+                                rotationAngle = 360
+                            }
+                        }
+                    }
+                    .onChange(of: viewModel.ocrStatus) { newStatus in
+                        if newStatus.state == .processing {
+                            rotationAngle = 0
+                            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
+                                rotationAngle = 360
+                            }
+                        } else {
+                            rotationAngle = 0
+                        }
+                    }
+
+                Text(viewModel.ocrStatus.displayText)
+                    .font(.retraceTinyMedium)
+                    .foregroundColor(.white.opacity(0.8))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(white: 0.15).opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(statusColor.opacity(0.4), lineWidth: 0.5)
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            .animation(.easeInOut(duration: 0.2), value: viewModel.ocrStatus)
+        }
+    }
+}
+
+// MARK: - Developer Actions Menu
+
+#if DEBUG
+/// Developer actions menu with OCR refresh and video boundary visualization options
+/// Only visible in DEBUG builds, positioned in top-left corner beside the frame ID badge
+struct DeveloperActionsMenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+    @State private var showReprocessFeedback = false
 
     /// Whether the current frame can be reprocessed (only Retrace frames)
     private var canReprocess: Bool {
@@ -2317,117 +2493,77 @@ struct DebugFrameIDBadge: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Frame ID copy button
+        Menu {
+            // Refresh OCR button
             Button(action: {
-                viewModel.copyCurrentFrameID()
-                showCopiedFeedback = true
-
-                // Reset feedback after 1.5 seconds
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    showCopiedFeedback = false
+                Task {
+                    do {
+                        try await viewModel.reprocessCurrentFrameOCR()
+                        showReprocessFeedback = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            showReprocessFeedback = false
+                        }
+                    } catch {
+                        Log.error("[OCR] Failed to reprocess OCR: \(error)", category: .ui)
+                    }
                 }
             }) {
-                HStack(spacing: 6) {
-                    Image(systemName: showCopiedFeedback ? "checkmark" : "doc.on.doc")
-                        .font(.retraceTinyMedium)
-                        .foregroundColor(showCopiedFeedback ? .green : .white.opacity(0.7))
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Frame ID")
-                            .font(.retraceTinyMedium)
-                            .foregroundColor(.white.opacity(0.5))
-
-                        if let frame = viewModel.currentFrame {
-                            Text(showCopiedFeedback ? "Copied!" : String(frame.id.value))
-                                .font(.retraceMonoSmall)
-                                .foregroundColor(showCopiedFeedback ? .green : .white)
-                        } else {
-                            Text("--")
-                                .font(.retraceMonoSmall)
-                                .foregroundColor(.white.opacity(0.5))
-                        }
-
-                        // Debug: Show video frame index being requested
-                        if let videoInfo = viewModel.currentVideoInfo {
-                            Text("VidIdx: \(videoInfo.frameIndex)")
-                                .font(.retraceMonoSmall)
-                                .foregroundColor(.orange.opacity(0.8))
-                        }
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(white: 0.15).opacity(0.9))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(isHovering ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
+                Label(
+                    showReprocessFeedback ? "Queued" : "Refresh OCR",
+                    systemImage: showReprocessFeedback ? "checkmark" : "arrow.clockwise"
                 )
             }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                isHovering = hovering
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
+            .disabled(!canReprocess)
+
+            Divider()
+
+            // Show Video Placements toggle
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    viewModel.showVideoBoundaries.toggle()
+                }
+            }) {
+                HStack {
+                    Label("Show Video Placements", systemImage: "film")
+                    if viewModel.showVideoBoundaries {
+                        Spacer()
+                        Image(systemName: "checkmark")
+                    }
                 }
             }
-            .help("Click to copy frame ID")
-
-            // Reprocess OCR button (only shown on hover and for Retrace frames)
-            if canReprocess {
-                Button(action: {
-                    Task {
-                        do {
-                            try await viewModel.reprocessCurrentFrameOCR()
-                            showReprocessFeedback = true
-                            // Reset feedback after 1.5 seconds
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                showReprocessFeedback = false
-                            }
-                        } catch {
-                            Log.error("[OCR] Failed to reprocess OCR: \(error)", category: .ui)
-                        }
-                    }
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: showReprocessFeedback ? "checkmark" : "arrow.clockwise")
-                            .font(.retraceTinyMedium)
-                            .foregroundColor(showReprocessFeedback ? .green : .white.opacity(0.7))
-
-                        Text(showReprocessFeedback ? "Queued" : "OCR")
-                            .font(.retraceTinyMedium)
-                            .foregroundColor(showReprocessFeedback ? .green : .white.opacity(0.7))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color(white: 0.15).opacity(0.9))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(isHoveringReprocess ? Color.white.opacity(0.3) : Color.white.opacity(0.15), lineWidth: 0.5)
-                    )
-                }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    isHoveringReprocess = hovering
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
-                .help("Reprocess OCR for this frame")
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "ant.fill")
+                    .font(.retraceTinyMedium)
+                    .foregroundColor(.orange)
+                Text("Dev")
+                    .font(.retraceTinyMedium)
+                    .foregroundColor(.orange)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(white: 0.15).opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isHovering ? Color.orange.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 0.5)
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
             }
         }
     }
 }
+#endif
 
 // MARK: - Text Selection Hint Banner
 

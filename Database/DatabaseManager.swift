@@ -1784,4 +1784,152 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
     }
+
+    /// Get the processing status for a specific frame
+    /// Returns nil if the frame doesn't exist
+    public func getFrameProcessingStatus(frameID: Int64) async throws -> Int? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT processingStatus FROM frame WHERE id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, frameID)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil // Frame not found
+        }
+
+        return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Check if a frame is currently in the processing queue
+    public func isFrameInProcessingQueue(frameID: Int64) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT 1 FROM processing_queue WHERE frameId = ? LIMIT 1;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, frameID)
+
+        return sqlite3_step(stmt) == SQLITE_ROW
+    }
+
+    /// Get the queue position for a frame (1-based, where 1 = next to be processed)
+    /// Returns nil if the frame is not in the queue
+    /// Queue is ordered by priority DESC, then enqueuedAt ASC
+    public func getFrameQueuePosition(frameID: Int64) async throws -> Int? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Get the priority and enqueuedAt for the target frame
+        let targetSql = "SELECT priority, enqueuedAt FROM processing_queue WHERE frameId = ?;"
+        var targetStmt: OpaquePointer?
+        defer { sqlite3_finalize(targetStmt) }
+
+        guard sqlite3_prepare_v2(db, targetSql, -1, &targetStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: targetSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(targetStmt, 1, frameID)
+
+        guard sqlite3_step(targetStmt) == SQLITE_ROW else {
+            return nil // Frame not in queue
+        }
+
+        let priority = sqlite3_column_int(targetStmt, 0)
+        let enqueuedAt = sqlite3_column_double(targetStmt, 1)
+
+        // Count how many frames are ahead in the queue (higher priority, or same priority but earlier enqueue time)
+        let positionSql = """
+            SELECT COUNT(*) + 1 FROM processing_queue
+            WHERE priority > ? OR (priority = ? AND enqueuedAt < ?);
+        """
+        var positionStmt: OpaquePointer?
+        defer { sqlite3_finalize(positionStmt) }
+
+        guard sqlite3_prepare_v2(db, positionSql, -1, &positionStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: positionSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int(positionStmt, 1, priority)
+        sqlite3_bind_int(positionStmt, 2, priority)
+        sqlite3_bind_double(positionStmt, 3, enqueuedAt)
+
+        guard sqlite3_step(positionStmt) == SQLITE_ROW else {
+            return nil
+        }
+
+        return Int(sqlite3_column_int(positionStmt, 0))
+    }
+
+    /// Get all frame IDs with pending status (processingStatus=0) that are NOT in the processing queue
+    /// Used to find frames that need to be re-enqueued for OCR processing
+    public func getPendingFrameIDsNotInQueue(limit: Int = 1000) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT f.id FROM frame f
+            LEFT JOIN processing_queue pq ON f.id = pq.frameId
+            WHERE f.processingStatus = 0 AND pq.frameId IS NULL
+            ORDER BY f.id DESC
+            LIMIT ?;
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int(stmt, 1, Int32(limit))
+
+        var frameIDs: [Int64] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(stmt, 0))
+        }
+
+        return frameIDs
+    }
+
+    /// Count frames with pending status (processingStatus=0) that are NOT in the processing queue
+    public func countPendingFramesNotInQueue() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT COUNT(*) FROM frame f
+            LEFT JOIN processing_queue pq ON f.id = pq.frameId
+            WHERE f.processingStatus = 0 AND pq.frameId IS NULL;
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return 0
+        }
+
+        return Int(sqlite3_column_int(stmt, 0))
+    }
 }

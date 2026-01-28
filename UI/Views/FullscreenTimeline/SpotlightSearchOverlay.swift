@@ -19,7 +19,6 @@ public struct SpotlightSearchOverlay: View {
     @ObservedObject private var viewModel: SearchViewModel
     @State private var isVisible = false
     @State private var resultsHeight: CGFloat = 0
-    @FocusState private var isSearchFocused: Bool
 
     private let panelWidth: CGFloat = 900
     private let maxResultsHeight: CGFloat = 550
@@ -132,13 +131,6 @@ public struct SpotlightSearchOverlay: View {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                 isVisible = true
             }
-            isSearchFocused = true
-        }
-        .onChange(of: isVisible) { visible in
-            // Ensure focus when overlay becomes visible
-            if visible {
-                isSearchFocused = true
-            }
         }
         .onExitCommand {
             Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen)", category: .ui)
@@ -171,25 +163,24 @@ public struct SpotlightSearchOverlay: View {
                 .font(.retraceTitle3)
                 .foregroundColor(.white.opacity(0.5))
 
-            TextField("Search your screen history...", text: $viewModel.searchQuery)
-                .textFieldStyle(.plain)
-                .font(.retraceHeadline)
-                .foregroundColor(.white)
-                .focused($isSearchFocused)
-                .onSubmit {
-                    // Always trigger a new search on Enter
+            SpotlightSearchField(
+                text: $viewModel.searchQuery,
+                onSubmit: {
                     if !viewModel.searchQuery.isEmpty {
                         Log.debug("\(searchLog) Submit pressed, triggering search", category: .ui)
                         viewModel.submitSearch()
                     }
-                }
-                .onChange(of: isSearchFocused) { focused in
-                    // Dismiss any open dropdowns when search field gains focus
-                    if focused && viewModel.isDropdownOpen {
-                        print("[SpotlightSearchOverlay] TextField focused, closing dropdowns")
+                },
+                onEscape: {
+                    if viewModel.isDropdownOpen {
                         viewModel.closeDropdownsSignal += 1
+                    } else {
+                        dismissOverlay()
                     }
-                }
+                },
+                placeholder: "Search your screen history..."
+            )
+            .frame(height: 24)
 
             // Clear button when there's text
             if !viewModel.searchQuery.isEmpty && !viewModel.isSearching {
@@ -860,6 +851,141 @@ private struct GalleryResultCard: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d, yyyy HH:mm"
         return formatter.string(from: date)
+    }
+}
+
+// MARK: - Spotlight Search Field
+
+/// NSViewRepresentable text field for the spotlight search overlay
+/// Uses manual makeFirstResponder for reliable focus in borderless windows
+struct SpotlightSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let onSubmit: () -> Void
+    let onEscape: () -> Void
+    var placeholder: String = "Search your screen history..."
+
+    func makeNSView(context: Context) -> FocusableTextField {
+        let textField = FocusableTextField()
+        textField.placeholderString = placeholder
+        textField.placeholderAttributedString = NSAttributedString(
+            string: placeholder,
+            attributes: [
+                .foregroundColor: NSColor.white.withAlphaComponent(0.35),
+                .font: NSFont.systemFont(ofSize: 17, weight: .medium)
+            ]
+        )
+        textField.font = .systemFont(ofSize: 17, weight: .medium)
+        textField.textColor = .white
+        textField.backgroundColor = .clear
+        textField.isBordered = false
+        textField.focusRingType = .none
+        textField.alignment = .left
+        textField.delegate = context.coordinator
+        textField.drawsBackground = false
+        textField.cell?.isScrollable = true
+        textField.cell?.wraps = false
+        textField.cell?.usesSingleLineMode = true
+        textField.isEditable = true
+        textField.isSelectable = true
+
+        textField.onCancelCallback = onEscape
+
+        // Focus the text field with retry logic for external monitors
+        focusTextField(textField, attempt: 1)
+
+        return textField
+    }
+
+    func updateNSView(_ textField: FocusableTextField, context: Context) {
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+    }
+
+    private func focusTextField(_ textField: FocusableTextField, attempt: Int) {
+        let maxAttempts = 5
+        let delay: TimeInterval = attempt == 1 ? 0.0 : Double(attempt) * 0.05
+
+        let schedule = {
+            guard let window = textField.window else {
+                if attempt < maxAttempts {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        self.focusTextField(textField, attempt: attempt + 1)
+                    }
+                }
+                return
+            }
+            self.performFocus(textField, in: window, attempt: attempt)
+        }
+
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: schedule)
+        } else {
+            DispatchQueue.main.async(execute: schedule)
+        }
+    }
+
+    private func performFocus(_ textField: FocusableTextField, in window: NSWindow, attempt: Int) {
+        let maxAttempts = 5
+
+        // Activate the app first — required for makeKey to work on external monitors
+        // where NSApp.isActive may be false when the overlay opens
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        window.makeKeyAndOrderFront(nil)
+        let isKeyAfterMakeKey = window.isKeyWindow
+        let success = window.makeFirstResponder(textField)
+
+        // Ensure field editor exists for caret to appear
+        if window.fieldEditor(false, for: textField) == nil {
+            _ = window.fieldEditor(true, for: textField)
+        }
+
+        // If the window isn't key yet (activation is async on external monitors),
+        // retry so keystrokes actually reach the text field
+        if !isKeyAfterMakeKey && attempt < maxAttempts {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.focusTextField(textField, attempt: attempt + 1)
+            }
+        } else if !success && attempt < maxAttempts {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.focusTextField(textField, attempt: attempt + 1)
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape)
+    }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        @Binding var text: String
+        let onSubmit: () -> Void
+        let onEscape: () -> Void
+
+        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void) {
+            self._text = text
+            self.onSubmit = onSubmit
+            self.onEscape = onEscape
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            if let textField = notification.object as? NSTextField {
+                text = textField.stringValue
+            }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                onSubmit()
+                return true
+            } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                onEscape()
+                return true
+            }
+            return false
+        }
     }
 }
 

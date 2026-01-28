@@ -35,6 +35,9 @@ public actor AppCoordinator {
     // Timeline visibility tracking - pause capture when timeline is open
     private var isTimelineVisible = false
 
+    // Signal to flush pending frames to the OCR queue
+    private var shouldFlushPendingFrames = false
+
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
@@ -73,6 +76,10 @@ public actor AppCoordinator {
     /// Set whether the timeline is currently visible (pauses frame processing when true)
     public func setTimelineVisible(_ visible: Bool) {
         isTimelineVisible = visible
+        // When timeline becomes visible, signal to flush any buffered frames to OCR queue
+        if visible {
+            shouldFlushPendingFrames = true
+        }
         Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
     }
 
@@ -143,6 +150,55 @@ public actor AppCoordinator {
             Log.warning("Crash recovery completed: \(result.sessionsRecovered) sessions, \(result.framesRecovered) frames recovered", category: .app)
         } else {
             Log.info("No crash recovery needed", category: .app)
+        }
+
+        // Re-enqueue orphaned frames (processingStatus=0 but not in queue)
+        // These are frames that were captured but never enqueued due to app restart
+        await reEnqueueOrphanedFrames()
+    }
+
+    /// Re-enqueue frames that have processingStatus=0 but are not in the processing queue
+    /// This happens when the app restarts before buffered frames were enqueued
+    private func reEnqueueOrphanedFrames() async {
+        guard let queue = await services.processingQueue else {
+            Log.warning("[ORPHAN-RECOVERY] Processing queue not available", category: .app)
+            return
+        }
+
+        do {
+            let orphanedCount = try await services.database.countPendingFramesNotInQueue()
+            if orphanedCount == 0 {
+                Log.info("[ORPHAN-RECOVERY] No orphaned frames found", category: .app)
+                return
+            }
+
+            Log.info("[ORPHAN-RECOVERY] Found \(orphanedCount) orphaned frames (pending but not in queue)", category: .app)
+
+            // Process in batches to avoid memory issues
+            let batchSize = 500
+            var totalEnqueued = 0
+
+            while true {
+                let frameIDs = try await services.database.getPendingFrameIDsNotInQueue(limit: batchSize)
+                if frameIDs.isEmpty {
+                    break
+                }
+
+                for frameID in frameIDs {
+                    // Enqueue without frame data (will extract from video)
+                    try await queue.enqueue(frameID: frameID, priority: -1) // Low priority so new frames process first
+                }
+
+                totalEnqueued += frameIDs.count
+                Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued)/\(orphanedCount))", category: .app)
+
+                // Small delay between batches to avoid overwhelming the queue
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            }
+
+            Log.info("[ORPHAN-RECOVERY] Completed - enqueued \(totalEnqueued) orphaned frames for OCR processing", category: .app)
+        } catch {
+            Log.error("[ORPHAN-RECOVERY] Failed to re-enqueue orphaned frames: \(error)", category: .app)
         }
     }
 
@@ -323,7 +379,7 @@ public actor AppCoordinator {
 
     /// Number of frames to buffer before enqueueing for OCR
     /// This gives the HEVC encoder time to complete B-frame reordering
-    private let ocrFrameBufferSize = 2
+    private let ocrFrameBufferSize = 4
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
     /// Uses Rewind-style multi-resolution video writing
@@ -349,6 +405,28 @@ public actor AppCoordinator {
 
             // Skip frames when timeline is visible (don't record while user is viewing timeline)
             if isTimelineVisible {
+                // Check if we need to flush pending frames before pausing
+                if shouldFlushPendingFrames {
+                    shouldFlushPendingFrames = false
+                    if let processingQueue = await services.processingQueue {
+                        for (resKey, var state) in writersByResolution {
+                            let pendingCount = state.pendingFrames.count
+                            let recentCount = state.recentFrameBuffer.count
+                            if pendingCount > 0 || recentCount > 0 {
+                                Log.info("[FLUSH] Timeline opened - flushing \(pendingCount) pending + \(recentCount) recent frames for \(resKey)", category: .app)
+                                for bufferedFrame in state.pendingFrames {
+                                    try? await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
+                                }
+                                state.pendingFrames = []
+                                for bufferedFrame in state.recentFrameBuffer {
+                                    try? await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
+                                }
+                                state.recentFrameBuffer = []
+                                writersByResolution[resKey] = state
+                            }
+                        }
+                    }
+                }
                 continue
             }
 
@@ -1179,6 +1257,36 @@ public actor AppCoordinator {
         return try await adapter.getAllOCRNodes(frameID: frameID, source: source)
     }
 
+    // MARK: - OCR Status
+
+    /// Get the OCR processing status for a specific frame
+    /// Returns the processing status combined with queue information
+    public func getOCRStatus(frameID: FrameID) async throws -> OCRProcessingStatus {
+        let statusInt = try await services.database.getFrameProcessingStatus(frameID: frameID.value)
+
+        guard let status = statusInt else {
+            return .unknown
+        }
+
+        switch status {
+        case 0: // pending
+            // Check if in queue and get position
+            let queuePosition = try await services.database.getFrameQueuePosition(frameID: frameID.value)
+            if queuePosition != nil {
+                return .queued(position: queuePosition, depth: nil)
+            }
+            return .pending
+        case 1: // processing
+            return .processing
+        case 2: // completed
+            return .completed
+        case 3: // failed
+            return .failed
+        default:
+            return .unknown
+        }
+    }
+
     // MARK: - OCR Reprocessing
 
     /// Reprocess OCR for a specific frame
@@ -1517,6 +1625,74 @@ public struct CleanupResult: Sendable {
     public let deletedFrames: Int
     public let deletedSegments: Int
     public let reclaimedBytes: Int64
+}
+
+/// OCR processing status for a frame
+/// Provides detailed status information for UI display
+public struct OCRProcessingStatus: Sendable, Equatable {
+    public enum State: Sendable, Equatable {
+        /// OCR completed successfully - text is available
+        case completed
+        /// Frame is pending but not yet in processing queue
+        case pending
+        /// Frame is in the processing queue waiting to be processed
+        case queued
+        /// Frame is currently being processed (OCR in progress)
+        case processing
+        /// OCR failed permanently
+        case failed
+        /// Frame not found or status unknown
+        case unknown
+    }
+
+    public let state: State
+    /// Position in queue (1 = next to be processed), nil if not in queue
+    public let queuePosition: Int?
+    /// Total items in the queue
+    public let queueDepth: Int?
+
+    public init(state: State, queuePosition: Int? = nil, queueDepth: Int? = nil) {
+        self.state = state
+        self.queuePosition = queuePosition
+        self.queueDepth = queueDepth
+    }
+
+    /// Human-readable description for display
+    public var displayText: String {
+        switch state {
+        case .completed: return "OCR Complete"
+        case .pending: return "Indexing text..."
+        case .queued:
+            if let position = queuePosition {
+                return "Queued #\(position)"
+            }
+            return "Queued"
+        case .processing: return "Indexing..."
+        case .failed: return "OCR Failed"
+        case .unknown: return ""
+        }
+    }
+
+    /// Whether OCR is still in progress (queued or processing)
+    public var isInProgress: Bool {
+        switch state {
+        case .queued, .processing, .pending:
+            return true
+        case .completed, .failed, .unknown:
+            return false
+        }
+    }
+
+    // Convenience static constructors
+    public static let completed = OCRProcessingStatus(state: .completed)
+    public static let pending = OCRProcessingStatus(state: .pending)
+    public static let processing = OCRProcessingStatus(state: .processing)
+    public static let failed = OCRProcessingStatus(state: .failed)
+    public static let unknown = OCRProcessingStatus(state: .unknown)
+
+    public static func queued(position: Int?, depth: Int?) -> OCRProcessingStatus {
+        OCRProcessingStatus(state: .queued, queuePosition: position, queueDepth: depth)
+    }
 }
 
 public enum AppError: Error {

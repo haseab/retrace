@@ -68,9 +68,17 @@ public struct TimelineTapeView: View {
 
             let tapeOffset = max(minOffset, min(maxOffset, unclampedTapeOffset))
 
-            HStack(spacing: blockSpacing) {
-                ForEach(blocks) { block in
-                    appBlockView(block: block)
+            ZStack(alignment: .leading) {
+                // Main tape blocks
+                HStack(spacing: blockSpacing) {
+                    ForEach(blocks) { block in
+                        appBlockView(block: block)
+                    }
+                }
+
+                // Video boundary markers overlay (only when enabled)
+                if viewModel.showVideoBoundaries {
+                    videoBoundaryMarkers(blocks: blocks)
                 }
             }
             .offset(x: tapeOffset)
@@ -78,6 +86,25 @@ public struct TimelineTapeView: View {
             // .animation(.linear(duration: 0.06), value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
+    }
+
+    // MARK: - Video Boundary Markers
+
+    /// Red tick marks showing where video segment boundaries are on the timeline
+    @ViewBuilder
+    private func videoBoundaryMarkers(blocks: [AppBlock]) -> some View {
+        let boundaries = viewModel.videoBoundaryIndices
+
+        ForEach(Array(boundaries), id: \.self) { frameIndex in
+            let xOffset = offsetForFrame(frameIndex, in: blocks) - pixelsPerFrame / 2
+
+            // Thick red line that protrudes above and below the tape
+            Rectangle()
+                .fill(Color.red)
+                .frame(width: 3, height: tapeHeight + 16)
+                .offset(x: xOffset, y: -8)
+        }
+        .allowsHitTesting(false)
     }
 
     // MARK: - App Block View
@@ -205,9 +232,14 @@ public struct TimelineTapeView: View {
                     }
                     .overlay(alignment: .trailing) {
                         // Go to Now button - fades in when not at most recent frame
+                        // Refresh button - shows when already at the most recent frame
                         // Positioned to the right of the datetime button without shifting it
                         if viewModel.shouldShowGoToNow {
                             GoToNowButton(viewModel: viewModel)
+                                .offset(x: TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing)
+                                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                        } else {
+                            RefreshButton(viewModel: viewModel)
                                 .offset(x: TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing)
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
@@ -378,6 +410,38 @@ struct GoToNowButton: View {
             else { NSCursor.pop() }
         }
         .instantTooltip("Go to Now", isVisible: $isHovering)
+    }
+}
+
+// MARK: - Refresh Button
+
+/// Button to refresh and load the newest data when already at the most recent frame
+struct RefreshButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.dismissContextMenu()
+            Task {
+                await viewModel.loadMostRecentFrame()
+            }
+        }) {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
+                .foregroundColor(isHovering ? .white : .white.opacity(0.7))
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .themeAwareCircleStyle(isHovering: isHovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .instantTooltip("Refresh", isVisible: $isHovering)
     }
 }
 
@@ -794,7 +858,7 @@ struct SearchButton: View {
                 Spacer()
 
                 // Keyboard shortcut hint
-                Text("⌘F")
+                Text("⌘K")
                     .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
                     .foregroundColor(isHovering ? .white.opacity(0.7) : .white.opacity(0.3))
                     .padding(.horizontal, 6 * TimelineScaleFactor.current)
@@ -815,7 +879,7 @@ struct SearchButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .help("Search (Cmd+F)")
+        .help("Search (Cmd+K)")
     }
 }
 
@@ -1616,30 +1680,42 @@ struct DateSearchField: NSViewRepresentable {
         // No focus logic needed here - makeNSView handles initial focus
     }
 
-    /// Robustly focus the text field using multiple attempts
-    private func focusTextField(_ textField: FocusableTextField) {
-        // Attempt 1: Immediate focus on next run loop
-        DispatchQueue.main.async {
+    /// Robustly focus the text field using multiple attempts with retry logic
+    /// for external monitors where NSApp activation is async
+    private func focusTextField(_ textField: FocusableTextField, attempt: Int = 1) {
+        let maxAttempts = 5
+        let delay: TimeInterval = attempt == 1 ? 0.0 : Double(attempt) * 0.05
+
+        let schedule = {
             guard let window = textField.window else {
-                // Window not ready yet, retry
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
-                    self.performFocus(textField)
+                if attempt < maxAttempts {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        self.focusTextField(textField, attempt: attempt + 1)
+                    }
                 }
                 return
             }
-            self.performFocus(textField, in: window)
+            self.performFocus(textField, in: window, attempt: attempt)
+        }
+
+        if delay > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: schedule)
+        } else {
+            DispatchQueue.main.async(execute: schedule)
         }
     }
 
-    /// Actually perform the focus operation
-    private func performFocus(_ textField: FocusableTextField, in window: NSWindow? = nil) {
-        let targetWindow = window ?? textField.window
-        guard let window = targetWindow else { return }
+    /// Actually perform the focus operation with retry for external monitors
+    private func performFocus(_ textField: FocusableTextField, in window: NSWindow, attempt: Int) {
+        let maxAttempts = 5
 
-        // Make window key first
-        window.makeKey()
-
-        // Make text field first responder
+        // Activate the app first — required for makeKey to work on external monitors
+        // where NSApp.isActive may be false when the panel opens
+        if !NSApp.isActive {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        window.makeKeyAndOrderFront(nil)
+        let isKeyAfterMakeKey = window.isKeyWindow
         let success = window.makeFirstResponder(textField)
 
         // Ensure field editor exists for caret to appear
@@ -1647,10 +1723,15 @@ struct DateSearchField: NSViewRepresentable {
             _ = window.fieldEditor(true, for: textField)
         }
 
-        // If initial attempt failed, retry
-        if !success {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                window.makeFirstResponder(textField)
+        // If the window isn't key yet (activation is async on external monitors),
+        // retry so keystrokes actually reach the text field
+        if !isKeyAfterMakeKey && attempt < maxAttempts {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.focusTextField(textField, attempt: attempt + 1)
+            }
+        } else if !success && attempt < maxAttempts {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self.focusTextField(textField, attempt: attempt + 1)
             }
         }
     }

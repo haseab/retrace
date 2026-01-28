@@ -172,6 +172,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// All OCR nodes for the current frame (used for text selection)
     @Published public var ocrNodes: [OCRNodeWithText] = []
 
+    /// OCR processing status for the current frame
+    @Published public var ocrStatus: OCRProcessingStatus = .unknown
+
     /// Character-level selection: start position (node ID, character index within node)
     @Published public var selectionStart: (nodeID: Int, charIndex: Int)?
 
@@ -336,6 +339,29 @@ public class SimpleTimelineViewModel: ObservableObject {
     public var showFrameIDs: Bool {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         return defaults.bool(forKey: "showFrameIDs")
+    }
+
+    /// Whether to show video segment boundaries on the timeline tape
+    @Published public var showVideoBoundaries: Bool = false
+
+    /// Frame indices where video boundaries occur (first frame of each new video)
+    /// A boundary exists when the videoPath changes between consecutive frames
+    public var videoBoundaryIndices: Set<Int> {
+        guard frames.count > 1 else { return [] }
+
+        var boundaries = Set<Int>()
+        var previousVideoPath: String? = nil
+
+        for (index, frame) in frames.enumerated() {
+            let currentVideoPath = frame.videoInfo?.videoPath
+            if let prev = previousVideoPath, let curr = currentVideoPath, prev != curr {
+                // Video changed - this frame is a boundary (first frame of new video)
+                boundaries.insert(index)
+            }
+            previousVideoPath = currentVideoPath
+        }
+
+        return boundaries
     }
 
     /// Copy the current frame ID to clipboard
@@ -606,6 +632,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
+
+    /// Task for polling OCR status when processing is in progress
+    private var ocrStatusPollingTask: Task<Void, Never>?
 
     /// Cache for Retrace images (loaded on demand since they're from disk)
     private var imageCache: [FrameID: NSImage] = [:] {
@@ -1722,6 +1751,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !frames.isEmpty {
             Log.info("[TIMELINE-REFRESH] 🔄 Have \(frames.count) cached frames, refreshing current image", category: .ui)
 
+            // Skip background refresh if user is deep in history (>250 frames from end).
+            // Appending present-moment frames while the user is far back corrupts the
+            // infinite scroll window — newestLoadedTimestamp jumps to now, causing the
+            // next forward scroll batch to skip ahead by potentially an entire day.
+            let distanceFromEnd = frames.count - 1 - currentIndex
+            if !navigateToNewest && distanceFromEnd > 250 {
+                Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is \(distanceFromEnd) frames from end (threshold: 250)", category: .ui)
+                loadImageIfNeeded()
+                return
+            }
+
             // Check if there are newer frames available
             if let newestCachedTimestamp = frames.last?.frame.timestamp {
                 do {
@@ -2041,6 +2081,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         } else {
             // Clear stale OCR/URL data during scrolling so old bounding boxes don't persist
             ocrNodes = []
+            ocrStatus = .unknown
+            ocrStatusPollingTask?.cancel()
+            ocrStatusPollingTask = nil
             urlBoundingBox = nil
             clearTextSelection()
         }
@@ -2153,6 +2196,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func loadOCRNodes() {
         guard currentTimelineFrame != nil else {
             ocrNodes = []
+            ocrStatus = .unknown
+            ocrStatusPollingTask?.cancel()
+            ocrStatusPollingTask = nil
             clearTextSelection()
             return
         }
@@ -2168,8 +2214,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load OCR nodes and wait for completion (used when we need to await the result)
     private func loadOCRNodesAsync() async {
+        // Cancel any existing polling task
+        ocrStatusPollingTask?.cancel()
+        ocrStatusPollingTask = nil
+
         guard let timelineFrame = currentTimelineFrame else {
             ocrNodes = []
+            ocrStatus = .unknown
             return
         }
 
@@ -2180,27 +2231,33 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.debug("[OCR-LOAD-DEBUG] Loading OCR nodes for frameID=\(frame.id.value), videoFrameIndex=\(videoInfo?.frameIndex ?? -1), source=\(frame.source)", category: .ui)
 
         do {
-            // Use frameID for precise lookup - timestamp can have precision issues causing 1-2 frame offset
-            let nodes = try await coordinator.getAllOCRNodes(
+            // Fetch OCR status and nodes concurrently
+            async let statusTask = coordinator.getOCRStatus(frameID: frame.id)
+            async let nodesTask = coordinator.getAllOCRNodes(
                 frameID: frame.id,
                 source: frame.source
             )
 
+            let (status, nodes) = try await (statusTask, nodesTask)
+
             // DEBUG: Log what we got back
-            Log.debug("[OCR-LOAD-DEBUG] Got \(nodes.count) nodes for frameID=\(frame.id.value)", category: .ui)
+            Log.debug("[OCR-LOAD-DEBUG] Got \(nodes.count) nodes for frameID=\(frame.id.value), status=\(status.displayText)", category: .ui)
             if let firstNode = nodes.first {
                 Log.debug("[OCR-LOAD-DEBUG] First node text: '\(firstNode.text.prefix(50))...'", category: .ui)
             }
 
             Log.debug("[SimpleTimelineViewModel] Loaded \(nodes.count) OCR nodes for frame \(frame.id.value) source=\(frame.source)", category: .ui)
 
-            // DEBUG: Log first few OCR node coordinates to verify they're correct (commented out to reduce log noise)
-            // for (i, node) in nodes.prefix(5).enumerated() {
-            //     Log.info("[OCR-DEBUG] Node[\(i)] id=\(node.id): x=\(String(format: "%.4f", node.x)), y=\(String(format: "%.4f", node.y)), w=\(String(format: "%.4f", node.width)), h=\(String(format: "%.4f", node.height)), text='\(node.text.prefix(30))'", category: .ui)
-            // }
-
             // Only update if we're still on the same frame
             if currentTimelineFrame?.frame.id == frame.id {
+                // Update OCR status
+                ocrStatus = status
+
+                // Start polling if OCR is in progress
+                if status.isInProgress {
+                    startOCRStatusPolling(for: frame.id)
+                }
+
                 // Filter out nodes with invalid coordinates (multi-monitor captures)
                 // Valid normalized coordinates should be in range [0.0, 1.0]
                 let filteredNodes = nodes.filter { node in
@@ -2221,6 +2278,83 @@ public class SimpleTimelineViewModel: ObservableObject {
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
             ocrNodes = []
+            ocrStatus = .unknown
+        }
+    }
+
+    /// Start polling for OCR status updates
+    /// Polls every 500ms until OCR completes or frame changes
+    private func startOCRStatusPolling(for frameID: FrameID) {
+        ocrStatusPollingTask?.cancel()
+
+        ocrStatusPollingTask = Task { [weak self] in
+            guard let self = self else { return }
+
+            while !Task.isCancelled {
+                // Wait 500ms between polls
+                try? await Task.sleep(nanoseconds: 500_000_000)
+
+                guard !Task.isCancelled else { return }
+
+                // Check if we're still on the same frame
+                guard let currentFrame = await MainActor.run(body: { self.currentTimelineFrame?.frame }),
+                      currentFrame.id == frameID else {
+                    return
+                }
+
+                // Fetch updated status
+                do {
+                    let status = try await self.coordinator.getOCRStatus(frameID: frameID)
+
+                    await MainActor.run {
+                        // Only update if still on the same frame
+                        guard self.currentTimelineFrame?.frame.id == frameID else { return }
+
+                        self.ocrStatus = status
+
+                        // If completed, also reload the OCR nodes
+                        if !status.isInProgress {
+                            Task {
+                                await self.reloadOCRNodesOnly(for: frameID)
+                            }
+                        }
+                    }
+
+                    // Stop polling if OCR is no longer in progress
+                    if !status.isInProgress {
+                        return
+                    }
+                } catch {
+                    Log.error("[OCR-POLL] Failed to poll OCR status: \(error)", category: .ui)
+                }
+            }
+        }
+    }
+
+    /// Reload only OCR nodes without fetching status (used after OCR completes)
+    private func reloadOCRNodesOnly(for frameID: FrameID) async {
+        guard let frame = currentTimelineFrame?.frame, frame.id == frameID else { return }
+
+        do {
+            let nodes = try await coordinator.getAllOCRNodes(
+                frameID: frame.id,
+                source: frame.source
+            )
+
+            // Only update if still on the same frame
+            guard currentTimelineFrame?.frame.id == frameID else { return }
+
+            let filteredNodes = nodes.filter { node in
+                node.x >= 0.0 && node.x <= 1.0 &&
+                node.y >= 0.0 && node.y <= 1.0 &&
+                (node.x + node.width) <= 1.0 &&
+                (node.y + node.height) <= 1.0
+            }
+
+            ocrNodes = filteredNodes
+            Log.debug("[OCR-POLL] Reloaded \(filteredNodes.count) OCR nodes for frame \(frameID.value)", category: .ui)
+        } catch {
+            Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
         }
     }
 
@@ -3313,22 +3447,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         return currentIndex < frames.count - 1 || hasMoreNewer
     }
 
-    /// Navigate to the most recent frame (now), clearing filters only if any are set
+    /// Navigate to the most recent frame — jumps to end of tape if already loaded, otherwise reloads from DB
     public func goToNow() {
         // Only clear filters if any are active
         if activeFilterCount > 0 {
             clearAllFilters()
         }
 
-        // Navigate to the most recent frame
-        if !frames.isEmpty {
+        if hasMoreNewer {
+            // Most recent frame is NOT in the loaded array — fetch from database
+            Task {
+                await loadMostRecentFrame()
+            }
+        } else if !frames.isEmpty {
+            // Most recent frame IS already loaded — just navigate to it
             navigateToFrame(frames.count - 1)
         }
-
-        // TODO: Uncomment if we want to also fetch newest frames from database
-        // Task {
-        //     await refreshFrameData()
-        // }
     }
 
     // MARK: - Date Search

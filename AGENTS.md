@@ -22,9 +22,6 @@ Retrace is a local-first screen recording and search application for macOS, insp
 # Build all targets
 swift build
 
-# Build specific module tests
-swift build --target DatabaseTests
-
 # Run all tests
 swift test
 
@@ -33,18 +30,9 @@ swift test --filter DatabaseTests
 
 # Run specific test
 swift test --filter testSpecificMethod
-```
 
-### Development Workflow
-```bash
 # Clean build artifacts
 rm -rf .build/
-
-# Check Swift version (requires 5.9+)
-swift --version
-
-# Format code (if using swift-format)
-swift-format format --in-place --recursive .
 ```
 
 ---
@@ -59,62 +47,107 @@ retrace/
 ├── Package.swift                # Swift Package Manager configuration
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
+│   ├── Logging.swift            # Log utility + debugFile() for /tmp/retrace_debug.log
+│   ├── AppPaths.swift           # Application path configuration
 │   ├── Models/                  # Data types used across modules
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
+│   │   ├── TextRegion.swift     # OCR text region types
 │   │   ├── Search.swift         # SearchQuery, SearchResult
+│   │   ├── Segment.swift        # Segment data model
 │   │   ├── Config.swift         # Configuration types
-│   │   └── Errors.swift         # Error types
+│   │   ├── Errors.swift         # Error types
+│   │   ├── Audio.swift          # Audio model types (Release 2)
+│   │   ├── FilterCriteria.swift # Timeline/search filter criteria
+│   │   ├── Source.swift         # Data source enum (native, rewind, etc.)
+│   │   └── Tag.swift            # Tag model types
 │   └── Protocols/               # Module interfaces
 │       ├── DatabaseProtocol.swift
 │       ├── StorageProtocol.swift
 │       ├── CaptureProtocol.swift
 │       ├── ProcessingProtocol.swift
-│       └── SearchProtocol.swift
+│       ├── SearchProtocol.swift
+│       └── MigrationProtocol.swift
 │
 ├── Database/                    # SQLite + FTS5 storage
 │   ├── AGENTS.md                # Module-specific agent instructions
-│   ├── DatabaseManager.swift
-│   ├── FTSManager.swift
-│   ├── Migrations/
-│   ├── Queries/
+│   ├── DatabaseManager.swift    # Main database coordinator
+│   ├── DatabaseConnection.swift # SQLite connection management
+│   ├── DatabaseConfig.swift     # Database configuration
+│   ├── FTSManager.swift         # Full-text search management
+│   ├── IDMappingService.swift   # ID mapping between sources
+│   ├── Schema.swift             # Current schema definition
+│   ├── Migrations/              # Schema migration scripts
+│   ├── Queries/                 # Query implementations
 │   └── Tests/
 │
-├── Storage/                     # File I/O, HEVC encoding, encryption
+├── Storage/                     # File I/O, HEVC encoding
 │   ├── AGENTS.md
 │   ├── StorageManager.swift
-│   ├── Encryption/
-│   ├── VideoEncoder/
+│   ├── ImageExtractor.swift     # Extract frames from video files
+│   ├── IncrementalSegmentWriter.swift
+│   ├── SegmentWriterImpl.swift
+│   ├── FileManager/             # File system utilities
+│   ├── VideoEncoder/            # HEVC video encoding
+│   ├── WAL/                     # Write-Ahead Log (WALManager, RecoveryManager)
 │   └── Tests/
 │
 ├── Capture/                     # CGWindowListCapture integration
 │   ├── AGENTS.md
 │   ├── CaptureManager.swift
-│   ├── ScreenCapture/
-│   ├── Deduplication/
+│   ├── ScreenCapture/           # Screen capture implementation
+│   ├── Deduplication/           # Perceptual hash deduplication
+│   ├── Metadata/                # AppInfoProvider, BrowserURLExtractor
 │   └── Tests/
 │
 ├── Processing/                  # OCR and text extraction
 │   ├── AGENTS.md
 │   ├── ProcessingManager.swift
-│   ├── OCR/
-│   ├── Accessibility/
+│   ├── FrameProcessingQueue.swift # Async frame processing queue
+│   ├── URLExtractor.swift       # URL extraction from OCR text
+│   ├── OCR/                     # Vision framework OCR
+│   ├── Accessibility/           # Accessibility API integration
+│   ├── TextMerger/              # Text merging utilities
 │   └── Tests/
 │
 ├── Search/                      # Full-text search
 │   ├── AGENTS.md
 │   ├── SearchManager.swift
-│   ├── QueryParser/
+│   ├── IngestionManager.swift   # Search index ingestion
+│   ├── QueryParser/             # Query parsing (app:, date:, -exclude)
+│   ├── Ranking/                 # Result ranking implementation
+│   ├── VectorSearchTODO/        # Planned for Release 2 (excluded from build)
 │   └── Tests/
 │
 ├── Migration/                   # Import from other apps
 │   ├── AGENTS.md
 │   ├── MigrationManager.swift
-│   └── Importers/
+│   └── Importers/               # Source-specific importers (Rewind)
 │
 ├── App/                         # Main application coordinator
+│   ├── AppCoordinator.swift     # Central coordinator (orchestrates all modules)
+│   ├── DataAdapter.swift        # Data layer adapter (DB queries, transformations)
+│   ├── ServiceContainer.swift   # Dependency injection container
+│   ├── AppLifecycle.swift       # App lifecycle management
+│   ├── ModelManager.swift       # Model management
+│   ├── OnboardingManager.swift  # First-run onboarding flow
+│   ├── RetentionManager.swift   # Data retention policies
+│   └── Tests/
+│
 └── UI/                          # SwiftUI interface
-    └── AGENTS.md
+    ├── AGENTS.md
+    ├── RetraceApp.swift         # App entry point
+    ├── ContentView.swift        # Root content view
+    ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
+    ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback)
+    ├── Views/
+    │   ├── Dashboard/           # App usage analytics views
+    │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
+    │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
+    │   ├── Settings/            # Settings panel
+    │   ├── Onboarding/          # Onboarding flow
+    │   └── Feedback/            # Feedback form & submission
+    └── Tests/
 ```
 
 ---
@@ -129,6 +162,7 @@ retrace/
 | **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (v0.1: no audio transcription) |
 | **SEARCH** | `Search/` | `Search/AGENTS.md` | Query parsing, FTS5 queries, result ranking (v0.1: no vector search) |
 | **MIGRATION** | `Migration/` | `Migration/AGENTS.md` | Import from Rewind AI (v0.1: Rewind only, others planned) |
+| **APP** | `App/` | — | Coordinator, DI container, data adapter, lifecycle management |
 | **UI** | `UI/` | `UI/AGENTS.md` | SwiftUI interface (timeline, dashboard, settings, search) |
 
 **Rule**: Each agent should **ONLY** modify files in their assigned module directory. Cross-module changes require explicit coordination.
@@ -155,200 +189,38 @@ retrace/
 - Throw specific errors, not generic ones
 - Add new error cases to your module's directory only
 
-### Testing (TDD Required)
-- **Write tests first** - Follow RED → GREEN → REFACTOR cycle
+### Testing
+- **Write tests first** - Follow TDD: RED → GREEN → REFACTOR
 - **Test locations**: `{Module}/Tests/`
 - **Test against protocols** - Not implementations
 - **Mock dependencies** - Using protocol conformance
 
 ### ⚠️ CRITICAL: Test with REAL Input Data, Not Fake Structures
 
-**The Problem:**
 Many tests "play cop and thief" - creating fake data structures and validating the fake data they created. This provides **zero confidence** about real system behavior.
 
-**Example of USELESS Test:**
+**USELESS** — tests that Swift can assign struct fields:
 ```swift
-func testAccessibilityResultCreation() {
-    let appInfo = AppInfo(bundleID: "com.apple.Safari", ...)  // WE CREATE THIS
-    let result = AccessibilityResult(appInfo: appInfo, ...)
-    XCTAssertEqual(result.appInfo.bundleID, "com.apple.Safari")  // WE VALIDATE WHAT WE CREATED
-}
+let appInfo = AppInfo(bundleID: "com.apple.Safari", ...)
+let result = AccessibilityResult(appInfo: appInfo, ...)
+XCTAssertEqual(result.appInfo.bundleID, "com.apple.Safari")  // circular
 ```
 
-**Example of USEFUL Test:**
+**USEFUL** — tests that exercise real system APIs:
 ```swift
-func testDatabaseSchemaExists() async throws {
-    // REAL SQLite query
-    let tables = try await database.getTables()
-    // Validates ACTUAL schema in REAL database
-    XCTAssertTrue(tables.contains("segment"))
-}
+let tables = try await database.getTables()
+XCTAssertTrue(tables.contains("segment"))  // validates real SQLite schema
 ```
 
-**What Makes a Test Useful:**
-1. ✅ Tests **real system APIs** (SQLite, FileManager, macOS Accessibility, Vision OCR)
-2. ✅ Uses **real production input** (real screenshots, real audio, real OCR output)
-3. ✅ Validates **end-to-end workflows** (screenshot → OCR → database → search)
-4. ❌ **NOT** testing if Swift can assign struct fields
-5. ❌ **NOT** testing string concatenation or boolean flags
-
-**Testing Philosophy:**
-- **Database tests**: Validate real SQLite behavior (SQL syntax, FTS5, migrations) ✅
-- **Integration tests**: Use REAL input data (see `test_assets/` requirements) ✅
-- **Avoid circular tests**: Don't create data and validate what you created ❌
-
-See [TESTS_CLEANUP.md](TESTS_CLEANUP.md) and [TESTS_MIGRATION.md](TESTS_MIGRATION.md) for full details.
-
-### Test Categories (All Modules)
-Every module MUST have:
-- **Schema/Config Validation**: Configuration is valid (SQL compiles, paths exist)
-- **Real API Tests**: Test actual system APIs (SQLite, FileManager, Vision, etc.)
-- **Edge Cases**: Boundaries, nulls, unicode, SQL injection
-- **Integration Tests**: End-to-end workflows WITH real production input data
-
-### Test Output Philosophy
-**Keep test output clean, structured, and high-level:**
-
-#### For simple/redundant checks (existence, counts):
-```
-Checking if 11/11 tables exist...
-✅ All 11 tables exist
-```
-
-#### For edge cases and complex behavior:
-```
-Testing 3 FTS trigger behaviors
-  ✓ Insert triggers auto-indexing
-  ✓ Delete removes from index
-  ✓ Update re-indexes content
-```
-
-**Principles:**
-- High-level summary first
-- Indented list of what was tested
-- No verbose per-item logging unless it provides value
-- Only print details when tests fail or for complex edge cases
-- Consolidate related tests instead of creating many small ones
-- **Always include negative tests** - verify that validation logic correctly detects failures (e.g., missing tables, non-existent columns, invalid data)
-
-#### Verbose Mode & HTML Reports
-
-Use the `runAsyncTest()` decorator for clean, reusable test logging:
-
-```swift
-func testFTSTriggers() async throws {
-    try await runAsyncTest(
-        description: "Testing FTS trigger behaviors",
-        verboseSteps: { log in
-            log.logStep(title: "Setup", details: "Running migration...")
-        }
-    ) {
-        // Your test code here
-        // Non-verbose: prints clean summary
-        // Verbose (VERBOSE_TESTS=1): generates HTML report with detailed steps
-
-        if logger.isVerbose {
-            logger.logStep(title: "Step 1", details: "Input: ...\nExpected: ...\nActual: ...")
-        }
-
-        // XCTAssert statements...
-    }
-}
-```
-
-**Benefits:**
-- Automatic test start/end handling
-- Automatic HTML report generation in verbose mode
-- Clean separation: verbose details in closures, test logic stays clean
-- Reusable across all test files
-
-**Usage:**
-```bash
-# Clean output
-swift test --filter MigrationTests
-
-# Detailed HTML report
-VERBOSE_TESTS=1 swift test --filter MigrationTests
-open test_report.html
-```
+**What makes a test useful:**
+- ✅ Tests real system APIs (SQLite, FileManager, Vision OCR)
+- ✅ Uses real production input (real screenshots, real OCR output)
+- ✅ Validates end-to-end workflows (screenshot → OCR → database → search)
+- ❌ NOT testing struct field assignment or string concatenation
 
 ---
 
 ## Architecture & Data Flow
-
-### Screenshot → Database Pipeline (Every 2 Seconds)
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    EVERY 2 SECONDS: SCREEN CAPTURE                      │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-        ┌───────────────────────────────────────────────────┐
-        │  Layer 1: CAPTURE                                 │
-        │  • ScreenCaptureKit → CGImage                     │
-        │  • Perceptual hash → Deduplication (95%)          │
-        │  • NSWorkspace → App metadata                     │
-        └───────────────────────────────────────────────────┘
-                                    ↓
-                    ┌───────────────┴───────────────┐
-                    ↓                               ↓
-    ┌───────────────────────────┐   ┌───────────────────────────┐
-    │  Layer 2A: VIDEO PATH     │   │  Layer 2B: OCR PATH       │
-    │  Buffer 150 frames        │   │  Vision.framework         │
-    │  (5 seconds @ 30 FPS)     │   │  Text extraction          │
-    └───────────────────────────┘   └───────────────────────────┘
-                    ↓                               ↓
-    ┌───────────────────────────┐   ┌───────────────────────────┐
-    │  Layer 3A: HEVC ENCODE    │   │  Layer 3B: NODE CREATION  │
-    │  CVPixelBuffer            │   │  • Bounding boxes         │
-    │  → H.265 compression      │   │  • Text offsets           │
-    │  → .mp4 file (5-7 MB)     │   │  • Sequential ordering    │
-    └───────────────────────────┘   └───────────────────────────┘
-                    ↓                               ↓
-                    └───────────────┬───────────────┘
-                                    ↓
-        ┌───────────────────────────────────────────────────┐
-        │  Layer 4: DATABASE INSERTION (Multi-table)        │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.1 segment → segmentId                     │  │
-        │  │     bundleID, windowName, browserUrl        │  │
-        │  └─────────────────────────────────────────────┘  │
-        │                      ↓                            │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.2 frame → frameId                         │  │
-        │  │     segmentId FK, videoId FK, timestamp     │  │
-        │  └─────────────────────────────────────────────┘  │
-        │                      ↓                            │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.3 node (bulk insert 10-100 rows)          │  │
-        │  │     frameId FK, bounds, textOffset          │  │
-        │  └─────────────────────────────────────────────┘  │
-        │                      ↓                            │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.4 searchRanking_content (FTS5) → docid    │  │
-        │  │     Full merged text for search             │  │
-        │  └─────────────────────────────────────────────┘  │
-        │                      ↓                            │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.5 doc_segment (linking table)             │  │
-        │  │     docid → frameId relationship            │  │
-        │  └─────────────────────────────────────────────┘  │
-        │                      ↓                            │
-        │  ┌─────────────────────────────────────────────┐  │
-        │  │ 4.6 video (metadata)                        │  │
-        │  │     path, fileSize, resolution, frameRate   │  │
-        │  └─────────────────────────────────────────────┘  │
-        └───────────────────────────────────────────────────┘
-                                    ↓
-        ┌───────────────────────────────────────────────────┐
-        │  Layer 5: SEARCH & RETRIEVAL                      │
-        │  5.1 FTS query → docid                            │
-        │  5.2 doc_segment → frameId                        │
-        │  5.3 frame → segment + video metadata             │
-        │  5.4 node → bounding boxes for highlighting       │
-        │  5.5 video → extract image from .mp4              │
-        └───────────────────────────────────────────────────┘
-```
 
 ### Data Flow by Module
 
@@ -370,6 +242,7 @@ DATABASE Module:
   Output: Core tables:
     • segment (app/window context)
     • frame (screenshot metadata)
+    • node (OCR bounding boxes)
     • searchRanking (FTS5 full-text index)
     • doc_segment (linking table)
     • video (file metadata)
@@ -389,7 +262,7 @@ segment (1) ──< (N) frame (N) >── (1) video
 frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 ```
 
-### Architecture Diagram (Module Level)
+### Architecture Diagram
 
 ```
                 +---------------------------+
@@ -421,7 +294,7 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 | Language | Swift 5.9+ | Actors, async/await, Sendable required |
 | UI Framework | SwiftUI | Fully implemented in v0.1 |
 | Screen Capture | CGWindowListCapture | Legacy API, no privacy indicator |
-| Video Encoding | VideoToolbox (HEVC) | Hardware encoding on Apple Silicon (working, not optimized) |
+| Video Encoding | VideoToolbox (HEVC) | Hardware encoding on Apple Silicon |
 | OCR | Vision framework | macOS native OCR |
 | Database | SQLite + FTS5 | Full-text search built-in |
 | Encryption | CryptoKit (AES-256-GCM) | Optional on-device encryption |
@@ -450,126 +323,6 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 
 ---
 
-## Agent Workflow (Getting Started)
-
-When working on this project:
-
-1. **Read module-specific instructions**: Check `{Module}/AGENTS.md` for your assigned module
-2. **Review protocols**: Understand interfaces in `Shared/Protocols/`
-3. **Review shared types**: Check data models in `Shared/Models/`
-4. **Write tests first**: Follow TDD (Test-Driven Development)
-5. **Implement features**: Only in your assigned module directory
-6. **Update PROGRESS.md**: Maintain continuity documentation (see below)
-
----
-
-## Documentation Requirements
-
-### PROGRESS.md (Critical for Continuity)
-
-Each module should maintain a `PROGRESS.md` file for work continuity:
-
-```markdown
-# {Module} Progress
-
-## Current Status
-- [ ] Task 1
-- [x] Task 2 (completed)
-
-## Completed Work
-- **File**: `path/to/file.swift` - Brief description
-
-## In Progress
-- Currently working on: {description}
-- Blockers: {any issues}
-
-## Design Decisions
-- Decision 1: Why we chose X over Y
-
-## Next Steps
-1. Next immediate task
-
-## Questions / Needs from Other Modules
-- Need X from {MODULE} module
-
-Last Updated: {timestamp}
-```
-
-**Update Rules**:
-- CREATE `PROGRESS.md` as first action in a module
-- UPDATE after completing each file/feature
-- UPDATE before ending any session
-- REMOVE outdated information regularly
-- Keep concise - it's a handoff document, not a journal
-
----
-
-## Communication Protocol
-
-If you need something from another module:
-1. Check if it exists in `Shared/Protocols/`
-2. If not, document the need in `TODO.md` in your directory
-3. Do NOT create cross-module dependencies directly
-
----
-
-## TDD Philosophy
-
-### Core Principle
-**Deploy based solely on tests passing - no manual inspection needed.**
-
-### The TDD Cycle
-```
-1. Write failing test (RED)
-2. Write minimum code to pass (GREEN)
-3. Refactor (REFACTOR)
-4. Repeat
-```
-
-### Edge Cases to ALWAYS Test
-- Empty state (no data)
-- Null/nil optional fields
-- Unicode and special characters
-- SQL injection attempts (for database module)
-- Boundary conditions (exact timestamps, limits)
-- Duplicate handling
-- Error conditions
-
-### Test Checklist Before ANY PR
-- [ ] All existing tests pass
-- [ ] New feature has tests
-- [ ] Edge cases covered
-- [ ] Integration test if cross-module
-
----
-
-## Third-Party Data Import
-
-Retrace supports importing from other screen recording apps:
-
-| Source | Status | Data Location |
-|--------|--------|---------------|
-| Rewind AI | Supported | `~/Library/Application Support/com.memoryvault.MemoryVault/chunks/` |
-| ScreenMemory | Planned | TBD |
-| TimeScroll | Planned | TBD |
-| Pensieve | Planned | TBD |
-
-### Import Features
-- **Resumable**: Survives app quit, sleep, restart
-- **Background**: Low CPU priority
-- **Progress UI**: Real-time progress bar
-- **Deduplication**: Skips duplicate frames
-
-### Database Source Column
-All frames/segments have a `source` column:
-- `native` - Captured by Retrace
-- `rewind` - Imported from Rewind AI
-- `screen_memory`, `time_scroll`, `pensieve` - Future sources
-
-See `Migration/AGENTS.md` for implementation details.
-
----
-
 ## Critical Rules for All Agents
 
 ### 1. Stay In Your Lane
@@ -593,6 +346,12 @@ See `Migration/AGENTS.md` for implementation details.
 - Cover edge cases thoroughly
 - All tests must pass before submitting changes
 
+### 5. Keep AGENTS.md Up-to-Date
+- **Whenever you add, rename, move, or delete files/directories**, update the relevant `AGENTS.md` (root or module-level) in the **same commit**
+- This includes: new Swift files, new subdirectories, new model/protocol types in `Shared/`, and changes to module structure
+- If you notice AGENTS.md is out of date while working, fix it immediately — don't leave it for later
+- The project structure tree, module ownership table, and shared type listings must always reflect reality
+
 ---
 
 ## Additional Resources
@@ -603,4 +362,4 @@ See `Migration/AGENTS.md` for implementation details.
 
 ---
 
-*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2025-12-13*
+*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-01-28*

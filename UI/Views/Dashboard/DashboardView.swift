@@ -1173,12 +1173,20 @@ public struct DashboardView: View {
 
                 Button(action: { showFeedbackSheet = true }) {
                     HStack(spacing: 6) {
-                        Image(systemName: "bubble.left.and.bubble.right")
-                            .font(.retraceCaption2)
-                        Text("Feedback")
+                        Image(systemName: "questionmark.circle")
+                            .font(.retraceCalloutMedium)
+                        Text("Help")
+                            .font(.retraceCaptionMedium)
                     }
-                    .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.05))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
                     .scaleEffect(isHoveringFeedback ? 1.05 : 1.0)
                     .animation(.easeInOut(duration: 0.15), value: isHoveringFeedback)
                 }
