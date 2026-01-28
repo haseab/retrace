@@ -576,48 +576,23 @@ struct ResetZoomButton: View {
 
 // MARK: - Simple Video Frame View
 
-/// Simplified video frame view using AVPlayer
-/// Optimized to only reload video when path changes, just seek when frame changes
+/// Double-buffered video frame view using two AVPlayers
+/// Eliminates black flash when crossing video boundaries by preloading the next video
+/// in a hidden player and swapping visibility once ready
 struct SimpleVideoFrameView: NSViewRepresentable {
     let videoInfo: FrameVideoInfo
     @Binding var forceReload: Bool
 
-    func makeNSView(context: Context) -> AVPlayerView {
-        let playerView = AVPlayerView()
-        playerView.controlsStyle = .none
-        playerView.showsFrameSteppingButtons = false
-        playerView.showsSharingServiceButton = false
-        playerView.showsFullScreenToggleButton = false
-
-        // Set black background to hide default AVPlayer placeholder icon
-        playerView.wantsLayer = true
-        playerView.layer?.backgroundColor = NSColor.black.cgColor
-
-        // Disable Live Text analysis to prevent VKImageAnalysisButton crashes
-        // when the window is in an inconsistent state during display cycles
-        if #available(macOS 13.0, *) {
-            playerView.allowsVideoFrameAnalysis = false
-        }
-
-        // Create player immediately
-        let player = AVPlayer()
-        player.actionAtItemEnd = .pause
-        playerView.player = player
-
-        return playerView
+    func makeNSView(context: Context) -> DoubleBufferedVideoView {
+        let containerView = DoubleBufferedVideoView()
+        return containerView
     }
 
-    func updateNSView(_ playerView: AVPlayerView, context: Context) {
-        guard let player = playerView.player else { return }
-
-        let currentPath = context.coordinator.currentVideoPath
-        let currentFrameIdx = context.coordinator.currentFrameIndex
-        let isWindowVisible = playerView.window?.isVisible ?? false
+    func updateNSView(_ containerView: DoubleBufferedVideoView, context: Context) {
+        let isWindowVisible = containerView.window?.isVisible ?? false
         let needsForceReload = forceReload
 
         // If forceReload is set, clear the cached path to trigger a full video reload
-        // This is needed because AVPlayer caches video metadata and won't see new frames
-        // that were appended to the video file while the window was hidden
         if needsForceReload {
             context.coordinator.currentVideoPath = nil
             context.coordinator.currentFrameIndex = nil
@@ -626,7 +601,6 @@ struct SimpleVideoFrameView: NSViewRepresentable {
             }
         }
 
-        // Re-read after potential clear
         let effectivePath = context.coordinator.currentVideoPath
         let effectiveFrameIdx = context.coordinator.currentFrameIndex
 
@@ -635,24 +609,24 @@ struct SimpleVideoFrameView: NSViewRepresentable {
             return
         }
 
-        // Only update coordinator state if window is visible (seeks are unreliable when hidden)
+        // Only update coordinator state if window is visible
         if isWindowVisible {
             context.coordinator.currentFrameIndex = videoInfo.frameIndex
         }
 
-        // If same video, just seek (fast path - no flickering)
+        // If same video, just seek on the active player (fast path)
         if effectivePath == videoInfo.videoPath {
             let time = videoInfo.frameTimeCMTime
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            containerView.seekActivePlayer(to: time)
             return
         }
 
         Log.debug("[VideoView] Loading new video: \(videoInfo.videoPath.suffix(30))", category: .ui)
 
-        // Different video - need to load new player item
+        // Different video - use double-buffering
         context.coordinator.currentVideoPath = videoInfo.videoPath
 
-        // Check if file exists (try both with and without .mp4 extension)
+        // Resolve actual video path
         var actualVideoPath = videoInfo.videoPath
         if !FileManager.default.fileExists(atPath: actualVideoPath) {
             let pathWithExtension = actualVideoPath + ".mp4"
@@ -664,18 +638,15 @@ struct SimpleVideoFrameView: NSViewRepresentable {
             }
         }
 
-        // Determine the URL to use - if file already has .mp4 extension, use directly
-        // Otherwise create symlink with .mp4 extension for AVFoundation
+        // Get URL (with symlink if needed for extensionless files)
         let url: URL
         if actualVideoPath.hasSuffix(".mp4") {
             url = URL(fileURLWithPath: actualVideoPath)
         } else {
-            // Create symlink with .mp4 extension (Rewind videos don't have extensions)
             let tempDir = FileManager.default.temporaryDirectory
             let fileName = (actualVideoPath as NSString).lastPathComponent
             let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
 
-            // Only create symlink if it doesn't exist
             if !FileManager.default.fileExists(atPath: symlinkPath) {
                 do {
                     try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
@@ -686,37 +657,11 @@ struct SimpleVideoFrameView: NSViewRepresentable {
             }
             url = URL(fileURLWithPath: symlinkPath)
         }
-        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-        let playerItem = AVPlayerItem(asset: asset)
 
-        // Clear old observers
-        context.coordinator.observers.forEach { $0.invalidate() }
-        context.coordinator.observers.removeAll()
-
-        player.replaceCurrentItem(with: playerItem)
-
-        // Seek to frame when ready - use integer arithmetic to avoid floating point precision issues
+        // Load video into buffer player and swap when ready
         let targetTime = videoInfo.frameTimeCMTime
         let targetFrameIndex = videoInfo.frameIndex
-        let videoPath = videoInfo.videoPath
-        let observer = playerItem.observe(\.status, options: [.new, .initial]) { item, _ in
-            Log.debug("[VideoView] PlayerItem status changed: \(item.status.rawValue) (0=unknown, 1=ready, 2=failed) for frame \(targetFrameIndex)", category: .ui)
-
-            if item.status == .failed {
-                Log.error("[VideoView] PlayerItem FAILED to load video: \(videoPath.suffix(50)), error: \(item.error?.localizedDescription ?? "unknown")", category: .ui)
-                return
-            }
-
-            guard item.status == .readyToPlay else { return }
-
-            Log.debug("[VideoView] PlayerItem ready, seeking to frame \(targetFrameIndex)", category: .ui)
-            player.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
-                Log.debug("[VideoView] Seek to frame \(targetFrameIndex) finished: \(finished)", category: .ui)
-                player.pause()
-            }
-        }
-
-        context.coordinator.observers.append(observer)
+        containerView.loadVideoIntoBuffer(url: url, seekTime: targetTime, frameIndex: targetFrameIndex)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -724,13 +669,172 @@ struct SimpleVideoFrameView: NSViewRepresentable {
     }
 
     class Coordinator {
-        var observers: [NSKeyValueObservation] = []
         var currentVideoPath: String?
         var currentFrameIndex: Int?
+    }
+}
 
-        deinit {
-            observers.forEach { $0.invalidate() }
+// MARK: - Double Buffered Video View
+
+/// Container view with two AVPlayerViews for seamless video transitions
+/// One player is always visible (active), the other loads in the background (buffer)
+/// When the buffer is ready, they swap roles
+class DoubleBufferedVideoView: NSView {
+    private var playerViewA: AVPlayerView!
+    private var playerViewB: AVPlayerView!
+    private var playerA: AVPlayer!
+    private var playerB: AVPlayer!
+
+    /// Which player is currently visible (true = A, false = B)
+    private var isPlayerAActive = true
+
+    /// Observers for player item status
+    private var observerA: NSKeyValueObservation?
+    private var observerB: NSKeyValueObservation?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupPlayers()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupPlayers()
+    }
+
+    private func setupPlayers() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
+
+        // Create player A
+        playerViewA = createPlayerView()
+        playerA = AVPlayer()
+        playerA.actionAtItemEnd = .pause
+        playerViewA.player = playerA
+
+        // Create player B
+        playerViewB = createPlayerView()
+        playerB = AVPlayer()
+        playerB.actionAtItemEnd = .pause
+        playerViewB.player = playerB
+
+        // Add both to view hierarchy
+        addSubview(playerViewA)
+        addSubview(playerViewB)
+
+        // Initially A is visible, B is hidden
+        playerViewA.isHidden = false
+        playerViewB.isHidden = true
+
+        // Setup constraints for both
+        setupConstraints(for: playerViewA)
+        setupConstraints(for: playerViewB)
+    }
+
+    private func createPlayerView() -> AVPlayerView {
+        let playerView = AVPlayerView()
+        playerView.controlsStyle = .none
+        playerView.showsFrameSteppingButtons = false
+        playerView.showsSharingServiceButton = false
+        playerView.showsFullScreenToggleButton = false
+        playerView.wantsLayer = true
+        playerView.layer?.backgroundColor = NSColor.black.cgColor
+
+        if #available(macOS 13.0, *) {
+            playerView.allowsVideoFrameAnalysis = false
         }
+
+        return playerView
+    }
+
+    private func setupConstraints(for playerView: AVPlayerView) {
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            playerView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            playerView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            playerView.topAnchor.constraint(equalTo: topAnchor),
+            playerView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    /// Seek the currently active player to a specific time
+    func seekActivePlayer(to time: CMTime) {
+        let activePlayer = isPlayerAActive ? playerA : playerB
+        activePlayer?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// Load a video into the buffer player and swap when ready
+    func loadVideoIntoBuffer(url: URL, seekTime: CMTime, frameIndex: Int) {
+        let bufferPlayer = isPlayerAActive ? playerB : playerA
+        let bufferPlayerView = isPlayerAActive ? playerViewB : playerViewA
+        let bufferObserver = isPlayerAActive ? observerB : observerA
+
+        // Clear previous observer
+        bufferObserver?.invalidate()
+
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+        let playerItem = AVPlayerItem(asset: asset)
+
+        bufferPlayer?.replaceCurrentItem(with: playerItem)
+
+        // Observe when buffer player is ready
+        let observer = playerItem.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
+            guard let self = self else { return }
+
+            Log.debug("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex)", category: .ui)
+
+            if item.status == .failed {
+                Log.error("[VideoView] Buffer player FAILED: \(item.error?.localizedDescription ?? "unknown")", category: .ui)
+                return
+            }
+
+            guard item.status == .readyToPlay else { return }
+
+            // Seek to target frame
+            bufferPlayer?.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                guard let self = self, finished else { return }
+
+                Log.debug("[VideoView] Buffer ready, swapping players for frame \(frameIndex)", category: .ui)
+
+                DispatchQueue.main.async {
+                    bufferPlayer?.pause()
+                    self.swapPlayers()
+                }
+            }
+        }
+
+        // Store observer
+        if isPlayerAActive {
+            observerB = observer
+        } else {
+            observerA = observer
+        }
+    }
+
+    /// Swap which player is visible
+    private func swapPlayers() {
+        let activePlayerView = isPlayerAActive ? playerViewA : playerViewB
+        let bufferPlayerView = isPlayerAActive ? playerViewB : playerViewA
+        let oldActivePlayer = isPlayerAActive ? playerA : playerB
+
+        // Show buffer (now becomes active)
+        bufferPlayerView?.isHidden = false
+
+        // Hide old active (now becomes buffer)
+        activePlayerView?.isHidden = true
+
+        // Clear the old active player's item to free memory
+        oldActivePlayer?.replaceCurrentItem(with: nil)
+
+        // Swap roles
+        isPlayerAActive.toggle()
+
+        Log.debug("[VideoView] Players swapped, now active: \(isPlayerAActive ? "A" : "B")", category: .ui)
+    }
+
+    deinit {
+        observerA?.invalidate()
+        observerB?.invalidate()
     }
 }
 
