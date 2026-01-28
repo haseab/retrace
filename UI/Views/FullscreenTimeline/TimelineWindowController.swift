@@ -919,11 +919,14 @@ public class TimelineWindowController: NSObject {
         // Use horizontal scrolling primarily, fall back to vertical
         let delta = abs(deltaX) > abs(deltaY) ? -deltaX : -deltaY
 
-        if abs(delta) > 0.1 {
+        // Trackpads have precise scrolling deltas, mice do not
+        let isTrackpad = event.hasPreciseScrollingDeltas
+
+        if abs(delta) > 0.001 {
             onScroll?(delta)
             // Forward scroll to view model
             Task { @MainActor in
-                await viewModel.handleScroll(delta: CGFloat(delta))
+                await viewModel.handleScroll(delta: CGFloat(delta), isTrackpad: isTrackpad)
             }
         }
     }

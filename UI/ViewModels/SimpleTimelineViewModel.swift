@@ -3391,7 +3391,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Handle scroll delta to navigate frames
-    public func handleScroll(delta: CGFloat) async {
+    /// - Parameters:
+    ///   - delta: The scroll delta value
+    ///   - isTrackpad: Whether the scroll came from a trackpad (precise scrolling) vs mouse wheel
+    public func handleScroll(delta: CGFloat, isTrackpad: Bool = true) async {
         guard !frames.isEmpty else {
             // print("[SimpleTimelineViewModel] handleScroll: frames is empty, ignoring")
             return
@@ -3405,11 +3408,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Scale sensitivity inversely with pixelsPerFrame to maintain consistent visual scroll speed
         // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
         // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
-        let baseSensitivity: CGFloat = 0.022
+        // Mouse wheels need higher sensitivity since they send larger discrete deltas less frequently
+        let baseSensitivity: CGFloat = isTrackpad ? 0.022 : 0.5
         let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
         let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
 
-        let frameStep = Int(scrollAccumulator * zoomAdjustedSensitivity)
+        var frameStep = Int(scrollAccumulator * zoomAdjustedSensitivity)
+
+        // For mouse wheels, ensure at least 1 frame movement per scroll event
+        if !isTrackpad && frameStep == 0 && abs(scrollAccumulator) > 0.001 {
+            frameStep = scrollAccumulator > 0 ? 1 : -1
+        }
 
         // Only process if we have enough scroll to move at least one frame
         guard frameStep != 0 else { return }
