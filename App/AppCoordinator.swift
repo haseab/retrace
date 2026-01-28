@@ -1433,8 +1433,13 @@ public actor AppCoordinator {
     }
 
     /// Get distinct hours for a specific date that have frames
+    /// Uses DataAdapter to query the appropriate database (Retrace or Rewind) based on date
     public func getDistinctHoursForDate(_ date: Date) async throws -> [Date] {
-        try await services.database.getDistinctHoursForDate(date)
+        if let adapter = await services.dataAdapter {
+            return try await adapter.getDistinctHoursForDate(date)
+        }
+        // Fallback to Retrace-only query
+        return try await services.database.getDistinctHoursForDate(date)
     }
 
     // MARK: - Daily Metrics

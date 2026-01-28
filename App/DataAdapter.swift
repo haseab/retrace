@@ -1780,7 +1780,8 @@ public actor DataAdapter {
         }
 
         // Hidden filter: Exclude segments with hidden tag (when .hide mode)
-        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+        // Skip for Rewind database - it doesn't have segment_tag table
+        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId, config.source != .rewind {
             whereClauses.append("""
                 NOT EXISTS (
                     SELECT 1 FROM segment_tag st_hidden
@@ -1858,7 +1859,8 @@ public actor DataAdapter {
         }
 
         // Bind hidden tag ID for NOT EXISTS clause (if applicable)
-        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+        // Skip for Rewind database - it doesn't have segment_tag table
+        if filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId, config.source != .rewind {
             sqlite3_bind_int64(statement, Int32(currentBindIndex), hiddenTagId)
             currentBindIndex += 1
         }
@@ -3203,6 +3205,126 @@ public actor DataAdapter {
         guard rewindConnection != nil else { return nil }
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
         return "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault"
+    }
+
+    // MARK: - Calendar Hours Query
+
+    /// Get distinct hours for a specific date that have frames
+    /// Queries the appropriate database based on cutoff date
+    public func getDistinctHoursForDate(_ date: Date) throws -> [Date] {
+        let calendar = Calendar.current
+        let startOfDay = calendar.startOfDay(for: date)
+        let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
+
+        // Determine which database to query based on cutoff
+        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, date < cutoff {
+            // Query Rewind (TEXT timestamps)
+            return try queryDistinctHoursRewind(
+                connection: rewind,
+                config: config,
+                startOfDay: startOfDay,
+                endOfDay: endOfDay
+            )
+        } else {
+            // Query Retrace (INTEGER milliseconds)
+            return try queryDistinctHoursRetrace(
+                connection: retraceConnection,
+                startOfDay: startOfDay,
+                endOfDay: endOfDay
+            )
+        }
+    }
+
+    /// Query distinct hours from Retrace database (INTEGER timestamps in milliseconds)
+    private func queryDistinctHoursRetrace(
+        connection: DatabaseConnection,
+        startOfDay: Date,
+        endOfDay: Date
+    ) throws -> [Date] {
+        let startMs = Int64(startOfDay.timeIntervalSince1970 * 1000)
+        let endMs = Int64(endOfDay.timeIntervalSince1970 * 1000)
+
+        let sql = """
+            SELECT MIN(createdAt) as hourTimestamp
+            FROM frame
+            WHERE createdAt >= ? AND createdAt < ?
+            GROUP BY strftime('%H', createdAt / 1000, 'unixepoch', 'localtime')
+            ORDER BY hourTimestamp ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, startMs)
+        sqlite3_bind_int64(statement, 2, endMs)
+
+        let calendar = Calendar.current
+        var hours: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let timestampMs = sqlite3_column_int64(statement, 0)
+            let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
+            // Normalize to start of hour
+            var components = calendar.dateComponents([.year, .month, .day, .hour], from: timestamp)
+            components.minute = 0
+            components.second = 0
+            if let hourDate = calendar.date(from: components) {
+                hours.append(hourDate)
+            }
+        }
+
+        return hours
+    }
+
+    /// Query distinct hours from Rewind database (TEXT ISO8601 timestamps)
+    private func queryDistinctHoursRewind(
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        startOfDay: Date,
+        endOfDay: Date
+    ) throws -> [Date] {
+        guard let formatter = config.dateFormatter else {
+            return []
+        }
+
+        let startISO = formatter.string(from: startOfDay)
+        let endISO = formatter.string(from: endOfDay)
+
+        // Rewind stores TEXT timestamps like '2025-12-18T22:00:02.655'
+        // Extract hour using substr (faster than strftime on TEXT)
+        let sql = """
+            SELECT MIN(createdAt) as hourTimestamp
+            FROM frame
+            WHERE createdAt >= ? AND createdAt < ?
+            GROUP BY substr(createdAt, 12, 2)
+            ORDER BY hourTimestamp ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_text(statement, 1, (startISO as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 2, (endISO as NSString).utf8String, -1, nil)
+
+        let calendar = Calendar.current
+        var hours: [Date] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let cString = sqlite3_column_text(statement, 0) else { continue }
+            let isoString = String(cString: cString)
+            guard let timestamp = formatter.date(from: isoString) else { continue }
+            // Normalize to start of hour
+            var components = calendar.dateComponents([.year, .month, .day, .hour], from: timestamp)
+            components.minute = 0
+            components.second = 0
+            if let hourDate = calendar.date(from: components) {
+                hours.append(hourDate)
+            }
+        }
+
+        return hours
     }
 }
 

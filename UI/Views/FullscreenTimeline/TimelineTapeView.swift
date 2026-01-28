@@ -69,9 +69,13 @@ public struct TimelineTapeView: View {
             let tapeOffset = max(minOffset, min(maxOffset, unclampedTapeOffset))
 
             ZStack(alignment: .leading) {
-                // Main tape blocks
+                // Main tape blocks with gap indicators
                 HStack(spacing: blockSpacing) {
                     ForEach(blocks) { block in
+                        // Show gap indicator before block if there's a significant time gap
+                        if block.formattedGapBefore != nil {
+                            gapIndicatorView(block: block)
+                        }
                         appBlockView(block: block)
                     }
                 }
@@ -103,6 +107,42 @@ public struct TimelineTapeView: View {
                 .fill(Color.red)
                 .frame(width: 3, height: tapeHeight + 16)
                 .offset(x: xOffset, y: -8)
+        }
+        .allowsHitTesting(false)
+    }
+
+    // MARK: - Gap Indicator View
+
+    /// Fixed-width indicator showing time gap between blocks
+    private func gapIndicatorView(block: AppBlock) -> some View {
+        let gapWidth: CGFloat = 100 * TimelineScaleFactor.current
+
+        return ZStack {
+            // Hatched background
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.white.opacity(0.05))
+                .frame(width: gapWidth, height: tapeHeight)
+                .overlay(
+                    GapHatchPattern()
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+
+            // Gap duration text with background
+            if let gapText = block.formattedGapBefore {
+                Text(gapText)
+                    .font(.system(size: 10 * TimelineScaleFactor.current, weight: .medium))
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.horizontal, 6 * TimelineScaleFactor.current)
+                    .padding(.vertical, 2 * TimelineScaleFactor.current)
+                    .background(
+                        Capsule()
+                            .fill(Color(white: 0.2))
+                    )
+            }
         }
         .allowsHitTesting(false)
     }
@@ -157,35 +197,51 @@ public struct TimelineTapeView: View {
 
     // MARK: - Helper Functions
 
+    /// Fixed width of gap indicators (doubled from original)
+    private var gapIndicatorWidth: CGFloat { 100 * TimelineScaleFactor.current }
+
     /// Calculate the total width of the timeline tape
     private func calculateTotalTapeWidth(blocks: [AppBlock]) -> CGFloat {
         guard !blocks.isEmpty else { return 0 }
 
         // Sum all block widths plus spacing between blocks
         let blocksWidth = blocks.reduce(0) { $0 + $1.width(pixelsPerFrame: pixelsPerFrame) }
-        let totalSpacing = CGFloat(blocks.count - 1) * blockSpacing
 
-        return blocksWidth + totalSpacing
+        // Count gap indicators (blocks with formattedGapBefore)
+        let gapCount = blocks.filter { $0.formattedGapBefore != nil }.count
+        let totalGapWidth = CGFloat(gapCount) * (gapIndicatorWidth + blockSpacing)
+
+        // Total spacing: between each item (blocks + gaps)
+        let totalItems = blocks.count + gapCount
+        let totalSpacing = CGFloat(totalItems - 1) * blockSpacing
+
+        return blocksWidth + totalGapWidth + totalSpacing - CGFloat(gapCount) * blockSpacing // Adjust for double-counted spacing
     }
 
     /// Calculate the horizontal offset for a given frame index
     private func offsetForFrame(_ frameIndex: Int, in blocks: [AppBlock]) -> CGFloat {
         var offset: CGFloat = 0
-        var blockCount = 0
+        var spacingCount = 0
 
         for block in blocks {
+            // Add gap indicator width if this block has one
+            if block.formattedGapBefore != nil {
+                offset += gapIndicatorWidth + blockSpacing
+                spacingCount += 1
+            }
+
             if frameIndex >= block.startIndex && frameIndex <= block.endIndex {
                 // Frame is in this block - calculate exact pixel position within block
                 let framePositionInBlock = frameIndex - block.startIndex
-                // Add spacing for all blocks before this one
-                let spacingBeforeBlock = CGFloat(blockCount) * blockSpacing
+                // Add spacing for all blocks/gaps before this one
+                let spacingBeforeBlock = CGFloat(spacingCount) * blockSpacing
                 // Add exact pixel position within this block (centered on the frame's pixel)
                 offset += CGFloat(framePositionInBlock) * pixelsPerFrame + pixelsPerFrame / 2 + spacingBeforeBlock
                 break
             } else {
                 // Add full block width (spacing handled separately)
                 offset += block.width(pixelsPerFrame: pixelsPerFrame)
-                blockCount += 1
+                spacingCount += 1
             }
         }
 
@@ -1909,6 +1965,32 @@ struct HiddenSegmentOverlay: View {
                 let color = Color.white.opacity(0.3)
 
                 // Draw diagonal stripes from bottom-left to top-right
+                var x: CGFloat = -size.height
+                while x < size.width + size.height {
+                    var path = Path()
+                    path.move(to: CGPoint(x: x, y: size.height))
+                    path.addLine(to: CGPoint(x: x + size.height, y: 0))
+                    context.stroke(path, with: .color(color), lineWidth: stripeWidth)
+                    x += spacing + stripeWidth
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+// MARK: - Gap Hatch Pattern
+
+/// Hatched pattern for gap indicators - subtle diagonal stripes
+struct GapHatchPattern: View {
+    var body: some View {
+        GeometryReader { geometry in
+            Canvas { context, size in
+                let stripeWidth: CGFloat = 1
+                let spacing: CGFloat = 5
+                let color = Color.white.opacity(0.1)
+
+                // Draw diagonal stripes
                 var x: CGFloat = -size.height
                 while x < size.width + size.height {
                     var path = Path()

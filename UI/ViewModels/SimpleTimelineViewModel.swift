@@ -68,9 +68,41 @@ public struct AppBlock: Identifiable {
     public let endIndex: Int
     public let frameCount: Int
 
+    /// Time gap in seconds BEFORE this block (if > 2 minutes, a gap indicator should be shown)
+    public let gapBeforeSeconds: TimeInterval?
+
     /// Calculate width based on current pixels per frame
     public func width(pixelsPerFrame: CGFloat) -> CGFloat {
         CGFloat(frameCount) * pixelsPerFrame
+    }
+
+    /// Format the gap duration for display (e.g., "5m", "2h 15m", "3d 5h")
+    public var formattedGapBefore: String? {
+        guard let gap = gapBeforeSeconds, gap >= 120 else { return nil }
+
+        let totalMinutes = Int(gap) / 60
+        let totalHours = totalMinutes / 60
+        let days = totalHours / 24
+        let remainingHours = totalHours % 24
+        let remainingMinutes = totalMinutes % 60
+
+        if days > 0 {
+            // Show days and hours (skip minutes for large gaps)
+            if remainingHours > 0 {
+                return "\(days)d \(remainingHours)h"
+            } else {
+                return "\(days)d"
+            }
+        } else if totalHours > 0 {
+            // Show hours and minutes
+            if remainingMinutes > 0 {
+                return "\(totalHours)h \(remainingMinutes)m"
+            } else {
+                return "\(totalHours)h"
+            }
+        } else {
+            return "\(totalMinutes)m"
+        }
     }
 }
 
@@ -1216,31 +1248,45 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Group frames into app blocks (parameterized version for filtered frames)
+    /// Splits on app change OR time gaps ≥2 min
     private func groupFramesIntoBlocks(from frameList: [TimelineFrame]) -> [AppBlock] {
         guard !frameList.isEmpty else { return [] }
 
         var blocks: [AppBlock] = []
-        var currentBundleID: String? = nil
+        var currentBundleID: String? = frameList[0].frame.metadata.appBundleID
         var blockStartIndex = 0
+        var gapBeforeCurrentBlock: TimeInterval? = nil
 
         for (index, timelineFrame) in frameList.enumerated() {
             let frameBundleID = timelineFrame.frame.metadata.appBundleID
 
-            if frameBundleID != currentBundleID {
-                // End previous block if exists
-                if index > 0 {
-                    blocks.append(AppBlock(
-                        bundleID: currentBundleID,
-                        appName: frameList[blockStartIndex].frame.metadata.appName,
-                        startIndex: blockStartIndex,
-                        endIndex: index - 1,
-                        frameCount: index - blockStartIndex
-                    ))
-                }
+            // Check for time gap between this frame and the previous one
+            var gapDuration: TimeInterval = 0
+            if index > 0 {
+                let previousTimestamp = frameList[index - 1].frame.timestamp
+                let currentTimestamp = timelineFrame.frame.timestamp
+                gapDuration = currentTimestamp.timeIntervalSince(previousTimestamp)
+            }
+
+            let hasSignificantGap = gapDuration >= Self.minimumGapThreshold
+            let appChanged = frameBundleID != currentBundleID
+
+            // Start a new block if: app changed OR significant time gap
+            if (appChanged || hasSignificantGap) && index > 0 {
+                // Close previous block
+                blocks.append(AppBlock(
+                    bundleID: currentBundleID,
+                    appName: frameList[blockStartIndex].frame.metadata.appName,
+                    startIndex: blockStartIndex,
+                    endIndex: index - 1,
+                    frameCount: index - blockStartIndex,
+                    gapBeforeSeconds: gapBeforeCurrentBlock
+                ))
 
                 // Start new block
                 currentBundleID = frameBundleID
                 blockStartIndex = index
+                gapBeforeCurrentBlock = hasSignificantGap ? gapDuration : nil
             }
         }
 
@@ -1250,7 +1296,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             appName: frameList[blockStartIndex].frame.metadata.appName,
             startIndex: blockStartIndex,
             endIndex: frameList.count - 1,
-            frameCount: frameList.count - blockStartIndex
+            frameCount: frameList.count - blockStartIndex,
+            gapBeforeSeconds: gapBeforeCurrentBlock
         ))
 
         return blocks
@@ -3950,32 +3997,48 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Private Helpers
 
-    /// Group consecutive frames by app bundle ID into blocks
+    /// Minimum gap in seconds to show a gap indicator (2 minutes)
+    private static let minimumGapThreshold: TimeInterval = 120
+
+    /// Group consecutive frames into blocks, splitting on app change OR time gaps ≥2 min
     private func groupFramesIntoBlocks() -> [AppBlock] {
         guard !frames.isEmpty else { return [] }
 
         var blocks: [AppBlock] = []
-        var currentBundleID: String? = nil
+        var currentBundleID: String? = frames[0].frame.metadata.appBundleID
         var blockStartIndex = 0
+        var gapBeforeCurrentBlock: TimeInterval? = nil
 
         for (index, timelineFrame) in frames.enumerated() {
             let frameBundleID = timelineFrame.frame.metadata.appBundleID
 
-            if frameBundleID != currentBundleID {
-                // End previous block if exists
-                if index > 0 {
-                    blocks.append(AppBlock(
-                        bundleID: currentBundleID,
-                        appName: frames[blockStartIndex].frame.metadata.appName,
-                        startIndex: blockStartIndex,
-                        endIndex: index - 1,
-                        frameCount: index - blockStartIndex
-                    ))
-                }
+            // Check for time gap between this frame and the previous one
+            var gapDuration: TimeInterval = 0
+            if index > 0 {
+                let previousTimestamp = frames[index - 1].frame.timestamp
+                let currentTimestamp = timelineFrame.frame.timestamp
+                gapDuration = currentTimestamp.timeIntervalSince(previousTimestamp)
+            }
+
+            let hasSignificantGap = gapDuration >= Self.minimumGapThreshold
+            let appChanged = frameBundleID != currentBundleID
+
+            // Start a new block if: app changed OR significant time gap
+            if (appChanged || hasSignificantGap) && index > 0 {
+                // Close previous block
+                blocks.append(AppBlock(
+                    bundleID: currentBundleID,
+                    appName: frames[blockStartIndex].frame.metadata.appName,
+                    startIndex: blockStartIndex,
+                    endIndex: index - 1,
+                    frameCount: index - blockStartIndex,
+                    gapBeforeSeconds: gapBeforeCurrentBlock
+                ))
 
                 // Start new block
                 currentBundleID = frameBundleID
                 blockStartIndex = index
+                gapBeforeCurrentBlock = hasSignificantGap ? gapDuration : nil
             }
         }
 
@@ -3985,7 +4048,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             appName: frames[blockStartIndex].frame.metadata.appName,
             startIndex: blockStartIndex,
             endIndex: frames.count - 1,
-            frameCount: frames.count - blockStartIndex
+            frameCount: frames.count - blockStartIndex,
+            gapBeforeSeconds: gapBeforeCurrentBlock
         ))
 
         return blocks
