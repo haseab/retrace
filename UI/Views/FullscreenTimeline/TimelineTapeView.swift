@@ -68,6 +68,14 @@ public struct TimelineTapeView: View {
 
             let tapeOffset = max(minOffset, min(maxOffset, unclampedTapeOffset))
 
+            // Calculate visible frame range for culling (only render visible frames)
+            let visibleLeftX = -tapeOffset
+            let visibleRightX = geometry.size.width - tapeOffset
+            // Add buffer for smooth scrolling
+            let buffer = geometry.size.width
+            let cullingLeftX = visibleLeftX - buffer
+            let cullingRightX = visibleRightX + buffer
+
             ZStack(alignment: .leading) {
                 // Main tape blocks with gap indicators
                 HStack(spacing: blockSpacing) {
@@ -76,7 +84,7 @@ public struct TimelineTapeView: View {
                         if block.formattedGapBefore != nil {
                             gapIndicatorView(block: block)
                         }
-                        appBlockView(block: block)
+                        appBlockView(block: block, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX, blocks: blocks)
                     }
                 }
 
@@ -86,8 +94,7 @@ public struct TimelineTapeView: View {
                 }
             }
             .offset(x: tapeOffset)
-            // Linear animation - constant speed without acceleration/deceleration for smooth scrubbing
-            // .animation(.linear(duration: 0.06), value: viewModel.currentIndex)
+            // .animation(.linear(duration: 0.04), value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }
@@ -149,11 +156,29 @@ public struct TimelineTapeView: View {
 
     // MARK: - App Block View
 
-    private func appBlockView(block: AppBlock) -> some View {
+    private func appBlockView(block: AppBlock, cullingLeftX: CGFloat, cullingRightX: CGFloat, blocks: [AppBlock]) -> some View {
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
         let isSelectedBlock = viewModel.selectedFrameIndex.map { $0 >= block.startIndex && $0 <= block.endIndex } ?? false
         let color = blockColor(for: block)
         let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
+
+        // Calculate this block's position in tape-space for frame culling
+        let blockLeftX = offsetForFrame(block.startIndex, in: blocks) - pixelsPerFrame / 2
+        let blockRightX = blockLeftX + blockWidth
+
+        // Calculate visible frame range within this block
+        let relativeLeft = max(0, cullingLeftX - blockLeftX)
+        let relativeRight = cullingRightX - blockLeftX
+
+        let firstVisibleFrame = block.startIndex + max(0, Int(floor(relativeLeft / pixelsPerFrame)))
+        let lastVisibleFrame = block.startIndex + min(block.frameCount - 1, Int(ceil(relativeRight / pixelsPerFrame)))
+
+        // Clamp to block bounds
+        let renderStart = max(block.startIndex, firstVisibleFrame)
+        let renderEnd = min(block.endIndex, lastVisibleFrame)
+
+        // Check if block is completely outside visible range
+        let blockVisible = blockRightX >= cullingLeftX && blockLeftX <= cullingRightX
 
         return ZStack {
             // Background block
@@ -166,13 +191,28 @@ public struct TimelineTapeView: View {
                 )
                 .opacity(isCurrentBlock || isSelectedBlock ? 1.0 : 0.7)
 
-            // Individual frame segments (clickable)
-            HStack(spacing: 0) {
-                ForEach(block.startIndex...block.endIndex, id: \.self) { frameIndex in
-                    frameSegment(at: frameIndex, in: block)
+            // Individual frame segments (clickable) - only render visible frames
+            if blockVisible && renderStart <= renderEnd {
+                HStack(spacing: 0) {
+                    // Spacer for frames before visible range
+                    if renderStart > block.startIndex {
+                        Spacer()
+                            .frame(width: CGFloat(renderStart - block.startIndex) * pixelsPerFrame)
+                    }
+
+                    // Only render visible frames
+                    ForEach(renderStart...renderEnd, id: \.self) { frameIndex in
+                        frameSegment(at: frameIndex, in: block)
+                    }
+
+                    // Spacer for frames after visible range
+                    if renderEnd < block.endIndex {
+                        Spacer()
+                            .frame(width: CGFloat(block.endIndex - renderEnd) * pixelsPerFrame)
+                    }
                 }
+                .frame(width: blockWidth, height: tapeHeight)
             }
-            .frame(width: blockWidth, height: tapeHeight)
 
             // App icon (only show if block is wide enough)
             if blockWidth > iconDisplayThreshold, let bundleID = block.bundleID {
@@ -397,7 +437,12 @@ struct FrameSegmentView: View {
                 }
             }
             .overlay(
-                FrameRightClickHandler(viewModel: viewModel, frameIndex: frameIndex)
+                Group {
+                    // Only create NSView for frames near current index to avoid 500 NSView instances
+                    if abs(frameIndex - viewModel.currentIndex) < 40 {
+                        FrameRightClickHandler(viewModel: viewModel, frameIndex: frameIndex)
+                    }
+                }
             )
     }
 }
