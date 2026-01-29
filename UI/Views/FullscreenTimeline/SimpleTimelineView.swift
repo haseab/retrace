@@ -3656,11 +3656,10 @@ struct FilterPanel: View {
                 // Left column: Apps and Visibility
                 VStack(alignment: .leading, spacing: 12) {
                     // Apps
-                    CompactFilterDropdown(
+                    CompactAppsFilterDropdown(
                         label: "APPS",
-                        value: appsLabel,
-                        icon: "square.grid.2x2",
-                        isActive: viewModel.pendingFilterCriteria.selectedApps != nil && !viewModel.pendingFilterCriteria.selectedApps!.isEmpty
+                        selectedApps: viewModel.pendingFilterCriteria.selectedApps,
+                        isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude
                     ) { frame in
                         withAnimation(.easeOut(duration: 0.15)) {
                             if viewModel.activeFilterDropdown == .apps {
@@ -3979,11 +3978,11 @@ struct CompactFilterDropdown: View {
                     HStack(spacing: 7) {
                         Image(systemName: icon)
                             .font(.system(size: 11))
-                            .foregroundColor(isActive ? RetraceMenuStyle.actionBlue : .white.opacity(0.5))
+                            .foregroundColor(isActive ? .white : .white.opacity(0.5))
 
                         Text(value)
                             .font(.system(size: 12))
-                            .foregroundColor(.white.opacity(0.9))
+                            .foregroundColor(isActive ? .white : .white.opacity(0.9))
                             .lineLimit(1)
 
                         Spacer(minLength: 2)
@@ -3996,11 +3995,11 @@ struct CompactFilterDropdown: View {
                     .padding(.vertical, 9)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08))
+                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(isActive ? RetraceMenuStyle.actionBlue.opacity(0.4) : Color.white.opacity(0.1), lineWidth: 1)
+                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
                     )
                 }
                 .buttonStyle(.plain)
@@ -4012,6 +4011,136 @@ struct CompactFilterDropdown: View {
             }
             .frame(height: 38)
         }
+    }
+}
+
+/// Compact apps filter dropdown with app icons (matches search dialog behavior)
+struct CompactAppsFilterDropdown: View {
+    let label: String
+    let selectedApps: Set<String>?
+    let isExcludeMode: Bool
+    let onTap: (CGRect) -> Void
+
+    @State private var isHovered = false
+
+    private let maxVisibleIcons = 5
+    private let iconSize: CGFloat = 18
+
+    private var sortedApps: [String] {
+        guard let apps = selectedApps else { return [] }
+        return apps.sorted()
+    }
+
+    private var isActive: Bool {
+        selectedApps != nil && !selectedApps!.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.4))
+                .tracking(0.5)
+
+            GeometryReader { geo in
+                let localFrame = geo.frame(in: .named("timelineContent"))
+                Button(action: { onTap(localFrame) }) {
+                    HStack(spacing: 7) {
+                        // Show exclude indicator
+                        if isExcludeMode && isActive {
+                            Image(systemName: "minus.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundColor(.orange)
+                        }
+
+                        if sortedApps.count == 1 {
+                            // Single app: show icon + name
+                            let bundleID = sortedApps[0]
+                            appIcon(for: bundleID)
+                                .frame(width: iconSize, height: iconSize)
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+
+                            Text(appName(for: bundleID))
+                                .font(.system(size: 12))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                                .strikethrough(isExcludeMode, color: .orange)
+                        } else if sortedApps.count > 1 {
+                            // Multiple apps: show icons stacked
+                            HStack(spacing: -4) {
+                                ForEach(Array(sortedApps.prefix(maxVisibleIcons)), id: \.self) { bundleID in
+                                    appIcon(for: bundleID)
+                                        .frame(width: iconSize, height: iconSize)
+                                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                                        .opacity(isExcludeMode ? 0.6 : 1.0)
+                                }
+                            }
+
+                            // Show "+X" if more than maxVisibleIcons
+                            if sortedApps.count > maxVisibleIcons {
+                                Text("+\(sortedApps.count - maxVisibleIcons)")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                        } else {
+                            // Default state - no apps selected
+                            Image(systemName: "square.grid.2x2")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.5))
+
+                            Text("All Apps")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.9))
+                        }
+
+                        Spacer(minLength: 2)
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.4))
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 9)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.1)) {
+                        isHovered = hovering
+                    }
+                }
+            }
+            .frame(height: 38)
+        }
+    }
+
+    @ViewBuilder
+    private func appIcon(for bundleID: String) -> some View {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(systemName: "app.fill")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundColor(.white.opacity(0.6))
+        }
+    }
+
+    private func appName(for bundleID: String) -> String {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: appURL.path)
+        }
+        // Fallback: extract last component of bundle ID
+        return bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 

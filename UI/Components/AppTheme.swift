@@ -1530,6 +1530,10 @@ public struct RetraceMenuStyle {
         Color.retraceAccent
     }
 
+    /// UI blue - desaturated, calmer blue for focus rings and subtle accents
+    /// Same hue as brand blue but lower saturation for less visual noise
+    public static let uiBlue = Color(red: 0.4, green: 0.55, blue: 0.7)
+
     // MARK: - Search Field Styling (within menus)
 
     /// Search field background

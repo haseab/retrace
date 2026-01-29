@@ -32,13 +32,13 @@ private struct KeyboardNavigationModifier: ViewModifier {
                 eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                     switch event.keyCode {
                     case 126: // Up arrow
-                        onUpArrow()
+                        self.onUpArrow()
                         return nil // Consume the event
                     case 125: // Down arrow
-                        onDownArrow()
+                        self.onDownArrow()
                         return nil // Consume the event
                     case 36: // Return key
-                        onReturn()
+                        self.onReturn()
                         return nil // Consume the event
                     default:
                         return event // Pass through other events
@@ -1194,7 +1194,7 @@ public struct DateRangeFilterPopover: View {
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(RetraceMenuStyle.actionBlue)
+                    .foregroundColor(Color.white.opacity(0.6))
                 }
             }
             .padding(.horizontal, 14)
@@ -1286,7 +1286,7 @@ public struct DateRangeFilterPopover: View {
             HStack(spacing: 8) {
                 Image(systemName: "calendar")
                     .font(.system(size: 12))
-                    .foregroundColor(isEditing ? RetraceMenuStyle.actionBlue : .white.opacity(0.5))
+                    .foregroundColor(isEditing ? .white.opacity(0.9) : .white.opacity(0.5))
                     .frame(width: 18)
 
                 Text(label)
@@ -1298,17 +1298,17 @@ public struct DateRangeFilterPopover: View {
 
                 Text(formatDate(date))
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isEditing ? RetraceMenuStyle.actionBlue : .white)
+                    .foregroundColor(.white)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isEditing ? RetraceMenuStyle.actionBlue.opacity(0.1) : Color.white.opacity(0.05))
+                    .fill(isEditing ? Color.white.opacity(0.12) : Color.white.opacity(0.05))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(isEditing ? RetraceMenuStyle.actionBlue.opacity(0.5) : Color.clear, lineWidth: 1)
+                    .stroke(isEditing ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -1402,7 +1402,7 @@ public struct DateRangeFilterPopover: View {
                                         .fill(RetraceMenuStyle.actionBlue)
                                 } else if isToday {
                                     Circle()
-                                        .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1)
+                                        .stroke(RetraceMenuStyle.uiBlue, lineWidth: 1)
                                 }
                             }
                         )

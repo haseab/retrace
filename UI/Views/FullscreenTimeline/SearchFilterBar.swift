@@ -446,7 +446,7 @@ private struct DateFilterPopover: View {
                     }
                     .buttonStyle(.plain)
                     .font(.retraceCaption2Medium)
-                    .foregroundColor(.accentColor)
+                    .foregroundColor(.white.opacity(0.6))
                 }
             }
             .padding(.horizontal, 16)
