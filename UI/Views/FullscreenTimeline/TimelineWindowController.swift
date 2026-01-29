@@ -668,6 +668,20 @@ public class TimelineWindowController: NSObject {
                     }
                 }
 
+                // Cmd+A to select all (handle before system can intercept)
+                if event.keyCode == 0 && modifiers == [.command] {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
+                // Cmd+C to copy (handle before system can intercept)
+                if event.keyCode == 8 && modifiers == [.command] {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Consume the event
+                    }
+                }
+
                 // For other keys, let text field handle them if it's active
                 if isTextFieldActive {
                     return event // Let the text field handle it
