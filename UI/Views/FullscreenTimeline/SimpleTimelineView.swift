@@ -167,6 +167,20 @@ public struct SimpleTimelineView: View {
                     .animation(.easeInOut(duration: 0.2), value: viewModel.isFrameZoomed)
                 }
 
+                // Peek mode banner (top center, below reset zoom if both visible)
+                if viewModel.isPeeking {
+                    VStack {
+                        PeekModeBanner(viewModel: viewModel)
+                            .padding(.top, viewModel.isFrameZoomed ? 60 : 12) // Below reset zoom button if visible
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.spacingL)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isPeeking)
+                }
+
                 // Close button (top-right) - always visible
                 VStack {
                     HStack {
@@ -574,6 +588,90 @@ struct ResetZoomButton: View {
     }
 }
 
+// MARK: - Peek Mode Banner
+
+/// Banner shown when viewing full timeline context (peek mode)
+/// Indicates filters are temporarily suspended and provides quick return action
+struct PeekModeBanner: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            // Eye icon to indicate "viewing"
+            Image(systemName: "eye.fill")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            // Message
+            Text("Viewing full timeline")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            // Separator
+            Rectangle()
+                .fill(Color.white.opacity(0.3))
+                .frame(width: 1, height: 16 * scale)
+
+            // Return button
+            Button(action: {
+                viewModel.exitPeek()
+            }) {
+                HStack(spacing: 6 * scale) {
+                    Image(systemName: "arrow.uturn.backward")
+                        .font(.system(size: 13 * scale, weight: .semibold))
+                    Text("Return to filtered view")
+                        .font(.system(size: 14 * scale, weight: .medium))
+                }
+                .foregroundColor(isHovering ? .white : .white.opacity(0.85))
+                .padding(.horizontal, 12 * scale)
+                .padding(.vertical, 6 * scale)
+                .background(
+                    Capsule()
+                        .fill(Color.white.opacity(isHovering ? 0.25 : 0.15))
+                )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+
+            // Keyboard hint
+            Text("Esc")
+                .font(.system(size: 11 * scale, weight: .medium, design: .monospaced))
+                .foregroundColor(.white.opacity(0.5))
+                .padding(.horizontal, 6 * scale)
+                .padding(.vertical, 3 * scale)
+                .background(
+                    RoundedRectangle(cornerRadius: 4 * scale)
+                        .fill(Color.white.opacity(0.1))
+                )
+        }
+        .padding(.horizontal, 16 * scale)
+        .padding(.vertical, 10 * scale)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.6))
+                .background(
+                    Capsule()
+                        .fill(.ultraThinMaterial)
+                )
+                .clipShape(Capsule())
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+        )
+    }
+}
+
 // MARK: - Simple Video Frame View
 
 /// Double-buffered video frame view using two AVPlayers
@@ -692,6 +790,10 @@ class DoubleBufferedVideoView: NSView {
     private var observerA: NSKeyValueObservation?
     private var observerB: NSKeyValueObservation?
 
+    /// Generation counter to invalidate stale async callbacks
+    /// Incremented each time a new load is initiated
+    private var loadGeneration: UInt64 = 0
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setupPlayers()
@@ -765,9 +867,15 @@ class DoubleBufferedVideoView: NSView {
 
     /// Load a video into the buffer player and swap when ready
     func loadVideoIntoBuffer(url: URL, seekTime: CMTime, frameIndex: Int) {
+        // Increment generation to invalidate any pending async callbacks
+        loadGeneration &+= 1
+        let currentGeneration = loadGeneration
+
         let bufferPlayer = isPlayerAActive ? playerB : playerA
-        let bufferPlayerView = isPlayerAActive ? playerViewB : playerViewA
         let bufferObserver = isPlayerAActive ? observerB : observerA
+
+        // Capture which player should become active after this load completes
+        let expectedActiveAfterSwap = !isPlayerAActive
 
         // Clear previous observer
         bufferObserver?.invalidate()
@@ -777,11 +885,19 @@ class DoubleBufferedVideoView: NSView {
 
         bufferPlayer?.replaceCurrentItem(with: playerItem)
 
+        Log.debug("[VideoView] Starting load gen=\(currentGeneration) for frame \(frameIndex), buffer=\(isPlayerAActive ? "B" : "A")", category: .ui)
+
         // Observe when buffer player is ready
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
             guard let self = self else { return }
 
-            Log.debug("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex)", category: .ui)
+            // Check if this load is still valid (no newer load has started)
+            guard currentGeneration == self.loadGeneration else {
+                Log.debug("[VideoView] Ignoring stale status callback gen=\(currentGeneration), current=\(self.loadGeneration)", category: .ui)
+                return
+            }
+
+            Log.debug("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex) gen=\(currentGeneration)", category: .ui)
 
             if item.status == .failed {
                 Log.error("[VideoView] Buffer player FAILED: \(item.error?.localizedDescription ?? "unknown")", category: .ui)
@@ -794,9 +910,28 @@ class DoubleBufferedVideoView: NSView {
             bufferPlayer?.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 guard let self = self, finished else { return }
 
-                Log.debug("[VideoView] Buffer ready, swapping players for frame \(frameIndex)", category: .ui)
+                // Re-check generation after async seek completes
+                guard currentGeneration == self.loadGeneration else {
+                    Log.debug("[VideoView] Ignoring stale seek callback gen=\(currentGeneration), current=\(self.loadGeneration)", category: .ui)
+                    return
+                }
+
+                Log.debug("[VideoView] Buffer ready, swapping players for frame \(frameIndex) gen=\(currentGeneration)", category: .ui)
 
                 DispatchQueue.main.async {
+                    // Final generation check on main thread before swap
+                    guard currentGeneration == self.loadGeneration else {
+                        Log.debug("[VideoView] Ignoring stale swap gen=\(currentGeneration), current=\(self.loadGeneration)", category: .ui)
+                        return
+                    }
+
+                    // Verify we're swapping to the expected player
+                    // If state drifted (shouldn't happen with generation check, but safety first)
+                    guard self.isPlayerAActive != expectedActiveAfterSwap else {
+                        Log.debug("[VideoView] Player already in expected state, skipping swap", category: .ui)
+                        return
+                    }
+
                     bufferPlayer?.pause()
                     self.swapPlayers()
                 }
@@ -3486,20 +3621,21 @@ struct FilterPanel: View {
 
                 HStack(spacing: 8) {
                     let sources = viewModel.pendingFilterCriteria.selectedSources
+                    // Default to only Retrace selected (nil means only native)
                     let retraceSelected = sources == nil || sources!.contains(.native)
-                    let rewindSelected = sources == nil || sources!.contains(.rewind)
+                    let rewindSelected = sources != nil && sources!.contains(.rewind)
 
-                    FilterToggleChipCompact(
+                    SourceFilterChip(
                         label: "Retrace",
-                        icon: "desktopcomputer",
+                        isRetrace: true,
                         isSelected: retraceSelected
                     ) {
                         viewModel.toggleSourceFilter(.native)
                     }
 
-                    FilterToggleChipCompact(
+                    SourceFilterChip(
                         label: "Rewind",
-                        icon: "arrow.counterclockwise",
+                        isRetrace: false,
                         isSelected: rewindSelected
                     ) {
                         viewModel.toggleSourceFilter(.rewind)
@@ -3767,6 +3903,9 @@ struct AdvancedFiltersSection: View {
                                     lineWidth: 1
                                 )
                         )
+                        .onSubmit {
+                            viewModel.applyFilters()
+                        }
                     }
 
                     // Browser URL filter
@@ -3797,6 +3936,9 @@ struct AdvancedFiltersSection: View {
                                     lineWidth: 1
                                 )
                         )
+                        .onSubmit {
+                            viewModel.applyFilters()
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -3906,6 +4048,65 @@ struct FilterToggleChipCompact: View {
         .onHover { hovering in
             isHovered = hovering
         }
+    }
+}
+
+/// Source filter chip with app logo (Retrace or Rewind)
+struct SourceFilterChip: View {
+    let label: String
+    let isRetrace: Bool
+    let isSelected: Bool
+    let action: () -> Void
+
+    private var retraceIcon: NSImage {
+        // Load Retrace app icon from /Applications
+        NSWorkspace.shared.icon(forFile: "/Applications/Retrace.app")
+    }
+
+    private var rewindIcon: NSImage? {
+        // Load Rewind app icon from /Applications, fallback to nil (will use system icon)
+        let rewindPath = "/Applications/Rewind.app"
+        if FileManager.default.fileExists(atPath: rewindPath) {
+            return NSWorkspace.shared.icon(forFile: rewindPath)
+        }
+        return nil
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                if isRetrace {
+                    // Retrace app icon from /Applications
+                    Image(nsImage: retraceIcon)
+                        .resizable()
+                        .frame(width: 16, height: 16)
+                } else {
+                    // Rewind app icon - load from /Applications
+                    if let icon = rewindIcon {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 11))
+                    }
+                }
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(isSelected ? .white : .white.opacity(0.5))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 

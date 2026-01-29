@@ -225,8 +225,10 @@ public struct TimelineTapeView: View {
 
         for block in blocks {
             // Add gap indicator width if this block has one
+            // Note: Don't add blockSpacing here - spacingBeforeBlock handles all spacing
+            // The HStack applies blockSpacing between [previousBlock, gapIndicator, currentBlock]
             if block.formattedGapBefore != nil {
-                offset += gapIndicatorWidth + blockSpacing
+                offset += gapIndicatorWidth
                 spacingCount += 1
             }
 
@@ -310,13 +312,16 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
-                // Right side controls (filter + zoom + more options)
+                // Right side controls (filter + peek + zoom + more options)
+                // Fixed width to prevent layout shift when peek button appears/disappears
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
-                    FilterButton(viewModel: viewModel)
+                    FilterAndPeekGroup(viewModel: viewModel)
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
-                .position(x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset, y: TimelineScaleFactor.controlsYOffset)
+                .padding(4)
+                .frame(width: (TimelineScaleFactor.controlButtonSize * 4) + (TimelineScaleFactor.controlSpacing * 3) + 8, alignment: .trailing)
+                .position(x: geometry.size.width - TimelineScaleFactor.rightControlsXOffset - (TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing) / 2, y: TimelineScaleFactor.controlsYOffset)
 
                 // Playhead vertical line (fixed at center)
                 UnevenRoundedRectangle(topLeadingRadius: 3, bottomLeadingRadius: 0, bottomTrailingRadius: 0, topTrailingRadius: 3)
@@ -465,7 +470,7 @@ struct GoToNowButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .instantTooltip("Go to Now", isVisible: $isHovering)
+        .instantTooltip("Go to Now (⌘J)", isVisible: $isHovering)
     }
 }
 
@@ -571,6 +576,7 @@ struct CurrentAppBadge: View {
                             }
                             appIconView(for: bundleID)
                                 .frame(width: iconSize, height: iconSize)
+                                .instantTooltip(hasOpenableURL ? "Open in browser" : (currentAppName ?? "App"), isVisible: .constant(isHovering && !shouldShowExpanded))
                         }
                         .frame(height: buttonSize)
                         .padding(.leading, shouldShowExpanded ? 12 : 0)
@@ -602,7 +608,6 @@ struct CurrentAppBadge: View {
                         NSCursor.pop()
                     }
                 }
-                .instantTooltip(hasOpenableURL ? "Open in browser" : (currentAppName ?? "App"), isVisible: .constant(isHovering && !shouldShowExpanded))
                 .id(bundleID)
             }
         }
@@ -839,7 +844,72 @@ struct FilterButton: View {
                 }
             }
         }
-        .instantTooltip(viewModel.activeFilterCount > 0 && isBadgeHovering ? "Clear filters" : "Filter", isVisible: .constant(isHovering || isBadgeHovering))
+        .instantTooltip(viewModel.activeFilterCount > 0 && isBadgeHovering ? "Clear filters" : "Filter (⌘F)", isVisible: .constant(isHovering || isBadgeHovering))
+    }
+}
+
+/// Groups the peek button (left) with the filter button (right) when filters are active
+struct FilterAndPeekGroup: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+
+    private var showPeekButton: Bool {
+        viewModel.activeFilterCount > 0 || viewModel.isPeeking
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // Peek button appears to the LEFT of filter when filters are active
+            if showPeekButton {
+                PeekButton(viewModel: viewModel)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .move(edge: .trailing).combined(with: .opacity)
+                    ))
+            }
+
+            FilterButton(viewModel: viewModel)
+        }
+        .padding(showPeekButton ? 4 : 0)
+        .background(
+            Group {
+                if showPeekButton {
+                    Capsule()
+                        .fill(Color.white.opacity(0.08))
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                        )
+                }
+            }
+        )
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showPeekButton)
+    }
+}
+
+/// Button to toggle peek mode (view full timeline context while filtered)
+struct PeekButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            viewModel.togglePeek()
+        }) {
+            Image(systemName: "eye")
+                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
+                .foregroundColor(isHovering || viewModel.isPeeking ? .white : .white.opacity(0.6))
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .themeAwareCircleStyle(isActive: viewModel.isPeeking, isHovering: isHovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .instantTooltip(viewModel.isPeeking ? "Hide Context (⌘P)" : "See Context (⌘P)", isVisible: .constant(isHovering))
     }
 }
 
@@ -870,7 +940,7 @@ struct ControlsToggleButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .instantTooltip(viewModel.areControlsHidden ? "Show" : "Hide", isVisible: $isHovering)
+        .instantTooltip(viewModel.areControlsHidden ? "Show (⌘H)" : "Hide (⌘H)", isVisible: $isHovering)
     }
 }
 

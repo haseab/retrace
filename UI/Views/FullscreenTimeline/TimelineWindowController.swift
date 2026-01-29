@@ -488,35 +488,82 @@ public class TimelineWindowController: NSObject {
 
     /// Show the timeline with a pre-applied filter for an app and window name
     /// This instantly opens a filtered timeline view without showing a dialog
-    public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil) {
-        show()
+    /// - Parameters:
+    ///   - startDate: Optional start date for filtering (e.g., week start)
+    ///   - endDate: Optional end date for filtering (e.g., now)
+    ///   - clickStartTime: Optional start time from when the tab was clicked (for end-to-end timing)
+    public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil, startDate: Date? = nil, endDate: Date? = nil, clickStartTime: CFAbsoluteTime? = nil) {
+        let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("TIMELINE_SHOW_WITH_FILTER", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-        // Apply filter after a brief delay to allow the view to initialize
+        // Build the filter criteria upfront
+        var criteria = FilterCriteria()
+        criteria.selectedApps = Set([bundleID])
+        criteria.appFilterMode = .include
+        if let url = browserUrl, !url.isEmpty {
+            criteria.browserUrlFilter = url
+        } else if let window = windowName, !window.isEmpty {
+            criteria.windowNameFilter = window
+        }
+        // Add date range filter
+        criteria.startDate = startDate
+        criteria.endDate = endDate
+
+        // Start database query in parallel with show()
+        let queryTask = Task {
+            guard let coordinator = coordinator else { return [FrameWithVideoInfo]() }
+            logTabClickTiming("QUERY_START_PARALLEL", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+            let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: criteria)
+            logTabClickTiming("QUERY_DONE_PARALLEL (count=\(frames?.count ?? 0))", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+            return frames ?? []
+        }
+
+        // Show window (this runs in parallel with the query)
+        show()
+        logTabClickTiming("TIMELINE_SHOW_CALLED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+
+        // Apply results once both are ready
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
             guard let viewModel = timelineViewModel else { return }
 
-            // Build the filter criteria
-            var criteria = FilterCriteria()
-            criteria.selectedApps = Set([bundleID])
-            criteria.appFilterMode = .include
-
-            // For window filtering, use windowNameFilter if we have a window name
-            // For browser URLs, use browserUrlFilter
-            if let url = browserUrl, !url.isEmpty {
-                criteria.browserUrlFilter = url
-            } else if let window = windowName, !window.isEmpty {
-                criteria.windowNameFilter = window
-            }
-
-            // Apply the filter directly (skip the pending state)
+            // Apply the filter criteria to viewModel
             viewModel.filterCriteria = criteria
             viewModel.pendingFilterCriteria = criteria
+            logTabClickTiming("TIMELINE_FILTER_SET", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            // Reload the timeline with the new filter
-            await viewModel.loadMostRecentFrame()
+            // Wait for query results and apply them
+            let frames = await queryTask.value
+            logTabClickTiming("TIMELINE_FRAMES_RECEIVED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            Log.info("[TIMELINE-FILTER] Applied filter for bundleID=\(bundleID), windowName=\(windowName ?? "nil"), browserUrl=\(browserUrl ?? "nil")", category: .ui)
+            // Load frames directly into viewModel (bypass re-querying)
+            await viewModel.loadFramesDirectly(frames, clickStartTime: startTime)
+            logTabClickTiming("TIMELINE_LOAD_COMPLETE", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+
+            Log.info("[TIMELINE-FILTER] Applied filter for bundleID=\(bundleID), windowName=\(windowName ?? "nil"), browserUrl=\(browserUrl ?? "nil"), dateRange=\(String(describing: startDate))-\(String(describing: endDate))", category: .ui)
+        }
+    }
+
+    // MARK: - Tab Click Timing
+
+    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+    /// Log timing for tab click filter queries
+    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, bundleID: String, browserUrl: String?) {
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filterInfo = browserUrl ?? bundleID
+        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: Self.tabClickLogPath)
+            }
         }
     }
 
@@ -732,6 +779,11 @@ public class TimelineWindowController: NSObject {
                     viewModel.clearTextSelection()
                     return true
                 }
+                // If in peek mode, exit peek mode and return to filtered view
+                if viewModel.isPeeking {
+                    viewModel.exitPeek()
+                    return true
+                }
                 // If filter panel is visible with open dropdown, let the panel handle it
                 if viewModel.isFilterPanelVisible && viewModel.isFilterDropdownOpen {
                     // The FilterPanel's NSEvent monitor will handle this
@@ -834,10 +886,29 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        // Cmd+. (period) to toggle timeline controls visibility
-        if event.keyCode == 47 && modifiers == [.command] { // Period key with Command
+        // Cmd+H to toggle timeline controls visibility
+        if event.keyCode == 4 && modifiers == [.command] { // H key with Command
             if let viewModel = timelineViewModel {
                 viewModel.toggleControlsVisibility()
+                return true
+            }
+        }
+
+        // Cmd+P to toggle peek mode (view full context while filtered)
+        if event.keyCode == 35 && modifiers == [.command] { // P key with Command
+            if let viewModel = timelineViewModel {
+                // Only allow peek if we have active filters or are already peeking
+                if viewModel.filterCriteria.hasActiveFilters || viewModel.isPeeking {
+                    viewModel.togglePeek()
+                    return true
+                }
+            }
+        }
+
+        // Cmd+J to go to now (most recent frame)
+        if event.keyCode == 38 && modifiers == [.command] { // J key with Command
+            if let viewModel = timelineViewModel {
+                viewModel.goToNow()
                 return true
             }
         }

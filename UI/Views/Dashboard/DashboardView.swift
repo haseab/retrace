@@ -419,12 +419,47 @@ public struct DashboardView: View {
     }
 
     private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
+        // Log the start of the tab click flow
+        let clickStartTime = CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("DASHBOARD_TAB_CLICKED", startTime: clickStartTime, filter: window.browserUrl ?? app.appBundleID)
+
+        // Calculate week date range (same as dashboard uses)
+        let calendar = Calendar.current
+        let now = Date()
+        let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+        let weekEnd = now
+
         // Launch filtered timeline instantly instead of showing sessions dialog
         TimelineWindowController.shared.showWithFilter(
             bundleID: app.appBundleID,
             windowName: window.windowName,
-            browserUrl: window.browserUrl
+            browserUrl: window.browserUrl,
+            startDate: weekStart,
+            endDate: weekEnd,
+            clickStartTime: clickStartTime
         )
+    }
+
+    // MARK: - Tab Click Timing
+
+    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String) {
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filter))\n"
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: Self.tabClickLogPath)
+            }
+        }
     }
 
     private func openTimelineAt(date: Date) {

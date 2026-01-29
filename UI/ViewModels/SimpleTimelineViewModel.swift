@@ -551,6 +551,23 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingFilterCriteria != filterCriteria
     }
 
+    // MARK: - Peek Mode State (view full timeline context while filtered)
+
+    /// Complete timeline state snapshot for returning from peek mode
+    public struct TimelineStateSnapshot {
+        let filterCriteria: FilterCriteria
+        let frames: [TimelineFrame]
+        let currentIndex: Int
+        let hasMoreOlder: Bool
+        let hasMoreNewer: Bool
+    }
+
+    /// Cached filtered view state (saved when entering peek mode, restored on exit)
+    private var cachedFilteredState: TimelineStateSnapshot?
+
+    /// Whether we're currently in peek mode (viewing full context)
+    @Published public var isPeeking: Bool = false
+
     // MARK: - Zoom Computed Properties
 
     /// Current pixels per frame based on zoom level
@@ -1374,35 +1391,25 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Toggle source filter selection (updates pending, not applied)
-    /// When nil (all sources), clicking deselects the clicked source (keeps the other)
-    /// When one is selected, clicking the other adds it (back to all)
-    /// When one is selected, clicking the same one does nothing (must have at least one)
+    /// Toggle source filter - nil means only Retrace (native)
+    /// Clicking Rewind toggles it on/off while keeping Retrace always on
+    /// Clicking Retrace when only Retrace is selected does nothing (must have at least one)
     public func toggleSourceFilter(_ source: FrameSource) {
-        if pendingFilterCriteria.selectedSources == nil {
-            // Currently showing all - clicking one deselects it (keeps only the other)
-            var sources: Set<FrameSource> = [.native, .rewind]
-            sources.remove(source)
-            pendingFilterCriteria.selectedSources = sources
-        } else {
-            var sources = pendingFilterCriteria.selectedSources!
-            if sources.contains(source) {
-                // Don't allow removing the last source
-                if sources.count > 1 {
-                    sources.remove(source)
-                    pendingFilterCriteria.selectedSources = sources
-                }
-            } else {
-                // Add the source back
-                sources.insert(source)
-                // If both are now selected, set to nil (all sources)
-                if sources.contains(.native) && sources.contains(.rewind) {
-                    pendingFilterCriteria.selectedSources = nil
-                } else {
-                    pendingFilterCriteria.selectedSources = sources
-                }
+        // nil means only native (Retrace) selected
+        var sources = pendingFilterCriteria.selectedSources ?? Set([.native])
+
+        if sources.contains(source) {
+            // Don't allow removing the last source
+            if sources.count > 1 {
+                sources.remove(source)
+                pendingFilterCriteria.selectedSources = sources
             }
+        } else {
+            // Add the source
+            sources.insert(source)
+            pendingFilterCriteria.selectedSources = sources
         }
-        Log.debug("[Filter] Toggled source filter for \(source.rawValue)", category: .ui)
+        Log.debug("[Filter] Toggled source filter for \(source.rawValue), now: \(pendingFilterCriteria.selectedSources?.map { $0.rawValue } ?? ["native only"])", category: .ui)
     }
 
     /// Toggle tag filter selection (updates pending, not applied)
@@ -1446,6 +1453,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func applyFilters() {
         Log.debug("[Filter] applyFilters() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), current.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
 
+        // Invalidate peek cache since filters are changing
+        invalidatePeekCache()
+
         // Capture current timestamp before applying filters to preserve position
         let timestampToPreserve = currentTimestamp
 
@@ -1477,15 +1487,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Clear all applied filters and reset pending
     public func clearAllFilters() {
+        // Invalidate peek cache since filters are changing
+        invalidatePeekCache()
+
         // Capture current timestamp before clearing filters to preserve position
         let timestampToPreserve = currentTimestamp
 
-        filterCriteria = .none
-        pendingFilterCriteria = .none
-        Log.debug("[Filter] Cleared all filters", category: .ui)
-
-        // Save (clear) filter criteria cache immediately
-        saveFilterCriteria()
+        clearFilterState()
 
         // Reload timeline without filters, preserving current position
         Task {
@@ -1496,6 +1504,109 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // No current position, fall back to most recent
                 await loadMostRecentFrame()
             }
+        }
+    }
+
+    /// Clear filter state without triggering a reload
+    /// Used by goToNow() which handles its own reload
+    private func clearFilterState() {
+        filterCriteria = .none
+        pendingFilterCriteria = .none
+        Log.debug("[Filter] Cleared all filters", category: .ui)
+
+        // Save (clear) filter criteria cache immediately
+        saveFilterCriteria()
+    }
+
+    // MARK: - Peek Mode (View Full Context)
+
+    /// Enter peek mode - temporarily clear filters to see full timeline context
+    /// Caches the current filtered state for instant restoration on exit
+    public func peekContext() {
+        guard filterCriteria.hasActiveFilters else {
+            Log.debug("[Peek] peekContext() called but no active filters - ignoring", category: .ui)
+            return
+        }
+
+        guard !frames.isEmpty else {
+            Log.debug("[Peek] peekContext() called but no frames loaded - ignoring", category: .ui)
+            return
+        }
+
+        let timestampToPreserve = currentTimestamp
+
+        // Cache current filtered state (so we can return to EXACT position later)
+        cachedFilteredState = TimelineStateSnapshot(
+            filterCriteria: filterCriteria,
+            frames: frames,
+            currentIndex: currentIndex,
+            hasMoreOlder: hasMoreOlder,
+            hasMoreNewer: hasMoreNewer
+        )
+        Log.info("[Peek] Cached filtered state: \(frames.count) frames, index=\(currentIndex)", category: .ui)
+
+        // Clear filters and load unfiltered timeline centered on current timestamp
+        filterCriteria = .none
+        pendingFilterCriteria = .none
+        isPeeking = true
+
+        Task {
+            if let timestamp = timestampToPreserve {
+                await reloadFramesAroundTimestamp(timestamp)
+            } else {
+                await loadMostRecentFrame()
+            }
+        }
+    }
+
+    /// Exit peek mode - restore previous filtered state instantly
+    public func exitPeek() {
+        guard isPeeking else {
+            Log.debug("[Peek] exitPeek() called but not in peek mode - ignoring", category: .ui)
+            return
+        }
+
+        guard let filteredState = cachedFilteredState else {
+            Log.warning("[Peek] exitPeek() called but no cached filtered state - clearing peek mode", category: .ui)
+            isPeeking = false
+            return
+        }
+
+        // Restore filtered state instantly - this restores the EXACT frame position
+        Log.info("[Peek] Restoring filtered state: \(filteredState.frames.count) frames, returning to index=\(filteredState.currentIndex)", category: .ui)
+        restoreTimelineState(filteredState)
+        isPeeking = false
+
+        // Clear cached filtered state since we've restored it
+        cachedFilteredState = nil
+    }
+
+    /// Toggle peek mode - enter if filtered, exit if peeking
+    public func togglePeek() {
+        if isPeeking {
+            exitPeek()
+        } else {
+            peekContext()
+        }
+    }
+
+    /// Restore timeline state from a snapshot
+    private func restoreTimelineState(_ snapshot: TimelineStateSnapshot) {
+        filterCriteria = snapshot.filterCriteria
+        pendingFilterCriteria = snapshot.filterCriteria
+        frames = snapshot.frames
+        currentIndex = snapshot.currentIndex
+        hasMoreOlder = snapshot.hasMoreOlder
+        hasMoreNewer = snapshot.hasMoreNewer
+        loadImageIfNeeded()
+    }
+
+    /// Invalidate peek cache (call when filters change or timeline reloads significantly)
+    public func invalidatePeekCache() {
+        cachedFilteredState = nil
+        if isPeeking {
+            isPeeking = false
+            Log.debug("[Peek] Peek cache invalidated, exiting peek mode", category: .ui)
         }
     }
 
@@ -1709,7 +1820,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Initial Load
 
     /// Load the most recent frame on startup
-    public func loadMostRecentFrame() async {
+    /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
+    public func loadMostRecentFrame(clickStartTime: CFAbsoluteTime? = nil) async {
+        let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("VM_LOAD_START", startTime: startTime)
+
         isLoading = true
         error = nil
 
@@ -1718,7 +1833,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Uses optimized query that JOINs on video table - no N+1 queries!
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: filterCriteria.selectedApps)), mode: \(filterCriteria.appFilterMode.rawValue)", category: .ui)
+            logTabClickTiming("VM_BEFORE_QUERY", startTime: startTime)
             let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: filterCriteria)
+            logTabClickTiming("VM_AFTER_QUERY (count=\(framesWithVideoInfo.count))", startTime: startTime)
 
             guard !framesWithVideoInfo.isEmpty else {
                 // No frames found - check if filters are active
@@ -1728,6 +1845,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     error = "No frames found in any database"
                 }
                 isLoading = false
+                logTabClickTiming("VM_NO_FRAMES", startTime: startTime)
                 return
             }
 
@@ -1735,6 +1853,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Reverse so oldest is first (index 0), newest is last
             // This matches the timeline UI which displays left-to-right as past-to-future
             frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            logTabClickTiming("VM_FRAMES_MAPPED", startTime: startTime)
 
             // Initialize window boundary timestamps for infinite scroll
             updateWindowBoundaries()
@@ -1776,12 +1895,84 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Load image if needed for current frame
             loadImageIfNeeded()
+            logTabClickTiming("VM_IMAGE_LOADED", startTime: startTime)
 
             isLoading = false
+            logTabClickTiming("VM_LOAD_COMPLETE", startTime: startTime)
 
         } catch {
             self.error = "Failed to load frames: \(error.localizedDescription)"
             isLoading = false
+            logTabClickTiming("VM_LOAD_ERROR: \(error.localizedDescription)", startTime: startTime)
+        }
+    }
+
+    /// Load pre-fetched frames directly (used when query runs in parallel with show())
+    /// - Parameters:
+    ///   - framesWithVideoInfo: Pre-fetched frames from parallel query
+    ///   - clickStartTime: Start time for end-to-end timing
+    public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime: CFAbsoluteTime? = nil) async {
+        let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("VM_LOAD_DIRECT_START", startTime: startTime)
+
+        isLoading = true
+        error = nil
+
+        guard !framesWithVideoInfo.isEmpty else {
+            if filterCriteria.hasActiveFilters {
+                showNoResultsMessage()
+            } else {
+                error = "No frames found in any database"
+            }
+            isLoading = false
+            logTabClickTiming("VM_LOAD_DIRECT_NO_FRAMES", startTime: startTime)
+            return
+        }
+
+        // Convert to TimelineFrame - reverse so oldest is first (index 0), newest is last
+        frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+        logTabClickTiming("VM_LOAD_DIRECT_MAPPED (count=\(frames.count))", startTime: startTime)
+
+        // Initialize window boundary timestamps for infinite scroll
+        updateWindowBoundaries()
+
+        Log.debug("[SimpleTimelineViewModel] Loaded \(frames.count) frames directly", category: .ui)
+
+        // Start at the most recent frame
+        currentIndex = frames.count - 1
+
+        // Restore cached search results if any
+        searchViewModel.restoreCachedSearchResults()
+
+        // Load image if needed for current frame
+        loadImageIfNeeded()
+        logTabClickTiming("VM_LOAD_DIRECT_IMAGE", startTime: startTime)
+
+        isLoading = false
+        logTabClickTiming("VM_LOAD_DIRECT_COMPLETE", startTime: startTime)
+    }
+
+    // MARK: - Tab Click Timing
+
+    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+    /// Log timing for tab click filter queries
+    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime) {
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filterInfo = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "no-filter"
+        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: Self.tabClickLogPath)
+            }
         }
     }
 
@@ -3409,7 +3600,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
         // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
         // Mouse wheels need higher sensitivity since they send larger discrete deltas less frequently
-        let baseSensitivity: CGFloat = isTrackpad ? 0.022 : 0.5
+        let baseSensitivity: CGFloat = isTrackpad ? 0.025 : 0.5
         let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
         let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
 
@@ -3505,19 +3696,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to the most recent frame — jumps to end of tape if already loaded, otherwise reloads from DB
     public func goToNow() {
-        // Only clear filters if any are active
+        // Clear filters without triggering reload (we'll handle that ourselves)
         if activeFilterCount > 0 {
-            clearAllFilters()
+            clearFilterState()
         }
 
-        if hasMoreNewer {
-            // Most recent frame is NOT in the loaded array — fetch from database
-            Task {
-                await loadMostRecentFrame()
-            }
-        } else if !frames.isEmpty {
-            // Most recent frame IS already loaded — just navigate to it
-            navigateToFrame(frames.count - 1)
+        // Always reload from DB to get the true most recent frame (unfiltered)
+        Task {
+            await loadMostRecentFrame()
         }
     }
 

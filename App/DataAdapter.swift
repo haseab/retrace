@@ -243,6 +243,9 @@ public actor DataAdapter {
 
     /// Optimized filtered query - tries Retrace first, then Rewind to get full limit
     private func getMostRecentFramesWithFilters(limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
+        let queryStartTime = CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("DA_FILTERS_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
+
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
 
@@ -254,6 +257,7 @@ public actor DataAdapter {
 
         // Step 1: Try Retrace first (unless excluded)
         if !excludeRetrace {
+            logTabClickTiming("DA_RETRACE_QUERY_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             let retraceFrames = try queryMostRecentFramesWithFiltersOptimized(
                 limit: limit,
                 connection: retraceConnection,
@@ -261,6 +265,7 @@ public actor DataAdapter {
                 filters: filters,
                 isRewindDatabase: false
             )
+            logTabClickTiming("DA_RETRACE_QUERY_DONE (count=\(retraceFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             allFrames.append(contentsOf: retraceFrames)
             remaining = limit - retraceFrames.count
             Log.debug("[Filter] Got \(retraceFrames.count) frames from Retrace, need \(remaining) more", category: .database)
@@ -268,9 +273,12 @@ public actor DataAdapter {
 
         // Step 2: If we don't have enough frames, query Rewind (unless excluded)
         // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
+        // Also skip if the filter's startDate is after the cutoff date (no Rewind data exists after cutoff)
         let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
                            filters.hiddenFilter == .onlyHidden
-        if remaining > 0, !excludeRewind, !hasTagFilters, let rewind = rewindConnection, let config = rewindConfig {
+        let startDateAfterCutoff = cutoffDate != nil && filters.startDate != nil && filters.startDate! >= cutoffDate!
+        if remaining > 0, !excludeRewind, !hasTagFilters, !startDateAfterCutoff, let rewind = rewindConnection, let config = rewindConfig {
+            logTabClickTiming("DA_REWIND_QUERY_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             let rewindFrames = try queryMostRecentFramesWithFiltersOptimized(
                 limit: remaining,
                 connection: rewind,
@@ -278,13 +286,41 @@ public actor DataAdapter {
                 filters: filters,
                 isRewindDatabase: true
             )
+            logTabClickTiming("DA_REWIND_QUERY_DONE (count=\(rewindFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             allFrames.append(contentsOf: rewindFrames)
             Log.debug("[Filter] Got \(rewindFrames.count) frames from Rewind", category: .database)
+        } else if startDateAfterCutoff {
+            Log.debug("[Filter] Skipping Rewind query - startDate \(filters.startDate!) is after cutoff \(cutoffDate!)", category: .database)
         }
 
         // Sort by timestamp descending (newest first)
         allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
+        logTabClickTiming("DA_FILTERS_COMPLETE (total=\(allFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
         return allFrames
+    }
+
+    // MARK: - Tab Click Timing
+
+    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+    /// Log timing for tab click filter queries
+    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String?) {
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let filterInfo = filter ?? "no-filter"
+        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: Self.tabClickLogPath)
+            }
+        }
     }
 
     /// Get most recent frames
@@ -972,6 +1008,10 @@ public actor DataAdapter {
         filters: FilterCriteria,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
+        let queryStartTime = CFAbsoluteTimeGetCurrent()
+        let dbName = isRewindDatabase ? "REWIND" : "RETRACE"
+        logTabClickTiming("SQL_\(dbName)_BUILD_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
+
         var whereClauses: [String] = []
         var bindIndex = 1
 
@@ -999,16 +1039,8 @@ public actor DataAdapter {
             }
         }
 
-        // Build CTE for window name FTS filter (if provided) - searches title column
-        // Note: FTS is only available in Retrace database, not Rewind
+        // Window name filter - uses direct LIKE on segment.windowName (faster than FTS)
         let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
-        var windowNameFTSCTE = ""
-        var windowNameFTSJoin = ""
-        if hasWindowNameFilter {
-            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
-            windowNameFTSCTE = ftsFilter.cte
-            windowNameFTSJoin = ftsFilter.join
-        }
 
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
@@ -1038,15 +1070,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Combine CTEs
-        var ctes: [String] = []
-        if hasWindowNameFilter {
-            ctes.append(windowNameFTSCTE)
-        }
-        if !tagCTE.isEmpty {
-            ctes.append(tagCTE)
-        }
-        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
+        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
 
         // App filter - uses index on segment.bundleID (include or exclude mode)
         if let apps = filters.selectedApps, !apps.isEmpty {
@@ -1057,6 +1082,11 @@ public actor DataAdapter {
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
             whereClauses.append(urlFilter.clause)
+        }
+
+        // Window name filter - direct LIKE on segment.windowName (much faster than FTS)
+        if hasWindowNameFilter {
+            whereClauses.append("s.windowName LIKE ?")
         }
 
         // Date range filter
@@ -1101,7 +1131,6 @@ public actor DataAdapter {
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             \(whereClause)
@@ -1117,6 +1146,7 @@ public actor DataAdapter {
         Log.debug("[Filter] Window name filter: \(filters.windowNameFilter ?? "nil")", category: .database)
         Log.debug("[Filter] Browser URL filter: \(filters.browserUrlFilter ?? "nil")", category: .database)
         Log.debug("[Filter] Date range: \(String(describing: filters.startDate)) - \(String(describing: filters.endDate))", category: .database)
+        logTabClickTiming("SQL_\(dbName)_QUERY_BUILT", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         let statement: OpaquePointer?
         do {
@@ -1133,14 +1163,7 @@ public actor DataAdapter {
             return []
         }
         defer { connection.finalize(stmt) }
-
-        // Bind window name FTS query FIRST (appears in the first CTE)
-        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
-            let ftsQuery = buildWindowNameFTSQueryString(windowName)
-            Log.debug("[Filter] Binding window name FTS query '\(ftsQuery)' at index \(bindIndex)", category: .database)
-            sqlite3_bind_text(stmt, Int32(bindIndex), (ftsQuery as NSString).utf8String, -1, nil)
-            bindIndex += 1
-        }
+        logTabClickTiming("SQL_\(dbName)_PREPARED", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
@@ -1164,6 +1187,14 @@ public actor DataAdapter {
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let pattern = "%\(browserUrlPattern)%"
             Log.debug("[Filter] Binding browser URL pattern '\(pattern)' at index \(bindIndex)", category: .database)
+            sqlite3_bind_text(stmt, Int32(bindIndex), (pattern as NSString).utf8String, -1, nil)
+            bindIndex += 1
+        }
+
+        // Bind window name pattern (LIKE query on segment.windowName)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let pattern = "%\(windowName)%"
+            Log.debug("[Filter] Binding window name pattern '\(pattern)' at index \(bindIndex)", category: .database)
             sqlite3_bind_text(stmt, Int32(bindIndex), (pattern as NSString).utf8String, -1, nil)
             bindIndex += 1
         }
@@ -1201,10 +1232,15 @@ public actor DataAdapter {
         Log.debug("[Filter] Binding limit \(limit) at index \(bindIndex)", category: .database)
         sqlite3_bind_int(stmt, Int32(bindIndex), Int32(limit))
         Log.debug("[Filter] ====== QUERY DEBUG END ======", category: .database)
+        logTabClickTiming("SQL_\(dbName)_BOUND", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         var frames: [FrameWithVideoInfo] = []
         var stepCount = 0
+        let execStartTime = CFAbsoluteTimeGetCurrent()
         var stepResult = sqlite3_step(stmt)
+        let firstStepTime = CFAbsoluteTimeGetCurrent()
+        logTabClickTiming("SQL_\(dbName)_FIRST_STEP (time=\(String(format: "%.1f", (firstStepTime - execStartTime) * 1000))ms)", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
+
         while stepResult == SQLITE_ROW {
             stepCount += 1
             if let frameWithVideo = try? parseFrameWithVideoInfo(statement: stmt, config: config) {
@@ -1212,12 +1248,14 @@ public actor DataAdapter {
             }
             stepResult = sqlite3_step(stmt)
         }
+        logTabClickTiming("SQL_\(dbName)_ALL_STEPS (count=\(stepCount))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         if stepResult != SQLITE_DONE {
             Log.error("[Filter] sqlite3_step error code: \(stepResult)", category: .database)
         }
 
         Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
+        logTabClickTiming("SQL_\(dbName)_COMPLETE (frames=\(frames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         return frames
     }
@@ -1260,15 +1298,8 @@ public actor DataAdapter {
             }
         }
 
-        // Build CTE for window name FTS filter (if provided) - searches title column
+        // Window name filter - uses direct LIKE on segment.windowName (faster than FTS)
         let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
-        var windowNameFTSCTE = ""
-        var windowNameFTSJoin = ""
-        if hasWindowNameFilter {
-            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
-            windowNameFTSCTE = ftsFilter.cte
-            windowNameFTSJoin = ftsFilter.join
-        }
 
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
@@ -1300,15 +1331,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Combine CTEs
-        var ctes: [String] = []
-        if hasWindowNameFilter {
-            ctes.append(windowNameFTSCTE)
-        }
-        if !tagCTE.isEmpty {
-            ctes.append(tagCTE)
-        }
-        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
+        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
 
         // Now bind timestamp (after tag IDs in CTE, if any)
         bindIndex += 1
@@ -1322,6 +1346,11 @@ public actor DataAdapter {
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
             whereClauses.append(urlFilter.clause)
+        }
+
+        // Window name filter - direct LIKE on segment.windowName (much faster than FTS)
+        if hasWindowNameFilter {
+            whereClauses.append("s.windowName LIKE ?")
         }
 
         // Date range filter - additional constraints beyond the timestamp
@@ -1366,7 +1395,6 @@ public actor DataAdapter {
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1378,13 +1406,6 @@ public actor DataAdapter {
         defer { connection.finalize(statement) }
 
         var currentBindIndex = 1
-
-        // Bind window name FTS query FIRST (appears in the first CTE)
-        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
-            let ftsQuery = buildWindowNameFTSQueryString(windowName)
-            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
-            currentBindIndex += 1
-        }
 
         // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
@@ -1409,6 +1430,13 @@ public actor DataAdapter {
         // Bind browser URL pattern
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind window name pattern (LIKE query on segment.windowName)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let pattern = "%\(windowName)%"
             sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
             currentBindIndex += 1
         }
@@ -1484,15 +1512,8 @@ public actor DataAdapter {
             }
         }
 
-        // Build CTE for window name FTS filter (if provided) - searches title column
+        // Window name filter - uses direct LIKE on segment.windowName (faster than FTS)
         let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
-        var windowNameFTSCTE = ""
-        var windowNameFTSJoin = ""
-        if hasWindowNameFilter {
-            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
-            windowNameFTSCTE = ftsFilter.cte
-            windowNameFTSJoin = ftsFilter.join
-        }
 
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
@@ -1523,15 +1544,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Combine CTEs
-        var ctes: [String] = []
-        if hasWindowNameFilter {
-            ctes.append(windowNameFTSCTE)
-        }
-        if !tagCTE.isEmpty {
-            ctes.append(tagCTE)
-        }
-        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
+        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
 
         // Now bind timestamp (after tag IDs in CTE, if any)
         bindIndex += 1
@@ -1545,6 +1559,11 @@ public actor DataAdapter {
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
             whereClauses.append(urlFilter.clause)
+        }
+
+        // Window name filter - direct LIKE on segment.windowName (much faster than FTS)
+        if hasWindowNameFilter {
+            whereClauses.append("s.windowName LIKE ?")
         }
 
         // Date range filter - additional constraints beyond the timestamp
@@ -1589,7 +1608,6 @@ public actor DataAdapter {
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1601,13 +1619,6 @@ public actor DataAdapter {
         defer { connection.finalize(statement) }
 
         var currentBindIndex = 1
-
-        // Bind window name FTS query FIRST (appears in the first CTE)
-        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
-            let ftsQuery = buildWindowNameFTSQueryString(windowName)
-            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
-            currentBindIndex += 1
-        }
 
         // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
@@ -1632,6 +1643,13 @@ public actor DataAdapter {
         // Bind browser URL pattern
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind window name pattern (LIKE query on segment.windowName)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let pattern = "%\(windowName)%"
             sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
             currentBindIndex += 1
         }
@@ -1704,15 +1722,8 @@ public actor DataAdapter {
             }
         }
 
-        // Build CTE for window name FTS filter (if provided) - searches title column
+        // Window name filter - uses direct LIKE on segment.windowName (faster than FTS)
         let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
-        var windowNameFTSCTE = ""
-        var windowNameFTSJoin = ""
-        if hasWindowNameFilter {
-            let ftsFilter = buildWindowNameFTSFilter(windowNameQuery: filters.windowNameFilter!)
-            windowNameFTSCTE = ftsFilter.cte
-            windowNameFTSJoin = ftsFilter.join
-        }
 
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
@@ -1743,15 +1754,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Combine CTEs
-        var ctes: [String] = []
-        if hasWindowNameFilter {
-            ctes.append(windowNameFTSCTE)
-        }
-        if !tagCTE.isEmpty {
-            ctes.append(tagCTE)
-        }
-        let combinedCTE = ctes.isEmpty ? "" : "WITH " + ctes.joined(separator: ",\n")
+        // Combine CTEs (only tag CTE now, window name uses direct WHERE clause)
+        let combinedCTE = tagCTE.isEmpty ? "" : "WITH " + tagCTE
 
         // Now bind timestamps (after tag IDs in CTE, if any)
         bindIndex += 2  // For startDate and endDate
@@ -1765,6 +1769,11 @@ public actor DataAdapter {
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
             whereClauses.append(urlFilter.clause)
+        }
+
+        // Window name filter - direct LIKE on segment.windowName (much faster than FTS)
+        if hasWindowNameFilter {
+            whereClauses.append("s.windowName LIKE ?")
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1801,7 +1810,6 @@ public actor DataAdapter {
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
-            \(windowNameFTSJoin)
             \(tagJoin)
             LEFT JOIN video v ON f.videoId = v.id
             WHERE \(whereClause)
@@ -1813,13 +1821,6 @@ public actor DataAdapter {
         defer { connection.finalize(statement) }
 
         var currentBindIndex = 1
-
-        // Bind window name FTS query FIRST (appears in the first CTE)
-        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
-            let ftsQuery = buildWindowNameFTSQueryString(windowName)
-            sqlite3_bind_text(statement, Int32(currentBindIndex), (ftsQuery as NSString).utf8String, -1, nil)
-            currentBindIndex += 1
-        }
 
         // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
@@ -1846,6 +1847,13 @@ public actor DataAdapter {
         // Bind browser URL pattern
         if let browserUrlPattern = filters.browserUrlFilter, !browserUrlPattern.isEmpty {
             let pattern = "%\(browserUrlPattern)%"
+            sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
+            currentBindIndex += 1
+        }
+
+        // Bind window name pattern (LIKE query on segment.windowName)
+        if hasWindowNameFilter, let windowName = filters.windowNameFilter {
+            let pattern = "%\(windowName)%"
             sqlite3_bind_text(statement, Int32(currentBindIndex), (pattern as NSString).utf8String, -1, nil)
             currentBindIndex += 1
         }
@@ -2888,54 +2896,6 @@ public actor DataAdapter {
         // Use LIKE with wildcards for partial matching
         let pattern = "%\(urlPattern)%"
         return (clause: "\(tableAlias).browserUrl LIKE ?", pattern: pattern)
-    }
-
-    /// Build SQL clause and subquery for window name FTS search (searches title/c2 column)
-    /// Returns the CTE for FTS matching and the join clause
-    private func buildWindowNameFTSFilter(windowNameQuery: String) -> (cte: String, join: String) {
-        // FTS5 query on title column (c2) - use prefix search for partial matches
-        // The FTS MATCH clause expects the full query as a single bound parameter
-        let cte = """
-            fts_matched_frames AS (
-                SELECT DISTINCT ds.frameId
-                FROM searchRanking
-                JOIN doc_segment ds ON searchRanking.rowid = ds.docid
-                WHERE searchRanking MATCH ?
-            )
-            """
-        let join = "INNER JOIN fts_matched_frames fmf ON f.id = fmf.frameId"
-        return (cte: cte, join: join)
-    }
-
-    /// Build the full FTS5 query string for window name search
-    /// Returns a query like: title:"search term"* for prefix matching on the title column
-    private func buildWindowNameFTSQueryString(_ text: String) -> String {
-        // Escape FTS5 special characters and wrap in quotes for exact phrase matching
-        let escaped = text
-            .replacingOccurrences(of: "\"", with: "\"\"")
-            .replacingOccurrences(of: "*", with: "")
-            .replacingOccurrences(of: ":", with: "")
-            .replacingOccurrences(of: "(", with: "")
-            .replacingOccurrences(of: ")", with: "")
-            .trimmingCharacters(in: .whitespaces)
-
-        // Use title column with quoted phrase and prefix wildcard
-        // Format: title:"escaped term"*
-        return "title:\"\(escaped)\"*"
-    }
-
-    /// Escape a window name query for FTS5 MATCH - handles special characters
-    private func escapeFTSQuery(_ text: String) -> String {
-        // Remove or escape FTS5 special characters that could break the query
-        let escaped = text
-            .replacingOccurrences(of: "\"", with: "\"\"")
-            .replacingOccurrences(of: "*", with: "")
-            .replacingOccurrences(of: ":", with: "")
-            .replacingOccurrences(of: "(", with: "")
-            .replacingOccurrences(of: ")", with: "")
-            .replacingOccurrences(of: "-", with: " ")
-            .trimmingCharacters(in: .whitespaces)
-        return escaped
     }
 
     private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
