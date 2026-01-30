@@ -1956,6 +1956,28 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
 
+    /// Log to debug file for infinite scroll debugging
+    private static func logDebugFileStatic(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: tabClickLogPath.path) {
+                if let handle = try? FileHandle(forWritingTo: tabClickLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: tabClickLogPath)
+            }
+        }
+    }
+
+    private func logDebugFile(_ message: String) {
+        Self.logDebugFileStatic(message)
+    }
+
     /// Log timing for tab click filter queries
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
@@ -1989,15 +2011,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !frames.isEmpty {
             Log.info("[TIMELINE-REFRESH] 🔄 Have \(frames.count) cached frames, refreshing current image", category: .ui)
 
-            // Skip background refresh if user is deep in history (>250 frames from end).
+            // Skip background refresh if user is deep in history (viewing frames >5 min old).
             // Appending present-moment frames while the user is far back corrupts the
             // infinite scroll window — newestLoadedTimestamp jumps to now, causing the
             // next forward scroll batch to skip ahead by potentially an entire day.
-            let distanceFromEnd = frames.count - 1 - currentIndex
-            if !navigateToNewest && distanceFromEnd > 250 {
-                Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is \(distanceFromEnd) frames from end (threshold: 250)", category: .ui)
-                loadImageIfNeeded()
-                return
+            if !navigateToNewest, let currentTimestamp = frames[safe: currentIndex]?.frame.timestamp {
+                let secondsFromPresent = Date().timeIntervalSince(currentTimestamp)
+                if secondsFromPresent > 300 { // 5 minutes
+                    Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is viewing frame from \(Int(secondsFromPresent))s ago (threshold: 300s)", category: .ui)
+                    loadImageIfNeeded()
+                    return
+                }
             }
 
             // Check if there are newer frames available

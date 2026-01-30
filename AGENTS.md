@@ -323,6 +323,58 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 
 ---
 
+## Debug Logging
+
+**ALL debug logs MUST go to `/tmp/retrace_debug.log`** — this is the single source of truth for debugging.
+
+### Writing Debug Logs
+
+```swift
+// Use the static helper in SimpleTimelineViewModel (or copy this pattern)
+private static func logDebugFileStatic(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path.path) {
+            if let handle = try? FileHandle(forWritingTo: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: path)
+        }
+    }
+}
+```
+
+### Reading Debug Logs
+
+```bash
+# Watch logs in real-time
+tail -f /tmp/retrace_debug.log
+
+# Search for specific patterns
+cat /tmp/retrace_debug.log | grep "DEBUG-LOAD"
+
+# View last 100 lines
+tail -100 /tmp/retrace_debug.log
+```
+
+### Best Practice: Clear Log Before Each Session
+
+**ALWAYS clear the debug log before starting a new debugging session:**
+
+```bash
+> /tmp/retrace_debug.log
+```
+
+This ensures you're only seeing logs from the current session, not stale data from previous runs.
+
+---
+
 ## Critical Rules for All Agents
 
 ### 1. Stay In Your Lane
