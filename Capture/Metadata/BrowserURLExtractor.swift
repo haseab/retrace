@@ -26,6 +26,25 @@ struct BrowserURLExtractor: Sendable {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "com.nickvision.browser",      // GNOME Web
+        "com.openai.chat",             // ChatGPT desktop app
+        "com.cometbrowser.Comet",      // Comet Browser
+        "com.aspect.browser",          // Dia Browser
+        "org.chromium.Chromium",       // Chromium
+        "com.sigmaos.sigmaos",         // SigmaOS
+        "com.nicklockwood.Duckduckgo", // DuckDuckGo
+        "com.duckduckgo.macos.browser", // DuckDuckGo (alternate)
+        "com.nicklockwood.iCab",       // iCab
+        "de.icab.iCab",                // iCab (alternate)
+        "com.nicklockwood.OmniWeb",    // OmniWeb
+        "org.webkit.MiniBrowser",      // WebKit MiniBrowser
+        "com.nicklockwood.Orion",      // Orion
+        "com.nicklockwood.Waterfox",   // Waterfox
+        "net.nicklockwood.Waterfox",   // Waterfox (alternate)
+        "org.nicklockwood.LibreWolf",  // LibreWolf
+        "io.nicklockwood.librewolf",   // LibreWolf (alternate)
+        "com.nicklockwood.Thorium",    // Thorium
+        "com.nicklockwood.Zen",        // Zen Browser
+        "com.nicklockwood.Floorp",     // Floorp
     ]
 
     /// Check if a bundle ID is a known browser
@@ -50,7 +69,9 @@ struct BrowserURLExtractor: Sendable {
         let url: String? = switch bundleID {
         case "com.apple.Safari":
             getSafariURL(pid: pid)
-        case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi":
+        case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi",
+             "org.chromium.Chromium", "com.sigmaos.sigmaos", "com.cometbrowser.Comet", "com.aspect.browser",
+             "com.openai.chat", "com.nicklockwood.Thorium":
             getChromiumURL(pid: pid)
         case "company.thebrowser.Browser":  // Arc
             getArcURL(pid: pid)
