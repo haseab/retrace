@@ -1003,6 +1003,12 @@ public actor AppCoordinator {
         return try await adapter.getFrameWithVideoInfoByID(id: id)
     }
 
+    /// Get processing status for multiple frames in a single query
+    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    public func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int] {
+        return try await services.database.getFrameProcessingStatuses(frameIDs: frameIDs)
+    }
+
     // MARK: - Segment Retrieval
 
     /// Get segments in a time range

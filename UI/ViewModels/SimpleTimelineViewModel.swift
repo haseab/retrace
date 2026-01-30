@@ -450,6 +450,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Timer to auto-dismiss search highlight
     private var searchHighlightTimer: Timer?
 
+    /// Timer for periodic processing status refresh while timeline is open
+    private var statusRefreshTimer: Timer?
+
     // MARK: - Context Menu State
 
     /// Whether the right-click context menu is visible
@@ -2132,6 +2135,73 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[TIMELINE-REFRESH] 🔄 No cached frames, doing full load", category: .ui)
         await loadMostRecentFrame()
         Log.info("[TIMELINE-REFRESH] 🔄 Full load completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - refreshStartTime) * 1000))ms", category: .ui)
+    }
+
+    /// Refresh processing status for all cached frames that aren't completed (status != 2)
+    /// This updates stale processingStatus values (e.g., p=4 frames that are now readable)
+    public func refreshProcessingStatuses() async {
+        // Find all frames that aren't completed (status != 2)
+        let framesToRefresh = frames.enumerated().filter { $0.element.processingStatus != 2 }
+
+        guard !framesToRefresh.isEmpty else {
+            Log.debug("[TIMELINE-REFRESH] No frames need status refresh (all completed)", category: .ui)
+            return
+        }
+
+        let frameIDs = framesToRefresh.map { $0.element.frame.id.value }
+        Log.debug("[TIMELINE-REFRESH] Refreshing processingStatus for \(frameIDs.count) frames", category: .ui)
+
+        do {
+            let updatedStatuses = try await coordinator.getFrameProcessingStatuses(frameIDs: frameIDs)
+
+            var updatedCount = 0
+            for (index, frame) in framesToRefresh {
+                if let newStatus = updatedStatuses[frame.frame.id.value],
+                   newStatus != frame.processingStatus {
+                    // Create updated TimelineFrame with new status
+                    frames[index] = TimelineFrame(
+                        frame: frame.frame,
+                        videoInfo: frame.videoInfo,
+                        processingStatus: newStatus
+                    )
+                    updatedCount += 1
+                }
+            }
+
+            if updatedCount > 0 {
+                Log.info("[TIMELINE-REFRESH] Updated processingStatus for \(updatedCount) frames", category: .ui)
+                // If current frame was updated, reload its image
+                if let currentFrame = currentTimelineFrame,
+                   updatedStatuses[currentFrame.frame.id.value] != nil {
+                    loadImageIfNeeded()
+                }
+            }
+        } catch {
+            Log.error("[TIMELINE-REFRESH] Failed to refresh processing statuses: \(error)", category: .ui)
+        }
+    }
+
+    /// Start periodic processing status refresh (every 10 seconds)
+    /// Call this when the timeline becomes visible
+    public func startPeriodicStatusRefresh() {
+        // Cancel any existing timer
+        stopPeriodicStatusRefresh()
+
+        Log.info("[TIMELINE-REFRESH] Starting periodic status refresh (10s interval)", category: .ui)
+
+        // Run on main thread since Timer needs RunLoop
+        statusRefreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshProcessingStatuses()
+            }
+        }
+    }
+
+    /// Stop periodic processing status refresh
+    /// Call this when the timeline is closed
+    public func stopPeriodicStatusRefresh() {
+        statusRefreshTimer?.invalidate()
+        statusRefreshTimer = nil
     }
 
     // MARK: - Frame Navigation

@@ -322,6 +322,12 @@ public struct SimpleTimelineView: View {
                         await viewModel.loadMostRecentFrame()
                     }
                 }
+                // Start periodic refresh of processing statuses
+                viewModel.startPeriodicStatusRefresh()
+            }
+            .onDisappear {
+                // Stop periodic refresh when timeline is closed
+                viewModel.stopPeriodicStatusRefresh()
             }
             // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
