@@ -33,9 +33,9 @@ public struct FrameDeduplicator: DeduplicationProtocol {
         // Check if frames are basically identical
         let similarity = computeSimilarity(frame, reference)
 
-        // If similarity is below threshold, keep the frame (it changed enough)
-        // threshold 0.95 → keep if similarity < 0.95 (frames are different enough)
-        return similarity < threshold
+        // If similarity is at or below threshold, keep the frame (it changed enough)
+        // threshold 0.997 → keep if similarity <= 0.997 (frames are different enough)
+        return similarity <= threshold
     }
 
     /// Compute a perceptual hash for a frame
@@ -81,10 +81,18 @@ public struct FrameDeduplicator: DeduplicationProtocol {
             return 0.0 // Completely different
         }
 
-        // Sample pixels across the image and compare
-        let sampleSize = 100 // Check 100 evenly-distributed pixels
+        // Sample pixels across the image in a uniform 2D grid
+        let sampleSize = 10000 // Target number of samples
         var matchingPixels = 0
         var totalSamples = 0
+
+        // Calculate grid dimensions for uniform 2D distribution
+        let aspectRatio = Double(frame1.width) / Double(frame1.height)
+        let gridRows = Int(sqrt(Double(sampleSize) / aspectRatio))
+        let gridCols = Int(Double(gridRows) * aspectRatio)
+
+        let stepX = max(1, frame1.width / gridCols)
+        let stepY = max(1, frame1.height / gridRows)
 
         frame1.imageData.withUnsafeBytes { bytes1 in
             frame2.imageData.withUnsafeBytes { bytes2 in
@@ -94,29 +102,30 @@ public struct FrameDeduplicator: DeduplicationProtocol {
                 let pixels1 = base1.assumingMemoryBound(to: UInt8.self)
                 let pixels2 = base2.assumingMemoryBound(to: UInt8.self)
 
-                let totalPixels = frame1.width * frame1.height
-                let step = max(1, totalPixels / sampleSize)
+                for row in stride(from: 0, to: frame1.height, by: stepY) {
+                    for col in stride(from: 0, to: frame1.width, by: stepX) {
+                        let pixelIndex = row * frame1.width + col
+                        let offset = pixelIndex * 4
 
-                for i in stride(from: 0, to: totalPixels, by: step).prefix(sampleSize) {
-                    let offset = i * 4
-                    if offset + 2 < frame1.imageData.count && offset + 2 < frame2.imageData.count {
-                        let r1 = pixels1[offset + 2]
-                        let g1 = pixels1[offset + 1]
-                        let b1 = pixels1[offset]
+                        if offset + 2 < frame1.imageData.count && offset + 2 < frame2.imageData.count {
+                            let r1 = pixels1[offset + 2]
+                            let g1 = pixels1[offset + 1]
+                            let b1 = pixels1[offset]
 
-                        let r2 = pixels2[offset + 2]
-                        let g2 = pixels2[offset + 1]
-                        let b2 = pixels2[offset]
+                            let r2 = pixels2[offset + 2]
+                            let g2 = pixels2[offset + 1]
+                            let b2 = pixels2[offset]
 
-                        // Check if pixels are very similar (within 5% tolerance)
-                        let rDiff = abs(Int(r1) - Int(r2))
-                        let gDiff = abs(Int(g1) - Int(g2))
-                        let bDiff = abs(Int(b1) - Int(b2))
+                            // Check if pixels are very similar (within 5% tolerance)
+                            let rDiff = abs(Int(r1) - Int(r2))
+                            let gDiff = abs(Int(g1) - Int(g2))
+                            let bDiff = abs(Int(b1) - Int(b2))
 
-                        if rDiff < 13 && gDiff < 13 && bDiff < 13 { // 13 ≈ 5% of 255
-                            matchingPixels += 1
+                            if rDiff < 13 && gDiff < 13 && bDiff < 13 { // 13 ≈ 5% of 255
+                                matchingPixels += 1
+                            }
+                            totalSamples += 1
                         }
-                        totalSamples += 1
                     }
                 }
             }

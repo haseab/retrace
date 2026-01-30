@@ -913,6 +913,7 @@ public actor DataAdapter {
                 f.videoId,
                 f.videoFrameIndex,
                 f.encodingStatus,
+                f.processingStatus,
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
@@ -971,11 +972,11 @@ public actor DataAdapter {
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
@@ -1126,7 +1127,7 @@ public actor DataAdapter {
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1390,7 +1391,7 @@ public actor DataAdapter {
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1603,7 +1604,7 @@ public actor DataAdapter {
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1805,7 +1806,7 @@ public actor DataAdapter {
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1919,11 +1920,11 @@ public actor DataAdapter {
         let whereClause = whereClauses.joined(separator: " AND ")
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2001,11 +2002,11 @@ public actor DataAdapter {
         let whereClause = whereClauses.joined(separator: " AND ")
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2058,7 +2059,7 @@ public actor DataAdapter {
         config: DatabaseConfig
     ) throws -> FrameWithVideoInfo? {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2973,15 +2974,16 @@ public actor DataAdapter {
         let encodingStatusText = sqlite3_column_text(statement, 5)
         let encodingStatusString = encodingStatusText != nil ? String(cString: encodingStatusText!) : "pending"
         let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
+        let processingStatus = Int(sqlite3_column_int(statement, 6))
 
-        let bundleID = getTextOrNil(statement, 6) ?? ""
-        let windowName = getTextOrNil(statement, 7)
-        let browserUrl = getTextOrNil(statement, 8)
+        let bundleID = getTextOrNil(statement, 7) ?? ""
+        let windowName = getTextOrNil(statement, 8)
+        let browserUrl = getTextOrNil(statement, 9)
 
-        let videoPath = getTextOrNil(statement, 9)
-        let frameRate = sqlite3_column_type(statement, 10) != SQLITE_NULL ? sqlite3_column_double(statement, 10) : nil
-        let width = sqlite3_column_type(statement, 11) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 11)) : nil
-        let height = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
+        let videoPath = getTextOrNil(statement, 10)
+        let frameRate = sqlite3_column_type(statement, 11) != SQLITE_NULL ? sqlite3_column_double(statement, 11) : nil
+        let width = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
+        let height = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
@@ -3016,7 +3018,7 @@ public actor DataAdapter {
             videoInfo = nil
         }
 
-        return FrameWithVideoInfo(frame: frame, videoInfo: videoInfo)
+        return FrameWithVideoInfo(frame: frame, videoInfo: videoInfo, processingStatus: processingStatus)
     }
 
     private func parseSegment(statement: OpaquePointer, config: DatabaseConfig) throws -> Segment {

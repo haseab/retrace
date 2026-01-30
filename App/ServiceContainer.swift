@@ -579,7 +579,7 @@ extension CaptureConfig {
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
-            deduplicationThreshold: 0.99, // 0.99 = only discard nearly identical frames (99%+ similar)
+            deduplicationThreshold: 0.997, // 0.997 = only discard nearly identical frames (99.7%+ similar)
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,

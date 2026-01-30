@@ -141,6 +141,15 @@ public actor AppCoordinator {
 
         let result = try await recoveryManager.recoverAll()
 
+        // Finalize any orphaned videos (processingState=1 but no active WAL session)
+        // This cleans up videos left unfinalised due to dev restarts or crashes
+        let activeWALSessions = try await walManager.listActiveSessions()
+        let activeVideoIDs = Set(activeWALSessions.map { $0.videoID.value })
+        let orphanedVideosFinalized = try await services.database.finalizeOrphanedVideos(activeVideoIDs: activeVideoIDs)
+        if orphanedVideosFinalized > 0 {
+            Log.warning("[Recovery] Finalized \(orphanedVideosFinalized) orphaned videos (processingState was stuck at 1)", category: .app)
+        }
+
         // Re-enqueue frames that were processing during crash
         if let queue = await services.processingQueue {
             try await queue.requeueCrashedFrames()
@@ -361,6 +370,8 @@ public actor AppCoordinator {
     private struct BufferedFrame {
         let frameID: Int64
         let capturedFrame: CapturedFrame
+        /// The frame's index in the video segment (0-based)
+        let frameIndexInSegment: Int
     }
 
     /// State for tracking a video writer by resolution
@@ -369,17 +380,11 @@ public actor AppCoordinator {
         var videoDBID: Int64
         var frameCount: Int
         var isReadable: Bool
+        /// Buffer for frames waiting to be confirmed flushed to disk before marking readable
         var pendingFrames: [BufferedFrame]
-        /// Buffer for recently captured frames that haven't been enqueued for OCR yet
-        /// Needed to allow HEVC encoder to complete B-frame reordering before frames are committed
-        var recentFrameBuffer: [BufferedFrame] = []
         var width: Int
         var height: Int
     }
-
-    /// Number of frames to buffer before enqueueing for OCR
-    /// This gives the HEVC encoder time to complete B-frame reordering
-    private let ocrFrameBufferSize = 4
 
     /// Main pipeline: Capture → Storage → Processing → Database → Search
     /// Uses Rewind-style multi-resolution video writing
@@ -409,20 +414,18 @@ public actor AppCoordinator {
                 if shouldFlushPendingFrames {
                     shouldFlushPendingFrames = false
                     if let processingQueue = await services.processingQueue {
-                        for (resKey, var state) in writersByResolution {
+                        for (resKey, state) in writersByResolution {
                             let pendingCount = state.pendingFrames.count
-                            let recentCount = state.recentFrameBuffer.count
-                            if pendingCount > 0 || recentCount > 0 {
-                                Log.info("[FLUSH] Timeline opened - flushing \(pendingCount) pending + \(recentCount) recent frames for \(resKey)", category: .app)
+                            if pendingCount > 0 {
+                                Log.info("[FLUSH] Timeline opened - enqueueing \(pendingCount) pending frames for OCR (keeping in buffer for later readable marking)", category: .app)
+                                // Enqueue frames for OCR (uses cached pixel data, not video file)
+                                // DON'T clear pendingFrames - they still need to be marked readable later
+                                // when the fragment actually flushes to disk
                                 for bufferedFrame in state.pendingFrames {
                                     try? await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
                                 }
-                                state.pendingFrames = []
-                                for bufferedFrame in state.recentFrameBuffer {
-                                    try? await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
-                                }
-                                state.recentFrameBuffer = []
-                                writersByResolution[resKey] = state
+                                // Note: NOT clearing pendingFrames here - frames will be marked readable
+                                // when flushedCount catches up in the normal pipeline flow
                             }
                         }
                     }
@@ -457,6 +460,17 @@ public actor AppCoordinator {
                 }
 
                 try await writerState.writer.appendFrame(frame)
+
+                // Verify encoder actually wrote the frame by checking its frame count
+                // This detects if the encoder silently failed or auto-finalized
+                let actualEncoderFrameCount = await writerState.writer.frameCount
+                if actualEncoderFrameCount != writerState.frameCount + 1 {
+                    Log.error("[ENCODER-MISMATCH] Encoder frame count (\(actualEncoderFrameCount)) != expected (\(writerState.frameCount + 1)) - encoder may have failed/finalized. Removing broken writer for videoDBID=\(writerState.videoDBID), resolution=\(resolutionKey)", category: .app)
+                    try? await writerState.writer.cancel()
+                    writersByResolution.removeValue(forKey: resolutionKey)
+                    continue
+                }
+
                 writerState.frameCount += 1
 
                 if writerState.width == 0 {
@@ -505,32 +519,43 @@ public actor AppCoordinator {
                     continue
                 }
 
-                // Create buffered frame entry with both ID and raw pixel data
-                let bufferedFrame = BufferedFrame(frameID: frameID, capturedFrame: frame)
+                // Create buffered frame entry with both ID, raw pixel data, and frame index
+                let bufferedFrame = BufferedFrame(frameID: frameID, capturedFrame: frame, frameIndexInSegment: frameIndexInSegment)
 
+                // Add frame to the pending buffer
+                writerState.pendingFrames.append(bufferedFrame)
+
+                // Check if first fragment has been written (makes video readable at all)
                 if !writerState.isReadable {
                     writerState.isReadable = await writerState.writer.hasFragmentWritten
-                    if writerState.isReadable && !writerState.pendingFrames.isEmpty {
-                        Log.info("Video fragment written for \(resolutionKey) - moving \(writerState.pendingFrames.count) buffered frames to recent buffer", category: .app)
-                        // Move pending frames to recent buffer instead of immediately enqueueing
-                        writerState.recentFrameBuffer.append(contentsOf: writerState.pendingFrames)
-                        writerState.pendingFrames = []
+                    if writerState.isReadable {
+                        Log.info("First video fragment written for \(resolutionKey) - frames now readable from disk", category: .app)
                     }
                 }
 
-                if writerState.isReadable {
-                    // Add current frame to recent buffer
-                    writerState.recentFrameBuffer.append(bufferedFrame)
+                // Get the count of frames confirmed flushed to disk
+                // Frames with frameIndex < flushedCount are guaranteed to be readable
+                let flushedCount = await writerState.writer.framesFlushedToDisk
 
-                    // Only enqueue frames that are old enough to be flushed to video
-                    // Keep the most recent ocrFrameBufferSize frames in buffer
-                    while writerState.recentFrameBuffer.count > ocrFrameBufferSize {
-                        let frameToEnqueue = writerState.recentFrameBuffer.removeFirst()
-                        // Pass the original captured frame pixels directly to OCR
-                        try await processingQueue.enqueue(frameID: frameToEnqueue.frameID, capturedFrame: frameToEnqueue.capturedFrame)
+                // Mark frames as readable and enqueue for OCR if they've been flushed to disk
+                while let firstFrame = writerState.pendingFrames.first,
+                      firstFrame.frameIndexInSegment < flushedCount {
+                    let frameToEnqueue = writerState.pendingFrames.removeFirst()
+                    // DEBUG: Log to file when marking readable
+                    let debugMsg = "[READABLE] frameID=\(frameToEnqueue.frameID) frameIndex=\(frameToEnqueue.frameIndexInSegment) flushedCount=\(flushedCount) videoDBID=\(writerState.videoDBID) writerFrameCount=\(writerState.frameCount)\n"
+                    if let data = debugMsg.data(using: .utf8) {
+                        let fileHandle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") ?? {
+                            FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: nil)
+                            return FileHandle(forWritingAtPath: "/tmp/retrace_debug.log")!
+                        }()
+                        fileHandle.seekToEndOfFile()
+                        fileHandle.write(data)
+                        fileHandle.closeFile()
                     }
-                } else {
-                    writerState.pendingFrames.append(bufferedFrame)
+                    // Mark frame as readable now that it's confirmed flushed to video file
+                    try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
+                    // Pass the original captured frame pixels directly to OCR
+                    try await processingQueue.enqueue(frameID: frameToEnqueue.frameID, capturedFrame: frameToEnqueue.capturedFrame)
                 }
 
                 writersByResolution[resolutionKey] = writerState
@@ -577,12 +602,10 @@ public actor AppCoordinator {
                 _ = try await writerState.writer.finalize()
                 Log.info("Video segment for \(resolutionKey) saved (unfinalised, \(writerState.frameCount) frames)", category: .app)
 
-                // After finalization, enqueue all remaining frames with their cached data
+                // After finalization, all frames are readable - mark them and enqueue for OCR
                 if let processingQueue = await services.processingQueue {
                     for bufferedFrame in writerState.pendingFrames {
-                        try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
-                    }
-                    for bufferedFrame in writerState.recentFrameBuffer {
+                        try await services.database.markFrameReadable(frameID: bufferedFrame.frameID)
                         try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
                     }
                 }
@@ -622,7 +645,6 @@ public actor AppCoordinator {
             frameCount: 0,
             isReadable: false,
             pendingFrames: [],
-            recentFrameBuffer: [],
             width: width,
             height: height
         )
@@ -643,19 +665,21 @@ public actor AppCoordinator {
         }
 
         // Clean up WAL session for the old unfinalised video (frames are already in the video file)
-        // The WAL directory is named with the segment tempID (from relativePath), not the database ID
-        // relativePath format: "chunks/YYYYMM/DD/{tempID}" - extract the tempID from the last component
-        let tempID = URL(fileURLWithPath: unfinalised.relativePath).lastPathComponent
+        // The WAL directory is named with the segment timestampID (from relativePath), not the database ID
+        // relativePath format: "chunks/YYYYMM/DD/{timestampID}" - extract the timestampID from the last component
+        let timestampID = URL(fileURLWithPath: unfinalised.relativePath).lastPathComponent
         let walDir = storageDir.deletingLastPathComponent().appendingPathComponent("wal")
-            .appendingPathComponent("active_segment_\(tempID)")
+            .appendingPathComponent("active_segment_\(timestampID)")
         if FileManager.default.fileExists(atPath: walDir.path) {
             try? FileManager.default.removeItem(at: walDir)
-            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id) (tempID: \(tempID))", category: .app)
+            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id) (timestampID: \(timestampID))", category: .app)
         }
 
         // Mark old video as finalized and start fresh
+        // WARNING: This uses the frameCount from the database, which may differ from actual video file frames
+        // if the app crashed before database was updated
         try await services.database.markVideoFinalized(id: unfinalised.id, frameCount: unfinalised.frameCount, fileSize: fileSize)
-        Log.info("Marked previous unfinalised video \(unfinalised.id) as finalized with \(unfinalised.frameCount) frames, \(fileSize) bytes", category: .app)
+        Log.warning("[RESUME-DEBUG] Marked unfinalised video \(unfinalised.id) as finalized with DB frameCount=\(unfinalised.frameCount), fileSize=\(fileSize) bytes - NOTE: actual video frames may differ if app crashed!", category: .app)
 
         let relativePath = await writer.relativePath
         let placeholderSegment = VideoSegment(
@@ -676,33 +700,36 @@ public actor AppCoordinator {
             frameCount: 0,
             isReadable: false,
             pendingFrames: [],
-            recentFrameBuffer: [],
             width: unfinalised.width,
             height: unfinalised.height
         )
     }
 
     private func finalizeWriter(_ writerState: inout VideoWriterState, processingQueue: FrameProcessingQueue?) async throws {
+        // IMPORTANT: Finalize writer FIRST to ensure file is fully flushed to disk,
+        // THEN mark as finalized in database. This prevents a race condition where
+        // the timeline reads an incomplete video file before it's fully written.
+
+        // Log before finalization for debugging
+        let encoderFrameCount = await writerState.writer.frameCount
+        Log.info("[FINALIZE-DEBUG] About to finalize videoDBID=\(writerState.videoDBID), writerState.frameCount=\(writerState.frameCount), encoderFrameCount=\(encoderFrameCount)", category: .app)
+
+        _ = try await writerState.writer.finalize()
         let fileSize = await writerState.writer.currentFileSize
         try await services.database.markVideoFinalized(id: writerState.videoDBID, frameCount: writerState.frameCount, fileSize: fileSize)
-        _ = try await writerState.writer.finalize()
-        Log.debug("Video segment finalized with DB ID: \(writerState.videoDBID), \(writerState.frameCount) frames, \(fileSize) bytes", category: .app)
+        Log.info("[FINALIZE-DEBUG] Marked videoDBID=\(writerState.videoDBID) as finalized with frameCount=\(writerState.frameCount), fileSize=\(fileSize) bytes", category: .app)
 
-        // After finalization, enqueue all remaining frames with their cached data
+        // After finalization, all frames are now readable from the video file
+        // Mark them as readable and enqueue for OCR processing
         if let processingQueue = processingQueue {
-            // Enqueue any pending frames (from before first fragment)
-            for bufferedFrame in writerState.pendingFrames {
-                try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
-            }
-            writerState.pendingFrames = []
-
-            // Enqueue buffered recent frames
-            if !writerState.recentFrameBuffer.isEmpty {
-                Log.debug("Enqueueing \(writerState.recentFrameBuffer.count) buffered frames after finalization", category: .app)
-                for bufferedFrame in writerState.recentFrameBuffer {
+            // Enqueue any pending frames that weren't yet marked readable
+            if !writerState.pendingFrames.isEmpty {
+                Log.debug("Enqueueing \(writerState.pendingFrames.count) pending frames after finalization", category: .app)
+                for bufferedFrame in writerState.pendingFrames {
+                    try await services.database.markFrameReadable(frameID: bufferedFrame.frameID)
                     try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
                 }
-                writerState.recentFrameBuffer = []
+                writerState.pendingFrames = []
             }
         }
     }

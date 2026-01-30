@@ -25,25 +25,29 @@ public struct TimelineTapeView: View {
         -(TimelineScaleFactor.controlButtonSize * 3 + TimelineScaleFactor.controlSpacing)
     }
 
-    // MARK: - Body 
+    // MARK: - Body 
 
-    public var body: some View { 
+    public var body: some View {
         ZStack {
             // Background (tap to clear selection)
             Rectangle()
                 .fill(Color.clear)
                 .contentShape(Rectangle())
-                .onTapGesture { 
+                .onTapGesture {
                     viewModel.clearSelection()
                 }
 
             // Scrollable tape content (right-click handled per-frame)
+            // Use id to force view recreation on peek toggle, enabling transition animation
             tapeContent
+                .id("tape-\(viewModel.isPeeking)")
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
 
             // Fixed center playhead (on top of everything)
             playhead
         }
         .frame(height: tapeHeight)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.isPeeking)
     }
 
     // MARK: - Tape Content
@@ -320,30 +324,29 @@ public struct TimelineTapeView: View {
             let centerX = geometry.size.width / 2
 
             ZStack {
-                // Datetime button (truly centered) with app badge and Go to Now button overlays
-                DatetimeButton(viewModel: viewModel)
-                    .overlay(alignment: .leading) {
-                        // Current app badge - shows the active app's icon
-                        // Positioned to the left of the datetime button without shifting it
-                        CurrentAppBadge(viewModel: viewModel)
-                            .offset(x: currentAppBadgeOffset)
-                    }
-                    .overlay(alignment: .trailing) {
-                        // Go to Now button - fades in when not at most recent frame
-                        // Refresh button - shows when already at the most recent frame
-                        // Positioned to the right of the datetime button without shifting it
+                // Center controls: Filter + Datetime + GoToNow/Refresh
+                // Datetime stays centered, filter on left, go-to-now on right
+                HStack(spacing: TimelineScaleFactor.controlSpacing) {
+                    // Filter button (left of datetime)
+                    FilterAndPeekGroup(viewModel: viewModel)
+
+                    // Datetime button (center)
+                    DatetimeButton(viewModel: viewModel)
+
+                    // Go to Now / Refresh button (right of datetime) - same width as left side
+                    Group {
                         if viewModel.shouldShowGoToNow {
                             GoToNowButton(viewModel: viewModel)
-                                .offset(x: TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing)
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         } else {
                             RefreshButton(viewModel: viewModel)
-                                .offset(x: TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing)
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
                     }
+                    .frame(width: TimelineScaleFactor.controlButtonSize * 2 + 6 + 8, alignment: .leading) // Match left side width
                     .animation(.easeInOut(duration: 0.2), value: viewModel.shouldShowGoToNow)
-                    .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
+                }
+                .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
                 // Left side controls (hide UI + search)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
@@ -352,10 +355,9 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
-                // Right side controls (filter + peek + zoom + more options)
-                // Fixed width to prevent layout shift when peek button appears/disappears
+                // Right side controls (app badge + zoom + more options)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
-                    FilterAndPeekGroup(viewModel: viewModel)
+                    CurrentAppBadge(viewModel: viewModel)
                     ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
@@ -647,10 +649,12 @@ struct CurrentAppBadge: View {
                     withAnimation(.easeOut(duration: 0.15)) {
                         isHovering = hovering
                     }
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
+                    if hasOpenableURL {
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
                     }
                 }
                 .id(bundleID)
@@ -894,6 +898,7 @@ struct FilterButton: View {
 }
 
 /// Groups the peek button (left) with the filter button (right) when filters are active
+/// Filter stays anchored; peek slides in/out on the left without shifting filter.
 struct FilterAndPeekGroup: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
 
@@ -901,31 +906,44 @@ struct FilterAndPeekGroup: View {
         viewModel.activeFilterCount > 0 || viewModel.isPeeking
     }
 
+    private let spacing: CGFloat = 6
+
     var body: some View {
-        HStack(spacing: 6) {
-            // Peek button appears to the LEFT of filter when filters are active
+        ZStack(alignment: .trailing) {
+            // Background capsule sized as if both buttons exist, so nothing jumps
+            Capsule()
+                .fill(Color.white.opacity(showPeekButton ? 0.08 : 0))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(showPeekButton ? 0.15 : 0), lineWidth: 0.5)
+                )
+                .frame(
+                    width: showPeekButton
+                        ? (TimelineScaleFactor.controlButtonSize * 2 + spacing + 8) // 2 buttons + spacing + padding
+                        : TimelineScaleFactor.controlButtonSize,                   // just filter button
+                    height: TimelineScaleFactor.controlButtonSize + (showPeekButton ? 8 : 0)
+                )
+                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showPeekButton)
+
+            // Anchored filter button (never moves)
+            FilterButton(viewModel: viewModel)
+                .padding(showPeekButton ? 4 : 0)
+
+            // Peek button slides in to the LEFT of filter, without affecting layout
             if showPeekButton {
                 PeekButton(viewModel: viewModel)
+                    .padding(4)
+                    .offset(x: -(TimelineScaleFactor.controlButtonSize + spacing))
                     .transition(.asymmetric(
-                        insertion: .move(edge: .trailing).combined(with: .opacity),
-                        removal: .move(edge: .trailing).combined(with: .opacity)
+                        insertion: .move(edge: .leading).combined(with: .opacity),
+                        removal: .move(edge: .leading).combined(with: .opacity)
                     ))
+                    .zIndex(1)
             }
-
-            FilterButton(viewModel: viewModel)
         }
-        .padding(showPeekButton ? 4 : 0)
-        .background(
-            Group {
-                if showPeekButton {
-                    Capsule()
-                        .fill(Color.white.opacity(0.08))
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                        )
-                }
-            }
+        .frame(
+            width: TimelineScaleFactor.controlButtonSize * 2 + spacing + 8, // Always reserve space for both buttons
+            alignment: .trailing
         )
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showPeekButton)
     }

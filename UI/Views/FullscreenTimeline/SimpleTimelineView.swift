@@ -4,6 +4,27 @@ import Shared
 import App
 import UniformTypeIdentifiers
 
+// MARK: - Debug Logging Helper
+
+/// Write debug message to /tmp/retrace_debug.log
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
 public struct SimpleTimelineView: View {
@@ -141,7 +162,7 @@ public struct SimpleTimelineView: View {
                         // OCR status indicator (only visible when OCR is in progress)
                         OCRStatusIndicator(viewModel: viewModel)
                         #if DEBUG
-                        DeveloperActionsMenu(viewModel: viewModel)
+                        DeveloperActionsMenu(viewModel: viewModel, onClose: onClose)
                         #endif
                         Spacer()
                             .allowsHitTesting(false)
@@ -264,14 +285,14 @@ public struct SimpleTimelineView: View {
                         }
 
                     VStack {
-                        Spacer()
+                        Spacer() 
                         HStack {
                             Spacer()
                             FilterPanel(viewModel: viewModel)
+                                .fixedSize()
                         }
-
                     }
-                    .padding(.trailing, TimelineScaleFactor.rightControlsXOffset + 20)
+                    .padding(.trailing, geometry.size.width / 2 + TimelineScaleFactor.controlSpacing + 60)
                     .padding(.bottom, TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + 75)
                     .transition(.opacity.combined(with: .offset(y: 15)))
 
@@ -281,7 +302,7 @@ public struct SimpleTimelineView: View {
 
                 // Timeline segment context menu (for right-click on timeline tape)
                 // Placed at the end of ZStack to ensure it renders above all other content
-                if viewModel.showTimelineContextMenu {
+                 if viewModel.showTimelineContextMenu {
                     TimelineSegmentContextMenu(
                         viewModel: viewModel,
                         isPresented: $viewModel.showTimelineContextMenu,
@@ -348,46 +369,88 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
-        if let videoInfo = viewModel.currentVideoInfo {
-            // Video-based frame (Rewind) with URL overlay
-            // Check if video file exists AND has playable content (not still buffering initial fragments)
+        let _ = debugLog("[FrameDisplay] frameNotReady=\(viewModel.frameNotReady), hasVideoInfo=\(viewModel.currentVideoInfo != nil), hasImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), frameID=\(viewModel.currentTimelineFrame?.frame.id.value ?? -1), processingStatus=\(viewModel.currentTimelineFrame?.processingStatus ?? -1)")
+        if viewModel.frameNotReady {
+            // Frame not yet written to video file - show placeholder
+            let _ = debugLog("[FrameDisplay] -> showing frameNotReady placeholder")
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Frame not ready yet")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("Still encoding...")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if let videoInfo = viewModel.currentVideoInfo {
+            let _ = debugLog("[FrameDisplay] -> showing video path=\(videoInfo.videoPath.suffix(30)), frameIndex=\(videoInfo.frameIndex), isFinalized=\(videoInfo.isVideoFinalized)")
+            // Video-based frame with URL overlay
+            // Check if video is finalized OR has enough data for playback
             let path = videoInfo.videoPath
             let pathWithExt = path + ".mp4"
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ??
-                           (try? FileManager.default.attributesOfItem(atPath: pathWithExt)[.size] as? Int64) ?? 0
 
-            // With movieFragmentInterval = 0.1s and ~3 frames needed before first fragment is written,
-            // a typical fragment with 1920x1080 HEVC frames is ~40-50KB minimum per fragment.
-            // However, to avoid corrupted/incomplete fragments, require at least 2 fragments written.
-            // Observed: Fragment 2 written at ~280KB total. Use 200KB threshold for safety.
-            let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
-            let fileReady = fileSize >= minFragmentSize
+            // Check if file exists FIRST - before trying to load it
+            let fileExists = FileManager.default.fileExists(atPath: path) || FileManager.default.fileExists(atPath: pathWithExt)
 
-            if fileReady {
-                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                    SimpleVideoFrameView(videoInfo: videoInfo, forceReload: .init(
-                        get: { viewModel.forceVideoReload },
-                        set: { viewModel.forceVideoReload = $0 }
-                    ))
-                }
-            } else {
-                let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet), showing placeholder", category: .ui)
-                // Video file not ready - show friendly message
+            if !fileExists {
+                // Video file is missing - show error message
+                let _ = debugLog("[FrameDisplay] -> video file missing: \(path)")
                 VStack(spacing: .spacingM) {
-                    Image(systemName: "clock")
+                    Image(systemName: "exclamationmark.triangle")
                         .font(.retraceDisplay)
                         .foregroundColor(.white.opacity(0.3))
-                    Text("Frame not ready yet")
+                    Text("Could not find frame")
                         .font(.retraceBody)
                         .foregroundColor(.white.opacity(0.5))
-                    Text("Relaunch timeline in a few seconds")
+                    Text("Video file missing")
                         .font(.retraceCaption)
                         .foregroundColor(.white.opacity(0.3))
+                }
+            } else {
+                let fileSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ??
+                               (try? FileManager.default.attributesOfItem(atPath: pathWithExt)[.size] as? Int64) ?? 0
+
+                // If video is finalized (processingState = 0), trust it's readable regardless of size.
+                // Otherwise, require minimum file size to ensure fragments are written.
+                // With movieFragmentInterval = 0.1s and ~3 frames needed before first fragment is written,
+                // a typical fragment with 1920x1080 HEVC frames is ~40-50KB minimum per fragment.
+                // However, to avoid corrupted/incomplete fragments, require at least 2 fragments written.
+                // Observed: Fragment 2 written at ~280KB total. Use 200KB threshold for safety.
+                let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
+                let fileReady = videoInfo.isVideoFinalized || fileSize >= minFragmentSize
+
+                if fileReady {
+                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                        SimpleVideoFrameView(videoInfo: videoInfo, forceReload: .init(
+                            get: { viewModel.forceVideoReload },
+                            set: { viewModel.forceVideoReload = $0 }
+                        ), onLoadFailed: {
+                            viewModel.frameNotReady = true
+                        }, onLoadSuccess: {
+                            viewModel.frameNotReady = false
+                        })
+                    }
+                } else {
+                    let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet) and not finalized, showing placeholder. Size=\(fileSize), isFinalized=\(videoInfo.isVideoFinalized)", category: .ui)
+                    // Video file not ready - show friendly message
+                    VStack(spacing: .spacingM) {
+                        Image(systemName: "clock")
+                            .font(.retraceDisplay)
+                            .foregroundColor(.white.opacity(0.3))
+                        Text("Frame not ready yet")
+                            .font(.retraceBody)
+                            .foregroundColor(.white.opacity(0.5))
+                        Text("Relaunch timeline in a few seconds")
+                            .font(.retraceCaption)
+                            .foregroundColor(.white.opacity(0.3))
+                    }
                 }
             }
         } else if let image = viewModel.currentImage {
             // Static image (Retrace) with URL overlay
-            // let _ = print("[SimpleTimelineView] Showing static image")
+            let _ = debugLog("[FrameDisplay] -> showing static image")
             FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                 Image(nsImage: image)
                     .resizable()
@@ -395,7 +458,7 @@ public struct SimpleTimelineView: View {
             }
         } else if !viewModel.isLoading {
             // Empty state - no video or image available
-            // let _ = print("[SimpleTimelineView] Empty state - no video or image, frames.isEmpty=\(viewModel.frames.isEmpty)")
+            let _ = debugLog("[FrameDisplay] -> showing EMPTY state (black screen)")
             VStack(spacing: .spacingM) {
                 Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
                     .font(.retraceDisplay)
@@ -680,13 +743,21 @@ struct PeekModeBanner: View {
 struct SimpleVideoFrameView: NSViewRepresentable {
     let videoInfo: FrameVideoInfo
     @Binding var forceReload: Bool
+    var onLoadFailed: (() -> Void)?
+    var onLoadSuccess: (() -> Void)?
 
     func makeNSView(context: Context) -> DoubleBufferedVideoView {
         let containerView = DoubleBufferedVideoView()
+        containerView.onLoadFailed = onLoadFailed
+        containerView.onLoadSuccess = onLoadSuccess
         return containerView
     }
 
     func updateNSView(_ containerView: DoubleBufferedVideoView, context: Context) {
+        // Update callbacks in case they changed
+        containerView.onLoadFailed = onLoadFailed
+        containerView.onLoadSuccess = onLoadSuccess
+
         let isWindowVisible = containerView.window?.isVisible ?? false
         let needsForceReload = forceReload
 
@@ -702,8 +773,11 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         let effectivePath = context.coordinator.currentVideoPath
         let effectiveFrameIdx = context.coordinator.currentFrameIndex
 
+        debugLog("[VideoView] updateNSView: effectivePath=\(effectivePath?.suffix(20) ?? "nil"), newPath=\(videoInfo.videoPath.suffix(20)), effectiveFrameIdx=\(effectiveFrameIdx ?? -1), newFrameIdx=\(videoInfo.frameIndex)")
+
         // If same video and same frame, nothing to do
         if effectivePath == videoInfo.videoPath && effectiveFrameIdx == videoInfo.frameIndex {
+            debugLog("[VideoView] -> same video+frame, skipping")
             return
         }
 
@@ -715,23 +789,25 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         // If same video, just seek on the active player (fast path)
         if effectivePath == videoInfo.videoPath {
             let time = videoInfo.frameTimeCMTime
+            debugLog("[VideoView] -> same video, seeking to frame \(videoInfo.frameIndex)")
             containerView.seekActivePlayer(to: time)
             return
         }
 
-        Log.debug("[VideoView] Loading new video: \(videoInfo.videoPath.suffix(30))", category: .ui)
+        debugLog("[VideoView] -> DIFFERENT video, loading new: \(videoInfo.videoPath.suffix(30))")
 
-        // Different video - use double-buffering
+        // Different video - update coordinator state and load
         context.coordinator.currentVideoPath = videoInfo.videoPath
 
-        // Resolve actual video path
+        // Resolve actual video path (file existence already checked in frameDisplay)
         var actualVideoPath = videoInfo.videoPath
         if !FileManager.default.fileExists(atPath: actualVideoPath) {
             let pathWithExtension = actualVideoPath + ".mp4"
             if FileManager.default.fileExists(atPath: pathWithExtension) {
                 actualVideoPath = pathWithExtension
             } else {
-                Log.error("[SimpleVideoFrameView] Video file not found: \(videoInfo.videoPath)", category: .app)
+                // This shouldn't happen since we check in frameDisplay, but handle gracefully
+                debugLog("[VideoView] ERROR: Video file not found (unexpected): \(videoInfo.videoPath)")
                 return
             }
         }
@@ -793,6 +869,12 @@ class DoubleBufferedVideoView: NSView {
     /// Generation counter to invalidate stale async callbacks
     /// Incremented each time a new load is initiated
     private var loadGeneration: UInt64 = 0
+
+    /// Callback when video loading fails (e.g., frame not yet in video file)
+    var onLoadFailed: (() -> Void)?
+
+    /// Callback when video loading succeeds
+    var onLoadSuccess: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -867,6 +949,8 @@ class DoubleBufferedVideoView: NSView {
 
     /// Load a video into the buffer player and swap when ready
     func loadVideoIntoBuffer(url: URL, seekTime: CMTime, frameIndex: Int) {
+        debugLog("[VideoView] loadVideoIntoBuffer called: url=\(url.lastPathComponent), frameIndex=\(frameIndex)")
+
         // Increment generation to invalidate any pending async callbacks
         loadGeneration &+= 1
         let currentGeneration = loadGeneration
@@ -885,7 +969,7 @@ class DoubleBufferedVideoView: NSView {
 
         bufferPlayer?.replaceCurrentItem(with: playerItem)
 
-        Log.debug("[VideoView] Starting load gen=\(currentGeneration) for frame \(frameIndex), buffer=\(isPlayerAActive ? "B" : "A")", category: .ui)
+        debugLog("[VideoView] Starting load gen=\(currentGeneration) for frame \(frameIndex), buffer=\(isPlayerAActive ? "B" : "A")")
 
         // Observe when buffer player is ready
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
@@ -897,43 +981,53 @@ class DoubleBufferedVideoView: NSView {
                 return
             }
 
-            Log.debug("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex) gen=\(currentGeneration)", category: .ui)
+            debugLog("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex) gen=\(currentGeneration)")
 
             if item.status == .failed {
-                Log.error("[VideoView] Buffer player FAILED: \(item.error?.localizedDescription ?? "unknown")", category: .ui)
+                debugLog("[VideoView] Buffer player FAILED: \(item.error?.localizedDescription ?? "unknown")")
+                DispatchQueue.main.async {
+                    self.onLoadFailed?()
+                }
                 return
             }
 
             guard item.status == .readyToPlay else { return }
 
+            debugLog("[VideoView] Buffer readyToPlay, seeking to frame \(frameIndex)")
+
             // Seek to target frame
             bufferPlayer?.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                guard let self = self, finished else { return }
-
-                // Re-check generation after async seek completes
-                guard currentGeneration == self.loadGeneration else {
-                    Log.debug("[VideoView] Ignoring stale seek callback gen=\(currentGeneration), current=\(self.loadGeneration)", category: .ui)
+                guard let self = self, finished else {
+                    debugLog("[VideoView] Seek failed or self is nil, finished=\(finished)")
                     return
                 }
 
-                Log.debug("[VideoView] Buffer ready, swapping players for frame \(frameIndex) gen=\(currentGeneration)", category: .ui)
+                // Re-check generation after async seek completes
+                guard currentGeneration == self.loadGeneration else {
+                    debugLog("[VideoView] Ignoring stale seek callback gen=\(currentGeneration), current=\(self.loadGeneration)")
+                    return
+                }
+
+                debugLog("[VideoView] Seek complete, swapping players for frame \(frameIndex) gen=\(currentGeneration)")
 
                 DispatchQueue.main.async {
                     // Final generation check on main thread before swap
                     guard currentGeneration == self.loadGeneration else {
-                        Log.debug("[VideoView] Ignoring stale swap gen=\(currentGeneration), current=\(self.loadGeneration)", category: .ui)
+                        debugLog("[VideoView] Ignoring stale swap gen=\(currentGeneration), current=\(self.loadGeneration)")
                         return
                     }
 
                     // Verify we're swapping to the expected player
                     // If state drifted (shouldn't happen with generation check, but safety first)
                     guard self.isPlayerAActive != expectedActiveAfterSwap else {
-                        Log.debug("[VideoView] Player already in expected state, skipping swap", category: .ui)
+                        debugLog("[VideoView] Player already in expected state, skipping swap")
                         return
                     }
 
+                    debugLog("[VideoView] SWAPPING players now for frame \(frameIndex)")
                     bufferPlayer?.pause()
                     self.swapPlayers()
+                    self.onLoadSuccess?()
                 }
             }
         }
@@ -2325,19 +2419,13 @@ class TextSelectionView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
 
-        // Note: Zoom region drag preview is now handled by ZoomRegionDragPreview in SwiftUI
-
-        // Lighter blue for text selection highlight
-        let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 0.4)
-
-        // Draw character-level selections
+        // Collect highlight rects for selected nodes
+        var highlightRects: [NSRect] = []
         for node in nodeData {
             guard let range = node.selectionRange, range.end > range.start else { continue }
-
             let textLength = node.text.count
             guard textLength > 0 else { continue }
 
-            // Calculate the portion of the node rect to highlight
             let startFraction = CGFloat(range.start) / CGFloat(textLength)
             let endFraction = CGFloat(range.end) / CGFloat(textLength)
 
@@ -2347,11 +2435,30 @@ class TextSelectionView: NSView {
                 width: node.rect.width * (endFraction - startFraction),
                 height: node.rect.height
             )
+            highlightRects.append(highlightRect)
+        }
 
-            selectionColor.setFill()
-            let path = NSBezierPath(roundedRect: highlightRect, xRadius: 2, yRadius: 2)
+        guard !highlightRects.isEmpty else { return }
+
+        // Use transparency layer to prevent opacity stacking when rects overlap
+        // All rects are composited together first, then the alpha is applied once to the result
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        context.saveGState()
+        context.setAlpha(0.4)  // Apply alpha to the entire layer, not per-rect
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
+
+        // Draw all rects with solid color (alpha will be applied to the layer)
+        let selectionColor = NSColor(red: 100/255, green: 160/255, blue: 230/255, alpha: 1.0)
+        selectionColor.setFill()
+
+        for rect in highlightRects {
+            let path = NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2)
             path.fill()
         }
+
+        context.endTransparencyLayer()
+        context.restoreGState()
     }
 }
 
@@ -2600,6 +2707,22 @@ struct DebugFrameIDBadge: View {
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
                     }
+
+                    // Debug: Show processing status
+                    if let timelineFrame = viewModel.currentTimelineFrame {
+                        let status = timelineFrame.processingStatus
+                        let statusText = switch status {
+                            case 0: "pending"
+                            case 1: "processing"
+                            case 2: "completed"
+                            case 3: "failed"
+                            case 4: "not readable"
+                            default: "unknown"
+                        }
+                        Text("p=\(status) (\(statusText))")
+                            .font(.retraceMonoSmall)
+                            .foregroundColor(status == 4 ? .red.opacity(0.8) : status == 2 ? .green.opacity(0.8) : .yellow.opacity(0.8))
+                    }
                 }
             }
             .padding(.horizontal, 10)
@@ -2723,6 +2846,7 @@ struct OCRStatusIndicator: View {
 /// Only visible in DEBUG builds, positioned in top-left corner beside the frame ID badge
 struct DeveloperActionsMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    let onClose: () -> Void
     @State private var isHovering = false
     @State private var showReprocessFeedback = false
 
@@ -2756,20 +2880,74 @@ struct DeveloperActionsMenu: View {
 
             Divider()
 
-            // Show Video Placements toggle
+            // Show/Hide Video Placements toggle
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     viewModel.showVideoBoundaries.toggle()
                 }
             }) {
-                HStack {
-                    Label("Show Video Placements", systemImage: "film")
-                    if viewModel.showVideoBoundaries {
-                        Spacer()
-                        Image(systemName: "checkmark")
+                Label(
+                    viewModel.showVideoBoundaries ? "Hide Video Placements" : "Show Video Placements",
+                    systemImage: "film"
+                )
+            }
+
+            Divider()
+
+            // Open Video File button - opens in QuickTime at the current frame's timestamp
+            Button(action: {
+                guard let videoInfo = viewModel.currentVideoInfo else { return }
+                let originalPath = videoInfo.videoPath
+                let timeInSeconds = videoInfo.timeInSeconds
+
+                // Close the timeline before opening the video
+                onClose()
+
+                // Small delay to allow the timeline to fully close before opening QuickTime
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    // Create a hard link with .mp4 extension so QuickTime recognizes the format
+                    // (files are stored without extension but are valid MP4 containers)
+                    // Hard links work better than symlinks with QuickTime
+                    let tempDir = FileManager.default.temporaryDirectory
+                    let filename = (originalPath as NSString).lastPathComponent
+                    let tempURL = tempDir.appendingPathComponent("\(filename).mp4")
+
+                    do {
+                        // Remove existing file if present
+                        if FileManager.default.fileExists(atPath: tempURL.path) {
+                            try FileManager.default.removeItem(at: tempURL)
+                        }
+                        // Create hard link with .mp4 extension (no data duplication)
+                        try FileManager.default.linkItem(atPath: originalPath, toPath: tempURL.path)
+                    } catch {
+                        Log.error("[Dev] Failed to create hard link for video: \(error)", category: .ui)
+                        return
+                    }
+
+                    // Use AppleScript to open QuickTime and seek to the specific time
+                    let script = """
+                        tell application "QuickTime Player"
+                            activate
+                            open POSIX file "\(tempURL.path)"
+                            delay 0.5
+                            tell front document
+                                set current time to \(timeInSeconds)
+                            end tell
+                        end tell
+                        """
+
+                    if let appleScript = NSAppleScript(source: script) {
+                        var error: NSDictionary?
+                        appleScript.executeAndReturnError(&error)
+                        if let error = error {
+                            Log.error("[Dev] AppleScript error: \(error)", category: .ui)
+                        }
                     }
                 }
+            }) {
+                Label("Open Video File", systemImage: "play.rectangle")
             }
+            .disabled(viewModel.currentVideoInfo == nil)
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "ant.fill")
@@ -3496,14 +3674,9 @@ struct FilterPanel: View {
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
 
-    /// Whether colored borders are enabled
-    private var showColoredBorders: Bool {
-        filterPanelSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
-    }
-
-    /// Border color based on user's color theme (or neutral if disabled)
+    /// Border color for filter panel
     private var themeBorderColor: Color {
-        showColoredBorders ? MilestoneCelebrationManager.getCurrentTheme().controlBorderColor : Color.white.opacity(0.15)
+        Color.white.opacity(0.15)
     }
 
     /// Label for apps filter chip (uses pending criteria)

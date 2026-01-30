@@ -27,6 +27,10 @@ public actor HEVCEncoder {
     private var frameCount: Int = 0
     private var fragmentCount: Int = 0
 
+    // Track how many frames have been confirmed flushed to disk
+    // This is updated when a fragment write is detected (file size increase > 1KB)
+    private var flushedFrameCount: Int = 0
+
     public init() {}
 
     /// Check if hardware encoding is available for the given codec
@@ -167,12 +171,14 @@ public actor HEVCEncoder {
         self.frameCount = 0
         self.fragmentCount = 0
         self.lastLoggedFileSize = 0
+        self.flushedFrameCount = 0
 
         Log.info("Video encoder initialized with movieFragmentInterval=0.1s (frames readable after ~3 captures)", category: .storage)
     }
 
     public func encode(pixelBuffer: CVPixelBuffer, timestamp: CMTime) async throws {
         guard var input = videoInput, var adaptor = adaptor, !isFinalized else {
+            Log.error("[HEVCEncoder] encode() called but encoder is in bad state: videoInput=\(videoInput != nil), adaptor=\(self.adaptor != nil), isFinalized=\(isFinalized), frameCount=\(frameCount), outputURL=\(outputURL?.lastPathComponent ?? "nil")", category: .storage)
             throw StorageModuleError.encodingFailed(underlying: "Encoder not initialized or finalized")
         }
 
@@ -196,7 +202,7 @@ public actor HEVCEncoder {
         while !input.isReadyForMoreMediaData {
             waitIterations += 1
             if waitIterations >= maxWaitIterations {
-                Log.error("Encoder timeout: isReadyForMoreMediaData never became true after 5s, auto-finalizing", category: .storage)
+                Log.error("[HEVCEncoder] Encoder timeout: isReadyForMoreMediaData never became true after 5s, auto-finalizing. frameCount=\(frameCount), outputURL=\(outputURL?.lastPathComponent ?? "nil")", category: .storage)
                 try await finalize()
                 throw StorageModuleError.encodingFailed(underlying: "Encoder timeout waiting for input ready - auto-finalized")
             }
@@ -204,6 +210,7 @@ public actor HEVCEncoder {
         }
 
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {
+            Log.error("[HEVCEncoder] adaptor.append() failed at frameCount=\(frameCount), timestamp=\(timestamp.seconds)s, writerStatus=\(assetWriter?.status.rawValue ?? -1), outputURL=\(outputURL?.lastPathComponent ?? "nil")", category: .storage)
             throw StorageModuleError.encodingFailed(underlying: "Failed to append pixel buffer")
         }
 
@@ -227,7 +234,26 @@ public actor HEVCEncoder {
             // Log when we detect a new fragment has been flushed to disk
             if sizeIncrease > 1024 && lastLoggedFileSize > 0 {
                 fragmentCount += 1
-                Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(frameCount) frames, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
+                // The fragment we just detected was written BEFORE this frame's append
+                // With B-frame reordering, we can't be certain the previous frame is in the fragment either
+                // frameCount is already incremented (includes current frame), so:
+                // - frameCount-1 = index of current frame (not yet flushed)
+                // - frameCount-2 = index of previous frame (may not be flushed due to B-frames)
+                // To be safe, only mark frames up to frameCount-2 as flushed
+                // This means indices 0 to frameCount-3 are readable (< frameCount-2)
+                flushedFrameCount = max(0, frameCount - 2)
+                // DEBUG: Log to file
+                let debugMsg = "[FRAGMENT] fragment=\(fragmentCount) frameCount=\(frameCount) flushedFrameCount=\(flushedFrameCount) sizeIncrease=\(sizeIncrease) file=\(url.lastPathComponent)\n"
+                if let data = debugMsg.data(using: .utf8) {
+                    let fileHandle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") ?? {
+                        FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: nil)
+                        return FileHandle(forWritingAtPath: "/tmp/retrace_debug.log")!
+                    }()
+                    fileHandle.seekToEndOfFile()
+                    fileHandle.write(data)
+                    fileHandle.closeFile()
+                }
+                Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(flushedFrameCount) frames flushed, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
                 lastLoggedFileSize = currentSize
             } else if lastLoggedFileSize == 0 && currentSize > 0 {
                 // First write - initialization
@@ -240,6 +266,8 @@ public actor HEVCEncoder {
         guard let writer = assetWriter, let input = videoInput, !isFinalized else { return }
 
         let preSize = (try? FileManager.default.attributesOfItem(atPath: outputURL?.path ?? "")[.size] as? Int64) ?? 0
+
+        Log.info("[HEVCEncoder] Finalizing: outputURL=\(outputURL?.lastPathComponent ?? "nil"), frameCount=\(frameCount), fragmentCount=\(fragmentCount), preFinalizeSize=\(preSize / 1024)KB, writerStatus=\(writer.status.rawValue)", category: .storage)
 
         isFinalized = true
         input.markAsFinished()
@@ -316,5 +344,11 @@ public actor HEVCEncoder {
     /// The fragmented MP4 is only readable after the first fragment is flushed
     public func hasFragmentWritten() -> Bool {
         return fragmentCount > 0
+    }
+
+    /// Returns the number of frames that have been confirmed flushed to disk
+    /// Frames with index < this value are guaranteed to be readable from the video file
+    public func framesFlushedToDisk() -> Int {
+        return flushedFrameCount
     }
 }

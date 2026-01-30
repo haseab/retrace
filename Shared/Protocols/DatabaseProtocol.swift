@@ -48,8 +48,19 @@ public protocol DatabaseProtocol: Actor {
     /// Check if a frame exists at the given timestamp (to the second)
     func frameExistsAtTimestamp(_ timestamp: Date) async throws -> Bool
 
+    /// Get frame ID at the given timestamp (to the second), returns nil if not found
+    func getFrameIDAtTimestamp(_ timestamp: Date) async throws -> Int64?
+
     /// Update frame's videoId and videoFrameIndex after video encoding
     func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws
+
+    /// Get processing status for multiple frames in a single query
+    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int]
+
+    /// Mark frame as readable from video file (processingStatus 4 -> 0)
+    /// Called when frame is confirmed to be written to video file
+    func markFrameReadable(frameID: Int64) async throws
 
     // MARK: - Video Segment Operations (Video Files)
 
@@ -84,6 +95,11 @@ public protocol DatabaseProtocol: Actor {
     /// Mark a video as finalized (complete, no more frames will be added)
     /// Also updates uploadedAt timestamp and fileSize
     func markVideoFinalized(id: Int64, frameCount: Int, fileSize: Int64) async throws
+
+    /// Finalize all orphaned videos (processingState=1) that have no active WAL session
+    /// Called during app startup after WAL recovery to clean up videos from dev restarts or crashes
+    /// Returns the number of videos finalized
+    func finalizeOrphanedVideos(activeVideoIDs: Set<Int64>) async throws -> Int
 
     /// Update video segment with current frame count
     func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64, frameCount: Int) async throws

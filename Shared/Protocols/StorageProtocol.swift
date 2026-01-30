@@ -29,6 +29,10 @@ public protocol StorageProtocol: Actor {
     /// Check if a segment file exists
     func segmentExists(id: VideoSegmentID) async throws -> Bool
 
+    /// Count the number of readable frames in an existing video file
+    /// Returns 0 if the file doesn't exist or is unreadable
+    func countFramesInSegment(id: VideoSegmentID) async throws -> Int
+
     // MARK: - Storage Management
 
     /// Get total storage used in bytes
@@ -77,6 +81,10 @@ public protocol SegmentWriter: Actor {
     /// Returns true if at least one fragment has been written to disk
     /// The fragmented MP4 is only readable after the first fragment is flushed
     var hasFragmentWritten: Bool { get }
+
+    /// Number of frames that have been confirmed flushed to disk
+    /// Frames with frameIndex < this value are guaranteed to be readable from the video file
+    var framesFlushedToDisk: Int { get }
 
     /// Append a frame to the segment
     func appendFrame(_ frame: CapturedFrame) async throws

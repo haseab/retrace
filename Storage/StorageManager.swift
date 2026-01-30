@@ -66,19 +66,19 @@ public actor StorageManager: StorageProtocol {
             throw StorageError.directoryCreationFailed(path: "Storage not initialized")
         }
 
-        // Generate a unique temporary ID based on current time (milliseconds since epoch)
+        // Generate a unique ID based on current time (milliseconds since epoch)
         // Add a counter to ensure uniqueness even if two writers are created in the same millisecond
         // This prevents race conditions between recovery and main pipeline
         let now = Date()
         segmentCounter += 1
         let baseID = Int64(now.timeIntervalSince1970 * 1000)
-        let tempID = VideoSegmentID(value: baseID + Int64(segmentCounter % 1000))
-        let fileURL = try await directoryManager.segmentURL(for: tempID, date: now)
+        let timestampID = VideoSegmentID(value: baseID + Int64(segmentCounter % 1000))
+        let fileURL = try await directoryManager.segmentURL(for: timestampID, date: now)
         let relative = await directoryManager.relativePath(from: fileURL)
 
         // Use IncrementalSegmentWriter with WAL support
         return try IncrementalSegmentWriter(
-            segmentID: tempID,
+            segmentID: timestampID,
             fileURL: fileURL,
             relativePath: relative,
             walManager: walManager,
@@ -137,6 +137,11 @@ public actor StorageManager: StorageProtocol {
 
         // Return requested frame
         guard frameIndex < frames.count else {
+            // Frame not yet available in video file - this can happen with actively-written fragmented MP4s
+            // where the database has more frame records than AVAssetReader can decode from the file.
+            // Don't cache this incomplete result - clear cache so next read re-decodes.
+            frameCache.removeValue(forKey: segmentIDValue)
+            Log.warning("[StorageManager] Frame index \(frameIndex) out of range (0..<\(frames.count)) for segment \(segmentID.value) - video may still be writing, cache cleared", category: .storage)
             throw StorageError.fileReadFailed(
                 path: segmentURL.path,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
@@ -172,9 +177,20 @@ public actor StorageManager: StorageProtocol {
 
         let asset = AVAsset(url: assetURL)
 
+        // Log asset duration for debugging fragmented MP4 issues
+        let duration = try await asset.load(.duration)
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+        Log.debug("[StorageManager] Loading asset: segmentID=\(segmentID), duration=\(String(format: "%.3f", duration.seconds))s, fileSize=\(fileSize) bytes", category: .storage)
+
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw StorageError.fileReadFailed(path: url.path, underlying: "No video track")
         }
+
+        // Log video track info for debugging
+        let trackDuration = try await videoTrack.load(.timeRange)
+        let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
+        let estimatedFrameCount = Int(trackDuration.duration.seconds * Double(nominalFrameRate))
+        Log.debug("[StorageManager] Video track: trackDuration=\(String(format: "%.3f", trackDuration.duration.seconds))s, frameRate=\(nominalFrameRate), estimatedFrames=\(estimatedFrameCount)", category: .storage)
 
         // Create asset reader
         let reader = try AVAssetReader(asset: asset)
@@ -220,8 +236,12 @@ public actor StorageManager: StorageProtocol {
         // Check for read errors
         if reader.status == .failed {
             let errorDesc = reader.error?.localizedDescription ?? "Unknown error"
+            Log.error("[StorageManager] AVAssetReader failed: \(errorDesc), segmentID=\(segmentID)", category: .storage)
             throw StorageError.fileReadFailed(path: url.path, underlying: "Reader failed: \(errorDesc)")
         }
+
+        // Log actual frame count vs expected for debugging
+        Log.debug("[StorageManager] Read \(framesWithPTS.count) frames from AVAssetReader, expected ~\(estimatedFrameCount)", category: .storage)
 
         // Sort by PTS to get presentation order
         framesWithPTS.sort { $0.pts.seconds < $1.pts.seconds }
@@ -303,6 +323,73 @@ public actor StorageManager: StorageProtocol {
 
     public func segmentExists(id: VideoSegmentID) async throws -> Bool {
         (try? await getSegmentPath(id: id)) != nil
+    }
+
+    /// Count the number of readable frames in an existing video file
+    /// Returns 0 if the file doesn't exist or is unreadable
+    public func countFramesInSegment(id: VideoSegmentID) async throws -> Int {
+        guard let segmentURL = try? await getSegmentPath(id: id) else {
+            return 0
+        }
+
+        // Check if file is empty
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            return 0
+        }
+
+        // Handle extensionless files by creating symlink
+        let assetURL: URL
+        if segmentURL.pathExtension.lowercased() == "mp4" {
+            assetURL = segmentURL
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = segmentURL.lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+
+            if !FileManager.default.fileExists(atPath: symlinkPath.path) {
+                try FileManager.default.createSymbolicLink(
+                    atPath: symlinkPath.path,
+                    withDestinationPath: segmentURL.path
+                )
+            }
+            assetURL = symlinkPath
+        }
+
+        let asset = AVAsset(url: assetURL)
+
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first else {
+            return 0
+        }
+
+        // Create asset reader to count frames
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            return 0
+        }
+
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+
+        guard reader.canAdd(trackOutput) else {
+            return 0
+        }
+        reader.add(trackOutput)
+
+        guard reader.startReading() else {
+            return 0
+        }
+
+        // Count frames without fully decoding them
+        var frameCount = 0
+        while trackOutput.copyNextSampleBuffer() != nil {
+            frameCount += 1
+        }
+
+        return frameCount
     }
 
     /// Rename a video segment file (used when temporary ID is replaced with database ID)

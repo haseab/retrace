@@ -346,6 +346,13 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.existsAtTimestamp(db: db, timestamp: timestamp)
     }
 
+    public func getFrameIDAtTimestamp(_ timestamp: Date) async throws -> Int64? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getFrameIDAtTimestamp(db: db, timestamp: timestamp)
+    }
+
     public func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -511,6 +518,13 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try SegmentQueries.markFinalized(db: db, id: id, frameCount: frameCount, fileSize: fileSize)
+    }
+
+    public func finalizeOrphanedVideos(activeVideoIDs: Set<Int64>) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.finalizeOrphanedVideos(db: db, activeVideoIDs: activeVideoIDs)
     }
 
     public func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64, frameCount: Int) async throws {
@@ -1807,6 +1821,66 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Mark frame as readable from video file (processingStatus 4 -> 0)
+    /// Called when frame is confirmed to be written to video file
+    public func markFrameReadable(frameID: Int64) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Only update if status is 4 (not yet readable)
+        let sql = "UPDATE frame SET processingStatus = 0 WHERE id = ? AND processingStatus = 4;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        sqlite3_bind_int64(stmt, 1, frameID)
+
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
+    /// Get processing status for multiple frames in a single query
+    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    public func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        guard !frameIDs.isEmpty else {
+            return [:]
+        }
+
+        // Build parameterized query for batch lookup
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        let sql = "SELECT id, processingStatus FROM frame WHERE id IN (\(placeholders));"
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        // Bind all frame IDs
+        for (index, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(stmt, Int32(index + 1), frameID)
+        }
+
+        var results: [Int64: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let frameID = sqlite3_column_int64(stmt, 0)
+            let status = Int(sqlite3_column_int(stmt, 1))
+            results[frameID] = status
+        }
+
+        return results
     }
 
     /// Check if a frame is currently in the processing queue

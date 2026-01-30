@@ -140,8 +140,11 @@ public final class AVAssetExtractor: ImageExtractor {
         let asset = AVAsset(url: assetURL)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.01, preferredTimescale: 600)
-        imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.01, preferredTimescale: 600)
+        // Use zero tolerance to get EXACT frames - required for B-frame encoded videos
+        // Without zero tolerance, AVAssetImageGenerator may return the nearest keyframe
+        // which causes duplicate/mismatched frames
+        imageGenerator.requestedTimeToleranceAfter = .zero
+        imageGenerator.requestedTimeToleranceBefore = .zero
 
         // Calculate CMTime from frame index using integer arithmetic to avoid floating point precision issues
         // For 30fps with timescale 600: each frame = 20 time units (600/30 = 20)

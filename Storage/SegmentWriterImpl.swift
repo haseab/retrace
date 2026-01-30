@@ -17,6 +17,7 @@ public actor SegmentWriterImpl: SegmentWriter {
     }
 
     public private(set) var hasFragmentWritten: Bool = false
+    public private(set) var framesFlushedToDisk: Int = 0
 
     private let encoder: HEVCEncoder
     private let encoderConfig: VideoEncoderConfig
@@ -79,6 +80,9 @@ public actor SegmentWriterImpl: SegmentWriter {
         if !hasFragmentWritten {
             hasFragmentWritten = await encoder.hasFragmentWritten()
         }
+
+        // Update the count of frames confirmed flushed to disk
+        framesFlushedToDisk = await encoder.framesFlushedToDisk()
     }
 
     public func finalize() async throws -> VideoSegment {

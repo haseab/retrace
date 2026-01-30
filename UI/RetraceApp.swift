@@ -88,6 +88,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var coordinatorWrapper: AppCoordinatorWrapper?
     private var sleepWakeObservers: [NSObjectProtocol] = []
     private var wasRecordingBeforeSleep = false
+    private var pendingDeeplinkURLs: [URL] = []
+    private var isInitialized = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prompt user to move app to Applications folder if not already there
@@ -153,8 +155,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
 
-            // Show dashboard on first launch
-            DashboardWindowController.shared.show()
+            // Mark as initialized before processing pending deeplinks
+            isInitialized = true
+
+            // Process any deeplinks that arrived before initialization completed
+            if !pendingDeeplinkURLs.isEmpty {
+                Log.info("[AppDelegate] Processing \(pendingDeeplinkURLs.count) pending deeplink(s)", category: .app)
+                for url in pendingDeeplinkURLs {
+                    handleDeeplink(url)
+                }
+                pendingDeeplinkURLs.removeAll()
+            } else {
+                // Show dashboard on first launch (only if no deeplinks)
+                DashboardWindowController.shared.show()
+            }
 
         } catch {
             Log.error("[AppDelegate] Failed to initialize: \(error)", category: .app)
@@ -274,6 +288,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         TimelineWindowController.shared.saveStateForTermination()
 
         Log.info("[AppDelegate] Application terminating", category: .app)
+    }
+
+    // MARK: - URL Handling
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Log.info("[AppDelegate] Received URLs: \(urls), isInitialized: \(isInitialized)", category: .app)
+        for url in urls {
+            if isInitialized {
+                Task { @MainActor in
+                    self.handleDeeplink(url)
+                }
+            } else {
+                // Queue the URL to be processed after initialization
+                Log.info("[AppDelegate] Queuing deeplink for later: \(url)", category: .app)
+                pendingDeeplinkURLs.append(url)
+            }
+        }
+    }
+
+    @MainActor
+    private func handleDeeplink(_ url: URL) {
+        guard url.scheme == "retrace" else {
+            Log.warning("[AppDelegate] Invalid URL scheme: \(url.scheme ?? "none")", category: .app)
+            return
+        }
+
+        guard let host = url.host else {
+            Log.warning("[AppDelegate] No host in URL: \(url)", category: .app)
+            return
+        }
+
+        let queryParams = url.queryParameters
+
+        switch host.lowercased() {
+        case "timeline":
+            // Parse timestamp from query params (t=unix_ms)
+            let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
+            Log.info("[AppDelegate] Opening timeline at timestamp: \(String(describing: timestamp))", category: .app)
+
+            if let timestamp = timestamp {
+                TimelineWindowController.shared.showAndNavigate(to: timestamp)
+            } else {
+                TimelineWindowController.shared.show()
+            }
+
+        case "search":
+            // Parse search parameters
+            let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
+            Log.info("[AppDelegate] Opening search/timeline at timestamp: \(String(describing: timestamp))", category: .app)
+
+            if let timestamp = timestamp {
+                TimelineWindowController.shared.showAndNavigate(to: timestamp)
+            } else {
+                TimelineWindowController.shared.show()
+            }
+
+        default:
+            Log.warning("[AppDelegate] Unknown deeplink route: \(host)", category: .app)
+        }
     }
 
     // MARK: - Permissions

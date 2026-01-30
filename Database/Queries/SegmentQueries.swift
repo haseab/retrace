@@ -133,6 +133,55 @@ enum SegmentQueries {
         }
     }
 
+    /// Finalize all orphaned videos (processingState=1) that don't have active WAL sessions
+    /// This cleans up videos left unfinalised due to dev restarts or crashes
+    /// Returns the number of videos finalized
+    static func finalizeOrphanedVideos(db: OpaquePointer, activeVideoIDs: Set<Int64>) throws -> Int {
+        // If there are active video IDs, exclude them from finalization
+        let sql: String
+        if activeVideoIDs.isEmpty {
+            sql = """
+                UPDATE video SET processingState = 0, uploadedAt = ?
+                WHERE processingState = 1;
+                """
+        } else {
+            let placeholders = activeVideoIDs.map { _ in "?" }.joined(separator: ", ")
+            sql = """
+                UPDATE video SET processingState = 0, uploadedAt = ?
+                WHERE processingState = 1 AND id NOT IN (\(placeholders));
+                """
+        }
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let currentTimestamp = Schema.currentTimestamp()
+        sqlite3_bind_int64(statement, 1, currentTimestamp)
+
+        // Bind active video IDs if any
+        for (index, videoID) in activeVideoIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(index + 2), videoID)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        return Int(sqlite3_changes(db))
+    }
+
     /// Get an unfinalised video matching the given resolution
     /// Returns nil if no unfinalised video exists for this resolution
     /// Used to resume writing to an existing video when a frame with matching resolution comes in

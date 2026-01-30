@@ -280,6 +280,10 @@ public actor FrameProcessingQueue {
 
         // Insert OCR nodes
         if docid > 0 && !extractedText.regions.isEmpty {
+            // Delete any existing nodes first to prevent duplicates
+            // (can happen if frame is reprocessed without going through reprocessOCR)
+            try await databaseManager.deleteNodes(frameID: FrameID(value: frameID))
+
             var currentOffset = 0
             var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
 
@@ -370,14 +374,76 @@ public actor FrameProcessingQueue {
         Log.warning("[Queue] Retrying frame \(queuedFrame.frameID), attempt \(queuedFrame.retryCount + 1)", category: .processing)
     }
 
-    /// Mark frame as permanently failed
+    /// Mark frame as permanently failed, or delete if truly unrecoverable
+    /// SAFETY: Only deletes frames after verifying the video is genuinely unrecoverable
     private func markFrameAsFailed(_ frameID: Int64, error: Error, skipRetries: Bool = false) async throws {
-        try await updateFrameProcessingStatus(frameID, status: .failed)
         if skipRetries {
-            Log.debug("[Queue] Frame \(frameID) marked as failed (video not ready)", category: .processing)
+            // Potential unrecoverable video error - verify before deleting
+            let shouldDelete = await verifyFrameIsUnrecoverable(frameID: frameID, error: error)
+
+            if shouldDelete {
+                try await databaseManager.deleteFrame(id: FrameID(value: frameID))
+                Log.warning("[Queue] Frame \(frameID) deleted (verified unrecoverable)", category: .processing)
+            } else {
+                // Not confirmed unrecoverable - mark as failed instead of deleting
+                try await updateFrameProcessingStatus(frameID, status: .failed)
+                Log.warning("[Queue] Frame \(frameID) marked as failed (deletion skipped - could not verify unrecoverable)", category: .processing)
+            }
         } else {
+            // Actual processing failure after retries - mark as failed
+            try await updateFrameProcessingStatus(frameID, status: .failed)
             Log.error("[Queue] Frame \(frameID) marked as failed after max retries: \(error)", category: .processing)
         }
+    }
+
+    /// Verify a frame is truly unrecoverable before deletion
+    /// Returns true only if we're certain the video data cannot be recovered
+    private func verifyFrameIsUnrecoverable(frameID: Int64, error: Error) async -> Bool {
+        let errorDesc = error.localizedDescription
+
+        // SAFETY CHECK 1: Only delete for specific known-unrecoverable error types
+        let isKnownUnrecoverableError =
+            errorDesc.contains("Frame index") && errorDesc.contains("out of range") ||  // Frame index doesn't exist in video
+            errorDesc.contains("Video file is empty")  // 0-byte video file
+
+        guard isKnownUnrecoverableError else {
+            return false
+        }
+
+        // SAFETY CHECK 2: Verify the frame actually exists and get its video info
+        guard let frameRef = try? await databaseManager.getFrame(id: FrameID(value: frameID)) else {
+            return false
+        }
+
+        // SAFETY CHECK 3: Verify the video segment exists in DB
+        guard let videoSegment = try? await databaseManager.getVideoSegment(id: frameRef.videoID) else {
+            return true  // Video record doesn't exist, frame is orphaned
+        }
+
+        // SAFETY CHECK 4: Extract segment ID and verify file state
+        let pathComponents = videoSegment.relativePath.split(separator: "/")
+        guard let lastComponent = pathComponents.last,
+              let _ = Int64(lastComponent) else {
+            return false
+        }
+
+        // SAFETY CHECK 5: For "frame index out of range" - verify the video has fewer frames than expected
+        if errorDesc.contains("Frame index") && errorDesc.contains("out of range") {
+            // The error message format is: "Frame index X out of range (0..<Y)"
+            // We've already failed to read this frame, so we know it's out of range
+            return true
+        }
+
+        // SAFETY CHECK 6: For "empty file" - verify file is actually 0 bytes
+        if errorDesc.contains("Video file is empty") {
+            if let exists = try? await storage.segmentExists(id: VideoSegmentID(value: Int64(pathComponents.last!)!)), !exists {
+                return true
+            }
+            // File exists but we got empty error - this is suspicious, don't delete
+            return false
+        }
+
+        return false
     }
 
     /// Re-enqueue frames that were processing during a crash
@@ -385,7 +451,9 @@ public actor FrameProcessingQueue {
     public func requeueCrashedFrames() async throws {
         let frameIDs = try await databaseManager.getCrashedProcessingFrameIDs()
 
-        guard !frameIDs.isEmpty else { return }
+        guard !frameIDs.isEmpty else {
+            return
+        }
 
         Log.warning("[Queue] Found \(frameIDs.count) frames that crashed during processing, verifying video files...", category: .processing)
 
@@ -419,6 +487,7 @@ public actor FrameProcessingQueue {
 
             // Try to verify the video file exists and is accessible
             let videoExists = try await storage.segmentExists(id: VideoSegmentID(value: actualSegmentID))
+
             if !videoExists {
                 Log.warning("[Queue] Video file missing for crashed frame \(frameID) (segment \(actualSegmentID)), marking as failed", category: .processing)
                 invalidFrameIDs.append(frameID)

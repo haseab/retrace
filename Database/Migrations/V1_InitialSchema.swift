@@ -64,6 +64,16 @@ struct V1_InitialSchema: Migration {
         Log.debug("✓ Created segment table")
     }
 
+    /// processingStatus values:
+    ///   0 = pending (ready for OCR)
+    ///   1 = processing (OCR in progress)
+    ///   2 = completed
+    ///   3 = failed
+    ///   4 = not yet readable from video file
+    ///
+    /// NOTE: Schema default is 0, but FrameQueries.insert() explicitly inserts 4.
+    /// Frames start as "not yet readable" (4) and transition to "pending" (0) when
+    /// the video encoder confirms the frame is flushed to disk.
     private func createFrameTable(db: OpaquePointer) throws {
         let sql = """
             CREATE TABLE IF NOT EXISTS frame (
@@ -75,7 +85,7 @@ struct V1_InitialSchema: Migration {
                 videoFrameIndex INTEGER,
                 isStarred       INTEGER NOT NULL DEFAULT 0,
                 encodingStatus  TEXT,
-                processingStatus INTEGER DEFAULT 0,
+                processingStatus INTEGER DEFAULT 0, -- See note above: insert uses 4, not this default
                 FOREIGN KEY (segmentId) REFERENCES segment(id) ON DELETE CASCADE,
                 FOREIGN KEY (videoId) REFERENCES video(id) ON DELETE SET NULL
             );

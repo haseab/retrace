@@ -1021,7 +1021,7 @@ public struct OnboardingView: View {
 
             // Scrollable features container with fixed height
             ScrollView {
-                VStack(alignment: .leading, spacing: .spacingL) { 
+                VStack(alignment: .leading, spacing: .spacingL) { 
                     // What this version has (green)
                     VStack(alignment: .leading, spacing: .spacingM) {
                         Text("What This Version Has")

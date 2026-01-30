@@ -36,7 +36,7 @@ public actor RecoveryManager {
     }
 
     /// Recover from any active WAL sessions (call this on app startup)
-    /// Groups sessions by resolution and merges them into single videos per resolution
+    /// Optimized: checks existing fragmented MP4 files first and only re-encodes missing frames
     public func recoverAll() async throws -> RecoveryResult {
         let sessions = try await walManager.listActiveSessions()
 
@@ -47,62 +47,145 @@ public actor RecoveryManager {
 
         Log.warning("[Recovery] Found \(sessions.count) incomplete WAL sessions - starting recovery", category: .storage)
 
-        // Read all frames from all sessions and group by resolution
-        var framesByResolution: [String: [(session: WALSession, frames: [CapturedFrame])]] = [:]
+        var totalFrames = 0
+        var totalSegments = 0
+        var totalSkippedFrames = 0
 
+        // Process each session individually to check existing video files
         for session in sessions {
             do {
-                let frames = try await walManager.readFrames(from: session)
-                guard !frames.isEmpty, let firstFrame = frames.first else {
+                let walFrames = try await walManager.readFrames(from: session)
+                guard !walFrames.isEmpty else {
                     // Empty session - just clean up
                     try await walManager.finalizeSession(session)
                     continue
                 }
 
-                let resolutionKey = "\(firstFrame.width)x\(firstFrame.height)"
-                if framesByResolution[resolutionKey] == nil {
-                    framesByResolution[resolutionKey] = []
+                // Check how many frames are already in the existing video file
+                let existingFrameCount = try await storage.countFramesInSegment(id: session.videoID)
+
+                if existingFrameCount >= walFrames.count {
+                    // All frames are already in the video - no re-encoding needed!
+                    Log.info("[Recovery] Video \(session.videoID.value) already has all \(walFrames.count) frames - skipping re-encode", category: .storage)
+                    totalSkippedFrames += walFrames.count
+
+                    // Still need to ensure DB records exist and enqueue for OCR if needed
+                    let result = try await ensureFramesInDatabase(walFrames, videoID: session.videoID)
+                    totalFrames += result.framesRecovered
+
+                    // Clean up WAL
+                    try await walManager.finalizeSession(session)
+                    continue
                 }
-                framesByResolution[resolutionKey]?.append((session: session, frames: frames))
+
+                // Some frames are missing from the video - need to re-encode
+                let missingFrames = Array(walFrames.dropFirst(existingFrameCount))
+                Log.info("[Recovery] Video \(session.videoID.value) has \(existingFrameCount)/\(walFrames.count) frames - re-encoding \(missingFrames.count) missing frames", category: .storage)
+
+                if existingFrameCount > 0 {
+                    totalSkippedFrames += existingFrameCount
+                    // Ensure the existing frames are in the database
+                    let existingResult = try await ensureFramesInDatabase(
+                        Array(walFrames.prefix(existingFrameCount)),
+                        videoID: session.videoID
+                    )
+                    totalFrames += existingResult.framesRecovered
+                }
+
+                // Re-encode only the missing frames
+                if !missingFrames.isEmpty {
+                    let resolutionKey = "\(missingFrames[0].width)x\(missingFrames[0].height)"
+                    let result = try await recoverFrames(missingFrames, resolutionKey: resolutionKey)
+                    totalFrames += result.framesRecovered
+                    totalSegments += result.videoSegmentsCreated
+                }
+
+                // Clean up WAL
+                try await walManager.finalizeSession(session)
+
             } catch {
-                Log.error("[Recovery] ✗ Failed to read WAL session \(session.videoID.value): \(error)", category: .storage)
+                Log.error("[Recovery] ✗ Failed to process WAL session \(session.videoID.value): \(error)", category: .storage)
             }
         }
 
-        var totalFrames = 0
-        var totalSegments = 0
-
-        // Process each resolution group - merge all sessions into one video
-        for (resolutionKey, sessionData) in framesByResolution {
-            do {
-                // Combine all frames from all sessions of this resolution, sorted by timestamp
-                let allFrames = sessionData.flatMap { $0.frames }.sorted { $0.timestamp < $1.timestamp }
-
-                guard !allFrames.isEmpty else { continue }
-
-                Log.info("[Recovery] Processing \(allFrames.count) frames for resolution \(resolutionKey) from \(sessionData.count) sessions", category: .storage)
-
-                let result = try await recoverFrames(allFrames, resolutionKey: resolutionKey)
-                totalFrames += result.framesRecovered
-                totalSegments += result.videoSegmentsCreated
-
-                // Clean up all WAL sessions for this resolution
-                for data in sessionData {
-                    try await walManager.finalizeSession(data.session)
-                }
-
-                Log.info("[Recovery] ✓ Recovered \(resolutionKey): \(result.framesRecovered) frames into \(result.videoSegmentsCreated) video(s)", category: .storage)
-            } catch {
-                Log.error("[Recovery] ✗ Failed to recover resolution \(resolutionKey): \(error)", category: .storage)
-            }
+        if totalSkippedFrames > 0 {
+            Log.info("[Recovery] Skipped re-encoding \(totalSkippedFrames) frames (already in video files)", category: .storage)
         }
-
-        Log.info("[Recovery] Complete: \(sessions.count) sessions, \(totalFrames) frames, \(totalSegments) video segments", category: .storage)
+        Log.info("[Recovery] Complete: \(sessions.count) sessions, \(totalFrames) frames processed, \(totalSegments) new video segments", category: .storage)
 
         return RecoveryResult(
             sessionsRecovered: sessions.count,
             framesRecovered: totalFrames,
             videoSegmentsCreated: totalSegments
+        )
+    }
+
+    /// Ensure frames exist in database and enqueue for OCR if needed (without re-encoding video)
+    /// Used when the video file already has all the frames
+    private func ensureFramesInDatabase(_ frames: [CapturedFrame], videoID: VideoSegmentID) async throws -> RecoveryResult {
+        var newFrameIDs: [Int64] = []
+        var existingFrameIDs: [Int64] = []
+        var currentAppSegmentID: Int64?
+
+        for (frameIndex, frame) in frames.enumerated() {
+            // Check if frame already exists in database
+            if let existingFrameID = try await database.getFrameIDAtTimestamp(frame.timestamp) {
+                existingFrameIDs.append(existingFrameID)
+                continue
+            }
+
+            // Frame doesn't exist - create it
+            if currentAppSegmentID == nil {
+                currentAppSegmentID = try await database.insertSegment(
+                    bundleID: frame.metadata.appBundleID ?? "com.unknown.recovered",
+                    startDate: frame.timestamp,
+                    endDate: frame.timestamp,
+                    windowName: frame.metadata.windowName ?? "Recovered Session",
+                    browserUrl: frame.metadata.browserURL,
+                    type: 0
+                )
+            }
+
+            // Get the database video ID (videoID from WAL is the file ID, need to look up or use it)
+            // The video should already be in the database since it was being written before crash
+            let dbVideoID = try await database.getVideoSegment(id: videoID)?.id.value ?? videoID.value
+
+            let frameRef = FrameReference(
+                id: FrameID(value: 0),
+                timestamp: frame.timestamp,
+                segmentID: AppSegmentID(value: currentAppSegmentID!),
+                videoID: VideoSegmentID(value: dbVideoID),
+                frameIndexInSegment: frameIndex,
+                metadata: frame.metadata,
+                source: .native
+            )
+            let frameID = try await database.insertFrame(frameRef)
+            newFrameIDs.append(frameID)
+        }
+
+        // Update app segment end date
+        if let segmentID = currentAppSegmentID, let lastFrame = frames.last {
+            try await database.updateSegmentEndDate(id: segmentID, endDate: lastFrame.timestamp)
+        }
+
+        // Enqueue frames for OCR processing (only those that need it)
+        let allFrameIDs = newFrameIDs + existingFrameIDs
+        if let enqueueCallback = frameEnqueueCallback, !allFrameIDs.isEmpty {
+            let statuses = try await database.getFrameProcessingStatuses(frameIDs: allFrameIDs)
+            let framesToProcess = allFrameIDs.filter { statuses[$0] ?? 0 != 2 }
+
+            if !framesToProcess.isEmpty {
+                try await enqueueCallback(framesToProcess)
+                Log.info("[Recovery] Enqueued \(framesToProcess.count) frames for OCR (skipped \(allFrameIDs.count - framesToProcess.count) already processed)", category: .storage)
+            } else {
+                Log.info("[Recovery] All \(allFrameIDs.count) frames already have OCR data", category: .storage)
+            }
+        }
+
+        return RecoveryResult(
+            sessionsRecovered: 0,
+            framesRecovered: newFrameIDs.count,
+            videoSegmentsCreated: 0
         )
     }
 
@@ -113,7 +196,6 @@ public actor RecoveryManager {
         var totalFramesRecovered = 0
         var totalVideosCreated = 0
         var recoveredFrameIDs: [Int64] = []
-        var skippedDuplicates = 0
 
         // Split frames into chunks of maxFramesPerSegment
         let frameChunks = stride(from: 0, to: frames.count, by: maxFramesPerSegment).map {
@@ -132,13 +214,23 @@ public actor RecoveryManager {
 
             Log.debug("[Recovery] Video segment created with DB ID: \(dbVideoID), \(chunk.count) frames", category: .storage)
 
-            // Process each frame: insert to database
+            // Process each frame: insert to database or update existing
             var currentAppSegmentID: Int64?
+            var updatedExistingFrames = 0
 
             for (frameIndex, frame) in chunk.enumerated() {
-                // Skip if a frame with the same timestamp already exists (to the second)
-                if try await database.frameExistsAtTimestamp(frame.timestamp) {
-                    skippedDuplicates += 1
+                // Check if a frame with the same timestamp already exists
+                if let existingFrameID = try await database.getFrameIDAtTimestamp(frame.timestamp) {
+                    // Frame already exists - update its video link to point to the new recovered video
+                    // This fixes orphan frames that were pointing to incomplete/corrupted videos
+                    try await database.updateFrameVideoLink(
+                        frameID: FrameID(value: existingFrameID),
+                        videoID: VideoSegmentID(value: dbVideoID),
+                        frameIndex: frameIndex
+                    )
+                    recoveredFrameIDs.append(existingFrameID)
+                    updatedExistingFrames += 1
+                    Log.debug("[Recovery] Updated existing frame \(existingFrameID) to point to recovered video \(dbVideoID), frameIndex=\(frameIndex)", category: .storage)
                     continue
                 }
 
@@ -175,16 +267,34 @@ public actor RecoveryManager {
             if let segmentID = currentAppSegmentID, let lastFrame = chunk.last {
                 try await database.updateSegmentEndDate(id: segmentID, endDate: lastFrame.timestamp)
             }
+
+            if updatedExistingFrames > 0 {
+                Log.info("[Recovery] Updated \(updatedExistingFrames) existing frames to point to recovered video", category: .storage)
+            }
         }
 
-        if skippedDuplicates > 0 {
-            Log.info("[Recovery] Skipped \(skippedDuplicates) duplicate frames (already in database)", category: .storage)
-        }
-
-        // Enqueue all recovered frames for async processing
+        // Enqueue only frames that haven't been processed yet
         if let enqueueCallback = frameEnqueueCallback, !recoveredFrameIDs.isEmpty {
-            try await enqueueCallback(recoveredFrameIDs)
-            Log.info("[Recovery] Enqueued \(recoveredFrameIDs.count) frames for async processing", category: .storage)
+            // Check which frames already have OCR processing completed
+            let statuses = try await database.getFrameProcessingStatuses(frameIDs: recoveredFrameIDs)
+
+            // Filter to only frames that need processing (status != 2 which is completed)
+            let framesToProcess = recoveredFrameIDs.filter { frameID in
+                let status = statuses[frameID] ?? 0  // Default to pending if not found
+                return status != 2  // 2 = completed
+            }
+
+            let skippedCount = recoveredFrameIDs.count - framesToProcess.count
+            if skippedCount > 0 {
+                Log.info("[Recovery] Skipping \(skippedCount) frames that already have OCR data", category: .storage)
+            }
+
+            if !framesToProcess.isEmpty {
+                try await enqueueCallback(framesToProcess)
+                Log.info("[Recovery] Enqueued \(framesToProcess.count) frames for async processing", category: .storage)
+            } else {
+                Log.info("[Recovery] All \(recoveredFrameIDs.count) recovered frames already processed, nothing to enqueue", category: .storage)
+            }
         }
 
         return RecoveryResult(

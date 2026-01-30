@@ -48,6 +48,8 @@ private enum MemoryTracker {
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
     public let videoInfo: FrameVideoInfo?
+    /// Processing status: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
+    public let processingStatus: Int
 
     public var id: FrameID { frame.id }
 
@@ -111,6 +113,11 @@ public struct AppBlock: Identifiable {
 @MainActor
 public class SimpleTimelineViewModel: ObservableObject {
 
+    // MARK: - Private Properties
+
+    /// Cancellables for Combine subscriptions
+    private var cancellables = Set<AnyCancellable>()
+
     // MARK: - Published State
 
     /// All loaded frames with their preloaded video info
@@ -138,6 +145,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Static image for displaying the current frame (for image-based sources like Retrace)
     @Published public var currentImage: NSImage?
+
+    /// Whether the current frame is not yet available in the video file (still encoding)
+    @Published public var frameNotReady: Bool = false
 
     /// Loading state
     @Published public var isLoading = false
@@ -226,6 +236,21 @@ public class SimpleTimelineViewModel: ObservableObject {
     public var hasSelection: Bool {
         isAllTextSelected || (selectionStart != nil && selectionEnd != nil)
     }
+
+    // MARK: - Selection Range Cache (performance optimization for Cmd+A)
+
+    /// Cached sorted OCR nodes for selection range calculation
+    /// Invalidated when ocrNodes changes
+    private var cachedSortedNodes: [OCRNodeWithText]?
+
+    /// Cached node ID to index lookup for O(1) access
+    private var cachedNodeIndexMap: [Int: Int]?
+
+    /// The ocrNodes array that the cache was built from (for invalidation check)
+    private var cachedNodesVersion: Int = 0
+
+    /// Current version of ocrNodes (incremented on change)
+    private var currentNodesVersion: Int = 0
 
     // MARK: - Zoom Region State (Shift+Drag focus rectangle)
 
@@ -699,6 +724,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Maximum images to keep in cache (prevents unbounded memory growth)
     private static let maxImageCacheSize = 50
 
+    /// Number of frames to preload ahead and behind current position
+    private static let preloadRadius = 5
+
+    /// Task for preloading nearby frames (cancelled when index changes rapidly)
+    private var preloadTask: Task<Void, Never>?
+
     // MARK: - Infinite Scroll Window State
 
     /// Timestamp of the oldest loaded frame (for loading older frames)
@@ -760,6 +791,27 @@ public class SimpleTimelineViewModel: ObservableObject {
                 self?.invalidateCachesAndReload()
             }
         }
+
+        // Observe dialog states to update emergency escape tracking
+        // This prevents triple-escape from triggering while dialogs are open
+        setupDialogStateObserver()
+    }
+
+    /// Set up Combine observer to track when any dialog/overlay is open
+    private func setupDialogStateObserver() {
+        Publishers.CombineLatest4(
+            $isSearchOverlayVisible,
+            $isFilterDropdownOpen,
+            $showTagSubmenu,
+            $isDateSearchActive
+        )
+        .combineLatest($isCalendarPickerVisible)
+        .sink { [weak self] combined, isCalendarVisible in
+            let (isSearch, isFilter, isTag, isDateSearch) = combined
+            let isAnyDialogOpen = isSearch || isFilter || isTag || isDateSearch || isCalendarVisible
+            TimelineWindowController.shared.setDialogOpen(isAnyDialogOpen)
+        }
+        .store(in: &cancellables)
     }
 
     /// Invalidate all caches and reload frames from the current position
@@ -825,7 +877,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[DataSourceChange] Fetched \(framesWithVideoInfo.count) frames from data adapter", category: .ui)
 
             if !framesWithVideoInfo.isEmpty {
-                frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+                frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
                 // Find the frame closest to the original timestamp
                 let closestIndex = findClosestFrameIndex(to: timestamp)
@@ -1341,7 +1393,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Phase 1: Instant - get installed apps from /Applications folder
         let installed = AppNameResolver.shared.getInstalledApps()
         let installedBundleIDs = Set(installed.map { $0.bundleID })
-        var allApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+        let allApps = installed.map { (bundleID: $0.bundleID, name: $0.name) }
         Log.info("[Filter] Phase 1: Loaded \(allApps.count) installed apps in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .ui)
 
         // Update UI immediately with installed apps
@@ -1852,7 +1904,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Convert to TimelineFrame - video info is already included from the JOIN
             // Reverse so oldest is first (index 0), newest is last
             // This matches the timeline UI which displays left-to-right as past-to-future
-            frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
             logTabClickTiming("VM_FRAMES_MAPPED", startTime: startTime)
 
             // Initialize window boundary timestamps for infinite scroll
@@ -1930,7 +1982,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Convert to TimelineFrame - reverse so oldest is first (index 0), newest is last
-        frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+        frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
         logTabClickTiming("VM_LOAD_DIRECT_MAPPED (count=\(frames.count))", startTime: startTime)
 
         // Initialize window boundary timestamps for infinite scroll
@@ -2015,7 +2067,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Appending present-moment frames while the user is far back corrupts the
             // infinite scroll window — newestLoadedTimestamp jumps to now, causing the
             // next forward scroll batch to skip ahead by potentially an entire day.
-            if !navigateToNewest, let currentTimestamp = frames[safe: currentIndex]?.frame.timestamp {
+            if !navigateToNewest, currentIndex < frames.count {
+                let currentTimestamp = frames[currentIndex].frame.timestamp
                 let secondsFromPresent = Date().timeIntervalSince(currentTimestamp)
                 if secondsFromPresent > 300 { // 5 minutes
                     Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is viewing frame from \(Int(secondsFromPresent))s ago (threshold: 300s)", category: .ui)
@@ -2037,7 +2090,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         Log.info("[TIMELINE-REFRESH] 🔄 Found \(newFrames.count) new frames since last view", category: .ui)
 
                         // Add new frames to the end (they're newer, so they go at the end)
-                        let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+                        let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
                         frames.append(contentsOf: newTimelineFrames)
 
                         // Update boundaries
@@ -2172,7 +2225,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame - video info is already included from the JOIN
-            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
             Log.debug("[SearchNavigation] Converted to \(timelineFrames.count) timeline frames", category: .ui)
 
             // Replace current frames with new window
@@ -2342,7 +2395,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             loadOCRNodes()
         } else {
             // Clear stale OCR/URL data during scrolling so old bounding boxes don't persist
-            ocrNodes = []
+            setOCRNodes([])
             ocrStatus = .unknown
             ocrStatusPollingTask?.cancel()
             ocrStatusPollingTask = nil
@@ -2352,9 +2405,25 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let frame = timelineFrame.frame
 
+        // Check if frame is not yet readable (processingStatus = 4)
+        // This provides instant feedback instead of waiting for async load to fail
+        if timelineFrame.processingStatus == 4 {
+            currentImage = nil
+            frameNotReady = true
+            // Still preload nearby frames
+            preloadNearbyFrames()
+            return
+        }
+
+        // Reset frameNotReady immediately when status != 4
+        // This prevents stale "still encoding" state from persisting when scrolling
+        // from a processingStatus=4 frame to an earlier ready frame
+        frameNotReady = false
+
         // Check cache first
         if let cached = imageCache[frame.id] {
             currentImage = cached
+            frameNotReady = false
             return
         }
 
@@ -2396,13 +2465,105 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Only update if we're still on the same frame
                     if currentTimelineFrame?.frame.id == frame.id {
                         currentImage = image
+                        frameNotReady = false
                     }
+                }
+            } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("still being written") {
+                // Expected during recording - file not ready yet
+                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) video still being written", category: .app)
+                if currentTimelineFrame?.frame.id == frame.id {
+                    currentImage = nil
+                    frameNotReady = true
+                }
+            } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("out of range") {
+                // Frame not yet written to video file - this is expected for recently captured frames
+                // The frame record exists in DB but the video encoder hasn't flushed it yet
+                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) not yet in video file (still encoding)", category: .app)
+                if currentTimelineFrame?.frame.id == frame.id {
+                    currentImage = nil
+                    frameNotReady = true
+                }
+            } catch let error as NSError where error.domain == "AVFoundationErrorDomain" && error.code == -11829 {
+                // Video file too small / no fragments yet - expected for very recent frames
+                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) video not ready yet (no fragments)", category: .app)
+                if currentTimelineFrame?.frame.id == frame.id {
+                    currentImage = nil
+                    frameNotReady = true
                 }
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
                 // Clear the image so we don't show the previous frame
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
+                    frameNotReady = false
+                }
+            }
+        }
+
+        // Preload nearby frames in background
+        preloadNearbyFrames()
+    }
+
+    /// Preload images for frames ahead and behind current position for smoother scrubbing
+    private func preloadNearbyFrames() {
+        // Cancel any existing preload task
+        preloadTask?.cancel()
+
+        let centerIndex = currentIndex
+        let frameCount = frames.count
+
+        // Calculate indices to preload (within bounds)
+        let startIndex = max(0, centerIndex - Self.preloadRadius)
+        let endIndex = min(frameCount - 1, centerIndex + Self.preloadRadius)
+
+        guard startIndex <= endIndex else { return }
+
+        // Capture frame data needed for preloading (avoid accessing frames array in async context)
+        var framesToPreload: [(frameID: FrameID, videoPath: String, frameIndex: Int)] = []
+        for index in startIndex...endIndex {
+            // Skip current frame (already loading)
+            if index == centerIndex { continue }
+
+            let timelineFrame = frames[index]
+            let frame = timelineFrame.frame
+
+            // Skip if already cached
+            if imageCache[frame.id] != nil { continue }
+
+            // Skip if no video info
+            guard let videoInfo = timelineFrame.videoInfo else { continue }
+
+            framesToPreload.append((frameID: frame.id, videoPath: videoInfo.videoPath, frameIndex: videoInfo.frameIndex))
+        }
+
+        guard !framesToPreload.isEmpty else { return }
+
+        preloadTask = Task {
+            for frameData in framesToPreload {
+                // Check for cancellation
+                if Task.isCancelled { return }
+
+                // Skip if already cached (might have been loaded by another path)
+                if imageCache[frameData.frameID] != nil { continue }
+
+                do {
+                    let filename = (frameData.videoPath as NSString).lastPathComponent
+                    guard let filenameID = Int64(filename) else { continue }
+
+                    let imageData = try await coordinator.getFrameImageDirect(
+                        filenameID: filenameID,
+                        frameIndex: frameData.frameIndex
+                    )
+
+                    if Task.isCancelled { return }
+
+                    if let image = NSImage(data: imageData) {
+                        pruneImageCacheIfNeeded()
+                        imageCache[frameData.frameID] = image
+                    }
+                } catch {
+                    // Silently ignore preload errors - frame might not be ready yet
+                    // This is expected for frames near the end that are still encoding
                 }
             }
         }
@@ -2454,10 +2615,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - OCR Node Loading and Text Selection
 
+    /// Set OCR nodes and invalidate the selection cache
+    private func setOCRNodes(_ nodes: [OCRNodeWithText]) {
+        ocrNodes = nodes
+        currentNodesVersion += 1
+    }
+
     /// Load all OCR nodes for the current frame
     private func loadOCRNodes() {
         guard currentTimelineFrame != nil else {
-            ocrNodes = []
+            setOCRNodes([])
             ocrStatus = .unknown
             ocrStatusPollingTask?.cancel()
             ocrStatusPollingTask = nil
@@ -2481,7 +2648,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         ocrStatusPollingTask = nil
 
         guard let timelineFrame = currentTimelineFrame else {
-            ocrNodes = []
+            setOCRNodes([])
             ocrStatus = .unknown
             return
         }
@@ -2534,12 +2701,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                     Log.debug("[SimpleTimelineViewModel] Filtered out \(filteredOut) nodes with invalid coordinates", category: .ui)
                 }
 
-                ocrNodes = filteredNodes
+                setOCRNodes(filteredNodes)
                 Log.debug("[SimpleTimelineViewModel] Set ocrNodes to \(ocrNodes.count) nodes", category: .ui)
             }
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
-            ocrNodes = []
+            setOCRNodes([])
             ocrStatus = .unknown
         }
     }
@@ -2613,7 +2780,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 (node.y + node.height) <= 1.0
             }
 
-            ocrNodes = filteredNodes
+            setOCRNodes(filteredNodes)
             Log.debug("[OCR-POLL] Reloaded \(filteredNodes.count) OCR nodes for frame \(frameID.value)", category: .ui)
         } catch {
             Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
@@ -3341,12 +3508,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         return (start: rangeStart, end: rangeEnd)
     }
 
-    /// Fallback selection for programmatic selection (Cmd+A, double-click, triple-click)
-    /// Uses full-screen reading order without rectangle filtering
-    private func getSelectionRangeFullScreen(for nodeID: Int) -> (start: Int, end: Int)? {
-        guard let start = selectionStart, let end = selectionEnd else { return nil }
+    /// Build or retrieve cached sorted nodes and index map for O(1) lookups
+    /// This dramatically improves Cmd+A performance from O(n² log n) to O(n log n)
+    private func getCachedSortedNodesAndIndexMap() -> (sortedNodes: [OCRNodeWithText], indexMap: [Int: Int]) {
+        // Check if cache is valid
+        if cachedNodesVersion == currentNodesVersion,
+           let sortedNodes = cachedSortedNodes,
+           let indexMap = cachedNodeIndexMap {
+            return (sortedNodes, indexMap)
+        }
 
-        // Sort all nodes by reading order
+        // Build cache: sort nodes by reading order (top to bottom, left to right)
         let sortedNodes = ocrNodes.sorted { node1, node2 in
             let yTolerance: CGFloat = 0.02
             if abs(node1.y - node2.y) > yTolerance {
@@ -3355,9 +3527,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             return node1.x < node2.x
         }
 
-        guard let startNodeIndex = sortedNodes.firstIndex(where: { $0.id == start.nodeID }),
-              let endNodeIndex = sortedNodes.firstIndex(where: { $0.id == end.nodeID }),
-              let thisNodeIndex = sortedNodes.firstIndex(where: { $0.id == nodeID }) else {
+        // Build index map for O(1) lookup by node ID
+        var indexMap: [Int: Int] = [:]
+        indexMap.reserveCapacity(sortedNodes.count)
+        for (index, node) in sortedNodes.enumerated() {
+            indexMap[node.id] = index
+        }
+
+        // Store in cache
+        cachedSortedNodes = sortedNodes
+        cachedNodeIndexMap = indexMap
+        cachedNodesVersion = currentNodesVersion
+
+        return (sortedNodes, indexMap)
+    }
+
+    /// Fallback selection for programmatic selection (Cmd+A, double-click, triple-click)
+    /// Uses full-screen reading order without rectangle filtering
+    /// Optimized to use cached sorted nodes and O(1) index lookup
+    private func getSelectionRangeFullScreen(for nodeID: Int) -> (start: Int, end: Int)? {
+        guard let start = selectionStart, let end = selectionEnd else { return nil }
+
+        // Use cached sorted nodes and index map for O(1) lookups instead of O(n) firstIndex calls
+        let (sortedNodes, indexMap) = getCachedSortedNodesAndIndexMap()
+
+        guard let startNodeIndex = indexMap[start.nodeID],
+              let endNodeIndex = indexMap[end.nodeID],
+              let thisNodeIndex = indexMap[nodeID] else {
             return nil
         }
 
@@ -3812,7 +4008,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.info("[Memory] Cleared image cache on calendar navigation (\(oldCacheCount) images removed)", category: .ui)
             }
 
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
             updateWindowBoundaries()
             hasMoreOlder = true
@@ -3888,7 +4084,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame - video info is already included from the JOIN
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
             // Reset infinite scroll state for new window
             updateWindowBoundaries()
@@ -3962,7 +4158,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
             // Reset infinite scroll state for new window
             updateWindowBoundaries()
@@ -4333,7 +4529,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Convert to TimelineFrame - video info is already included from the JOIN
             // framesWithVideoInfo are returned DESC (newest first), reverse to get ASC (oldest first)
-            let newTimelineFrames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            let newTimelineFrames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
             // Prepend to existing frames
             // Use insert(contentsOf:) to avoid unnecessary @Published triggers
@@ -4396,7 +4592,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Convert to TimelineFrame - video info is already included from the JOIN
             // framesWithVideoInfo are returned ASC (oldest first), which is correct for appending
-            let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo) }
+            let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
 
             // Append to existing frames
             // Use append(contentsOf:) to avoid unnecessary @Published triggers
