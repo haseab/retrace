@@ -191,11 +191,52 @@ public class SearchViewModel: ObservableObject {
         let query = searchQuery
         if !query.isEmpty {
             DashboardViewModel.recordSearch(coordinator: coordinator, query: query)
+
+            // Track filtered search if any filters are active
+            if hasActiveFilters {
+                let filtersJson = buildFiltersJson()
+                DashboardViewModel.recordFilteredSearch(coordinator: coordinator, query: query, filters: filtersJson)
+            }
         }
 
         currentSearchTask = Task {
             await performSearch(query: query)
         }
+    }
+
+    /// Build JSON representation of active filters for metrics
+    private func buildFiltersJson() -> String {
+        var components: [String] = []
+
+        if let apps = selectedAppFilters, !apps.isEmpty {
+            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
+            components.append("\"apps\":[\(appsArray)]")
+            components.append("\"appMode\":\"\(appFilterMode.rawValue)\"")
+        }
+
+        if let startDate = startDate {
+            components.append("\"startDate\":\"\(ISO8601DateFormatter().string(from: startDate))\"")
+        }
+
+        if let endDate = endDate {
+            components.append("\"endDate\":\"\(ISO8601DateFormatter().string(from: endDate))\"")
+        }
+
+        if contentType != .all {
+            components.append("\"contentType\":\"\(contentType.rawValue)\"")
+        }
+
+        if let tags = selectedTags, !tags.isEmpty {
+            let tagsArray = tags.map { "\($0)" }.joined(separator: ",")
+            components.append("\"tags\":[\(tagsArray)]")
+            components.append("\"tagMode\":\"\(tagFilterMode.rawValue)\"")
+        }
+
+        if hiddenFilter != .hide {
+            components.append("\"hiddenFilter\":\"\(hiddenFilter.rawValue)\"")
+        }
+
+        return "{\(components.joined(separator: ","))}"
     }
 
     public func performSearch(query: String) async {

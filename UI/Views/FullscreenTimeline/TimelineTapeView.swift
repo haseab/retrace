@@ -12,6 +12,7 @@ public struct TimelineTapeView: View {
 
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let width: CGFloat
+    let coordinator: AppCoordinator
 
     // Tape dimensions (resolution-adaptive)
     private var tapeHeight: CGFloat { TimelineScaleFactor.tapeHeight }
@@ -1012,6 +1013,7 @@ struct ControlsToggleButton: View {
 /// Search button styled as an input field that opens the spotlight search overlay
 struct SearchButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
     @State private var isHovering = false
 
     /// Display text: shows the search query if present, otherwise "Search"
@@ -1030,6 +1032,8 @@ struct SearchButton: View {
             viewModel.dismissContextMenu()
             // Set overlay visible immediately, clear highlight asynchronously to avoid blocking
             viewModel.isSearchOverlayVisible = true
+            // Record search dialog open metric
+            DashboardViewModel.recordSearchDialogOpen(coordinator: coordinatorWrapper.coordinator)
             Task { @MainActor in
                 viewModel.clearSearchHighlight()
             }
@@ -1077,6 +1081,7 @@ struct SearchButton: View {
 /// Three-dot menu button with dropdown options
 struct MoreOptionsMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
     @State private var isButtonHovering = false
     @State private var isMenuHovering = false
     @State private var showMenu = false
@@ -2074,12 +2079,16 @@ class FrameRightClickNSView: NSView {
 #if DEBUG
 struct TimelineTapeView_Previews: PreviewProvider {
     static var previews: some View {
+        let coordinator = AppCoordinator()
+        let wrapper = AppCoordinatorWrapper(coordinator: coordinator)
         ZStack {
             Color.black
             TimelineTapeView(
-                viewModel: SimpleTimelineViewModel(coordinator: AppCoordinator()),
-                width: 800
+                viewModel: SimpleTimelineViewModel(coordinator: coordinator),
+                width: 800,
+                coordinator: coordinator
             )
+            .environmentObject(wrapper)
         }
         .frame(width: 800, height: 100)
     }

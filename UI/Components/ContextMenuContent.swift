@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVFoundation
 import Shared
+import App
 
 // MARK: - Shared Context Menu Content
 
@@ -9,6 +10,7 @@ import Shared
 struct ContextMenuContent: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @Binding var showMenu: Bool
+    @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -52,10 +54,14 @@ struct ContextMenuContent: View {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(url.absoluteString, forType: .string)
+            // Record deeplink copy metric with the URL
+            DashboardViewModel.recordDeeplinkCopy(coordinator: coordinatorWrapper.coordinator, url: url.absoluteString)
         }
     }
 
     private func saveImage() {
+        let coordinator = coordinatorWrapper.coordinator
+        let frameID = viewModel.currentFrame?.id.value
         getCurrentFrameImage { image in
             guard let image = image else { return }
 
@@ -70,6 +76,8 @@ struct ContextMenuContent: View {
                        let bitmap = NSBitmapImageRep(data: tiffData),
                        let pngData = bitmap.representation(using: .png, properties: [:]) {
                         try? pngData.write(to: url)
+                        // Record image save metric with frame ID
+                        DashboardViewModel.recordImageSave(coordinator: coordinator, frameID: frameID)
                     }
                 }
             }
@@ -77,11 +85,15 @@ struct ContextMenuContent: View {
     }
 
     private func copyImageToClipboard() {
+        let coordinator = coordinatorWrapper.coordinator
+        let frameID = viewModel.currentFrame?.id.value
         getCurrentFrameImage { image in
             guard let image = image else { return }
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.writeObjects([image])
+            // Record image copy metric with frame ID
+            DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: frameID)
         }
     }
 

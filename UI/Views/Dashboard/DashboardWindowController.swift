@@ -33,7 +33,9 @@ public class DashboardWindowController: NSObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.toggle()
+            Task { @MainActor in
+                self?.toggle()
+            }
         }
     }
 

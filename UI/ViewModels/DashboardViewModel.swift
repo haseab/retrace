@@ -558,6 +558,144 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    /// Record an image copy event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - frameID: Optional frame ID that was copied
+    public static func recordImageCopy(coordinator: AppCoordinator, frameID: Int64? = nil) {
+        Task {
+            let metadata = frameID.map { "\($0)" }
+            try? await coordinator.recordMetricEvent(metricType: .imageCopies, metadata: metadata)
+        }
+    }
+
+    /// Record an image save event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - frameID: Optional frame ID that was saved
+    public static func recordImageSave(coordinator: AppCoordinator, frameID: Int64? = nil) {
+        Task {
+            let metadata = frameID.map { "\($0)" }
+            try? await coordinator.recordMetricEvent(metricType: .imageSaves, metadata: metadata)
+        }
+    }
+
+    /// Record a deeplink copy event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - url: The deeplink URL that was copied
+    public static func recordDeeplinkCopy(coordinator: AppCoordinator, url: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .deeplinkCopies, metadata: url)
+        }
+    }
+
+    /// Record timeline session duration (only if > 3 seconds)
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - duration: Duration in milliseconds
+    public static func recordTimelineSession(coordinator: AppCoordinator, durationMs: Int64) {
+        guard durationMs > 3000 else { return }  // Only record if > 3 seconds
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+        }
+    }
+
+    /// Record a filtered search query
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - query: The search query text
+    ///   - filters: JSON string of applied filters
+    public static func recordFilteredSearch(coordinator: AppCoordinator, query: String, filters: String) {
+        Task {
+            let json = "{\"query\":\"\(query)\",\"filters\":\(filters)}"
+            try? await coordinator.recordMetricEvent(metricType: .filteredSearchQuery, metadata: json)
+        }
+    }
+
+    /// Record a timeline filter query
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - filterJson: JSON string of timeline filters
+    public static func recordTimelineFilter(coordinator: AppCoordinator, filterJson: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .timelineFilterQuery, metadata: filterJson)
+        }
+    }
+
+    /// Record scrub distance for the session
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - distancePixels: Total scrub distance in pixels
+    public static func recordScrubDistance(coordinator: AppCoordinator, distancePixels: Double) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(Int(distancePixels))")
+        }
+    }
+
+    /// Record a search dialog open event
+    public static func recordSearchDialogOpen(coordinator: AppCoordinator) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .searchDialogOpens)
+        }
+    }
+
+    /// Record an OCR reprocess request
+    public static func recordOCRReprocess(coordinator: AppCoordinator) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .ocrReprocessRequests)
+        }
+    }
+
+    /// Record an arrow key navigation event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - direction: "left" or "right"
+    public static func recordArrowKeyNavigation(coordinator: AppCoordinator, direction: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .arrowKeyNavigation, metadata: direction)
+        }
+    }
+
+    /// Record a shift+drag zoom region event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - region: The bounding box of the zoom region
+    ///   - screenSize: The size of the screen
+    public static func recordShiftDragZoom(coordinator: AppCoordinator, region: CGRect, screenSize: CGSize) {
+        Task {
+            let json = "{\"region\":{\"x\":\(region.origin.x),\"y\":\(region.origin.y),\"width\":\(region.width),\"height\":\(region.height)},\"screenSize\":{\"width\":\(screenSize.width),\"height\":\(screenSize.height)}}"
+            try? await coordinator.recordMetricEvent(metricType: .shiftDragZoomRegion, metadata: json)
+        }
+    }
+
+    /// Record a shift+drag text copy event
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - copiedText: The text that was copied
+    public static func recordShiftDragTextCopy(coordinator: AppCoordinator, copiedText: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .shiftDragTextCopy, metadata: copiedText)
+        }
+    }
+
+    /// Record an app launch event
+    public static func recordAppLaunch(coordinator: AppCoordinator) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .appLaunches)
+        }
+    }
+
+    /// Record a keyboard shortcut usage
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - shortcut: The shortcut identifier (e.g. "cmd+shift+t", "cmd+f")
+    public static func recordKeyboardShortcut(coordinator: AppCoordinator, shortcut: String) {
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .keyboardShortcut, metadata: shortcut)
+        }
+    }
+
     // MARK: - Cleanup
 
     deinit {

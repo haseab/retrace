@@ -1327,6 +1327,9 @@ public actor AppCoordinator {
     public func reprocessOCR(frameID: FrameID) async throws {
         Log.info("[OCR-REPROCESS] Starting reprocess for frame \(frameID.value)", category: .processing)
 
+        // Record OCR reprocess metric
+        try? await recordMetricEvent(metricType: .ocrReprocessRequests, metadata: "\(frameID.value)")
+
         // Clear existing OCR nodes for this frame
         try await services.database.deleteNodes(frameID: frameID)
         Log.info("[OCR-REPROCESS] Deleted nodes for frame \(frameID.value)", category: .processing)

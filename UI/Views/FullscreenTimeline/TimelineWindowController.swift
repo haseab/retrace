@@ -21,6 +21,12 @@ public class TimelineWindowController: NSObject {
     /// Path to the performance log file
     private static let perfLogPath = URL(fileURLWithPath: "/tmp/retrace_timeline_perf.log")
 
+    // MARK: - Session Duration Tracking
+
+    /// Tracks when the timeline was opened for duration tracking
+    private var sessionStartTime: Date?
+    private var sessionScrubDistance: Double = 0
+
     /// Log detailed timing breakdown for timeline show (writes to temp file)
     private func logShowTiming(_ checkpoint: String) {
         guard showStartTime > 0 else { return }
@@ -55,6 +61,7 @@ public class TimelineWindowController: NSObject {
 
     private var window: NSWindow?
     private var coordinator: AppCoordinator?
+    private var coordinatorWrapper: AppCoordinatorWrapper?
     private var eventMonitor: Any?
     private var localEventMonitor: Any?
     private var timelineViewModel: SimpleTimelineViewModel?
@@ -212,6 +219,7 @@ public class TimelineWindowController: NSObject {
     /// Configure with the app coordinator (call once during app launch)
     public func configure(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        self.coordinatorWrapper = AppCoordinatorWrapper(coordinator: coordinator)
         // Pre-render the window in the background for instant show()
         Task { @MainActor in
             // Small delay to let app finish launching
@@ -271,6 +279,11 @@ public class TimelineWindowController: NSObject {
         Log.info("[TIMELINE-PRERENDER] 📊 ViewModel created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
         // Create the SwiftUI view
+        guard let coordinatorWrapper = coordinatorWrapper else {
+            Log.error("[TIMELINE-PRERENDER] Coordinator wrapper not initialized", category: .ui)
+            return
+        }
+
         let timelineView = SimpleTimelineView(
             coordinator: coordinator,
             viewModel: viewModel,
@@ -278,6 +291,7 @@ public class TimelineWindowController: NSObject {
                 self?.hide()
             }
         )
+        .environmentObject(coordinatorWrapper)
         Log.info("[TIMELINE-PRERENDER] 📺 SwiftUI view created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
         // Host the SwiftUI view
@@ -363,6 +377,11 @@ public class TimelineWindowController: NSObject {
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
 
+        guard let coordinatorWrapper = coordinatorWrapper else {
+            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
+            return
+        }
+
         // Create the SwiftUI view (using new SimpleTimelineView)
         let timelineView = SimpleTimelineView(
             coordinator: coordinator,
@@ -371,6 +390,7 @@ public class TimelineWindowController: NSObject {
                 self?.hide()
             }
         )
+        .environmentObject(coordinatorWrapper)
 
         // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
         let hostingView = FirstMouseHostingView(rootView: timelineView)
@@ -436,6 +456,10 @@ public class TimelineWindowController: NSObject {
             await coordinator.setTimelineVisible(true)
         }
 
+        // Track session start time for duration metrics
+        sessionStartTime = Date()
+        sessionScrubDistance = 0  // Reset scrub distance for new session
+
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
     }
@@ -443,6 +467,20 @@ public class TimelineWindowController: NSObject {
     /// Hide the timeline overlay
     public func hide() {
         guard isVisible, let window = window else { return }
+
+        // Record timeline session duration (only if > 3 seconds)
+        if let startTime = sessionStartTime, let coordinator = coordinator {
+            let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+            DashboardViewModel.recordTimelineSession(coordinator: coordinator, durationMs: durationMs)
+
+            // Record scrub distance metric
+            if sessionScrubDistance > 0 {
+                DashboardViewModel.recordScrubDistance(coordinator: coordinator, distancePixels: sessionScrubDistance)
+            }
+
+            sessionStartTime = nil
+            sessionScrubDistance = 0  // Reset scrub distance for next session
+        }
 
         // Don't save position on hide - window stays in memory
         // Position is only saved on app termination (see savePositionForTermination)
@@ -475,6 +513,8 @@ public class TimelineWindowController: NSObject {
                 // Use navigateToNewest: false to preserve user's position within the 2-minute grace period
                 if let viewModel = self?.timelineViewModel {
                     await viewModel.refreshFrameData(navigateToNewest: false)
+                    // Reset zoom region state on hide
+                    viewModel.exitZoomRegion()
                 }
 
                 self?.onClose?()
@@ -680,6 +720,11 @@ public class TimelineWindowController: NSObject {
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
 
+        guard let coordinatorWrapper = coordinatorWrapper else {
+            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
+            return
+        }
+
         let timelineView = SimpleTimelineView(
             coordinator: coordinator,
             viewModel: viewModel,
@@ -687,6 +732,7 @@ public class TimelineWindowController: NSObject {
                 self?.hide()
             }
         )
+        .environmentObject(coordinatorWrapper)
 
         let hostingView = FirstMouseHostingView(rootView: timelineView)
         hostingView.frame = newWindow.contentView?.bounds ?? .zero
@@ -829,51 +875,68 @@ public class TimelineWindowController: NSObject {
 
                 // Cmd+K to toggle search overlay
                 if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // Cmd+F to toggle filter panel
                 if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+G to toggle date search
+                if event.keyCode == 5 && modifiers == [.command] { // Cmd+G
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // Cmd+=/+ to zoom in (handle before system can intercept)
                 if (event.keyCode == 24 || event.keyCode == 69) && (modifiers == [.command] || modifiers == [.command, .shift]) {
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // Cmd+- to zoom out (handle before system can intercept)
                 if (event.keyCode == 27 || event.keyCode == 78) && modifiers == [.command] {
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
-                // Cmd+0 to reset zoom (handle before system can intercept)
+                // Cmd+0 or Ctrl+0 to reset zoom (handle before system can intercept)
                 if event.keyCode == 29 && (modifiers == [.command] || modifiers == [.control]) {
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // Cmd+A to select all (handle before system can intercept)
                 if event.keyCode == 0 && modifiers == [.command] {
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // Cmd+C to copy (handle before system can intercept)
                 if event.keyCode == 8 && modifiers == [.command] {
-                    if self?.handleKeyEvent(event) == true {
-                        return nil // Consume the event
-                    }
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+H to toggle controls visibility (handle before system can intercept)
+                if event.keyCode == 4 && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+J to go to now (handle before system can intercept)
+                if event.keyCode == 38 && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+P to toggle peek mode (handle before system can intercept)
+                if event.keyCode == 35 && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
                 }
 
                 // For other keys, let text field handle them if it's active
@@ -1021,6 +1084,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+G to toggle date search panel ("Go to" date)
         if event.keyCode == 5 && modifiers == [.command] { // G key with Command
+            recordShortcut("cmd+g")
             if let viewModel = timelineViewModel {
                 viewModel.toggleDateSearch()
             }
@@ -1029,11 +1093,16 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+K to toggle search overlay
         if event.keyCode == 40 && modifiers == [.command] { // K key with Command
+            recordShortcut("cmd+k")
             if let viewModel = timelineViewModel {
                 let wasVisible = viewModel.isSearchOverlayVisible
                 viewModel.isSearchOverlayVisible.toggle()
                 // Clear search highlight asynchronously when opening search overlay
                 if !wasVisible {
+                    // Record search dialog open metric
+                    if let coordinator = coordinator {
+                        DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
+                    }
                     Task { @MainActor in
                         viewModel.clearSearchHighlight()
                     }
@@ -1044,6 +1113,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+F to toggle filter panel
         if event.keyCode == 3 && modifiers == [.command] { // F key with Command
+            recordShortcut("cmd+f")
             if let viewModel = timelineViewModel {
                 if viewModel.isFilterPanelVisible {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -1080,6 +1150,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+A to select all text on the frame
         if event.keyCode == 0 && modifiers == [.command] { // A key with Command
+            recordShortcut("cmd+a")
             if let viewModel = timelineViewModel {
                 viewModel.selectAllText()
                 return true
@@ -1088,6 +1159,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+C to copy selected text
         if event.keyCode == 8 && modifiers == [.command] { // C key with Command
+            recordShortcut("cmd+c")
             if let viewModel = timelineViewModel, viewModel.hasSelection {
                 viewModel.copySelectedText()
                 return true
@@ -1096,6 +1168,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+H to toggle timeline controls visibility
         if event.keyCode == 4 && modifiers == [.command] { // H key with Command
+            recordShortcut("cmd+h")
             if let viewModel = timelineViewModel {
                 viewModel.toggleControlsVisibility()
                 return true
@@ -1104,6 +1177,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+P to toggle peek mode (view full context while filtered)
         if event.keyCode == 35 && modifiers == [.command] { // P key with Command
+            recordShortcut("cmd+p")
             if let viewModel = timelineViewModel {
                 // Only allow peek if we have active filters or are already peeking
                 if viewModel.filterCriteria.hasActiveFilters || viewModel.isPeeking {
@@ -1115,6 +1189,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+J to go to now (most recent frame)
         if event.keyCode == 38 && modifiers == [.command] { // J key with Command
+            recordShortcut("cmd+j")
             if let viewModel = timelineViewModel {
                 viewModel.goToNow()
                 return true
@@ -1126,6 +1201,10 @@ public class TimelineWindowController: NSObject {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex - step)
+                // Record arrow key navigation metric
+                if let coordinator = coordinator {
+                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
+                }
             }
             return true // Always consume arrow keys to prevent system "bonk" sound
         }
@@ -1135,12 +1214,17 @@ public class TimelineWindowController: NSObject {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex + step)
+                // Record arrow key navigation metric
+                if let coordinator = coordinator {
+                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
+                }
             }
             return true // Always consume arrow keys to prevent system "bonk" sound
         }
 
         // Ctrl+0 to reset frame zoom to 100%
         if event.keyCode == 29 && modifiers == [.control] { // 0 key with Control
+            recordShortcut("ctrl+0")
             if let viewModel = timelineViewModel, viewModel.isFrameZoomed {
                 viewModel.resetFrameZoom()
                 return true
@@ -1149,6 +1233,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+0 to reset frame zoom to 100% (alternative shortcut)
         if event.keyCode == 29 && modifiers == [.command] { // 0 key with Command
+            recordShortcut("cmd+0")
             if let viewModel = timelineViewModel, viewModel.isFrameZoomed {
                 viewModel.resetFrameZoom()
                 return true
@@ -1158,6 +1243,7 @@ public class TimelineWindowController: NSObject {
         // Cmd++ (Cmd+=) to zoom in frame
         // Key code 24 is '=' which is '+' with shift, but Cmd+= works as zoom in
         if (event.keyCode == 24 || event.keyCode == 69) && (modifiers == [.command] || modifiers == [.command, .shift]) {
+            recordShortcut("cmd++")
             if let viewModel = timelineViewModel {
                 viewModel.applyMagnification(1.25, animated: true) // Zoom in by 25%
                 return true
@@ -1166,6 +1252,7 @@ public class TimelineWindowController: NSObject {
 
         // Cmd+- to zoom out frame
         if (event.keyCode == 27 || event.keyCode == 78) && modifiers == [.command] { // - key (main or numpad)
+            recordShortcut("cmd+-")
             if let viewModel = timelineViewModel {
                 viewModel.applyMagnification(0.8, animated: true) // Zoom out by 20%
                 return true
@@ -1293,6 +1380,44 @@ public class TimelineWindowController: NSObject {
 
         default: return 0
         }
+    }
+
+    // MARK: - Scrub Distance Tracking
+
+    /// Accumulate scrub distance for the current session
+    public func accumulateScrubDistance(_ distance: Double) {
+        sessionScrubDistance += distance
+    }
+
+    // MARK: - Keyboard Shortcut Tracking
+
+    /// Record keyboard shortcut usage
+    private func recordShortcut(_ shortcut: String) {
+        if let coordinator = coordinator {
+            DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
+        }
+    }
+
+    // MARK: - Session Metrics
+
+    /// Force record session metrics (called on app termination)
+    public func forceRecordSessionMetrics() {
+        guard let startTime = sessionStartTime, let coordinator = coordinator else { return }
+
+        let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+
+        // Record synchronously using a blocking task
+        let semaphore = DispatchSemaphore(value: 0)
+        Task {
+            try? await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+
+            if sessionScrubDistance > 0 {
+                try? await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(Int(sessionScrubDistance))")
+            }
+
+            semaphore.signal()
+        }
+        semaphore.wait()
     }
 }
 

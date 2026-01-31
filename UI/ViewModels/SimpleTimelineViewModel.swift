@@ -713,6 +713,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Task for polling OCR status when processing is in progress
     private var ocrStatusPollingTask: Task<Void, Never>?
 
+    /// Task for auto-dismissing error messages after a delay
+    private var errorDismissTask: Task<Void, Never>?
+
     /// Cache for Retrace images (loaded on demand since they're from disk)
     private var imageCache: [FrameID: NSImage] = [:] {
         didSet {
@@ -867,7 +870,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func reloadFramesAroundTimestamp(_ timestamp: Date) async {
         Log.debug("[DataSourceChange] reloadFramesAroundTimestamp() starting for timestamp: \(timestamp)", category: .ui)
         isLoading = true
-        error = nil
+        clearError()
 
         do {
             let calendar = Calendar.current
@@ -1516,6 +1519,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         filterCriteria = pendingFilterCriteria
         Log.debug("[Filter] Applied filters - filterCriteria.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+
+        // Record timeline filter metric with JSON of applied filters
+        let filterJson = buildTimelineFilterJson()
+        DashboardViewModel.recordTimelineFilter(coordinator: coordinator, filterJson: filterJson)
+
         dismissFilterPanel()
 
         // Save filter criteria to cache immediately
@@ -1571,6 +1579,37 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Save (clear) filter criteria cache immediately
         saveFilterCriteria()
+    }
+
+
+    /// Build JSON representation of active timeline filters for metrics
+    private func buildTimelineFilterJson() -> String {
+        var components: [String] = []
+
+        if let apps = filterCriteria.selectedApps, !apps.isEmpty {
+            let appsArray = apps.map { "\"\($0)\"" }.joined(separator: ",")
+            components.append("\"bundleIDs\":[\(appsArray)]")
+        }
+
+        if let windowName = filterCriteria.windowNameFilter {
+            let escaped = windowName.replacingOccurrences(of: "\"", with: "\\\"")
+            components.append("\"windowName\":\"\(escaped)\"")
+        }
+
+        if let browserUrl = filterCriteria.browserUrlFilter {
+            let escaped = browserUrl.replacingOccurrences(of: "\"", with: "\\\"")
+            components.append("\"browserUrl\":\"\(escaped)\"")
+        }
+
+        if let startDate = filterCriteria.startDate {
+            components.append("\"startDate\":\"\(ISO8601DateFormatter().string(from: startDate))\"")
+        }
+
+        if let endDate = filterCriteria.endDate {
+            components.append("\"endDate\":\"\(ISO8601DateFormatter().string(from: endDate))\"")
+        }
+
+        return "{\(components.joined(separator: ","))}"
     }
 
     // MARK: - Peek Mode (View Full Context)
@@ -1665,9 +1704,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Clear error message and cancel any auto-dismiss task
+    private func clearError() {
+        errorDismissTask?.cancel()
+        error = nil
+    }
+
     /// Show "no results" message and provide option to clear filters
     private func showNoResultsMessage() {
         error = "No frames found matching the current filters. Clear filters to see all frames."
+
+        // Cancel any existing dismiss task
+        errorDismissTask?.cancel()
+
+        // Auto-dismiss after 5 seconds
+        errorDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+            if !Task.isCancelled {
+                error = nil
+            }
+        }
     }
 
     /// Dismiss filter panel (resets pending to match applied)
@@ -1881,7 +1937,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         logTabClickTiming("VM_LOAD_START", startTime: startTime)
 
         isLoading = true
-        error = nil
+        clearError()
 
         do {
             // Load most recent frames
@@ -1971,7 +2027,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         logTabClickTiming("VM_LOAD_DIRECT_START", startTime: startTime)
 
         isLoading = true
-        error = nil
+        clearError()
 
         guard !framesWithVideoInfo.isEmpty else {
             if filterCriteria.hasActiveFilters {
@@ -2208,9 +2264,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int) {
+        let oldIndex = currentIndex
         // Clamp to valid range
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
+
+        // Track scrub distance for metrics
+        let distance = abs(clampedIndex - currentIndex)
+        TimelineWindowController.shared.accumulateScrubDistance(Double(distance))
 
         currentIndex = clampedIndex
 
@@ -3077,6 +3138,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[ZoomRegion] endZoomRegion: start=\(start), end=\(end)", category: .ui)
         Log.info("[ZoomRegion] endZoomRegion: finalRect=\(finalRect) (normalized coords, Y=0 at top)", category: .ui)
 
+        // Record shift+drag zoom region metric
+        if let screenSize = NSScreen.main?.frame.size {
+            let absoluteRect = CGRect(
+                x: finalRect.origin.x * screenSize.width,
+                y: finalRect.origin.y * screenSize.height,
+                width: finalRect.width * screenSize.width,
+                height: finalRect.height * screenSize.height
+            )
+            DashboardViewModel.recordShiftDragZoom(coordinator: coordinator, region: absoluteRect, screenSize: screenSize)
+        }
+
         // Store the starting rect for animation
         zoomTransitionStartRect = finalRect
         zoomRegion = finalRect
@@ -3748,7 +3820,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         NSPasteboard.general.setString(text, forType: .string)
 
         // Track text copy event with the copied text
+        // Track text copy event with the copied text
         DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+        
+        // Track shift+drag text copy if this was from a manual selection
+        if selectionStart != nil && selectionEnd != nil {
+            DashboardViewModel.recordShiftDragTextCopy(coordinator: coordinator, copiedText: text)
+        }
     }
 
     /// Copy the zoomed region as an image to clipboard
@@ -4055,7 +4133,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Navigate to a specific date (start of day or specific time)
     private func navigateToDate(_ targetDate: Date) async {
         isLoading = true
-        error = nil
+        clearError()
 
         do {
             let calendar = Calendar.current
@@ -4100,7 +4178,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard !searchText.isEmpty else { return }
 
         isLoading = true
-        error = nil
+        clearError()
 
         do {
             // If frame ID search is enabled and input looks like a frame ID (pure number), try that first

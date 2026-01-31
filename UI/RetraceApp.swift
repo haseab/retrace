@@ -120,6 +120,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize the app coordinator and UI
         Task { @MainActor in
             await initializeApp()
+            
+            // Record app launch metric
+            if let coordinator = coordinatorWrapper?.coordinator {
+                DashboardViewModel.recordAppLaunch(coordinator: coordinator)
+            }
         }
 
         // Note: Permissions are now handled in the onboarding flow
@@ -286,6 +291,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Save timeline state (filters, search) for cross-session persistence
         TimelineWindowController.shared.saveStateForTermination()
+
+        // Force record any active timeline session before terminating
+        TimelineWindowController.shared.forceRecordSessionMetrics()
 
         Log.info("[AppDelegate] Application terminating", category: .app)
     }

@@ -132,7 +132,8 @@ public struct SimpleTimelineView: View {
                     Spacer()
                     TimelineTapeView(
                         viewModel: viewModel,
-                        width: geometry.size.width
+                        width: geometry.size.width,
+                        coordinator: coordinator
                     )
                     .padding(.bottom, TimelineScaleFactor.tapeBottomPadding)
                 }
@@ -1081,6 +1082,7 @@ class DoubleBufferedVideoView: NSView {
 /// Supports trackpad pinch-to-zoom for zooming in/out of the frame
 struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
     let onURLClicked: () -> Void
     let content: () -> Content
 
@@ -3164,6 +3166,7 @@ extension View {
 /// Floating context menu that appears at click location with smart edge detection
 struct FloatingContextMenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
     @Binding var isPresented: Bool
     let location: CGPoint
     let containerSize: CGSize
@@ -4688,11 +4691,13 @@ struct FilterDropdownButton: View {
 struct SimpleTimelineView_Previews: PreviewProvider {
     static var previews: some View {
         let coordinator = AppCoordinator()
+        let wrapper = AppCoordinatorWrapper(coordinator: coordinator)
         SimpleTimelineView(
             coordinator: coordinator,
             viewModel: SimpleTimelineViewModel(coordinator: coordinator),
             onClose: {}
         )
+        .environmentObject(wrapper)
         .frame(width: 1920, height: 1080)
     }
 }
