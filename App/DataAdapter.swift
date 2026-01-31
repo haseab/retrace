@@ -1122,6 +1122,9 @@ public actor DataAdapter {
                 """)
         }
 
+        // Always exclude p=4 frames (not yet readable)
+        whereClauses.append("f.processingStatus != 4")
+
         let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
@@ -1386,6 +1389,9 @@ public actor DataAdapter {
                 """)
         }
 
+        // Always exclude p=4 frames (not yet readable)
+        whereClauses.append("f.processingStatus != 4")
+
         let whereClause = whereClauses.joined(separator: " AND ")
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
@@ -1598,6 +1604,9 @@ public actor DataAdapter {
                 )
                 """)
         }
+
+        // Always exclude p=4 frames (not yet readable)
+        whereClauses.append("f.processingStatus != 4")
 
         let whereClause = whereClauses.joined(separator: " AND ")
 

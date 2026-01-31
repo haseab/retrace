@@ -1338,6 +1338,10 @@ public actor AppCoordinator {
         try await services.database.deleteFTSContent(frameId: frameID.value)
         Log.info("[OCR-REPROCESS] Deleted FTS content for frame \(frameID.value)", category: .processing)
 
+        // Reset processingStatus to 0 (pending) so frame can be re-enqueued
+        try await services.database.updateFrameProcessingStatus(frameID: frameID.value, status: 0)
+        Log.info("[OCR-REPROCESS] Reset processingStatus to pending for frame \(frameID.value)", category: .processing)
+
         // Enqueue for reprocessing with high priority
         guard let queue = await services.processingQueue else {
             Log.error("[OCR-REPROCESS] Processing queue not available!", category: .processing)

@@ -842,7 +842,7 @@ public class TimelineWindowController: NSObject {
     // MARK: - Event Monitoring
 
     private func setupEventMonitors() {
-        // Monitor for escape key and toggle shortcut (global)
+        // Monitor for all key events globally (when timeline is visible but not key window)
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
@@ -910,7 +910,12 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Cmd+A to select all (handle before system can intercept)
+                // But let it pass through when a dialog with text input is active
                 if event.keyCode == 0 && modifiers == [.command] {
+                    if let viewModel = self?.timelineViewModel,
+                       (viewModel.isSearchOverlayVisible || viewModel.isFilterPanelVisible || viewModel.isDateSearchActive) {
+                        return event // Let the text field handle Cmd+A
+                    }
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1096,15 +1101,11 @@ public class TimelineWindowController: NSObject {
             recordShortcut("cmd+k")
             if let viewModel = timelineViewModel {
                 let wasVisible = viewModel.isSearchOverlayVisible
-                viewModel.isSearchOverlayVisible.toggle()
-                // Clear search highlight asynchronously when opening search overlay
+                viewModel.toggleSearchOverlay()
+                // Record search dialog open metric when opening
                 if !wasVisible {
-                    // Record search dialog open metric
                     if let coordinator = coordinator {
                         DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
-                    }
-                    Task { @MainActor in
-                        viewModel.clearSearchHighlight()
                     }
                 }
             }
@@ -1120,7 +1121,9 @@ public class TimelineWindowController: NSObject {
                         viewModel.dismissFilterPanel()
                     }
                 } else {
-                    viewModel.openFilterPanel()
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        viewModel.openFilterPanel()
+                    }
                 }
             }
             return true
@@ -1149,9 +1152,14 @@ public class TimelineWindowController: NSObject {
         }
 
         // Cmd+A to select all text on the frame
+        // Skip when a dialog with text input is active - let the text field handle it
         if event.keyCode == 0 && modifiers == [.command] { // A key with Command
-            recordShortcut("cmd+a")
             if let viewModel = timelineViewModel {
+                // Don't intercept when dialogs with text inputs are open
+                if viewModel.isSearchOverlayVisible || viewModel.isFilterPanelVisible || viewModel.isDateSearchActive {
+                    return false // Let the text field handle Cmd+A
+                }
+                recordShortcut("cmd+a")
                 viewModel.selectAllText()
                 return true
             }

@@ -534,6 +534,7 @@ struct RefreshButton: View {
             viewModel.dismissContextMenu()
             Task {
                 await viewModel.loadMostRecentFrame()
+                await viewModel.refreshProcessingStatuses()
             }
         }) {
             Image(systemName: "arrow.clockwise")
@@ -839,7 +840,7 @@ struct FilterButton: View {
                         viewModel.dismissFilterPanel()
                     }
                 } else {
-                    withAnimation(.easeOut(duration: 0.15)) {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                         viewModel.openFilterPanel()
                     }
                 }
@@ -849,6 +850,7 @@ struct FilterButton: View {
                     .foregroundColor(isHovering || viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0
                         ? .white
                         : .white.opacity(0.6))
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: viewModel.isFilterPanelVisible)
                     .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
                     .themeAwareCircleStyle(isActive: viewModel.isFilterPanelVisible || viewModel.activeFilterCount > 0, isHovering: isHovering)
             }
@@ -2170,6 +2172,7 @@ struct ThemeAwareCircleButtonStyle: ViewModifier {
             .background(
                 Circle()
                     .fill(isActive ? Color.white.opacity(0.15) : Color(white: 0.15))
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isActive)
             )
             .overlay(
                 Circle()

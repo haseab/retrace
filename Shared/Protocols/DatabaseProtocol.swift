@@ -62,6 +62,12 @@ public protocol DatabaseProtocol: Actor {
     /// Called when frame is confirmed to be written to video file
     func markFrameReadable(frameID: Int64) async throws
 
+    /// Update frame's processing status
+    /// - Parameters:
+    ///   - frameID: The frame ID to update
+    ///   - status: The new processing status (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws
+
     // MARK: - Video Segment Operations (Video Files)
 
     /// Insert a new video segment (150-frame video chunk) and return the auto-generated ID

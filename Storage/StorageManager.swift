@@ -392,6 +392,76 @@ public actor StorageManager: StorageProtocol {
         return frameCount
     }
 
+    /// Check if a video file has valid timestamps (first frame dts=0)
+    /// Returns false if the video was not properly finalized (crash recovery case)
+    public func isVideoValid(id: VideoSegmentID) async throws -> Bool {
+        guard let segmentURL = try? await getSegmentPath(id: id) else {
+            return false
+        }
+
+        // Check if file is empty
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            return false
+        }
+
+        // Handle extensionless files by creating symlink
+        let assetURL: URL
+        if segmentURL.pathExtension.lowercased() == "mp4" {
+            assetURL = segmentURL
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = segmentURL.lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+
+            if !FileManager.default.fileExists(atPath: symlinkPath.path) {
+                try FileManager.default.createSymbolicLink(
+                    atPath: symlinkPath.path,
+                    withDestinationPath: segmentURL.path
+                )
+            }
+            assetURL = symlinkPath
+        }
+
+        let asset = AVAsset(url: assetURL)
+
+        guard let videoTrack = try? await asset.loadTracks(withMediaType: .video).first else {
+            return false
+        }
+
+        // Create asset reader to check first frame's timestamp
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            return false
+        }
+
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+
+        guard reader.canAdd(trackOutput) else {
+            return false
+        }
+        reader.add(trackOutput)
+
+        guard reader.startReading() else {
+            return false
+        }
+
+        // Check first frame's presentation time
+        guard let firstSample = trackOutput.copyNextSampleBuffer() else {
+            return false
+        }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(firstSample)
+
+        // Valid videos start at pts=0 (or very close to it)
+        // Crashed/unfinalized videos start at pts=20/600 or later
+        return pts.value == 0
+    }
+
     /// Rename a video segment file (used when temporary ID is replaced with database ID)
     public func renameSegment(from oldID: VideoSegmentID, to newID: VideoSegmentID, date: Date) async throws {
         // Find old file

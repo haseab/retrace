@@ -139,6 +139,24 @@ public class SimpleTimelineViewModel: ObservableObject {
                 if let frame = currentTimelineFrame {
                     Log.debug("[SimpleTimelineViewModel] New frame: timestamp=\(frame.frame.timestamp), frameIndex=\(frame.videoInfo?.frameIndex ?? -1)", category: .ui)
                 }
+
+                // CRITICAL: Clear previous frame state IMMEDIATELY to prevent old frame from showing
+                // This runs synchronously before SwiftUI re-renders
+                currentImage = nil
+
+                // Pre-check if frame will have loading issues (synchronous check)
+                // This prevents showing a fallback frame before the async error is detected
+                if let timelineFrame = currentTimelineFrame {
+                    if timelineFrame.processingStatus == 4 {
+                        // Frame not yet readable
+                        frameNotReady = true
+                        frameLoadError = false
+                    } else {
+                        // Reset states - actual load will set them if needed
+                        frameNotReady = false
+                        frameLoadError = false
+                    }
+                }
             }
         }
     }
@@ -147,7 +165,22 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentImage: NSImage?
 
     /// Whether the current frame is not yet available in the video file (still encoding)
-    @Published public var frameNotReady: Bool = false
+    @Published public var frameNotReady: Bool = false {
+        willSet {
+            if newValue != frameNotReady {
+                let frameID = currentTimelineFrame?.frame.id.value ?? -1
+                let status = currentTimelineFrame?.processingStatus ?? -1
+                Log.info("[FRAME-READY-CHANGE] ⚠️ frameNotReady changing: \(frameNotReady) -> \(newValue) for frameID=\(frameID), processingStatus=\(status)", category: .ui)
+
+                // Print stack trace to see where this is being called from
+                let stackTrace = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
+                Log.info("[FRAME-READY-CHANGE] Stack trace:\n\(stackTrace)", category: .ui)
+            }
+        }
+    }
+
+    /// Whether the current frame failed to load (e.g., index out of range, file read error)
+    @Published public var frameLoadError: Bool = false
 
     /// Loading state
     @Published public var isLoading = false
@@ -1726,6 +1759,38 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Dismiss all dialogs except the specified one
+    /// - Parameter except: The dialog type to keep open (nil to dismiss all)
+    public func dismissOtherDialogs(except: DialogType? = nil) {
+        // Dismiss filter panel
+        if except != .filter && isFilterPanelVisible {
+            pendingFilterCriteria = filterCriteria
+            isFilterPanelVisible = false
+        }
+
+        // Dismiss date search (Cmd+G)
+        if except != .dateSearch && isDateSearchActive {
+            isDateSearchActive = false
+            dateSearchText = ""
+        }
+
+        // Dismiss search overlay (Cmd+K)
+        if except != .search && isSearchOverlayVisible {
+            isSearchOverlayVisible = false
+        }
+
+        // Always dismiss context menus
+        dismissContextMenu()
+        dismissTimelineContextMenu()
+    }
+
+    /// Dialog types for mutual exclusion
+    public enum DialogType {
+        case filter      // Cmd+F - Filter panel
+        case dateSearch  // Cmd+G - Date search
+        case search      // Cmd+K - Search overlay
+    }
+
     /// Dismiss filter panel (resets pending to match applied)
     public func dismissFilterPanel() {
         // Reset pending first - animation is handled by the View
@@ -1735,8 +1800,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Open filter panel and load necessary data
     public func openFilterPanel() {
-        dismissContextMenu()
-        dismissTimelineContextMenu()
+        // Dismiss other dialogs first
+        dismissOtherDialogs(except: .filter)
         // Initialize pending with current applied filters
         pendingFilterCriteria = filterCriteria
         // Set visible immediately - animation is handled by the View
@@ -1835,6 +1900,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Open the date search panel with animation
     public func openDateSearch() {
+        // Dismiss other dialogs first
+        dismissOtherDialogs(except: .dateSearch)
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             isDateSearchActive = true
         }
@@ -1854,6 +1921,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             closeDateSearch()
         } else {
             openDateSearch()
+        }
+    }
+
+    // MARK: - Search Overlay
+
+    /// Open the search overlay and dismiss other dialogs
+    public func openSearchOverlay() {
+        // Dismiss other dialogs first
+        dismissOtherDialogs(except: .search)
+        isSearchOverlayVisible = true
+        // Clear any existing search highlight
+        Task { @MainActor in
+            clearSearchHighlight()
+        }
+    }
+
+    /// Close the search overlay
+    public func closeSearchOverlay() {
+        isSearchOverlayVisible = false
+    }
+
+    /// Toggle the search overlay
+    public func toggleSearchOverlay() {
+        if isSearchOverlayVisible {
+            closeSearchOverlay()
+        } else {
+            openSearchOverlay()
         }
     }
 
@@ -2067,28 +2161,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
 
-    /// Log to debug file for infinite scroll debugging
-    private static func logDebugFileStatic(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: tabClickLogPath)
-            }
-        }
-    }
-
-    private func logDebugFile(_ message: String) {
-        Self.logDebugFileStatic(message)
-    }
-
     /// Log timing for tab click filter queries
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
@@ -2150,6 +2222,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                         // Add new frames to the end (they're newer, so they go at the end)
                         let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+
+                        // Log processing statuses of new frames
+                        let statusSummary = newTimelineFrames.map { "[\($0.frame.id.value):p=\($0.processingStatus)]" }.joined(separator: ", ")
+                        Log.info("[TIMELINE-REFRESH] 🔄 New frames processing statuses: \(statusSummary)", category: .ui)
+
                         frames.append(contentsOf: newTimelineFrames)
 
                         // Update boundaries
@@ -2195,9 +2272,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Refresh processing status for all cached frames that aren't completed (status != 2)
     /// This updates stale processingStatus values (e.g., p=4 frames that are now readable)
+    /// and also refreshes videoInfo for frames whose status changed
     public func refreshProcessingStatuses() async {
         // Find all frames that aren't completed (status != 2)
-        let framesToRefresh = frames.enumerated().filter { $0.element.processingStatus != 2 }
+        let framesToRefresh = frames.enumerated() // .filter { $0.element.processingStatus != 2 }
 
         guard !framesToRefresh.isEmpty else {
             Log.debug("[TIMELINE-REFRESH] No frames need status refresh (all completed)", category: .ui)
@@ -2205,21 +2283,38 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let frameIDs = framesToRefresh.map { $0.element.frame.id.value }
-        Log.debug("[TIMELINE-REFRESH] Refreshing processingStatus for \(frameIDs.count) frames", category: .ui)
 
         do {
             let updatedStatuses = try await coordinator.getFrameProcessingStatuses(frameIDs: frameIDs)
 
             var updatedCount = 0
+            var currentFrameUpdated = false
+
             for (index, frame) in framesToRefresh {
                 if let newStatus = updatedStatuses[frame.frame.id.value],
                    newStatus != frame.processingStatus {
-                    // Create updated TimelineFrame with new status
-                    frames[index] = TimelineFrame(
-                        frame: frame.frame,
-                        videoInfo: frame.videoInfo,
-                        processingStatus: newStatus
-                    )
+                    // Re-fetch the full frame with updated videoInfo
+                    if let updatedFrame = try await coordinator.getFrameWithVideoInfoByID(id: frame.frame.id) {
+                        // Create updated TimelineFrame with new status AND updated videoInfo
+                        frames[index] = TimelineFrame(
+                            frame: updatedFrame.frame,
+                            videoInfo: updatedFrame.videoInfo,
+                            processingStatus: updatedFrame.processingStatus
+                        )
+
+                        // Check if this is the current frame
+                        if let currentFrame = currentTimelineFrame,
+                           currentFrame.frame.id.value == frame.frame.id.value {
+                            currentFrameUpdated = true
+                        }
+                    } else {
+                        // Still update the status even if we can't get videoInfo
+                        frames[index] = TimelineFrame(
+                            frame: frame.frame,
+                            videoInfo: frame.videoInfo,
+                            processingStatus: newStatus
+                        )
+                    }
                     updatedCount += 1
                 }
             }
@@ -2227,8 +2322,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             if updatedCount > 0 {
                 Log.info("[TIMELINE-REFRESH] Updated processingStatus for \(updatedCount) frames", category: .ui)
                 // If current frame was updated, reload its image
-                if let currentFrame = currentTimelineFrame,
-                   updatedStatuses[currentFrame.frame.id.value] != nil {
+                if currentFrameUpdated {
                     loadImageIfNeeded()
                 }
             }
@@ -2517,8 +2611,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
         guard let timelineFrame = currentTimelineFrame else {
+            Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
             return
         }
+
+        Log.debug("[TIMELINE-LOAD] ▶️ loadImageIfNeeded() START for frame \(timelineFrame.frame.id.value), currentFrameNotReady=\(frameNotReady), processingStatus=\(timelineFrame.processingStatus)", category: .ui)
 
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {
@@ -2539,6 +2636,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Check if frame is not yet readable (processingStatus = 4)
         // This provides instant feedback instead of waiting for async load to fail
         if timelineFrame.processingStatus == 4 {
+            Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=4 (NOT_YET_READABLE), setting frameNotReady=true", category: .ui)
             currentImage = nil
             frameNotReady = true
             // Still preload nearby frames
@@ -2549,12 +2647,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Reset frameNotReady immediately when status != 4
         // This prevents stale "still encoding" state from persisting when scrolling
         // from a processingStatus=4 frame to an earlier ready frame
+        Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=\(timelineFrame.processingStatus) (!= 4), setting frameNotReady=false", category: .ui)
         frameNotReady = false
+        frameLoadError = false
 
         // Check cache first
         if let cached = imageCache[frame.id] {
+            Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
             currentImage = cached
             frameNotReady = false
+            frameLoadError = false
             return
         }
 
@@ -2597,36 +2699,67 @@ public class SimpleTimelineViewModel: ObservableObject {
                     if currentTimelineFrame?.frame.id == frame.id {
                         currentImage = image
                         frameNotReady = false
+                        frameLoadError = false
+                        Log.debug("[TIMELINE-LOAD] Successfully loaded image for frame \(frame.id.value), set frameNotReady=false", category: .ui)
                     }
                 }
             } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("still being written") {
                 // Expected during recording - file not ready yet
-                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) video still being written", category: .app)
+                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video still being written (processingStatus=\(timelineFrame.processingStatus))", category: .app)
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
-                    frameNotReady = true
+                    frameLoadError = false
+                    // Don't set frameNotReady=true for completed frames (processingStatus=2)
+                    if timelineFrame.processingStatus != 2 {
+                        Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        frameNotReady = true
+                    } else {
+                        Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                    }
                 }
             } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("out of range") {
                 // Frame not yet written to video file - this is expected for recently captured frames
                 // The frame record exists in DB but the video encoder hasn't flushed it yet
-                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) not yet in video file (still encoding)", category: .app)
+                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) not yet in video file (still encoding, processingStatus=\(timelineFrame.processingStatus))", category: .app)
+
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
-                    frameNotReady = true
+                    // Don't set frameNotReady=true for completed frames (processingStatus=2)
+                    if timelineFrame.processingStatus != 2 {
+                        frameNotReady = true
+                        frameLoadError = false
+                    } else {
+                        // For completed frames that can't be loaded, this is an actual error
+                        Log.error("[TIMELINE-LOAD] Frame marked as completed (processingStatus=2) but failed to load", category: .app)
+                        frameNotReady = false
+                        frameLoadError = true
+                    }
                 }
             } catch let error as NSError where error.domain == "AVFoundationErrorDomain" && error.code == -11829 {
                 // Video file too small / no fragments yet - expected for very recent frames
-                Log.debug("[SimpleTimelineViewModel] Frame \(frame.id.value) video not ready yet (no fragments)", category: .app)
+                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video not ready yet (no fragments, processingStatus=\(timelineFrame.processingStatus))", category: .app)
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
-                    frameNotReady = true
+                    // Don't set frameNotReady=true for completed frames (processingStatus=2)
+                    if timelineFrame.processingStatus != 2 {
+                        Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        frameNotReady = true
+                        frameLoadError = false
+                    } else {
+                        Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                        frameNotReady = false
+                        frameLoadError = false
+                    }
                 }
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
+
                 // Clear the image so we don't show the previous frame
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
                     frameNotReady = false
+                    // Show error screen for unexpected failures
+                    frameLoadError = true
                 }
             }
         }
@@ -4072,6 +4205,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Always reload from DB to get the true most recent frame (unfiltered)
         Task {
             await loadMostRecentFrame()
+            await refreshProcessingStatuses()
         }
     }
 

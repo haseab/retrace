@@ -1632,14 +1632,18 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Processing Queue Operations
 
     /// Enqueue a frame for OCR processing
+    /// Only enqueues frames with processingStatus = 0 (pending)
     public func enqueueFrameForProcessing(frameID: Int64, priority: Int = 0) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
+        // Only enqueue if processingStatus = 0 (pending)
         let sql = """
             INSERT INTO processing_queue (frameId, enqueuedAt, priority, retryCount)
-            VALUES (?, ?, ?, 0);
+            SELECT ?, ?, ?, 0
+            FROM frame
+            WHERE id = ? AND processingStatus = 0;
         """
 
         var stmt: OpaquePointer?
@@ -1652,24 +1656,34 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_int64(stmt, 1, frameID)
         sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
         sqlite3_bind_int(stmt, 3, Int32(priority))
+        sqlite3_bind_int64(stmt, 4, frameID)
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
+
+        // Check if any row was actually inserted
+        let changes = sqlite3_changes(db)
+        if changes == 0 {
+            throw DatabaseError.queryFailed(query: sql, underlying: "Frame \(frameID) not eligible for processing (processingStatus != 0)")
+        }
     }
 
     /// Dequeue the next frame for processing (highest priority, oldest first)
+    /// Only dequeues frames with processingStatus = 0 (pending)
     /// Returns tuple of (queueID, frameID, retryCount) or nil if queue is empty
     public func dequeueFrameForProcessing() async throws -> (queueID: Int64, frameID: Int64, retryCount: Int)? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        // Get highest priority item
+        // Get highest priority item where frame still has processingStatus = 0
         let selectSql = """
-            SELECT id, frameId, retryCount
-            FROM processing_queue
-            ORDER BY priority DESC, enqueuedAt ASC
+            SELECT pq.id, pq.frameId, pq.retryCount
+            FROM processing_queue pq
+            INNER JOIN frame f ON pq.frameId = f.id
+            WHERE f.processingStatus = 0
+            ORDER BY pq.priority DESC, pq.enqueuedAt ASC
             LIMIT 1;
         """
 

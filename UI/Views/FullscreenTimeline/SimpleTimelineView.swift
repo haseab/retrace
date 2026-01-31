@@ -4,27 +4,6 @@ import Shared
 import App
 import UniformTypeIdentifiers
 
-// MARK: - Debug Logging Helper
-
-/// Write debug message to /tmp/retrace_debug.log
-private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
-    let path = "/tmp/retrace_debug.log"
-
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        } else {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-    }
-}
-
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
 public struct SimpleTimelineView: View {
@@ -295,7 +274,7 @@ public struct SimpleTimelineView: View {
                     }
                     .padding(.trailing, geometry.size.width / 2 + TimelineScaleFactor.controlSpacing + 60)
                     .padding(.bottom, TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + 75)
-                    .transition(.opacity.combined(with: .offset(y: 15)))
+                    .transition(.opacity.combined(with: .offset(y: 10)))
 
                     // Filter dropdowns - rendered at top level to avoid clipping issues
                     FilterDropdownOverlay(viewModel: viewModel)
@@ -376,10 +355,21 @@ public struct SimpleTimelineView: View {
 
     @ViewBuilder
     private var frameDisplay: some View {
-        let _ = debugLog("[FrameDisplay] frameNotReady=\(viewModel.frameNotReady), hasVideoInfo=\(viewModel.currentVideoInfo != nil), hasImage=\(viewModel.currentImage != nil), isLoading=\(viewModel.isLoading), frameID=\(viewModel.currentTimelineFrame?.frame.id.value ?? -1), processingStatus=\(viewModel.currentTimelineFrame?.processingStatus ?? -1)")
-        if viewModel.frameNotReady {
+        if viewModel.frameLoadError {
+            // Frame failed to load - show error message on black background
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Come back in a few frames")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("This frame is still being processed")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if viewModel.frameNotReady {
             // Frame not yet written to video file - show placeholder
-            let _ = debugLog("[FrameDisplay] -> showing frameNotReady placeholder")
             VStack(spacing: .spacingM) {
                 Image(systemName: "clock")
                     .font(.retraceDisplay)
@@ -392,7 +382,6 @@ public struct SimpleTimelineView: View {
                     .foregroundColor(.white.opacity(0.3))
             }
         } else if let videoInfo = viewModel.currentVideoInfo {
-            let _ = debugLog("[FrameDisplay] -> showing video path=\(videoInfo.videoPath.suffix(30)), frameIndex=\(videoInfo.frameIndex), isFinalized=\(videoInfo.isVideoFinalized)")
             // Video-based frame with URL overlay
             // Check if video is finalized OR has enough data for playback
             let path = videoInfo.videoPath
@@ -403,7 +392,6 @@ public struct SimpleTimelineView: View {
 
             if !fileExists {
                 // Video file is missing - show error message
-                let _ = debugLog("[FrameDisplay] -> video file missing: \(path)")
                 VStack(spacing: .spacingM) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.retraceDisplay)
@@ -428,15 +416,26 @@ public struct SimpleTimelineView: View {
                 let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
                 let fileReady = videoInfo.isVideoFinalized || fileSize >= minFragmentSize
 
-                if fileReady {
+                // Don't render video if we already know it will fail to load
+                if fileReady && !viewModel.frameLoadError {
                     FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                         SimpleVideoFrameView(videoInfo: videoInfo, forceReload: .init(
                             get: { viewModel.forceVideoReload },
                             set: { viewModel.forceVideoReload = $0 }
                         ), onLoadFailed: {
-                            viewModel.frameNotReady = true
+                            // Don't set frameNotReady=true for completed frames (processingStatus=2)
+                            // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
+                            if viewModel.currentTimelineFrame?.processingStatus != 2 {
+                                viewModel.frameNotReady = true
+                                viewModel.frameLoadError = false
+                            } else {
+                                // For completed frames, this is a real error
+                                viewModel.frameNotReady = false
+                                viewModel.frameLoadError = true
+                            }
                         }, onLoadSuccess: {
                             viewModel.frameNotReady = false
+                            viewModel.frameLoadError = false
                         })
                     }
                 } else {
@@ -457,7 +456,6 @@ public struct SimpleTimelineView: View {
             }
         } else if let image = viewModel.currentImage {
             // Static image (Retrace) with URL overlay
-            let _ = debugLog("[FrameDisplay] -> showing static image")
             FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                 Image(nsImage: image)
                     .resizable()
@@ -465,7 +463,6 @@ public struct SimpleTimelineView: View {
             }
         } else if !viewModel.isLoading {
             // Empty state - no video or image available
-            let _ = debugLog("[FrameDisplay] -> showing EMPTY state (black screen)")
             VStack(spacing: .spacingM) {
                 Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
                     .font(.retraceDisplay)
@@ -780,11 +777,8 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         let effectivePath = context.coordinator.currentVideoPath
         let effectiveFrameIdx = context.coordinator.currentFrameIndex
 
-        debugLog("[VideoView] updateNSView: effectivePath=\(effectivePath?.suffix(20) ?? "nil"), newPath=\(videoInfo.videoPath.suffix(20)), effectiveFrameIdx=\(effectiveFrameIdx ?? -1), newFrameIdx=\(videoInfo.frameIndex)")
-
         // If same video and same frame, nothing to do
         if effectivePath == videoInfo.videoPath && effectiveFrameIdx == videoInfo.frameIndex {
-            debugLog("[VideoView] -> same video+frame, skipping")
             return
         }
 
@@ -796,25 +790,22 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         // If same video, just seek on the active player (fast path)
         if effectivePath == videoInfo.videoPath {
             let time = videoInfo.frameTimeCMTime
-            debugLog("[VideoView] -> same video, seeking to frame \(videoInfo.frameIndex)")
             containerView.seekActivePlayer(to: time)
             return
         }
-
-        debugLog("[VideoView] -> DIFFERENT video, loading new: \(videoInfo.videoPath.suffix(30))")
 
         // Different video - update coordinator state and load
         context.coordinator.currentVideoPath = videoInfo.videoPath
 
         // Resolve actual video path (file existence already checked in frameDisplay)
         var actualVideoPath = videoInfo.videoPath
+
         if !FileManager.default.fileExists(atPath: actualVideoPath) {
             let pathWithExtension = actualVideoPath + ".mp4"
             if FileManager.default.fileExists(atPath: pathWithExtension) {
                 actualVideoPath = pathWithExtension
             } else {
                 // This shouldn't happen since we check in frameDisplay, but handle gracefully
-                debugLog("[VideoView] ERROR: Video file not found (unexpected): \(videoInfo.videoPath)")
                 return
             }
         }
@@ -956,11 +947,12 @@ class DoubleBufferedVideoView: NSView {
 
     /// Load a video into the buffer player and swap when ready
     func loadVideoIntoBuffer(url: URL, seekTime: CMTime, frameIndex: Int) {
-        debugLog("[VideoView] loadVideoIntoBuffer called: url=\(url.lastPathComponent), frameIndex=\(frameIndex)")
-
         // Increment generation to invalidate any pending async callbacks
         loadGeneration &+= 1
         let currentGeneration = loadGeneration
+
+        // Keep the active player visible until the buffer is ready
+        // This prevents black flicker during video transitions
 
         let bufferPlayer = isPlayerAActive ? playerB : playerA
         let bufferObserver = isPlayerAActive ? observerB : observerA
@@ -976,8 +968,6 @@ class DoubleBufferedVideoView: NSView {
 
         bufferPlayer?.replaceCurrentItem(with: playerItem)
 
-        debugLog("[VideoView] Starting load gen=\(currentGeneration) for frame \(frameIndex), buffer=\(isPlayerAActive ? "B" : "A")")
-
         // Observe when buffer player is ready
         let observer = playerItem.observe(\.status, options: [.new, .initial]) { [weak self] item, _ in
             guard let self = self else { return }
@@ -988,10 +978,7 @@ class DoubleBufferedVideoView: NSView {
                 return
             }
 
-            debugLog("[VideoView] Buffer player status: \(item.status.rawValue) for frame \(frameIndex) gen=\(currentGeneration)")
-
             if item.status == .failed {
-                debugLog("[VideoView] Buffer player FAILED: \(item.error?.localizedDescription ?? "unknown")")
                 DispatchQueue.main.async {
                     self.onLoadFailed?()
                 }
@@ -1000,38 +987,21 @@ class DoubleBufferedVideoView: NSView {
 
             guard item.status == .readyToPlay else { return }
 
-            debugLog("[VideoView] Buffer readyToPlay, seeking to frame \(frameIndex)")
-
             // Seek to target frame
             bufferPlayer?.seek(to: seekTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                guard let self = self, finished else {
-                    debugLog("[VideoView] Seek failed or self is nil, finished=\(finished)")
-                    return
-                }
+                guard let self = self, finished else { return }
 
                 // Re-check generation after async seek completes
-                guard currentGeneration == self.loadGeneration else {
-                    debugLog("[VideoView] Ignoring stale seek callback gen=\(currentGeneration), current=\(self.loadGeneration)")
-                    return
-                }
-
-                debugLog("[VideoView] Seek complete, swapping players for frame \(frameIndex) gen=\(currentGeneration)")
+                guard currentGeneration == self.loadGeneration else { return }
 
                 DispatchQueue.main.async {
                     // Final generation check on main thread before swap
-                    guard currentGeneration == self.loadGeneration else {
-                        debugLog("[VideoView] Ignoring stale swap gen=\(currentGeneration), current=\(self.loadGeneration)")
-                        return
-                    }
+                    guard currentGeneration == self.loadGeneration else { return }
 
                     // Verify we're swapping to the expected player
                     // If state drifted (shouldn't happen with generation check, but safety first)
-                    guard self.isPlayerAActive != expectedActiveAfterSwap else {
-                        debugLog("[VideoView] Player already in expected state, skipping swap")
-                        return
-                    }
+                    guard self.isPlayerAActive != expectedActiveAfterSwap else { return }
 
-                    debugLog("[VideoView] SWAPPING players now for frame \(frameIndex)")
                     bufferPlayer?.pause()
                     self.swapPlayers()
                     self.onLoadSuccess?()

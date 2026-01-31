@@ -63,15 +63,35 @@ public actor RecoveryManager {
 
                 // Check how many frames are already in the existing video file
                 let existingFrameCount = try await storage.countFramesInSegment(id: session.videoID)
+                let hasValidTimestamps = try await storage.isVideoValid(id: session.videoID)
 
-                if existingFrameCount >= walFrames.count {
-                    // All frames are already in the video - no re-encoding needed!
+                if existingFrameCount >= walFrames.count && hasValidTimestamps {
+                    // All frames are already in the video with valid timestamps - no re-encoding needed!
                     Log.info("[Recovery] Video \(session.videoID.value) already has all \(walFrames.count) frames - skipping re-encode", category: .storage)
                     totalSkippedFrames += walFrames.count
 
                     // Still need to ensure DB records exist and enqueue for OCR if needed
                     let result = try await ensureFramesInDatabase(walFrames, videoID: session.videoID)
                     totalFrames += result.framesRecovered
+
+                    // Clean up WAL
+                    try await walManager.finalizeSession(session)
+                    continue
+                }
+
+                // Check if video has invalid timestamps (crashed before finalization)
+                // In this case, we need to re-encode ALL frames, not just missing ones
+                if !hasValidTimestamps && existingFrameCount > 0 {
+                    Log.warning("[Recovery] Video \(session.videoID.value) has invalid timestamps (first frame dts != 0) - re-encoding all \(walFrames.count) frames", category: .storage)
+
+                    // Delete the corrupted video file
+                    try? await storage.deleteSegment(id: session.videoID)
+
+                    // Re-encode all frames
+                    let resolutionKey = "\(walFrames[0].width)x\(walFrames[0].height)"
+                    let result = try await recoverFrames(walFrames, resolutionKey: resolutionKey)
+                    totalFrames += result.framesRecovered
+                    totalSegments += result.videoSegmentsCreated
 
                     // Clean up WAL
                     try await walManager.finalizeSession(session)
@@ -172,7 +192,46 @@ public actor RecoveryManager {
         let allFrameIDs = newFrameIDs + existingFrameIDs
         if let enqueueCallback = frameEnqueueCallback, !allFrameIDs.isEmpty {
             let statuses = try await database.getFrameProcessingStatuses(frameIDs: allFrameIDs)
-            let framesToProcess = allFrameIDs.filter { statuses[$0] ?? 0 != 2 }
+
+            // Filter to frames that need processing (not completed)
+            // Possible statuses: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
+            var framesToMarkReadable: [Int64] = []
+            var framesToResetToPending: [Int64] = []
+            var framesToProcess: [Int64] = []
+
+            for frameID in allFrameIDs {
+                let status = statuses[frameID] ?? 0
+                switch status {
+                case 2: // completed - skip
+                    continue
+                case 4: // not yet readable - mark as readable first
+                    framesToMarkReadable.append(frameID)
+                    framesToProcess.append(frameID)
+                case 1, 3: // processing or failed - reset to pending first
+                    framesToResetToPending.append(frameID)
+                    framesToProcess.append(frameID)
+                case 0: // pending - ready to enqueue
+                    framesToProcess.append(frameID)
+                default:
+                    Log.warning("[Recovery] Unknown processingStatus \(status) for frame \(frameID)", category: .storage)
+                }
+            }
+
+            // Mark frames as readable (4 -> 0)
+            for frameID in framesToMarkReadable {
+                try await database.markFrameReadable(frameID: frameID)
+            }
+            if !framesToMarkReadable.isEmpty {
+                Log.info("[Recovery] Marked \(framesToMarkReadable.count) frames as readable", category: .storage)
+            }
+
+            // Reset failed/processing frames to pending
+            for frameID in framesToResetToPending {
+                try await database.updateFrameProcessingStatus(frameID: frameID, status: 0)
+            }
+            if !framesToResetToPending.isEmpty {
+                Log.info("[Recovery] Reset \(framesToResetToPending.count) frames to pending status", category: .storage)
+            }
 
             if !framesToProcess.isEmpty {
                 try await enqueueCallback(framesToProcess)
@@ -278,10 +337,44 @@ public actor RecoveryManager {
             // Check which frames already have OCR processing completed
             let statuses = try await database.getFrameProcessingStatuses(frameIDs: recoveredFrameIDs)
 
-            // Filter to only frames that need processing (status != 2 which is completed)
-            let framesToProcess = recoveredFrameIDs.filter { frameID in
-                let status = statuses[frameID] ?? 0  // Default to pending if not found
-                return status != 2  // 2 = completed
+            // Filter to frames that need processing (not completed)
+            // Possible statuses: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
+            var framesToMarkReadable: [Int64] = []
+            var framesToResetToPending: [Int64] = []
+            var framesToProcess: [Int64] = []
+
+            for frameID in recoveredFrameIDs {
+                let status = statuses[frameID] ?? 0
+                switch status {
+                case 2: // completed - skip
+                    continue
+                case 4: // not yet readable - mark as readable first
+                    framesToMarkReadable.append(frameID)
+                    framesToProcess.append(frameID)
+                case 1, 3: // processing or failed - reset to pending first
+                    framesToResetToPending.append(frameID)
+                    framesToProcess.append(frameID)
+                case 0: // pending - ready to enqueue
+                    framesToProcess.append(frameID)
+                default:
+                    Log.warning("[Recovery] Unknown processingStatus \(status) for frame \(frameID)", category: .storage)
+                }
+            }
+
+            // Mark frames as readable (4 -> 0)
+            for frameID in framesToMarkReadable {
+                try await database.markFrameReadable(frameID: frameID)
+            }
+            if !framesToMarkReadable.isEmpty {
+                Log.info("[Recovery] Marked \(framesToMarkReadable.count) frames as readable", category: .storage)
+            }
+
+            // Reset failed/processing frames to pending
+            for frameID in framesToResetToPending {
+                try await database.updateFrameProcessingStatus(frameID: frameID, status: 0)
+            }
+            if !framesToResetToPending.isEmpty {
+                Log.info("[Recovery] Reset \(framesToResetToPending.count) frames to pending status", category: .storage)
             }
 
             let skippedCount = recoveredFrameIDs.count - framesToProcess.count

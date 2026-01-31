@@ -507,6 +507,12 @@ public actor FrameProcessingQueue {
         }
 
         if !validFrameIDs.isEmpty {
+            // Reset valid crashed frames back to pending status before re-enqueueing
+            for frameID in validFrameIDs {
+                try await updateFrameProcessingStatus(frameID, status: .pending)
+            }
+            Log.info("[Queue] Reset \(validFrameIDs.count) crashed frames to pending status", category: .processing)
+
             Log.info("[Queue] Re-enqueueing \(validFrameIDs.count) crashed frames with valid video files", category: .processing)
             try await enqueueBatch(frameIDs: validFrameIDs)
         }

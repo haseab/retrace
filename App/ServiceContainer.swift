@@ -378,8 +378,7 @@ public actor ServiceContainer {
 
     /// Helper to configure Rewind source on DataAdapter
     private func configureRewindSource(adapter: DataAdapter) async {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        let rewindDBPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
+        let rewindDBPath = NSString(string: AppPaths.rewindDBPath).expandingTildeInPath
 
         guard FileManager.default.fileExists(atPath: rewindDBPath) else {
             Log.warning("Rewind database not found at: \(rewindDBPath)", category: .app)
@@ -430,7 +429,9 @@ public actor ServiceContainer {
         // Create connection and config
         let rewindConnection = SQLCipherConnection(db: db)
         let rewindConfig = DatabaseConfig.rewind
-        let rewindChunksPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/chunks"
+        // Chunks directory is always in the same parent directory as the database
+        let rewindDBDir = (rewindDBPath as NSString).deletingLastPathComponent
+        let rewindChunksPath = "\(rewindDBDir)/chunks"
         let rewindImageExtractor = AVAssetExtractor(storageRoot: rewindChunksPath)
         let cutoffDate = Date(timeIntervalSince1970: 1766217600) // Dec 20, 2025 00:00:00 UTC
 

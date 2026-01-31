@@ -38,10 +38,22 @@ public struct SettingsView: View {
     // Storage settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = 0 // 0 = forever
     @State private var retentionSettingChanged = false
+    @State private var showRetentionConfirmation = false
+    @State private var pendingRetentionDays: Int?
     @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = 50.0
     @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = true
     @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = false
+
+    // Database location settings
+    @AppStorage("customRetraceDBLocation", store: settingsStore) private var customRetraceDBLocation: String?
+    @AppStorage("customRewindDBLocation", store: settingsStore) private var customRewindDBLocation: String?
+    @State private var retraceDBLocationChanged = false
+    @State private var rewindDBLocationChanged = false
+    @State private var showRetraceDBWarning = false
+    @State private var pendingRetraceDBPath: String?
+    @State private var showRewindDBWarning = false
+    @State private var pendingRewindDBPath: String?
 
     // Privacy settings
     @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = ""
@@ -698,6 +710,130 @@ public struct SettingsView: View {
                 }
             }
 
+            ModernSettingsCard(title: "Database Locations", icon: "externaldrive") {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Warning when recording is active (only for Retrace)
+                    if coordinatorWrapper.isRunning {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                                .font(.system(size: 12))
+                            Text("Stop recording to change Retrace database location")
+                                .font(.retraceCaption)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.orange.opacity(0.1))
+                        .cornerRadius(8)
+                    }
+
+                    // Retrace Database Location
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Retrace Database")
+                                    .font(.retraceCalloutMedium)
+                                    .foregroundColor(.retracePrimary)
+                                Text(customRetraceDBLocation ?? AppPaths.defaultStorageRoot)
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button("Choose...") {
+                                selectRetraceDBLocation()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(coordinatorWrapper.isRunning)
+                            .help(coordinatorWrapper.isRunning ? "Stop recording to change Retrace database location" : "")
+                        }
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    // Rewind Database Location
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Rewind Database")
+                                    .font(.retraceCalloutMedium)
+                                    .foregroundColor(.retracePrimary)
+                                Text(customRewindDBLocation ?? AppPaths.defaultRewindDBPath)
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button("Choose...") {
+                                selectRewindDBLocation()
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+
+                    if customRetraceDBLocation != nil || customRewindDBLocation != nil {
+                        Divider()
+                            .background(Color.white.opacity(0.1))
+
+                        Button(action: resetDatabaseLocations) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.system(size: 12))
+                                Text("Reset to Defaults")
+                                    .font(.retraceCalloutMedium)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(coordinatorWrapper.isRunning && customRetraceDBLocation != nil)
+                        .help(coordinatorWrapper.isRunning && customRetraceDBLocation != nil ? "Stop recording to reset Retrace database location" : "")
+                    }
+
+                    // Restart prompt for Retrace database changes only
+                    if retraceDBLocationChanged {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Restart the app to apply Retrace database changes")
+                                .font(.retraceCaption)
+                                .foregroundColor(.retraceSecondary)
+
+                            HStack(spacing: 8) {
+                                Button(action: restartApp) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 11))
+                                        Text("Restart Now")
+                                            .font(.retraceCalloutMedium)
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.retraceAccent)
+                                .controlSize(.small)
+
+                                Button(action: restartAndResumeRecording) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "record.circle")
+                                            .font(.system(size: 11))
+                                        Text("Restart & Resume Recording")
+                                            .font(.retraceCalloutMedium)
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(12)
+                        .background(Color.retraceAccent.opacity(0.1))
+                        .cornerRadius(8)
+                    }
+                }
+            }
+
             ModernSettingsCard(title: "Retention Policy", icon: "calendar.badge.clock") {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
@@ -724,18 +860,20 @@ public struct SettingsView: View {
                             .cornerRadius(8)
                     }
 
-                    RetentionPolicyPicker(selectedDays: $retentionDays)
-                        .onChange(of: retentionDays) { _ in
-                            retentionSettingChanged = true
+                    RetentionPolicyPicker(currentDays: retentionDays) { newDays in
+                        if newDays != retentionDays {
+                            pendingRetentionDays = newDays
+                            showRetentionConfirmation = true
                         }
+                    }
 
                     if retentionSettingChanged {
                         HStack {
-                            Text("Restart the app to apply changes")
+                            Text("Changes will take effect within an hour or on next launch")
                                 .font(.retraceCaption)
                                 .foregroundColor(.retraceSecondary)
                             Spacer()
-                            Button("Restart") {
+                            Button("Restart Now") {
                                 restartApp()
                             }
                             .buttonStyle(.borderedProminent)
@@ -743,6 +881,22 @@ public struct SettingsView: View {
                             .controlSize(.small)
                         }
                     }
+                }
+            }
+            .alert("Change Retention Policy?", isPresented: $showRetentionConfirmation) {
+                Button("Cancel", role: .cancel) {
+                    pendingRetentionDays = nil
+                }
+                Button("Confirm", role: .destructive) {
+                    if let newDays = pendingRetentionDays {
+                        retentionDays = newDays
+                        retentionSettingChanged = true
+                    }
+                    pendingRetentionDays = nil
+                }
+            } message: {
+                if let pendingDays = pendingRetentionDays {
+                    Text("Are you sure you want to change the retention policy to \(retentionDisplayTextFor(pendingDays))? Changes will take effect within an hour or on next launch.")
                 }
             }
 
@@ -1188,6 +1342,26 @@ public struct SettingsView: View {
                 }
             } message: {
                 Text("This will permanently delete all your recordings and data. This action cannot be undone.")
+            }
+            .alert("Create New Retrace Database?", isPresented: $showRetraceDBWarning) {
+                Button("Cancel", role: .cancel) {
+                    pendingRetraceDBPath = nil
+                }
+                Button("Continue", role: .none) {
+                    confirmRetraceDBLocation()
+                }
+            } message: {
+                Text("No existing Retrace database found at this location. A new database will be created here when you restart the app. Your current recordings will remain in the old location.")
+            }
+            .alert("Missing Chunks Folder?", isPresented: $showRewindDBWarning) {
+                Button("Cancel", role: .cancel) {
+                    pendingRewindDBPath = nil
+                }
+                Button("Continue Anyway", role: .none) {
+                    confirmRewindDBLocation()
+                }
+            } message: {
+                Text("The selected Rewind database exists, but the 'chunks' folder (video storage) was not found in the same directory. Retrace may not be able to load video frames from this database.")
             }
         }
     }
@@ -1763,7 +1937,8 @@ private struct CaptureIntervalPicker: View {
 // MARK: - Retention Policy Picker (Sliding Scale)
 
 private struct RetentionPolicyPicker: View {
-    @Binding var selectedDays: Int
+    var currentDays: Int
+    var onSelectionChange: (Int) -> Void
 
     // Retention options: 3 days through 1 year, then Forever (0) at the end
     private let options: [(days: Int, label: String)] = [
@@ -1780,7 +1955,7 @@ private struct RetentionPolicyPicker: View {
 
     // Map days to slider index (default to last index = Forever)
     private var sliderIndex: Double {
-        Double(options.firstIndex(where: { $0.days == selectedDays }) ?? (options.count - 1))
+        Double(options.firstIndex(where: { $0.days == currentDays }) ?? (options.count - 1))
     }
 
     @GestureState private var isDragging = false
@@ -1835,8 +2010,8 @@ private struct RetentionPolicyPicker: View {
                             let adjustedX = x - horizontalInset
                             let index = Int(round(adjustedX / segmentWidth))
                             let clampedIndex = max(0, min(options.count - 1, index))
-                            if options[clampedIndex].days != selectedDays {
-                                selectedDays = options[clampedIndex].days
+                            if options[clampedIndex].days != currentDays {
+                                onSelectionChange(options[clampedIndex].days)
                             }
                         }
                 )
@@ -1872,7 +2047,11 @@ extension SettingsView {
     }
 
     var retentionDisplayText: String {
-        switch retentionDays {
+        retentionDisplayTextFor(retentionDays)
+    }
+
+    func retentionDisplayTextFor(_ days: Int) -> String {
+        switch days {
         case 0: return "Forever"
         case 3: return "3 days"
         case 7: return "1 week"
@@ -1882,7 +2061,7 @@ extension SettingsView {
         case 90: return "3 months"
         case 180: return "6 months"
         case 365: return "1 year"
-        default: return "\(retentionDays) days"
+        default: return "\(days) days"
         }
     }
 
@@ -1929,6 +2108,153 @@ extension SettingsView {
         task.arguments = [path]
         task.launch()
         NSApp.terminate(nil)
+    }
+
+    func restartAndResumeRecording() {
+        // Set flag in UserDefaults to auto-start recording on next launch
+        let defaults = UserDefaults(suiteName: "Retrace") ?? .standard
+        defaults.set(true, forKey: "shouldAutoStartRecording")
+        defaults.synchronize()
+        Log.info("Set shouldAutoStartRecording flag for restart", category: .ui)
+
+        // Restart the app
+        restartApp()
+    }
+
+    func selectRetraceDBLocation() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a location for the Retrace database"
+        panel.prompt = "Select"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let selectedPath = url.path
+            let dbPath = "\(selectedPath)/retrace.db"
+
+            // Check if database already exists at this location
+            if FileManager.default.fileExists(atPath: dbPath) {
+                // Database exists, use it directly
+                customRetraceDBLocation = selectedPath
+                retraceDBLocationChanged = true
+                Log.info("Retrace database location changed to existing database: \(selectedPath)", category: .ui)
+            } else {
+                // No database exists, show warning
+                pendingRetraceDBPath = selectedPath
+                showRetraceDBWarning = true
+            }
+        }
+    }
+
+    func confirmRetraceDBLocation() {
+        guard let path = pendingRetraceDBPath else { return }
+        customRetraceDBLocation = path
+        retraceDBLocationChanged = true
+        showRetraceDBWarning = false
+        pendingRetraceDBPath = nil
+        Log.info("Retrace database location changed to new location: \(path)", category: .ui)
+    }
+
+    func selectRewindDBLocation() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.database, .data]
+        panel.message = "Choose the Rewind database file (db-enc.sqlite3)"
+        panel.prompt = "Select"
+
+        if panel.runModal() == .OK, let url = panel.url {
+            let selectedPath = url.path
+
+            // Check if the selected file exists and has proper structure
+            if FileManager.default.fileExists(atPath: selectedPath) {
+                let parentDir = (selectedPath as NSString).deletingLastPathComponent
+                let chunksPath = "\(parentDir)/chunks"
+
+                // Check if chunks directory exists
+                if FileManager.default.fileExists(atPath: chunksPath) {
+                    // Valid Rewind database structure - apply immediately
+                    applyRewindDBLocation(selectedPath)
+                } else {
+                    // Database exists but no chunks folder
+                    pendingRewindDBPath = selectedPath
+                    showRewindDBWarning = true
+                }
+            } else {
+                // File doesn't exist
+                Log.warning("Selected Rewind database file does not exist: \(selectedPath)", category: .ui)
+            }
+        }
+    }
+
+    func confirmRewindDBLocation() {
+        guard let path = pendingRewindDBPath else { return }
+        showRewindDBWarning = false
+        pendingRewindDBPath = nil
+        applyRewindDBLocation(path)
+    }
+
+    func applyRewindDBLocation(_ path: String) {
+        customRewindDBLocation = path
+        Log.info("Rewind database location changed to: \(path)", category: .ui)
+
+        // Apply changes immediately by reconnecting Rewind source
+        Task {
+            let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+            let useRewindData = defaults.bool(forKey: "useRewindData")
+
+            if useRewindData {
+                Log.info("Reconnecting Rewind source with new location", category: .ui)
+                // Disconnect old source
+                await coordinatorWrapper.coordinator.setRewindSourceEnabled(false)
+                // Reconnect with new location
+                await coordinatorWrapper.coordinator.setRewindSourceEnabled(true)
+                Log.info("✓ Rewind source reconnected", category: .ui)
+
+                // Notify timeline to reload
+                await MainActor.run {
+                    SearchViewModel.clearPersistedSearchCache()
+                    NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
+                    Log.info("✓ Timeline notified of Rewind database change", category: .ui)
+                }
+            } else {
+                Log.info("Rewind data not enabled, skipping reconnection", category: .ui)
+            }
+        }
+    }
+
+    func resetDatabaseLocations() {
+        let hadCustomRetrace = customRetraceDBLocation != nil
+        let hadCustomRewind = customRewindDBLocation != nil
+
+        customRetraceDBLocation = nil
+        customRewindDBLocation = nil
+        retraceDBLocationChanged = hadCustomRetrace
+        Log.info("Database locations reset to defaults", category: .ui)
+
+        // If Rewind was customized, apply the default location immediately
+        if hadCustomRewind {
+            Task {
+                let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+                let useRewindData = defaults.bool(forKey: "useRewindData")
+
+                if useRewindData {
+                    Log.info("Reconnecting Rewind source with default location", category: .ui)
+                    // Disconnect and reconnect to pick up default path
+                    await coordinatorWrapper.coordinator.setRewindSourceEnabled(false)
+                    await coordinatorWrapper.coordinator.setRewindSourceEnabled(true)
+                    Log.info("✓ Rewind source reconnected to default location", category: .ui)
+
+                    await MainActor.run {
+                        SearchViewModel.clearPersistedSearchCache()
+                        NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
+                    }
+                }
+            }
+        }
     }
 
     func resetAllSettings() {

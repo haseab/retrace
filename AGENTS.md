@@ -368,10 +368,29 @@ tail -100 /tmp/retrace_debug.log
 **ALWAYS clear the debug log before starting a new debugging session:**
 
 ```bash
-> /tmp/retrace_debug.log
+# FASTEST way to clear (instant, shell builtin)
+: > /tmp/retrace_debug.log
+
+# Alternative methods (also fast)
+cat /dev/null > /tmp/retrace_debug.log
+truncate -s 0 /tmp/retrace_debug.log
+
+# Clear and watch in one command
+: > /tmp/retrace_debug.log && tail -f /tmp/retrace_debug.log | grep "TIMELINE"
 ```
 
-This ensures you're only seeing logs from the current session, not stale data from previous runs.
+### Debugging Philosophy: Trace Execution First
+
+**When debugging, add logging to trace the actual execution path BEFORE making assumptions.**
+
+Don't assume you know which code is running. Add logs at each layer to verify:
+```swift
+debugLog("[VM] → Calling coordinator")
+debugLog("[COORDINATOR] → Calling adapter")
+debugLog("[ADAPTER] → Taking FILTERED path")  // Reveals which path!
+```
+
+Then check which path actually executes and fix the right code.
 
 ---
 

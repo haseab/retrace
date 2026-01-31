@@ -6,8 +6,17 @@ public enum AppPaths {
 
     // MARK: - Base Paths
 
-    /// Root storage path for all app data
-    public static let storageRoot = "~/Library/Application Support/Retrace"
+    /// Default root storage path for all app data
+    public static let defaultStorageRoot = "~/Library/Application Support/Retrace"
+
+    /// Default Rewind database path
+    public static let defaultRewindDBPath = "~/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
+
+    /// Root storage path for all app data (respects custom location if set)
+    public static var storageRoot: String {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return defaults.string(forKey: "customRetraceDBLocation") ?? defaultStorageRoot
+    }
 
     /// Expanded storage root path (tilde resolved)
     public static var expandedStorageRoot: String {
@@ -16,8 +25,19 @@ public enum AppPaths {
 
     // MARK: - Database
 
-    /// Database file path
-    public static let databasePath = "\(storageRoot)/retrace.db"
+    /// Database file path (respects custom location if set)
+    public static var databasePath: String {
+        "\(storageRoot)/retrace.db"
+    }
+
+    /// Rewind database path (respects custom location if set)
+    public static var rewindDBPath: String {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        if let customPath = defaults.string(forKey: "customRewindDBLocation") {
+            return customPath
+        }
+        return defaultRewindDBPath
+    }
 
     // MARK: - Storage Directories
 

@@ -33,6 +33,10 @@ public protocol StorageProtocol: Actor {
     /// Returns 0 if the file doesn't exist or is unreadable
     func countFramesInSegment(id: VideoSegmentID) async throws -> Int
 
+    /// Check if a video file has valid timestamps (first frame dts=0)
+    /// Returns false if the video was not properly finalized (crash recovery case)
+    func isVideoValid(id: VideoSegmentID) async throws -> Bool
+
     // MARK: - Storage Management
 
     /// Get total storage used in bytes
