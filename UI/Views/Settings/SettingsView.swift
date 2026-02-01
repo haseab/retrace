@@ -2162,6 +2162,9 @@ public struct SettingsView: View {
                     isOn: $enableFrameIDSearch
                 )
 
+                Divider()
+                    .padding(.vertical, 8)
+
                 ModernButton(title: "Show Database Schema", icon: "doc.text", style: .secondary) {
                     loadDatabaseSchema()
                     showingDatabaseSchema = true

@@ -22,6 +22,20 @@ public actor StorageManager: StorageProtocol {
     /// Maximum number of segments to keep in cache
     private let maxCachedSegments = 3
 
+    /// Cache for AVAssetImageGenerator instances, keyed by video path
+    /// Reusing generators avoids expensive AVAsset initialization per frame
+    private var generatorCache: [String: GeneratorCacheEntry] = [:]
+
+    /// Maximum number of generators to keep cached
+    private let maxCachedGenerators = 10
+
+    /// Cached AVAssetImageGenerator entry
+    private struct GeneratorCacheEntry {
+        let generator: AVAssetImageGenerator
+        let symlinkURL: URL?  // Keep symlink alive while generator is cached
+        var lastAccessTime: Date
+    }
+
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
         encoderConfig: VideoEncoderConfig = .default
@@ -107,74 +121,109 @@ public actor StorageManager: StorageProtocol {
 
     /// Fast single-frame extraction using AVAssetImageGenerator
     /// This is much faster than decoding all frames - AVFoundation handles B-frame decoding internally
+    /// Generator instances are cached per video path for efficient scrubbing
     private func extractSingleFrame(from videoURL: URL, frameIndex: Int, frameRate: Double = 30.0) async throws -> Data {
-        // Check if file exists
-        guard FileManager.default.fileExists(atPath: videoURL.path) else {
-            throw StorageError.fileNotFound(path: videoURL.path)
-        }
+        let cacheKey = videoURL.path
 
-        // Check if file is empty
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
-        if fileSize == 0 {
-            throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
-        }
-
-        // Handle extensionless files by creating symlink
-        let assetURL: URL
-        var tempURL: URL? = nil
-
-        if videoURL.pathExtension.lowercased() == "mp4" {
-            assetURL = videoURL
+        // Get or create cached generator
+        let imageGenerator: AVAssetImageGenerator
+        if var entry = generatorCache[cacheKey] {
+            entry.lastAccessTime = Date()
+            generatorCache[cacheKey] = entry
+            imageGenerator = entry.generator
         } else {
-            // Create temporary symlink with .mp4 extension
-            let tempPath = FileManager.default.temporaryDirectory
-                .appendingPathComponent(UUID().uuidString + ".mp4")
-            tempURL = tempPath
-
-            try FileManager.default.createSymbolicLink(
-                at: tempPath,
-                withDestinationURL: videoURL
-            )
-            assetURL = tempPath
-        }
-
-        defer {
-            if let tempURL = tempURL {
-                try? FileManager.default.removeItem(at: tempURL)
+            // Check if file exists
+            guard FileManager.default.fileExists(atPath: videoURL.path) else {
+                throw StorageError.fileNotFound(path: videoURL.path)
             }
-        }
 
-        // Use AVAssetImageGenerator for fast single-frame extraction
-        let asset = AVAsset(url: assetURL)
-        let imageGenerator = AVAssetImageGenerator(asset: asset)
-        imageGenerator.appliesPreferredTrackTransform = true
-        // Zero tolerance ensures exact frame - AVFoundation handles B-frame decoding internally
-        imageGenerator.requestedTimeToleranceAfter = .zero
-        imageGenerator.requestedTimeToleranceBefore = .zero
+            // Check if file is empty
+            let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
+            if fileSize == 0 {
+                throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
+            }
+
+            // Handle extensionless files by creating symlink
+            let assetURL: URL
+            var symlinkURL: URL? = nil
+
+            if videoURL.pathExtension.lowercased() == "mp4" {
+                assetURL = videoURL
+            } else {
+                // Create symlink with .mp4 extension (kept alive in cache)
+                let tempPath = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString + ".mp4")
+                symlinkURL = tempPath
+
+                try FileManager.default.createSymbolicLink(
+                    at: tempPath,
+                    withDestinationURL: videoURL
+                )
+                assetURL = tempPath
+            }
+
+            // Create and configure the generator
+            let asset = AVAsset(url: assetURL)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.requestedTimeToleranceAfter = .zero
+            generator.requestedTimeToleranceBefore = .zero
+
+            // Cache the generator
+            generatorCache[cacheKey] = GeneratorCacheEntry(
+                generator: generator,
+                symlinkURL: symlinkURL,
+                lastAccessTime: Date()
+            )
+            imageGenerator = generator
+
+            // Evict old generators if needed
+            evictOldGenerators()
+        }
 
         // Calculate CMTime from frame index
         let time: CMTime
         if frameRate == 30.0 {
-            // Fast path for 30fps - use exact integer arithmetic
             time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
         } else {
             let timeInSeconds = Double(frameIndex) / frameRate
             time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
         }
 
-        // Extract frame
+        // Extract frame using cached generator
         let cgImage: CGImage
         do {
             cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
         } catch {
+            // Invalidate cache on error and clean up symlink
+            if let entry = generatorCache.removeValue(forKey: cacheKey),
+               let symlinkURL = entry.symlinkURL {
+                try? FileManager.default.removeItem(at: symlinkURL)
+            }
             throw StorageError.fileReadFailed(
                 path: videoURL.path,
                 underlying: "Frame extraction failed: \(error.localizedDescription)"
             )
         }
 
-        // Convert to JPEG
         return try convertCGImageToJPEG(cgImage)
+    }
+
+    /// Evict oldest generators when cache is full
+    private func evictOldGenerators() {
+        guard generatorCache.count > maxCachedGenerators else { return }
+
+        // Sort by last access time and remove oldest
+        let sorted = generatorCache.sorted { $0.value.lastAccessTime < $1.value.lastAccessTime }
+        let toRemove = sorted.prefix(generatorCache.count - maxCachedGenerators)
+
+        for (key, entry) in toRemove {
+            generatorCache.removeValue(forKey: key)
+            // Clean up symlink
+            if let symlinkURL = entry.symlinkURL {
+                try? FileManager.default.removeItem(at: symlinkURL)
+            }
+        }
     }
 
     /// Read a frame from a video at a specific path

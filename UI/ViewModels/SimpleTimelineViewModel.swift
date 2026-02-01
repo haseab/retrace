@@ -738,8 +738,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             return cached
         }
 
+        let startTime = CFAbsoluteTimeGetCurrent()
         let blocks = groupFramesIntoBlocks()
+        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
         _cachedAppBlocks = blocks
+
+        // === PERF DEBUG: Log block computation ===
+        let hasFilter = filterCriteria.hasActiveFilters
+        let filterDesc = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "none"
+        print("🔥 [PERF] appBlocks computed | frames=\(frames.count) | blocks=\(blocks.count) | filtered=\(hasFilter) | filter=\(filterDesc) | took=\(String(format: "%.2f", elapsed))ms")
+        // === END PERF DEBUG ===
+
         return blocks
     }
 
@@ -819,6 +828,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// How long the cached filter criteria remains valid (2 minutes)
     private static let filterCacheExpirationSeconds: TimeInterval = 120
 
+    // MARK: - Background Refresh Throttling
+
+    /// Threshold: if user is within this many frames of newest, allow background refresh
+    private static let nearLiveEdgeFrameThreshold: Int = 50
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -827,6 +841,15 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+
+        // Restore search overlay visibility from last session
+        // On first launch, default to showing the overlay (true)
+        if UserDefaults.standard.object(forKey: "searchOverlayVisible") == nil {
+            self.isSearchOverlayVisible = true
+            UserDefaults.standard.set(true, forKey: "searchOverlayVisible")
+        } else {
+            self.isSearchOverlayVisible = UserDefaults.standard.bool(forKey: "searchOverlayVisible")
+        }
 
         // Listen for data source changes (e.g., Rewind data toggled)
         Log.debug("[SimpleTimelineViewModel] Setting up dataSourceDidChange observer", category: .ui)
@@ -845,6 +868,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Observe dialog states to update emergency escape tracking
         // This prevents triple-escape from triggering while dialogs are open
         setupDialogStateObserver()
+
+        // Persist search overlay visibility preference
+        setupSearchOverlayPersistence()
     }
 
     /// Set up Combine observer to track when any dialog/overlay is open
@@ -862,6 +888,16 @@ public class SimpleTimelineViewModel: ObservableObject {
             TimelineWindowController.shared.setDialogOpen(isAnyDialogOpen)
         }
         .store(in: &cancellables)
+    }
+
+    /// Persist search overlay visibility state across app launches
+    private func setupSearchOverlayPersistence() {
+        $isSearchOverlayVisible
+            .dropFirst() // Skip initial value from restoration
+            .sink { isVisible in
+                UserDefaults.standard.set(isVisible, forKey: "searchOverlayVisible")
+            }
+            .store(in: &cancellables)
     }
 
     /// Invalidate all caches and reload frames from the current position
@@ -938,6 +974,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 hasMoreNewer = true
 
                 loadImageIfNeeded()
+
+                // Check if we need to pre-load more frames (near edge of loaded window)
+                checkAndLoadMoreFrames()
 
                 Log.info("[DataSourceChange] Reloaded \(frames.count) frames around \(timestamp)", category: .ui)
             } else {
@@ -2109,6 +2148,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Start at the most recent frame (last in array since sorted ascending, oldest first)
             currentIndex = frames.count - 1
 
+            // Check if we need to pre-load more frames (e.g., if loaded window is small)
+            checkAndLoadMoreFrames()
+
             // Restore cached search results if any
             searchViewModel.restoreCachedSearchResults()
 
@@ -2139,6 +2181,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
         logTabClickTiming("VM_LOAD_DIRECT_START", startTime: startTime)
 
+        // === PERF DEBUG: Log frame loading ===
+        let hasFilter = filterCriteria.hasActiveFilters
+        let filterDesc = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "none"
+        let imageCacheSize = imageCache.count
+        print("🔥 [PERF] loadFramesDirectly | incoming=\(framesWithVideoInfo.count) | filtered=\(hasFilter) | filter=\(filterDesc) | imageCacheSize=\(imageCacheSize)")
+        // === END PERF DEBUG ===
+
         isLoading = true
         clearError()
 
@@ -2164,6 +2213,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Start at the most recent frame
         currentIndex = frames.count - 1
+
+        // Check if we need to pre-load more frames (e.g., if loaded window is small)
+        checkAndLoadMoreFrames()
 
         // Restore cached search results if any
         searchViewModel.restoreCachedSearchResults()
@@ -2213,18 +2265,24 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !frames.isEmpty {
             Log.info("[TIMELINE-REFRESH] 🔄 Have \(frames.count) cached frames, refreshing current image", category: .ui)
 
-            // Skip background refresh if user is deep in history (viewing frames >5 min old).
-            // Appending present-moment frames while the user is far back corrupts the
-            // infinite scroll window — newestLoadedTimestamp jumps to now, causing the
-            // next forward scroll batch to skip ahead by potentially an entire day.
+            // Background refresh rules:
+            // - Hidden > 1 minute (navigateToNewest=true): always refresh and navigate to newest
+            // - Hidden < 1 minute AND within 50 frames: refresh and navigate to newest
+            // - Hidden < 1 minute AND > 50 frames away: skip refresh entirely
+            let framesFromNewest = frames.count - 1 - currentIndex
+            let shouldNavigateToNewest: Bool
+
             if !navigateToNewest, currentIndex < frames.count {
-                let currentTimestamp = frames[currentIndex].frame.timestamp
-                let secondsFromPresent = Date().timeIntervalSince(currentTimestamp)
-                if secondsFromPresent > 300 { // 5 minutes
-                    Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is viewing frame from \(Int(secondsFromPresent))s ago (threshold: 300s)", category: .ui)
+                if framesFromNewest > Self.nearLiveEdgeFrameThreshold {
+                    Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is \(framesFromNewest) frames from newest (threshold: \(Self.nearLiveEdgeFrameThreshold))", category: .ui)
                     loadImageIfNeeded()
                     return
                 }
+                // Within 50 frames - allow refresh AND navigate to newest
+                shouldNavigateToNewest = true
+                Log.info("[TIMELINE-REFRESH] 🔄 Within \(Self.nearLiveEdgeFrameThreshold) frames of newest (\(framesFromNewest)), will navigate to newest", category: .ui)
+            } else {
+                shouldNavigateToNewest = navigateToNewest
             }
 
             // Check if there are newer frames available
@@ -2251,8 +2309,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Update boundaries
                         updateWindowBoundaries()
 
-                        // Only navigate to newest if requested (preserve position during background refresh)
-                        if navigateToNewest {
+                        // Navigate to newest frame
+                        if shouldNavigateToNewest {
                             let oldIndex = currentIndex
                             currentIndex = frames.count - 1
 
@@ -2262,8 +2320,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                             } else {
                                 Log.info("[TIMELINE-REFRESH] 🔄 Updated currentIndex: \(oldIndex) -> \(currentIndex), frames.count=\(frames.count), NO VIDEO INFO", category: .ui)
                             }
-                        } else {
-                            Log.info("[TIMELINE-REFRESH] 🔄 Preserving position at currentIndex=\(currentIndex), frames.count=\(frames.count) (navigateToNewest=false)", category: .ui)
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
@@ -2375,6 +2431,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Frame Navigation
 
+    // === PERF DEBUG: Track navigation frequency ===
+    private static var lastNavLogTime: CFAbsoluteTime = 0
+    private static var navCountSinceLastLog: Int = 0
+    // === END PERF DEBUG ===
+
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int) {
         // Exit live mode on explicit navigation
@@ -2385,6 +2446,27 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Clamp to valid range
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
+
+        // === PERF DEBUG: Log navigation rate ===
+        Self.navCountSinceLastLog += 1
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - Self.lastNavLogTime >= 1.0 {
+            let rate = Double(Self.navCountSinceLastLog) / (now - Self.lastNavLogTime)
+            let hasFilter = filterCriteria.hasActiveFilters
+            print("🔥 [PERF] Navigation rate | \(String(format: "%.1f", rate)) nav/sec | frames=\(frames.count) | filtered=\(hasFilter)")
+            Self.navCountSinceLastLog = 0
+            Self.lastNavLogTime = now
+        }
+        // === END PERF DEBUG ===
+
+        // Clear search highlight when manually navigating
+        if isShowingSearchHighlight {
+            clearSearchHighlight()
+        }
+        // Only dismiss search overlay if there's no active search query
+        if isSearchOverlayVisible && searchViewModel.searchQuery.isEmpty {
+            isSearchOverlayVisible = false
+        }
 
         // Track scrub distance for metrics
         let distance = abs(clampedIndex - currentIndex)
@@ -2504,6 +2586,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             loadImageIfNeeded()
+
+            // Check if we need to pre-load more frames (near edge of loaded window)
+            checkAndLoadMoreFrames()
+
             // Wait for OCR nodes to load before showing highlight
             // (loadImageIfNeeded calls loadOCRNodes but doesn't await it)
             await loadOCRNodesAsync()
@@ -2566,40 +2652,31 @@ public class SimpleTimelineViewModel: ObservableObject {
             return []
         }
 
-        let lowercaseQuery = query.lowercased()
-        let queryStem = getWordStem(lowercaseQuery)
+        // Strip quotes and normalize query for highlighting
+        let cleanedQuery = query.lowercased()
+            .replacingOccurrences(of: "\"", with: "")
+        // Split query into individual search terms
+        let queryTerms = cleanedQuery.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+        Log.debug("[SearchHighlight] Query: '\(query)', cleaned: '\(cleanedQuery)', terms: \(queryTerms)", category: .ui)
         var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
 
         for node in ocrNodes {
             let nodeText = node.text.lowercased()
             var ranges: [Range<String.Index>] = []
-            var searchStartIndex = nodeText.startIndex
 
-            // Find all exact occurrences of the query in this node
-            while let range = nodeText.range(of: lowercaseQuery, range: searchStartIndex..<nodeText.endIndex) {
-                ranges.append(range)
-                searchStartIndex = range.upperBound
-            }
+            // For each query term, find exact matches in this node
+            for term in queryTerms {
+                var searchStartIndex = nodeText.startIndex
 
-            // If no exact matches, try stem-based matching for nominalized words
-            if ranges.isEmpty && queryStem.count >= 3 {
-                // Find words that share the same stem as the query
-                let words = nodeText.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
-                for word in words {
-                    let wordStem = getWordStem(word)
-                    // Match if stems are equal, or one is prefix of the other
-                    if wordStem == queryStem || word.hasPrefix(queryStem) || queryStem.hasPrefix(word) {
-                        // Find the range of this word in the node text
-                        if let wordRange = nodeText.range(of: word) {
-                            ranges.append(wordRange)
-                        }
-                    }
+                while let range = nodeText.range(of: term, range: searchStartIndex..<nodeText.endIndex) {
+                    ranges.append(range)
+                    searchStartIndex = range.upperBound
                 }
             }
 
             if !ranges.isEmpty {
                 matchingNodes.append((node: node, ranges: ranges))
-                Log.debug("[SearchHighlight] MATCH: node.id=\(node.id), text='\(node.text.prefix(50))', x=\(node.x), y=\(node.y), w=\(node.width), h=\(node.height)", category: .ui)
+                Log.debug("[SearchHighlight] MATCH: node.id=\(node.id), text='\(node.text.prefix(50))', ranges=\(ranges.count)", category: .ui)
             }
         }
 
@@ -2615,20 +2692,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         return matchingNodes
-    }
-
-    /// Get a simple word stem by removing common suffixes
-    /// This mimics basic porter stemmer behavior for common English suffixes
-    private func getWordStem(_ word: String) -> String {
-        let suffixes = ["ing", "ed", "er", "est", "ly", "tion", "sion", "ness", "ment", "able", "ible", "ful", "less", "ous", "ive", "al", "s"]
-        var stem = word
-        for suffix in suffixes {
-            if stem.hasSuffix(suffix) && stem.count > suffix.count + 2 {
-                stem = String(stem.dropLast(suffix.count))
-                break
-            }
-        }
-        return stem
     }
 
     /// Exit live mode and transition to historical frames
@@ -2695,11 +2758,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Check cache first
         if let cached = imageCache[frame.id] {
             Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
+            // === PERF DEBUG: Cache hit ===
+            print("🔥 [PERF] Image cache HIT | cacheSize=\(imageCache.count) | frames=\(frames.count)")
+            // === END PERF DEBUG ===
             currentImage = cached
             frameNotReady = false
             frameLoadError = false
             return
         }
+
+        // === PERF DEBUG: Cache miss ===
+        print("🔥 [PERF] Image cache MISS | cacheSize=\(imageCache.count) | frames=\(frames.count) | loading frame \(frame.id.value)")
+        // === END PERF DEBUG ===
 
         // Load from disk
         Task {
@@ -4428,6 +4498,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Load image if needed
             loadImageIfNeeded()
 
+            // Check if we need to pre-load more frames (near edge of loaded window)
+            checkAndLoadMoreFrames()
+
             // Log memory state after date search
             MemoryTracker.logMemoryState(
                 context: "DATE SEARCH COMPLETE",
@@ -4508,6 +4581,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Load image if needed
             loadImageIfNeeded()
+
+            // Check if we need to pre-load more frames (near edge of loaded window)
+            checkAndLoadMoreFrames()
 
             // Log memory state after frame ID search
             MemoryTracker.logMemoryState(

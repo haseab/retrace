@@ -91,7 +91,8 @@ actor MigrationRunner {
             V1_InitialSchema(),
             V2_UnfinalisedVideoTracking(),
             V3_TagSystem(),
-            V4_DailyMetrics()
+            V4_DailyMetrics(),
+            V5_FTSUnicode61()
         ]
     }
 

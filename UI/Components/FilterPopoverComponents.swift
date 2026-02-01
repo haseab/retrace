@@ -454,7 +454,7 @@ public struct AppsFilterPopover: View {
     }
 
     public var body: some View {
-        FilterPopoverContainer {
+        FilterPopoverContainer(width: 220) {
             // Search field
             FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFocused)
                 .padding(.top, 8)

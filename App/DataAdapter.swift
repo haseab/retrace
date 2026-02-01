@@ -2753,6 +2753,9 @@ public actor DataAdapter {
         // CTE MATERIALIZED approach: Force SQLite to compute FTS results first
         // Without MATERIALIZED, SQLite may inline the CTE and optimize it poorly
         // Tag include uses INNER JOIN (more efficient than EXISTS in WHERE clause)
+        // Determine sort order
+        let sortOrderClause = query.sortOrder == .newestFirst ? "DESC" : "ASC"
+
         let sql: String
         if hasAppFilter || hasTagFilters {
             // With app/tag filter: CTE MATERIALIZED for FTS first, then join all tables and filter
@@ -2772,7 +2775,7 @@ public actor DataAdapter {
                 JOIN segment s ON f.segmentId = s.id
                 \(tagJoin)
                 \(whereClause)
-                ORDER BY f.createdAt DESC
+                ORDER BY f.createdAt \(sortOrderClause)
                 LIMIT ? OFFSET ?
             """
         } else {
@@ -2791,7 +2794,7 @@ public actor DataAdapter {
                 WHERE ds.docid IN (
                     SELECT rowid FROM searchRanking WHERE searchRanking MATCH ? ORDER BY rowid DESC LIMIT \(ftsLimit)
                 ) \(filterClause)
-                ORDER BY f.createdAt DESC
+                ORDER BY f.createdAt \(sortOrderClause)
                 LIMIT ? OFFSET ?
             """
         }
@@ -2917,17 +2920,67 @@ public actor DataAdapter {
     }
 
     private func buildFTSQuery(_ text: String) -> String {
-        let words = text.components(separatedBy: .whitespaces)
-            .filter { !$0.isEmpty }
-            .map { word -> String in
-                let escaped = word
-                    .replacingOccurrences(of: "\"", with: "\"\"")
-                    .replacingOccurrences(of: "*", with: "")
-                    .replacingOccurrences(of: ":", with: "")
-                return "\"\(escaped)\"*"
-            }
+        var parts: [String] = []
+        var current = ""
+        var inQuotes = false
 
-        return words.joined(separator: " ")
+        // Tokenize while preserving quoted phrases
+        for char in text {
+            if char == "\"" {
+                if inQuotes {
+                    // End of quoted phrase
+                    if !current.isEmpty {
+                        // Phrase search: wrap in quotes, no prefix matching
+                        let escaped = current
+                            .replacingOccurrences(of: "*", with: "")
+                            .replacingOccurrences(of: ":", with: "")
+                        parts.append("\"\(escaped)\"")
+                    }
+                    current = ""
+                    inQuotes = false
+                } else {
+                    // Start of quoted phrase - save any pending word first
+                    if !current.trimmingCharacters(in: .whitespaces).isEmpty {
+                        let word = current.trimmingCharacters(in: .whitespaces)
+                        let escaped = word
+                            .replacingOccurrences(of: "\"", with: "")
+                            .replacingOccurrences(of: "*", with: "")
+                            .replacingOccurrences(of: ":", with: "")
+                        parts.append("\"\(escaped)\"*")
+                    }
+                    current = ""
+                    inQuotes = true
+                }
+            } else if char.isWhitespace && !inQuotes {
+                // Word boundary outside quotes
+                if !current.isEmpty {
+                    let escaped = current
+                        .replacingOccurrences(of: "\"", with: "")
+                        .replacingOccurrences(of: "*", with: "")
+                        .replacingOccurrences(of: ":", with: "")
+                    parts.append("\"\(escaped)\"*")
+                    current = ""
+                }
+            } else {
+                current.append(char)
+            }
+        }
+
+        // Handle remaining content
+        if !current.isEmpty {
+            let escaped = current
+                .replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "*", with: "")
+                .replacingOccurrences(of: ":", with: "")
+            if inQuotes {
+                // Unclosed quote - treat as phrase anyway
+                parts.append("\"\(escaped)\"")
+            } else {
+                parts.append("\"\(escaped)\"*")
+            }
+        }
+
+        return parts.joined(separator: " ")
     }
 
     /// Build SQL clause for app filtering (IN or NOT IN based on filter mode)

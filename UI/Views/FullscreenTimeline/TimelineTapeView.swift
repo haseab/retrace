@@ -83,15 +83,30 @@ public struct TimelineTapeView: View {
 
             ZStack(alignment: .leading) {
                 // Main tape blocks with gap indicators
-                HStack(spacing: blockSpacing) {
-                    ForEach(blocks) { block in
-                        // Show gap indicator before block if there's a significant time gap
-                        if block.formattedGapBefore != nil {
-                            gapIndicatorView(block: block)
-                        }
-                        appBlockView(block: block, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX, blocks: blocks)
-                    }
+                // Use absolute positioning with block-level culling for performance
+                // Only blocks intersecting the visible range are rendered
+                let visibleBlocks = blocks.enumerated().compactMap { (index, block) -> (block: AppBlock, leftX: CGFloat)? in
+                    let blockLeftX = blockLeftPosition(for: block, at: index, in: blocks)
+                    let blockRightX = blockLeftX + block.width(pixelsPerFrame: pixelsPerFrame)
+                    guard blockRightX >= cullingLeftX && blockLeftX <= cullingRightX else { return nil }
+                    return (block, blockLeftX)
                 }
+
+                // === PERF DEBUG ===
+                let _ = print("🔥 [PERF] Block rendering | total=\(blocks.count) | visible=\(visibleBlocks.count) | cullingRange=\(Int(cullingLeftX))...\(Int(cullingRightX))")
+                // === END PERF DEBUG ===
+
+                ForEach(visibleBlocks, id: \.block.id) { item in
+                    // Gap indicator before block
+                    if item.block.formattedGapBefore != nil {
+                        gapIndicatorView(block: item.block)
+                            .offset(x: item.leftX - gapIndicatorWidth - blockSpacing)
+                    }
+                    // The block itself
+                    appBlockView(block: item.block, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX, blocks: blocks)
+                        .offset(x: item.leftX)
+                }
+                .frame(width: totalTapeWidth, alignment: .leading)
 
                 // Video boundary markers overlay (only when enabled)
                 if viewModel.showVideoBoundaries {
@@ -245,6 +260,28 @@ public struct TimelineTapeView: View {
     /// Fixed width of gap indicators (doubled from original)
     private var gapIndicatorWidth: CGFloat { 100 * TimelineScaleFactor.current }
 
+    /// Calculate the left X position for a block (for absolute positioning)
+    private func blockLeftPosition(for block: AppBlock, at index: Int, in blocks: [AppBlock]) -> CGFloat {
+        var offset: CGFloat = 0
+
+        for i in 0..<index {
+            let prevBlock = blocks[i]
+            // Add gap indicator width if present
+            if prevBlock.formattedGapBefore != nil {
+                offset += gapIndicatorWidth + blockSpacing
+            }
+            // Add block width + spacing
+            offset += prevBlock.width(pixelsPerFrame: pixelsPerFrame) + blockSpacing
+        }
+
+        // Add gap for current block if present
+        if block.formattedGapBefore != nil {
+            offset += gapIndicatorWidth + blockSpacing
+        }
+
+        return offset
+    }
+
     /// Calculate the total width of the timeline tape
     private func calculateTotalTapeWidth(blocks: [AppBlock]) -> CGFloat {
         guard !blocks.isEmpty else { return 0 }
@@ -352,7 +389,12 @@ public struct TimelineTapeView: View {
                 // Left side controls (hide UI + search)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
                     ControlsToggleButton(viewModel: viewModel)
+                    // Keep search button in layout but hide visually when overlay is open
+                    // This prevents the Cmd+H button from shifting
                     SearchButton(viewModel: viewModel)
+                        .opacity(viewModel.isSearchOverlayVisible ? 0 : 1)
+                        .scaleEffect(viewModel.isSearchOverlayVisible ? 0.8 : 1.0)
+                        .animation(.easeOut(duration: 0.15), value: viewModel.isSearchOverlayVisible)
                 }
                 .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
@@ -1707,10 +1749,10 @@ struct CalendarPickerView: View {
                             ZStack {
                                 if isSelected {
                                     Circle()
-                                        .fill(Color.retraceAccent)
+                                        .fill(RetraceMenuStyle.actionBlue)
                                 } else if isToday {
                                     Circle()
-                                        .stroke(Color.retraceAccent, lineWidth: 1.5)
+                                        .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1.5)
                                 }
                             }
                         )
@@ -1812,7 +1854,7 @@ struct TimeSlotButton: View {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(
                             hasFrames
-                                ? (isHovering ? Color.retraceAccent : Color.white.opacity(0.1))
+                                ? (isHovering ? RetraceMenuStyle.actionBlue : Color.white.opacity(0.1))
                                 : Color.clear
                         )
                 )

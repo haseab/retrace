@@ -2,6 +2,24 @@ import SwiftUI
 import Shared
 import App
 
+/// Debug logging to file
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
+}
+
 /// Main search view - find frames by text content
 /// Activated with Cmd+F
 public struct SearchView: View {
@@ -59,11 +77,31 @@ public struct SearchView: View {
         VStack(spacing: 0) {
             // Results header
             HStack {
-                Text("\(results.count) results")
-                    .font(.retraceHeadline)
-                    .foregroundColor(.retracePrimary)
+                // Match count with segment info for grouped view
+                if viewModel.viewMode == .grouped, let grouped = viewModel.groupedResults {
+                    Text("\(grouped.totalMatchCount) matches")
+                        .font(.retraceHeadline)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("in \(grouped.totalSegmentCount) segments")
+                        .font(.retraceCallout)
+                        .foregroundColor(.retraceSecondary)
+                } else {
+                    Text("\(results.count) results")
+                        .font(.retraceHeadline)
+                        .foregroundColor(.retracePrimary)
+                }
 
                 Spacer()
+
+                // View mode toggle
+                HStack(spacing: 2) {
+                    viewModeButton(mode: .grouped, icon: "rectangle.stack", tooltip: "Grouped by segment")
+                    viewModeButton(mode: .flat, icon: "list.bullet", tooltip: "Flat list")
+                }
+                .padding(2)
+                .background(Color.retraceCard)
+                .cornerRadius(6)
 
                 // Sort options (future enhancement)
                 Menu {
@@ -86,15 +124,51 @@ public struct SearchView: View {
 
             Divider()
 
-            // Results list
-            SearchResultsList(
-                results: results,
-                searchQuery: viewModel.searchQuery,
-                coordinator: viewModel.coordinator
-            ) { result in
-                viewModel.selectResult(result)
+            // Conditional view based on mode
+            let _ = debugLog("[SearchView] Rendering - viewMode=\(viewModel.viewMode), groupedResults=\(viewModel.groupedResults != nil ? "set(\(viewModel.groupedResults!.daySections.count) sections)" : "nil")")
+            if viewModel.viewMode == .grouped, let grouped = viewModel.groupedResults {
+                let _ = debugLog("[SearchView] Using GroupedSearchResultsList")
+                GroupedSearchResultsList(
+                    groupedResults: grouped,
+                    searchQuery: viewModel.searchQuery,
+                    coordinator: viewModel.coordinator,
+                    onSelectResult: { result in
+                        viewModel.selectResult(result)
+                    },
+                    onToggleStack: { segmentID in
+                        viewModel.toggleStackExpansion(segmentID: segmentID)
+                    }
+                )
+            } else {
+                let _ = debugLog("[SearchView] Using SearchResultsList (flat mode)")
+                SearchResultsList(
+                    results: results,
+                    searchQuery: viewModel.searchQuery,
+                    coordinator: viewModel.coordinator
+                ) { result in
+                    viewModel.selectResult(result)
+                }
             }
         }
+    }
+
+    // MARK: - View Mode Toggle
+
+    private func viewModeButton(mode: SearchViewMode, icon: String, tooltip: String) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                viewModel.viewMode = mode
+            }
+        } label: {
+            Image(systemName: icon)
+                .font(.retraceCallout)
+                .foregroundColor(viewModel.viewMode == mode ? .retracePrimary : .retraceSecondary)
+                .frame(width: 28, height: 24)
+                .background(viewModel.viewMode == mode ? Color.retraceHover : Color.clear)
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .help(tooltip)
     }
 
     // MARK: - Frame Viewer Sheet

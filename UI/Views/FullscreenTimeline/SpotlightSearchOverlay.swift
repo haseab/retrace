@@ -21,6 +21,7 @@ public struct SpotlightSearchOverlay: View {
     @State private var resultsHeight: CGFloat = 0
 
     private let panelWidth: CGFloat = 900
+    private let collapsedWidth: CGFloat = 400
     private let maxResultsHeight: CGFloat = 550
     private let thumbnailSize = CGSize(width: 280, height: 175)
     private let gridColumns = [
@@ -48,83 +49,82 @@ public struct SpotlightSearchOverlay: View {
     public var body: some View {
         ZStack {
             // Backdrop - also dismisses dropdowns if open
-            Color.black.opacity(isVisible ? 0.6 : 0)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    if viewModel.isDropdownOpen {
-                        viewModel.closeDropdownsSignal += 1
-                    } else {
-                        dismissOverlay()
-                    }
-                }
-
-            // Search panel
-            VStack(spacing: 0) {
-                searchBar
-
-                Divider()
-                    .background(Color.white.opacity(0.1))
-
-                // Filter bar and results in a ZStack so dropdowns can overlay results
-                ZStack(alignment: .top) {
-                    // Results area (bottom layer)
-                    VStack(spacing: 0) {
-                        // Spacer for the filter bar height (chips ~40px + vertical padding 24px = ~64px)
-                        Color.clear
-                            .frame(height: 56)
-
-                        if hasResults {
-                            let _ = print("[SpotlightSearchOverlay] Rendering results area (zIndex=0)")
-                            // Small gap before divider to maintain visual spacing below filter bar
-                            Color.clear.frame(height: 4)
-
-                            Divider()
-                                .background(Color.white.opacity(0.1))
-
-                            resultsArea
-                        }
-                    }
-                    .zIndex(0)
-                    .contentShape(Rectangle())
+            // Only show backdrop when there's search input
+            if !viewModel.searchQuery.isEmpty {
+                Color.black.opacity(isVisible ? 0.6 : 0)
+                    .ignoresSafeArea()
                     .onTapGesture {
-                        // Dismiss dropdown when tapping on results area
                         if viewModel.isDropdownOpen {
                             viewModel.closeDropdownsSignal += 1
+                        } else {
+                            dismissOverlay()
                         }
                     }
-                    .background(GeometryReader { geo in
-                        Color.clear.onAppear {
-                            print("[SpotlightSearchOverlay] Results VStack frame: \(geo.frame(in: .global))")
-                        }
-                    })
+            }
 
-                    // Filter bar (top layer, dropdowns will be above results)
+            // Search panel - use ZStack to allow dropdowns to escape clipping
+            ZStack(alignment: .top) {
+                // Main panel content (clipped)
+                VStack(spacing: 0) {
+                    searchBar
+
+                    // Only show filter bar and results when there's input
+                    if !viewModel.searchQuery.isEmpty {
+                        Divider()
+                            .background(Color.white.opacity(0.1))
+
+                        // Filter bar placeholder + results
+                        VStack(spacing: 0) {
+                            // Spacer for the filter bar height (chips ~40px + vertical padding 24px = ~64px)
+                            Color.clear
+                                .frame(height: 56)
+                                .allowsHitTesting(false)
+
+                            if hasResults {
+                                // Small gap before divider to maintain visual spacing below filter bar
+                                Color.clear.frame(height: 4)
+
+                                Divider()
+                                    .background(Color.white.opacity(0.1))
+
+                                resultsArea
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        // Dismiss dropdown when tapping on results area
+                                        if viewModel.isDropdownOpen {
+                                            viewModel.closeDropdownsSignal += 1
+                                        }
+                                    }
+                            }
+                        }
+                    }
+                }
+                .frame(width: viewModel.searchQuery.isEmpty ? collapsedWidth : panelWidth)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.black.opacity(0.4))
+                        .background(.ultraThinMaterial)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
+
+                // Filter bar overlay (NOT clipped, so dropdowns can extend beyond panel)
+                if !viewModel.searchQuery.isEmpty {
                     VStack(spacing: 0) {
-                        let _ = print("[SpotlightSearchOverlay] Rendering filter bar (zIndex=100)")
+                        // Offset to position below search bar + divider
+                        Color.clear.frame(height: 57) // searchBar height (~56px) + divider (1px)
                         SearchFilterBar(viewModel: viewModel)
                     }
-                    .zIndex(100)
-                    .background(GeometryReader { geo in
-                        Color.clear.onAppear {
-                            print("[SpotlightSearchOverlay] FilterBar VStack frame: \(geo.frame(in: .global))")
-                        }
-                    })
+                    .frame(width: panelWidth)
                 }
-                .background(GeometryReader { geo in
-                    Color.clear.onAppear {
-                        print("[SpotlightSearchOverlay] Inner ZStack frame: \(geo.frame(in: .global))")
-                    }
-                })
             }
-            .frame(width: panelWidth)
-            .retraceMenuContainer(addPadding: false)
-            .background(GeometryReader { geo in
-                Color.clear.onAppear {
-                    print("[SpotlightSearchOverlay] Outer panel frame (after retraceMenuContainer): \(geo.frame(in: .global))")
-                }
-            })
             .scaleEffect(isVisible ? 1.0 : 0.95)
             .opacity(isVisible ? 1.0 : 0)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.searchQuery.isEmpty)
         }
         .onAppear {
             Log.debug("\(searchLog) Search overlay opened", category: .ui)
@@ -217,6 +217,21 @@ public struct SpotlightSearchOverlay: View {
                 .buttonStyle(.plain)
                 .disabled(viewModel.searchQuery.isEmpty)
             }
+
+            // Close button
+            Button(action: {
+                dismissOverlay()
+            }) {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.1))
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
@@ -483,7 +498,22 @@ public struct SpotlightSearchOverlay: View {
                 }
             } catch {
                 let duration = Date().timeIntervalSince(startTime) * 1000
-                Log.error("\(searchLog) Failed to load thumbnail after \(Int(duration))ms: \(error.localizedDescription)", category: .ui)
+                Log.error("\(searchLog) ❌ THUMBNAIL FAILED after \(Int(duration))ms: \(error)", category: .ui)
+                Log.error("\(searchLog) ❌ Details: videoID=\(result.videoID), frameIndex=\(result.frameIndex), source=\(result.source)", category: .ui)
+
+                // Write to debug log file
+                let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] ❌ THUMBNAIL FAILED: \(error)\n  videoID=\(result.videoID), frameID=\(result.frameID), frameIndex=\(result.frameIndex), source=\(result.source)\n"
+                if let data = logMessage.data(using: .utf8) {
+                    let logPath = "/tmp/retrace_debug.log"
+                    if !FileManager.default.fileExists(atPath: logPath) {
+                        FileManager.default.createFile(atPath: logPath, contents: nil)
+                    }
+                    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        handle.closeFile()
+                    }
+                }
 
                 // Create a placeholder thumbnail so the UI doesn't show infinite loading
                 let placeholder = createPlaceholderThumbnail(size: thumbnailSize)

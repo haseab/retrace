@@ -67,7 +67,7 @@ public struct SimpleTimelineView: View {
                         )
                 }
                 .allowsHitTesting(false)
-                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : 0)
+                .offset(y: viewModel.areControlsHidden ? TimelineScaleFactor.hiddenControlsOffset : (viewModel.isTapeHidden ? TimelineScaleFactor.hiddenControlsOffset : 0))
                 .opacity(viewModel.areControlsHidden || viewModel.isDraggingZoomRegion ? 0 : 1)
 
                 // Dismiss overlay for date search panel (Cmd+G) - clicking outside closes it
@@ -4444,69 +4444,36 @@ struct FilterDropdownOverlay: View {
                             }
                         }
 
-                    // Date range dropdown opens upward, others open downward
-                    if viewModel.activeFilterDropdown == .dateRange {
-                        // Position dropdown above the anchor (opens upward)
-                        VStack(spacing: 0) {
+                    // All dropdowns open downward
+                    VStack(spacing: 0) {
+                        // Top spacer to push content down to anchor.maxY + gap
+                        Spacer()
+                            .frame(height: anchor.maxY + 8)
+
+                        HStack(spacing: 0) {
+                            // Left spacer to push content to anchor.minX
                             Spacer()
+                                .frame(width: anchor.minX)
 
-                            HStack(spacing: 0) {
-                                Spacer()
-                                    .frame(width: anchor.minX)
-
-                                dropdownContent
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .fill(Color(white: 0.12))
-                                    )
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .shadow(color: .black.opacity(0.5), radius: 15, y: -8)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
-                                    .fixedSize()
-
-                                Spacer()
-                            }
-
-                            // Bottom spacer to push content up above the anchor
-                            Spacer()
-                                .frame(height: max(0, NSScreen.main?.frame.height ?? 800) - anchor.minY + 8)
-                        }
-                    } else {
-                        // Use VStack with Spacer to position dropdown at the correct Y
-                        // Then use HStack with Spacer to position at the correct X
-                        VStack(spacing: 0) {
-                            // Top spacer to push content down to anchor.maxY + gap
-                            Spacer()
-                                .frame(height: anchor.maxY + 8)
-
-                            HStack(spacing: 0) {
-                                // Left spacer to push content to anchor.minX
-                                Spacer()
-                                    .frame(width: anchor.minX)
-
-                                // The actual dropdown content
-                                // Scroll events are handled at TimelineWindowController level
-                                dropdownContent
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .fill(Color(white: 0.12))
-                                    )
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10)
-                                            .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                    )
-                                    .fixedSize()
-
-                                Spacer()
-                            }
+                            // The actual dropdown content
+                            // Scroll events are handled at TimelineWindowController level
+                            dropdownContent
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(Color(white: 0.12))
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                                .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                                )
+                                .fixedSize()
 
                             Spacer()
                         }
+
+                        Spacer()
                     }
                 }
                 .transition(.opacity)

@@ -275,6 +275,8 @@ public class TimelineWindowController: NSObject {
         // Create the window (hidden)
         let window = createWindow(for: screen)
         window.alphaValue = 0
+        // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
+        window.ignoresMouseEvents = true
         window.orderOut(nil)
         Log.info("[TIMELINE-PRERENDER] 🪟 Window created (hidden), elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
@@ -493,6 +495,9 @@ public class TimelineWindowController: NSObject {
         let isLive = (timelineViewModel?.isInLiveMode ?? false) && timelineViewModel?.liveScreenshot != nil
         window.alphaValue = isLive ? 1 : 0
 
+        // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
+        window.ignoresMouseEvents = false
+
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         window.makeKeyAndOrderFront(nil)
         logShowTiming("makeKeyAndOrderFront")
@@ -593,6 +598,8 @@ public class TimelineWindowController: NSObject {
 
                 // Hide window but keep it around for instant re-show
                 // This is the key optimization - we don't destroy the window or view model
+                // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
+                window.ignoresMouseEvents = true
                 window.orderOut(nil)
                 self?.isVisible = false
                 Self.isTimelineVisible = false  // For emergency escape tap
@@ -604,6 +611,7 @@ public class TimelineWindowController: NSObject {
                     viewModel.isInLiveMode = false
                     viewModel.liveScreenshot = nil
                     viewModel.isTapeHidden = true
+                    viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
                 }
 
                 // Immediately refresh frame data so next open has fresh data
@@ -888,6 +896,8 @@ public class TimelineWindowController: NSObject {
 
         // Fade in for filter/historical path (data already loaded)
         window.alphaValue = 0
+        // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
+        window.ignoresMouseEvents = false
         window.makeKeyAndOrderFront(nil)
         isVisible = true
         Self.isTimelineVisible = true
@@ -1093,11 +1103,7 @@ public class TimelineWindowController: NSObject {
                     return nil // Consume the event
                 }
             } else if event.type == .scrollWheel {
-                // Don't intercept scroll events when search overlay is visible
-                // Let SwiftUI ScrollView handle them for scrolling through results
-                if let viewModel = self?.timelineViewModel, viewModel.isSearchOverlayVisible {
-                    return event // Let the ScrollView handle it
-                }
+                // Allow scrolling timeline while search overlay is open (don't block)
                 // Don't intercept scroll events when a filter dropdown is open
                 // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
                 if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
@@ -1107,6 +1113,12 @@ public class TimelineWindowController: NSObject {
                 // Let SwiftUI ScrollView handle them for scrolling through tags
                 if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
                     return event // Let the tag submenu ScrollView handle it
+                }
+                // Don't intercept scroll events when search overlay is open with results
+                // Prioritize scrolling the search results over timeline navigation
+                if let viewModel = self?.timelineViewModel,
+                   viewModel.isSearchOverlayVisible && !viewModel.searchViewModel.searchQuery.isEmpty {
+                    return event // Let the search results ScrollView handle it
                 }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events

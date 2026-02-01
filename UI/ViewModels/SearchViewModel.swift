@@ -3,6 +3,24 @@ import Combine
 import Shared
 import App
 
+/// Debug logging to file
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
+}
+
 /// Lightweight struct for caching app info to disk
 private struct CachedAppInfo: Codable {
     let bundleID: String
@@ -35,6 +53,18 @@ public class SearchViewModel: ObservableObject {
 
     // Search mode (tabs)
     @Published public var searchMode: SearchMode = .relevant
+
+    // View mode (flat vs grouped)
+    @Published public var viewMode: SearchViewMode = .grouped
+
+    // Grouped search results (when viewMode == .grouped)
+    @Published public var groupedResults: GroupedSearchResults?
+
+    // Expanded segment IDs (for tracking which stacks are open in grouped view)
+    @Published public var expandedSegmentIDs: Set<Int64> = []
+
+    // Sort order (for "all" mode)
+    @Published public var sortOrder: SearchSortOrder = .newestFirst
 
     // Available apps for filter dropdown (installed apps shown first, then "other" apps from DB)
     @Published public var installedApps: [AppInfo] = []
@@ -75,6 +105,10 @@ public class SearchViewModel: ObservableObject {
     // Flag to prevent re-search during cache restore
     private var isRestoringFromCache = false
 
+    // Flag to track if user has submitted a search at least once
+    // Filter changes only auto-trigger re-search after first submit
+    private var hasSubmittedSearch = false
+
     // MARK: - Dependencies
 
     public let coordinator: AppCoordinator
@@ -107,6 +141,8 @@ public class SearchViewModel: ObservableObject {
     private static let cachedContentTypeKey = "search.cachedContentType"
     /// Key for storing the cached search mode
     private static let cachedSearchModeKey = "search.cachedSearchMode"
+    /// Key for storing the cached sort order
+    private static let cachedSearchSortOrderKey = "search.cachedSearchSortOrder"
     /// Cache version - increment when data structure changes to invalidate old caches
     private static let searchCacheVersion = 3  // v3: Multi-select app filters
     private static let searchCacheVersionKey = "search.cacheVersion"
@@ -153,12 +189,13 @@ public class SearchViewModel: ObservableObject {
                     Log.debug("[SearchCache] Query is empty, clearing results and cache", category: .ui)
                     self?.results = nil
                     self?.committedSearchQuery = ""
+                    self?.hasSubmittedSearch = false  // Reset so filters don't auto-update for new query
                     self?.clearSearchCache()
                 }
             }
             .store(in: &cancellables)
 
-        // Re-search when filters change (skip during cache restore)
+        // Re-search when filters change (skip during cache restore and before first submit)
         // Use CombineLatest to watch all filter properties
         Publishers.CombineLatest4(
             $selectedAppFilters,
@@ -170,7 +207,14 @@ public class SearchViewModel: ObservableObject {
         .dropFirst()  // Skip initial values
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
-            guard let self = self, !self.searchQuery.isEmpty, !self.isRestoringFromCache else { return }
+            // Only auto-trigger re-search if:
+            // 1. Query is not empty
+            // 2. Not restoring from cache
+            // 3. User has already submitted a search at least once
+            guard let self = self,
+                  !self.searchQuery.isEmpty,
+                  !self.isRestoringFromCache,
+                  self.hasSubmittedSearch else { return }
             // Cancel any existing search before starting a new one
             self.currentSearchTask?.cancel()
             self.currentSearchTask = Task {
@@ -186,6 +230,9 @@ public class SearchViewModel: ObservableObject {
     public func submitSearch() {
         // Cancel any existing search before starting a new one
         currentSearchTask?.cancel()
+
+        // Mark that user has submitted a search - enables filter auto-refresh
+        hasSubmittedSearch = true
 
         // Track search event only on explicit submit (Enter key)
         let query = searchQuery
@@ -279,10 +326,17 @@ public class SearchViewModel: ObservableObject {
                 Log.debug("[SearchViewModel] First result: frameID=\(firstResult.frameID.stringValue), timestamp=\(firstResult.timestamp), snippet='\(firstResult.snippet.prefix(50))...'", category: .ui)
             }
 
+            // Create grouped results from flat results
+            let grouped = groupResultsByDayAndSegment(searchResults.results, query: searchResults.query, searchTimeMs: searchResults.searchTimeMs)
+            debugLog("[SearchViewModel] Created grouped results: \(grouped.daySections.count) day sections, \(grouped.totalSegmentCount) segments, \(grouped.totalMatchCount) matches")
+
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 results = searchResults
+                groupedResults = grouped
+                expandedSegmentIDs.removeAll()  // Reset expansion state for new search
                 isSearching = false
+                debugLog("[SearchViewModel] UI updated - viewMode=\(viewMode), groupedResults=\(groupedResults != nil ? "set" : "nil")")
             }
         } catch is CancellationError {
             Log.debug("[SearchViewModel] Search was cancelled", category: .ui)
@@ -350,7 +404,8 @@ public class SearchViewModel: ObservableObject {
             filters: filters,
             limit: defaultResultLimit,
             offset: offset,
-            mode: searchMode
+            mode: searchMode,
+            sortOrder: sortOrder
         )
     }
 
@@ -358,9 +413,22 @@ public class SearchViewModel: ObservableObject {
     public func setSearchMode(_ mode: SearchMode) {
         guard mode != searchMode else { return }
         searchMode = mode
-        // Clear results and re-search with new mode
-        if !searchQuery.isEmpty {
+        // Clear results and re-search with new mode (only if user has submitted a search)
+        if !searchQuery.isEmpty && hasSubmittedSearch {
             // Cancel any existing search before starting a new one
+            currentSearchTask?.cancel()
+            currentSearchTask = Task {
+                await performSearch(query: searchQuery)
+            }
+        }
+    }
+
+    /// Switch sort order and re-run search (only affects "all" mode)
+    public func setSearchSortOrder(_ order: SearchSortOrder) {
+        guard order != sortOrder else { return }
+        sortOrder = order
+        // Re-search with new sort order (only if user has submitted a search)
+        if !searchQuery.isEmpty && hasSubmittedSearch {
             currentSearchTask?.cancel()
             currentSearchTask = Task {
                 await performSearch(query: searchQuery)
@@ -735,6 +803,156 @@ public class SearchViewModel: ObservableObject {
         !hasResults && !isSearching
     }
 
+    // MARK: - Grouped Results
+
+    /// Date formatter for day keys (yyyy-MM-dd)
+    private static let dateKeyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// Format a date as a human-readable day label
+    private func formatDayLabel(_ date: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return "Today"
+        } else if calendar.isDateInYesterday(date) {
+            return "Yesterday"
+        } else {
+            let formatter = DateFormatter()
+            // Show year if not current year
+            if !calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
+                formatter.dateFormat = "MMM d, yyyy"
+            } else {
+                formatter.dateFormat = "MMM d"
+            }
+            return formatter.string(from: date)
+        }
+    }
+
+    /// Convert flat search results to grouped structure (by time clusters and day)
+    /// Groups results that are within a time window AND from the same app into a single stack
+    private func groupResultsByDayAndSegment(_ results: [SearchResult], query: SearchQuery, searchTimeMs: Int) -> GroupedSearchResults {
+        guard !results.isEmpty else {
+            return GroupedSearchResults(
+                query: query,
+                daySections: [],
+                totalMatchCount: 0,
+                totalSegmentCount: 0,
+                searchTimeMs: searchTimeMs
+            )
+        }
+
+        // Step 1: Sort results by timestamp (newest first)
+        let sortedResults = results.sorted { $0.timestamp > $1.timestamp }
+
+        // Step 2: Group into time-based clusters (5 minute window, same app)
+        let timeWindowSeconds: TimeInterval = 5 * 60  // 5 minutes
+        var clusters: [[SearchResult]] = []
+        var currentCluster: [SearchResult] = []
+
+        for result in sortedResults {
+            if currentCluster.isEmpty {
+                currentCluster.append(result)
+            } else {
+                let lastResult = currentCluster.last!
+                let timeDiff = abs(result.timestamp.timeIntervalSince(lastResult.timestamp))
+                let sameApp = result.appBundleID == lastResult.appBundleID
+
+                // Group if within time window AND same app
+                if timeDiff <= timeWindowSeconds && sameApp {
+                    currentCluster.append(result)
+                } else {
+                    clusters.append(currentCluster)
+                    currentCluster = [result]
+                }
+            }
+        }
+        // Don't forget the last cluster
+        if !currentCluster.isEmpty {
+            clusters.append(currentCluster)
+        }
+
+        // Step 3: Create SegmentSearchStack for each cluster
+        let segmentStacks: [SegmentSearchStack] = clusters.enumerated().compactMap { (index, clusterResults) in
+            // Pick the highest relevance match as representative
+            guard let bestMatch = clusterResults.max(by: { $0.relevanceScore < $1.relevanceScore }) else {
+                return nil
+            }
+
+            // Use a synthetic cluster ID based on index (since we're not using segmentID anymore)
+            // We'll use the first result's segmentID as the cluster identifier
+            let clusterSegmentID = clusterResults.first?.segmentID ?? AppSegmentID(value: Int64(index))
+
+            return SegmentSearchStack(
+                segmentID: clusterSegmentID,
+                representativeResult: bestMatch,
+                matchCount: clusterResults.count,
+                expandedResults: clusterResults.count > 1 ? clusterResults : nil,
+                isExpanded: false
+            )
+        }
+
+        // Step 4: Group stacks by day
+        let byDay = Dictionary(grouping: segmentStacks) { stack -> String in
+            let date = stack.representativeResult.timestamp
+            return Self.dateKeyFormatter.string(from: date)
+        }
+
+        // Step 4: Create day sections
+        let daySections: [SearchDaySection] = byDay.map { (dateKey, stacks) in
+            let date = Self.dateKeyFormatter.date(from: dateKey) ?? Date()
+            let displayLabel = formatDayLabel(date)
+            // Sort stacks by timestamp (newest first)
+            let sortedStacks = stacks.sorted { $0.representativeResult.timestamp > $1.representativeResult.timestamp }
+            return SearchDaySection(
+                dateKey: dateKey,
+                displayLabel: displayLabel,
+                date: date,
+                segmentStacks: sortedStacks
+            )
+        }.sorted { $0.date > $1.date }  // Sort days newest first
+
+        return GroupedSearchResults(
+            query: query,
+            daySections: daySections,
+            totalMatchCount: results.count,
+            totalSegmentCount: segmentStacks.count,
+            searchTimeMs: searchTimeMs
+        )
+    }
+
+    /// Toggle expansion of a segment stack
+    public func toggleStackExpansion(segmentID: AppSegmentID) {
+        let segmentValue = segmentID.value
+
+        if expandedSegmentIDs.contains(segmentValue) {
+            expandedSegmentIDs.remove(segmentValue)
+        } else {
+            expandedSegmentIDs.insert(segmentValue)
+        }
+
+        // Update the isExpanded flag in groupedResults
+        updateStackExpansionState(segmentID: segmentID)
+    }
+
+    /// Update isExpanded state in groupedResults to match expandedSegmentIDs
+    private func updateStackExpansionState(segmentID: AppSegmentID) {
+        guard var grouped = groupedResults else { return }
+
+        for sectionIdx in grouped.daySections.indices {
+            for stackIdx in grouped.daySections[sectionIdx].segmentStacks.indices {
+                if grouped.daySections[sectionIdx].segmentStacks[stackIdx].segmentID.value == segmentID.value {
+                    grouped.daySections[sectionIdx].segmentStacks[stackIdx].isExpanded =
+                        expandedSegmentIDs.contains(segmentID.value)
+                }
+            }
+        }
+
+        groupedResults = grouped
+    }
+
     // MARK: - Search Results Cache
 
     /// Save the current search results to cache for instant restore on app reopen
@@ -775,6 +993,7 @@ public class SearchViewModel: ObservableObject {
         }
         UserDefaults.standard.set(contentType.rawValue, forKey: Self.cachedContentTypeKey)
         UserDefaults.standard.set(searchMode.rawValue, forKey: Self.cachedSearchModeKey)
+        UserDefaults.standard.set(sortOrder.rawValue, forKey: Self.cachedSearchSortOrderKey)
 
         // Force UserDefaults to persist immediately (important for quick close/reopen)
         UserDefaults.standard.synchronize()
@@ -840,6 +1059,7 @@ public class SearchViewModel: ObservableObject {
         let cachedEndDateValue = UserDefaults.standard.double(forKey: Self.cachedEndDateKey)
         let cachedContentTypeRaw = UserDefaults.standard.string(forKey: Self.cachedContentTypeKey)
         let cachedSearchModeRaw = UserDefaults.standard.string(forKey: Self.cachedSearchModeKey)
+        let cachedSearchSortOrderRaw = UserDefaults.standard.string(forKey: Self.cachedSearchSortOrderKey)
 
         // Load cached results from disk
         do {
@@ -869,6 +1089,9 @@ public class SearchViewModel: ObservableObject {
             }
             if let rawValue = cachedSearchModeRaw, let mode = SearchMode(rawValue: rawValue) {
                 searchMode = mode
+            }
+            if let rawValue = cachedSearchSortOrderRaw, let order = SearchSortOrder(rawValue: rawValue) {
+                sortOrder = order
             }
 
             // Clear the flag after restore is complete (after debounce delay)
@@ -905,6 +1128,7 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: cachedEndDateKey)
         UserDefaults.standard.removeObject(forKey: cachedContentTypeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchModeKey)
+        UserDefaults.standard.removeObject(forKey: cachedSearchSortOrderKey)
 
         // Remove cached results file
         try? FileManager.default.removeItem(at: cachedSearchResultsPath)

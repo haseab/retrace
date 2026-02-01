@@ -27,14 +27,60 @@ public struct SearchFilterBar: View {
     @State private var showDatePopover = false
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
+    @State private var showSortDropdown = false
 
     // MARK: - Body
 
+    private func logToFile(_ message: String) {
+        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = logMessage.data(using: .utf8) {
+            let logPath = "/tmp/retrace_debug.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        }
+    }
+
     public var body: some View {
-        let _ = print("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover)")
+        let _ = logToFile("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover), showTagsDropdown=\(showTagsDropdown), showVisibilityDropdown=\(showVisibilityDropdown)")
         HStack(spacing: 10) {
             // Search mode tabs (Relevant / All)
             SearchModeTabs(viewModel: viewModel)
+
+            // Sort order dropdown (only visible in "All" mode)
+            if viewModel.searchMode == .all {
+                SortOrderChip(
+                    currentOrder: viewModel.sortOrder,
+                    action: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showSortDropdown.toggle()
+                            showAppsDropdown = false
+                            showDatePopover = false
+                            showTagsDropdown = false
+                            showVisibilityDropdown = false
+                        }
+                    }
+                )
+                .dropdownOverlay(isPresented: $showSortDropdown, yOffset: 56) {
+                    SortOrderPopover(
+                        currentOrder: viewModel.sortOrder,
+                        onSelect: { order in
+                            viewModel.setSearchSortOrder(order)
+                        },
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                showSortDropdown = false
+                            }
+                        }
+                    )
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
 
             Divider()
                 .frame(height: 28)
@@ -46,12 +92,14 @@ public struct SearchFilterBar: View {
                 filterMode: viewModel.appFilterMode,
                 isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
                 action: {
+                    logToFile("[SearchFilterBar] Apps chip CLICKED! showAppsDropdown was \(showAppsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showAppsDropdown.toggle()
                         showDatePopover = false
                         showTagsDropdown = false
                         showVisibilityDropdown = false
                     }
+                    logToFile("[SearchFilterBar] Apps chip after toggle: showAppsDropdown=\(showAppsDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: 56) {
@@ -82,12 +130,14 @@ public struct SearchFilterBar: View {
                 isActive: viewModel.startDate != nil || viewModel.endDate != nil,
                 showChevron: true
             ) {
+                logToFile("[SearchFilterBar] Date chip CLICKED! showDatePopover was \(showDatePopover), toggling...")
                 withAnimation(.easeOut(duration: 0.15)) {
                     showDatePopover.toggle()
                     showAppsDropdown = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
                 }
+                logToFile("[SearchFilterBar] Date chip after toggle: showDatePopover=\(showDatePopover)")
             }
             .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
                 DateFilterPopover(
@@ -103,12 +153,14 @@ public struct SearchFilterBar: View {
                 filterMode: viewModel.tagFilterMode,
                 isActive: viewModel.selectedTags != nil && !viewModel.selectedTags!.isEmpty,
                 action: {
+                    logToFile("[SearchFilterBar] Tags chip CLICKED! showTagsDropdown was \(showTagsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showTagsDropdown.toggle()
                         showAppsDropdown = false
                         showDatePopover = false
                         showVisibilityDropdown = false
                     }
+                    logToFile("[SearchFilterBar] Tags chip after toggle: showTagsDropdown=\(showTagsDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: 56) {
@@ -136,12 +188,14 @@ public struct SearchFilterBar: View {
                 currentFilter: viewModel.hiddenFilter,
                 isActive: viewModel.hiddenFilter != .hide,
                 action: {
+                    logToFile("[SearchFilterBar] Visibility chip CLICKED! showVisibilityDropdown was \(showVisibilityDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showVisibilityDropdown.toggle()
                         showAppsDropdown = false
                         showDatePopover = false
                         showTagsDropdown = false
                     }
+                    logToFile("[SearchFilterBar] Visibility chip after toggle: showVisibilityDropdown=\(showVisibilityDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: 56) {
@@ -190,7 +244,7 @@ public struct SearchFilterBar: View {
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
             // Lazy load apps only when dropdown is opened
             if isOpen {
                 Task {
@@ -199,13 +253,16 @@ public struct SearchFilterBar: View {
             }
         }
         .onChange(of: showDatePopover) { _ in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
         .onChange(of: showTagsDropdown) { _ in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
         .onChange(of: showVisibilityDropdown) { _ in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+        }
+        .onChange(of: showSortDropdown) { _ in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { _ in
             // Close all dropdowns when signal is received (from Escape key in parent)
@@ -214,6 +271,7 @@ public struct SearchFilterBar: View {
                 showDatePopover = false
                 showTagsDropdown = false
                 showVisibilityDropdown = false
+                showSortDropdown = false
             }
         }
     }
@@ -249,8 +307,26 @@ private struct FilterChip: View {
 
     @State private var isHovered = false
 
+    private func logToFile(_ message: String) {
+        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = logMessage.data(using: .utf8) {
+            let logPath = "/tmp/retrace_debug.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        }
+    }
+
     var body: some View {
-        Button(action: action) {
+        Button(action: {
+            logToFile("[FilterChip] Button action triggered for: \(label)")
+            action()
+        }) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 14))
@@ -307,8 +383,26 @@ private struct AppsFilterChip: View {
         filterMode == .exclude && isActive
     }
 
+    private func logToFile(_ message: String) {
+        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = logMessage.data(using: .utf8) {
+            let logPath = "/tmp/retrace_debug.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        }
+    }
+
     var body: some View {
-        Button(action: action) {
+        Button(action: {
+            logToFile("[AppsFilterChip] Button action triggered!")
+            action()
+        }) {
             HStack(spacing: 6) {
                 // Show exclude indicator
                 if isExcludeMode {
@@ -928,8 +1022,26 @@ private struct TagsFilterChip: View {
         }
     }
 
+    private func logToFile(_ message: String) {
+        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = logMessage.data(using: .utf8) {
+            let logPath = "/tmp/retrace_debug.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        }
+    }
+
     var body: some View {
-        Button(action: action) {
+        Button(action: {
+            logToFile("[TagsFilterChip] Button action triggered!")
+            action()
+        }) {
             HStack(spacing: 6) {
                 // Show exclude indicator
                 if isExcludeMode {
@@ -996,8 +1108,26 @@ private struct VisibilityFilterChip: View {
         }
     }
 
+    private func logToFile(_ message: String) {
+        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        if let data = logMessage.data(using: .utf8) {
+            let logPath = "/tmp/retrace_debug.log"
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        }
+    }
+
     var body: some View {
-        Button(action: action) {
+        Button(action: {
+            logToFile("[VisibilityFilterChip] Button action triggered!")
+            action()
+        }) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 14))
@@ -1027,6 +1157,128 @@ private struct VisibilityFilterChip: View {
                 isHovered = hovering
             }
         }
+    }
+}
+
+// MARK: - Sort Order Chip
+
+private struct SortOrderChip: View {
+    let currentOrder: SearchSortOrder
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    private var icon: String {
+        switch currentOrder {
+        case .newestFirst: return "arrow.down"
+        case .oldestFirst: return "arrow.up"
+        }
+    }
+
+    private var label: String {
+        switch currentOrder {
+        case .newestFirst: return "Newest"
+        case .oldestFirst: return "Oldest"
+        }
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 14))
+
+                Text(label)
+                    .font(.retraceCalloutMedium)
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.down")
+                    .font(.retraceCaption2)
+            }
+            .foregroundColor(.white.opacity(0.7))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.white.opacity(isHovered ? 0.15 : 0.1))
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+// MARK: - Sort Order Popover
+
+private struct SortOrderPopover: View {
+    let currentOrder: SearchSortOrder
+    let onSelect: (SearchSortOrder) -> Void
+    var onDismiss: (() -> Void)?
+
+    @FocusState private var isFocused: Bool
+    @State private var highlightedIndex: Int = 0
+
+    private let options: [SearchSortOrder] = [.newestFirst, .oldestFirst]
+
+    private func selectHighlightedItem() {
+        guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
+        onSelect(options[highlightedIndex])
+        onDismiss?()
+    }
+
+    private func moveHighlight(by offset: Int) {
+        highlightedIndex = max(0, min(options.count - 1, highlightedIndex + offset))
+    }
+
+    var body: some View {
+        FilterPopoverContainer(width: 200) {
+            VStack(spacing: 0) {
+                // Newest First option (default)
+                FilterRow(
+                    systemIcon: "arrow.down",
+                    title: "Newest First",
+                    subtitle: "Most recent results first",
+                    isSelected: currentOrder == .newestFirst,
+                    isKeyboardHighlighted: highlightedIndex == 0
+                ) {
+                    onSelect(.newestFirst)
+                    onDismiss?()
+                }
+                .id(0)
+
+                Divider()
+                    .padding(.vertical, 4)
+
+                // Oldest First option
+                FilterRow(
+                    systemIcon: "arrow.up",
+                    title: "Oldest First",
+                    subtitle: "Oldest results first",
+                    isSelected: currentOrder == .oldestFirst,
+                    isKeyboardHighlighted: highlightedIndex == 1
+                ) {
+                    onSelect(.oldestFirst)
+                    onDismiss?()
+                }
+                .id(1)
+            }
+            .padding(.vertical, 8)
+        }
+        .focused($isFocused)
+        .onAppear {
+            // Set initial highlight to current selection
+            highlightedIndex = options.firstIndex(of: currentOrder) ?? 0
+            isFocused = true
+        }
+        .keyboardNavigation(
+            onUpArrow: { moveHighlight(by: -1) },
+            onDownArrow: { moveHighlight(by: 1) },
+            onReturn: { selectHighlightedItem() }
+        )
     }
 }
 

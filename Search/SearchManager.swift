@@ -66,6 +66,7 @@ public actor SearchManager: SearchProtocol {
 
         // Build FTS query
         let ftsQuery = parsed.toFTSQuery()
+        Log.debug("[SearchManager] Raw query: '\(query.text)' → FTS query: '\(ftsQuery)' | terms: \(parsed.searchTerms) | phrases: \(parsed.phrases)", category: .search)
 
         // Build filters
         var filters = query.filters
