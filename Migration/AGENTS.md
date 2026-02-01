@@ -20,7 +20,7 @@ You are the **MIGRATION** agent responsible for importing data from third-party 
 Migration/
 ├── MigrationManager.swift      # Main coordinator, manages all importers
 ├── Importers/
-│   ├── RewindImporter.swift    # Rewind AI (com.memoryvault.MemoryVault)
+│   ├── RewindImporter.swift    # Rewind AI importer
 │   └── [Future importers...]
 ├── State/
 │   └── [State persistence files]
@@ -30,9 +30,9 @@ Migration/
 
 ## Supported Sources (Current & Planned)
 
-| Source | Status | Bundle ID / Path |
+| Source | Status | Path Configuration |
 |--------|--------|------------------|
-| Rewind AI | ✅ v0.1 Implemented | `com.memoryvault.MemoryVault` |
+| Rewind AI | ✅ v0.1 Implemented | `AppPaths.rewindStorageRoot` |
 | ScreenMemory | 🔮 v0.2+ Planned | TBD |
 | TimeScroll | 🔮 v0.2+ Planned | TBD |
 | Pensieve | 🔮 v0.2+ Planned | TBD |
@@ -41,10 +41,11 @@ Migration/
 
 ### Rewind Data Format
 
-Rewind stores screen recordings in:
+Rewind stores screen recordings in `AppPaths.rewindChunksPath`:
 ```
-~/Library/Application Support/com.memoryvault.MemoryVault/chunks/YYYYMM/DD/*.mp4
+{rewindStorageRoot}/chunks/YYYYMM/DD/*.mp4
 ```
+Default: `~/Library/Application Support/com.memoryvault.MemoryVault/chunks/`
 
 **Critical Understanding**:
 - Each MP4 is typically ~2-5 seconds of video at ~30 FPS

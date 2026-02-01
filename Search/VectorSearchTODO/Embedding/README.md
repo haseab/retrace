@@ -140,7 +140,7 @@ let results = try await hybridSearch.search(
 
 ```swift
 EmbeddingConfig(
-    modelPath: "~/Library/Application Support/Retrace/models/nomic-embed-text-v1.5.Q4_K_M.gguf",
+    modelPath: AppPaths.modelsPath + "/nomic-embed-text-v1.5.Q4_K_M.gguf",
     contextSize: 8192,      // Max tokens (don't change for Nomic)
     gpuLayers: -1,          // -1 = offload all to GPU
     batchSize: 512,         // Batch size for processing
@@ -170,7 +170,7 @@ HybridSearchConfig.semanticHeavy
 The model is automatically downloaded on first use:
 
 ```swift
-let modelPath = "~/Library/Application Support/Retrace/models/nomic-embed-text-v1.5.Q4_K_M.gguf"
+let modelPath = AppPaths.modelsPath + "/nomic-embed-text-v1.5.Q4_K_M.gguf"
 
 // Downloads from HuggingFace if not present
 try await LocalEmbeddingService.downloadModelIfNeeded(to: modelPath)
@@ -178,9 +178,13 @@ try await LocalEmbeddingService.downloadModelIfNeeded(to: modelPath)
 
 **Manual Download:**
 
+Models are stored in `{AppPaths.storageRoot}/models/` (default: `~/Library/Application Support/Retrace/models/`, configurable in Settings)
+
 ```bash
-mkdir -p ~/Library/Application\ Support/Retrace/models
-cd ~/Library/Application\ Support/Retrace/models
+# Set RETRACE_STORAGE_ROOT to use custom location, or omit for default
+MODELS_DIR="${RETRACE_STORAGE_ROOT:-$HOME/Library/Application Support/Retrace}/models"
+mkdir -p "$MODELS_DIR"
+cd "$MODELS_DIR"
 
 # Download from HuggingFace
 curl -L -O https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf

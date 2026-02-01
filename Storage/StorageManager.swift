@@ -91,6 +91,12 @@ public actor StorageManager: StorageProtocol {
         return walManager
     }
 
+    /// Clear all WAL sessions (used when changing database location)
+    /// WARNING: This deletes unrecovered frame data!
+    public func clearWALSessions() async throws {
+        try await walManager.clearAllSessions()
+    }
+
     public func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
         let segmentIDValue = segmentID.value
 
@@ -105,23 +111,37 @@ public actor StorageManager: StorageProtocol {
             if frameIndex < cacheEntry.frames.count {
                 let frame = cacheEntry.frames[frameIndex]
                 let jpegData = try convertCGImageToJPEG(frame.image)
-                Log.debug("[StorageManager] ✅ Cache hit: segmentID=\(segmentIDValue), frameIndex=\(frameIndex), pts=\(frame.pts.seconds)s", category: .storage)
                 return jpegData
             }
         }
 
         // Not in cache - need to decode the video
-        let segmentURL = try await getSegmentPath(id: segmentID)
+        let segmentURL: URL
+        do {
+            segmentURL = try await getSegmentPath(id: segmentID)
+        } catch {
+            throw error
+        }
+
+        // Check if file exists
+        let fileExists = FileManager.default.fileExists(atPath: segmentURL.path)
+        if !fileExists {
+            throw StorageError.fileNotFound(path: segmentURL.path)
+        }
 
         // Check if file is empty or too small to be a valid video
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
         if fileSize == 0 {
-            Log.warning("[StorageManager] Video file is empty (0 bytes), still being written: \(segmentURL.path)", category: .storage)
             throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Video file is empty (still being written)")
         }
 
         // Decode all frames from the video using AVAssetReader
-        let frames = try await decodeAllFrames(from: segmentURL, segmentID: segmentIDValue)
+        let frames: [DecodedFrame]
+        do {
+            frames = try await decodeAllFrames(from: segmentURL, segmentID: segmentIDValue)
+        } catch {
+            throw error
+        }
 
         // Store in cache
         let cacheEntry = FrameCacheEntry(
@@ -155,32 +175,104 @@ public actor StorageManager: StorageProtocol {
         return jpegData
     }
 
+    /// Read a frame from a video at a specific path (used for Rewind frames with string-based IDs)
+    public func readFrameFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
+
+        // Use path hash as cache key since Rewind paths are strings not Int64
+        let cacheKey = Int64(videoPath.hashValue)
+
+        // Check if we have this segment cached
+        if let cacheEntry = frameCache[cacheKey] {
+            // Update access time
+            var updatedEntry = cacheEntry
+            updatedEntry.lastAccessTime = Date()
+            frameCache[cacheKey] = updatedEntry
+
+            // Check if requested frame is in cache
+            if frameIndex < cacheEntry.frames.count {
+                let frame = cacheEntry.frames[frameIndex]
+                let jpegData = try convertCGImageToJPEG(frame.image)
+                return jpegData
+            }
+        }
+
+        // Check if file exists
+        let fileExists = FileManager.default.fileExists(atPath: videoPath)
+        if !fileExists {
+            throw StorageError.fileNotFound(path: videoPath)
+        }
+
+        // Check if file is empty
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoPath)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            throw StorageError.fileReadFailed(path: videoPath, underlying: "Video file is empty")
+        }
+
+        // Decode all frames from the video
+        let segmentURL = URL(fileURLWithPath: videoPath)
+        let frames: [DecodedFrame]
+        do {
+            frames = try await decodeAllFrames(from: segmentURL, segmentID: cacheKey)
+        } catch {
+            throw error
+        }
+
+        // Store in cache
+        let cacheEntry = FrameCacheEntry(
+            segmentID: cacheKey,
+            frames: frames,
+            lastAccessTime: Date(),
+            totalFrameCount: frames.count
+        )
+        frameCache[cacheKey] = cacheEntry
+
+        // Evict old cache entries if needed
+        evictOldCacheEntries()
+
+        // Return requested frame
+        guard frameIndex < frames.count else {
+            frameCache.removeValue(forKey: cacheKey)
+            Log.warning("[StorageManager] Frame index \(frameIndex) out of range (0..<\(frames.count)) for path \(videoPath)", category: .storage)
+            throw StorageError.fileReadFailed(
+                path: videoPath,
+                underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
+            )
+        }
+
+        let frame = frames[frameIndex]
+        let jpegData = try convertCGImageToJPEG(frame.image)
+
+        return jpegData
+    }
+
     /// Decode all frames from a video file using AVAssetReader, sorted by PTS (presentation order)
     private func decodeAllFrames(from url: URL, segmentID: Int64) async throws -> [DecodedFrame] {
+
         // Handle extensionless files by creating symlink
+        // Use UUID to avoid conflicts when multiple workers process same video
+        // Note: We don't delete symlinks immediately as AVAsset may still need them
         let assetURL: URL
         if url.pathExtension.lowercased() == "mp4" {
             assetURL = url
         } else {
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = url.lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
 
-            if !FileManager.default.fileExists(atPath: symlinkPath.path) {
+            do {
                 try FileManager.default.createSymbolicLink(
                     atPath: symlinkPath.path,
                     withDestinationPath: url.path
                 )
+            } catch {
+                throw error
             }
             assetURL = symlinkPath
         }
 
         let asset = AVAsset(url: assetURL)
 
-        // Log asset duration for debugging fragmented MP4 issues
-        let duration = try await asset.load(.duration)
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
-        Log.debug("[StorageManager] Loading asset: segmentID=\(segmentID), duration=\(String(format: "%.3f", duration.seconds))s, fileSize=\(fileSize) bytes", category: .storage)
+        // Load asset duration (validates asset is readable)
+        _ = try await asset.load(.duration)
 
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw StorageError.fileReadFailed(path: url.path, underlying: "No video track")
@@ -339,20 +431,18 @@ public actor StorageManager: StorageProtocol {
         }
 
         // Handle extensionless files by creating symlink
+        // Use UUID to avoid conflicts when multiple workers process same video
         let assetURL: URL
         if segmentURL.pathExtension.lowercased() == "mp4" {
             assetURL = segmentURL
         } else {
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = segmentURL.lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
 
-            if !FileManager.default.fileExists(atPath: symlinkPath.path) {
-                try FileManager.default.createSymbolicLink(
-                    atPath: symlinkPath.path,
-                    withDestinationPath: segmentURL.path
-                )
-            }
+            try FileManager.default.createSymbolicLink(
+                atPath: symlinkPath.path,
+                withDestinationPath: segmentURL.path
+            )
             assetURL = symlinkPath
         }
 
@@ -406,20 +496,18 @@ public actor StorageManager: StorageProtocol {
         }
 
         // Handle extensionless files by creating symlink
+        // Use UUID to avoid conflicts when multiple workers process same video
         let assetURL: URL
         if segmentURL.pathExtension.lowercased() == "mp4" {
             assetURL = segmentURL
         } else {
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = segmentURL.lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4")
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
 
-            if !FileManager.default.fileExists(atPath: symlinkPath.path) {
-                try FileManager.default.createSymbolicLink(
-                    atPath: symlinkPath.path,
-                    withDestinationPath: segmentURL.path
-                )
-            }
+            try FileManager.default.createSymbolicLink(
+                atPath: symlinkPath.path,
+                withDestinationPath: segmentURL.path
+            )
             assetURL = symlinkPath
         }
 
@@ -481,7 +569,7 @@ public actor StorageManager: StorageProtocol {
         }
     }
 
-    public func getTotalStorageUsed() async throws -> Int64 {
+    public func getTotalStorageUsed(includeRewind: Bool = false) async throws -> Int64 {
         var totalSize: Int64 = 0
 
         // Retrace storage: chunks/ folder + retrace.db
@@ -489,28 +577,24 @@ public actor StorageManager: StorageProtocol {
         let retraceDbURL = storageRootURL.appendingPathComponent("retrace.db")
         let retraceChunksSize = calculateFolderSize(at: retraceChunksURL)
         totalSize += retraceChunksSize
-        print("[Storage] Retrace chunks: \(Double(retraceChunksSize) / 1_000_000_000) GB")
 
         if let dbSize = try? retraceDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
             totalSize += Int64(dbSize)
-            print("[Storage] Retrace db: \(Double(dbSize) / 1_000_000_000) GB")
         }
 
-        // Rewind storage: chunks/ folder + db-enc.sqlite3
-        let rewindURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/com.memoryvault.MemoryVault")
-        let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
-        let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
-        let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
-        totalSize += rewindChunksSize
-        print("[Storage] Rewind chunks: \(Double(rewindChunksSize) / 1_000_000_000) GB")
+        // Rewind storage: only include if enabled
+        if includeRewind {
+            let rewindURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
+            let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
+            let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
+            let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
+            totalSize += rewindChunksSize
 
-        if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
-            totalSize += Int64(dbSize)
-            print("[Storage] Rewind db: \(Double(dbSize) / 1_000_000_000) GB")
+            if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
+                totalSize += Int64(dbSize)
+            }
         }
 
-        print("[Storage] TOTAL: \(Double(totalSize) / 1_000_000_000) GB")
         return totalSize
     }
 
@@ -580,9 +664,11 @@ public actor StorageManager: StorageProtocol {
         try DiskSpaceMonitor.availableBytes(at: storageRootURL)
     }
 
+    /// Returns video segment IDs that are older than the given date WITHOUT deleting them.
+    /// Use deleteSegment() to actually delete after filtering for exclusions.
     public func cleanupOldSegments(olderThan date: Date) async throws -> [VideoSegmentID] {
         let files = try await directoryManager.listAllSegmentFiles()
-        var deleted: [VideoSegmentID] = []
+        var candidates: [VideoSegmentID] = []
 
         for url in files {
             let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
@@ -590,12 +676,12 @@ public actor StorageManager: StorageProtocol {
             guard modDate < date else { continue }
 
             if let id = parseSegmentID(from: url) {
-                deleted.append(id)
+                candidates.append(id)
             }
-            try? FileManager.default.removeItem(at: url)
+            // NOTE: Do NOT delete here - let caller filter for exclusions first, then call deleteSegment()
         }
 
-        return deleted
+        return candidates
     }
 
     public func getStorageDirectory() -> URL {

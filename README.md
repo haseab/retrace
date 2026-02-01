@@ -131,7 +131,7 @@ swift build -c release
 4. Optionally import existing Rewind AI data
 5. Configure settings (capture interval, excluded apps, shortcuts)
 
-The app will create its database at `~/Library/Application Support/Retrace/`
+The app will create its database at the default location (`~/Library/Application Support/Retrace/`) or a custom location if configured in Settings.
 
 ### 3. Development Scripts
 

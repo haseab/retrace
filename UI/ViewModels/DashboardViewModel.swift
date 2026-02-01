@@ -65,11 +65,24 @@ public class DashboardViewModel: ObservableObject {
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         setupAutoRefresh()
+        setupDataSourceObserver()
         // Check permissions immediately on init
         checkPermissions()
     }
 
     // MARK: - Setup
+
+    private func setupDataSourceObserver() {
+        NotificationCenter.default.addObserver(
+            forName: .dataSourceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.loadStatistics()
+            }
+        }
+    }
 
     private func setupAutoRefresh() {
         // Refresh recording status and permissions every 2 seconds
@@ -132,14 +145,16 @@ public class DashboardViewModel: ObservableObject {
     }
 
     public func toggleRecording(to newValue: Bool) async {
+        // Update UI immediately for instant feedback
+        isRecording = newValue
+        MenuBarManager.shared?.updateRecordingStatus(newValue)
+
         do {
             if newValue {
                 try await coordinator.startPipeline()
             } else {
                 try await coordinator.stopPipeline()
             }
-            // Update recording status immediately
-            await updateRecordingStatus()
         } catch {
             Log.error("[DashboardViewModel] Failed to toggle recording: \(error)", category: .ui)
             // Revert to actual state on error
@@ -221,7 +236,7 @@ public class DashboardViewModel: ObservableObject {
 
             // Fire all queries in parallel
             let todayStart = calendar.startOfDay(for: now)
-            var t0 = CFAbsoluteTimeGetCurrent()
+            let t0 = CFAbsoluteTimeGetCurrent()
 
             async let weeklyStorageTask = coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
             async let appStatsTask = coordinator.getAppUsageStats(from: weekStart, to: weekEnd)

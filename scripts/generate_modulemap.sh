@@ -4,9 +4,12 @@ set -euo pipefail
 # Generate module.modulemap for whisper.cpp with correct paths
 # Usage: ./scripts/generate_modulemap.sh
 
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
 # Determine whisper.cpp installation path
-# Priority: WHISPER_CPP_PATH env var > default location
-WHISPER_PATH="${WHISPER_CPP_PATH:-$HOME/Library/Application Support/Retrace/whisper.cpp}"
+# Priority: WHISPER_CPP_PATH env var > app settings > default location
+WHISPER_PATH="${WHISPER_CPP_PATH:-$RETRACE_STORAGE_ROOT/whisper.cpp}"
 
 # Verify whisper.cpp is installed
 WHISPER_HEADER="$WHISPER_PATH/include/whisper.h"

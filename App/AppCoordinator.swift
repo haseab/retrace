@@ -232,7 +232,7 @@ public actor AppCoordinator {
 
     private static let recordingStateKey = "shouldAutoStartRecording"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
-    private static let userDefaultsSuite = UserDefaults(suiteName: "Retrace") ?? .standard
+    private static let userDefaultsSuite = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
     /// Save recording state to UserDefaults for persistence across app restarts
     private nonisolated func saveRecordingState(_ isRecording: Bool) {
@@ -892,6 +892,11 @@ public actor AppCoordinator {
         return try await services.storage.readFrame(segmentID: videoSegmentID, frameIndex: frameIndex)
     }
 
+    /// Get frame image from a full video path (used for Rewind frames with string-based IDs)
+    public func getFrameImageFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
+        return try await services.storage.readFrameFromPath(videoPath: videoPath, frameIndex: frameIndex)
+    }
+
     /// Get frames in a time range
     /// Seamlessly blends data from all sources via DataAdapter
     public func getFrames(from startDate: Date, to endDate: Date, limit: Int = 500, filters: FilterCriteria? = nil) async throws -> [FrameReference] {
@@ -1387,6 +1392,7 @@ public actor AppCoordinator {
 
     /// Get all distinct dates that have frames (for calendar display)
     /// Uses filesystem (chunks folder structure) instead of slow database queries
+    /// Checks both Retrace chunks and Rewind chunks (if Rewind is connected)
     public func getDistinctDates() async throws -> [Date] {
         var allDates = Set<Date>()
 
@@ -1396,6 +1402,7 @@ public actor AppCoordinator {
         allDates.formUnion(retraceDates)
 
         // Get dates from Rewind chunks folder if connected
+        // Uses rewindStorageRootPath which returns nil if Rewind not connected
         if let adapter = await services.dataAdapter,
            let rewindPath = await adapter.rewindStorageRootPath {
             let rewindChunks = URL(fileURLWithPath: rewindPath).appendingPathComponent("chunks")
@@ -1451,9 +1458,11 @@ public actor AppCoordinator {
 
     // MARK: - Storage Statistics
 
-    /// Get total storage used in bytes (Retrace + Rewind)
+    /// Get total storage used in bytes (Retrace + Rewind if enabled)
     public func getTotalStorageUsed() async throws -> Int64 {
-        return try await services.storage.getTotalStorageUsed()
+        // Check if Rewind is enabled via DataAdapter
+        let includeRewind = await services.dataAdapter?.rewindStorageRootPath != nil
+        return try await services.storage.getTotalStorageUsed(includeRewind: includeRewind)
     }
 
     /// Get storage used for a specific date range

@@ -1152,7 +1152,7 @@ public struct OnboardingView: View {
                                     .foregroundColor(.retraceSecondary)
                             }
 
-                            Text("~/Library/Application Support/com.memoryvault.MemoryVault")
+                            Text(AppPaths.rewindStorageRoot)
                                 .font(.retraceMonoSmall)
                                 .foregroundColor(.retracePrimary)
                                 .multilineTextAlignment(.center)
@@ -1926,7 +1926,7 @@ public struct OnboardingView: View {
 
     private func detectRewindData() async {
         // Check for Rewind memoryVault folder
-        let memoryVaultPath = NSHomeDirectory() + "/Library/Application Support/com.memoryvault.MemoryVault"
+        let memoryVaultPath = AppPaths.expandedRewindStorageRoot
         let fileManager = FileManager.default
 
         if fileManager.fileExists(atPath: memoryVaultPath) {

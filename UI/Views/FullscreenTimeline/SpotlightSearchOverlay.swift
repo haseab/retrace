@@ -207,7 +207,7 @@ public struct SpotlightSearchOverlay: View {
                 }) {
                     ZStack {
                         Circle()
-                            .fill(viewModel.searchQuery.isEmpty ? Color.white.opacity(0.2) : Color.retraceAccent)
+                            .fill(viewModel.searchQuery.isEmpty ? Color.white.opacity(0.2) : Color.retraceSubmitAccent)
                         Image(systemName: "arrow.right")
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(.white)

@@ -29,7 +29,7 @@ The llama.cpp library is bundled, but **AI models are downloaded at runtime** on
 
 - **Nomic Embed v1.5** (~80 MB): For semantic search embeddings
 
-Models are downloaded to: `~/Library/Application Support/Retrace/models/`
+Models are downloaded to: `{AppPaths.storageRoot}/models/` (default: `~/Library/Application Support/Retrace/models/`, configurable in Settings)
 
 This approach:
 - Keeps repository size small (~3.8 MB for library vs ~80 MB for model)

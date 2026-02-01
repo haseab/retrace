@@ -3,6 +3,7 @@ import Shared
 import AppKit
 import App
 import ScreenCaptureKit
+import SQLCipher
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore = UserDefaults(suiteName: "io.retrace.app")
@@ -21,11 +22,16 @@ public struct SettingsView: View {
     @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = "blue"
     @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = true
 
+    // Font style - tracked as @State to trigger view refresh on change
+    @State private var fontStyle: RetraceFontStyle = RetraceFont.currentStyle
+
     // Keyboard shortcuts
     @State private var timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
     @State private var dashboardShortcut = SettingsShortcutKey(from: .defaultDashboard)
+    @State private var recordingShortcut = SettingsShortcutKey(from: .defaultRecording)
     @State private var isRecordingTimelineShortcut = false
     @State private var isRecordingDashboardShortcut = false
+    @State private var isRecordingRecordingShortcut = false
     @State private var shortcutError: String? = nil
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
@@ -38,22 +44,35 @@ public struct SettingsView: View {
     // Storage settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = 0 // 0 = forever
     @State private var retentionSettingChanged = false
+    @State private var retentionChangeProgress: CGFloat = 0  // Progress for auto-dismiss animation (0 to 1)
+    @State private var retentionChangeTimer: Timer?
     @State private var showRetentionConfirmation = false
     @State private var pendingRetentionDays: Int?
+    @State private var previewRetentionDays: Int?  // Visual preview while selecting
     @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = 50.0
     @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = true
+    @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = 0.9985 // Must match CaptureConfig.defaultDeduplicationThreshold
     @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = false
+
+    // Retention exclusion settings - data from these won't be deleted during cleanup
+    @AppStorage("retentionExcludedApps", store: settingsStore) private var retentionExcludedAppsString = ""
+    @AppStorage("retentionExcludedTagIds", store: settingsStore) private var retentionExcludedTagIdsString = ""
+    @AppStorage("retentionExcludeHidden", store: settingsStore) private var retentionExcludeHidden: Bool = false
+    @State private var retentionExcludedAppsPopoverShown = false
+    @State private var retentionExcludedTagsPopoverShown = false
+    @State private var installedAppsForRetention: [(bundleID: String, name: String)] = []
+    @State private var otherAppsForRetention: [(bundleID: String, name: String)] = []
+    @State private var availableTagsForRetention: [Tag] = []
 
     // Database location settings
     @AppStorage("customRetraceDBLocation", store: settingsStore) private var customRetraceDBLocation: String?
     @AppStorage("customRewindDBLocation", store: settingsStore) private var customRewindDBLocation: String?
-    @State private var retraceDBLocationChanged = false
     @State private var rewindDBLocationChanged = false
-    @State private var showRetraceDBWarning = false
-    @State private var pendingRetraceDBPath: String?
-    @State private var showRewindDBWarning = false
-    @State private var pendingRewindDBPath: String?
+
+    // Track the Retrace DB path the app was launched with (to know if restart is needed)
+    @State private var launchedWithRetraceDBPath: String?
+    @State private var launchedPathInitialized = false
 
     // Privacy settings
     @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = ""
@@ -83,14 +102,47 @@ public struct SettingsView: View {
     @AppStorage("excludeChromeIncognito", store: settingsStore) private var excludeChromeIncognito = true
     @AppStorage("encryptionEnabled", store: settingsStore) private var encryptionEnabled = true
 
+    // Computed property to manage retention-excluded apps as a Set
+    private var retentionExcludedApps: Set<String> {
+        get {
+            guard !retentionExcludedAppsString.isEmpty else { return [] }
+            return Set(retentionExcludedAppsString.split(separator: ",").map { String($0) })
+        }
+        set {
+            retentionExcludedAppsString = newValue.sorted().joined(separator: ",")
+        }
+    }
+
+    // Computed property to manage retention-excluded tag IDs as a Set
+    private var retentionExcludedTagIds: Set<Int64> {
+        get {
+            guard !retentionExcludedTagIdsString.isEmpty else { return [] }
+            return Set(retentionExcludedTagIdsString.split(separator: ",").compactMap { Int64($0) })
+        }
+        set {
+            retentionExcludedTagIdsString = newValue.sorted().map { String($0) }.joined(separator: ",")
+        }
+    }
+
     // Developer settings
     @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = false
     @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = false
 
     // Check if Rewind data folder exists
     private var rewindDataExists: Bool {
-        let memoryVaultPath = NSHomeDirectory() + "/Library/Application Support/com.memoryvault.MemoryVault"
-        return FileManager.default.fileExists(atPath: memoryVaultPath)
+        return FileManager.default.fileExists(atPath: AppPaths.expandedRewindStorageRoot)
+    }
+
+    // Check if Retrace database location is accessible
+    private var retraceDBAccessible: Bool {
+        let path = customRetraceDBLocation ?? AppPaths.defaultStorageRoot
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    // Check if Rewind database is accessible
+    private var rewindDBAccessible: Bool {
+        let path = customRewindDBLocation ?? AppPaths.defaultRewindDBPath
+        return FileManager.default.fileExists(atPath: path)
     }
 
     // Permission states
@@ -109,6 +161,15 @@ public struct SettingsView: View {
 
     // Cache clear feedback
     @State private var cacheClearMessage: String? = nil
+
+    // Compression settings feedback
+    @State private var compressionUpdateMessage: String? = nil
+
+    // Capture interval settings feedback
+    @State private var captureUpdateMessage: String? = nil
+
+    // Excluded apps feedback
+    @State private var excludedAppsUpdateMessage: String? = nil
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
@@ -150,6 +211,64 @@ public struct SettingsView: View {
                     .blur(radius: 80)
             }
         )
+        .onAppear {
+            // Capture the Retrace DB path the app was launched with (only once)
+            if !launchedPathInitialized {
+                launchedWithRetraceDBPath = customRetraceDBLocation
+                launchedPathInitialized = true
+            }
+        }
+    }
+
+    /// Returns true if the current Retrace DB setting differs from what the app launched with
+    private var retraceDBLocationChanged: Bool {
+        guard launchedPathInitialized else { return false }
+        return customRetraceDBLocation != launchedWithRetraceDBPath
+    }
+
+    /// Confirmation message for retention policy change
+    private var retentionConfirmationMessage: String {
+        guard let pendingDays = pendingRetentionDays else {
+            return ""
+        }
+        if pendingDays == 0 {
+            return "Are you sure you want to change the retention policy to Forever? All data will be kept indefinitely."
+        } else {
+            let cutoffDate = Date().addingTimeInterval(-TimeInterval(pendingDays) * 86400)
+            let formatter = DateFormatter()
+            formatter.dateFormat = "MMM d, yyyy 'at' h:mm a"
+
+            // Build exclusions summary
+            var exclusions: [String] = []
+            if !retentionExcludedApps.isEmpty {
+                let appNames = retentionExcludedApps.compactMap { bundleID in
+                    installedAppsForRetention.first(where: { $0.bundleID == bundleID })?.name
+                        ?? otherAppsForRetention.first(where: { $0.bundleID == bundleID })?.name
+                        ?? bundleID
+                }
+                exclusions.append("Apps: \(appNames.joined(separator: ", "))")
+            }
+            if !retentionExcludedTagIds.isEmpty {
+                let tagNames = retentionExcludedTagIds.compactMap { tagId in
+                    availableTagsForRetention.first(where: { $0.id.value == tagId })?.name
+                }
+                if !tagNames.isEmpty {
+                    exclusions.append("Tags: \(tagNames.joined(separator: ", "))")
+                }
+            }
+            if retentionExcludeHidden {
+                exclusions.append("Hidden items")
+            }
+
+            var message = "All data before \(formatter.string(from: cutoffDate))"
+            if exclusions.isEmpty {
+                message += " will be deleted."
+            } else {
+                message += " that is not in your exclusions will be deleted.\n\nExclusions:\n• \(exclusions.joined(separator: "\n• "))"
+            }
+
+            return message
+        }
     }
 
     /// Theme-aware base background color
@@ -211,9 +330,15 @@ public struct SettingsView: View {
                 Text("Retrace")
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
+                #if DEBUG
+                Text("Dev Version")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary.opacity(0.6))
+                #else
                 Text("v\(UpdaterManager.shared.currentVersion)")
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary.opacity(0.6))
+                #endif
             }
             .frame(maxWidth: .infinity)
             .padding(.bottom, 20)
@@ -255,6 +380,7 @@ public struct SettingsView: View {
             )
         }
         .buttonStyle(.plain)
+        .scaleEffect(isHovered ? 1.02 : 1.0)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 hoveredTab = hovering ? tab : nil
@@ -316,6 +442,19 @@ public struct SettingsView: View {
                         .font(.retraceCaptionMedium)
                         .foregroundColor(.retraceSecondary)
                 }
+
+                Spacer()
+
+                // Reset section button (only for sections with resettable settings)
+                if let resetAction = selectedTab.resetAction(for: self) {
+                    Button(action: resetAction) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 14))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset all \(selectedTab.rawValue.lowercased()) settings to defaults")
+                }
             }
         }
         .padding(.horizontal, 32)
@@ -333,7 +472,7 @@ public struct SettingsView: View {
                         label: "Open Timeline",
                         shortcut: $timelineShortcut,
                         isRecording: $isRecordingTimelineShortcut,
-                        otherShortcut: dashboardShortcut
+                        otherShortcuts: [dashboardShortcut, recordingShortcut]
                     )
 
                     Divider()
@@ -343,7 +482,17 @@ public struct SettingsView: View {
                         label: "Open Dashboard",
                         shortcut: $dashboardShortcut,
                         isRecording: $isRecordingDashboardShortcut,
-                        otherShortcut: timelineShortcut
+                        otherShortcuts: [timelineShortcut, recordingShortcut]
+                    )
+
+                    Divider()
+                        .background(Color.retraceBorder)
+
+                    settingsShortcutRecorderRow(
+                        label: "Toggle Recording",
+                        shortcut: $recordingShortcut,
+                        isRecording: $isRecordingRecordingShortcut,
+                        otherShortcuts: [timelineShortcut, dashboardShortcut]
                     )
 
                     if let error = shortcutError {
@@ -362,9 +511,10 @@ public struct SettingsView: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 // Cancel recording if user clicks outside
-                if isRecordingTimelineShortcut || isRecordingDashboardShortcut {
+                if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut {
                     isRecordingTimelineShortcut = false
                     isRecordingDashboardShortcut = false
+                    isRecordingRecordingShortcut = false
                     recordingTimeoutTask?.cancel()
                 }
             }
@@ -442,15 +592,15 @@ public struct SettingsView: View {
                                 .font(.retraceCalloutMedium)
                                 .foregroundColor(.retracePrimary)
 
-                            Text("Changes require restarting the app to fully apply")
+                            Text("Choose your preferred font style")
                                 .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary)
                         }
 
-                        FontStylePicker(selection: Binding(
-                            get: { RetraceFont.currentStyle },
-                            set: { RetraceFont.currentStyle = $0 }
-                        ))
+                        FontStylePicker(selection: $fontStyle)
+                            .onChange(of: fontStyle) { newStyle in
+                                RetraceFont.currentStyle = newStyle
+                            }
                     }
 
                     Divider()
@@ -497,7 +647,7 @@ public struct SettingsView: View {
         label: String,
         shortcut: Binding<SettingsShortcutKey>,
         isRecording: Binding<Bool>,
-        otherShortcut: SettingsShortcutKey
+        otherShortcuts: [SettingsShortcutKey]
     ) -> some View {
         HStack {
             Text(label)
@@ -511,6 +661,7 @@ public struct SettingsView: View {
                 // Cancel any other recording first
                 isRecordingTimelineShortcut = false
                 isRecordingDashboardShortcut = false
+                isRecordingRecordingShortcut = false
                 shortcutError = nil
                 recordingTimeoutTask?.cancel()
 
@@ -574,7 +725,7 @@ public struct SettingsView: View {
                 SettingsShortcutCaptureField(
                     isRecording: isRecording,
                     capturedShortcut: shortcut,
-                    otherShortcut: otherShortcut,
+                    otherShortcuts: otherShortcuts,
                     onDuplicateAttempt: {
                         shortcutError = "This shortcut is already in use"
                     },
@@ -594,6 +745,7 @@ public struct SettingsView: View {
 
     private static let timelineShortcutKey = "timelineShortcutConfig"
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
+    private static let recordingShortcutKey = "recordingShortcutConfig"
 
     private func loadSavedShortcuts() async {
         // Load directly from UserDefaults (same as OnboardingManager)
@@ -605,6 +757,10 @@ public struct SettingsView: View {
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             dashboardShortcut = SettingsShortcutKey(from: config)
         }
+        if let data = settingsStore?.data(forKey: Self.recordingShortcutKey),
+           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
+            recordingShortcut = SettingsShortcutKey(from: config)
+        }
     }
 
     private func saveShortcuts() async {
@@ -614,6 +770,9 @@ public struct SettingsView: View {
         }
         if let data = try? JSONEncoder().encode(dashboardShortcut.toConfig) {
             settingsStore?.set(data, forKey: Self.dashboardShortcutKey)
+        }
+        if let data = try? JSONEncoder().encode(recordingShortcut.toConfig) {
+            settingsStore?.set(data, forKey: Self.recordingShortcutKey)
         }
         // Re-register hotkeys with MenuBarManager
         MenuBarManager.shared?.reloadShortcuts()
@@ -640,7 +799,165 @@ public struct SettingsView: View {
                     }
 
                     CaptureIntervalPicker(selectedInterval: $captureIntervalSeconds)
+                        .onChange(of: captureIntervalSeconds) { _ in
+                            showCaptureUpdateFeedback()
+                        }
+
+                    // Estimated storage description and reset button on same line
+                    HStack {
+                        Text(captureIntervalEstimateText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        // Reset to default button (default is 2s)
+                        if captureIntervalSeconds != 2.0 {
+                            Button(action: {
+                                captureIntervalSeconds = 2.0
+                                showCaptureUpdateFeedback()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Update feedback message
+                    if let message = captureUpdateMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text(message)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
+                .animation(.easeInOut(duration: 0.2), value: captureUpdateMessage)
+            }
+
+            ModernSettingsCard(title: "Compression", icon: "archivebox") {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("Video quality")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Spacer()
+                        Text(videoQualityDisplayText)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
+                    }
+
+                    ModernSlider(value: $videoQuality, range: 0...1, step: 0.05)
+                        .onChange(of: videoQuality) { _ in
+                            showCompressionUpdateFeedback()
+                        }
+
+                    // Estimated storage description and reset button on same line
+                    HStack {
+                        Text(videoQualityEstimateText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        // Reset to default button (default is 50%)
+                        if videoQuality != 0.5 {
+                            Button(action: {
+                                videoQuality = 0.5
+                                showCompressionUpdateFeedback()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    // Deduplication slider
+                    HStack {
+                        Text("Deduplication")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Spacer()
+                        Text(deduplicationThresholdDisplayText)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
+                    }
+
+                    ModernSlider(value: $deduplicationThreshold, range: 0.98...1.0, step: 0.0001)
+                        .onChange(of: deduplicationThreshold) { newValue in
+                            updateDeduplicationThreshold()
+                            // Sync the boolean flag for backwards compatibility
+                            deleteDuplicateFrames = newValue < 1.0
+                        }
+
+                    // Sensitivity description and reset button on same line
+                    HStack {
+                        Text(deduplicationSensitivityText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        // Reset to default button
+                        if deduplicationThreshold != CaptureConfig.defaultDeduplicationThreshold {
+                            Button(action: {
+                                deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
+                                deleteDuplicateFrames = true
+                                updateDeduplicationThreshold()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    // Update feedback message
+                    if let message = compressionUpdateMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text(message)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: compressionUpdateMessage)
             }
 
             // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
@@ -680,34 +997,32 @@ public struct SettingsView: View {
     private var storageSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
             // Rewind Data Source
-            if rewindDataExists {
-                ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
-                    ModernToggleRow(
-                        title: "Use Rewind data",
-                        subtitle: "Show your old Rewind recordings in the timeline",
-                        isOn: Binding(
-                            get: { useRewindData },
-                            set: { newValue in
-                                Log.debug("[SettingsView] Rewind data toggle changed to: \(newValue)", category: .ui)
-                                useRewindData = newValue
-                                Task {
-                                    Log.debug("[SettingsView] Calling setRewindSourceEnabled(\(newValue))", category: .ui)
-                                    await coordinatorWrapper.coordinator.setRewindSourceEnabled(newValue)
-                                    Log.debug("[SettingsView] setRewindSourceEnabled completed", category: .ui)
-                                    // Increment data source version to invalidate timeline cache
-                                    // This ensures any cached frames are discarded when timeline reopens
-                                    await MainActor.run {
-                                        // Clear persisted search cache so search results are cleared
-                                        SearchViewModel.clearPersistedSearchCache()
-                                        // Notify any live timeline instances to reload
-                                        NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
-                                        Log.debug("[SettingsView] dataSourceDidChange notification posted", category: .ui)
-                                    }
+            ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
+                ModernToggleRow(
+                    title: "Use Rewind data",
+                    subtitle: "Show your old Rewind recordings in the timeline",
+                    isOn: Binding(
+                        get: { useRewindData },
+                        set: { newValue in
+                            Log.debug("[SettingsView] Rewind data toggle changed to: \(newValue)", category: .ui)
+                            useRewindData = newValue
+                            Task {
+                                Log.debug("[SettingsView] Calling setRewindSourceEnabled(\(newValue))", category: .ui)
+                                await coordinatorWrapper.coordinator.setRewindSourceEnabled(newValue)
+                                Log.debug("[SettingsView] setRewindSourceEnabled completed", category: .ui)
+                                // Increment data source version to invalidate timeline cache
+                                // This ensures any cached frames are discarded when timeline reopens
+                                await MainActor.run {
+                                    // Clear persisted search cache so search results are cleared
+                                    SearchViewModel.clearPersistedSearchCache()
+                                    // Notify any live timeline instances to reload
+                                    NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
+                                    Log.debug("[SettingsView] dataSourceDidChange notification posted", category: .ui)
                                 }
                             }
-                        )
+                        }
                     )
-                }
+                )
             }
 
             ModernSettingsCard(title: "Database Locations", icon: "externaldrive") {
@@ -732,52 +1047,90 @@ public struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("Retrace Database")
-                                    .font(.retraceCalloutMedium)
-                                    .foregroundColor(.retracePrimary)
-                                Text(customRetraceDBLocation ?? AppPaths.defaultStorageRoot)
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
+                                HStack(spacing: 6) {
+                                    Text("Retrace Database Folder")
+                                        .font(.retraceCalloutMedium)
+                                        .foregroundColor(.retracePrimary)
+                                    PingDotView(
+                                        color: retraceDBAccessible ? .green : .orange,
+                                        size: 8,
+                                        isAnimating: retraceDBAccessible
+                                    )
+                                }
+                                HStack(spacing: 4) {
+                                    Text(customRetraceDBLocation ?? AppPaths.defaultStorageRoot)
+                                        .font(.retraceCaption2)
+                                        .foregroundColor(retraceDBAccessible ? .retraceSecondary : .orange)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    if !retraceDBAccessible {
+                                        Text("(not found)")
+                                            .font(.retraceCaption2)
+                                            .foregroundColor(.orange)
+                                    }
+                                }
                             }
                             Spacer()
-                            Button("Choose...") {
+                            Button("Choose Folder...") {
                                 selectRetraceDBLocation()
                             }
                             .buttonStyle(.bordered)
-                            .controlSize(.small)
+                            .controlSize(.regular)
                             .disabled(coordinatorWrapper.isRunning)
-                            .help(coordinatorWrapper.isRunning ? "Stop recording to change Retrace database location" : "")
+                            .help(coordinatorWrapper.isRunning ? "Stop recording to change Retrace database location" : "Select a folder to store the Retrace database")
+                        }
+                        Text("Select a folder where retrace.db will be stored")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                    }
+
+                    // Rewind Database Location (only shown when Use Rewind data is enabled)
+                    if useRewindData {
+                        Divider()
+                            .background(Color.white.opacity(0.1))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        Text("Rewind Database")
+                                            .font(.retraceCalloutMedium)
+                                            .foregroundColor(.retracePrimary)
+                                        PingDotView(
+                                            color: rewindDBAccessible ? .green : .orange,
+                                            size: 8,
+                                            isAnimating: rewindDBAccessible
+                                        )
+                                    }
+                                    HStack(spacing: 4) {
+                                        Text(customRewindDBLocation ?? AppPaths.defaultRewindDBPath)
+                                            .font(.retraceCaption2)
+                                            .foregroundColor(rewindDBAccessible ? .retraceSecondary : .orange)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        if !rewindDBAccessible {
+                                            Text("(not found)")
+                                                .font(.retraceCaption2)
+                                                .foregroundColor(.orange)
+                                        }
+                                    }
+                                }
+                                Spacer()
+                                Button("Choose File...") {
+                                    selectRewindDBLocation()
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                                .help("Select the db-enc.sqlite3 file from your Rewind installation")
+                            }
+                            Text("Select db-enc.sqlite3 file (chunks folder must be in same directory)")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
                         }
                     }
 
-                    Divider()
-                        .background(Color.white.opacity(0.1))
-
-                    // Rewind Database Location
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("Rewind Database")
-                                    .font(.retraceCalloutMedium)
-                                    .foregroundColor(.retracePrimary)
-                                Text(customRewindDBLocation ?? AppPaths.defaultRewindDBPath)
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            Spacer()
-                            Button("Choose...") {
-                                selectRewindDBLocation()
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                    }
-
-                    if customRetraceDBLocation != nil || customRewindDBLocation != nil {
+                    if customRetraceDBLocation != nil || (useRewindData && customRewindDBLocation != nil) {
                         Divider()
                             .background(Color.white.opacity(0.1))
 
@@ -802,30 +1155,17 @@ public struct SettingsView: View {
                                 .font(.retraceCaption)
                                 .foregroundColor(.retraceSecondary)
 
-                            HStack(spacing: 8) {
-                                Button(action: restartApp) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "arrow.clockwise")
-                                            .font(.system(size: 11))
-                                        Text("Restart Now")
-                                            .font(.retraceCalloutMedium)
-                                    }
+                            Button(action: restartApp) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "arrow.clockwise")
+                                        .font(.system(size: 11))
+                                    Text("Restart")
+                                        .font(.retraceCalloutMedium)
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.retraceAccent)
-                                .controlSize(.small)
-
-                                Button(action: restartAndResumeRecording) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "record.circle")
-                                            .font(.system(size: 11))
-                                        Text("Restart & Resume Recording")
-                                            .font(.retraceCalloutMedium)
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
                             }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.retraceAccent)
+                            .controlSize(.small)
                         }
                         .padding(12)
                         .background(Color.retraceAccent.opacity(0.1))
@@ -851,7 +1191,7 @@ public struct SettingsView: View {
                             }
                         }
                         Spacer()
-                        Text(retentionDisplayText)
+                        Text(retentionDisplayTextFor(previewRetentionDays ?? retentionDays))
                             .font(.retraceCalloutBold)
                             .foregroundColor(.white)
                             .padding(.horizontal, 12)
@@ -860,31 +1200,217 @@ public struct SettingsView: View {
                             .cornerRadius(8)
                     }
 
-                    RetentionPolicyPicker(currentDays: retentionDays) { newDays in
-                        if newDays != retentionDays {
-                            pendingRetentionDays = newDays
-                            showRetentionConfirmation = true
+                    RetentionPolicyPicker(
+                        displayDays: previewRetentionDays ?? retentionDays,
+                        onPreviewChange: { newDays in
+                            previewRetentionDays = newDays
+                        },
+                        onSelectionEnd: { newDays in
+                            if newDays != retentionDays {
+                                // Check if new policy is MORE restrictive (would delete data)
+                                // More restrictive = shorter retention period
+                                // Note: 0 means "Forever" (least restrictive)
+                                let isMoreRestrictive: Bool
+                                if retentionDays == 0 {
+                                    // Going from Forever to any limit is more restrictive
+                                    isMoreRestrictive = true
+                                } else if newDays == 0 {
+                                    // Going to Forever is less restrictive
+                                    isMoreRestrictive = false
+                                } else {
+                                    // Both are limited: smaller number = more restrictive
+                                    isMoreRestrictive = newDays < retentionDays
+                                }
+
+                                if isMoreRestrictive {
+                                    // Show confirmation before deleting data
+                                    pendingRetentionDays = newDays
+                                    showRetentionConfirmation = true
+                                } else {
+                                    // Less restrictive (keeping more data) - apply directly without confirmation
+                                    retentionDays = newDays
+                                    previewRetentionDays = nil
+                                }
+                            } else {
+                                // User dragged back to original value, just reset preview
+                                previewRetentionDays = nil
+                            }
+                        }
+                    )
+
+                    if retentionSettingChanged {
+                        VStack(spacing: 8) {
+                            HStack {
+                                Text("Changes will take effect within an hour or on next launch")
+                                    .font(.retraceCaption)
+                                    .foregroundColor(.retraceSecondary)
+                                Spacer()
+                                Button("Restart Now") {
+                                    dismissRetentionChangeNotification()
+                                    restartApp()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.retraceAccent)
+                                .controlSize(.small)
+                            }
+
+                            // Auto-dismiss progress bar (Cloudflare-style)
+                            GeometryReader { geometry in
+                                ZStack(alignment: .leading) {
+                                    // Background track
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.white.opacity(0.1))
+                                        .frame(height: 3)
+
+                                    // Progress fill
+                                    RoundedRectangle(cornerRadius: 2)
+                                        .fill(Color.retraceAccent.opacity(0.6))
+                                        .frame(width: geometry.size.width * retentionChangeProgress, height: 3)
+                                }
+                            }
+                            .frame(height: 3)
+                        }
+                        .onAppear {
+                            startRetentionChangeTimer()
+                        }
+                        .onDisappear {
+                            retentionChangeTimer?.invalidate()
+                            retentionChangeTimer = nil
+                        }
+                        .onChange(of: retentionDays) { _ in
+                            // Restart the timer if retention value changes while notification is showing
+                            startRetentionChangeTimer()
                         }
                     }
 
-                    if retentionSettingChanged {
-                        HStack {
-                            Text("Changes will take effect within an hour or on next launch")
-                                .font(.retraceCaption)
-                                .foregroundColor(.retraceSecondary)
-                            Spacer()
-                            Button("Restart Now") {
-                                restartApp()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.retraceAccent)
-                            .controlSize(.small)
-                        }
-                    }
+                    Divider()
+                        .padding(.vertical, 4)
+
+                    // TODO: Re-enable retention exclusions in a future version
+                    // Retention Exclusions - data from these won't be auto-deleted
+                    // VStack(alignment: .leading, spacing: 12) {
+                    //     HStack(spacing: 8) {
+                    //         Text("Retention Exclusions")
+                    //             .font(.retraceCalloutMedium)
+                    //             .foregroundColor(.retracePrimary)
+                    //     }
+                    //
+                    //     Text(retentionDays == 0
+                    //         ? "When a retention period is set, data from these apps and tags will be kept forever."
+                    //         : "Data from these apps and tags will be kept forever, even when older data is deleted.")
+                    //         .font(.retraceCaption)
+                    //         .foregroundColor(.retraceSecondary)
+                    //
+                    //     // Apps and Tags in horizontal layout
+                    //     HStack(spacing: 12) {
+                    //         // Apps exclusion
+                    //         VStack(alignment: .leading, spacing: 6) {
+                    //             Text("Excluded Apps")
+                    //                 .font(.retraceCaption)
+                    //                 .foregroundColor(.retraceSecondary)
+                    //
+                    //             RetentionAppsChip(
+                    //                 selectedApps: retentionExcludedApps,
+                    //                 isPopoverShown: $retentionExcludedAppsPopoverShown
+                    //             ) {
+                    //                 AppsFilterPopover(
+                    //                     apps: installedAppsForRetention,
+                    //                     otherApps: otherAppsForRetention,
+                    //                     selectedApps: retentionExcludedApps.isEmpty ? nil : retentionExcludedApps,
+                    //                     filterMode: .include,
+                    //                     allowMultiSelect: true,
+                    //                     showAllOption: false,
+                    //                     onSelectApp: { bundleID in
+                    //                         toggleRetentionExcludedApp(bundleID)
+                    //                     },
+                    //                     onFilterModeChange: nil,
+                    //                     onDismiss: { retentionExcludedAppsPopoverShown = false }
+                    //                 )
+                    //             }
+                    //         }
+                    //
+                    //         // Tags exclusion
+                    //         VStack(alignment: .leading, spacing: 6) {
+                    //             Text("Excluded Tags")
+                    //                 .font(.retraceCaption)
+                    //                 .foregroundColor(.retraceSecondary)
+                    //
+                    //             RetentionTagsChip(
+                    //                 selectedTagIds: retentionExcludedTagIds,
+                    //                 availableTags: availableTagsForRetention,
+                    //                 isPopoverShown: $retentionExcludedTagsPopoverShown
+                    //             ) {
+                    //                 TagsFilterPopover(
+                    //                     tags: availableTagsForRetention,
+                    //                     selectedTags: retentionExcludedTagIds.isEmpty ? nil : retentionExcludedTagIds,
+                    //                     filterMode: .include,
+                    //                     allowMultiSelect: true,
+                    //                     showAllOption: false,
+                    //                     onSelectTag: { tagID in
+                    //                         toggleRetentionExcludedTag(tagID)
+                    //                     },
+                    //                     onFilterModeChange: nil,
+                    //                     onDismiss: { retentionExcludedTagsPopoverShown = false }
+                    //                 )
+                    //             }
+                    //         }
+                    //
+                    //         // Hidden items chip
+                    //         VStack(alignment: .leading, spacing: 6) {
+                    //             Text("Hidden")
+                    //                 .font(.retraceCaption)
+                    //                 .foregroundColor(.retraceSecondary)
+                    //
+                    //             Button(action: {
+                    //                 retentionExcludeHidden.toggle()
+                    //             }) {
+                    //                 HStack(spacing: 8) {
+                    //                     Image(systemName: "eye.slash.fill")
+                    //                         .font(.system(size: 12))
+                    //                     Text(retentionExcludeHidden ? "Excluded" : "Not excluded")
+                    //                         .font(.retraceCaptionMedium)
+                    //                     Image(systemName: retentionExcludeHidden ? "checkmark" : "plus")
+                    //                         .font(.system(size: 10, weight: .bold))
+                    //                 }
+                    //                 .padding(.horizontal, 12)
+                    //                 .padding(.vertical, 8)
+                    //                 .background(
+                    //                     RoundedRectangle(cornerRadius: 8)
+                    //                         .fill(retentionExcludeHidden ? Color.retraceAccent.opacity(0.3) : Color.white.opacity(0.08))
+                    //                 )
+                    //                 .overlay(
+                    //                     RoundedRectangle(cornerRadius: 8)
+                    //                         .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                    //                 )
+                    //             }
+                    //             .buttonStyle(.plain)
+                    //         }
+                    //
+                    //         Spacer()
+                    //
+                    //         if !retentionExcludedApps.isEmpty || !retentionExcludedTagIds.isEmpty || retentionExcludeHidden {
+                    //             Button(action: {
+                    //                 clearRetentionExclusions()
+                    //                 retentionExcludeHidden = false
+                    //             }) {
+                    //                 Image(systemName: "xmark.circle")
+                    //                     .font(.system(size: 14, weight: .medium))
+                    //                     .foregroundColor(.retraceSecondary)
+                    //             }
+                    //             .buttonStyle(.plain)
+                    //             .help("Clear all exclusions")
+                    //         }
+                    //     }
+                    // }
                 }
             }
+            // .onAppear {
+            //     loadRetentionExclusionData()
+            // }
             .alert("Change Retention Policy?", isPresented: $showRetentionConfirmation) {
                 Button("Cancel", role: .cancel) {
+                    // Reset preview to original value
+                    previewRetentionDays = nil
                     pendingRetentionDays = nil
                 }
                 Button("Confirm", role: .destructive) {
@@ -892,12 +1418,11 @@ public struct SettingsView: View {
                         retentionDays = newDays
                         retentionSettingChanged = true
                     }
+                    previewRetentionDays = nil
                     pendingRetentionDays = nil
                 }
             } message: {
-                if let pendingDays = pendingRetentionDays {
-                    Text("Are you sure you want to change the retention policy to \(retentionDisplayTextFor(pendingDays))? Changes will take effect within an hour or on next launch.")
-                }
+                Text(retentionConfirmationMessage)
             }
 
             // TODO: Add Storage Limit settings later
@@ -920,56 +1445,6 @@ public struct SettingsView: View {
 //                    ModernSlider(value: $maxStorageGB, range: 10...500, step: 10)
 //                }
 //            }
-
-            ModernSettingsCard(title: "Compression", icon: "archivebox") {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack {
-                        Text("Video quality")
-                            .font(.retraceCalloutMedium)
-                            .foregroundColor(.retracePrimary)
-                        Spacer()
-                        Text(videoQualityDisplayText)
-                            .font(.retraceCalloutBold)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.retraceAccent.opacity(0.3))
-                            .cornerRadius(8)
-                    }
-
-                    VStack(spacing: 8) {
-                        ModernSlider(value: $videoQuality, range: 0...1, step: 0.05)
-
-                        HStack {
-                            Text("Smaller files")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                            Spacer()
-                            Text("Higher quality")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                    }
-                }
-            }
-
-            ModernSettingsCard(title: "Auto-Cleanup", icon: "trash") {
-                // TODO: Add "Delete frames with no text" setting later
-//                ModernToggleRow(
-//                    title: "Delete frames with no text",
-//                    subtitle: "Remove frames that contain no detectable text",
-//                    isOn: .constant(false)
-//                )
-
-                ModernToggleRow(
-                    title: "Delete duplicate frames",
-                    subtitle: "Automatically remove similar consecutive frames",
-                    isOn: $deleteDuplicateFrames
-                )
-                .onChange(of: deleteDuplicateFrames) { newValue in
-                    updateDeduplicationSetting(enabled: newValue)
-                }
-            }
         }
     }
 
@@ -977,7 +1452,17 @@ public struct SettingsView: View {
 
     private var exportDataSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // TODO: Add export and data management options
+            ModernSettingsCard(title: "Coming Soon", icon: "clock") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("These settings will be provided in the next update!")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.retracePrimary)
+
+                    Text("Major exporting and importing flexibility")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                }
+            }
         }
     }
 
@@ -1010,37 +1495,50 @@ public struct SettingsView: View {
             //     }
             // }
 
-            ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Apps that will not be recorded")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary)
-
-                    if excludedApps.isEmpty {
-                        Text("No apps excluded")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.6))
-                            .padding(.vertical, 4)
-                    } else {
-                        // Wrap excluded apps in a flow layout
-                        FlowLayout(spacing: 8) {
-                            ForEach(excludedApps) { app in
-                                ExcludedAppChip(app: app) {
-                                    removeExcludedApp(app)
-                                }
-                            }
-                        }
-                    }
-
-                    ModernButton(title: "Add App", icon: "plus", style: .secondary) {
-                        showAppPicker { appInfo in
-                            if let app = appInfo {
-                                addExcludedApp(app)
-                            }
-                        }
-                    }
-                }
-            }
+            // TODO: Re-enable excluded apps in a future version
+            // ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
+            //     VStack(alignment: .leading, spacing: 12) {
+            //         Text("Apps that will not be recorded")
+            //             .font(.retraceCaption)
+            //             .foregroundColor(.retraceSecondary)
+            //
+            //         if excludedApps.isEmpty {
+            //             Text("No apps excluded")
+            //                 .font(.retraceCaption2)
+            //                 .foregroundColor(.retraceSecondary.opacity(0.6))
+            //                 .padding(.vertical, 4)
+            //         } else {
+            //             // Wrap excluded apps in a flow layout
+            //             FlowLayout(spacing: 8) {
+            //                 ForEach(excludedApps) { app in
+            //                     ExcludedAppChip(app: app) {
+            //                         removeExcludedApp(app)
+            //                     }
+            //                 }
+            //             }
+            //         }
+            //
+            //         // Update feedback message
+            //         if let message = excludedAppsUpdateMessage {
+            //             HStack(spacing: 6) {
+            //                 Image(systemName: "checkmark.circle.fill")
+            //                     .foregroundColor(.green)
+            //                     .font(.system(size: 12))
+            //                 Text(message)
+            //                     .font(.retraceCaption2)
+            //                     .foregroundColor(.retraceSecondary)
+            //             }
+            //             .transition(.opacity.combined(with: .move(edge: .top)))
+            //         }
+            //
+            //         ModernButton(title: "Add App", icon: "plus", style: .secondary) {
+            //             showAppPickerMultiple { apps in
+            //                 addExcludedApps(apps)
+            //             }
+            //         }
+            //     }
+            //     .animation(.easeInOut(duration: 0.2), value: excludedAppsUpdateMessage)
+            // }
 
             // TODO: Re-enable once private window detection is more reliable
             // Currently disabled because title-based detection has false positives
@@ -1343,26 +1841,6 @@ public struct SettingsView: View {
             } message: {
                 Text("This will permanently delete all your recordings and data. This action cannot be undone.")
             }
-            .alert("Create New Retrace Database?", isPresented: $showRetraceDBWarning) {
-                Button("Cancel", role: .cancel) {
-                    pendingRetraceDBPath = nil
-                }
-                Button("Continue", role: .none) {
-                    confirmRetraceDBLocation()
-                }
-            } message: {
-                Text("No existing Retrace database found at this location. A new database will be created here when you restart the app. Your current recordings will remain in the old location.")
-            }
-            .alert("Missing Chunks Folder?", isPresented: $showRewindDBWarning) {
-                Button("Cancel", role: .cancel) {
-                    pendingRewindDBPath = nil
-                }
-                Button("Continue Anyway", role: .none) {
-                    confirmRewindDBLocation()
-                }
-            } message: {
-                Text("The selected Rewind database exists, but the 'chunks' folder (video storage) was not found in the same directory. Retrace may not be able to load video frames from this database.")
-            }
         }
     }
 }
@@ -1373,6 +1851,9 @@ private struct ModernSettingsCard<Content: View>: View {
     let title: String
     let icon: String
     var dangerous: Bool = false
+    var trailingAction: (() -> Void)? = nil
+    var trailingActionIcon: String? = nil
+    var trailingActionTooltip: String? = nil
     @ViewBuilder let content: () -> Content
 
     var body: some View {
@@ -1385,6 +1866,18 @@ private struct ModernSettingsCard<Content: View>: View {
                 Text(title)
                     .font(.retraceBodyBold)
                     .foregroundColor(dangerous ? .retraceDanger : .retracePrimary)
+
+                Spacer()
+
+                if let action = trailingAction, let actionIcon = trailingActionIcon {
+                    Button(action: action) {
+                        Image(systemName: actionIcon)
+                            .font(.system(size: 14))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help(trailingActionTooltip ?? "")
+                }
             }
 
             content()
@@ -1836,6 +2329,7 @@ private struct FontStylePicker: View {
                         RoundedRectangle(cornerRadius: 10)
                             .stroke(selection == style ? Color.retraceAccent.opacity(0.5) : Color.clear, lineWidth: 1.5)
                     )
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -1906,18 +2400,19 @@ private struct CaptureIntervalPicker: View {
     var body: some View {
         HStack(spacing: 6) {
             ForEach(intervals, id: \.self) { interval in
-                Button(action: { selectedInterval = interval }) {
-                    Text(intervalLabel(interval))
-                        .font(selectedInterval == interval ? .retraceCaption2Bold : .retraceCaption2Medium)
-                        .foregroundColor(selectedInterval == interval ? .retracePrimary : .retraceSecondary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(selectedInterval == interval ? Color.white.opacity(0.1) : Color.clear)
-                        )
-                }
-                .buttonStyle(.plain)
+                Text(intervalLabel(interval))
+                    .font(selectedInterval == interval ? .retraceCalloutBold : .retraceCalloutMedium)
+                    .foregroundColor(selectedInterval == interval ? .retracePrimary : .retraceSecondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(selectedInterval == interval ? Color.white.opacity(0.1) : Color.clear)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedInterval = interval
+                    }
             }
         }
         .padding(4)
@@ -1937,8 +2432,9 @@ private struct CaptureIntervalPicker: View {
 // MARK: - Retention Policy Picker (Sliding Scale)
 
 private struct RetentionPolicyPicker: View {
-    var currentDays: Int
-    var onSelectionChange: (Int) -> Void
+    var displayDays: Int  // What to visually show (may differ from persisted value during preview)
+    var onPreviewChange: (Int) -> Void  // Called during drag to update visual preview
+    var onSelectionEnd: (Int) -> Void   // Called when drag ends to trigger confirmation
 
     // Retention options: 3 days through 1 year, then Forever (0) at the end
     private let options: [(days: Int, label: String)] = [
@@ -1955,10 +2451,10 @@ private struct RetentionPolicyPicker: View {
 
     // Map days to slider index (default to last index = Forever)
     private var sliderIndex: Double {
-        Double(options.firstIndex(where: { $0.days == currentDays }) ?? (options.count - 1))
+        Double(options.firstIndex(where: { $0.days == displayDays }) ?? (options.count - 1))
     }
 
-    @GestureState private var isDragging = false
+    @State private var lastSelectedDays: Int?
 
     var body: some View {
         VStack(spacing: 12) {
@@ -2001,17 +2497,22 @@ private struct RetentionPolicyPicker: View {
                 .contentShape(Rectangle())
                 .gesture(
                     DragGesture(minimumDistance: 0)
-                        .updating($isDragging) { _, state, _ in
-                            state = true
-                        }
                         .onChanged { value in
                             let x = value.location.x
                             // Adjust for inset
                             let adjustedX = x - horizontalInset
                             let index = Int(round(adjustedX / segmentWidth))
                             let clampedIndex = max(0, min(options.count - 1, index))
-                            if options[clampedIndex].days != currentDays {
-                                onSelectionChange(options[clampedIndex].days)
+                            let newDays = options[clampedIndex].days
+                            if newDays != displayDays {
+                                lastSelectedDays = newDays
+                                onPreviewChange(newDays)
+                            }
+                        }
+                        .onEnded { _ in
+                            if let selectedDays = lastSelectedDays {
+                                onSelectionEnd(selectedDays)
+                                lastSelectedDays = nil
                             }
                         }
                 )
@@ -2031,6 +2532,187 @@ private struct RetentionPolicyPicker: View {
     }
 }
 
+// MARK: - Retention Exclusion Chips
+
+/// Chip for selecting apps to exclude from retention policy (mirrors AppsFilterChip design)
+private struct RetentionAppsChip<PopoverContent: View>: View {
+    let selectedApps: Set<String>
+    @Binding var isPopoverShown: Bool
+    @ViewBuilder var popoverContent: () -> PopoverContent
+
+    @State private var isHovered = false
+
+    private let maxVisibleIcons = 5
+    private let iconSize: CGFloat = 18
+
+    private var sortedApps: [String] {
+        selectedApps.sorted()
+    }
+
+    private var isActive: Bool {
+        !selectedApps.isEmpty
+    }
+
+    var body: some View {
+        Button(action: {
+            isPopoverShown.toggle()
+        }) {
+            HStack(spacing: 6) {
+                if sortedApps.count == 1 {
+                    // Single app: show icon + name
+                    let bundleID = sortedApps[0]
+                    appIcon(for: bundleID)
+                        .frame(width: iconSize, height: iconSize)
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+
+                    Text(appName(for: bundleID))
+                        .font(.retraceCaptionMedium)
+                        .lineLimit(1)
+                } else if sortedApps.count > 1 {
+                    // Multiple apps: show overlapping icons
+                    HStack(spacing: -4) {
+                        ForEach(Array(sortedApps.prefix(maxVisibleIcons)), id: \.self) { bundleID in
+                            appIcon(for: bundleID)
+                                .frame(width: iconSize, height: iconSize)
+                                .clipShape(RoundedRectangle(cornerRadius: 3))
+                        }
+                    }
+
+                    // Show "+X" if more than maxVisibleIcons
+                    if sortedApps.count > maxVisibleIcons {
+                        Text("+\(sortedApps.count - maxVisibleIcons)")
+                            .font(.retraceTinyBold)
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                } else {
+                    // Default state - no apps selected
+                    Image(systemName: "app.fill")
+                        .font(.system(size: 12))
+                    Text("None")
+                        .font(.retraceCaptionMedium)
+                }
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .rotationEffect(.degrees(isPopoverShown ? 180 : 0))
+            }
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: sortedApps)
+            .foregroundColor(isActive ? .white : .retraceSecondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.retraceAccent.opacity(0.2) : Color.white.opacity(0.05))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isActive ? Color.retraceAccent.opacity(0.4) : Color.white.opacity(0.1), lineWidth: 1)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .popover(isPresented: $isPopoverShown, arrowEdge: .bottom) {
+            popoverContent()
+        }
+    }
+
+    @ViewBuilder
+    private func appIcon(for bundleID: String) -> some View {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(systemName: "app.fill")
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .foregroundColor(.white.opacity(0.6))
+        }
+    }
+
+    private func appName(for bundleID: String) -> String {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: appURL.path)
+        }
+        return bundleID.components(separatedBy: ".").last ?? bundleID
+    }
+}
+
+/// Chip for selecting tags to exclude from retention policy
+private struct RetentionTagsChip<PopoverContent: View>: View {
+    let selectedTagIds: Set<Int64>
+    let availableTags: [Tag]
+    @Binding var isPopoverShown: Bool
+    @ViewBuilder var popoverContent: () -> PopoverContent
+
+    @State private var isHovered = false
+
+    private var selectedTags: [Tag] {
+        availableTags.filter { selectedTagIds.contains($0.id.value) }
+    }
+
+    private var isActive: Bool {
+        !selectedTagIds.isEmpty
+    }
+
+    var body: some View {
+        Button(action: {
+            isPopoverShown.toggle()
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: "tag.fill")
+                    .font(.system(size: 12))
+
+                if selectedTags.count == 1 {
+                    // Single tag: show tag name
+                    Text(selectedTags[0].name)
+                        .font(.retraceCaptionMedium)
+                        .lineLimit(1)
+                } else if selectedTags.count > 1 {
+                    // Multiple tags: show count
+                    Text("\(selectedTags.count) tags")
+                        .font(.retraceCaptionMedium)
+                } else {
+                    // Default state - no tags selected
+                    Text("None")
+                        .font(.retraceCaptionMedium)
+                }
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .rotationEffect(.degrees(isPopoverShown ? 180 : 0))
+            }
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: selectedTagIds)
+            .foregroundColor(isActive ? .white : .retraceSecondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.retraceAccent.opacity(0.2) : Color.white.opacity(0.05))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(isActive ? Color.retraceAccent.opacity(0.4) : Color.white.opacity(0.1), lineWidth: 1)
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
+        .popover(isPresented: $isPopoverShown, arrowEdge: .bottom) {
+            popoverContent()
+        }
+    }
+}
+
 extension SettingsView {
     var captureIntervalDisplayText: String {
         if captureIntervalSeconds >= 60 {
@@ -2044,6 +2726,103 @@ extension SettingsView {
     var videoQualityDisplayText: String {
         let percentage = Int(videoQuality * 100)
         return "\(percentage)%"
+    }
+
+    /// Calculate storage multiplier based on video quality setting
+    /// Reference: 50% quality = 1.0x multiplier
+    private func videoQualityMultiplier() -> Double {
+        // Interpolation based on quality percentage
+        // At 50% (0.5): baseline multiplier = 1.0
+        // Multipliers relative to 50%:
+        // 5% → 0.22x, 15% → 0.48x, 30% → 0.76x, 50% → 1.0x, 85% → 3.65x
+        if videoQuality <= 0.05 {
+            return 0.22
+        } else if videoQuality <= 0.15 {
+            // Interpolate between 0.05 (0.22) and 0.15 (0.48)
+            let t = (videoQuality - 0.05) / 0.10
+            return 0.22 + t * (0.48 - 0.22)
+        } else if videoQuality <= 0.30 {
+            // Interpolate between 0.15 (0.48) and 0.30 (0.76)
+            let t = (videoQuality - 0.15) / 0.15
+            return 0.48 + t * (0.76 - 0.48)
+        } else if videoQuality <= 0.50 {
+            // Interpolate between 0.30 (0.76) and 0.50 (1.0)
+            let t = (videoQuality - 0.30) / 0.20
+            return 0.76 + t * (1.0 - 0.76)
+        } else if videoQuality <= 0.85 {
+            // Interpolate between 0.50 (1.0) and 0.85 (3.65)
+            let t = (videoQuality - 0.50) / 0.35
+            return 1.0 + t * (3.65 - 1.0)
+        } else {
+            // Interpolate between 0.85 (3.65) and 1.0 (estimated ~5.0)
+            let t = (videoQuality - 0.85) / 0.15
+            return 3.65 + t * (5.0 - 3.65)
+        }
+    }
+
+    /// Calculate storage multiplier based on capture interval
+    /// Reference: 2 seconds = 1.0x multiplier (baseline)
+    /// Longer intervals = less storage (linear relationship)
+    private func captureIntervalMultiplier() -> Double {
+        // At 2s interval: 1.0x (baseline)
+        // At 5s interval: 0.4x (2/5)
+        // At 10s interval: 0.2x (2/10)
+        // etc.
+        return 2.0 / captureIntervalSeconds
+    }
+
+    /// Estimated storage per month based on video quality and capture interval settings
+    /// Reference: 50% quality at 2s interval ≈ 6-14 GB/month
+    var videoQualityEstimateText: String {
+        let qualityMultiplier = videoQualityMultiplier()
+        let intervalMultiplier = captureIntervalMultiplier()
+        let combinedMultiplier = qualityMultiplier * intervalMultiplier
+
+        let lowGB = 6.0 * combinedMultiplier
+        let highGB = 14.0 * combinedMultiplier
+
+        // Format with 1 decimal place
+        let lowStr = String(format: "%.1f", lowGB)
+        let highStr = String(format: "%.1f", highGB)
+
+        // Handle case where estimate is very small
+        if highGB < 0.1 {
+            return "Estimated: <0.1 GB per month"
+        } else if lowStr == highStr {
+            return "Estimated: ~\(lowStr) GB per month"
+        }
+
+        return "Estimated: ~\(lowStr)-\(highStr) GB per month"
+    }
+
+    /// Estimated storage for capture interval section (same calculation)
+    var captureIntervalEstimateText: String {
+        videoQualityEstimateText
+    }
+
+    var deduplicationThresholdDisplayText: String {
+        let percentage = deduplicationThreshold * 100
+        return String(format: "%.2f%%", percentage)
+    }
+
+    /// Sensitivity description based on deduplication threshold
+    var deduplicationSensitivityText: String {
+        let threshold = deduplicationThreshold
+        if threshold >= 1.0 {
+            return "Records every frame (no deduplication)"
+        } else if threshold >= 0.9998 {
+            return "New frame on: a single word changing"
+        } else if threshold >= 0.999 {
+            return "New frame on: a few words changing"
+        } else if threshold >= 0.9985 {
+            return "New frame on: several words changing"
+        } else if threshold >= 0.995 {
+            return "New frame on: line changes"
+        } else if threshold >= 0.99 {
+            return "New frame on: multiple line changes"
+        } else {
+            return "New frame on: paragraph changes"
+        }
     }
 
     var retentionDisplayText: String {
@@ -2063,6 +2842,115 @@ extension SettingsView {
         case 365: return "1 year"
         default: return "\(days) days"
         }
+    }
+
+    // MARK: - Retention Change Notification Timer
+
+    func startRetentionChangeTimer() {
+        // Reset progress
+        retentionChangeProgress = 0
+
+        // Cancel any existing timer
+        retentionChangeTimer?.invalidate()
+
+        let duration: Double = 10.0  // 10 seconds
+        let updateInterval: Double = 0.05  // 50ms updates for smooth animation
+        let totalSteps = duration / updateInterval
+
+        retentionChangeTimer = Timer.scheduledTimer(withTimeInterval: updateInterval, repeats: true) { [self] timer in
+            withAnimation(.linear(duration: updateInterval)) {
+                retentionChangeProgress += 1.0 / totalSteps
+            }
+
+            if retentionChangeProgress >= 1.0 {
+                timer.invalidate()
+                dismissRetentionChangeNotification()
+            }
+        }
+    }
+
+    func dismissRetentionChangeNotification() {
+        withAnimation(.easeOut(duration: 0.3)) {
+            retentionSettingChanged = false
+        }
+        retentionChangeProgress = 0
+        retentionChangeTimer?.invalidate()
+        retentionChangeTimer = nil
+    }
+
+    // MARK: - Retention Exclusion Data Loading
+
+    func loadRetentionExclusionData() {
+        // Load installed apps
+        let installed = AppNameResolver.shared.getInstalledApps()
+        let installedBundleIDs = Set(installed.map { $0.bundleID })
+        installedAppsForRetention = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+
+        // Load other apps from database (apps that were recorded but aren't currently installed)
+        Task {
+            do {
+                let historyBundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
+                let otherBundleIDs = historyBundleIDs.filter { !installedBundleIDs.contains($0) }
+                let resolvedApps = AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs)
+                let other = resolvedApps.map { appInfo in
+                    (bundleID: appInfo.bundleID, name: appInfo.name)
+                }
+
+                await MainActor.run {
+                    otherAppsForRetention = other
+                }
+            } catch {
+                Log.error("[Settings] Failed to load history apps for retention: \(error)", category: .ui)
+            }
+
+            // Load tags
+            do {
+                let tags = try await coordinatorWrapper.coordinator.getAllTags()
+                await MainActor.run {
+                    availableTagsForRetention = tags
+                }
+            } catch {
+                Log.error("[Settings] Failed to load tags for retention: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Toggle an app in/out of retention exclusions
+    func toggleRetentionExcludedApp(_ bundleID: String?) {
+        if let bundleID = bundleID {
+            var current = retentionExcludedApps
+            if current.contains(bundleID) {
+                current.remove(bundleID)
+            } else {
+                current.insert(bundleID)
+            }
+            retentionExcludedAppsString = current.sorted().joined(separator: ",")
+        } else {
+            // nil passed - clear exclusions
+            retentionExcludedAppsString = ""
+        }
+    }
+
+    /// Toggle a tag in/out of retention exclusions
+    func toggleRetentionExcludedTag(_ tagID: TagID?) {
+        if let tagID = tagID {
+            var current = retentionExcludedTagIds
+            if current.contains(tagID.value) {
+                current.remove(tagID.value)
+            } else {
+                current.insert(tagID.value)
+            }
+            retentionExcludedTagIdsString = current.sorted().map { String($0) }.joined(separator: ",")
+        } else {
+            // nil passed - clear exclusions
+            retentionExcludedTagIdsString = ""
+        }
+    }
+
+    /// Clear all retention exclusions
+    func clearRetentionExclusions() {
+        retentionExcludedAppsString = ""
+        retentionExcludedTagIdsString = ""
     }
 
     // MARK: - Advanced Settings Actions
@@ -2112,7 +3000,7 @@ extension SettingsView {
 
     func restartAndResumeRecording() {
         // Set flag in UserDefaults to auto-start recording on next launch
-        let defaults = UserDefaults(suiteName: "Retrace") ?? .standard
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         defaults.set(true, forKey: "shouldAutoStartRecording")
         defaults.synchronize()
         Log.info("Set shouldAutoStartRecording flag for restart", category: .ui)
@@ -2130,31 +3018,82 @@ extension SettingsView {
         panel.message = "Choose a location for the Retrace database"
         panel.prompt = "Select"
 
+        // Open to current location if set, otherwise default storage root
+        if let currentPath = customRetraceDBLocation {
+            panel.directoryURL = URL(fileURLWithPath: (currentPath as NSString).deletingLastPathComponent)
+        } else {
+            panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+        }
+
         if panel.runModal() == .OK, let url = panel.url {
             let selectedPath = url.path
-            let dbPath = "\(selectedPath)/retrace.db"
+            let defaultPath = NSString(string: AppPaths.defaultStorageRoot).expandingTildeInPath
+            let currentPath = customRetraceDBLocation ?? defaultPath
 
-            // Check if database already exists at this location
-            if FileManager.default.fileExists(atPath: dbPath) {
-                // Database exists, use it directly
-                customRetraceDBLocation = selectedPath
-                retraceDBLocationChanged = true
-                Log.info("Retrace database location changed to existing database: \(selectedPath)", category: .ui)
+            // Check if selecting the same location that's currently active
+            if selectedPath == currentPath {
+                Log.info("Retrace database location unchanged (same as current): \(selectedPath)", category: .ui)
+                return
+            }
+
+            // Validate the selected folder
+            let fm = FileManager.default
+            let dbPath = "\(selectedPath)/retrace.db"
+            let chunksPath = "\(selectedPath)/chunks"
+            let hasDatabase = fm.fileExists(atPath: dbPath)
+            let hasChunks = fm.fileExists(atPath: chunksPath)
+
+            // If has database, verify it's a valid Retrace database
+            if hasDatabase {
+                let verification = verifyRetraceDatabase(at: dbPath)
+                if !verification.isValid {
+                    showDatabaseAlert(
+                        type: .error,
+                        title: "Invalid Retrace Database",
+                        message: verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database."
+                    )
+                    return
+                }
+
+                // Valid database but no chunks - ask if they want to continue
+                if !hasChunks {
+                    let shouldContinue = showDatabaseConfirmation(
+                        title: "Missing Chunks Folder",
+                        message: "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?",
+                        primaryButton: "Continue Anyway"
+                    )
+                    if !shouldContinue {
+                        return
+                    }
+                }
+            }
+
+            // If no database, check if directory is empty or has other files
+            if !hasDatabase {
+                let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
+                // Filter out hidden files like .DS_Store
+                let visibleContents = contents.filter { !$0.hasPrefix(".") }
+
+                if !visibleContents.isEmpty {
+                    // Folder has other files - show error dialog
+                    showDatabaseAlert(
+                        type: .error,
+                        title: "Invalid Folder Selection",
+                        message: "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
+                    )
+                    return
+                }
+            }
+
+            // If selecting the default location, clear custom path
+            if selectedPath == defaultPath {
+                customRetraceDBLocation = nil
+                Log.info("Retrace database location reset to default: \(selectedPath)", category: .ui)
             } else {
-                // No database exists, show warning
-                pendingRetraceDBPath = selectedPath
-                showRetraceDBWarning = true
+                customRetraceDBLocation = selectedPath
+                Log.info("Retrace database location changed to: \(selectedPath)", category: .ui)
             }
         }
-    }
-
-    func confirmRetraceDBLocation() {
-        guard let path = pendingRetraceDBPath else { return }
-        customRetraceDBLocation = path
-        retraceDBLocationChanged = true
-        showRetraceDBWarning = false
-        pendingRetraceDBPath = nil
-        Log.info("Retrace database location changed to new location: \(path)", category: .ui)
     }
 
     func selectRewindDBLocation() {
@@ -2166,35 +3105,147 @@ extension SettingsView {
         panel.message = "Choose the Rewind database file (db-enc.sqlite3)"
         panel.prompt = "Select"
 
+        // Open to current location if set, otherwise default Rewind storage root
+        if let currentPath = customRewindDBLocation {
+            panel.directoryURL = URL(fileURLWithPath: (currentPath as NSString).deletingLastPathComponent)
+        } else {
+            panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
+        }
+
         if panel.runModal() == .OK, let url = panel.url {
             let selectedPath = url.path
 
-            // Check if the selected file exists and has proper structure
-            if FileManager.default.fileExists(atPath: selectedPath) {
-                let parentDir = (selectedPath as NSString).deletingLastPathComponent
-                let chunksPath = "\(parentDir)/chunks"
-
-                // Check if chunks directory exists
-                if FileManager.default.fileExists(atPath: chunksPath) {
-                    // Valid Rewind database structure - apply immediately
-                    applyRewindDBLocation(selectedPath)
-                } else {
-                    // Database exists but no chunks folder
-                    pendingRewindDBPath = selectedPath
-                    showRewindDBWarning = true
-                }
-            } else {
-                // File doesn't exist
+            // Check if the selected file exists
+            guard FileManager.default.fileExists(atPath: selectedPath) else {
                 Log.warning("Selected Rewind database file does not exist: \(selectedPath)", category: .ui)
+                return
+            }
+
+            // Verify it's a valid Rewind database using SQLCipher
+            let verificationResult = verifyRewindDatabase(at: selectedPath)
+            guard verificationResult.isValid else {
+                showDatabaseAlert(
+                    type: .error,
+                    title: "Invalid Rewind Database",
+                    message: verificationResult.error ?? "The selected file is not a valid Rewind database."
+                )
+                return
+            }
+
+            let parentDir = (selectedPath as NSString).deletingLastPathComponent
+            let chunksPath = "\(parentDir)/chunks"
+
+            // Check if chunks directory exists
+            if FileManager.default.fileExists(atPath: chunksPath) {
+                // Valid Rewind database structure - apply immediately
+                applyRewindDBLocation(selectedPath)
+            } else {
+                // Database exists but no chunks folder - ask user if they want to continue
+                let shouldContinue = showDatabaseConfirmation(
+                    title: "Missing Chunks Folder",
+                    message: "The selected Rewind database exists, but the 'chunks' folder (video storage) was not found in the same directory.\n\nRetrace may not be able to load video frames from this database.",
+                    primaryButton: "Continue Anyway"
+                )
+                if shouldContinue {
+                    applyRewindDBLocation(selectedPath)
+                }
             }
         }
     }
 
-    func confirmRewindDBLocation() {
-        guard let path = pendingRewindDBPath else { return }
-        showRewindDBWarning = false
-        pendingRewindDBPath = nil
-        applyRewindDBLocation(path)
+    /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)
+    private func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
+        var db: OpaquePointer?
+
+        // Try to open the database
+        guard sqlite3_open(path, &db) == SQLITE_OK else {
+            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+            sqlite3_close(db)
+            return (false, "Failed to open database: \(errorMsg)")
+        }
+
+        // Verify we can read from sqlite_master (confirms it's a valid SQLite database)
+        var testStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
+              sqlite3_step(testStmt) == SQLITE_ROW else {
+            sqlite3_finalize(testStmt)
+            sqlite3_close(db)
+            return (false, "File is not a valid SQLite database.")
+        }
+        sqlite3_finalize(testStmt)
+
+        // Check for Retrace-specific tables (frame, segment, video)
+        let requiredTables = ["frame", "segment", "video"]
+        for table in requiredTables {
+            var stmt: OpaquePointer?
+            let query = "SELECT name FROM sqlite_master WHERE type='table' AND name='\(table)'"
+            guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK,
+                  sqlite3_step(stmt) == SQLITE_ROW else {
+                sqlite3_finalize(stmt)
+                sqlite3_close(db)
+                return (false, "Database is missing required '\(table)' table. This may not be a Retrace database.")
+            }
+            sqlite3_finalize(stmt)
+        }
+
+        sqlite3_close(db)
+        return (true, nil)
+    }
+
+    /// Verifies that a file is a valid Rewind database by attempting to open it with SQLCipher (encrypted)
+    private func verifyRewindDatabase(at path: String) -> (isValid: Bool, error: String?) {
+        var db: OpaquePointer?
+
+        // Try to open the database
+        guard sqlite3_open(path, &db) == SQLITE_OK else {
+            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+            sqlite3_close(db)
+            return (false, "Failed to open database: \(errorMsg)")
+        }
+
+        // Set the Rewind encryption key
+        let rewindPassword = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
+        let keySQL = "PRAGMA key = '\(rewindPassword)'"
+        var keyError: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, keySQL, nil, nil, &keyError) != SQLITE_OK {
+            let error = keyError.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(keyError)
+            sqlite3_close(db)
+            return (false, "Failed to set encryption key: \(error)")
+        }
+
+        // Set cipher compatibility (Rewind uses SQLCipher 4)
+        var compatError: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, "PRAGMA cipher_compatibility = 4", nil, nil, &compatError) != SQLITE_OK {
+            let error = compatError.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(compatError)
+            sqlite3_close(db)
+            return (false, "Failed to set cipher compatibility: \(error)")
+        }
+
+        // Verify connection by querying sqlite_master
+        var testStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
+              sqlite3_step(testStmt) == SQLITE_ROW else {
+            sqlite3_finalize(testStmt)
+            sqlite3_close(db)
+            return (false, "Database encryption verification failed. This may not be a Rewind database.")
+        }
+        sqlite3_finalize(testStmt)
+
+        // Check for Rewind-specific table (frame table)
+        var frameStmt: OpaquePointer?
+        let frameQuery = "SELECT name FROM sqlite_master WHERE type='table' AND name='frame'"
+        guard sqlite3_prepare_v2(db, frameQuery, -1, &frameStmt, nil) == SQLITE_OK,
+              sqlite3_step(frameStmt) == SQLITE_ROW else {
+            sqlite3_finalize(frameStmt)
+            sqlite3_close(db)
+            return (false, "Database does not contain expected Rewind tables (missing 'frame' table).")
+        }
+        sqlite3_finalize(frameStmt)
+
+        sqlite3_close(db)
+        return (true, nil)
     }
 
     func applyRewindDBLocation(_ path: String) {
@@ -2227,12 +3278,10 @@ extension SettingsView {
     }
 
     func resetDatabaseLocations() {
-        let hadCustomRetrace = customRetraceDBLocation != nil
         let hadCustomRewind = customRewindDBLocation != nil
 
         customRetraceDBLocation = nil
         customRewindDBLocation = nil
-        retraceDBLocationChanged = hadCustomRetrace
         Log.info("Database locations reset to defaults", category: .ui)
 
         // If Rewind was customized, apply the default location immediately
@@ -2269,6 +3318,7 @@ extension SettingsView {
         retentionDays = 0
         maxStorageGB = 50.0
         deleteDuplicateFrames = true
+        deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
         launchAtLogin = false
         showMenuBarIcon = true
         excludePrivateWindows = true
@@ -2281,8 +3331,8 @@ extension SettingsView {
             // Stop capture pipeline first
             try? await coordinatorWrapper.stopPipeline()
 
-            // Delete the entire storage directory
-            let storagePath = NSString(string: "~/Library/Application Support/Retrace").expandingTildeInPath
+            // Delete the entire storage directory (respects custom location)
+            let storagePath = AppPaths.expandedStorageRoot
             try? FileManager.default.removeItem(atPath: storagePath)
 
             // Quit the app - user will need to restart
@@ -2304,6 +3354,53 @@ extension SettingsView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             cacheClearMessage = nil
         }
+    }
+
+    // MARK: - Alert Helpers
+
+    enum AlertType {
+        case error
+        case warning
+        case info
+
+        var style: NSAlert.Style {
+            switch self {
+            case .error: return .critical
+            case .warning: return .warning
+            case .info: return .informational
+            }
+        }
+    }
+
+    /// Shows a simple alert dialog with an OK button
+    func showDatabaseAlert(type: AlertType, title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = type.style
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+
+        switch type {
+        case .error:
+            Log.error("\(title): \(message)", category: .ui)
+        case .warning:
+            Log.warning("\(title): \(message)", category: .ui)
+        case .info:
+            Log.info("\(title): \(message)", category: .ui)
+        }
+    }
+
+    /// Shows a confirmation dialog with Continue/Cancel buttons
+    /// Returns true if the user clicked the primary button
+    func showDatabaseConfirmation(title: String, message: String, primaryButton: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: primaryButton)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }
 
@@ -2353,6 +3450,24 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .privacy: return .retraceGreenGradient
         // case .search: return .retraceAccentGradient
         case .advanced: return .retracePurpleGradient
+        }
+    }
+
+    /// Returns a reset action for this tab if it has resettable settings
+    func resetAction(for view: SettingsView) -> (() -> Void)? {
+        switch self {
+        case .general:
+            return { view.resetGeneralSettings() }
+        case .capture:
+            return { view.resetCaptureSettings() }
+        case .storage:
+            return { view.resetStorageSettings() }
+        case .privacy:
+            return { view.resetPrivacySettings() }
+        case .advanced:
+            return { view.resetAdvancedSettings() }
+        case .exportData:
+            return nil  // No resettable settings
         }
     }
 }
@@ -2550,32 +3665,44 @@ extension SettingsView {
 // MARK: - Excluded Apps Management
 
 extension SettingsView {
-    /// Add an app to the exclusion list
-    func addExcludedApp(_ app: ExcludedAppInfo) {
-        guard !excludedAppsString.isEmpty else {
-            // First app
-            if let data = try? JSONEncoder().encode([app]),
-               let string = String(data: data, encoding: .utf8) {
-                excludedAppsString = string
+    /// Add multiple apps to the exclusion list
+    func addExcludedApps(_ newApps: [ExcludedAppInfo]) {
+        guard !newApps.isEmpty else { return }
+
+        var currentApps: [ExcludedAppInfo] = []
+        if !excludedAppsString.isEmpty,
+           let data = excludedAppsString.data(using: .utf8),
+           let apps = try? JSONDecoder().decode([ExcludedAppInfo].self, from: data) {
+            currentApps = apps
+        }
+
+        // Filter out duplicates
+        var addedCount = 0
+        for app in newApps {
+            if !currentApps.contains(where: { $0.bundleID == app.bundleID }) {
+                currentApps.append(app)
+                addedCount += 1
             }
-            return
         }
 
-        // Parse existing apps
-        guard let data = excludedAppsString.data(using: .utf8),
-              var apps = try? JSONDecoder().decode([ExcludedAppInfo].self, from: data) else {
-            return
-        }
-
-        // Don't add duplicates
-        guard !apps.contains(where: { $0.bundleID == app.bundleID }) else { return }
-        apps.append(app)
+        guard addedCount > 0 else { return }
 
         // Save back
-        if let newData = try? JSONEncoder().encode(apps),
+        if let newData = try? JSONEncoder().encode(currentApps),
            let string = String(data: newData, encoding: .utf8) {
             excludedAppsString = string
         }
+
+        // Update capture config in real-time
+        updateExcludedAppsConfig()
+
+        // Show feedback
+        showExcludedAppsUpdateFeedback(added: addedCount)
+    }
+
+    /// Add an app to the exclusion list (single app - kept for compatibility)
+    func addExcludedApp(_ app: ExcludedAppInfo) {
+        addExcludedApps([app])
     }
 
     /// Remove an app from the exclusion list
@@ -2594,9 +3721,97 @@ extension SettingsView {
         } else {
             excludedAppsString = ""
         }
+
+        // Update capture config in real-time
+        updateExcludedAppsConfig()
+
+        // Show feedback
+        showExcludedAppsUpdateFeedback(removed: app.name)
     }
 
-    /// Show the app picker panel
+    /// Update the capture config with current excluded apps
+    private func updateExcludedAppsConfig() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            // Build new excluded bundle IDs set
+            var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
+            for app in excludedApps {
+                excludedBundleIDs.insert(app.bundleID)
+            }
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: excludedBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Excluded apps updated: \(excludedBundleIDs.count - 1) apps excluded", category: .ui)
+            } catch {
+                Log.error("[SettingsView] Failed to update excluded apps config: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Show brief feedback for excluded apps changes
+    private func showExcludedAppsUpdateFeedback(added: Int) {
+        let message = added == 1 ? "App excluded" : "\(added) apps excluded"
+        excludedAppsUpdateMessage = message
+
+        // Auto-dismiss after 2 seconds
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await MainActor.run {
+                excludedAppsUpdateMessage = nil
+            }
+        }
+    }
+
+    /// Show brief feedback for app removal
+    private func showExcludedAppsUpdateFeedback(removed appName: String) {
+        excludedAppsUpdateMessage = "\(appName) removed"
+
+        // Auto-dismiss after 2 seconds
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await MainActor.run {
+                excludedAppsUpdateMessage = nil
+            }
+        }
+    }
+
+    /// Show the app picker panel with multiple selection support
+    func showAppPickerMultiple(completion: @escaping ([ExcludedAppInfo]) -> Void) {
+        let panel = NSOpenPanel()
+        panel.title = "Select Apps to Exclude"
+        panel.message = "Choose applications that should not be recorded (Cmd+Click to select multiple)"
+        panel.prompt = "Exclude Apps"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+
+        panel.begin { response in
+            guard response == .OK else {
+                completion([])
+                return
+            }
+
+            let apps = panel.urls.compactMap { ExcludedAppInfo.from(appURL: $0) }
+            completion(apps)
+        }
+    }
+
+    /// Show the app picker panel (single selection - kept for compatibility)
     func showAppPicker(completion: @escaping (ExcludedAppInfo?) -> Void) {
         let panel = NSOpenPanel()
         panel.title = "Select an App to Exclude"
@@ -2754,7 +3969,7 @@ extension SettingsView {
             let newConfig = CaptureConfig(
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: enabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                deduplicationThreshold: deduplicationThreshold,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -2770,6 +3985,168 @@ extension SettingsView {
                 Log.error("[SettingsView] Failed to update deduplication setting: \(error)", category: .ui)
             }
         }
+    }
+
+    /// Update deduplication threshold in capture config
+    private func updateDeduplicationThreshold() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+
+            // Get current config from capture manager
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            // Create new config with updated threshold
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor
+            )
+
+            // Update the capture manager config
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Deduplication threshold updated to: \(deduplicationThreshold)", category: .ui)
+                showCompressionUpdateFeedback()
+            } catch {
+                Log.error("[SettingsView] Failed to update deduplication threshold: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Show brief "Updated" feedback for compression settings
+    private func showCompressionUpdateFeedback() {
+        compressionUpdateMessage = "Updated"
+
+        // Auto-dismiss after 2 seconds
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await MainActor.run {
+                compressionUpdateMessage = nil
+            }
+        }
+    }
+
+    /// Show brief "Updated" feedback for capture interval settings
+    private func showCaptureUpdateFeedback() {
+        captureUpdateMessage = "Updated"
+
+        // Auto-dismiss after 2 seconds
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await MainActor.run {
+                captureUpdateMessage = nil
+            }
+        }
+    }
+
+    // MARK: - Section Reset Functions
+
+    /// Reset all General settings to defaults
+    func resetGeneralSettings() {
+        // Keyboard shortcuts
+        timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
+        dashboardShortcut = SettingsShortcutKey(from: .defaultDashboard)
+        recordingShortcut = SettingsShortcutKey(from: .defaultRecording)
+
+        // Save and apply shortcuts
+        Task {
+            await saveShortcuts()
+        }
+
+        // Startup - set value and apply
+        launchAtLogin = false
+        setLaunchAtLogin(enabled: false)
+
+        // Appearance
+        theme = .auto
+    }
+
+    /// Reset all Capture settings to defaults
+    func resetCaptureSettings() {
+        // Capture rate
+        captureIntervalSeconds = 2.0
+
+        // Compression - video quality
+        videoQuality = 0.5
+
+        // Compression - deduplication
+        deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
+        deleteDuplicateFrames = true
+
+        // Apply all capture config changes immediately
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: 2.0,
+                adaptiveCaptureEnabled: true,
+                deduplicationThreshold: CaptureConfig.defaultDeduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Capture settings reset to defaults", category: .ui)
+            } catch {
+                Log.error("[SettingsView] Failed to reset capture settings: \(error)", category: .ui)
+            }
+        }
+
+        showCaptureUpdateFeedback()
+    }
+
+    /// Reset all Storage settings to defaults
+    func resetStorageSettings() {
+        // Retention policy - default is forever (0 = no limit)
+        retentionDays = 0
+        retentionSettingChanged = true
+        startRetentionChangeTimer()
+    }
+
+    /// Reset all Privacy settings to defaults
+    func resetPrivacySettings() {
+        // Excluded apps - clear the list
+        excludedAppsString = ""
+
+        // Apply to capture config immediately
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: [],  // Clear excluded apps
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Privacy settings reset to defaults", category: .ui)
+            } catch {
+                Log.error("[SettingsView] Failed to reset privacy settings: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Reset all Advanced settings to defaults
+    func resetAdvancedSettings() {
+        // No specific settings to reset currently
+        // Cache and logging are managed differently
     }
 }
 
@@ -2825,7 +4202,7 @@ struct SettingsShortcutKey: Equatable {
 struct SettingsShortcutCaptureField: NSViewRepresentable {
     @Binding var isRecording: Bool
     @Binding var capturedShortcut: SettingsShortcutKey
-    let otherShortcut: SettingsShortcutKey
+    let otherShortcuts: [SettingsShortcutKey]
     let onDuplicateAttempt: () -> Void
     let onShortcutCaptured: () -> Void
 
@@ -2836,6 +4213,8 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: SettingsShortcutCaptureNSView, context: Context) {
+        // Update coordinator's parent to get latest otherShortcuts values
+        context.coordinator.parent = self
         nsView.isRecordingEnabled = isRecording
         if isRecording {
             DispatchQueue.main.async {
@@ -2874,8 +4253,21 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
 
             let newShortcut = SettingsShortcutKey(key: keyName, modifiers: modifiers)
 
-            // Check for duplicate
-            if newShortcut == parent.otherShortcut {
+            // Debug logging
+            let debugLog = """
+            === Shortcut Capture Debug ===
+            New shortcut: key="\(newShortcut.key)" modifiers=\(newShortcut.modifiers.rawValue)
+            Other shortcuts:
+            \(parent.otherShortcuts.enumerated().map { "  [\($0.offset)] key=\"\($0.element.key)\" modifiers=\($0.element.modifiers.rawValue)" }.joined(separator: "\n"))
+            Contains check result: \(parent.otherShortcuts.contains(newShortcut))
+            Individual comparisons:
+            \(parent.otherShortcuts.map { "  \($0.key)==\(newShortcut.key)? \($0.key == newShortcut.key), mods \($0.modifiers.rawValue)==\(newShortcut.modifiers.rawValue)? \($0.modifiers == newShortcut.modifiers)" }.joined(separator: "\n"))
+            ==============================
+            """
+            try? debugLog.write(toFile: "/tmp/retrace_debug.log", atomically: true, encoding: .utf8)
+
+            // Check for duplicate against all other shortcuts
+            if parent.otherShortcuts.contains(newShortcut) {
                 parent.onDuplicateAttempt()
                 parent.isRecording = false
                 return

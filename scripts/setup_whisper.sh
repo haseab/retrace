@@ -6,6 +6,9 @@ set -e
 
 echo "🎙️  Setting up whisper.cpp for Retrace..."
 
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
@@ -22,7 +25,7 @@ else
 fi
 
 # Create directories
-INSTALL_DIR="$HOME/Library/Application Support/Retrace"
+INSTALL_DIR="$RETRACE_STORAGE_ROOT"
 WHISPER_DIR="$INSTALL_DIR/whisper.cpp"
 MODELS_DIR="$INSTALL_DIR/models"
 

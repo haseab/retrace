@@ -71,7 +71,9 @@ public actor ServiceContainer {
         // Initialize all managers
         self.database = DatabaseManager(databasePath: databasePath)
         self.ftsEngine = FTSManager(databasePath: databasePath)
-        self.storage = StorageManager()
+        // Use the correct storage root (respects custom path setting)
+        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        self.storage = StorageManager(storageRoot: storageRootURL)
         self.capture = CaptureManager(config: captureConfig)
         // ⚠️ RELEASE 2 ONLY - Audio initialization commented out
         // self.audioCapture = AudioCaptureManager(config: audioCaptureConfig)
@@ -150,7 +152,9 @@ public actor ServiceContainer {
 
         self.database = DatabaseManager(databasePath: sharedMemoryPath)
         self.ftsEngine = FTSManager(databasePath: sharedMemoryPath)
-        self.storage = StorageManager()
+        // Use the correct storage root (respects custom path setting)
+        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        self.storage = StorageManager(storageRoot: storageRootURL)
         self.capture = CaptureManager()
         // ⚠️ RELEASE 2 ONLY
         // self.audioCapture = AudioCaptureManager()
@@ -226,6 +230,31 @@ public actor ServiceContainer {
         // 3. Initialize storage (creates directories, loads encryption key)
         try await storage.initialize(config: storageConfig)
         Log.info("✓ Storage initialized", category: .app)
+
+        // DIAGNOSTIC: Log critical paths for troubleshooting database/storage mismatches
+        Log.info("=== Storage Configuration ===", category: .app)
+        Log.info("Storage Root: \(AppPaths.storageRoot)", category: .app)
+        Log.info("Expanded Root: \(AppPaths.expandedStorageRoot)", category: .app)
+        Log.info("Database Path: \(AppPaths.databasePath)", category: .app)
+        let fm = FileManager.default
+        let chunksPath = "\(AppPaths.expandedStorageRoot)/chunks"
+        let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
+        Log.info("Database exists: \(fm.fileExists(atPath: dbPath))", category: .app)
+        Log.info("Chunks folder exists: \(fm.fileExists(atPath: chunksPath))", category: .app)
+
+        // SAFETY: If database exists but chunks folder is missing, clear processing queue
+        // This prevents infinite retry loops from orphaned frame records
+        if fm.fileExists(atPath: dbPath) && !fm.fileExists(atPath: chunksPath) {
+            Log.error("⚠️ CRITICAL: Database exists but chunks folder missing!", category: .app)
+            Log.warning("Clearing processing queue to prevent failures...", category: .app)
+
+            // Clear processing queue - frames can't be processed without video files
+            // Note: WAL is relative to storageRoot so it's already at the correct location
+            try await database.clearProcessingQueue()
+
+            Log.info("✓ Cleared processing queue (frames have no video files)", category: .app)
+        }
+        Log.info("============================", category: .app)
 
         // 4. Initialize processing (sets config)
         try await processing.initialize(config: processingConfig)
@@ -560,6 +589,8 @@ extension CaptureConfig {
         // Delete duplicate frames setting controls adaptive capture (deduplication)
         // Default to true - deduplication enabled by default
         let deleteDuplicateFrames = defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
+        // Deduplication threshold - how similar frames must be to be considered duplicates
+        let deduplicationThreshold = defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
@@ -580,7 +611,7 @@ extension CaptureConfig {
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
-            deduplicationThreshold: 0.997, // 0.997 = only discard nearly identical frames (99.7%+ similar)
+            deduplicationThreshold: deduplicationThreshold, // Controlled by "Similarity threshold" slider in settings
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,

@@ -40,7 +40,7 @@ public protocol StorageProtocol: Actor {
     // MARK: - Storage Management
 
     /// Get total storage used in bytes
-    func getTotalStorageUsed() async throws -> Int64
+    func getTotalStorageUsed(includeRewind: Bool) async throws -> Int64
 
     /// Get storage used for a specific date range
     func getStorageUsedForDateRange(from startDate: Date, to endDate: Date) async throws -> Int64

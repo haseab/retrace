@@ -3,7 +3,10 @@
 
 set -e
 
-DB_DIR="$HOME/Library/Application Support/Retrace"
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
+DB_DIR="$RETRACE_STORAGE_ROOT"
 DB_PATH="$DB_DIR/retrace.db"
 
 echo "🗑️  Deleting Retrace database..."

@@ -231,7 +231,7 @@ CAPTURE Module:
 
 STORAGE Module (Video Path):
   Input:  CGImage stream
-  Output: .mp4 file (HEVC encoded) → ~/Library/Application Support/Retrace/videos/
+  Output: .mp4 file (HEVC encoded) → {AppPaths.storageRoot}/videos/
 
 PROCESSING Module (OCR Path):
   Input:  CGImage

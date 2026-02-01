@@ -5,10 +5,14 @@ import SQLite3
 
 // MARK: - Test Script for Rewind Database Connection
 // This script tests if we can properly decrypt and query the Rewind database
+// Note: Path should match AppPaths.defaultRewindStorageRoot in Shared/AppPaths.swift
 
 let password = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
 let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-let dbPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
+// Default Rewind storage root - matches AppPaths.defaultRewindStorageRoot
+let defaultRewindStorageRoot = "~/Library/Application Support/com.memoryvault.MemoryVault"
+let rewindStorageRoot = NSString(string: defaultRewindStorageRoot).expandingTildeInPath
+let dbPath = "\(rewindStorageRoot)/db-enc.sqlite3"
 
 print("=" * 60)
 print("REWIND DATABASE CONNECTION TEST")

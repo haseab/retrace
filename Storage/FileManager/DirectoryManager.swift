@@ -17,8 +17,20 @@ actor DirectoryManager {
     func ensureBaseDirectories() throws {
         let chunks = storageRoot.appendingPathComponent("chunks", isDirectory: true)
         let temp = storageRoot.appendingPathComponent("temp", isDirectory: true)
+
+        // Create root directory if needed
         try createDirIfNeeded(storageRoot)
-        try createDirIfNeeded(chunks)
+
+        // For chunks: only create if it doesn't exist
+        // This prevents creating empty chunks folder when database already has data elsewhere
+        if !fileManager.fileExists(atPath: chunks.path) {
+            try createDirIfNeeded(chunks)
+            Log.info("Created chunks directory at: \(chunks.path)", category: .storage)
+        } else {
+            Log.info("Using existing chunks directory at: \(chunks.path)", category: .storage)
+        }
+
+        // Temp directory is always safe to create
         try createDirIfNeeded(temp)
     }
 

@@ -5,6 +5,9 @@
 
 set -e
 
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,7 +15,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Configuration
-MODEL_DIR="$HOME/Library/Application Support/Retrace/models"
+MODEL_DIR="$RETRACE_STORAGE_ROOT/models"
 MODEL_FILE="nomic-embed-text-v1.5.Q4_K_M.gguf"
 MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
 MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/$MODEL_FILE"

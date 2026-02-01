@@ -1319,7 +1319,7 @@ struct FloatingDateSearchPanel: View {
                 Button(action: onSubmit) {
                     ZStack {
                         Circle()
-                            .fill(text.isEmpty ? Color.white.opacity(0.2) : Color.retraceAccent.opacity(isSubmitButtonHovering ? 1.0 : 0.8))
+                            .fill(text.isEmpty ? Color.white.opacity(0.2) : Color.retraceSubmitAccent.opacity(isSubmitButtonHovering ? 1.0 : 0.8))
                         Image(systemName: "arrow.right")
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(.white)
@@ -1643,15 +1643,10 @@ struct CalendarPickerView: View {
                         hasFrames: hasFrames,
                         selectedDate: viewModel.selectedCalendarDate
                     ) {
-                        if hasFrames, let selectedDate = viewModel.selectedCalendarDate {
-                            let cal = Calendar.current
-                            var components = cal.dateComponents([.year, .month, .day], from: selectedDate)
-                            components.hour = hour
-                            components.minute = 0
-                            if let targetDate = cal.date(from: components) {
-                                Task {
-                                    await viewModel.navigateToHour(targetDate)
-                                }
+                        // Use actual timestamp from hoursWithFrames (contains first frame time)
+                        if let actualTimestamp = getFirstFrameTimestamp(forHour: hour) {
+                            Task {
+                                await viewModel.navigateToHour(actualTimestamp)
                             }
                         }
                     }
@@ -1671,6 +1666,14 @@ struct CalendarPickerView: View {
         guard viewModel.selectedCalendarDate != nil else { return false }
         let cal = Calendar.current
         return viewModel.hoursWithFrames.contains { date in
+            cal.component(.hour, from: date) == hour
+        }
+    }
+
+    /// Get the actual first frame timestamp for a given hour
+    private func getFirstFrameTimestamp(forHour hour: Int) -> Date? {
+        let cal = Calendar.current
+        return viewModel.hoursWithFrames.first { date in
             cal.component(.hour, from: date) == hour
         }
     }
@@ -2159,9 +2162,8 @@ struct ThemeAwareCircleButtonStyle: ViewModifier {
     let isActive: Bool
     let isHovering: Bool
 
-    private var theme: MilestoneCelebrationManager.ColorTheme {
-        MilestoneCelebrationManager.getCurrentTheme()
-    }
+    // Track theme changes to trigger view updates
+    @State private var theme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     private var showColoredBorders: Bool {
         timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
@@ -2178,6 +2180,11 @@ struct ThemeAwareCircleButtonStyle: ViewModifier {
                 Circle()
                     .stroke(showColoredBorders ? theme.controlBorderColor : Color.white.opacity(0.15), lineWidth: 1.0)
             )
+            .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { notification in
+                if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
+                    theme = newTheme
+                }
+            }
     }
 }
 
@@ -2186,9 +2193,8 @@ struct ThemeAwareCapsuleButtonStyle: ViewModifier {
     let isActive: Bool
     let isHovering: Bool
 
-    private var theme: MilestoneCelebrationManager.ColorTheme {
-        MilestoneCelebrationManager.getCurrentTheme()
-    }
+    // Track theme changes to trigger view updates
+    @State private var theme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     private var showColoredBorders: Bool {
         timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
@@ -2204,6 +2210,11 @@ struct ThemeAwareCapsuleButtonStyle: ViewModifier {
                 Capsule()
                     .stroke(showColoredBorders ? theme.controlBorderColor : Color.white.opacity(0.15), lineWidth: 1.0)
             )
+            .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { notification in
+                if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
+                    theme = newTheme
+                }
+            }
     }
 }
 

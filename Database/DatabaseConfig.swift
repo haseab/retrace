@@ -36,15 +36,12 @@ extension DatabaseConfig {
     /// Configuration for native Retrace data source
     /// - INTEGER timestamps (milliseconds since epoch)
     /// - No cutoff date (current/future data)
-    /// - Storage in ~/Library/Application Support/retrace
+    /// - Storage in AppPaths.expandedStorageRoot (respects custom location)
     /// Note: DB stores paths like "chunks/202601/17/...", so storageRoot should NOT include "chunks"
     public static var retrace: DatabaseConfig {
-        let homeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
-        let storageRoot = "\(homeDirectory)/Library/Application Support/retrace"
-
         return DatabaseConfig(
             dateFormatter: nil, // Use INTEGER milliseconds
-            storageRoot: storageRoot,
+            storageRoot: AppPaths.expandedStorageRoot,
             source: .native,
             cutoffDate: nil // No cutoff
         )
@@ -53,10 +50,9 @@ extension DatabaseConfig {
     /// Configuration for Rewind AI data source
     /// - TEXT timestamps (ISO8601 format)
     /// - Cutoff date: December 20, 2025 00:00:00 UTC (frozen historical data)
-    /// - Storage in ~/Library/Application Support/com.memoryvault.MemoryVault/chunks
+    /// - Storage in ~/Library/Application Support/com.memoryvault.MemoryVault/chunks (or custom location)
     public static var rewind: DatabaseConfig {
-        let homeDirectory = FileManager.default.homeDirectoryForCurrentUser.path
-        let storageRoot = "\(homeDirectory)/Library/Application Support/com.memoryvault.MemoryVault/chunks"
+        let storageRoot = AppPaths.expandedRewindStorageRoot + "/chunks"
 
         // ISO8601 formatter for Rewind's TEXT timestamps
         let formatter = DateFormatter()

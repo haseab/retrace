@@ -20,7 +20,7 @@ Vendors/whisper/
 
 ## Why Bundled?
 
-**Previous Approach**: Required manual whisper.cpp installation in `~/Library/Application Support/Retrace/whisper.cpp/`
+**Previous Approach**: Required manual whisper.cpp installation
 - ❌ Build failed if not installed
 - ❌ Machine-specific paths in Package.swift
 - ❌ Hard to onboard new developers
@@ -37,7 +37,7 @@ The whisper.cpp library is bundled, but **AI models are downloaded at runtime** 
 - **Whisper Small Model** (~465 MB): For speech-to-text transcription
 - **Nomic Embed v1.5** (~80 MB): For semantic search embeddings
 
-Models are downloaded to: `~/Library/Application Support/Retrace/models/`
+Models are downloaded to: `{AppPaths.storageRoot}/models/` (default: `~/Library/Application Support/Retrace/models/`, configurable in Settings)
 
 This approach:
 - Keeps repository size small (~400 KB for library vs ~545 MB for models)

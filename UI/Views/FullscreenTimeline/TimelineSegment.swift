@@ -21,7 +21,7 @@ public struct TimelineSegment: View {
         let totalDuration = timeRange.end.timeIntervalSince(timeRange.start)
         guard totalDuration > 0 else { return 50 }
 
-        let segmentEnd = segment.endDate ?? Date()
+        let segmentEnd = segment.endDate
         let segmentDuration = segmentEnd.timeIntervalSince(segment.startDate)
         let width = CGFloat(segmentDuration / totalDuration) * totalWidth
 

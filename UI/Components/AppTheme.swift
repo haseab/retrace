@@ -21,8 +21,8 @@ public class AppNameResolver {
     private var isDirty = false
 
     private init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let retraceDir = appSupport.appendingPathComponent("Retrace", isDirectory: true)
+        // Use AppPaths which respects custom storage location
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
         cacheFileURL = retraceDir.appendingPathComponent("app_names.json")
         loadFromDisk()
@@ -336,9 +336,8 @@ public class FaviconProvider {
     private var diskCache: [String: Data] = [:]
 
     private init() {
-        // Store favicon cache in Application Support/Retrace/
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let retraceDir = appSupport.appendingPathComponent("Retrace", isDirectory: true)
+        // Store favicon cache in AppPaths.storageRoot (respects custom location)
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
         cacheFileURL = retraceDir.appendingPathComponent("favicon_cache")
 
@@ -648,9 +647,8 @@ public class AppIconColorCache {
     private var isDirty = false
 
     private init() {
-        // Store in Application Support/Retrace/
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let retraceDir = appSupport.appendingPathComponent("Retrace", isDirectory: true)
+        // Store in AppPaths.storageRoot (respects custom location)
+        let retraceDir = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
 
         // Create directory if needed
         try? FileManager.default.createDirectory(at: retraceDir, withIntermediateDirectories: true)
@@ -847,14 +845,14 @@ extension Color {
     public static let retraceDeepBlue = Color(red: 5/255, green: 17/255, blue: 39/255)
 
     // Primary accent color - adapts based on user's color theme preference
-    // Blue: Retrace official brand color #0b336c
+    // Blue: Retrace accent color (lighter blue for better visibility)
     // Gold: Warm gold accent
     // Purple: Royal purple accent
     public static var retraceAccent: Color {
         let theme = MilestoneCelebrationManager.getCurrentTheme()
         switch theme {
         case .blue:
-            return Color(red: 11/255, green: 51/255, blue: 108/255)  // #0b336c - default blue
+            return Color(red: 59/255, green: 130/255, blue: 246/255)  // #3B82F6 - lighter blue
         case .gold:
             return Color(red: 255/255, green: 200/255, blue: 0/255)  // Gold
         case .purple:
@@ -864,6 +862,9 @@ extension Color {
 
     // Original brand blue (for cases where we always want blue)
     public static let retraceBrandBlue = Color(red: 11/255, green: 51/255, blue: 108/255)
+
+    // Submit button accent - darker blue for submit/action buttons (#0b336c)
+    public static let retraceSubmitAccent = Color(red: 11/255, green: 51/255, blue: 108/255)
 
     // Card background: hsl(222, 47%, 7%)
     public static let retraceCard = Color(red: 9/255, green: 18/255, blue: 38/255)
@@ -1525,9 +1526,9 @@ public struct RetraceMenuStyle {
     /// Chevron size
     public static let chevronSize: CGFloat = 10
 
-    /// Action button color (used for all primary action buttons) - adapts based on user tier
+    /// Action button color (used for all primary action buttons like Submit, Apply, Include)
     public static var actionBlue: Color {
-        Color.retraceAccent
+        Color.retraceSubmitAccent
     }
 
     /// UI blue - desaturated, calmer blue for focus rings and subtle accents
@@ -1759,5 +1760,49 @@ extension Color {
             blue: Double(b) / 255,
             opacity: Double(a) / 255
         )
+    }
+}
+
+// MARK: - Ping Dot View
+
+/// A pulsating dot indicator for status display
+/// Use for showing active/connected states (green) or warning/disconnected states (orange)
+public struct PingDotView: View {
+    let color: Color
+    let size: CGFloat
+    let isAnimating: Bool
+
+    @State private var isPulsing = false
+
+    public init(color: Color, size: CGFloat = 8, isAnimating: Bool = true) {
+        self.color = color
+        self.size = size
+        self.isAnimating = isAnimating
+    }
+
+    public var body: some View {
+        ZStack {
+            if isAnimating {
+                Circle()
+                    .fill(color)
+                    .frame(width: size, height: size)
+                    .scaleEffect(isPulsing ? 2.0 : 1.0)
+                    .opacity(isPulsing ? 0.0 : 0.6)
+            }
+
+            Circle()
+                .fill(color)
+                .frame(width: size, height: size)
+        }
+        .onAppear {
+            if isAnimating {
+                withAnimation(
+                    Animation.easeOut(duration: 1.5)
+                        .repeatForever(autoreverses: false)
+                ) {
+                    isPulsing = true
+                }
+            }
+        }
     }
 }

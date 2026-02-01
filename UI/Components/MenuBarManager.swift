@@ -29,6 +29,12 @@ public class MenuBarManager: ObservableObject {
     /// Cached shortcuts (loaded from OnboardingManager)
     private var timelineShortcut: ShortcutConfig = .defaultTimeline
     private var dashboardShortcut: ShortcutConfig = .defaultDashboard
+    private var recordingShortcut: ShortcutConfig = .defaultRecording
+
+    /// Timer for icon fill animation
+    private var iconAnimationTimer: Timer?
+    /// Current fill progress for icon animation (0.0 to 1.0)
+    private var iconFillProgress: CGFloat = 0.0
 
     // MARK: - Initialization
 
@@ -77,7 +83,8 @@ public class MenuBarManager: ObservableObject {
     private func loadShortcuts() async {
         timelineShortcut = await onboardingManager.timelineShortcut
         dashboardShortcut = await onboardingManager.dashboardShortcut
-        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString)", category: .ui)
+        recordingShortcut = await onboardingManager.recordingShortcut
+        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString)", category: .ui)
     }
 
     /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
@@ -130,6 +137,14 @@ public class MenuBarManager: ObservableObject {
             self?.toggleDashboard()
         }
 
+        // Register recording global hotkey
+        HotkeyManager.shared.registerHotkey(
+            key: recordingShortcut.key,
+            modifiers: recordingShortcut.modifiers.nsModifiers
+        ) { [weak self] in
+            self?.toggleRecording()
+        }
+
         // Also configure the timeline window controller
         Task { @MainActor in
             TimelineWindowController.shared.configure(coordinator: coordinator)
@@ -148,6 +163,34 @@ public class MenuBarManager: ObservableObject {
         NotificationCenter.default.post(name: .toggleDashboard, object: nil)
     }
 
+    /// Toggle recording on/off (called from global hotkey)
+    private func toggleRecording() {
+        Task { @MainActor in
+            do {
+                let currentlyRecording = await coordinator.getStatus().isRunning
+                let shouldRecord = !currentlyRecording
+
+                // Update state and animate icon
+                isRecording = shouldRecord
+                animateIconFill(toRecording: shouldRecord)
+
+                if shouldRecord {
+                    Log.debug("[MenuBar] Hotkey toggle ON - Starting pipeline...", category: .ui)
+                    try await coordinator.startPipeline()
+                } else {
+                    Log.debug("[MenuBar] Hotkey toggle OFF - Stopping pipeline...", category: .ui)
+                    try await coordinator.stopPipeline()
+                }
+            } catch {
+                Log.error("[MenuBar] Failed to toggle recording via hotkey: \(error)", category: .ui)
+                // Revert on error
+                let actualState = await coordinator.getStatus().isRunning
+                isRecording = actualState
+                updateIcon(recording: actualState)
+            }
+        }
+    }
+
     /// Hide recording indicator (called when timeline opens)
     private func hideRecordingIndicator() {
         shouldHideRecordingIndicator = true
@@ -160,47 +203,115 @@ public class MenuBarManager: ObservableObject {
         updateIcon(recording: isRecording)
     }
 
-    /// Update the menu bar icon to show recording status
+    /// Update the menu bar icon to show recording status (no animation)
     private func updateIcon(recording: Bool) {
         guard let button = statusItem?.button else { return }
 
-        // Create custom image with two circles (like Rewind)
-        let image = createStatusIcon(recording: recording)
+        let image = createStatusIcon(filled: recording)
         button.image = image
         button.image?.isTemplate = true
     }
 
+    /// Animate the menu bar icon with a "press" effect when recording state changes
+    /// The triangle shrinks down fast, then expands back slower
+    private func animateIconFill(toRecording: Bool) {
+        // Cancel any existing animation
+        iconAnimationTimer?.invalidate()
+
+        let frameRate: TimeInterval = 1.0 / 60.0
+        let pressDuration: TimeInterval = 0.10   // Press down (100ms)
+        let releaseDuration: TimeInterval = 0.30  // Release (300ms)
+        let pressFrames = Int(pressDuration / frameRate)
+        let releaseFrames = Int(releaseDuration / frameRate)
+        var currentFrame = 0
+        var phase: Int = 0  // 0 = pressing down, 1 = releasing
+
+        let startFilled = !toRecording  // Current state before change
+        let minScale: CGFloat = 0.3  // Shrink to 30% size
+
+        iconAnimationTimer = Timer.scheduledTimer(withTimeInterval: frameRate, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+
+            currentFrame += 1
+
+            if phase == 0 {
+                // Phase 0: Fast shrinking (pressing down)
+                let progress = CGFloat(currentFrame) / CGFloat(pressFrames)
+                // Ease-in for snappy press feel
+                let easedProgress = progress * progress
+                let scale = 1.0 - ((1.0 - minScale) * easedProgress)
+
+                if let button = self.statusItem?.button {
+                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    button.image = image
+                    button.image?.isTemplate = true
+                }
+
+                if currentFrame >= pressFrames {
+                    // Switch to release phase and change fill state
+                    phase = 1
+                    currentFrame = 0
+                }
+            } else {
+                // Phase 1: Slower expanding back (releasing) with new fill state
+                let progress = CGFloat(currentFrame) / CGFloat(releaseFrames)
+                // Ease-out for smooth release
+                let easedProgress = 1.0 - pow(1.0 - progress, 3)
+                let scale = minScale + ((1.0 - minScale) * easedProgress)
+
+                if let button = self.statusItem?.button {
+                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    button.image = image
+                    button.image?.isTemplate = true
+                }
+
+                if currentFrame >= releaseFrames {
+                    timer.invalidate()
+                    // Ensure final state is correct
+                    self.iconFillProgress = toRecording ? 1.0 : 0.0
+                }
+            }
+        }
+    }
+
     /// Create a custom status icon with two triangles (Retrace logo)
-    /// Left triangle: Points left, filled when recording, outlined otherwise
+    /// Left triangle: Points left, filled or outlined based on state, with optional scale
     /// Right triangle: Points right, always outlined
-    private func createStatusIcon(recording: Bool) -> NSImage {
+    private func createStatusIcon(filled: Bool, scale: CGFloat = 1.0) -> NSImage {
         let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size)
 
         image.lockFocus()
 
         // Triangle dimensions (matching logo proportions)
-        let triangleHeight: CGFloat = 12
-        let triangleWidth: CGFloat = 8
+        let baseTriangleHeight: CGFloat = 12
+        let baseTriangleWidth: CGFloat = 8
         let verticalCenter: CGFloat = size.height / 2
         let gap: CGFloat = 3.0 // Gap between triangles
 
+        // Apply scale to left triangle dimensions
+        let triangleHeight = baseTriangleHeight * scale
+        let triangleWidth = baseTriangleWidth * scale
+
         // Left triangle - Points left ◁ (recording indicator)
+        // Center the scaled triangle at the same position
+        let baseCenterX: CGFloat = 2 + (baseTriangleWidth / 2)  // Original center X
+        let leftTip = baseCenterX - (triangleWidth / 2)
+        let leftBase = baseCenterX + (triangleWidth / 2)
+
         let leftTriangle = NSBezierPath()
-        let leftTip: CGFloat = 2
-        let leftBase: CGFloat = leftTip + triangleWidth
-        leftTriangle.move(to: NSPoint(x: leftTip, y: verticalCenter)) // Left tip
-        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter - triangleHeight / 2)) // Top right
-        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter + triangleHeight / 2)) // Bottom right
+        leftTriangle.move(to: NSPoint(x: leftTip, y: verticalCenter))
+        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter - triangleHeight / 2))
+        leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
         leftTriangle.close()
 
-        if recording {
-            // Filled with border when recording
+        if filled {
+            // Filled when recording (no border)
             NSColor.white.setFill()
             leftTriangle.fill()
-            NSColor.white.setStroke()
-            leftTriangle.lineWidth = 1.2
-            leftTriangle.stroke()
         } else {
             // Outlined when not recording
             NSColor.white.setStroke()
@@ -208,13 +319,13 @@ public class MenuBarManager: ObservableObject {
             leftTriangle.stroke()
         }
 
-        // Right triangle - Points right ▷ (always outlined)
+        // Right triangle - Points right ▷ (always outlined, not scaled)
         let rightTriangle = NSBezierPath()
-        let rightBase: CGFloat = leftBase + gap
-        let rightTip: CGFloat = rightBase + triangleWidth
+        let rightBase: CGFloat = 2 + baseTriangleWidth + gap
+        let rightTip: CGFloat = rightBase + baseTriangleWidth
         rightTriangle.move(to: NSPoint(x: rightTip, y: verticalCenter)) // Right tip
-        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter - triangleHeight / 2)) // Top left
-        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter + triangleHeight / 2)) // Bottom left
+        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter - baseTriangleHeight / 2)) // Top left
+        rightTriangle.line(to: NSPoint(x: rightBase, y: verticalCenter + baseTriangleHeight / 2)) // Bottom left
         rightTriangle.close()
 
         NSColor.white.setStroke()
@@ -223,6 +334,129 @@ public class MenuBarManager: ObservableObject {
 
         image.unlockFocus()
         return image
+    }
+
+    /// Create a custom view with a toggle switch for recording
+    private func createRecordingToggleView() -> NSView {
+        let containerWidth: CGFloat = 235
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: 30))
+
+        // Label
+        let label = NSTextField(labelWithString: "Recording")
+        label.frame = NSRect(x: 14, y: 5, width: 100, height: 20)
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.textColor = .labelColor
+        containerView.addSubview(label)
+
+        // Custom toggle switch view - positioned on the far right
+        let toggleWidth: CGFloat = 40
+        let rightPadding: CGFloat = 8
+        let toggleView = RecordingToggleSwitch(
+            frame: NSRect(x: containerWidth - toggleWidth - rightPadding, y: 5, width: toggleWidth, height: 20),
+            isOn: isRecording,
+            onColor: NSColor(red: 11/255.0, green: 51/255.0, blue: 108/255.0, alpha: 1.0)
+        )
+        toggleView.target = self
+        toggleView.action = #selector(recordingToggleChanged(_:))
+        containerView.addSubview(toggleView)
+
+        return containerView
+    }
+
+    /// Handle recording toggle switch change
+    @objc private func recordingToggleChanged(_ sender: Any) {
+        guard let toggle = sender as? RecordingToggleSwitch else { return }
+        let shouldRecord = toggle.state == .on
+
+        // Update state and animate icon (using common run loop mode to work while menu is open)
+        isRecording = shouldRecord
+        animateIconFillWithCommonMode(toRecording: shouldRecord)
+
+        // Then perform the actual operation in the background
+        Task { @MainActor in
+            do {
+                if shouldRecord {
+                    Log.debug("[MenuBar] Toggle ON - Starting pipeline...", category: .ui)
+                    try await coordinator.startPipeline()
+                } else {
+                    Log.debug("[MenuBar] Toggle OFF - Stopping pipeline...", category: .ui)
+                    try await coordinator.stopPipeline()
+                }
+            } catch {
+                Log.error("[MenuBar] Failed to toggle recording: \(error)", category: .ui)
+                // Revert on error
+                let actualState = await coordinator.getStatus().isRunning
+                toggle.isOn = actualState
+                isRecording = actualState
+                updateIcon(recording: actualState)
+            }
+        }
+    }
+
+    /// Animate icon using common run loop mode (works while menu is open)
+    private func animateIconFillWithCommonMode(toRecording: Bool) {
+        iconAnimationTimer?.invalidate()
+
+        let frameRate: TimeInterval = 1.0 / 60.0
+        let pressDuration: TimeInterval = 0.10   // Press down (100ms)
+        let releaseDuration: TimeInterval = 0.30  // Release (300ms)
+        let pressFrames = Int(pressDuration / frameRate)
+        let releaseFrames = Int(releaseDuration / frameRate)
+        var currentFrame = 0
+        var phase: Int = 0
+
+        let startFilled = !toRecording
+        let minScale: CGFloat = 0.3  // Shrink to 30% size
+
+        // Use Timer with .common mode so it runs while menu is tracking
+        let timer = Timer(timeInterval: frameRate, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+
+            currentFrame += 1
+
+            if phase == 0 {
+                // Phase 0: Fast shrinking down
+                let progress = CGFloat(currentFrame) / CGFloat(pressFrames)
+                // Ease-in for snappy press feel
+                let easedProgress = progress * progress
+                let scale = 1.0 - ((1.0 - minScale) * easedProgress)
+
+                if let button = self.statusItem?.button {
+                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    button.image = image
+                    button.image?.isTemplate = true
+                }
+
+                if currentFrame >= pressFrames {
+                    phase = 1
+                    currentFrame = 0
+                }
+            } else {
+                // Phase 1: Slower expanding back with bounce
+                let progress = CGFloat(currentFrame) / CGFloat(releaseFrames)
+                // Ease-out for smooth release
+                let easedProgress = 1.0 - pow(1.0 - progress, 3)
+                let scale = minScale + ((1.0 - minScale) * easedProgress)
+
+                if let button = self.statusItem?.button {
+                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    button.image = image
+                    button.image?.isTemplate = true
+                }
+
+                if currentFrame >= releaseFrames {
+                    timer.invalidate()
+                    self.iconFillProgress = toRecording ? 1.0 : 0.0
+                }
+            }
+        }
+
+        // Add to common run loop mode so it runs while menu is tracking
+        RunLoop.main.add(timer, forMode: .common)
+        iconAnimationTimer = timer
     }
 
     private func setupMenu() {
@@ -259,13 +493,10 @@ public class MenuBarManager: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Start/Pause Recording
-        let recordingItem = NSMenuItem(
-            title: isRecording ? "Pause Recording" : "Start Recording",
-            action: #selector(toggleRecording),
-            keyEquivalent: "r"
-        )
-        recordingItem.keyEquivalentModifierMask = [.command, .shift]
+        // Recording toggle with switch
+        let recordingItem = NSMenuItem()
+        let recordingView = createRecordingToggleView()
+        recordingItem.view = recordingView
         menu.addItem(recordingItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -325,33 +556,6 @@ public class MenuBarManager: ObservableObject {
         NotificationCenter.default.post(name: .toggleDashboard, object: nil)
     }
 
-    @objc private func toggleRecording() {
-        Task { @MainActor in
-            do {
-                // Check actual coordinator state first
-                let coordinatorIsRunning = await coordinator.getStatus().isRunning
-                Log.debug("[MenuBar] toggleRecording called, coordinatorIsRunning=\(coordinatorIsRunning)", category: .ui)
-
-                if coordinatorIsRunning {
-                    Log.debug("[MenuBar] Stopping pipeline...", category: .ui)
-                    try await coordinator.stopPipeline()
-                    Log.debug("[MenuBar] Pipeline stopped, updating status to false", category: .ui)
-                    updateRecordingStatus(false)
-                } else {
-                    Log.debug("[MenuBar] Starting pipeline...", category: .ui)
-                    try await coordinator.startPipeline()
-                    Log.debug("[MenuBar] Pipeline started, updating status to true", category: .ui)
-                    updateRecordingStatus(true)
-                }
-            } catch {
-                Log.error("[MenuBar] Failed to toggle recording: \(error)", category: .ui)
-                // Sync state with coordinator on error
-                let actualState = await coordinator.getStatus().isRunning
-                updateRecordingStatus(actualState)
-            }
-        }
-    }
-
     /// Sync recording status with coordinator
     public func syncWithCoordinator() {
         Task { @MainActor in
@@ -377,9 +581,16 @@ public class MenuBarManager: ObservableObject {
     // MARK: - Update
 
     public func updateRecordingStatus(_ recording: Bool) {
+        let wasRecording = isRecording
         isRecording = recording
         setupMenu()
-        updateIcon(recording: recording)
+
+        // Animate the icon fill if the state actually changed
+        if wasRecording != recording {
+            animateIconFill(toRecording: recording)
+        } else {
+            updateIcon(recording: recording)
+        }
     }
 
     /// Show the menu bar icon
@@ -407,6 +618,150 @@ public class MenuBarManager: ObservableObject {
 
     deinit {
         refreshTimer?.invalidate()
+        iconAnimationTimer?.invalidate()
+    }
+}
+
+// MARK: - Custom Toggle Switch
+
+/// A custom toggle switch view with customizable on-color and animation
+private class RecordingToggleSwitch: NSView {
+    var isOn: Bool {
+        didSet {
+            if oldValue != isOn {
+                animateToggle()
+            }
+        }
+    }
+    var onColor: NSColor
+    weak var target: AnyObject?
+    var action: Selector?
+
+    private let trackWidth: CGFloat = 40
+    private let trackHeight: CGFloat = 20
+    private let knobDiameter: CGFloat = 16
+    private let knobPadding: CGFloat = 2
+
+    // Animation state
+    private var knobProgress: CGFloat = 0.0  // 0.0 = off position, 1.0 = on position
+    private var colorProgress: CGFloat = 0.0  // 0.0 = off color, 1.0 = on color
+    private var animationTimer: Timer?
+
+    init(frame: NSRect, isOn: Bool, onColor: NSColor) {
+        self.isOn = isOn
+        self.knobProgress = isOn ? 1.0 : 0.0
+        self.colorProgress = isOn ? 1.0 : 0.0
+        self.onColor = onColor
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private func animateToggle() {
+        animationTimer?.invalidate()
+
+        let targetKnob: CGFloat = isOn ? 1.0 : 0.0
+        let targetColor: CGFloat = isOn ? 1.0 : 0.0
+        let duration: TimeInterval = 0.15
+        let frameRate: TimeInterval = 1.0 / 60.0
+        let totalFrames = Int(duration / frameRate)
+        var currentFrame = 0
+
+        let startKnob = knobProgress
+        let startColor = colorProgress
+
+        // Use Timer with .common mode so it runs while menu is tracking
+        let timer = Timer(timeInterval: frameRate, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+
+            currentFrame += 1
+            let progress = CGFloat(currentFrame) / CGFloat(totalFrames)
+            // Ease-out curve
+            let easedProgress = 1.0 - pow(1.0 - progress, 3)
+
+            self.knobProgress = startKnob + (targetKnob - startKnob) * easedProgress
+            self.colorProgress = startColor + (targetColor - startColor) * easedProgress
+
+            self.needsDisplay = true
+
+            if currentFrame >= totalFrames {
+                timer.invalidate()
+                self.knobProgress = targetKnob
+                self.colorProgress = targetColor
+                self.needsDisplay = true
+            }
+        }
+
+        // Add to common run loop mode so it runs while menu is tracking
+        RunLoop.main.add(timer, forMode: .common)
+        animationTimer = timer
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+
+        // Draw track (pill shape)
+        let trackRect = NSRect(
+            x: (bounds.width - trackWidth) / 2,
+            y: (bounds.height - trackHeight) / 2,
+            width: trackWidth,
+            height: trackHeight
+        )
+
+        let trackPath = NSBezierPath(roundedRect: trackRect, xRadius: trackHeight / 2, yRadius: trackHeight / 2)
+
+        // Interpolate color based on colorProgress
+        let offColor = NSColor.systemGray.withAlphaComponent(0.4)
+        let blendedColor = NSColor(
+            red: offColor.redComponent + (onColor.redComponent - offColor.redComponent) * colorProgress,
+            green: offColor.greenComponent + (onColor.greenComponent - offColor.greenComponent) * colorProgress,
+            blue: offColor.blueComponent + (onColor.blueComponent - offColor.blueComponent) * colorProgress,
+            alpha: offColor.alphaComponent + (onColor.alphaComponent - offColor.alphaComponent) * colorProgress
+        )
+        blendedColor.setFill()
+        trackPath.fill()
+
+        // Draw knob (circle) - position based on knobProgress
+        let offX = trackRect.minX + knobPadding
+        let onX = trackRect.maxX - knobDiameter - knobPadding
+        let knobX = offX + (onX - offX) * knobProgress
+        let knobY = trackRect.minY + (trackHeight - knobDiameter) / 2
+
+        let knobRect = NSRect(x: knobX, y: knobY, width: knobDiameter, height: knobDiameter)
+        let knobPath = NSBezierPath(ovalIn: knobRect)
+
+        // Add subtle shadow to knob
+        context.saveGState()
+        context.setShadow(offset: CGSize(width: 0, height: -1), blur: 2, color: NSColor.black.withAlphaComponent(0.2).cgColor)
+        NSColor.white.setFill()
+        knobPath.fill()
+        context.restoreGState()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isOn.toggle()
+
+        // Send action
+        if let target = target, let action = action {
+            NSApp.sendAction(action, to: target, from: self)
+        }
+    }
+
+    /// Property to check state (used by action handler)
+    var state: NSControl.StateValue {
+        return isOn ? .on : .off
+    }
+
+    deinit {
+        animationTimer?.invalidate()
     }
 }
 

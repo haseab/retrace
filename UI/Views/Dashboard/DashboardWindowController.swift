@@ -155,6 +155,14 @@ public class DashboardWindowController: NSObject {
         show()
         NotificationCenter.default.post(name: .dashboardShowSettings, object: nil)
     }
+
+    /// Toggle between settings and dashboard views
+    /// If on dashboard or window not visible: show settings
+    /// If on settings: go back to dashboard
+    public func toggleSettings() {
+        show()
+        NotificationCenter.default.post(name: .toggleSettings, object: nil)
+    }
 }
 
 // MARK: - NSWindowDelegate
@@ -243,6 +251,10 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .dashboardShowSettings)) { _ in
             selectedView = .settings
         }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
+            // Toggle: if on settings go to dashboard, otherwise go to settings
+            selectedView = selectedView == .settings ? .dashboard : .settings
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
             selectedView = .settings
             DashboardWindowController.shared.show()
@@ -283,4 +295,5 @@ extension Notification.Name {
     static let dashboardDidClose = Notification.Name("dashboardDidClose")
     static let dashboardShowSettings = Notification.Name("dashboardShowSettings")
     static let dashboardDidBecomeKey = Notification.Name("dashboardDidBecomeKey")
+    static let toggleSettings = Notification.Name("toggleSettings")
 }

@@ -246,6 +246,7 @@ let package = Package(
         .executableTarget(
             name: "QueryRewindApps",
             dependencies: [
+                "Shared",
                 .product(name: "SQLCipher", package: "swift-sqlcipher")
             ],
             path: "Sources/QueryRewindApps"

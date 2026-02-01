@@ -174,6 +174,10 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Set the user's color theme preference
     public nonisolated static func setColorThemePreference(_ theme: ColorTheme) {
         settingsStore?.set(theme.rawValue, forKey: colorThemePreferenceKey)
+        // Post notification so views can update
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .colorThemeDidChange, object: theme)
+        }
     }
 
     #if DEBUG
@@ -359,4 +363,11 @@ public class MilestoneCelebrationManager: ObservableObject {
     deinit {
         checkTimer?.invalidate()
     }
+}
+
+// MARK: - Notifications
+
+extension Notification.Name {
+    /// Posted when the color theme preference changes
+    static let colorThemeDidChange = Notification.Name("colorThemeDidChange")
 }

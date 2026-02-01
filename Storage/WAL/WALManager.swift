@@ -9,7 +9,7 @@ import Shared
 /// - Recovery on app restart
 ///
 /// Directory structure:
-/// ~/Library/Application Support/Retrace/wal/
+/// {AppPaths.storageRoot}/wal/
 ///   └── active_segment_{videoID}/
 ///       ├── frames.bin      # Binary: [FrameHeader|PixelData][FrameHeader|PixelData]...
 ///       └── metadata.json   # Segment metadata (videoID, startTime, frameCount)
@@ -168,6 +168,31 @@ public actor WALManager {
         // Use try? to handle case where directory was already deleted (e.g., double-finalize)
         if FileManager.default.fileExists(atPath: session.sessionDir.path) {
             try FileManager.default.removeItem(at: session.sessionDir)
+        }
+    }
+
+    /// Clear ALL WAL sessions (used when changing database location)
+    /// WARNING: This deletes unrecovered frame data! Only call when intentionally switching databases.
+    public func clearAllSessions() async throws {
+        guard FileManager.default.fileExists(atPath: walRootURL.path) else {
+            return
+        }
+
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: walRootURL,
+            includingPropertiesForKeys: nil
+        )
+
+        var clearedCount = 0
+        for dir in contents where dir.hasDirectoryPath {
+            if dir.lastPathComponent.hasPrefix("active_segment_") {
+                try FileManager.default.removeItem(at: dir)
+                clearedCount += 1
+            }
+        }
+
+        if clearedCount > 0 {
+            Log.warning("[WAL] Cleared \(clearedCount) WAL sessions (database location changed)", category: .storage)
         }
     }
 

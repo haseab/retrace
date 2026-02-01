@@ -6,6 +6,9 @@ set -e
 
 echo "🔧 Rebuilding dylibs for macOS 13.0+ compatibility..."
 
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
 # macOS 13.0 = deployment target 23.0
 export MACOSX_DEPLOYMENT_TARGET=13.0
 
@@ -14,7 +17,7 @@ ARCH=$(uname -m)
 echo "📱 Architecture: $ARCH"
 
 # Directories
-WHISPER_SOURCE="$HOME/Library/Application Support/Retrace/whisper.cpp"
+WHISPER_SOURCE="$RETRACE_STORAGE_ROOT/whisper.cpp"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WHISPER_VENDOR="$PROJECT_ROOT/Vendors/whisper"
 LLAMA_VENDOR="$PROJECT_ROOT/Vendors/llama"
@@ -69,7 +72,7 @@ otool -l "$WHISPER_VENDOR/lib/libwhisper.dylib" | grep -A 3 "LC_BUILD_VERSION" |
 echo ""
 echo "🦙 Building llama.cpp..."
 
-LLAMA_SOURCE="$HOME/Library/Application Support/Retrace/llama.cpp"
+LLAMA_SOURCE="$RETRACE_STORAGE_ROOT/llama.cpp"
 
 if [ ! -d "$LLAMA_SOURCE" ]; then
     echo "⚠️  Llama source not found at: $LLAMA_SOURCE"

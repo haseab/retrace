@@ -40,8 +40,10 @@ Storage/
 
 ## Directory Structure on Disk
 
+Location: `AppPaths.storageRoot` (default: `~/Library/Application Support/Retrace/`, configurable in Settings)
+
 ```
-~/Library/Application Support/Retrace/
+{storageRoot}/
 ├── config.json                    # App configuration
 ├── retrace.db                     # SQLite database (owned by DATABASE)
 ├── segments/

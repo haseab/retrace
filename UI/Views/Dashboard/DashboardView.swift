@@ -156,6 +156,7 @@ public struct DashboardView: View {
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
+    @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     enum AppUsageViewMode: String, CaseIterable {
         case list = "list"
@@ -271,7 +272,7 @@ public struct DashboardView: View {
                                         subtitle: card.subtitle,
                                         graphData: card.graphData,
                                         graphColor: card.graphColor,
-                                        theme: MilestoneCelebrationManager.getCurrentTheme(),
+                                        theme: currentTheme,
                                         valueFormatter: card.valueFormatter,
                                         layoutSize: layoutSize
                                     )
@@ -310,6 +311,11 @@ public struct DashboardView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
             Task { await viewModel.loadStatistics() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { notification in
+            if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
+                currentTheme = newTheme
+            }
         }
         .overlay {
             // Sessions detail overlay (replaces .sheet for faster presentation)
@@ -936,16 +942,13 @@ public struct DashboardView: View {
     }
 
     private var themeBorderColor: Color {
-        let theme = MilestoneCelebrationManager.getCurrentTheme()
-        return theme.controlBorderColor
+        currentTheme.controlBorderColor
     }
 
     /// Theme-aware base background color
     /// Gold theme uses a warmer, darker tone that complements gold better than blue
     private var themeBaseBackground: Color {
-        let theme = MilestoneCelebrationManager.getCurrentTheme()
-
-        switch theme {
+        switch currentTheme {
         case .gold:
             // Warm dark brown/slate that complements gold
             // HSL roughly: 30°, 20%, 5% - a very dark warm gray with slight brown undertone
@@ -958,7 +961,7 @@ public struct DashboardView: View {
 
     /// Theme-aware ambient background with subtle glow effects
     private var themeAmbientBackground: some View {
-        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        let theme = currentTheme
 
         // Use custom colors for better contrast against backgrounds
         let ambientGlowColor: Color = {

@@ -905,6 +905,9 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+
         let sql = """
             SELECT
                 f.id,
@@ -913,7 +916,7 @@ public actor DataAdapter {
                 f.videoId,
                 f.videoFrameIndex,
                 f.encodingStatus,
-                f.processingStatus,
+                \(processingStatusColumn),
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
@@ -971,12 +974,16 @@ public actor DataAdapter {
         config: DatabaseConfig,
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
@@ -1122,15 +1129,20 @@ public actor DataAdapter {
                 """)
         }
 
-        // Always exclude p=4 frames (not yet readable)
-        whereClauses.append("f.processingStatus != 4")
+        // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
+        if config.source != .rewind {
+            whereClauses.append("f.processingStatus != 4")
+        }
 
         let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
+
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1389,15 +1401,20 @@ public actor DataAdapter {
                 """)
         }
 
-        // Always exclude p=4 frames (not yet readable)
-        whereClauses.append("f.processingStatus != 4")
+        // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
+        if config.source != .rewind {
+            whereClauses.append("f.processingStatus != 4")
+        }
 
         let whereClause = whereClauses.joined(separator: " AND ")
+
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1605,15 +1622,20 @@ public actor DataAdapter {
                 """)
         }
 
-        // Always exclude p=4 frames (not yet readable)
-        whereClauses.append("f.processingStatus != 4")
+        // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
+        if config.source != .rewind {
+            whereClauses.append("f.processingStatus != 4")
+        }
 
         let whereClause = whereClauses.joined(separator: " AND ")
+
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1812,10 +1834,13 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1827,7 +1852,9 @@ public actor DataAdapter {
             LIMIT ?
             """
 
-        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return []
+        }
         defer { connection.finalize(statement) }
 
         var currentBindIndex = 1
@@ -1928,12 +1955,16 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2010,12 +2041,16 @@ public actor DataAdapter {
 
         let whereClause = whereClauses.joined(separator: " AND ")
 
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2067,8 +2102,11 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig
     ) throws -> FrameWithVideoInfo? {
+        // Rewind database doesn't have processingStatus column
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -3174,39 +3212,46 @@ public actor DataAdapter {
     /// Get Rewind storage root path for storage calculations (returns nil if Rewind not connected)
     public var rewindStorageRootPath: String? {
         guard rewindConnection != nil else { return nil }
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        return "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault"
+        return AppPaths.expandedRewindStorageRoot
     }
 
     // MARK: - Calendar Hours Query
 
     /// Get distinct hours for a specific date that have frames
-    /// Queries the appropriate database based on cutoff date
+    /// Queries both databases and merges results to show all available hours
     public func getDistinctHoursForDate(_ date: Date) throws -> [Date] {
         let calendar = Calendar.current
         let startOfDay = calendar.startOfDay(for: date)
         let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!
 
-        // Determine which database to query based on cutoff
-        if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, date < cutoff {
-            // Query Rewind (TEXT timestamps)
-            return try queryDistinctHoursRewind(
+        var allHours = Set<Date>()
+
+        // Query Retrace database
+        let retraceHours = try queryDistinctHoursRetrace(
+            connection: retraceConnection,
+            startOfDay: startOfDay,
+            endOfDay: endOfDay
+        )
+        allHours.formUnion(retraceHours)
+
+        // Query Rewind database if connected
+        if let rewind = rewindConnection, let config = rewindConfig {
+            let rewindHours = try queryDistinctHoursRewind(
                 connection: rewind,
                 config: config,
                 startOfDay: startOfDay,
                 endOfDay: endOfDay
             )
-        } else {
-            // Query Retrace (INTEGER milliseconds)
-            return try queryDistinctHoursRetrace(
-                connection: retraceConnection,
-                startOfDay: startOfDay,
-                endOfDay: endOfDay
-            )
+            allHours.formUnion(rewindHours)
         }
+
+        // Return sorted by time (earliest first)
+        return Array(allHours).sorted()
     }
 
     /// Query distinct hours from Retrace database (INTEGER timestamps in milliseconds)
+    /// Returns the actual first frame timestamp for each hour (not normalized to :00:00)
+    /// so that navigation can find frames around that time
     private func queryDistinctHoursRetrace(
         connection: DatabaseConnection,
         startOfDay: Date,
@@ -3231,24 +3276,20 @@ public actor DataAdapter {
         sqlite3_bind_int64(statement, 1, startMs)
         sqlite3_bind_int64(statement, 2, endMs)
 
-        let calendar = Calendar.current
         var hours: [Date] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let timestampMs = sqlite3_column_int64(statement, 0)
+            // Return actual timestamp (not normalized) so navigation can find frames
             let timestamp = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
-            // Normalize to start of hour
-            var components = calendar.dateComponents([.year, .month, .day, .hour], from: timestamp)
-            components.minute = 0
-            components.second = 0
-            if let hourDate = calendar.date(from: components) {
-                hours.append(hourDate)
-            }
+            hours.append(timestamp)
         }
 
         return hours
     }
 
     /// Query distinct hours from Rewind database (TEXT ISO8601 timestamps)
+    /// Returns the actual first frame timestamp for each hour (not normalized to :00:00)
+    /// so that navigation can find frames around that time
     private func queryDistinctHoursRewind(
         connection: DatabaseConnection,
         config: DatabaseConfig,
@@ -3280,19 +3321,13 @@ public actor DataAdapter {
         sqlite3_bind_text(statement, 1, (startISO as NSString).utf8String, -1, nil)
         sqlite3_bind_text(statement, 2, (endISO as NSString).utf8String, -1, nil)
 
-        let calendar = Calendar.current
         var hours: [Date] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             guard let cString = sqlite3_column_text(statement, 0) else { continue }
             let isoString = String(cString: cString)
+            // Return actual timestamp (not normalized) so navigation can find frames
             guard let timestamp = formatter.date(from: isoString) else { continue }
-            // Normalize to start of hour
-            var components = calendar.dateComponents([.year, .month, .day, .hour], from: timestamp)
-            components.minute = 0
-            components.second = 0
-            if let hourDate = calendar.date(from: components) {
-                hours.append(hourDate)
-            }
+            hours.append(timestamp)
         }
 
         return hours

@@ -1,6 +1,7 @@
 import SwiftUI
 import App
 import Shared
+import SQLCipher
 
 /// Main app entry point
 @main
@@ -35,12 +36,14 @@ struct RetraceApp: App {
             Button("Open Dashboard") {
                 DashboardWindowController.shared.show()
             }
-            .keyboardShortcut("d", modifiers: [.command, .shift])
+            // Note: Global hotkey is registered via HotkeyManager from saved settings
+            // Don't add a static .keyboardShortcut here as it would conflict
 
             Button("Open Timeline") {
                 TimelineWindowController.shared.toggle()
             }
-            .keyboardShortcut("t", modifiers: [.command, .shift])
+            // Note: Global hotkey is registered via HotkeyManager from saved settings
+            // Don't add a static .keyboardShortcut here as it would conflict
 
             Divider()
         }
@@ -61,7 +64,7 @@ struct RetraceApp: App {
             Divider()
 
             Button("Settings") {
-                DashboardWindowController.shared.showSettings()
+                DashboardWindowController.shared.toggleSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
         }
@@ -74,7 +77,8 @@ struct RetraceApp: App {
                     }
                 }
             }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
+            // Note: Global hotkey is registered via HotkeyManager from saved settings
+            // Don't add a static .keyboardShortcut here as it would conflict
         }
     }
 
@@ -132,6 +136,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func initializeApp() async {
+        // Pre-flight check: Ensure custom storage path is accessible (if set)
+        if !checkStoragePathAvailable() {
+            return // User chose to quit or we're waiting for them to reconnect
+        }
+
         do {
             let wrapper = AppCoordinatorWrapper()
             self.coordinatorWrapper = wrapper
@@ -183,6 +192,213 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    // MARK: - Storage Path Validation
+
+    /// Pre-flight check to ensure custom storage path is accessible
+    /// Returns true if app should continue, false if user chose to quit
+    @MainActor
+    private func checkStoragePathAvailable() -> Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
+        // Only check if user has set a custom path (not new users)
+        guard let customPath = defaults.string(forKey: "customRetraceDBLocation") else {
+            return true // Using default path, always available
+        }
+
+        let fm = FileManager.default
+        let expandedPath = NSString(string: customPath).expandingTildeInPath
+
+        // Check if the custom path itself exists
+        // User explicitly set this path, so we should verify it's there
+        if fm.fileExists(atPath: expandedPath) {
+            return true // Custom path exists
+        }
+
+        // Custom path doesn't exist - determine the appropriate message
+        let parentDir = (expandedPath as NSString).deletingLastPathComponent
+        let isDriveDisconnected = !fm.fileExists(atPath: parentDir)
+
+        Log.warning("[AppDelegate] Custom storage path not found: \(expandedPath) (drive disconnected: \(isDriveDisconnected))", category: .app)
+
+        let alert = NSAlert()
+        if isDriveDisconnected {
+            alert.messageText = "Storage Drive Not Found"
+            alert.informativeText = """
+                Retrace is configured to store data at:
+                \(customPath)
+
+                This location is not accessible. The drive may be disconnected.
+
+                What would you like to do?
+                """
+        } else {
+            alert.messageText = "Database Folder Not Found"
+            alert.informativeText = """
+                Retrace is configured to store data at:
+                \(customPath)
+
+                This folder no longer exists. It may have been moved or deleted.
+
+                What would you like to do?
+                """
+        }
+        alert.alertStyle = .warning
+
+        alert.addButton(withTitle: "Browse for Folder")
+        alert.addButton(withTitle: "Reset to Default Location")
+        alert.addButton(withTitle: "Quit")
+
+        let response = alert.runModal()
+
+        switch response {
+        case .alertFirstButtonReturn:
+            // Browse for folder - open at parent of the missing path
+            if let newPath = browseForDatabaseFolder(startingAt: parentDir) {
+                defaults.set(newPath, forKey: "customRetraceDBLocation")
+                defaults.synchronize()
+                Log.info("[AppDelegate] User selected new storage location: \(newPath)", category: .app)
+                return true
+            } else {
+                // User cancelled - show dialog again
+                return checkStoragePathAvailable()
+            }
+
+        case .alertSecondButtonReturn:
+            // Reset to default location
+            defaults.removeObject(forKey: "customRetraceDBLocation")
+            defaults.synchronize()
+            Log.info("[AppDelegate] Reset to default storage location", category: .app)
+            return true
+
+        default:
+            // Quit
+            Log.info("[AppDelegate] User chose to quit", category: .app)
+            NSApp.terminate(nil)
+            return false
+        }
+    }
+
+    /// Shows folder picker for selecting database location
+    /// Returns the selected path if valid, nil if cancelled or invalid
+    @MainActor
+    private func browseForDatabaseFolder(startingAt directory: String?) -> String? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a folder for the Retrace database"
+        panel.prompt = "Select"
+
+        // Open at the specified directory if it exists
+        if let dir = directory, FileManager.default.fileExists(atPath: dir) {
+            panel.directoryURL = URL(fileURLWithPath: dir)
+        }
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return nil
+        }
+
+        let selectedPath = url.path
+        let fm = FileManager.default
+        let dbPath = "\(selectedPath)/retrace.db"
+        let chunksPath = "\(selectedPath)/chunks"
+        let hasDatabase = fm.fileExists(atPath: dbPath)
+        let hasChunks = fm.fileExists(atPath: chunksPath)
+
+        // If has database but no chunks, ask if they want to continue
+        if hasDatabase && !hasChunks {
+            let alert = NSAlert()
+            alert.messageText = "Missing Chunks Folder"
+            alert.informativeText = "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Continue Anyway")
+            alert.addButton(withTitle: "Cancel")
+
+            if alert.runModal() != .alertFirstButtonReturn {
+                // User cancelled - let them pick again
+                return browseForDatabaseFolder(startingAt: directory)
+            }
+        }
+
+        // If no database, check if directory is empty or has other files
+        if !hasDatabase {
+            let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
+            // Filter out hidden files like .DS_Store
+            let visibleContents = contents.filter { !$0.hasPrefix(".") }
+
+            if !visibleContents.isEmpty {
+                // Folder has other files - show error dialog
+                let alert = NSAlert()
+                alert.messageText = "Invalid Folder Selection"
+                alert.informativeText = "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+
+                // Let them pick again
+                return browseForDatabaseFolder(startingAt: directory)
+            }
+        }
+
+        // Verify it's a valid Retrace database
+        if hasDatabase {
+            let verification = verifyRetraceDatabase(at: dbPath)
+            if !verification.isValid {
+                let alert = NSAlert()
+                alert.messageText = "Invalid Retrace Database"
+                alert.informativeText = verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database."
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+
+                // Let them pick again
+                return browseForDatabaseFolder(startingAt: directory)
+            }
+        }
+
+        return selectedPath
+    }
+
+    /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)
+    private func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
+        var db: OpaquePointer?
+
+        // Try to open the database
+        guard sqlite3_open(path, &db) == SQLITE_OK else {
+            let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+            sqlite3_close(db)
+            return (false, "Failed to open database: \(errorMsg)")
+        }
+
+        // Verify we can read from sqlite_master (confirms it's a valid SQLite database)
+        var testStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &testStmt, nil) == SQLITE_OK,
+              sqlite3_step(testStmt) == SQLITE_ROW else {
+            sqlite3_finalize(testStmt)
+            sqlite3_close(db)
+            return (false, "File is not a valid SQLite database.")
+        }
+        sqlite3_finalize(testStmt)
+
+        // Check for Retrace-specific tables (frame, segment, video)
+        let requiredTables = ["frame", "segment", "video"]
+        for table in requiredTables {
+            var stmt: OpaquePointer?
+            let query = "SELECT name FROM sqlite_master WHERE type='table' AND name='\(table)'"
+            guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK,
+                  sqlite3_step(stmt) == SQLITE_ROW else {
+                sqlite3_finalize(stmt)
+                sqlite3_close(db)
+                return (false, "Database is missing required '\(table)' table. This may not be a Retrace database.")
+            }
+            sqlite3_finalize(stmt)
+        }
+
+        sqlite3_close(db)
+        return (true, nil)
     }
 
     // MARK: - Sleep/Wake Handling

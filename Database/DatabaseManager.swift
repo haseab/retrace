@@ -1289,8 +1289,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         // Query Rewind's database for max IDs
-        let rewindDBPath = "~/Library/Application Support/com.memoryvault.MemoryVault/rewind.db"
-        let expandedRewindPath = NSString(string: rewindDBPath).expandingTildeInPath
+        let expandedRewindPath = NSString(string: AppPaths.rewindUnencryptedDBPath).expandingTildeInPath
 
         // Check if Rewind database exists
         guard FileManager.default.fileExists(atPath: expandedRewindPath) else {
@@ -1736,6 +1735,24 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Clear the entire processing queue (used when changing database location)
+    /// WARNING: This removes all pending OCR work! Only call when intentionally switching databases.
+    public func clearProcessingQueue() async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "DELETE FROM processing_queue;"
+        var error: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, sql, nil, nil, &error) != SQLITE_OK {
+            let errorMsg = error.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(error)
+            throw DatabaseError.queryFailed(query: sql, underlying: errorMsg)
+        }
+
+        Log.warning("[Database] Cleared processing queue (database location changed)", category: .database)
     }
 
     /// Get frame IDs that were in "processing" status (crashed during OCR)

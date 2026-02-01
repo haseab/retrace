@@ -4,10 +4,10 @@ import CoreImage
 import AppKit
 import Shared
 
-/// Imports screen recording data from Rewind AI (com.memoryvault.MemoryVault)
+/// Imports screen recording data from Rewind AI
 ///
-/// Rewind stores data in:
-/// ~/Library/Application Support/com.memoryvault.MemoryVault/chunks/YYYYMM/DD/*.mp4
+/// Rewind stores data in: `AppPaths.rewindChunksPath` (default: ~/Library/Application Support/com.memoryvault.MemoryVault/chunks) or a custom path
+/// Video files are organized as: YYYYMM/DD/*.mp4
 ///
 /// Each MP4 contains frames captured at 0.5 FPS (1 frame every 2 seconds real-time),
 /// but encoded at ~30 FPS. So a 2-second video contains ~60 frames representing
@@ -518,14 +518,7 @@ public actor RewindImporter: MigrationProtocol {
 
     /// Get the path to Rewind's chunks directory
     private func getRewindChunksPath() -> URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-
-        return appSupport
-            .appendingPathComponent("com.memoryvault.MemoryVault")
-            .appendingPathComponent("chunks")
+        return URL(fileURLWithPath: NSString(string: AppPaths.rewindChunksPath).expandingTildeInPath)
     }
 
     /// Find all MP4 files recursively in a directory

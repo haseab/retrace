@@ -225,6 +225,19 @@ public actor FrameProcessingQueue {
         }
         Log.info("[Queue-DIAG] Frame \(frameID) videoPath=\(videoSegment.relativePath)", category: .processing)
 
+        // CRITICAL: Verify video file exists before attempting any extraction
+        // This prevents infinite retry loops when database points to missing files
+        let storageRoot = await storage.getStorageDirectory()
+        let videoFullPath = storageRoot.appendingPathComponent(videoSegment.relativePath).path
+        if !FileManager.default.fileExists(atPath: videoFullPath) {
+            Log.error("[Queue] Video file not found for frame \(frameID): \(videoFullPath)", category: .processing)
+            Log.error("[Queue] This suggests database/storage path mismatch. Check AppPaths.storageRoot setting.", category: .processing)
+
+            // Mark as failed permanently - don't retry endlessly for missing files
+            try await updateFrameProcessingStatus(frameID, status: .failed)
+            return // Stop processing this frame
+        }
+
         // Check if we have cached frame data (avoids B-frame timing issues)
         let capturedFrame: CapturedFrame
         if let cachedFrame = frameDataCache[frameID] {
@@ -366,6 +379,8 @@ public actor FrameProcessingQueue {
 
     /// Retry a failed frame
     private func retryFrame(_ queuedFrame: QueuedFrame, error: Error) async throws {
+        // Reset status to pending so it can be dequeued again
+        try await updateFrameProcessingStatus(queuedFrame.frameID, status: .pending)
         try await databaseManager.retryFrameProcessing(
             frameID: queuedFrame.frameID,
             retryCount: queuedFrame.retryCount + 1,
@@ -531,11 +546,19 @@ public actor FrameProcessingQueue {
             return true
         }
 
+        // NSCocoaErrorDomain Code=516 = file already exists (temp symlink conflict)
+        // This happens when multiple workers try to extract from same video simultaneously
+        // Retrying won't help - need to fix the temp file handling, but don't spam retries
+        if nsError.domain == "NSCocoaErrorDomain" && nsError.code == 516 {
+            return true
+        }
+
         // Check error message for common indicators
         if errorDescription.contains("cannot open") ||
            errorDescription.contains("media may be damaged") ||
            errorDescription.contains("file not found") ||
-           errorDescription.contains("no such file") {
+           errorDescription.contains("no such file") ||
+           errorDescription.contains("file with the same name already exists") {
             return true
         }
 

@@ -1,12 +1,13 @@
 import Foundation
 import SQLCipher
+import Shared
 
 // Rewind database path and password
-let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-let dbPath = "\(homeDir)/Library/Application Support/com.memoryvault.MemoryVault/db-enc.sqlite3"
+let dbPath = NSString(string: AppPaths.rewindDBPath).expandingTildeInPath
 let password = "soiZ58XZJhdka55hLUp18yOtTUTDXz7Diu7Z4JzuwhRwGG13N6Z9RTVU1fGiKkuF"
 
 // Output file path
+let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
 let outputPath = "\(homeDir)/Desktop/rewind_segments.txt"
 
 print("Opening Rewind database at: \(dbPath)")

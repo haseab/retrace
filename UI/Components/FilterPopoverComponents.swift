@@ -286,6 +286,7 @@ public struct AppsFilterPopover: View {
     let selectedApps: Set<String>?
     let filterMode: AppFilterMode
     let allowMultiSelect: Bool
+    let showAllOption: Bool
     let onSelectApp: (String?) -> Void
     let onFilterModeChange: ((AppFilterMode) -> Void)?
     var onDismiss: (() -> Void)?
@@ -306,6 +307,7 @@ public struct AppsFilterPopover: View {
         selectedApps: Set<String>?,
         filterMode: AppFilterMode = .include,
         allowMultiSelect: Bool = false,
+        showAllOption: Bool = true,
         onSelectApp: @escaping (String?) -> Void,
         onFilterModeChange: ((AppFilterMode) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
@@ -315,6 +317,7 @@ public struct AppsFilterPopover: View {
         self.selectedApps = selectedApps
         self.filterMode = filterMode
         self.allowMultiSelect = allowMultiSelect
+        self.showAllOption = showAllOption
         self.onSelectApp = onSelectApp
         self.onFilterModeChange = onFilterModeChange
         self.onDismiss = onDismiss
@@ -375,8 +378,8 @@ public struct AppsFilterPopover: View {
     private var selectableBundleIDs: [String?] {
         var ids: [String?] = []
 
-        // "All Apps" option (only in include mode and not searching)
-        if filterMode == .include && searchText.isEmpty {
+        // "All Apps" option (only in include mode and not searching, when showAllOption is true)
+        if showAllOption && filterMode == .include && searchText.isEmpty {
             ids.append(nil)
         }
 
@@ -454,6 +457,8 @@ public struct AppsFilterPopover: View {
         FilterPopoverContainer {
             // Search field
             FilterSearchField(text: $searchText, placeholder: "Search apps...", isFocused: $isSearchFocused)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
 
             // Include/Exclude toggle (only shown if filter mode change is supported)
             if hasFilterModeSupport {
@@ -486,8 +491,8 @@ public struct AppsFilterPopover: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        // "All Apps" option (only in include mode and when not searching)
-                        if filterMode == .include && searchText.isEmpty {
+                        // "All Apps" option (only in include mode, when not searching, and when showAllOption is true)
+                        if showAllOption && filterMode == .include && searchText.isEmpty {
                             FilterRow(
                                 systemIcon: "square.grid.2x2.fill",
                                 title: "All Apps",
@@ -647,6 +652,7 @@ public struct TagsFilterPopover: View {
     let selectedTags: Set<Int64>?
     let filterMode: TagFilterMode
     let allowMultiSelect: Bool
+    let showAllOption: Bool
     let onSelectTag: (TagID?) -> Void
     let onFilterModeChange: ((TagFilterMode) -> Void)?
     var onDismiss: (() -> Void)?
@@ -666,6 +672,7 @@ public struct TagsFilterPopover: View {
         selectedTags: Set<Int64>?,
         filterMode: TagFilterMode = .include,
         allowMultiSelect: Bool = false,
+        showAllOption: Bool = true,
         onSelectTag: @escaping (TagID?) -> Void,
         onFilterModeChange: ((TagFilterMode) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
@@ -674,6 +681,7 @@ public struct TagsFilterPopover: View {
         self.selectedTags = selectedTags
         self.filterMode = filterMode
         self.allowMultiSelect = allowMultiSelect
+        self.showAllOption = showAllOption
         self.onSelectTag = onSelectTag
         self.onFilterModeChange = onFilterModeChange
         self.onDismiss = onDismiss
@@ -716,8 +724,8 @@ public struct TagsFilterPopover: View {
     private var selectableTagIDs: [Int64?] {
         var ids: [Int64?] = []
 
-        // "All Tags" option (only in include mode and not searching)
-        if filterMode == .include && searchText.isEmpty {
+        // "All Tags" option (only in include mode and not searching, when showAllOption is true)
+        if showAllOption && filterMode == .include && searchText.isEmpty {
             ids.append(nil)
         }
 
@@ -793,6 +801,8 @@ public struct TagsFilterPopover: View {
         FilterPopoverContainer(width: 220) {
             // Search field
             FilterSearchField(text: $searchText, placeholder: "Search tags...", isFocused: $isSearchFocused)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
 
             // Include/Exclude toggle (only shown if filter mode change is supported)
             if hasFilterModeSupport {
@@ -847,8 +857,8 @@ public struct TagsFilterPopover: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 0) {
-                            // "All Tags" option (only in include mode and when not searching)
-                            if filterMode == .include && searchText.isEmpty {
+                            // "All Tags" option (only in include mode, when not searching, and when showAllOption is true)
+                            if showAllOption && filterMode == .include && searchText.isEmpty {
                                 FilterRow(
                                     systemIcon: "tag",
                                     title: "All Tags",

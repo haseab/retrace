@@ -65,10 +65,11 @@ await migration.cancelImport(source: .rewind)
 
 ## Rewind Data Format
 
-Rewind stores data in:
+Rewind stores data in `AppPaths.rewindChunksPath`:
 ```
-~/Library/Application Support/com.memoryvault.MemoryVault/chunks/YYYYMM/DD/*.mp4
+{rewindStorageRoot}/chunks/YYYYMM/DD/*.mp4
 ```
+Default: `~/Library/Application Support/com.memoryvault.MemoryVault/chunks/`
 
 Each MP4:
 - ~2-5 seconds of video at ~30 FPS

@@ -14,7 +14,7 @@ import Shared
 // ║                     OCR PIPELINE INTEGRATION TEST                            ║
 // ║                                                                              ║
 // ║  Tests the full pipeline: JPEG files → OCR → Video → Database → Search      ║
-// ║  Uses real screenshot data from /Users/haseab/ScreenMemoryData              ║
+// ║  Set TEST_SCREENSHOT_PATH environment variable to point to test data        ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 final class OCRPipelineTests: XCTestCase {
@@ -27,14 +27,20 @@ final class OCRPipelineTests: XCTestCase {
     var processing: ProcessingManager!
     var search: SearchManager!
 
-    /// Path to test screenshots
-    let screenshotPath = "/Users/haseab/ScreenMemoryData/screenshots/2026/01/11/07"
+    /// Path to test screenshots (set via TEST_SCREENSHOT_PATH env var)
+    var screenshotPath: String {
+        ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"] ?? NSString(string: "~/ScreenMemoryData/screenshots").expandingTildeInPath
+    }
 
-    /// Database path for this test
-    let testDatabasePath = NSString(string: "~/Library/Application Support/Retrace/retrace.db").expandingTildeInPath
+    /// Database path for this test (uses AppPaths which respects custom location)
+    var testDatabasePath: String {
+        NSString(string: AppPaths.databasePath).expandingTildeInPath
+    }
 
-    /// Storage root for video segments (DirectoryManager will create segments/ subdirectory)
-    let storageRoot = URL(fileURLWithPath: NSString(string: "~/Library/Application Support/Retrace").expandingTildeInPath)
+    /// Storage root for video segments (uses AppPaths which respects custom location)
+    var storageRoot: URL {
+        URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+    }
 
     // MARK: - Setup/Teardown
 
@@ -44,8 +50,7 @@ final class OCRPipelineTests: XCTestCase {
         print(String(repeating: "═", count: 70))
 
         // Create directories if needed
-        let retraceDir = NSString(string: "~/Library/Application Support/Retrace").expandingTildeInPath
-        try FileManager.default.createDirectory(atPath: retraceDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: AppPaths.expandedStorageRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
         // Initialize managers with real database path

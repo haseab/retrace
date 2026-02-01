@@ -17,6 +17,7 @@ public actor OnboardingManager {
     private static let onboardingVersionKey = "onboardingVersion"
     private static let timelineShortcutKey = "timelineShortcutConfig"
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
+    private static let recordingShortcutKey = "recordingShortcutConfig"
     private static let hasRewindDataKey = "hasRewindData"
     private static let rewindMigrationCompletedKey = "rewindMigrationCompleted"
 
@@ -52,6 +53,15 @@ public actor OnboardingManager {
         guard let data = settingsDefaults.data(forKey: Self.dashboardShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultDashboard
+        }
+        return config
+    }
+
+    /// Recording shortcut configuration (key + modifiers)
+    public var recordingShortcut: ShortcutConfig {
+        guard let data = settingsDefaults.data(forKey: Self.recordingShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultRecording
         }
         return config
     }
@@ -113,6 +123,14 @@ public actor OnboardingManager {
         }
     }
 
+    /// Set recording shortcut (full config with key + modifiers)
+    public func setRecordingShortcut(_ config: ShortcutConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            settingsDefaults.set(data, forKey: Self.recordingShortcutKey)
+            Log.info("Recording shortcut set to: \(config.displayString)", category: .app)
+        }
+    }
+
     // MARK: - Rewind Data
 
     public func setHasRewindData(_ hasData: Bool) {
@@ -134,6 +152,7 @@ public actor OnboardingManager {
         settingsDefaults.removeObject(forKey: Self.onboardingVersionKey)
         settingsDefaults.removeObject(forKey: Self.timelineShortcutKey)
         settingsDefaults.removeObject(forKey: Self.dashboardShortcutKey)
+        settingsDefaults.removeObject(forKey: Self.recordingShortcutKey)
         settingsDefaults.removeObject(forKey: Self.hasRewindDataKey)
         settingsDefaults.removeObject(forKey: Self.rewindMigrationCompletedKey)
         Log.info("Onboarding state reset", category: .app)

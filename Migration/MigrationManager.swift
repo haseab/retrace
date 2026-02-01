@@ -22,10 +22,8 @@ public actor MigrationManager {
         self.database = database
         self.processing = processing
 
-        let stateDir = stateDirectory ?? FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!.appendingPathComponent("Retrace/Migration")
+        let stateDir = stateDirectory ?? URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+            .appendingPathComponent("Migration")
 
         self.stateStore = MigrationStateStore(directory: stateDir)
     }

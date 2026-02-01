@@ -159,7 +159,7 @@ final class StorageManagerTests: XCTestCase {
         _ = try createFakeSegmentFile(root: root, id: id1, date: now, ext: "hevc", size: 123, modDate: now)
         _ = try createFakeSegmentFile(root: root, id: id2, date: now, ext: "hevc", size: 456, modDate: now)
 
-        let total = try await storage.getTotalStorageUsed()
+        let total = try await storage.getTotalStorageUsed(includeRewind: false)
         XCTAssertEqual(total, 123 + 456)
 
         try? FileManager.default.removeItem(at: root)

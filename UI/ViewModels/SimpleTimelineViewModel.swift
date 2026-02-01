@@ -1745,14 +1745,22 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Show "no results" message and provide option to clear filters
     private func showNoResultsMessage() {
-        error = "No frames found matching the current filters. Clear filters to see all frames."
+        showErrorWithAutoDismiss("No frames found matching the current filters. Clear filters to see all frames.")
+    }
+
+    /// Show an error message that auto-dismisses after a delay
+    /// - Parameters:
+    ///   - message: The error message to display
+    ///   - seconds: Time in seconds before auto-dismissing (default: 5)
+    private func showErrorWithAutoDismiss(_ message: String, seconds: UInt64 = 5) {
+        error = message
 
         // Cancel any existing dismiss task
         errorDismissTask?.cancel()
 
-        // Auto-dismiss after 5 seconds
+        // Auto-dismiss after specified seconds
         errorDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 seconds
+            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
             if !Task.isCancelled {
                 error = nil
             }
@@ -2047,7 +2055,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 if filterCriteria.hasActiveFilters {
                     showNoResultsMessage()
                 } else {
-                    error = "No frames found in any database"
+                    showErrorWithAutoDismiss("No frames found in any database")
                 }
                 isLoading = false
                 logTabClickTiming("VM_NO_FRAMES", startTime: startTime)
@@ -2127,7 +2135,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             if filterCriteria.hasActiveFilters {
                 showNoResultsMessage()
             } else {
-                error = "No frames found in any database"
+                showErrorWithAutoDismiss("No frames found in any database")
             }
             isLoading = false
             logTabClickTiming("VM_LOAD_DIRECT_NO_FRAMES", startTime: startTime)
@@ -2668,17 +2676,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // If we have videoInfo (optimized JOIN query result), use it directly
                 // This avoids expensive database lookups for video path resolution
                 if let videoInfo = timelineFrame.videoInfo {
-                    // Extract filename from full path (e.g., "/path/chunks/202601/1768624554519" -> "1768624554519")
-                    let videoPath = videoInfo.videoPath
-                    let filename = (videoPath as NSString).lastPathComponent
-                    guard let filenameID = Int64(filename) else {
-                        throw NSError(domain: "SimpleTimelineViewModel", code: 400,
-                                    userInfo: [NSLocalizedDescriptionKey: "Invalid video path format: \(videoPath)"])
-                    }
-
-                    // Use optimized direct read (NO database lookups!)
-                    imageData = try await coordinator.getFrameImageDirect(
-                        filenameID: filenameID,
+                    // Read directly from the full video path (works for both Retrace and Rewind)
+                    imageData = try await coordinator.getFrameImageFromPath(
+                        videoPath: videoInfo.videoPath,
                         frameIndex: videoInfo.frameIndex
                     )
                 } else {
@@ -4118,6 +4118,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Mark as actively scrolling (disables tape animation) - only when actually moving
         isActivelyScrolling = true
 
+        // Dismiss context menus when scrolling
+        dismissContextMenu()
+        dismissTimelineContextMenu()
+
         // Cancel previous debounce task since we're moving to a new frame
         scrollDebounceTask?.cancel()
 
@@ -4242,7 +4246,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    /// Load hours with frames for a specific date
+    /// Load hours with frames for a specific date (displays available hours in the picker)
     public func loadHoursForDate(_ date: Date) async {
         do {
             let hours = try await coordinator.getDistinctHoursForDate(date)
@@ -4278,7 +4282,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found around \(targetDate)"
+                showErrorWithAutoDismiss("No frames found around \(targetDate)")
                 isLoading = false
                 return
             }
@@ -4353,7 +4357,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[DateSearch] Got \(framesWithVideoInfo.count) frames", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found around \(targetDate)"
+                showErrorWithAutoDismiss("No frames found around \(targetDate)")
                 isLoading = false
                 return
             }
@@ -4427,7 +4431,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[FrameIDSearch] Got \(framesWithVideoInfo.count) frames in window", category: .ui)
 
             guard !framesWithVideoInfo.isEmpty else {
-                error = "No frames found around frame #\(frameID)"
+                showErrorWithAutoDismiss("No frames found around frame #\(frameID)")
                 isLoading = false
                 return false
             }

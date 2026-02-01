@@ -47,7 +47,7 @@ final class DatabaseManagerTests: XCTestCase {
     // └─────────────────────────────────────────────────────────────────────────┘
 
     func testActualDatabaseMigration() async throws {
-        let dbPath = "~/Library/Application Support/Retrace/retrace.db"
+        let dbPath = AppPaths.databasePath
         let db = DatabaseManager(databasePath: dbPath)
 
         try await db.initialize()

@@ -96,3 +96,10 @@ Package.resolved
 # Development scripts (consolidated into build_and_sign.sh and dev.sh)
 build_debug.sh
 run_debug.sh
+
+# Icon generation utility scripts (contain hardcoded local paths)
+regenerate_small_icons.py
+svg_to_icons.py
+fill_triangles.py
+make_transparent.py
+fix_triangles.py

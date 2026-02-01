@@ -13,9 +13,12 @@
 
 set -e  # Exit on error
 
+# Get storage root from app settings or default
+source "$(dirname "$0")/_get_storage_root.sh"
+
 BUNDLE_ID="io.retrace.app"
 DEFAULTS_DOMAIN="Retrace"  # App uses "Retrace" for UserDefaults.standard
-APP_SUPPORT_DIR="$HOME/Library/Application Support/Retrace"
+APP_SUPPORT_DIR="$RETRACE_STORAGE_ROOT"
 PREFERENCES_DIR="$HOME/Library/Preferences"
 CACHES_DIR="$HOME/Library/Caches/$BUNDLE_ID"
 

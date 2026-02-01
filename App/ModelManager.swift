@@ -46,12 +46,8 @@ public actor ModelManager {
         if let modelsDirectory = modelsDirectory {
             self.modelsDirectory = modelsDirectory
         } else {
-            let appSupport = FileManager.default.urls(
-                for: .applicationSupportDirectory,
-                in: .userDomainMask
-            ).first!
-            self.modelsDirectory = appSupport
-                .appendingPathComponent("Retrace")
+            // Use AppPaths which respects custom storage location
+            self.modelsDirectory = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
                 .appendingPathComponent("models")
         }
     }

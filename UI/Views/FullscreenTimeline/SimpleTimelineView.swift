@@ -265,7 +265,7 @@ public struct SimpleTimelineView: View {
                         }
 
                     VStack {
-                        Spacer() 
+                        Spacer() 
                         HStack {
                             Spacer()
                             FilterPanel(viewModel: viewModel)
@@ -399,7 +399,7 @@ public struct SimpleTimelineView: View {
                     Text("Could not find frame")
                         .font(.retraceBody)
                         .foregroundColor(.white.opacity(0.5))
-                    Text("Video file missing")
+                    Text("Video file missing: \(path.suffix(50))")
                         .font(.retraceCaption)
                         .foregroundColor(.white.opacity(0.3))
                 }
@@ -423,13 +423,14 @@ public struct SimpleTimelineView: View {
                             get: { viewModel.forceVideoReload },
                             set: { viewModel.forceVideoReload = $0 }
                         ), onLoadFailed: {
-                            // Don't set frameNotReady=true for completed frames (processingStatus=2)
+                            // Don't set frameNotReady=true for completed frames (processingStatus=2) or Rewind frames (-1)
                             // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
-                            if viewModel.currentTimelineFrame?.processingStatus != 2 {
+                            let status = viewModel.currentTimelineFrame?.processingStatus
+                            if status != 2 && status != -1 {
                                 viewModel.frameNotReady = true
                                 viewModel.frameLoadError = false
                             } else {
-                                // For completed frames, this is a real error
+                                // For completed frames or Rewind frames, this is a real error
                                 viewModel.frameNotReady = false
                                 viewModel.frameLoadError = true
                             }
@@ -815,17 +816,15 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         if actualVideoPath.hasSuffix(".mp4") {
             url = URL(fileURLWithPath: actualVideoPath)
         } else {
+            // Use UUID to avoid conflicts when multiple views create symlinks for same video
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4").path
 
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
-                    return
-                }
+            do {
+                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+            } catch {
+                Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
+                return
             }
             url = URL(fileURLWithPath: symlinkPath)
         }
@@ -2690,6 +2689,7 @@ struct DebugFrameIDBadge: View {
                     if let timelineFrame = viewModel.currentTimelineFrame {
                         let status = timelineFrame.processingStatus
                         let statusText = switch status {
+                            case -1: "N/A (Rewind)"
                             case 0: "pending"
                             case 1: "processing"
                             case 2: "completed"
@@ -2699,7 +2699,7 @@ struct DebugFrameIDBadge: View {
                         }
                         Text("p=\(status) (\(statusText))")
                             .font(.retraceMonoSmall)
-                            .foregroundColor(status == 4 ? .red.opacity(0.8) : status == 2 ? .green.opacity(0.8) : .yellow.opacity(0.8))
+                            .foregroundColor(status == -1 ? .blue.opacity(0.8) : status == 4 ? .red.opacity(0.8) : status == 2 ? .green.opacity(0.8) : .yellow.opacity(0.8))
                     }
                 }
             }

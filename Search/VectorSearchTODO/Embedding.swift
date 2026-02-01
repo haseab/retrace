@@ -1,4 +1,5 @@
 import Foundation
+import Shared
 
 // MARK: - Embedding Types
 
@@ -41,7 +42,7 @@ public struct EmbeddingConfig: Sendable {
 
     /// Default configuration for Nomic Embed v1.5
     public static let nomicEmbed = EmbeddingConfig(
-        modelPath: "~/Library/Application Support/Retrace/models/nomic-embed-text-v1.5.Q4_K_M.gguf",
+        modelPath: AppPaths.modelsPath + "/nomic-embed-text-v1.5.Q4_K_M.gguf",
         contextSize: 8192,
         gpuLayers: -1,
         batchSize: 512,
