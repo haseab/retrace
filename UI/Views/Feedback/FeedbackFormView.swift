@@ -12,26 +12,6 @@ public struct FeedbackFormView: View {
 
     private let liveChatURL = URL(string: "https://retrace.to/chat")!
 
-    // MARK: - Debug Logging
-
-    private func debugLog(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
-        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: path.path) {
-                if let handle = try? FileHandle(forWritingTo: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: path)
-            }
-        }
-    }
-
     // MARK: - Body
 
     public var body: some View {

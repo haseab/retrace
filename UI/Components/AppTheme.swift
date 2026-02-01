@@ -2,24 +2,6 @@ import SwiftUI
 import AppKit
 import Shared
 
-/// Debug logging helper for appearance changes
-private func themeDebugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let logMessage = "[\(timestamp)] \(message)\n"
-    if let data = logMessage.data(using: .utf8) {
-        let fileURL = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if let handle = try? FileHandle(forWritingTo: fileURL) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: fileURL)
-        }
-    }
-}
-
 /// Retrace design system
 /// Provides consistent colors, typography, and spacing across the UI
 public struct AppTheme {
@@ -977,12 +959,9 @@ public enum RetraceFont {
             return .default
         }
         set {
-            themeDebugLog("[RetraceFont.currentStyle setter] Setting to: \(newValue.rawValue)")
             settingsStore?.set(newValue.rawValue, forKey: fontStyleKey)
-            themeDebugLog("[RetraceFont.currentStyle setter] Saved to UserDefaults, posting notification")
             // Post notification so views can update
             DispatchQueue.main.async {
-                themeDebugLog("[RetraceFont.currentStyle setter] Posting fontStyleDidChange notification")
                 NotificationCenter.default.post(name: .fontStyleDidChange, object: newValue)
             }
         }

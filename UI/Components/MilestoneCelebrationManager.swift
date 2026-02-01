@@ -3,24 +3,6 @@ import Combine
 import App
 import Shared
 
-/// Debug logging helper for color theme changes
-private func colorThemeDebugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let logMessage = "[\(timestamp)] \(message)\n"
-    if let data = logMessage.data(using: .utf8) {
-        let fileURL = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if let handle = try? FileHandle(forWritingTo: fileURL) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: fileURL)
-        }
-    }
-}
-
 /// Manages milestone celebration dialogs that appear at 10, 100, 1000, and 10000 hours of screen time
 /// Each milestone is shown only once
 ///
@@ -191,12 +173,9 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Set the user's color theme preference
     public nonisolated static func setColorThemePreference(_ theme: ColorTheme) {
-        colorThemeDebugLog("[setColorThemePreference] Setting to: \(theme.rawValue)")
         settingsStore?.set(theme.rawValue, forKey: colorThemePreferenceKey)
-        colorThemeDebugLog("[setColorThemePreference] Saved to UserDefaults, posting notification")
         // Post notification so views can update
         DispatchQueue.main.async {
-            colorThemeDebugLog("[setColorThemePreference] Posting colorThemeDidChange notification")
             NotificationCenter.default.post(name: .colorThemeDidChange, object: theme)
         }
     }

@@ -5,24 +5,6 @@ import App
 import ScreenCaptureKit
 import SQLCipher
 
-/// Debug logging helper for Settings appearance changes
-private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let logMessage = "[\(timestamp)] \(message)\n"
-    if let data = logMessage.data(using: .utf8) {
-        let fileURL = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            if let handle = try? FileHandle(forWritingTo: fileURL) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: fileURL)
-        }
-    }
-}
-
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore = UserDefaults(suiteName: "io.retrace.app")
 
@@ -751,16 +733,11 @@ public struct SettingsView: View {
                         ColorThemePicker(
                             selection: Binding(
                                 get: {
-                                    let current = MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
-                                    debugLog("[ColorThemePicker] get binding: colorThemePreference=\(colorThemePreference), resolved=\(current.rawValue)")
-                                    return current
+                                    MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
                                 },
                                 set: { newValue in
-                                    debugLog("[ColorThemePicker] set binding: newValue=\(newValue.rawValue)")
                                     colorThemePreference = newValue.rawValue
-                                    debugLog("[ColorThemePicker] colorThemePreference updated to: \(colorThemePreference)")
                                     MilestoneCelebrationManager.setColorThemePreference(newValue)
-                                    debugLog("[ColorThemePicker] setColorThemePreference called")
                                 }
                             )
                         )
@@ -2681,9 +2658,7 @@ private struct FontStylePicker: View {
         HStack(spacing: 8) {
             ForEach(RetraceFontStyle.allCases) { style in
                 Button(action: {
-                    debugLog("[FontStylePicker Button] Tapped style: \(style.rawValue) (design: \(style.design)), current selection: \(selection.rawValue) (design: \(selection.design))")
                     selection = style
-                    debugLog("[FontStylePicker Button] After assignment, selection: \(selection.rawValue) (design: \(selection.design))")
                 }) {
                     VStack(spacing: 8) {
                         // Preview text in the actual font style
@@ -2744,9 +2719,7 @@ private struct ColorThemePicker: View {
         let isSelected = selection == theme
 
         Button(action: {
-            debugLog("[ColorThemePicker Button] Tapped theme: \(theme.rawValue), current selection: \(selection.rawValue)")
             selection = theme
-            debugLog("[ColorThemePicker Button] After assignment, selection: \(selection.rawValue)")
         }) {
             VStack(spacing: 8) {
                 // Color swatch preview
@@ -4657,19 +4630,6 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
             }
 
             let newShortcut = SettingsShortcutKey(key: keyName, modifiers: modifiers)
-
-            // Debug logging
-            let debugLog = """
-            === Shortcut Capture Debug ===
-            New shortcut: key="\(newShortcut.key)" modifiers=\(newShortcut.modifiers.rawValue)
-            Other shortcuts:
-            \(parent.otherShortcuts.enumerated().map { "  [\($0.offset)] key=\"\($0.element.key)\" modifiers=\($0.element.modifiers.rawValue)" }.joined(separator: "\n"))
-            Contains check result: \(parent.otherShortcuts.contains(newShortcut))
-            Individual comparisons:
-            \(parent.otherShortcuts.map { "  \($0.key)==\(newShortcut.key)? \($0.key == newShortcut.key), mods \($0.modifiers.rawValue)==\(newShortcut.modifiers.rawValue)? \($0.modifiers == newShortcut.modifiers)" }.joined(separator: "\n"))
-            ==============================
-            """
-            try? debugLog.write(toFile: "/tmp/retrace_debug.log", atomically: true, encoding: .utf8)
 
             // Check for duplicate against all other shortcuts
             if parent.otherShortcuts.contains(newShortcut) {

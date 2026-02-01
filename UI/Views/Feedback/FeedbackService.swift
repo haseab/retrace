@@ -79,24 +79,6 @@ public final class FeedbackService {
         )
     }
 
-    private func debugLog(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
-        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: path.path) {
-                if let handle = try? FileHandle(forWritingTo: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: path)
-            }
-        }
-    }
-
     /// Collect diagnostics without any logs (instant, for immediate display)
     /// Database stats should be passed in, logs will show as empty
     public func collectDiagnosticsNoLogs(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {

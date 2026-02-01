@@ -601,7 +601,6 @@ public actor StorageManager: StorageProtocol {
             }
         }
 
-        logStorageTiming("  getTotalStorageUsed enumerated \(fileCount) files")
         return totalSize
     }
 
@@ -715,20 +714,6 @@ public actor StorageManager: StorageProtocol {
         }
 
         return (size, fileCount)
-    }
-
-    /// Log to dashboard timing file for performance diagnostics
-    private func logStorageTiming(_ message: String) {
-        let logPath = "/tmp/dashboard_timing.log"
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let line = "[\(timestamp)] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if let handle = FileHandle(forWritingAtPath: logPath) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        }
     }
 
     public func getAvailableDiskSpace() async throws -> Int64 {
