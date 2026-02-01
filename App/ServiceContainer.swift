@@ -540,6 +540,11 @@ public actor ServiceContainer {
         try await database.getAppSessionCount()
     }
 
+    /// Get quick database statistics (single query, for feedback diagnostics)
+    public func getDatabaseStatsQuick() async throws -> (frameCount: Int, sessionCount: Int) {
+        try await database.getStatisticsQuick()
+    }
+
     /// Get search statistics
     public func getSearchStats() async -> SearchStatistics {
         await search.getStatistics()
@@ -608,6 +613,9 @@ extension CaptureConfig {
             }
         }
 
+        // Capture on window change - instantly capture when switching apps/windows
+        let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
+
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
@@ -615,7 +623,8 @@ extension CaptureConfig {
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,
-            showCursor: showCursor
+            showCursor: showCursor,
+            captureOnWindowChange: captureOnWindowChange
         )
     }
 }

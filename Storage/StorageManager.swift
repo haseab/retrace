@@ -264,7 +264,8 @@ public actor StorageManager: StorageProtocol {
                     withDestinationPath: url.path
                 )
             } catch {
-                throw error
+                Log.error("[StorageManager] Failed to create symlink for segment \(segmentID): \(symlinkPath.path)", category: .storage, error: error)
+                throw StorageError.fileWriteFailed(path: symlinkPath.path, underlying: error.localizedDescription)
             }
             assetURL = symlinkPath
         }
@@ -312,6 +313,7 @@ public actor StorageManager: StorageProtocol {
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
             guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                Log.warning("[StorageManager] Skipping frame - no image buffer at PTS \(String(format: "%.3f", pts.seconds))s, segment \(segmentID)", category: .storage)
                 continue
             }
 
@@ -319,6 +321,7 @@ public actor StorageManager: StorageProtocol {
             let ciImage = CIImage(cvPixelBuffer: imageBuffer)
             let context = CIContext(options: nil)
             guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+                Log.warning("[StorageManager] Failed to create CGImage at PTS \(String(format: "%.3f", pts.seconds))s, segment \(segmentID)", category: .storage)
                 continue
             }
 
@@ -571,12 +574,14 @@ public actor StorageManager: StorageProtocol {
 
     public func getTotalStorageUsed(includeRewind: Bool = false) async throws -> Int64 {
         var totalSize: Int64 = 0
+        var fileCount = 0
 
         // Retrace storage: chunks/ folder + retrace.db
         let retraceChunksURL = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
         let retraceDbURL = storageRootURL.appendingPathComponent("retrace.db")
-        let retraceChunksSize = calculateFolderSize(at: retraceChunksURL)
+        let (retraceChunksSize, retraceFileCount) = calculateFolderSizeWithCount(at: retraceChunksURL)
         totalSize += retraceChunksSize
+        fileCount += retraceFileCount
 
         if let dbSize = try? retraceDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
             totalSize += Int64(dbSize)
@@ -587,14 +592,16 @@ public actor StorageManager: StorageProtocol {
             let rewindURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
             let rewindChunksURL = rewindURL.appendingPathComponent("chunks", isDirectory: true)
             let rewindDbURL = rewindURL.appendingPathComponent("db-enc.sqlite3")
-            let rewindChunksSize = calculateFolderSize(at: rewindChunksURL)
+            let (rewindChunksSize, rewindFileCount) = calculateFolderSizeWithCount(at: rewindChunksURL)
             totalSize += rewindChunksSize
+            fileCount += rewindFileCount
 
             if let dbSize = try? rewindDbURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]).totalFileAllocatedSize {
                 totalSize += Int64(dbSize)
             }
         }
 
+        logStorageTiming("  getTotalStorageUsed enumerated \(fileCount) files")
         return totalSize
     }
 
@@ -632,8 +639,36 @@ public actor StorageManager: StorageProtocol {
         return totalSize
     }
 
-    /// Recursively calculate the total size of a folder in bytes (actual disk allocation)
+    /// Get the total allocated size of a folder (fast version using du)
     private func calculateFolderSize(at url: URL) -> Int64 {
+        // Use du -sk for fast kernel-level size calculation
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
+        process.arguments = ["-sk", url.path]  // -s = summary, -k = kilobytes
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8),
+               let sizeStr = output.split(separator: "\t").first,
+               let sizeKB = Int64(sizeStr) {
+                return sizeKB * 1024  // Convert KB to bytes
+            }
+        } catch {
+            // Fallback on error
+        }
+
+        return calculateFolderSizeFallback(at: url)
+    }
+
+    /// Fallback: enumerate files if du fails
+    private func calculateFolderSizeFallback(at url: URL) -> Int64 {
         let fileManager = FileManager.default
         var totalSize: Int64 = 0
 
@@ -652,12 +687,48 @@ public actor StorageManager: StorageProtocol {
                     totalSize += Int64(fileSize)
                 }
             } catch {
-                // Skip files we can't read
                 continue
             }
         }
 
         return totalSize
+    }
+
+    /// Get folder size with file count (for diagnostics only)
+    private func calculateFolderSizeWithCount(at url: URL) -> (size: Int64, fileCount: Int) {
+        let size = calculateFolderSize(at: url)
+        // For file count, we still need to enumerate but this is only used for diagnostics
+        let fileManager = FileManager.default
+        var fileCount = 0
+
+        if let enumerator = fileManager.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for case let fileURL as URL in enumerator {
+                if let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+                   values.isRegularFile == true {
+                    fileCount += 1
+                }
+            }
+        }
+
+        return (size, fileCount)
+    }
+
+    /// Log to dashboard timing file for performance diagnostics
+    private func logStorageTiming(_ message: String) {
+        let logPath = "/tmp/dashboard_timing.log"
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        let line = "[\(timestamp)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if let handle = FileHandle(forWritingAtPath: logPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            }
+        }
     }
 
     public func getAvailableDiskSpace() async throws -> Int64 {

@@ -56,7 +56,7 @@ public final class HEVCStorageExtractor: ImageExtractor {
 /// Image extractor for Rewind's MP4 videos using AVFoundation
 /// Handles the symlink hack needed for extensionless MP4 files
 public final class AVAssetExtractor: ImageExtractor {
-    private let imageCache = NSCache<NSString, NSData>()
+    private nonisolated(unsafe) let imageCache = NSCache<NSString, NSData>()
     private let storageRoot: String
 
     public init(storageRoot: String) {

@@ -95,7 +95,7 @@ public actor AppCoordinator {
             do {
                 try await recoverFromCrash()
             } catch {
-                Log.error("Background crash recovery failed: \(error)", category: .app)
+                Log.error("[AppCoordinator] Background crash recovery failed", category: .app, error: error)
             }
         }
 
@@ -207,7 +207,7 @@ public actor AppCoordinator {
 
             Log.info("[ORPHAN-RECOVERY] Completed - enqueued \(totalEnqueued) orphaned frames for OCR processing", category: .app)
         } catch {
-            Log.error("[ORPHAN-RECOVERY] Failed to re-enqueue orphaned frames: \(error)", category: .app)
+            Log.error("[ORPHAN-RECOVERY] Failed to re-enqueue orphaned frames", category: .app, error: error)
         }
     }
 
@@ -567,7 +567,7 @@ public actor AppCoordinator {
 
             } catch let error as StorageError {
                 totalErrors += 1
-                Log.error("Pipeline error processing frame: \(error)", category: .app)
+                Log.error("[Pipeline] Error processing frame", category: .app, error: error)
 
                 // If it's a file write failure, the writer is broken - remove it so a fresh one is created
                 if case .fileWriteFailed = error {
@@ -581,7 +581,7 @@ public actor AppCoordinator {
                 continue
             } catch {
                 totalErrors += 1
-                Log.error("Pipeline error processing frame: \(error)", category: .app)
+                Log.error("[Pipeline] Error processing frame", category: .app, error: error)
                 continue
             }
         }
@@ -610,7 +610,7 @@ public actor AppCoordinator {
                     }
                 }
             } catch {
-                Log.error("Failed to save video segment for \(resolutionKey): \(error)", category: .app)
+                Log.error("[Pipeline] Failed to save video segment for \(resolutionKey)", category: .app, error: error)
             }
         }
 
@@ -1160,6 +1160,17 @@ public actor AppCoordinator {
         try await services.database.getTagsForSegment(segmentId: segmentId)
     }
 
+    /// Delete a tag entirely
+    public func deleteTag(tagId: TagID) async throws {
+        try await services.database.deleteTag(tagId: tagId)
+        Log.info("[AppCoordinator] Deleted tag \(tagId.value)", category: .app)
+    }
+
+    /// Get the count of segments that have a specific tag
+    public func getSegmentCountForTag(tagId: TagID) async throws -> Int {
+        try await services.database.getSegmentCountForTag(tagId: tagId)
+    }
+
     /// Get all segment IDs that have the "hidden" tag
     public func getHiddenSegmentIds() async throws -> Set<SegmentID> {
         return try await services.database.getHiddenSegmentIds()
@@ -1575,6 +1586,11 @@ public actor AppCoordinator {
         try await services.getAppSessionCount()
     }
 
+    /// Get quick database statistics (single query, for feedback diagnostics)
+    public func getDatabaseStatisticsQuick() async throws -> (frameCount: Int, sessionCount: Int) {
+        try await services.getDatabaseStatsQuick()
+    }
+
     /// Get current pipeline status
     public func getStatus() -> PipelineStatus {
         PipelineStatus(
@@ -1652,6 +1668,11 @@ public actor AppCoordinator {
         try await services.database.analyze()
 
         Log.info("Database maintenance complete", category: .app)
+    }
+
+    /// Get database schema description for debugging
+    public func getDatabaseSchemaDescription() async throws -> String {
+        try await services.database.getSchemaDescription()
     }
 }
 
@@ -1780,7 +1801,7 @@ private final class MigrationProgressDelegate: MigrationDelegate, @unchecked Sen
     }
 
     func migrationDidFailProcessingVideo(at path: String, error: Error) {
-        Log.error("Failed processing video: \(path) - \(error)", category: .app)
+        Log.error("[Migration] Failed processing video: \(path)", category: .app, error: error)
     }
 
     func migrationDidComplete(result: MigrationResult) {
@@ -1788,6 +1809,6 @@ private final class MigrationProgressDelegate: MigrationDelegate, @unchecked Sen
     }
 
     func migrationDidFail(error: Error) {
-        Log.error("Migration failed: \(error)", category: .app)
+        Log.error("[Migration] Failed", category: .app, error: error)
     }
 }

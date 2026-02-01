@@ -42,8 +42,9 @@ public final class FeedbackService {
 
     /// Collect current diagnostic information with real database stats from provider
     public func collectDiagnostics(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
-        let logs = collectRecentLogs()
-        let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
+        // Use file-based logs for submission (more complete, includes all logs)
+        let logs = Log.getRecentLogs(maxCount: 500)
+        let errors = Log.getRecentErrors(maxCount: 50)
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -55,6 +56,60 @@ public final class FeedbackService {
             databaseStats: stats,
             recentErrors: errors,
             recentLogs: logs
+        )
+    }
+
+    /// Collect diagnostics quickly for preview using in-memory log buffer (instant)
+    /// This avoids the slow OSLogStore query entirely
+    public func collectDiagnosticsQuick(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
+        // Use the fast file-based log buffer instead of OSLogStore
+        let logs = Log.getRecentLogs(maxCount: 100)
+        let errors = Log.getRecentErrors(maxCount: 20)
+
+        return DiagnosticInfo(
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            macOSVersion: macOSVersion,
+            deviceModel: deviceModel,
+            totalDiskSpace: totalDiskSpace,
+            freeDiskSpace: freeDiskSpace,
+            databaseStats: stats,
+            recentErrors: errors,
+            recentLogs: logs
+        )
+    }
+
+    private func debugLog(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let handle = try? FileHandle(forWritingTo: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: path)
+            }
+        }
+    }
+
+    /// Collect diagnostics without any logs (instant, for immediate display)
+    /// Database stats should be passed in, logs will show as empty
+    public func collectDiagnosticsNoLogs(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
+        return DiagnosticInfo(
+            appVersion: appVersion,
+            buildNumber: buildNumber,
+            macOSVersion: macOSVersion,
+            deviceModel: deviceModel,
+            totalDiskSpace: totalDiskSpace,
+            freeDiskSpace: freeDiskSpace,
+            databaseStats: stats,
+            recentErrors: [],
+            recentLogs: []
         )
     }
 
@@ -152,21 +207,25 @@ public final class FeedbackService {
 
     // MARK: - Log Collection
 
-    /// Collect recent logs from the last hour using OSLogStore
-    private func collectRecentLogs() -> [String] {
+    /// Collect recent logs using OSLogStore
+    /// - Parameters:
+    ///   - minutes: Time window to fetch logs from (default 60 minutes)
+    ///   - maxEntries: Maximum number of log entries to return (default 200)
+    /// - Returns: Array of formatted log strings
+    private func collectRecentLogs(minutes: Int = 60, maxEntries: Int = 200) -> [String] {
         guard #available(macOS 12.0, *) else {
             return ["Log collection requires macOS 12.0+"]
         }
 
         do {
             let store = try OSLogStore(scope: .currentProcessIdentifier)
-            let oneHourAgo = Date().addingTimeInterval(-3600) // Last 1 hour
-            let position = store.position(date: oneHourAgo)
+            let startTime = Date().addingTimeInterval(-Double(minutes * 60))
+            let position = store.position(date: startTime)
 
             let entries = try store.getEntries(at: position)
                 .compactMap { $0 as? OSLogEntryLog }
                 .filter { $0.subsystem == "io.retrace.app" }
-                .suffix(500) // Limit to last 500 entries to avoid huge payloads
+                .suffix(maxEntries)
 
             return entries.map { entry in
                 let timestamp = ISO8601DateFormatter().string(from: entry.date)
@@ -229,10 +288,10 @@ public final class FeedbackService {
             Log.info("[FeedbackService] Feedback submitted successfully", category: .app)
             return true
         } catch let urlError as URLError {
-            Log.error("[FeedbackService] Network error: \(urlError.localizedDescription) (code: \(urlError.code.rawValue))", category: .app)
+            Log.error("[FeedbackService] Network error (code: \(urlError.code.rawValue))", category: .app, error: urlError)
             throw FeedbackError.networkError(urlError.localizedDescription)
         } catch {
-            Log.error("[FeedbackService] Submission error: \(error.localizedDescription)", category: .app)
+            Log.error("[FeedbackService] Submission error", category: .app, error: error)
             throw error
         }
     }

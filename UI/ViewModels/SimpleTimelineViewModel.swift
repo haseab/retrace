@@ -164,6 +164,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Static image for displaying the current frame (for image-based sources like Retrace)
     @Published public var currentImage: NSImage?
 
+    /// Whether the timeline is in "live mode" showing a live screenshot
+    /// When true, the liveScreenshot is displayed instead of historical frames
+    /// Exits to historical frames on first scroll/navigation
+    @Published public var isInLiveMode: Bool = false
+
+    /// The live screenshot captured at timeline launch (only used when isInLiveMode == true)
+    @Published public var liveScreenshot: NSImage?
+
+    /// Whether the tape is hidden (off-screen below) - used for slide-up animation in live mode
+    @Published public var isTapeHidden: Bool = false
+
     /// Whether the current frame is not yet available in the video file (still encoding)
     @Published public var frameNotReady: Bool = false {
         willSet {
@@ -2283,7 +2294,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// and also refreshes videoInfo for frames whose status changed
     public func refreshProcessingStatuses() async {
         // Find all frames that aren't completed (status != 2)
-        let framesToRefresh = frames.enumerated() // .filter { $0.element.processingStatus != 2 }
+        let framesToRefresh = Array(frames.enumerated()) // .filter { $0.element.processingStatus != 2 }
 
         guard !framesToRefresh.isEmpty else {
             Log.debug("[TIMELINE-REFRESH] No frames need status refresh (all completed)", category: .ui)
@@ -2366,7 +2377,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int) {
-        let oldIndex = currentIndex
+        // Exit live mode on explicit navigation
+        if isInLiveMode {
+            exitLiveMode()
+        }
+
         // Clamp to valid range
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
@@ -2614,6 +2629,24 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
         return stem
+    }
+
+    /// Exit live mode and transition to historical frames
+    /// Called on first scroll/navigation after timeline launch
+    private func exitLiveMode() {
+        guard isInLiveMode else { return }
+
+        Log.info("[TIMELINE-LIVE] Exiting live mode, transitioning to historical frames", category: .ui)
+        isInLiveMode = false
+        liveScreenshot = nil
+        isTapeHidden = false  // Reset animation state
+
+        // If frames are already loaded, show the most recent
+        if !frames.isEmpty {
+            currentIndex = frames.count - 1
+            loadImageIfNeeded()
+        }
+        // If frames are still loading, they'll be displayed when ready
     }
 
     /// Load image for image-based frames (Retrace) if needed
@@ -4087,6 +4120,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     ///   - delta: The scroll delta value
     ///   - isTrackpad: Whether the scroll came from a trackpad (precise scrolling) vs mouse wheel
     public func handleScroll(delta: CGFloat, isTrackpad: Bool = true) async {
+        // Exit live mode on first scroll
+        if isInLiveMode {
+            exitLiveMode()
+            return // First scroll exits live mode, don't navigate yet
+        }
+
         guard !frames.isEmpty else {
             // print("[SimpleTimelineViewModel] handleScroll: frames is empty, ignoring")
             return
@@ -4186,9 +4225,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the timeline is currently showing the most recent frame
     /// Returns true only when at the last frame and no newer frames exist
     public var isAtMostRecentFrame: Bool {
+        return isNearMostRecentFrame(within: 1)
+    }
+
+    /// Whether the timeline is within N frames of the most recent
+    /// - Parameter within: Number of frames from the end to consider "near" (1 = last frame only, 2 = last 2 frames, etc.)
+    public func isNearMostRecentFrame(within count: Int) -> Bool {
         guard !frames.isEmpty else { return true }
-        // Show "Go to Now" button if not at the last loaded frame OR if there are more newer frames available
-        return currentIndex >= frames.count - 1 && !hasMoreNewer
+        return currentIndex >= frames.count - count && !hasMoreNewer
     }
 
     /// Whether to show the "Go to Now" button

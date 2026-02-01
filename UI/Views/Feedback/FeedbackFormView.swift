@@ -10,7 +10,27 @@ public struct FeedbackFormView: View {
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
     @Environment(\.dismiss) private var dismiss
 
-    private let liveChatURL = URL(string: "https://retrace.to")!
+    private let liveChatURL = URL(string: "https://retrace.to/chat")!
+
+    // MARK: - Debug Logging
+
+    private func debugLog(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let handle = try? FileHandle(forWritingTo: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: path)
+            }
+        }
+    }
 
     // MARK: - Body
 
@@ -29,6 +49,31 @@ public struct FeedbackFormView: View {
         .frame(width: 480, height: 540)
         .onAppear {
             viewModel.setCoordinator(coordinatorWrapper)
+            setupEscapeKeyHandler()
+        }
+        .onDisappear {
+            removeEscapeKeyHandler()
+        }
+    }
+
+    // MARK: - Escape Key Handling
+
+    @State private var escapeKeyMonitor: Any?
+
+    private func setupEscapeKeyHandler() {
+        escapeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            if event.keyCode == 53 { // Escape key
+                dismiss()
+                return nil // Consume the event
+            }
+            return event
+        }
+    }
+
+    private func removeEscapeKeyHandler() {
+        if let monitor = escapeKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            escapeKeyMonitor = nil
         }
     }
 
@@ -70,36 +115,68 @@ public struct FeedbackFormView: View {
     // MARK: - Form View
 
     private var formView: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            // Header
-            header
+        ScrollViewReader { scrollProxy in
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 14) {
+                    // Header
+                    header
 
-            // Feedback Type Picker
-            feedbackTypeSection
+                    // Feedback Type Picker
+                    feedbackTypeSection
 
-            // Email
-            emailSection
+                    // Email
+                    emailSection
 
-            // Description
-            descriptionSection
+                    // Description
+                    descriptionSection
 
-            // Diagnostics Preview
-            diagnosticsSection
+                    // Diagnostics Preview - expands downward only
+                    diagnosticsSection
+                        .id("diagnostics")
 
-            // Image Attachment
-            imageAttachmentSection
+                    // Image Attachment
+                    imageAttachmentSection
 
-            // Error
-            if let error = viewModel.error {
-                errorBanner(error)
+                    // Error
+                    if let error = viewModel.error {
+                        errorBanner(error)
+                    }
+
+                    Spacer(minLength: 80)
+                }
+                .padding(20)
+                .padding(.bottom, 80) // Extra padding for action buttons
             }
+            .overlay(alignment: .bottom) {
+                // Action buttons fixed at bottom
+                VStack(spacing: 0) {
+                    // Gradient fade at top of button area
+                    LinearGradient(
+                        colors: [
+                            Color.retraceBackground.opacity(0),
+                            Color.retraceBackground.opacity(0.8),
+                            Color.retraceBackground
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 40)
 
-            Spacer(minLength: 0)
-
-            // Actions
-            actionButtons
+                    actionButtons
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 20)
+                        .background(Color.retraceBackground)
+                }
+            }
+            .onChange(of: viewModel.showDiagnosticsDetail) { isExpanded in
+                if isExpanded {
+                    // Scroll to diagnostics section when expanded
+                    withAnimation {
+                        scrollProxy.scrollTo("diagnostics", anchor: .top)
+                    }
+                }
+            }
         }
-        .padding(20)
     }
 
     // MARK: - Header
@@ -294,12 +371,28 @@ public struct FeedbackFormView: View {
                     .background(Color.white.opacity(0.06))
 
                 if let diagnostics = viewModel.diagnostics {
-                    Text(diagnostics.formattedText())
-                        .font(.retraceMonoSmall)
-                        .foregroundColor(.retraceSecondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(maxHeight: 100)
+                    VStack(spacing: 0) {
+                        ScrollView {
+                            Text(diagnostics.fullFormattedText())
+                                .font(.retraceMonoSmall)
+                                .foregroundColor(.retraceSecondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                        }
+                        .frame(height: 280)
+                        .background(Color.black.opacity(0.2))
+                        .cornerRadius(6)
+
+                        // Log count indicator
+                        HStack {
+                            Spacer()
+                            Text("(Last \(diagnostics.recentLogs.count) log entries)")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.5))
+                        }
+                        .padding(.top, 4)
+                    }
                 } else {
                     HStack {
                         SpinnerView(size: 16, lineWidth: 2)

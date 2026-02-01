@@ -66,6 +66,8 @@ public class TimelineWindowController: NSObject {
     private var localEventMonitor: Any?
     private var timelineViewModel: SimpleTimelineViewModel?
     private var hostingView: NSView?
+    private var tapeShowAnimationTask: Task<Void, Never>?
+    private var isHiding = false
 
     // MARK: - Emergency Escape (CGEvent tap for when main thread is blocked)
 
@@ -85,6 +87,9 @@ public class TimelineWindowController: NSObject {
 
     /// When the timeline was last hidden (for cache expiry check)
     private var lastHiddenAt: Date?
+
+    /// Cached live screenshot for instant toggle without re-capture
+    private var cachedLiveScreenshot: NSImage?
 
     /// Timer that periodically refreshes timeline data in the background
     private var backgroundRefreshTimer: Timer?
@@ -276,6 +281,8 @@ public class TimelineWindowController: NSObject {
         // Create the view model
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
+        // Pre-set tape as hidden so view renders with tape off-screen initially
+        viewModel.isTapeHidden = true
         Log.info("[TIMELINE-PRERENDER] 📊 ViewModel created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
         // Create the SwiftUI view
@@ -321,15 +328,43 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Show/Hide
 
-    /// Show the timeline overlay on the current screen
-    public func show() {
+	    /// Show the timeline overlay on the current screen
+	    public func show() {
         // Start performance tracking
         startPerfTrace()
+
+        // If we're in the middle of hiding, cancel the animation and snap back to visible
+        if isHiding, let window = window {
+            isHiding = false
+            // Cancel any running animation by setting duration to 0
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0
+                window.animator().alphaValue = 1
+            })
+            isVisible = true
+            Self.isTimelineVisible = true
+            logShowTiming("cancelled hide, snapping back to visible")
+            return
+        }
 
         guard !isVisible, let coordinator = coordinator else {
             return
         }
         logShowTiming("guard passed")
+
+        // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
+        // Otherwise, user was viewing a historical frame and should see that instead
+        let shouldUseLiveMode = timelineViewModel?.isNearMostRecentFrame(within: 2) ?? true
+
+        let liveScreenshot: NSImage?
+        if shouldUseLiveMode {
+            // Always capture fresh screenshot
+            liveScreenshot = captureLiveScreenshot()
+            logShowTiming("live screenshot captured")
+        } else {
+            liveScreenshot = nil
+            logShowTiming("skipped live screenshot - playhead not at latest frame")
+        }
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -342,12 +377,21 @@ public class TimelineWindowController: NSObject {
         }
         logShowTiming("screen detected")
 
-        // Don't stop the background refresh timer - let it keep running
-        // The timer callback checks isVisible and skips refresh while timeline is open
+	        // Don't stop the background refresh timer - let it keep running
+	        // The timer callback checks isVisible and skips refresh while timeline is open
 
         // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, timelineViewModel != nil {
+        if isPrepared, let window = window, let viewModel = timelineViewModel {
             logShowTiming("using prerendered window")
+
+            // Set live mode with captured screenshot
+            if let screenshot = liveScreenshot {
+                viewModel.isInLiveMode = true
+                viewModel.liveScreenshot = screenshot
+                logShowTiming("live mode activated")
+            }
+            viewModel.isTapeHidden = true
+            tapeShowAnimationTask?.cancel()
 
             // Move window to target screen if needed (instant, no recreation)
             if window.frame != targetScreen.frame {
@@ -370,12 +414,21 @@ public class TimelineWindowController: NSObject {
         logShowTiming("no prerendered window, creating new")
 
         // Fallback: Create window from scratch (original behavior)
-        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
-        let newWindow = createWindow(for: targetScreen)
+	        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
+	        let newWindow = createWindow(for: targetScreen)
 
-        // Create and store the view model so we can forward scroll events
+	        // Create and store the view model so we can forward scroll events
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
+        viewModel.isTapeHidden = true
+        tapeShowAnimationTask?.cancel()
+
+        // Set live mode with captured screenshot
+        if let screenshot = liveScreenshot {
+            viewModel.isInLiveMode = true
+            viewModel.liveScreenshot = screenshot
+            logShowTiming("live mode activated (fallback)")
+        }
 
         guard let coordinatorWrapper = coordinatorWrapper else {
             Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
@@ -402,15 +455,23 @@ public class TimelineWindowController: NSObject {
         self.window = newWindow
         self.hostingView = hostingView
         self.isPrepared = true
-        
+
         // Show the window
         showPreparedWindow(coordinator: coordinator)
+
+        // Start async frame loading in background (non-blocking)
+        Task {
+            await viewModel.loadMostRecentFrame()
+            logShowTiming("background frame load complete (fallback)")
+        }
     }
 
     /// Show the prepared window with animation and setup event monitors
     private func showPreparedWindow(coordinator: AppCoordinator) {
         logShowTiming("showPreparedWindow started")
         guard let window = window else { return }
+        timelineViewModel?.isTapeHidden = true
+        tapeShowAnimationTask?.cancel()
 
         // Log current view model state before showing
         if let viewModel = timelineViewModel {
@@ -420,7 +481,8 @@ public class TimelineWindowController: NSObject {
 
         // Force video reload BEFORE showing window to avoid flicker
         // This ensures AVPlayer loads fresh video data with any new frames
-        if let viewModel = timelineViewModel, viewModel.frames.count > 1 {
+        // Skip this when in live mode since we're showing a live screenshot instead
+        if let viewModel = timelineViewModel, !viewModel.isInLiveMode, viewModel.frames.count > 1 {
             viewModel.forceVideoReload = true
             let original = viewModel.currentIndex
             viewModel.currentIndex = max(0, original - 1)
@@ -428,22 +490,33 @@ public class TimelineWindowController: NSObject {
         }
         logShowTiming("video reload triggered")
 
+        let isLive = (timelineViewModel?.isInLiveMode ?? false) && timelineViewModel?.liveScreenshot != nil
+        window.alphaValue = isLive ? 1 : 0
+
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         window.makeKeyAndOrderFront(nil)
         logShowTiming("makeKeyAndOrderFront")
 
-        // Animate in
-        window.alphaValue = 0
-        isVisible = true  // Set before animation so window.isVisible check works
+        isVisible = true
         Self.isTimelineVisible = true  // For emergency escape tap
-        NSAnimationContext.runAnimationGroup({ [weak self] context in
-            context.duration = 0.2
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
-        }, completionHandler: { [weak self] in
-            self?.logShowTiming("✅ animation complete")
-            self?.showStartTime = 0  // Reset for next show
-        })
+
+        // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
+        if !isLive {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.35
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                window.animator().alphaValue = 1
+            })
+        }
+
+        // Trigger tape slide-up animation (Cmd+H style)
+        tapeShowAnimationTask = Task { @MainActor in
+            await Task.yield()
+            guard let viewModel = self.timelineViewModel, !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                viewModel.isTapeHidden = false
+            }
+        }
 
         // Track timeline open event
         DashboardViewModel.recordTimelineOpen(coordinator: coordinator)
@@ -466,7 +539,8 @@ public class TimelineWindowController: NSObject {
 
     /// Hide the timeline overlay
     public func hide() {
-        guard isVisible, let window = window else { return }
+        guard isVisible, let window = window, !isHiding else { return }
+        isHiding = true
 
         // Record timeline session duration (only if > 3 seconds)
         if let startTime = sessionStartTime, let coordinator = coordinator {
@@ -485,19 +559,35 @@ public class TimelineWindowController: NSObject {
         // Don't save position on hide - window stays in memory
         // Position is only saved on app termination (see savePositionForTermination)
 
+        // Cancel any running fade-in animation before starting fade-out
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0
+            window.animator().alphaValue = window.alphaValue  // Snap to current value
+        })
+
+        tapeShowAnimationTask?.cancel()
+        if let viewModel = timelineViewModel {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                viewModel.isTapeHidden = true
+            }
+        }
+
         // Remove event monitors
         removeEventMonitors()
 
         // Animate out
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.15
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor in
+                self?.isHiding = false
                 // Only hide dashboard if it wasn't the active window before timeline opened
                 // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
-                if self?.dashboardWasKeyWindow != true {
+                // Also don't hide if a modal sheet (feedback form, etc.) is attached
+                if self?.dashboardWasKeyWindow != true,
+                   DashboardWindowController.shared.window?.attachedSheet == nil {
                     DashboardWindowController.shared.hide()
                 }
 
@@ -508,6 +598,13 @@ public class TimelineWindowController: NSObject {
                 Self.isTimelineVisible = false  // For emergency escape tap
                 self?.lastHiddenAt = Date()
                 self?.startBackgroundRefreshTimer()
+
+                // Clean up live mode state AFTER fade-out completes (prevents flicker)
+                if let viewModel = self?.timelineViewModel {
+                    viewModel.isInLiveMode = false
+                    viewModel.liveScreenshot = nil
+                    viewModel.isTapeHidden = true
+                }
 
                 // Immediately refresh frame data so next open has fresh data
                 // Use navigateToNewest: false to preserve user's position within the 2-minute grace period
@@ -550,6 +647,31 @@ public class TimelineWindowController: NSObject {
         }
     }
 
+    /// Capture a live screenshot for seamless timeline launch
+    /// Returns NSImage of the current screen, or nil on failure
+    private func captureLiveScreenshot() -> NSImage? {
+        // Get the screen where the mouse cursor is located
+        let mouseLocation = NSEvent.mouseLocation
+        guard let targetScreen = NSScreen.screens.first(where: {
+            NSMouseInRect(mouseLocation, $0.frame, false)
+        }) ?? NSScreen.main else {
+            return nil
+        }
+
+        // Get display ID for this screen
+        guard let screenNumber = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            return nil
+        }
+
+        // Capture the screen
+        guard let cgImage = CGDisplayCreateImage(screenNumber) else {
+            Log.warning("[TIMELINE-LIVE] Failed to capture live screenshot", category: .ui)
+            return nil
+        }
+
+        return NSImage(cgImage: cgImage, size: targetScreen.frame.size)
+    }
+
     /// Start a repeating timer that keeps timeline data fresh while hidden
     private func startBackgroundRefreshTimer() {
         // Don't restart if already running
@@ -574,9 +696,9 @@ public class TimelineWindowController: NSObject {
                     return
                 }
 
-                // Check if position cache has expired (2 minutes)
+                // Check if position cache has expired (1 minute)
                 // If expired, navigate to newest; if not expired, preserve user's position
-                let cacheExpirationSeconds: TimeInterval = 120
+                let cacheExpirationSeconds: TimeInterval = 60
                 let cacheExpired: Bool
                 if let lastHidden = self.lastHiddenAt {
                     cacheExpired = Date().timeIntervalSince(lastHidden) > cacheExpirationSeconds
@@ -585,7 +707,7 @@ public class TimelineWindowController: NSObject {
                 }
 
                 Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered (cacheExpired: \(cacheExpired))", category: .ui)
-                // Only preserve position if cache hasn't expired; after 2 minutes, navigate to newest
+                // Only preserve position if cache hasn't expired; after 1 minute, navigate to newest
                 await viewModel.refreshFrameData(navigateToNewest: cacheExpired)
                 // Force video reload so AVPlayer picks up new frames appended to the video file
                 viewModel.forceVideoReload = true
@@ -707,11 +829,13 @@ public class TimelineWindowController: NSObject {
         }
 
         // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, timelineViewModel != nil {
+        if isPrepared, let window = window, let viewModel = timelineViewModel {
             // Move window to target screen if needed
             if window.frame != targetScreen.frame {
                 window.setFrame(targetScreen.frame, display: false)
             }
+            // Ensure tape starts hidden for slide-up animation
+            viewModel.isTapeHidden = true
             return
         }
 
@@ -719,6 +843,8 @@ public class TimelineWindowController: NSObject {
         let newWindow = createWindow(for: targetScreen)
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
+        // Pre-set tape as hidden so view renders with tape off-screen initially
+        viewModel.isTapeHidden = true
 
         guard let coordinatorWrapper = coordinatorWrapper else {
             Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
@@ -748,6 +874,10 @@ public class TimelineWindowController: NSObject {
     private func fadeInPreparedWindow() {
         guard let window = window, let coordinator = coordinator else { return }
 
+        // Ensure tape starts hidden and cancel any pending animation
+        timelineViewModel?.isTapeHidden = true
+        tapeShowAnimationTask?.cancel()
+
         // Force video reload before showing
         if let viewModel = timelineViewModel, viewModel.frames.count > 1 {
             viewModel.forceVideoReload = true
@@ -756,17 +886,26 @@ public class TimelineWindowController: NSObject {
             viewModel.currentIndex = original
         }
 
-        // Make window visible but transparent
+        // Fade in for filter/historical path (data already loaded)
         window.alphaValue = 0
         window.makeKeyAndOrderFront(nil)
         isVisible = true
+        Self.isTimelineVisible = true
 
-        // Fade in (same 0.2s as normal timeline open)
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.2
+            context.duration = 0.35
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 1
         })
+
+        // Trigger tape slide-up animation
+        tapeShowAnimationTask = Task { @MainActor in
+            await Task.yield()
+            guard let viewModel = self.timelineViewModel, !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                viewModel.isTapeHidden = false
+            }
+        }
 
         // Track timeline open event
         DashboardViewModel.recordTimelineOpen(coordinator: coordinator)
@@ -820,6 +959,7 @@ public class TimelineWindowController: NSObject {
 
         // Configure window properties
         window.level = .screenSaver
+        window.animationBehavior = .none
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = false
@@ -1458,5 +1598,22 @@ class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         return true
+    }
+}
+
+// MARK: - String Extension for Debug Logging
+extension String {
+    func appendToFile(at path: String) throws {
+        if let data = self.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path) {
+                if let fileHandle = FileHandle(forWritingAtPath: path) {
+                    fileHandle.seekToEndOfFile()
+                    fileHandle.write(data)
+                    fileHandle.closeFile()
+                }
+            } else {
+                try self.write(toFile: path, atomically: false, encoding: .utf8)
+            }
+        }
     }
 }

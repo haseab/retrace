@@ -2,6 +2,24 @@ import SwiftUI
 import AppKit
 import Shared
 
+/// Debug logging helper for appearance changes
+private func themeDebugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logMessage = "[\(timestamp)] \(message)\n"
+    if let data = logMessage.data(using: .utf8) {
+        let fileURL = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            if let handle = try? FileHandle(forWritingTo: fileURL) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+}
+
 /// Retrace design system
 /// Provides consistent colors, typography, and spacing across the UI
 public struct AppTheme {
@@ -946,17 +964,27 @@ public enum RetraceFont {
     /// UserDefaults key for font preference
     private static let fontStyleKey = "retraceFontStyle"
 
+    /// Shared UserDefaults store (same as Settings uses)
+    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+
     /// The current font style (persisted in UserDefaults)
     public static var currentStyle: RetraceFontStyle {
         get {
-            if let rawValue = UserDefaults.standard.string(forKey: fontStyleKey),
+            if let rawValue = settingsStore?.string(forKey: fontStyleKey),
                let style = RetraceFontStyle(rawValue: rawValue) {
                 return style
             }
             return .default
         }
         set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: fontStyleKey)
+            themeDebugLog("[RetraceFont.currentStyle setter] Setting to: \(newValue.rawValue)")
+            settingsStore?.set(newValue.rawValue, forKey: fontStyleKey)
+            themeDebugLog("[RetraceFont.currentStyle setter] Saved to UserDefaults, posting notification")
+            // Post notification so views can update
+            DispatchQueue.main.async {
+                themeDebugLog("[RetraceFont.currentStyle setter] Posting fontStyleDidChange notification")
+                NotificationCenter.default.post(name: .fontStyleDidChange, object: newValue)
+            }
         }
     }
 
@@ -978,45 +1006,45 @@ public enum RetraceFont {
 
 extension Font {
     // MARK: Display (Hero text, large numbers)
-    public static let retraceDisplay = RetraceFont.font(size: 48, weight: .bold)
-    public static let retraceDisplay2 = RetraceFont.font(size: 36, weight: .bold)
-    public static let retraceDisplay3 = RetraceFont.font(size: 32, weight: .bold)
+    public static var retraceDisplay: Font { RetraceFont.font(size: 48, weight: .bold) }
+    public static var retraceDisplay2: Font { RetraceFont.font(size: 36, weight: .bold) }
+    public static var retraceDisplay3: Font { RetraceFont.font(size: 32, weight: .bold) }
 
     // MARK: Titles
-    public static let retraceTitle = RetraceFont.font(size: 28, weight: .bold)
-    public static let retraceTitle2 = RetraceFont.font(size: 22, weight: .bold)
-    public static let retraceTitle3 = RetraceFont.font(size: 20, weight: .semibold)
+    public static var retraceTitle: Font { RetraceFont.font(size: 28, weight: .bold) }
+    public static var retraceTitle2: Font { RetraceFont.font(size: 22, weight: .bold) }
+    public static var retraceTitle3: Font { RetraceFont.font(size: 20, weight: .semibold) }
 
     // MARK: Large Numbers (for stats/metrics display)
-    public static let retraceLargeNumber = RetraceFont.font(size: 28, weight: .bold)
-    public static let retraceMediumNumber = RetraceFont.font(size: 24, weight: .semibold)
+    public static var retraceLargeNumber: Font { RetraceFont.font(size: 28, weight: .bold) }
+    public static var retraceMediumNumber: Font { RetraceFont.font(size: 24, weight: .semibold) }
 
     // MARK: Body Text
-    public static let retraceHeadline = RetraceFont.font(size: 17, weight: .semibold)
-    public static let retraceBody = RetraceFont.font(size: 15, weight: .regular)
-    public static let retraceBodyMedium = RetraceFont.font(size: 15, weight: .medium)
-    public static let retraceBodyBold = RetraceFont.font(size: 15, weight: .semibold)
-    public static let retraceCallout = RetraceFont.font(size: 14, weight: .regular)
-    public static let retraceCalloutMedium = RetraceFont.font(size: 14, weight: .medium)
-    public static let retraceCalloutBold = RetraceFont.font(size: 14, weight: .semibold)
+    public static var retraceHeadline: Font { RetraceFont.font(size: 17, weight: .semibold) }
+    public static var retraceBody: Font { RetraceFont.font(size: 15, weight: .regular) }
+    public static var retraceBodyMedium: Font { RetraceFont.font(size: 15, weight: .medium) }
+    public static var retraceBodyBold: Font { RetraceFont.font(size: 15, weight: .semibold) }
+    public static var retraceCallout: Font { RetraceFont.font(size: 14, weight: .regular) }
+    public static var retraceCalloutMedium: Font { RetraceFont.font(size: 14, weight: .medium) }
+    public static var retraceCalloutBold: Font { RetraceFont.font(size: 14, weight: .semibold) }
 
     // MARK: Small Text
-    public static let retraceCaption = RetraceFont.font(size: 13, weight: .regular)
-    public static let retraceCaptionMedium = RetraceFont.font(size: 13, weight: .medium)
-    public static let retraceCaptionBold = RetraceFont.font(size: 13, weight: .semibold)
-    public static let retraceCaption2 = RetraceFont.font(size: 11, weight: .regular)
-    public static let retraceCaption2Medium = RetraceFont.font(size: 11, weight: .medium)
-    public static let retraceCaption2Bold = RetraceFont.font(size: 11, weight: .semibold)
+    public static var retraceCaption: Font { RetraceFont.font(size: 13, weight: .regular) }
+    public static var retraceCaptionMedium: Font { RetraceFont.font(size: 13, weight: .medium) }
+    public static var retraceCaptionBold: Font { RetraceFont.font(size: 13, weight: .semibold) }
+    public static var retraceCaption2: Font { RetraceFont.font(size: 11, weight: .regular) }
+    public static var retraceCaption2Medium: Font { RetraceFont.font(size: 11, weight: .medium) }
+    public static var retraceCaption2Bold: Font { RetraceFont.font(size: 11, weight: .semibold) }
 
     // MARK: Tiny Text (for labels, badges)
-    public static let retraceTiny = RetraceFont.font(size: 10, weight: .regular)
-    public static let retraceTinyMedium = RetraceFont.font(size: 10, weight: .medium)
-    public static let retraceTinyBold = RetraceFont.font(size: 10, weight: .semibold)
+    public static var retraceTiny: Font { RetraceFont.font(size: 10, weight: .regular) }
+    public static var retraceTinyMedium: Font { RetraceFont.font(size: 10, weight: .medium) }
+    public static var retraceTinyBold: Font { RetraceFont.font(size: 10, weight: .semibold) }
 
     // MARK: Monospace (for IDs, technical data - always uses monospaced design)
-    public static let retraceMono = RetraceFont.mono(size: 13)
-    public static let retraceMonoSmall = RetraceFont.mono(size: 11)
-    public static let retraceMonoLarge = RetraceFont.mono(size: 15)
+    public static var retraceMono: Font { RetraceFont.mono(size: 13) }
+    public static var retraceMonoSmall: Font { RetraceFont.mono(size: 11) }
+    public static var retraceMonoLarge: Font { RetraceFont.mono(size: 15) }
 }
 
 // MARK: - Spacing
@@ -1805,4 +1833,11 @@ public struct PingDotView: View {
             }
         }
     }
+}
+
+// MARK: - Notifications
+
+extension Notification.Name {
+    /// Posted when the font style preference changes
+    public static let fontStyleDidChange = Notification.Name("fontStyleDidChange")
 }

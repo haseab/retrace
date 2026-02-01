@@ -21,6 +21,10 @@ actor DisplaySwitchMonitor {
     /// Callback when accessibility permission is denied
     nonisolated(unsafe) var onAccessibilityPermissionDenied: (@Sendable () async -> Void)?
 
+    /// Callback when active window changes (app switch or window focus change within app)
+    /// Fires for immediate capture when captureOnWindowChange is enabled
+    nonisolated(unsafe) var onWindowChange: (@Sendable () async -> Void)?
+
     // MARK: - Initialization
 
     init(displayMonitor: DisplayMonitor) {
@@ -42,6 +46,10 @@ actor DisplaySwitchMonitor {
 
             // Observe when user switches to a different application
             for await _ in center.notifications(named: NSWorkspace.didActivateApplicationNotification) {
+                // Notify window change for immediate capture (app switch)
+                if let callback = self.onWindowChange {
+                    await callback()
+                }
                 await self.checkForDisplaySwitch()
                 // Re-setup AX observer for the new frontmost app
                 await self.setupAXObserverForFrontmostApp()
@@ -80,7 +88,7 @@ actor DisplaySwitchMonitor {
             guard let refcon = refcon else { return }
             let monitor = Unmanaged<DisplaySwitchMonitorRef>.fromOpaque(refcon).takeUnretainedValue()
             Task {
-                await monitor.monitor.checkForDisplaySwitch()
+                await monitor.monitor.handleWindowChangeFromAX()
             }
         }, &observer)
 
@@ -95,9 +103,10 @@ actor DisplaySwitchMonitor {
         let refWrapper = DisplaySwitchMonitorRef(monitor: self)
         let refPtr = Unmanaged.passRetained(refWrapper).toOpaque()
 
-        // Add notifications for window moved and focused window changed
+        // Add notifications for window moved, focused window changed, and title changed
         AXObserverAddNotification(observer, appElement, kAXMovedNotification as CFString, refPtr)
         AXObserverAddNotification(observer, appElement, kAXFocusedWindowChangedNotification as CFString, refPtr)
+        AXObserverAddNotification(observer, appElement, kAXTitleChangedNotification as CFString, refPtr)
 
         // Add observer to run loop on main actor
         await MainActor.run {
@@ -122,6 +131,17 @@ actor DisplaySwitchMonitor {
     }
 
     // MARK: - Private Methods
+
+    /// Handle window change from AX observer (window focus change within app)
+    /// Triggers immediate capture callback and then checks for display switch
+    func handleWindowChangeFromAX() async {
+        // Notify window change for immediate capture
+        if let callback = onWindowChange {
+            await callback()
+        }
+        // Then check for display switch
+        await checkForDisplaySwitch()
+    }
 
     /// Check if the active window is on a different display
     private func checkForDisplaySwitch() async {

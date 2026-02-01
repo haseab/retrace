@@ -78,11 +78,11 @@ public final class FeedbackViewModel: ObservableObject {
         self.coordinatorWrapper = wrapper
     }
 
-    /// Load diagnostics when user wants to see details or on submit
+    /// Load diagnostics when user wants to see details (uses quick method for fast preview)
     public func loadDiagnosticsIfNeeded() {
         guard diagnostics == nil else { return }
         Task {
-            await loadDiagnosticsWithRealStats()
+            await loadDiagnosticsQuick()
         }
     }
 
@@ -93,7 +93,56 @@ public final class FeedbackViewModel: ObservableObject {
         diagnostics = feedbackService.collectDiagnostics()
     }
 
-    /// Load diagnostic information with real database stats from coordinator
+    /// Load diagnostics quickly for preview (5-minute log window, optimized query)
+    /// This is fast enough for the "Details" button
+    private func loadDiagnosticsQuick() async {
+        guard let wrapper = coordinatorWrapper else {
+            // Fallback to basic diagnostics without coordinator
+            let stats = DiagnosticInfo.DatabaseStats(
+                sessionCount: 0,
+                frameCount: 0,
+                segmentCount: 0,
+                databaseSizeMB: 0
+            )
+            diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+            return
+        }
+
+        do {
+            // Use the optimized single-query method
+            let quickStats = try await wrapper.coordinator.getDatabaseStatisticsQuick()
+
+            // Get database file size (fast - just file attributes)
+            let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
+            var dbSizeMB: Double = 0
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
+               let size = attrs[.size] as? Int64 {
+                dbSizeMB = Double(size) / (1024 * 1024)
+            }
+
+            let stats = DiagnosticInfo.DatabaseStats(
+                sessionCount: quickStats.sessionCount,
+                frameCount: quickStats.frameCount,
+                segmentCount: 0, // Not fetched in quick query
+                databaseSizeMB: dbSizeMB
+            )
+
+            // Use quick diagnostics with file-based log buffer (instant)
+            self.diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+        } catch {
+            Log.warning("[FeedbackViewModel] Failed to load quick stats: \(error)", category: .ui)
+            let stats = DiagnosticInfo.DatabaseStats(
+                sessionCount: 0,
+                frameCount: 0,
+                segmentCount: 0,
+                databaseSizeMB: 0
+            )
+            // Still use quick diagnostics - it uses file-based buffer now
+            diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+        }
+    }
+
+    /// Load full diagnostic information with complete stats and logs (for submission)
     private func loadDiagnosticsWithRealStats() async {
         guard let wrapper = coordinatorWrapper else {
             diagnostics = feedbackService.collectDiagnostics()
@@ -101,19 +150,24 @@ public final class FeedbackViewModel: ObservableObject {
         }
 
         do {
-            let dbStats = try await wrapper.coordinator.getDatabaseStatistics()
-            let sessionCount = try await wrapper.coordinator.getAppSessionCount()
+            let quickStats = try await wrapper.coordinator.getDatabaseStatisticsQuick()
+
+            // Get database file size (fast - just file attributes)
+            let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
+            var dbSizeMB: Double = 0
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dbPath),
+               let size = attrs[.size] as? Int64 {
+                dbSizeMB = Double(size) / (1024 * 1024)
+            }
 
             let stats = DiagnosticInfo.DatabaseStats(
-                sessionCount: sessionCount,
-                frameCount: dbStats.frameCount,
-                segmentCount: dbStats.segmentCount, // Video segments
-                databaseSizeMB: Double(dbStats.databaseSizeBytes) / (1024 * 1024)
+                sessionCount: quickStats.sessionCount,
+                frameCount: quickStats.frameCount,
+                segmentCount: 0, // Not needed for feedback
+                databaseSizeMB: dbSizeMB
             )
 
-            await MainActor.run {
-                self.diagnostics = feedbackService.collectDiagnostics(with: stats)
-            }
+            self.diagnostics = feedbackService.collectDiagnostics(with: stats)
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load real stats: \(error)", category: .ui)
             diagnostics = feedbackService.collectDiagnostics()
@@ -127,10 +181,8 @@ public final class FeedbackViewModel: ObservableObject {
         isSubmitting = true
         error = nil
 
-        // Load diagnostics if not already loaded
-        if diagnostics == nil {
-            await loadDiagnosticsWithRealStats()
-        }
+        // Always collect full diagnostics (with complete logs) for submission
+        await loadDiagnosticsWithRealStats()
 
         guard let diagnostics = diagnostics else {
             self.error = "Failed to collect diagnostics"

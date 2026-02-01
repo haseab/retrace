@@ -148,6 +148,7 @@ public struct DashboardView: View {
     // MARK: - Properties
 
     @StateObject private var viewModel: DashboardViewModel
+    @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
     @ObservedObject var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @ObservedObject var milestoneCelebrationManager: MilestoneCelebrationManager
     @State private var isPulsing = false
@@ -192,6 +193,7 @@ public struct DashboardView: View {
         milestoneCelebrationManager: MilestoneCelebrationManager
     ) {
         _viewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
+        _coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
         self.launchOnLoginReminderManager = launchOnLoginReminderManager
         self.milestoneCelebrationManager = milestoneCelebrationManager
     }
@@ -510,6 +512,7 @@ public struct DashboardView: View {
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()
+                .environmentObject(coordinatorWrapper)
         }
     }
 

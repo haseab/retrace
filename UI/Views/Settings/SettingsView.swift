@@ -5,8 +5,69 @@ import App
 import ScreenCaptureKit
 import SQLCipher
 
+/// Debug logging helper for Settings appearance changes
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logMessage = "[\(timestamp)] \(message)\n"
+    if let data = logMessage.data(using: .utf8) {
+        let fileURL = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            if let handle = try? FileHandle(forWritingTo: fileURL) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+}
+
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+
+// MARK: - Settings Defaults (Single Source of Truth)
+
+/// All default values for settings in one place.
+/// Reference these when declaring @AppStorage and in reset functions.
+enum SettingsDefaults {
+    // MARK: General
+    static let launchAtLogin = false
+    static let showMenuBarIcon = true
+    static let theme: ThemePreference = .auto
+    static let automaticUpdates = true
+
+    // MARK: Appearance
+    static let fontStyle: RetraceFontStyle = .default
+    static let colorTheme = "blue"
+    static let timelineColoredBorders = false
+
+    // MARK: Capture
+    static let captureIntervalSeconds: Double = 2.0
+    static let captureResolution: CaptureResolution = .original
+    static let captureActiveDisplayOnly = false
+    static let excludeCursor = false
+    static let videoQuality: Double = 0.5
+    static let deleteDuplicateFrames = true
+    static let deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold
+    static let captureOnWindowChange = true
+
+    // MARK: Storage
+    static let retentionDays: Int = 0  // 0 = forever
+    static let maxStorageGB: Double = 50.0
+    static let useRewindData = false
+
+    // MARK: Privacy
+    static let excludedApps = ""
+    static let excludePrivateWindows = false
+    static let excludeSafariPrivate = true
+    static let excludeChromeIncognito = true
+    static let encryptionEnabled = true
+
+    // MARK: Developer
+    static let showFrameIDs = false
+    static let enableFrameIDSearch = false
+}
 
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
@@ -16,14 +77,19 @@ public struct SettingsView: View {
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
-    @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = false
-    @AppStorage("showMenuBarIcon", store: settingsStore) private var showMenuBarIcon = true
-    @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = .auto
-    @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = "blue"
-    @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = true
+
+    // MARK: General Settings
+    @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = SettingsDefaults.launchAtLogin
+    @AppStorage("showMenuBarIcon", store: settingsStore) private var showMenuBarIcon = SettingsDefaults.showMenuBarIcon
+    @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = SettingsDefaults.theme
+    @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = SettingsDefaults.colorTheme
+    @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = SettingsDefaults.timelineColoredBorders
 
     // Font style - tracked as @State to trigger view refresh on change
     @State private var fontStyle: RetraceFontStyle = RetraceFont.currentStyle
+
+    // Refresh ID to force view recreation when font or color theme changes
+    @State private var appearanceRefreshID = UUID()
 
     // Keyboard shortcuts
     @State private var timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
@@ -35,25 +101,26 @@ public struct SettingsView: View {
     @State private var shortcutError: String? = nil
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
-    // Capture settings
-    @AppStorage("captureIntervalSeconds", store: settingsStore) private var captureIntervalSeconds: Double = 2.0
-    @AppStorage("captureResolution", store: settingsStore) private var captureResolution: CaptureResolution = .original
-    @AppStorage("captureActiveDisplayOnly", store: settingsStore) private var captureActiveDisplayOnly = false
-    @AppStorage("excludeCursor", store: settingsStore) private var excludeCursor = false
+    // MARK: Capture Settings
+    @AppStorage("captureIntervalSeconds", store: settingsStore) private var captureIntervalSeconds: Double = SettingsDefaults.captureIntervalSeconds
+    @AppStorage("captureResolution", store: settingsStore) private var captureResolution: CaptureResolution = SettingsDefaults.captureResolution
+    @AppStorage("captureActiveDisplayOnly", store: settingsStore) private var captureActiveDisplayOnly = SettingsDefaults.captureActiveDisplayOnly
+    @AppStorage("excludeCursor", store: settingsStore) private var excludeCursor = SettingsDefaults.excludeCursor
+    @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = SettingsDefaults.videoQuality
+    @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = SettingsDefaults.deleteDuplicateFrames
+    @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = SettingsDefaults.deduplicationThreshold
+    @AppStorage("captureOnWindowChange", store: settingsStore) private var captureOnWindowChange: Bool = SettingsDefaults.captureOnWindowChange
 
-    // Storage settings
-    @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = 0 // 0 = forever
+    // MARK: Storage Settings
+    @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = SettingsDefaults.retentionDays
     @State private var retentionSettingChanged = false
     @State private var retentionChangeProgress: CGFloat = 0  // Progress for auto-dismiss animation (0 to 1)
     @State private var retentionChangeTimer: Timer?
     @State private var showRetentionConfirmation = false
     @State private var pendingRetentionDays: Int?
     @State private var previewRetentionDays: Int?  // Visual preview while selecting
-    @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = 50.0
-    @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = 0.5 // 0.0 = max compression, 1.0 = max quality
-    @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = true
-    @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = 0.9985 // Must match CaptureConfig.defaultDeduplicationThreshold
-    @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = false
+    @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = SettingsDefaults.maxStorageGB
+    @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = SettingsDefaults.useRewindData
 
     // Retention exclusion settings - data from these won't be deleted during cleanup
     @AppStorage("retentionExcludedApps", store: settingsStore) private var retentionExcludedAppsString = ""
@@ -74,10 +141,9 @@ public struct SettingsView: View {
     @State private var launchedWithRetraceDBPath: String?
     @State private var launchedPathInitialized = false
 
-    // Privacy settings
-    @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = ""
-    // TODO: Re-enable once private window detection is more reliable
-    @AppStorage("excludePrivateWindows", store: settingsStore) private var excludePrivateWindows = false
+    // MARK: Privacy Settings
+    @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = SettingsDefaults.excludedApps
+    @AppStorage("excludePrivateWindows", store: settingsStore) private var excludePrivateWindows = SettingsDefaults.excludePrivateWindows
 
     // Computed property to manage excluded apps as array
     private var excludedApps: [ExcludedAppInfo] {
@@ -98,9 +164,9 @@ public struct SettingsView: View {
             excludedAppsString = string
         }
     }
-    @AppStorage("excludeSafariPrivate", store: settingsStore) private var excludeSafariPrivate = true
-    @AppStorage("excludeChromeIncognito", store: settingsStore) private var excludeChromeIncognito = true
-    @AppStorage("encryptionEnabled", store: settingsStore) private var encryptionEnabled = true
+    @AppStorage("excludeSafariPrivate", store: settingsStore) private var excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
+    @AppStorage("excludeChromeIncognito", store: settingsStore) private var excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
+    @AppStorage("encryptionEnabled", store: settingsStore) private var encryptionEnabled = SettingsDefaults.encryptionEnabled
 
     // Computed property to manage retention-excluded apps as a Set
     private var retentionExcludedApps: Set<String> {
@@ -124,9 +190,18 @@ public struct SettingsView: View {
         }
     }
 
-    // Developer settings
-    @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = false
-    @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = false
+    // MARK: Developer Settings
+    @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
+    @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
+
+    // MARK: Tag Management
+    @State private var tagsForSettings: [Tag] = []
+    @State private var tagSegmentCounts: [TagID: Int] = [:]
+    @State private var tagToDelete: Tag? = nil
+    @State private var showTagDeleteConfirmation = false
+    @State private var newTagName: String = ""
+    @State private var isCreatingTag = false
+    @State private var tagCreationError: String? = nil
 
     // Check if Rewind data folder exists
     private var rewindDataExists: Bool {
@@ -159,6 +234,10 @@ public struct SettingsView: View {
     @State private var showingResetConfirmation = false
     @State private var showingDeleteConfirmation = false
 
+    // Database schema display
+    @State private var showingDatabaseSchema = false
+    @State private var databaseSchemaText: String = ""
+
     // Cache clear feedback
     @State private var cacheClearMessage: String? = nil
 
@@ -173,6 +252,9 @@ public struct SettingsView: View {
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
+
+    // Observe UpdaterManager for automatic updates toggle
+    @ObservedObject private var updaterManager = UpdaterManager.shared
 
     // MARK: - Body
 
@@ -410,6 +492,8 @@ public struct SettingsView: View {
                         exportDataSettings
                     case .privacy:
                         privacySettings
+                    case .tags:
+                        tagManagementSettings
                     case .advanced:
                         advancedSettings
                     }
@@ -448,12 +532,19 @@ public struct SettingsView: View {
                 // Reset section button (only for sections with resettable settings)
                 if let resetAction = selectedTab.resetAction(for: self) {
                     Button(action: resetAction) {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 14))
-                            .foregroundColor(.white.opacity(0.5))
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 12))
+                            Text("Reset to Defaults")
+                                .font(.retraceCaption2)
+                        }
+                        .foregroundColor(.white.opacity(0.7))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(8)
                     }
                     .buttonStyle(.plain)
-                    .help("Reset all \(selectedTab.rawValue.lowercased()) settings to defaults")
                 }
             }
         }
@@ -556,10 +647,7 @@ public struct SettingsView: View {
                 ModernToggleRow(
                     title: "Automatic Updates",
                     subtitle: "Automatically download and install updates",
-                    isOn: Binding(
-                        get: { UpdaterManager.shared.automaticUpdatesEnabled },
-                        set: { UpdaterManager.shared.automaticUpdatesEnabled = $0 }
-                    )
+                    isOn: $updaterManager.automaticUpdatesEnabled
                 )
             }
 
@@ -587,14 +675,35 @@ public struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 24) {
                     // Font Style Section
                     VStack(alignment: .leading, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Font Style")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Font Style")
+                                    .font(.retraceCalloutMedium)
+                                    .foregroundColor(.retracePrimary)
 
-                            Text("Choose your preferred font style")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
+                                Text("Choose your preferred font style")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+
+                            Spacer()
+
+                            // Reset to default button
+                            if fontStyle != SettingsDefaults.fontStyle {
+                                Button(action: {
+                                    fontStyle = SettingsDefaults.fontStyle
+                                    RetraceFont.currentStyle = SettingsDefaults.fontStyle
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 10))
+                                        Text("Reset to Default")
+                                            .font(.retraceCaption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.7))
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
 
                         FontStylePicker(selection: $fontStyle)
@@ -608,24 +717,50 @@ public struct SettingsView: View {
 
                     // Tier Theme Section
                     VStack(alignment: .leading, spacing: 16) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Accent Color")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Accent Color")
+                                    .font(.retraceCalloutMedium)
+                                    .foregroundColor(.retracePrimary)
 
-                            Text("Choose your preferred color theme")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
+                                Text("Choose your preferred color theme")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+
+                            Spacer()
+
+                            // Reset to default button
+                            if colorThemePreference != SettingsDefaults.colorTheme {
+                                Button(action: {
+                                    colorThemePreference = SettingsDefaults.colorTheme
+                                    MilestoneCelebrationManager.setColorThemePreference(.blue)
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 10))
+                                        Text("Reset to Default")
+                                            .font(.retraceCaption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.7))
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
 
                         ColorThemePicker(
                             selection: Binding(
                                 get: {
-                                    MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
+                                    let current = MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
+                                    debugLog("[ColorThemePicker] get binding: colorThemePreference=\(colorThemePreference), resolved=\(current.rawValue)")
+                                    return current
                                 },
                                 set: { newValue in
+                                    debugLog("[ColorThemePicker] set binding: newValue=\(newValue.rawValue)")
                                     colorThemePreference = newValue.rawValue
+                                    debugLog("[ColorThemePicker] colorThemePreference updated to: \(colorThemePreference)")
                                     MilestoneCelebrationManager.setColorThemePreference(newValue)
+                                    debugLog("[ColorThemePicker] setColorThemePreference called")
                                 }
                             )
                         )
@@ -811,10 +946,10 @@ public struct SettingsView: View {
 
                         Spacer()
 
-                        // Reset to default button (default is 2s)
-                        if captureIntervalSeconds != 2.0 {
+                        // Reset to default button
+                        if captureIntervalSeconds != SettingsDefaults.captureIntervalSeconds {
                             Button(action: {
-                                captureIntervalSeconds = 2.0
+                                captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
                                 showCaptureUpdateFeedback()
                             }) {
                                 HStack(spacing: 4) {
@@ -840,6 +975,28 @@ public struct SettingsView: View {
                                 .foregroundColor(.retraceSecondary)
                         }
                         .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    // Capture on window change toggle
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Capture on window change")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Text("Instantly capture when switching apps or windows")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+                        }
+                        Spacer()
+                        Toggle("", isOn: $captureOnWindowChange)
+                            .toggleStyle(SwitchToggleStyle(tint: .retraceAccent))
+                            .labelsHidden()
+                            .onChange(of: captureOnWindowChange) { _ in
+                                updateCaptureOnWindowChangeSetting()
+                            }
                     }
                 }
                 .animation(.easeInOut(duration: 0.2), value: captureUpdateMessage)
@@ -874,10 +1031,10 @@ public struct SettingsView: View {
 
                         Spacer()
 
-                        // Reset to default button (default is 50%)
-                        if videoQuality != 0.5 {
+                        // Reset to default button
+                        if videoQuality != SettingsDefaults.videoQuality {
                             Button(action: {
-                                videoQuality = 0.5
+                                videoQuality = SettingsDefaults.videoQuality
                                 showCompressionUpdateFeedback()
                             }) {
                                 HStack(spacing: 4) {
@@ -926,10 +1083,10 @@ public struct SettingsView: View {
                         Spacer()
 
                         // Reset to default button
-                        if deduplicationThreshold != CaptureConfig.defaultDeduplicationThreshold {
+                        if deduplicationThreshold != SettingsDefaults.deduplicationThreshold {
                             Button(action: {
-                                deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
-                                deleteDuplicateFrames = true
+                                deduplicationThreshold = SettingsDefaults.deduplicationThreshold
+                                deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
                                 updateDeduplicationThreshold()
                             }) {
                                 HStack(spacing: 4) {
@@ -1237,6 +1394,28 @@ public struct SettingsView: View {
                             }
                         }
                     )
+
+                    // Reset to default button (default is Forever = 0)
+                    if retentionDays != SettingsDefaults.retentionDays {
+                        HStack {
+                            Spacer()
+                            Button(action: {
+                                retentionDays = SettingsDefaults.retentionDays
+                                previewRetentionDays = nil
+                                retentionSettingChanged = true
+                                startRetentionChangeTimer()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
 
                     if retentionSettingChanged {
                         VStack(spacing: 8) {
@@ -1650,6 +1829,222 @@ public struct SettingsView: View {
         }
     }
 
+    // MARK: - Tag Management Settings
+    private var tagManagementSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            ModernSettingsCard(title: "Manage Tags", icon: "tag") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Create and manage tags for organizing your recordings.")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+
+                    // Create tag section
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 8) {
+                            TextField("Tag name", text: $newTagName)
+                                .textFieldStyle(.plain)
+                                .font(.retraceCallout)
+                                .foregroundColor(.retracePrimary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(Color.retraceSecondary.opacity(0.05))
+                                .cornerRadius(8)
+                                .disabled(isCreatingTag)
+                                .onSubmit {
+                                    Task {
+                                        await createTag()
+                                    }
+                                }
+
+                            ModernButton(
+                                title: isCreatingTag ? "Creating..." : "Create Tag",
+                                icon: "plus",
+                                style: .secondary
+                            ) {
+                                Task {
+                                    await createTag()
+                                }
+                            }
+                            .disabled(newTagName.trimmingCharacters(in: .whitespaces).isEmpty || isCreatingTag)
+                        }
+
+                        if let error = tagCreationError {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.retraceWarning)
+                                    .font(.system(size: 12))
+                                Text(error)
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceWarning)
+                            }
+                            .transition(.opacity)
+                        }
+                    }
+
+                    if !tagsForSettings.isEmpty {
+                        Divider()
+                            .background(Color.retraceBorder)
+                            .padding(.vertical, 4)
+
+                        VStack(spacing: 0) {
+                            ForEach(tagsForSettings, id: \.id) { tag in
+                                tagRow(for: tag)
+
+                                if tag.id != tagsForSettings.last?.id {
+                                    Divider()
+                                        .background(Color.retraceBorder)
+                                }
+                            }
+                        }
+                    } else {
+                        HStack {
+                            Spacer()
+                            VStack(spacing: 8) {
+                                Image(systemName: "tag.slash")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                                Text("No tags created yet")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary.opacity(0.6))
+                            }
+                            .padding(.vertical, 20)
+                            Spacer()
+                        }
+                    }
+                }
+            }
+        }
+        .task {
+            await loadTagsForSettings()
+        }
+        .alert("Delete Tag", isPresented: $showTagDeleteConfirmation, presenting: tagToDelete) { tag in
+            Button("Cancel", role: .cancel) {
+                tagToDelete = nil
+            }
+            Button("Delete", role: .destructive) {
+                Task {
+                    await deleteTag(tag)
+                }
+            }
+        } message: { tag in
+            let count = tagSegmentCounts[tag.id] ?? 0
+            if count == 0 {
+                Text("This tag is not applied to any segments.")
+            } else {
+                Text("This tag is applied to \(count) segment\(count == 1 ? "" : "s"). The segments will remain, but the tag will be removed from them.")
+            }
+        }
+    }
+
+    private func tagRow(for tag: Tag) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tag.name)
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
+
+                let count = tagSegmentCounts[tag.id] ?? 0
+                Text("\(count) segment\(count == 1 ? "" : "s")")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            Spacer()
+
+            Button {
+                tagToDelete = tag
+                showTagDeleteConfirmation = true
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retraceSecondary)
+            }
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func loadTagsForSettings() async {
+        let coordinator = coordinatorWrapper.coordinator
+
+        do {
+            let allTags = try await coordinator.getAllTags()
+            // Filter out the hidden system tag
+            let userTags = allTags.filter { !$0.isHidden }
+
+            // Get segment counts for each tag
+            var counts: [TagID: Int] = [:]
+            for tag in userTags {
+                counts[tag.id] = try await coordinator.getSegmentCountForTag(tagId: tag.id)
+            }
+
+            await MainActor.run {
+                self.tagsForSettings = userTags
+                self.tagSegmentCounts = counts
+            }
+        } catch {
+            Log.error("[Settings] Failed to load tags: \(error)", category: .ui)
+        }
+    }
+
+    private func deleteTag(_ tag: Tag) async {
+        let coordinator = coordinatorWrapper.coordinator
+
+        do {
+            try await coordinator.deleteTag(tagId: tag.id)
+            await loadTagsForSettings()
+        } catch {
+            Log.error("[Settings] Failed to delete tag: \(error)", category: .ui)
+        }
+    }
+
+    private func createTag() async {
+        let trimmedName = newTagName.trimmingCharacters(in: .whitespaces)
+        guard !trimmedName.isEmpty else { return }
+
+        await MainActor.run {
+            isCreatingTag = true
+            tagCreationError = nil
+        }
+
+        let coordinator = coordinatorWrapper.coordinator
+
+        do {
+            // Check if tag already exists
+            if try await coordinator.getTag(name: trimmedName) != nil {
+                await MainActor.run {
+                    tagCreationError = "Tag '\(trimmedName)' already exists"
+                    isCreatingTag = false
+                }
+                return
+            }
+
+            // Create the tag
+            _ = try await coordinator.createTag(name: trimmedName)
+
+            await MainActor.run {
+                newTagName = ""
+                isCreatingTag = false
+            }
+
+            // Reload the tags list
+            await loadTagsForSettings()
+
+            // Clear error after success (with delay)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await MainActor.run {
+                tagCreationError = nil
+            }
+        } catch {
+            await MainActor.run {
+                tagCreationError = "Failed to create tag: \(error.localizedDescription)"
+                isCreatingTag = false
+            }
+            Log.error("[Settings] Failed to create tag: \(error)", category: .ui)
+        }
+    }
+
     // MARK: - Search Settings
     // TODO: Add Search settings later
 //    private var searchSettings: some View {
@@ -1777,26 +2172,6 @@ public struct SettingsView: View {
                 .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
             }
 
-            ModernSettingsCard(title: "Logging", icon: "doc.text") {
-                // TODO: Add Log Level picker later
-//                VStack(alignment: .leading, spacing: 12) {
-//                    Text("Log Level")
-//                        .font(.retraceCalloutMedium)
-//                        .foregroundColor(.retracePrimary)
-//
-//                    ModernSegmentedPicker(
-//                        selection: .constant("info"),
-//                        options: ["error", "warning", "info", "debug"]
-//                    ) { option in
-//                        Text(option.capitalized)
-//                    }
-//                }
-
-                ModernButton(title: "Open Logs Folder", icon: "folder", style: .secondary) {
-                    openLogsFolder()
-                }
-            }
-
             ModernSettingsCard(title: "Developer", icon: "hammer") {
                 ModernToggleRow(
                     title: "Show frame IDs in UI",
@@ -1810,8 +2185,12 @@ public struct SettingsView: View {
                     isOn: $enableFrameIDSearch
                 )
 
-                ModernButton(title: "Export Database Schema", icon: "square.and.arrow.up", style: .secondary) {
-                    exportDatabaseSchema()
+                ModernButton(title: "Show Database Schema", icon: "doc.text", style: .secondary) {
+                    loadDatabaseSchema()
+                    showingDatabaseSchema = true
+                }
+                .sheet(isPresented: $showingDatabaseSchema) {
+                    DatabaseSchemaView(schemaText: databaseSchemaText, isPresented: $showingDatabaseSchema)
                 }
             }
 
@@ -2301,7 +2680,11 @@ private struct FontStylePicker: View {
     var body: some View {
         HStack(spacing: 8) {
             ForEach(RetraceFontStyle.allCases) { style in
-                Button(action: { selection = style }) {
+                Button(action: {
+                    debugLog("[FontStylePicker Button] Tapped style: \(style.rawValue) (design: \(style.design)), current selection: \(selection.rawValue) (design: \(selection.design))")
+                    selection = style
+                    debugLog("[FontStylePicker Button] After assignment, selection: \(selection.rawValue) (design: \(selection.design))")
+                }) {
                     VStack(spacing: 8) {
                         // Preview text in the actual font style
                         Text("Aa")
@@ -2361,7 +2744,9 @@ private struct ColorThemePicker: View {
         let isSelected = selection == theme
 
         Button(action: {
+            debugLog("[ColorThemePicker Button] Tapped theme: \(theme.rawValue), current selection: \(selection.rawValue)")
             selection = theme
+            debugLog("[ColorThemePicker Button] After assignment, selection: \(selection.rawValue)")
         }) {
             VStack(spacing: 8) {
                 // Color swatch preview
@@ -2955,35 +3340,17 @@ extension SettingsView {
 
     // MARK: - Advanced Settings Actions
 
-    func openLogsFolder() {
-        // macOS system logs are in ~/Library/Logs - open Console.app filtered to our app
-        // Or open our app's container folder
-        let logsPath = NSString(string: "~/Library/Logs").expandingTildeInPath
-        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: logsPath)
-    }
-
-    func exportDatabaseSchema() {
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "retrace_schema.json"
-        panel.title = "Export Database Schema"
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-
-            // Export a simple schema description
-            let schema: [String: Any] = [
-                "version": "1.0",
-                "tables": [
-                    "frames": ["id", "segment_id", "frame_index", "timestamp", "ocr_text", "app_name", "window_title"],
-                    "segments": ["id", "start_time", "end_time", "frame_count", "file_path", "width", "height"],
-                    "frames_fts": ["Full-text search virtual table for OCR text"]
-                ],
-                "exported_at": ISO8601DateFormatter().string(from: Date())
-            ]
-
-            if let data = try? JSONSerialization.data(withJSONObject: schema, options: .prettyPrinted) {
-                try? data.write(to: url)
+    func loadDatabaseSchema() {
+        Task {
+            do {
+                let schema = try await coordinatorWrapper.coordinator.getDatabaseSchemaDescription()
+                await MainActor.run {
+                    databaseSchemaText = schema
+                }
+            } catch {
+                await MainActor.run {
+                    databaseSchemaText = "Error loading schema: \(error.localizedDescription)"
+                }
             }
         }
     }
@@ -3312,18 +3679,12 @@ extension SettingsView {
         settingsStore?.removePersistentDomain(forName: domain)
         settingsStore?.synchronize()
 
-        // Reset local @AppStorage values to defaults
-        captureIntervalSeconds = 2.0
-        videoQuality = 0.5
-        retentionDays = 0
-        maxStorageGB = 50.0
-        deleteDuplicateFrames = true
-        deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
-        launchAtLogin = false
-        showMenuBarIcon = true
-        excludePrivateWindows = true
-        showFrameIDs = false
-        enableFrameIDSearch = false
+        // Reset all pages using SettingsDefaults as source of truth
+        resetGeneralSettings()
+        resetCaptureSettings()
+        resetStorageSettings()
+        resetPrivacySettings()
+        resetAdvancedSettings()
     }
 
     func deleteAllData() {
@@ -3412,6 +3773,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case storage = "Storage"
     case exportData = "Export & Data"
     case privacy = "Privacy"
+    case tags = "Tags"
     // case search = "Search"  // TODO: Add Search settings later
     case advanced = "Advanced"
 
@@ -3424,6 +3786,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return "externaldrive"
         case .exportData: return "square.and.arrow.up"
         case .privacy: return "lock.shield"
+        case .tags: return "tag"
         // case .search: return "magnifyingglass"
         case .advanced: return "wrench.and.screwdriver"
         }
@@ -3436,6 +3799,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return "Retention, limits, and compression"
         case .exportData: return "Export and manage your data"
         case .privacy: return "Encryption, exclusions, and permissions"
+        case .tags: return "Manage and delete tags"
         // case .search: return "Search behavior and ranking"
         case .advanced: return "Database, encoding, and developer tools"
         }
@@ -3448,6 +3812,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return .retraceOrangeGradient
         case .exportData: return .retraceAccentGradient
         case .privacy: return .retraceGreenGradient
+        case .tags: return .retraceAccentGradient
         // case .search: return .retraceAccentGradient
         case .advanced: return .retracePurpleGradient
         }
@@ -3466,7 +3831,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return { view.resetPrivacySettings() }
         case .advanced:
             return { view.resetAdvancedSettings() }
-        case .exportData:
+        case .exportData, .tags:
             return nil  // No resettable settings
         }
     }
@@ -3749,7 +4114,8 @@ extension SettingsView {
                 excludedAppBundleIDs: excludedBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
             do {
@@ -3974,7 +4340,8 @@ extension SettingsView {
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
             // Update the capture manager config
@@ -4004,7 +4371,8 @@ extension SettingsView {
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
             // Update the capture manager config
@@ -4014,6 +4382,38 @@ extension SettingsView {
                 showCompressionUpdateFeedback()
             } catch {
                 Log.error("[SettingsView] Failed to update deduplication threshold: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Update capture on window change setting in capture config
+    private func updateCaptureOnWindowChangeSetting() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+
+            // Get current config from capture manager
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            // Create new config with updated setting
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: captureOnWindowChange
+            )
+
+            // Update the capture manager config
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Capture on window change updated to: \(captureOnWindowChange)", category: .ui)
+                showCaptureUpdateFeedback()
+            } catch {
+                Log.error("[SettingsView] Failed to update capture on window change: \(error)", category: .ui)
             }
         }
     }
@@ -4052,46 +4452,48 @@ extension SettingsView {
         timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
         dashboardShortcut = SettingsShortcutKey(from: .defaultDashboard)
         recordingShortcut = SettingsShortcutKey(from: .defaultRecording)
+        Task { await saveShortcuts() }
 
-        // Save and apply shortcuts
-        Task {
-            await saveShortcuts()
-        }
+        // Startup
+        launchAtLogin = SettingsDefaults.launchAtLogin
+        setLaunchAtLogin(enabled: SettingsDefaults.launchAtLogin)
+        showMenuBarIcon = SettingsDefaults.showMenuBarIcon
 
-        // Startup - set value and apply
-        launchAtLogin = false
-        setLaunchAtLogin(enabled: false)
+        // Updates
+        UpdaterManager.shared.automaticUpdatesEnabled = SettingsDefaults.automaticUpdates
 
         // Appearance
-        theme = .auto
+        theme = SettingsDefaults.theme
+        fontStyle = SettingsDefaults.fontStyle
+        RetraceFont.currentStyle = SettingsDefaults.fontStyle
+        colorThemePreference = SettingsDefaults.colorTheme
+        MilestoneCelebrationManager.setColorThemePreference(.blue)
+        timelineColoredBorders = SettingsDefaults.timelineColoredBorders
     }
 
     /// Reset all Capture settings to defaults
     func resetCaptureSettings() {
-        // Capture rate
-        captureIntervalSeconds = 2.0
+        captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
+        videoQuality = SettingsDefaults.videoQuality
+        deduplicationThreshold = SettingsDefaults.deduplicationThreshold
+        deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
+        captureOnWindowChange = SettingsDefaults.captureOnWindowChange
 
-        // Compression - video quality
-        videoQuality = 0.5
-
-        // Compression - deduplication
-        deduplicationThreshold = CaptureConfig.defaultDeduplicationThreshold
-        deleteDuplicateFrames = true
-
-        // Apply all capture config changes immediately
+        // Apply capture config changes immediately
         Task {
             let coordinator = coordinatorWrapper.coordinator
             let currentConfig = await coordinator.getCaptureConfig()
 
             let newConfig = CaptureConfig(
-                captureIntervalSeconds: 2.0,
+                captureIntervalSeconds: SettingsDefaults.captureIntervalSeconds,
                 adaptiveCaptureEnabled: true,
-                deduplicationThreshold: CaptureConfig.defaultDeduplicationThreshold,
+                deduplicationThreshold: SettingsDefaults.deduplicationThreshold,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: SettingsDefaults.captureOnWindowChange
             )
 
             do {
@@ -4107,16 +4509,18 @@ extension SettingsView {
 
     /// Reset all Storage settings to defaults
     func resetStorageSettings() {
-        // Retention policy - default is forever (0 = no limit)
-        retentionDays = 0
+        retentionDays = SettingsDefaults.retentionDays
+        maxStorageGB = SettingsDefaults.maxStorageGB
         retentionSettingChanged = true
         startRetentionChangeTimer()
     }
 
     /// Reset all Privacy settings to defaults
     func resetPrivacySettings() {
-        // Excluded apps - clear the list
-        excludedAppsString = ""
+        excludedAppsString = SettingsDefaults.excludedApps
+        excludePrivateWindows = SettingsDefaults.excludePrivateWindows
+        excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
+        excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
 
         // Apply to capture config immediately
         Task {
@@ -4128,10 +4532,11 @@ extension SettingsView {
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: currentConfig.deduplicationThreshold,
                 maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: [],  // Clear excluded apps
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                excludedAppBundleIDs: [],
+                excludePrivateWindows: SettingsDefaults.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
             do {
@@ -4145,8 +4550,8 @@ extension SettingsView {
 
     /// Reset all Advanced settings to defaults
     func resetAdvancedSettings() {
-        // No specific settings to reset currently
-        // Cache and logging are managed differently
+        showFrameIDs = SettingsDefaults.showFrameIDs
+        enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     }
 }
 
@@ -4321,6 +4726,77 @@ class SettingsShortcutCaptureNSView: NSView {
         } else {
             super.keyDown(with: event)
         }
+    }
+}
+
+// MARK: - Database Schema View
+
+private struct DatabaseSchemaView: View {
+    let schemaText: String
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Database Schema")
+                    .font(.retraceTitle3)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+
+                Button(action: { isPresented = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.retraceSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding()
+            .background(Color.retraceBackground)
+
+            Divider()
+
+            // Schema content
+            ScrollView {
+                Text(schemaText.isEmpty ? "Loading..." : schemaText)
+                    .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .foregroundColor(.retracePrimary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .background(Color.black.opacity(0.3))
+
+            Divider()
+
+            // Footer with copy button
+            HStack {
+                Spacer()
+
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(schemaText, forType: .string)
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "doc.on.doc")
+                        Text("Copy to Clipboard")
+                    }
+                    .font(.retraceCalloutMedium)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.retraceAccent)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+                .background(Color.retraceAccent.opacity(0.1))
+                .cornerRadius(8)
+            }
+            .padding()
+            .background(Color.retraceBackground)
+        }
+        .frame(width: 600, height: 500)
+        .background(Color.retraceBackground)
+        .cornerRadius(12)
     }
 }
 

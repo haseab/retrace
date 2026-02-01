@@ -68,7 +68,12 @@ public actor HEVCEncoder {
         // Remove any existing file (should only happen if re-using a path, which shouldn't occur)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             Log.warning("🗑️ [HEVCEncoder.initialize] Removing existing file at: \(outputURL.path)", category: .storage)
-            try? FileManager.default.removeItem(at: outputURL)
+            do {
+                try FileManager.default.removeItem(at: outputURL)
+            } catch {
+                Log.warning("[HEVCEncoder] Could not remove existing file: \(outputURL.lastPathComponent) | Error: \(error.localizedDescription)", category: .storage)
+                // Continue - we'll try to overwrite
+            }
         }
 
         // Configure video codec

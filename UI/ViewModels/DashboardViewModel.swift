@@ -245,7 +245,7 @@ public class DashboardViewModel: ObservableObject {
 
             // Await all results
             let (weeklyStorage, appStats, todayStats, _) = try await (weeklyStorageTask, appStatsTask, todayStatsTask, dailyGraphTask)
-            logTiming("parallel queries: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+            logTiming("parallel queries TOTAL: \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
 
             weeklyStorageBytes = weeklyStorage
             totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
@@ -296,16 +296,21 @@ public class DashboardViewModel: ObservableObject {
 
         do {
             // Load daily screen time data
+            var t = CFAbsoluteTimeGetCurrent()
             let screenTimeData = try await coordinator.getDailyScreenTime(
                 from: weekStart,
                 to: weekEnd
             )
             dailyScreenTimeData = fillMissingDays(data: screenTimeData, allDays: allDays)
+            logTiming("  getDailyScreenTime: \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms")
 
             // Load storage data for each day (just that day's folder size)
+            t = CFAbsoluteTimeGetCurrent()
             dailyStorageData = try await loadDailyStorageData(for: allDays)
+            logTiming("  loadDailyStorageData: \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms (7 days)")
 
             // Load timeline opens data
+            t = CFAbsoluteTimeGetCurrent()
             let timelineData = try await coordinator.getDailyMetrics(
                 metricType: .timelineOpens,
                 from: weekStart,
@@ -313,8 +318,10 @@ public class DashboardViewModel: ObservableObject {
             )
             dailyTimelineOpensData = fillMissingDays(data: timelineData, allDays: allDays)
             timelineOpensThisWeek = dailyTimelineOpensData.reduce(0) { $0 + $1.value }
+            logTiming("  getDailyMetrics(timelineOpens): \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms")
 
             // Load searches data
+            t = CFAbsoluteTimeGetCurrent()
             let searchesData = try await coordinator.getDailyMetrics(
                 metricType: .searches,
                 from: weekStart,
@@ -322,8 +329,10 @@ public class DashboardViewModel: ObservableObject {
             )
             dailySearchesData = fillMissingDays(data: searchesData, allDays: allDays)
             searchesThisWeek = dailySearchesData.reduce(0) { $0 + $1.value }
+            logTiming("  getDailyMetrics(searches): \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms")
 
             // Load text copies data
+            t = CFAbsoluteTimeGetCurrent()
             let textCopiesData = try await coordinator.getDailyMetrics(
                 metricType: .textCopies,
                 from: weekStart,
@@ -331,6 +340,7 @@ public class DashboardViewModel: ObservableObject {
             )
             dailyTextCopiesData = fillMissingDays(data: textCopiesData, allDays: allDays)
             textCopiesThisWeek = dailyTextCopiesData.reduce(0) { $0 + $1.value }
+            logTiming("  getDailyMetrics(textCopies): \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms")
 
         } catch {
             Log.error("[DashboardViewModel] Failed to load daily graph data: \(error)", category: .ui)
@@ -348,10 +358,14 @@ public class DashboardViewModel: ObservableObject {
 
     /// Load storage for each day's folder
     private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM/dd"
         var dataPoints: [DailyDataPoint] = []
-        for day in days {
+        for (index, day) in days.enumerated() {
+            let t = CFAbsoluteTimeGetCurrent()
             let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
             dataPoints.append(DailyDataPoint(date: day, value: dayStorage))
+            logTiming("    day \(index + 1) (\(formatter.string(from: day))): \(Int((CFAbsoluteTimeGetCurrent() - t) * 1000))ms")
         }
         return dataPoints
     }

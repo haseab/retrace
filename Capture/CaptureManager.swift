@@ -35,6 +35,11 @@ public actor CaptureManager: CaptureProtocol {
     // Permission warnings
     private var hasShownAccessibilityWarning = false
 
+    // Window change debouncing and title tracking
+    private var lastWindowChangeCaptureTime: Date?
+    private var lastNormalizedTitle: String?
+    private var lastBundleID: String?
+
     /// Callback for accessibility permission warnings
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
 
@@ -191,7 +196,54 @@ public actor CaptureManager: CaptureProtocol {
             await self.handleAccessibilityPermissionDenied()
         }
 
+        // Set up window change callback for immediate capture
+        displaySwitchMonitor.onWindowChange = { [weak self] in
+            await self?.handleWindowChange()
+        }
+
         await displaySwitchMonitor.startMonitoring(initialDisplayID: initialDisplayID)
+    }
+
+    /// Handle window change - capture immediately and reset timer if enabled
+    private func handleWindowChange() async {
+        guard _isCapturing else { return }
+        guard currentConfig.captureOnWindowChange else { return }
+
+        // Get current window info
+        let currentInfo = await MainActor.run {
+            appInfoProvider.getFrontmostAppInfo()
+        }
+        let currentTitle = currentInfo.windowName ?? ""
+        let currentBundleID = currentInfo.appBundleID ?? ""
+
+        // Check if this is a meaningful title change
+        // Skip if titles are related (one contains the other) - handles "Messenger" vs "Messenger (1)"
+        if let lastTitle = lastNormalizedTitle,
+           let lastBundle = lastBundleID,
+           lastBundle == currentBundleID {  // Same app
+            let titlesRelated = lastTitle.contains(currentTitle) || currentTitle.contains(lastTitle)
+            if titlesRelated && !lastTitle.isEmpty && !currentTitle.isEmpty {
+                // Titles are related, skip capture - let regular timer handle it
+                Log.debug("[CaptureManager] Window title change skipped (related titles): '\(lastTitle)' -> '\(currentTitle)'", category: .capture)
+                return
+            }
+        }
+
+        // Debounce: minimum 200ms between window-change captures
+        if let lastTime = lastWindowChangeCaptureTime,
+           Date().timeIntervalSince(lastTime) < 0.2 {
+            return
+        }
+        lastWindowChangeCaptureTime = Date()
+
+        // Update tracked title/bundle
+        lastNormalizedTitle = currentTitle
+        lastBundleID = currentBundleID
+
+        // Trigger immediate capture and reset timer
+        await cgWindowListCapture.captureImmediateAndResetTimer()
+
+        Log.debug("[CaptureManager] Window changed - captured frame and reset timer (title: '\(currentTitle)')", category: .capture)
     }
 
     /// Handle display switch by restarting capture on the new display

@@ -14,6 +14,7 @@ public actor CGWindowListCapture {
     // MARK: - Properties
 
     nonisolated(unsafe) private var timer: Timer?
+    nonisolated(unsafe) private var currentDisplayID: CGWindowID?
     private var isActive = false
     private var currentConfig: CaptureConfig?
 
@@ -91,6 +92,9 @@ public actor CGWindowListCapture {
     /// Start polling for frames
     @MainActor
     private func startPolling(displayID: CGWindowID, interval: TimeInterval) {
+        // Store display ID for immediate captures
+        self.currentDisplayID = displayID
+
         // Invalidate existing timer
         timer?.invalidate()
 
@@ -107,6 +111,26 @@ public actor CGWindowListCapture {
         }
     }
 
+    /// Trigger an immediate capture and reset the timer
+    /// Called when window changes and captureOnWindowChange is enabled
+    func captureImmediateAndResetTimer() async {
+        guard let displayID = currentDisplayID else { return }
+        guard let config = currentConfig else { return }
+
+        // Capture immediately
+        await captureFrame(displayID: displayID)
+
+        // Reset the timer to restart the interval on main actor
+        await MainActor.run {
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: config.captureIntervalSeconds, repeats: true) { [weak self] _ in
+                Task {
+                    await self?.captureFrame(displayID: displayID)
+                }
+            }
+        }
+    }
+
     /// Capture a single frame with real-time filtering of excluded apps and private windows
     private func captureFrame(displayID: CGWindowID) async {
         guard isActive, let config = currentConfig else { return }
@@ -116,13 +140,13 @@ public actor CGWindowListCapture {
 
         // Capture the frame using CGWindowList with filtering
         guard let cgImage = captureWithFiltering(displayID: displayID, excludedWindowIDs: excludedIDs) else {
-            Log.warning("Failed to capture CGImage", category: .capture)
+            Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
             return
         }
 
         // Convert CGImage to BGRA data format (matching ScreenCaptureKit output)
         guard let frameData = convertCGImageToBGRAData(cgImage) else {
-            Log.warning("Failed to convert CGImage to BGRA data", category: .capture)
+            Log.warning("[CGWindowListCapture] Failed to convert CGImage to BGRA data for displayID=\(displayID)", category: .capture)
             return
         }
 

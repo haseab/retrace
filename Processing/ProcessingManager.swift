@@ -85,8 +85,13 @@ public actor ProcessingManager: ProcessingProtocol {
         if config.accessibilityEnabled {
             let hasPermission = await accessibility.hasPermission()
             if hasPermission {
-                axResult = try? await accessibility.getFocusedAppText()
-                axText = axResult?.textElements.map(\.text).joined(separator: " ")
+                do {
+                    axResult = try await accessibility.getFocusedAppText()
+                    axText = axResult?.textElements.map(\.text).joined(separator: " ")
+                } catch {
+                    Log.debug("[ProcessingManager] Accessibility text extraction failed (non-critical): \(error.localizedDescription)", category: .processing)
+                    axResult = nil
+                }
             }
         }
 
@@ -238,9 +243,11 @@ public actor ProcessingManager: ProcessingProtocol {
                 completion(.success(text))
             } catch let error as ProcessingError {
                 errorCount += 1
+                Log.error("[ProcessingManager] Queue processing failed for frame: \(error)", category: .processing)
                 completion(.failure(error))
             } catch {
                 errorCount += 1
+                Log.error("[ProcessingManager] Queue processing failed for frame: \(error.localizedDescription)", category: .processing, error: error)
                 completion(.failure(.ocrFailed(underlying: error.localizedDescription)))
             }
         }

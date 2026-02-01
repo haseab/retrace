@@ -12,6 +12,7 @@ public struct ContentView: View {
     @StateObject private var deeplinkHandler = DeeplinkHandler()
     @StateObject private var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
+    @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
 
     private let coordinator: AppCoordinator
 
@@ -21,6 +22,7 @@ public struct ContentView: View {
         self.coordinator = coordinator
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
+        self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
     }
 
     // MARK: - Body
@@ -99,6 +101,7 @@ public struct ContentView: View {
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()
+                .environmentObject(coordinatorWrapper)
         }
     }
 

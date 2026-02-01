@@ -51,11 +51,16 @@ public actor DatabaseManager: DatabaseProtocol {
         let isInMemory = databasePath == ":memory:" || databasePath.contains("mode=memory")
         if !isInMemory {
             let directory = (expandedPath as NSString).deletingLastPathComponent
-            try FileManager.default.createDirectory(
-                atPath: directory,
-                withIntermediateDirectories: true,
-                attributes: nil
-            )
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: directory,
+                    withIntermediateDirectories: true,
+                    attributes: nil
+                )
+            } catch {
+                Log.critical("[DatabaseManager] Failed to create database directory: \(directory)", category: .database, error: error)
+                throw DatabaseError.connectionFailed(underlying: "Directory creation failed: \(error.localizedDescription)")
+            }
         }
 
         // Open database
@@ -66,6 +71,7 @@ public actor DatabaseManager: DatabaseProtocol {
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(expandedPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+            Log.critical("[DatabaseManager] Failed to open database at: \(expandedPath) - \(errorMsg)", category: .database)
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
         Log.debug("[DatabaseManager] Database opened successfully", category: .database)
@@ -893,6 +899,62 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
+    /// Delete a tag entirely (CASCADE will remove all segment associations)
+    public func deleteTag(tagId: TagID) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "DELETE FROM tag WHERE id = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, tagId.value)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Get the count of segments that have a specific tag
+    public func getSegmentCountForTag(tagId: TagID) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM segment_tag WHERE tagId = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, tagId.value)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     /// Get all tags for a segment
     public func getTagsForSegment(segmentId: SegmentID) async throws -> [Tag] {
         guard let db = db else {
@@ -1197,6 +1259,41 @@ public actor DatabaseManager: DatabaseProtocol {
         return try AppSegmentQueries.getCount(db: db)
     }
 
+    /// Quick statistics query - single combined query for feedback diagnostics
+    /// Only returns frameCount and sessionCount (what's actually displayed)
+    public func getStatisticsQuick() async throws -> (frameCount: Int, sessionCount: Int) {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT
+                (SELECT COUNT(*) FROM frame) as frameCount,
+                (SELECT COUNT(*) FROM segment) as sessionCount
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(query: sql, underlying: "No result row")
+        }
+
+        let frameCount = Int(sqlite3_column_int64(statement, 0))
+        let sessionCount = Int(sqlite3_column_int64(statement, 1))
+
+        return (frameCount: frameCount, sessionCount: sessionCount)
+    }
+
     // MARK: - Maintenance Operations
 
     /// Checkpoint the WAL file (merge WAL into main database and truncate)
@@ -1381,6 +1478,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
             guard sqlite3_exec(db, pragma, nil, nil, &errorMessage) == SQLITE_OK else {
                 let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+                Log.error("[DatabaseManager] PRAGMA execution failed: \(pragma) - \(message)", category: .database)
                 throw DatabaseError.queryFailed(query: pragma, underlying: message)
             }
         }
@@ -2036,5 +2134,78 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    // MARK: - Schema Inspection
+
+    /// Returns a human-readable description of the database schema
+    public func getSchemaDescription() async throws -> String {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        var result = "DATABASE SCHEMA\n"
+        result += "===============\n\n"
+
+        // Get all tables
+        let tablesSql = "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name;"
+        var tablesStmt: OpaquePointer?
+        defer { sqlite3_finalize(tablesStmt) }
+
+        guard sqlite3_prepare_v2(db, tablesSql, -1, &tablesStmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: tablesSql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        while sqlite3_step(tablesStmt) == SQLITE_ROW {
+            guard let namePtr = sqlite3_column_text(tablesStmt, 0) else { continue }
+            let tableName = String(cString: namePtr)
+
+            // Skip internal SQLite tables
+            if tableName.hasPrefix("sqlite_") { continue }
+
+            result += "TABLE: \(tableName)\n"
+            result += String(repeating: "-", count: tableName.count + 7) + "\n"
+
+            // Get column info
+            let pragmaSql = "PRAGMA table_info(\(tableName));"
+            var pragmaStmt: OpaquePointer?
+
+            if sqlite3_prepare_v2(db, pragmaSql, -1, &pragmaStmt, nil) == SQLITE_OK {
+                while sqlite3_step(pragmaStmt) == SQLITE_ROW {
+                    let colName = sqlite3_column_text(pragmaStmt, 1).map { String(cString: $0) } ?? "?"
+                    let colType = sqlite3_column_text(pragmaStmt, 2).map { String(cString: $0) } ?? "?"
+                    let notNull = sqlite3_column_int(pragmaStmt, 3) != 0
+                    let isPK = sqlite3_column_int(pragmaStmt, 5) != 0
+
+                    var colDesc = "  \(colName) \(colType)"
+                    if isPK { colDesc += " PRIMARY KEY" }
+                    if notNull { colDesc += " NOT NULL" }
+                    result += colDesc + "\n"
+                }
+                sqlite3_finalize(pragmaStmt)
+            }
+
+            result += "\n"
+        }
+
+        // Get indexes
+        result += "INDEXES\n"
+        result += "-------\n"
+
+        let indexSql = "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY tbl_name, name;"
+        var indexStmt: OpaquePointer?
+        defer { sqlite3_finalize(indexStmt) }
+
+        guard sqlite3_prepare_v2(db, indexSql, -1, &indexStmt, nil) == SQLITE_OK else {
+            return result + "Error loading indexes\n"
+        }
+
+        while sqlite3_step(indexStmt) == SQLITE_ROW {
+            let name = sqlite3_column_text(indexStmt, 0).map { String(cString: $0) } ?? "?"
+            let table = sqlite3_column_text(indexStmt, 1).map { String(cString: $0) } ?? "?"
+            result += "  \(name) ON \(table)\n"
+        }
+
+        return result
     }
 }

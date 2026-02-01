@@ -17,6 +17,7 @@ public final class UpdaterManager: ObservableObject {
     private var updaterController: SPUStandardUpdaterController?
 
     /// Whether automatic update checks are enabled
+    /// Default: true (matches SettingsDefaults.automaticUpdates)
     @Published public var automaticUpdatesEnabled: Bool = true {
         didSet {
             updaterController?.updater.automaticallyChecksForUpdates = automaticUpdatesEnabled

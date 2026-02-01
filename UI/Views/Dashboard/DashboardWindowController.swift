@@ -20,6 +20,26 @@ public class DashboardWindowController: NSObject {
     /// Whether the dashboard window is currently visible
     public private(set) var isVisible = false
 
+    // MARK: - Debug Logging
+
+    private func debugLog(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let handle = try? FileHandle(forWritingTo: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: path)
+            }
+        }
+    }
+
     // MARK: - Initialization
 
     private override init() {
@@ -80,13 +100,20 @@ public class DashboardWindowController: NSObject {
 
     /// Hide the dashboard window
     public func hide() {
-        guard let window = window, isVisible else { return }
+        debugLog("[DASHBOARD-HIDE] Called - isVisible=\(isVisible), hasWindow=\(window != nil), attachedSheet=\(window?.attachedSheet != nil)")
 
+        guard let window = window, isVisible else {
+            debugLog("[DASHBOARD-HIDE] Guard failed - early return")
+            return
+        }
+
+        debugLog("[DASHBOARD-HIDE] Calling orderOut(nil)")
         window.orderOut(nil)
         isVisible = false
 
         // Post notification
         NotificationCenter.default.post(name: .dashboardDidClose, object: nil)
+        debugLog("[DASHBOARD-HIDE] Complete")
     }
 
     /// Toggle dashboard visibility
@@ -94,14 +121,20 @@ public class DashboardWindowController: NSObject {
     /// - If visible but behind other windows: bring to front
     /// - If visible and frontmost: hide
     public func toggle() {
+        debugLog("[DASHBOARD-TOGGLE] isVisible=\(isVisible), isKeyWindow=\(window?.isKeyWindow ?? false), isActive=\(NSApp.isActive), attachedSheet=\(window?.attachedSheet != nil)")
+
         if isVisible {
             // Check if window is frontmost (key window and app is active)
-            if let window = window, window.isKeyWindow && NSApp.isActive {
+            // OR if a modal sheet is attached (sheet becomes key window, not parent window)
+            if let window = window, (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
+                debugLog("[DASHBOARD-TOGGLE] Calling hide()")
                 hide()
             } else {
+                debugLog("[DASHBOARD-TOGGLE] Calling bringToFront()")
                 bringToFront()
             }
         } else {
+            debugLog("[DASHBOARD-TOGGLE] Calling show()")
             show()
         }
     }
@@ -270,6 +303,7 @@ struct DashboardContentView: View {
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()
+                .environmentObject(coordinatorWrapper)
         }
     }
 

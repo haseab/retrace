@@ -49,6 +49,23 @@ public enum Log {
         #endif
     }
 
+    // MARK: - Log File (for fast feedback diagnostics)
+
+    /// Path to the log file - persists across crashes
+    public static let logFilePath = NSHomeDirectory() + "/Library/Logs/Retrace/retrace.log"
+
+    /// Get recent logs from the log file (fast file read, no OSLogStore)
+    public static func getRecentLogs(maxCount: Int = 200) -> [String] {
+        LogFile.shared.readLastLines(count: maxCount)
+    }
+
+    /// Get recent error logs only
+    public static func getRecentErrors(maxCount: Int = 50) -> [String] {
+        LogFile.shared.readLastLines(count: maxCount * 2).filter {
+            $0.contains("[ERROR]") || $0.contains("[WARN]") || $0.contains("[CRITICAL]")
+        }.suffix(maxCount).map { $0 }
+    }
+
     // MARK: - Log Levels
 
     /// Debug level - verbose information for development
@@ -197,7 +214,97 @@ public enum Log {
     ) {
         let filename = (file as NSString).lastPathComponent
         let timestamp = ISO8601DateFormatter().string(from: Date())
-        print("[\(timestamp)] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)")
+        let formattedLog = "[\(timestamp)] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
+        print(formattedLog)
+
+        // Also write to log file for persistence across crashes
+        LogFile.shared.append(formattedLog)
+    }
+}
+
+// MARK: - Log File
+
+/// Writes logs to a file for persistence and fast retrieval
+/// Used for feedback diagnostics (avoids slow OSLogStore)
+private final class LogFile: @unchecked Sendable {
+    static let shared = LogFile()
+
+    private let fileURL: URL
+    private let lock = NSLock()
+    private var fileHandle: FileHandle?
+    private let maxFileSize: Int64 = 5 * 1024 * 1024  // 5MB max, then rotate
+
+    private init() {
+        let logDir = NSHomeDirectory() + "/Library/Logs/Retrace"
+        self.fileURL = URL(fileURLWithPath: logDir + "/retrace.log")
+
+        // Create directory if needed
+        try? FileManager.default.createDirectory(
+            atPath: logDir,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        // Open file handle for appending
+        if !FileManager.default.fileExists(atPath: fileURL.path) {
+            FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+        }
+        fileHandle = try? FileHandle(forWritingTo: fileURL)
+        fileHandle?.seekToEndOfFile()
+    }
+
+    func append(_ entry: String) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let data = (entry + "\n").data(using: .utf8) else { return }
+
+        // Check if we need to rotate
+        if let handle = fileHandle {
+            let currentSize = handle.offsetInFile
+            if currentSize > maxFileSize {
+                rotateLog()
+            }
+        }
+
+        // Write to file
+        if fileHandle == nil {
+            fileHandle = try? FileHandle(forWritingTo: fileURL)
+            fileHandle?.seekToEndOfFile()
+        }
+        try? fileHandle?.write(contentsOf: data)
+    }
+
+    private func rotateLog() {
+        // Close current handle
+        try? fileHandle?.close()
+        fileHandle = nil
+
+        // Rename current log to .old (overwrite any existing .old)
+        let oldURL = fileURL.deletingPathExtension().appendingPathExtension("old.log")
+        try? FileManager.default.removeItem(at: oldURL)
+        try? FileManager.default.moveItem(at: fileURL, to: oldURL)
+
+        // Create new log file
+        FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+        fileHandle = try? FileHandle(forWritingTo: fileURL)
+    }
+
+    func readLastLines(count: Int) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Flush any pending writes
+        try? fileHandle?.synchronize()
+
+        guard let data = try? Data(contentsOf: fileURL),
+              let content = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+        let startIndex = max(0, lines.count - count)
+        return Array(lines[startIndex...])
     }
 }
 
