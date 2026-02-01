@@ -83,13 +83,10 @@ public struct TimelineTapeView: View {
 
             ZStack(alignment: .leading) {
                 // Main tape blocks with gap indicators
-                // Use absolute positioning with block-level culling for performance
-                // Only blocks intersecting the visible range are rendered
-                let visibleBlocks = blocks.enumerated().compactMap { (index, block) -> (block: AppBlock, leftX: CGFloat)? in
-                    let blockLeftX = blockLeftPosition(for: block, at: index, in: blocks)
-                    let blockRightX = blockLeftX + block.width(pixelsPerFrame: pixelsPerFrame)
-                    guard blockRightX >= cullingLeftX && blockLeftX <= cullingRightX else { return nil }
-                    return (block, blockLeftX)
+                // Precompute all block positions in O(n), then filter to visible
+                let blockPositions = computeBlockPositions(blocks: blocks)
+                let visibleBlocks = blockPositions.filter { item in
+                    item.rightX >= cullingLeftX && item.leftX <= cullingRightX
                 }
 
                 // === PERF DEBUG ===
@@ -100,7 +97,7 @@ public struct TimelineTapeView: View {
                     // Gap indicator before block
                     if item.block.formattedGapBefore != nil {
                         gapIndicatorView(block: item.block)
-                            .offset(x: item.leftX - gapIndicatorWidth - blockSpacing)
+                            .offset(x: item.gapX)
                     }
                     // The block itself
                     appBlockView(block: item.block, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX, blocks: blocks)
@@ -260,26 +257,44 @@ public struct TimelineTapeView: View {
     /// Fixed width of gap indicators (doubled from original)
     private var gapIndicatorWidth: CGFloat { 100 * TimelineScaleFactor.current }
 
-    /// Calculate the left X position for a block (for absolute positioning)
-    private func blockLeftPosition(for block: AppBlock, at index: Int, in blocks: [AppBlock]) -> CGFloat {
-        var offset: CGFloat = 0
+    /// Block position info for absolute positioning
+    private struct BlockPosition {
+        let block: AppBlock
+        let leftX: CGFloat   // Block's left edge
+        let rightX: CGFloat  // Block's right edge
+        let gapX: CGFloat    // Gap indicator's left edge (if present)
+    }
 
-        for i in 0..<index {
-            let prevBlock = blocks[i]
-            // Add gap indicator width if present
-            if prevBlock.formattedGapBefore != nil {
-                offset += gapIndicatorWidth + blockSpacing
+    /// Compute all block positions in a single O(n) pass
+    private func computeBlockPositions(blocks: [AppBlock]) -> [BlockPosition] {
+        var positions: [BlockPosition] = []
+        positions.reserveCapacity(blocks.count)
+        var x: CGFloat = 0
+
+        for block in blocks {
+            var gapX: CGFloat = 0
+
+            // Gap indicator before this block
+            if block.formattedGapBefore != nil {
+                gapX = x
+                x += gapIndicatorWidth + blockSpacing
             }
-            // Add block width + spacing
-            offset += prevBlock.width(pixelsPerFrame: pixelsPerFrame) + blockSpacing
+
+            let blockLeftX = x
+            let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
+            let blockRightX = x + blockWidth
+
+            positions.append(BlockPosition(
+                block: block,
+                leftX: blockLeftX,
+                rightX: blockRightX,
+                gapX: gapX
+            ))
+
+            x = blockRightX + blockSpacing
         }
 
-        // Add gap for current block if present
-        if block.formattedGapBefore != nil {
-            offset += gapIndicatorWidth + blockSpacing
-        }
-
-        return offset
+        return positions
     }
 
     /// Calculate the total width of the timeline tape
