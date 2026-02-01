@@ -98,52 +98,126 @@ public actor StorageManager: StorageProtocol {
     }
 
     public func readFrame(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
+        // Get segment path
+        let segmentURL = try await getSegmentPath(id: segmentID)
+
+        // Use fast single-frame extraction
+        return try await extractSingleFrame(from: segmentURL, frameIndex: frameIndex)
+    }
+
+    /// Fast single-frame extraction using AVAssetImageGenerator
+    /// This is much faster than decoding all frames - AVFoundation handles B-frame decoding internally
+    private func extractSingleFrame(from videoURL: URL, frameIndex: Int, frameRate: Double = 30.0) async throws -> Data {
+        // Check if file exists
+        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            throw StorageError.fileNotFound(path: videoURL.path)
+        }
+
+        // Check if file is empty
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
+        }
+
+        // Handle extensionless files by creating symlink
+        let assetURL: URL
+        var tempURL: URL? = nil
+
+        if videoURL.pathExtension.lowercased() == "mp4" {
+            assetURL = videoURL
+        } else {
+            // Create temporary symlink with .mp4 extension
+            let tempPath = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + ".mp4")
+            tempURL = tempPath
+
+            try FileManager.default.createSymbolicLink(
+                at: tempPath,
+                withDestinationURL: videoURL
+            )
+            assetURL = tempPath
+        }
+
+        defer {
+            if let tempURL = tempURL {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
+
+        // Use AVAssetImageGenerator for fast single-frame extraction
+        let asset = AVAsset(url: assetURL)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        // Zero tolerance ensures exact frame - AVFoundation handles B-frame decoding internally
+        imageGenerator.requestedTimeToleranceAfter = .zero
+        imageGenerator.requestedTimeToleranceBefore = .zero
+
+        // Calculate CMTime from frame index
+        let time: CMTime
+        if frameRate == 30.0 {
+            // Fast path for 30fps - use exact integer arithmetic
+            time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
+        } else {
+            let timeInSeconds = Double(frameIndex) / frameRate
+            time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+        }
+
+        // Extract frame
+        let cgImage: CGImage
+        do {
+            cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
+        } catch {
+            throw StorageError.fileReadFailed(
+                path: videoURL.path,
+                underlying: "Frame extraction failed: \(error.localizedDescription)"
+            )
+        }
+
+        // Convert to JPEG
+        return try convertCGImageToJPEG(cgImage)
+    }
+
+    /// Read a frame from a video at a specific path
+    /// Uses fast single-frame extraction via AVAssetImageGenerator
+    public func readFrameFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
+        let videoURL = URL(fileURLWithPath: videoPath)
+        return try await extractSingleFrame(from: videoURL, frameIndex: frameIndex)
+    }
+
+    // MARK: - Legacy decode-all methods (kept for easy rollback if B-frame issues occur)
+
+    /// Read a frame using the old decode-all-frames approach (SLOW - decodes entire video)
+    /// This was the original implementation before the AVAssetImageGenerator optimization.
+    /// Kept for easy rollback if B-frame issues are discovered.
+    /// To rollback: change readFrame() to call this instead of extractSingleFrame()
+    public func readFrameDecodeAll(segmentID: VideoSegmentID, frameIndex: Int) async throws -> Data {
         let segmentIDValue = segmentID.value
 
-        // Check if we have this segment cached
+        // Check cache first
         if let cacheEntry = frameCache[segmentIDValue] {
-            // Update access time
             var updatedEntry = cacheEntry
             updatedEntry.lastAccessTime = Date()
             frameCache[segmentIDValue] = updatedEntry
 
-            // Check if requested frame is in cache
             if frameIndex < cacheEntry.frames.count {
                 let frame = cacheEntry.frames[frameIndex]
-                let jpegData = try convertCGImageToJPEG(frame.image)
-                return jpegData
+                return try convertCGImageToJPEG(frame.image)
             }
         }
 
-        // Not in cache - need to decode the video
-        let segmentURL: URL
-        do {
-            segmentURL = try await getSegmentPath(id: segmentID)
-        } catch {
-            throw error
-        }
+        let segmentURL = try await getSegmentPath(id: segmentID)
 
-        // Check if file exists
-        let fileExists = FileManager.default.fileExists(atPath: segmentURL.path)
-        if !fileExists {
+        guard FileManager.default.fileExists(atPath: segmentURL.path) else {
             throw StorageError.fileNotFound(path: segmentURL.path)
         }
 
-        // Check if file is empty or too small to be a valid video
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: segmentURL.path)[.size] as? Int64) ?? 0
         if fileSize == 0 {
             throw StorageError.fileReadFailed(path: segmentURL.path, underlying: "Video file is empty (still being written)")
         }
 
-        // Decode all frames from the video using AVAssetReader
-        let frames: [DecodedFrame]
-        do {
-            frames = try await decodeAllFrames(from: segmentURL, segmentID: segmentIDValue)
-        } catch {
-            throw error
-        }
+        let frames = try await decodeAllFrames(from: segmentURL, segmentID: segmentIDValue)
 
-        // Store in cache
         let cacheEntry = FrameCacheEntry(
             segmentID: segmentIDValue,
             frames: frames,
@@ -151,73 +225,47 @@ public actor StorageManager: StorageProtocol {
             totalFrameCount: frames.count
         )
         frameCache[segmentIDValue] = cacheEntry
-
-        // Evict old cache entries if needed
         evictOldCacheEntries()
 
-        // Return requested frame
         guard frameIndex < frames.count else {
-            // Frame not yet available in video file - this can happen with actively-written fragmented MP4s
-            // where the database has more frame records than AVAssetReader can decode from the file.
-            // Don't cache this incomplete result - clear cache so next read re-decodes.
             frameCache.removeValue(forKey: segmentIDValue)
-            Log.warning("[StorageManager] Frame index \(frameIndex) out of range (0..<\(frames.count)) for segment \(segmentID.value) - video may still be writing, cache cleared", category: .storage)
             throw StorageError.fileReadFailed(
                 path: segmentURL.path,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
             )
         }
 
-        let frame = frames[frameIndex]
-        let jpegData = try convertCGImageToJPEG(frame.image)
-        Log.debug("[StorageManager] ✅ Decoded and cached: segmentID=\(segmentIDValue), frameIndex=\(frameIndex)/\(frames.count), pts=\(String(format: "%.3f", frame.pts.seconds))s", category: .storage)
-
-        return jpegData
+        return try convertCGImageToJPEG(frames[frameIndex].image)
     }
 
-    /// Read a frame from a video at a specific path (used for Rewind frames with string-based IDs)
-    public func readFrameFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
-
-        // Use path hash as cache key since Rewind paths are strings not Int64
+    /// Read a frame from path using the old decode-all-frames approach (SLOW)
+    /// Kept for easy rollback if B-frame issues are discovered.
+    public func readFrameFromPathDecodeAll(videoPath: String, frameIndex: Int) async throws -> Data {
         let cacheKey = Int64(videoPath.hashValue)
 
-        // Check if we have this segment cached
         if let cacheEntry = frameCache[cacheKey] {
-            // Update access time
             var updatedEntry = cacheEntry
             updatedEntry.lastAccessTime = Date()
             frameCache[cacheKey] = updatedEntry
 
-            // Check if requested frame is in cache
             if frameIndex < cacheEntry.frames.count {
                 let frame = cacheEntry.frames[frameIndex]
-                let jpegData = try convertCGImageToJPEG(frame.image)
-                return jpegData
+                return try convertCGImageToJPEG(frame.image)
             }
         }
 
-        // Check if file exists
-        let fileExists = FileManager.default.fileExists(atPath: videoPath)
-        if !fileExists {
+        guard FileManager.default.fileExists(atPath: videoPath) else {
             throw StorageError.fileNotFound(path: videoPath)
         }
 
-        // Check if file is empty
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoPath)[.size] as? Int64) ?? 0
         if fileSize == 0 {
             throw StorageError.fileReadFailed(path: videoPath, underlying: "Video file is empty")
         }
 
-        // Decode all frames from the video
         let segmentURL = URL(fileURLWithPath: videoPath)
-        let frames: [DecodedFrame]
-        do {
-            frames = try await decodeAllFrames(from: segmentURL, segmentID: cacheKey)
-        } catch {
-            throw error
-        }
+        let frames = try await decodeAllFrames(from: segmentURL, segmentID: cacheKey)
 
-        // Store in cache
         let cacheEntry = FrameCacheEntry(
             segmentID: cacheKey,
             frames: frames,
@@ -225,24 +273,17 @@ public actor StorageManager: StorageProtocol {
             totalFrameCount: frames.count
         )
         frameCache[cacheKey] = cacheEntry
-
-        // Evict old cache entries if needed
         evictOldCacheEntries()
 
-        // Return requested frame
         guard frameIndex < frames.count else {
             frameCache.removeValue(forKey: cacheKey)
-            Log.warning("[StorageManager] Frame index \(frameIndex) out of range (0..<\(frames.count)) for path \(videoPath)", category: .storage)
             throw StorageError.fileReadFailed(
                 path: videoPath,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
             )
         }
 
-        let frame = frames[frameIndex]
-        let jpegData = try convertCGImageToJPEG(frame.image)
-
-        return jpegData
+        return try convertCGImageToJPEG(frames[frameIndex].image)
     }
 
     /// Decode all frames from a video file using AVAssetReader, sorted by PTS (presentation order)
