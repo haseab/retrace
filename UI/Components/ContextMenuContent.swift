@@ -33,12 +33,17 @@ struct ContextMenuContent: View {
                 .background(Color.white.opacity(0.1))
                 .padding(.vertical, 4)
 
-            ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2") {
+            ContextMenuRow(title: viewModel.areControlsHidden ? "Show Controls" : "Hide Controls", icon: viewModel.areControlsHidden ? "menubar.arrow.up.rectangle" : "menubar.arrow.down.rectangle", shortcut: "⌘H") {
+                showMenu = false
+                viewModel.toggleControlsVisibility()
+            }
+
+            ContextMenuRow(title: "Dashboard", icon: "square.grid.2x2", shortcut: "⌘⇧D") {
                 showMenu = false
                 openDashboard()
             }
 
-            ContextMenuRow(title: "Settings", icon: "gear") {
+            ContextMenuRow(title: "Settings", icon: "gear", shortcut: "⌘,") {
                 showMenu = false
                 openSettings()
             }

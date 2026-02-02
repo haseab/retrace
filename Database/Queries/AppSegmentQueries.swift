@@ -617,7 +617,7 @@ enum AppSegmentQueries {
         bundleID: String,
         from startDate: Date,
         to endDate: Date
-    ) throws -> [(windowName: String?, duration: TimeInterval)] {
+    ) throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
         let isBrowser = browserBundleIDs.contains(bundleID)
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
@@ -629,14 +629,15 @@ enum AppSegmentQueries {
         // 5. Cap gaps at 2 minutes and sum per window/domain
         let sql: String
         if isBrowser {
-            // For browsers: extract domain from browserUrl only (no fallback to windowName)
-            // This ensures "Websites" view shows only entries with actual URL data
+            // For browsers: show websites (from browserUrl) first, then windowName fallback entries
+            // Uses UNION to combine website entries and window-only entries, sorted by type then duration
             sql = """
                 WITH all_frames AS (
                     SELECT
                         f.createdAt,
                         s.bundleID,
                         s.id as segmentId,
+                        s.windowName,
                         CASE
                             WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
                                 CASE
@@ -654,7 +655,7 @@ enum AppSegmentQueries {
                                     ELSE s.browserUrl
                                 END
                             ELSE NULL
-                        END as item_name
+                        END as domain
                     FROM frame f
                     JOIN segment s ON f.segmentId = s.id
                     WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -663,28 +664,61 @@ enum AppSegmentQueries {
                     SELECT
                         LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
                         LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
-                        LAG(item_name) OVER (ORDER BY createdAt) as prev_item,
+                        LAG(windowName) OVER (ORDER BY createdAt) as prev_windowName,
+                        LAG(domain) OVER (ORDER BY createdAt) as prev_domain,
                         createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                     FROM all_frames
+                ),
+                -- Website entries (have domain from browserUrl)
+                website_usage AS (
+                    SELECT
+                        prev_domain as item_name,
+                        1 as is_website,
+                        SUM(CASE
+                            WHEN gap_ms IS NULL THEN 0
+                            WHEN gap_ms > ? THEN ?
+                            ELSE gap_ms
+                        END) as duration_ms
+                    FROM frame_gaps
+                    WHERE prev_bundleID = ?
+                        AND prev_domain IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM segment_tag st
+                            JOIN tag t ON st.tagId = t.id
+                            WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                        )
+                    GROUP BY prev_domain
+                    HAVING duration_ms >= 1000
+                ),
+                -- Window fallback entries (no browserUrl but have windowName)
+                window_usage AS (
+                    SELECT
+                        prev_windowName as item_name,
+                        0 as is_website,
+                        SUM(CASE
+                            WHEN gap_ms IS NULL THEN 0
+                            WHEN gap_ms > ? THEN ?
+                            ELSE gap_ms
+                        END) as duration_ms
+                    FROM frame_gaps
+                    WHERE prev_bundleID = ?
+                        AND prev_domain IS NULL
+                        AND prev_windowName IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM segment_tag st
+                            JOIN tag t ON st.tagId = t.id
+                            WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                        )
+                    GROUP BY prev_windowName
+                    HAVING duration_ms >= 1000
                 )
-                SELECT
-                    prev_item as item_name,
-                    SUM(CASE
-                        WHEN gap_ms IS NULL THEN 0
-                        WHEN gap_ms > ? THEN ?
-                        ELSE gap_ms
-                    END) as duration_ms
-                FROM frame_gaps
-                WHERE prev_bundleID = ?
-                    AND prev_item IS NOT NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM segment_tag st
-                        JOIN tag t ON st.tagId = t.id
-                        WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
-                    )
-                GROUP BY prev_item
-                HAVING duration_ms >= 1000
-                ORDER BY duration_ms DESC
+                SELECT item_name, is_website, duration_ms
+                FROM (
+                    SELECT * FROM website_usage
+                    UNION ALL
+                    SELECT * FROM window_usage
+                )
+                ORDER BY is_website DESC, duration_ms DESC
                 """
         } else {
             // For non-browsers: use windowName
@@ -709,6 +743,7 @@ enum AppSegmentQueries {
                 )
                 SELECT
                     prev_item as item_name,
+                    0 as is_website,
                     SUM(CASE
                         WHEN gap_ms IS NULL THEN 0
                         WHEN gap_ms > ? THEN ?
@@ -744,7 +779,14 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 4, maxGapMs)
         sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
 
-        var results: [(windowName: String?, duration: TimeInterval)] = []
+        // For browser query, we have additional parameters for the window fallback subquery
+        if isBrowser {
+            sqlite3_bind_int64(statement, 6, maxGapMs)
+            sqlite3_bind_int64(statement, 7, maxGapMs)
+            sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, nil)
+        }
+
+        var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
@@ -752,10 +794,12 @@ enum AppSegmentQueries {
             } else {
                 windowName = String(cString: sqlite3_column_text(statement, 0))
             }
-            let durationMs = sqlite3_column_int64(statement, 1)
+            let isWebsite = sqlite3_column_int(statement, 1) == 1
+            let durationMs = sqlite3_column_int64(statement, 2)
 
             results.append((
                 windowName: windowName,
+                isWebsite: isWebsite,
                 duration: TimeInterval(durationMs) / 1000.0
             ))
         }

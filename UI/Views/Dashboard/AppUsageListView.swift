@@ -316,11 +316,13 @@ struct AppUsageListView: View {
                                 rowIndex: index
                             )
 
-                            // Nested tabs for this domain
-                            let domainKey = "\(app.appBundleID)_\(window.displayName)"
-                            if expandedDomainKey == domainKey {
-                                domainTabsSection(for: app, domain: window.displayName, appColor: appColor, layoutSize: layoutSize)
-                                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+                            // Nested tabs for this domain (only for actual websites, not window fallbacks)
+                            if window.isWebsite {
+                                let domainKey = "\(app.appBundleID)_\(window.displayName)"
+                                if expandedDomainKey == domainKey {
+                                    domainTabsSection(for: app, domain: window.displayName, appColor: appColor, layoutSize: layoutSize)
+                                        .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+                                }
                             }
                         }
                     } else {
@@ -494,32 +496,44 @@ struct AppUsageListView: View {
         }
     }
 
-    // MARK: - Website Row (Expandable)
+    // MARK: - Website Row (Expandable) or Window Fallback Row
 
     /// Website row in "Websites" mode that can expand to show tabs for that domain
+    /// For window fallbacks (isWebsite=false), shows app icon instead of favicon and doesn't expand
     private func websiteRow(window: WindowUsageData, app: AppUsageData, appColor: Color, layoutSize: AppUsageLayoutSize, rowIndex: Int) -> some View {
         let domainKey = "\(app.appBundleID)_\(window.displayName)"
-        let isExpanded = expandedDomainKey == domainKey
+        let isExpanded = window.isWebsite && expandedDomainKey == domainKey
         let isHovered = hoveredWindowKey == domainKey
 
         return HStack(spacing: layoutSize.rowSpacing) {
-            // Expand/collapse chevron
-            Image(systemName: "chevron.right")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(.retraceSecondary.opacity(0.5))
-                .frame(width: 10)
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                .animation(.easeInOut(duration: 0.2), value: isExpanded)
+            // Expand/collapse chevron - only show for websites (not window fallbacks)
+            if window.isWebsite {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                    .frame(width: 10)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    .animation(.easeInOut(duration: 0.2), value: isExpanded)
+            } else {
+                // Spacer for alignment when no chevron
+                Spacer()
+                    .frame(width: 10)
+            }
 
-            // Indent spacer + favicon
+            // Indent spacer + icon (favicon for websites, app icon for window fallbacks)
             HStack(spacing: 8) {
                 Spacer()
                     .frame(width: layoutSize.rankWidth - 14)
 
-                FaviconView(domain: window.displayName, size: 20, fallbackColor: appColor)
+                if window.isWebsite {
+                    FaviconView(domain: window.displayName, size: 20, fallbackColor: appColor)
+                } else {
+                    // Window fallback: use app icon
+                    AppIconView(bundleID: app.appBundleID, size: 20)
+                }
             }
 
-            // Domain name
+            // Domain name or window name
             Text(window.displayName)
                 .font(layoutSize.windowNameFont)
                 .foregroundColor(.retracePrimary.opacity(0.85))
@@ -569,8 +583,8 @@ struct AppUsageListView: View {
             }
             if hovering {
                 NSCursor.pointingHand.push()
-                // Preload domain tabs on hover
-                if domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
+                // Preload domain tabs on hover (only for websites)
+                if window.isWebsite && domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
                     loadDomainTabs(for: app, domain: window.displayName)
                 }
             } else {
@@ -578,16 +592,22 @@ struct AppUsageListView: View {
             }
         }
         .onTapGesture {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                if expandedDomainKey == domainKey {
-                    expandedDomainKey = nil
-                } else {
-                    expandedDomainKey = domainKey
-                    // Load domain tabs if not cached
-                    if domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
-                        loadDomainTabs(for: app, domain: window.displayName)
+            if window.isWebsite {
+                // Websites expand to show tabs
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if expandedDomainKey == domainKey {
+                        expandedDomainKey = nil
+                    } else {
+                        expandedDomainKey = domainKey
+                        // Load domain tabs if not cached
+                        if domainTabsCache[domainKey] == nil && !loadingDomainTabs.contains(domainKey) {
+                            loadDomainTabs(for: app, domain: window.displayName)
+                        }
                     }
                 }
+            } else {
+                // Window fallbacks: trigger tap action to open timeline
+                onWindowTapped?(app, window)
             }
         }
     }

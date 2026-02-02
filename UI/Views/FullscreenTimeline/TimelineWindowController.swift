@@ -612,6 +612,7 @@ public class TimelineWindowController: NSObject {
                     viewModel.liveScreenshot = nil
                     viewModel.isTapeHidden = true
                     viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
+                    viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
                 }
 
                 // Immediately refresh frame data so next open has fresh data

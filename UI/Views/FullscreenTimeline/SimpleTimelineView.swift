@@ -126,10 +126,10 @@ public struct SimpleTimelineView: View {
                     VStack {
                         Spacer()
                         HStack {
-                            ControlsToggleButton(viewModel: viewModel)
                             Spacer()
+                            ControlsToggleButton(viewModel: viewModel)
                         }
-                        .padding(.leading, 24)
+                        .padding(.trailing, 24)
                         .padding(.bottom, 24)
                     }
                     .transition(.opacity.animation(.easeInOut(duration: 0.2).delay(0.1)))

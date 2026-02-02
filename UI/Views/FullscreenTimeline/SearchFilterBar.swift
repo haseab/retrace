@@ -238,6 +238,10 @@ public struct SearchFilterBar: View {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.clearAllFilters()
                     }
+                    // Re-run search with cleared filters
+                    if !viewModel.searchQuery.isEmpty {
+                        viewModel.submitSearch()
+                    }
                 }) {
                     HStack(spacing: 4) {
                         Image(systemName: "xmark")

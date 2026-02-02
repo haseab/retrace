@@ -111,7 +111,7 @@ public struct TimelineTapeView: View {
                 }
             }
             .offset(x: tapeOffset)
-            // .animation(.linear(duration: 0.04), value: viewModel.currentIndex)
+            .animation(.easeOut(duration: 0.10), value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }
@@ -401,22 +401,17 @@ public struct TimelineTapeView: View {
                 }
                 .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
-                // Left side controls (hide UI + search)
-                HStack(spacing: TimelineScaleFactor.controlSpacing) {
-                    ControlsToggleButton(viewModel: viewModel)
-                    // Keep search button in layout but hide visually when overlay is open
-                    // This prevents the Cmd+H button from shifting
-                    SearchButton(viewModel: viewModel)
-                        .opacity(viewModel.isSearchOverlayVisible ? 0 : 1)
-                        .scaleEffect(viewModel.isSearchOverlayVisible ? 0.8 : 1.0)
-                        .animation(.easeOut(duration: 0.15), value: viewModel.isSearchOverlayVisible)
-                }
-                .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
+                // Left side controls (search)
+                SearchButton(viewModel: viewModel)
+                    .opacity(viewModel.isSearchOverlayVisible ? 0 : 1)
+                    .scaleEffect(viewModel.isSearchOverlayVisible ? 0.8 : 1.0)
+                    .animation(.easeOut(duration: 0.15), value: viewModel.isSearchOverlayVisible)
+                    .position(x: TimelineScaleFactor.leftControlsX, y: TimelineScaleFactor.controlsYOffset)
 
-                // Right side controls (app badge + zoom + more options)
+                // Right side controls (app badge + more options)
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
                     CurrentAppBadge(viewModel: viewModel)
-                    ZoomControl(viewModel: viewModel)
+                    // ZoomControl(viewModel: viewModel)
                     MoreOptionsMenu(viewModel: viewModel)
                 }
                 .padding(4)
@@ -659,7 +654,8 @@ struct CurrentAppBadge: View {
 
     var body: some View {
         Group {
-            if let bundleID = currentBundleID {
+            // Only show the badge for browsers with an openable URL
+            if let bundleID = currentBundleID, hasOpenableURL {
                 Button(action: {
                     if hasOpenableURL, let urlString = currentBrowserURL, let url = URL(string: urlString) {
                         TimelineWindowController.shared.hide()

@@ -37,6 +37,7 @@ public struct SpotlightSearchOverlay: View {
     @ObservedObject private var viewModel: SearchViewModel
     @State private var isVisible = false
     @State private var resultsHeight: CGFloat = 0
+    @State private var isExpanded = false  // Whether to show filters and results (expanded view)
 
     private let panelWidth: CGFloat = 900
     private let collapsedWidth: CGFloat = 400
@@ -67,8 +68,8 @@ public struct SpotlightSearchOverlay: View {
     public var body: some View {
         ZStack {
             // Backdrop - also dismisses dropdowns if open
-            // Only show backdrop when there's search input
-            if !viewModel.searchQuery.isEmpty {
+            // Only show backdrop when expanded
+            if isExpanded {
                 Color.black.opacity(isVisible ? 0.6 : 0)
                     .ignoresSafeArea()
                     .onTapGesture {
@@ -86,8 +87,8 @@ public struct SpotlightSearchOverlay: View {
                 VStack(spacing: 0) {
                     searchBar
 
-                    // Only show filter bar and results when there's input
-                    if !viewModel.searchQuery.isEmpty {
+                    // Only show filter bar and results when expanded
+                    if isExpanded {
                         Divider()
                             .background(Color.white.opacity(0.1))
 
@@ -117,7 +118,7 @@ public struct SpotlightSearchOverlay: View {
                         }
                     }
                 }
-                .frame(width: viewModel.searchQuery.isEmpty ? collapsedWidth : panelWidth)
+                .frame(width: isExpanded ? panelWidth : collapsedWidth)
                 .background(
                     RoundedRectangle(cornerRadius: 12)
                         .fill(Color.black.opacity(0.4))
@@ -131,7 +132,7 @@ public struct SpotlightSearchOverlay: View {
                 .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
 
                 // Filter bar overlay (NOT clipped, so dropdowns can extend beyond panel)
-                if !viewModel.searchQuery.isEmpty {
+                if isExpanded {
                     VStack(spacing: 0) {
                         // Offset to position below search bar + divider
                         Color.clear.frame(height: 57) // searchBar height (~56px) + divider (1px)
@@ -142,7 +143,7 @@ public struct SpotlightSearchOverlay: View {
             }
             .scaleEffect(isVisible ? 1.0 : 0.95)
             .opacity(isVisible ? 1.0 : 0)
-            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.searchQuery.isEmpty)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isExpanded)
         }
         .onAppear {
             Log.debug("\(searchLog) Search overlay opened", category: .ui)
@@ -186,6 +187,9 @@ public struct SpotlightSearchOverlay: View {
                 onSubmit: {
                     if !viewModel.searchQuery.isEmpty {
                         Log.debug("\(searchLog) Submit pressed, triggering search", category: .ui)
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            isExpanded = true
+                        }
                         viewModel.submitSearch()
                     }
                 },
@@ -206,41 +210,28 @@ public struct SpotlightSearchOverlay: View {
             )
             .frame(height: 24)
 
-            // Clear button when there's text
-            if !viewModel.searchQuery.isEmpty && !viewModel.isSearching {
-                Button(action: {
-                    viewModel.searchQuery = ""
-                }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.retraceHeadline)
-                        .foregroundColor(.white.opacity(0.4))
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Search button
+            // Loading spinner (shown while searching)
             if viewModel.isSearching {
                 SpinnerView(size: 20, lineWidth: 2, color: .white)
                     .frame(width: 32, height: 32)
-            } else {
-                Button(action: {
-                    if !viewModel.searchQuery.isEmpty {
-                        Log.debug("\(searchLog) Search button clicked, triggering search", category: .ui)
-                        viewModel.submitSearch()
-                    }
-                }) {
-                    ZStack {
-                        Circle()
-                            .fill(viewModel.searchQuery.isEmpty ? Color.white.opacity(0.2) : Color.retraceSubmitAccent)
-                        Image(systemName: "arrow.right")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(.white)
-                    }
-                    .frame(width: 26, height: 26)
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.searchQuery.isEmpty)
             }
+
+            // Filter button (expands to show filters)
+            Button(action: {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    isExpanded = true
+                }
+            }) {
+                ZStack {
+                    Circle()
+                        .fill(isExpanded ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
+                    Image(systemName: "line.3.horizontal.decrease")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(isExpanded ? .white : .white.opacity(0.6))
+                }
+                .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
 
             // Close button
             Button(action: {
@@ -762,6 +753,10 @@ public struct SpotlightSearchOverlay: View {
 
         // Cancel any in-flight search tasks to prevent blocking
         viewModel.cancelSearch()
+
+        // Clear search query and filters when dismissing
+        viewModel.searchQuery = ""
+        viewModel.clearAllFilters()
 
         withAnimation(.easeOut(duration: 0.15)) {
             isVisible = false

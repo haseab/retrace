@@ -4432,6 +4432,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         isLoading = true
         clearError()
 
+        // Exit live mode if active (we're navigating away from "now")
+        if isInLiveMode {
+            isInLiveMode = false
+            liveScreenshot = nil
+            isTapeHidden = false
+        }
+
         do {
             // If frame ID search is enabled and input looks like a frame ID (pure number), try that first
             if enableFrameIDSearch, let frameID = Int64(searchText.trimmingCharacters(in: .whitespaces)) {
@@ -4618,21 +4625,35 @@ public class SimpleTimelineViewModel: ObservableObject {
             return now
         }
         if trimmed == "yesterday" {
-            return calendar.date(byAdding: .day, value: -1, to: now)
+            if let targetDate = calendar.date(byAdding: .day, value: -1, to: now) {
+                return calendar.startOfDay(for: targetDate)
+            }
+            return nil
         }
         if trimmed == "last week" {
-            return calendar.date(byAdding: .day, value: -7, to: now)
+            if let targetDate = calendar.date(byAdding: .day, value: -7, to: now) {
+                return calendar.startOfDay(for: targetDate)
+            }
+            return nil
         }
         if trimmed == "last month" {
-            return calendar.date(byAdding: .month, value: -1, to: now)
+            if let targetDate = calendar.date(byAdding: .month, value: -1, to: now) {
+                return calendar.startOfDay(for: targetDate)
+            }
+            return nil
         }
 
         // "X hours ago", "X hour ago", "an hour ago"
+        // Returns the START of that hour (e.g., "2 hours ago" at 3:45pm returns 1:00pm)
         if trimmed.contains("hour") {
-            if let hours = extractNumber(from: trimmed) {
-                return calendar.date(byAdding: .hour, value: -hours, to: now)
+            let hours = extractNumber(from: trimmed) ?? 1
+            if let targetTime = calendar.date(byAdding: .hour, value: -hours, to: now) {
+                // Return start of that hour
+                return calendar.date(bySetting: .minute, value: 0, of: targetTime).flatMap {
+                    calendar.date(bySetting: .second, value: 0, of: $0)
+                }
             }
-            return calendar.date(byAdding: .hour, value: -1, to: now)
+            return nil
         }
 
         // "X minutes ago", "X min ago", "30 min ago"
@@ -4644,18 +4665,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // "X days ago"
+        // Returns the START of that day (midnight)
         if trimmed.contains("day") && trimmed.contains("ago") {
             if let days = extractNumber(from: trimmed) {
-                return calendar.date(byAdding: .day, value: -days, to: now)
+                if let targetDate = calendar.date(byAdding: .day, value: -days, to: now) {
+                    // Return start of that day (midnight)
+                    return calendar.startOfDay(for: targetDate)
+                }
             }
+            return nil
         }
 
         // "X weeks ago"
+        // Returns the START of that day (midnight)
         if trimmed.contains("week") {
-            if let weeks = extractNumber(from: trimmed) {
-                return calendar.date(byAdding: .day, value: -weeks * 7, to: now)
+            let weeks = extractNumber(from: trimmed) ?? 1
+            if let targetDate = calendar.date(byAdding: .day, value: -weeks * 7, to: now) {
+                // Return start of that day (midnight)
+                return calendar.startOfDay(for: targetDate)
             }
-            return calendar.date(byAdding: .day, value: -7, to: now)
+            return nil
         }
 
         // === ABSOLUTE DATES ===

@@ -1371,7 +1371,7 @@ public struct TimelineScaleFactor {
     public static var calendarPickerYOffset: CGFloat { -280 * current }
 
     /// X position for left controls
-    public static var leftControlsX: CGFloat { 145 * current }
+    public static var leftControlsX: CGFloat { 130 * current }
 
     /// X offset from right edge for right controls
     public static var rightControlsXOffset: CGFloat { 100 * current }

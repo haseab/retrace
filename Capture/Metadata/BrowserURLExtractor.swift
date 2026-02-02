@@ -174,6 +174,8 @@ struct BrowserURLExtractor: Sendable {
     /// Arc is Chromium-based but often has an incomplete AX tree.
     /// AppleScript is the most reliable method.
     private static func getArcURL(pid: pid_t) -> String? {
+        Log.debug("[BrowserURL] Attempting Arc URL extraction via AppleScript", category: .capture)
+
         // Method 1: AppleScript (most reliable)
         if let url = runAppleScript("""
             tell application "Arc"
@@ -182,8 +184,11 @@ struct BrowserURLExtractor: Sendable {
                 end if
             end tell
             """) {
+            Log.info("[BrowserURL] ✅ Arc URL extracted via AppleScript method 1", category: .capture)
             return url
         }
+
+        Log.debug("[BrowserURL] Arc AppleScript method 1 failed, trying method 2", category: .capture)
 
         // Method 2: Alternative AppleScript syntax
         if let url = runAppleScript("""
@@ -193,11 +198,20 @@ struct BrowserURLExtractor: Sendable {
                 end if
             end tell
             """) {
+            Log.info("[BrowserURL] ✅ Arc URL extracted via AppleScript method 2", category: .capture)
             return url
         }
 
+        Log.debug("[BrowserURL] Arc AppleScript methods failed, falling back to Chromium AX approach", category: .capture)
+
         // Method 3: Fall back to Chromium AX approach
-        return getChromiumURL(pid: pid)
+        let chromiumResult = getChromiumURL(pid: pid)
+        if chromiumResult != nil {
+            Log.info("[BrowserURL] ✅ Arc URL extracted via Chromium AX fallback", category: .capture)
+        } else {
+            Log.warning("[BrowserURL] ❌ All Arc URL extraction methods failed", category: .capture)
+        }
+        return chromiumResult
     }
 
     // MARK: - Firefox
@@ -353,16 +367,31 @@ struct BrowserURLExtractor: Sendable {
     private static func runAppleScript(_ source: String) -> String? {
         var error: NSDictionary?
         guard let script = NSAppleScript(source: source) else {
+            Log.error("[AppleScript] Failed to create NSAppleScript", category: .capture)
             return nil
         }
 
         let result = script.executeAndReturnError(&error)
 
-        if error != nil {
+        if let error = error {
+            let errorNum = error[NSAppleScript.errorNumber] as? Int ?? -1
+            let errorMsg = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
+            Log.error("[AppleScript] Execution failed: \(errorMsg) (code: \(errorNum))", category: .capture)
+
+            // Error -1743 = "Not authorized to send Apple events"
+            if errorNum == -1743 {
+                Log.error("[AppleScript] ⚠️ Automation permission denied - user needs to grant permission in System Settings → Privacy & Security → Automation", category: .capture)
+            }
             return nil
         }
 
-        return result.stringValue
+        if let url = result.stringValue {
+            Log.debug("[AppleScript] Successfully got URL: \(url.prefix(50))...", category: .capture)
+            return url
+        }
+
+        Log.warning("[AppleScript] Script executed but returned nil/empty result", category: .capture)
+        return nil
     }
 
 }
