@@ -23,6 +23,7 @@ enum SettingsDefaults {
     static let fontStyle: RetraceFontStyle = .default
     static let colorTheme = "blue"
     static let timelineColoredBorders = false
+    static let scrubbingAnimationDuration: Double = 0.10  // 0 = no animation, max 0.20
 
     // MARK: Capture
     static let captureIntervalSeconds: Double = 2.0
@@ -66,6 +67,7 @@ public struct SettingsView: View {
     @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = SettingsDefaults.theme
     @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = SettingsDefaults.colorTheme
     @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = SettingsDefaults.timelineColoredBorders
+    @AppStorage("scrubbingAnimationDuration", store: settingsStore) private var scrubbingAnimationDuration: Double = SettingsDefaults.scrubbingAnimationDuration
 
     // Font style - tracked as @State to trigger view refresh on change
     @State private var fontStyle: RetraceFontStyle = RetraceFont.currentStyle
@@ -225,6 +227,9 @@ public struct SettingsView: View {
 
     // Compression settings feedback
     @State private var compressionUpdateMessage: String? = nil
+
+    // Scrubbing animation settings feedback
+    @State private var scrubbingAnimationUpdateMessage: String? = nil
 
     // Capture interval settings feedback
     @State private var captureUpdateMessage: String? = nil
@@ -748,6 +753,69 @@ public struct SettingsView: View {
                         subtitle: "Show accent-colored borders on timeline control buttons",
                         isOn: $timelineColoredBorders
                     )
+
+                    Divider()
+                        .background(Color.retraceBorder)
+
+                    // Scrubbing Animation Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack {
+                            Text("Scrubbing animation")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Spacer()
+                            Text(scrubbingAnimationDisplayText)
+                                .font(.retraceCalloutBold)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.retraceAccent.opacity(0.3))
+                                .cornerRadius(8)
+                        }
+
+                        ModernSlider(value: $scrubbingAnimationDuration, range: 0...0.20, step: 0.01)
+                            .onChange(of: scrubbingAnimationDuration) { _ in
+                                showScrubbingAnimationUpdateFeedback()
+                            }
+
+                        HStack {
+                            Text(scrubbingAnimationDescriptionText)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                            Spacer()
+
+                            if scrubbingAnimationDuration != SettingsDefaults.scrubbingAnimationDuration {
+                                Button(action: {
+                                    scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
+                                    showScrubbingAnimationUpdateFeedback()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 10))
+                                        Text("Reset to Default")
+                                            .font(.retraceCaption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.7))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        // Update feedback message
+                        if let message = scrubbingAnimationUpdateMessage {
+                            HStack(spacing: 6) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.green)
+                                    .font(.system(size: 12))
+                                Text(message)
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: scrubbingAnimationUpdateMessage)
                 }
             }
         }
@@ -3089,6 +3157,29 @@ extension SettingsView {
         return "\(percentage)%"
     }
 
+    var scrubbingAnimationDisplayText: String {
+        if scrubbingAnimationDuration == 0 {
+            return "None"
+        } else {
+            let ms = Int(scrubbingAnimationDuration * 1000)
+            return "\(ms)ms"
+        }
+    }
+
+    var scrubbingAnimationDescriptionText: String {
+        if scrubbingAnimationDuration == 0 {
+            return "Instant scrubbing with no animation"
+        } else if scrubbingAnimationDuration <= 0.05 {
+            return "Minimal animation for quick scrubbing"
+        } else if scrubbingAnimationDuration <= 0.10 {
+            return "Smooth animation for comfortable navigation"
+        } else if scrubbingAnimationDuration <= 0.15 {
+            return "Moderate animation for visual feedback"
+        } else {
+            return "Maximum animation for cinematic feel"
+        }
+    }
+
     /// Calculate storage multiplier based on video quality setting
     /// Reference: 50% quality = 1.0x multiplier
     private func videoQualityMultiplier() -> Double {
@@ -4420,6 +4511,19 @@ extension SettingsView {
         }
     }
 
+    /// Show brief "Updated" feedback for scrubbing animation settings
+    private func showScrubbingAnimationUpdateFeedback() {
+        scrubbingAnimationUpdateMessage = "Updated"
+
+        // Auto-dismiss after 2 seconds
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await MainActor.run {
+                scrubbingAnimationUpdateMessage = nil
+            }
+        }
+    }
+
     // MARK: - Section Reset Functions
 
     /// Reset all General settings to defaults
@@ -4445,6 +4549,7 @@ extension SettingsView {
         colorThemePreference = SettingsDefaults.colorTheme
         MilestoneCelebrationManager.setColorThemePreference(.blue)
         timelineColoredBorders = SettingsDefaults.timelineColoredBorders
+        scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
     }
 
     /// Reset all Capture settings to defaults

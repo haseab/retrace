@@ -26,7 +26,19 @@ public struct TimelineTapeView: View {
         -(TimelineScaleFactor.controlButtonSize * 3 + TimelineScaleFactor.controlSpacing)
     }
 
-    // MARK: - Body 
+    /// Shared UserDefaults store for accessing settings
+    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+
+    /// Scrubbing animation duration from settings (0 = no animation, max 0.20)
+    private var scrubbingAnimationDuration: Double {
+        guard let store = Self.settingsStore else { return 0.10 }
+        // Check if key exists, otherwise return default (double(forKey:) returns 0 for missing keys)
+        return store.object(forKey: "scrubbingAnimationDuration") != nil
+            ? store.double(forKey: "scrubbingAnimationDuration")
+            : 0.10
+    }
+
+    // MARK: - Body
 
     public var body: some View {
         ZStack {
@@ -111,7 +123,7 @@ public struct TimelineTapeView: View {
                 }
             }
             .offset(x: tapeOffset)
-            .animation(.easeOut(duration: 0.10), value: viewModel.currentIndex)
+            .animation(scrubbingAnimationDuration > 0 ? .easeOut(duration: scrubbingAnimationDuration) : nil, value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }
