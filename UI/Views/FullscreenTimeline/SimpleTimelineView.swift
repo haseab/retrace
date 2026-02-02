@@ -3680,6 +3680,10 @@ struct FilterPanel: View {
     @GestureState private var dragOffset: CGSize = .zero
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
+    @State private var tabKeyMonitor: Any?
+
+    /// Filter order for Tab navigation: Apps(1) → Tags(2) → Visibility(3) → Date(4) → back to Apps
+    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .dateRange]
 
     /// Border color for filter panel
     private var themeBorderColor: Color {
@@ -3927,7 +3931,12 @@ struct FilterPanel: View {
             HStack(spacing: 10) {
                 // Clear button (only when pending filters are active)
                 if viewModel.pendingFilterCriteria.hasActiveFilters {
-                    Button(action: { viewModel.clearPendingFilters() }) {
+                    Button(action: {
+                        viewModel.clearPendingFilters()
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.applyFilters()
+                        }
+                    }) {
                         Text("Clear")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundColor(.white.opacity(0.7))
@@ -3996,12 +4005,41 @@ struct FilterPanel: View {
                 }
                 return event
             }
+
+            // Set up Tab key monitor for cycling through filters
+            tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Only handle Tab key (keycode 48)
+                guard event.keyCode == 48 else { return event }
+
+                // Only handle if a dropdown is currently open
+                guard viewModel.activeFilterDropdown != .none else { return event }
+
+                // Find current index in filter order
+                let currentDropdown = viewModel.activeFilterDropdown
+                guard let currentIndex = filterOrder.firstIndex(of: currentDropdown) else { return event }
+
+                // Calculate next index (cycle back to first)
+                let nextIndex = (currentIndex + 1) % filterOrder.count
+                let nextDropdown = filterOrder[nextIndex]
+
+                // Open the next dropdown
+                withAnimation(.easeOut(duration: 0.15)) {
+                    viewModel.showFilterDropdown(nextDropdown, anchorFrame: viewModel.filterDropdownAnchorFrame)
+                }
+
+                return nil // Consume the event
+            }
         }
         .onDisappear {
             // Clean up escape key monitor
             if let monitor = escapeMonitor {
                 NSEvent.removeMonitor(monitor)
                 escapeMonitor = nil
+            }
+            // Clean up tab key monitor
+            if let monitor = tabKeyMonitor {
+                NSEvent.removeMonitor(monitor)
+                tabKeyMonitor = nil
             }
         }
     }

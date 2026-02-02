@@ -102,6 +102,10 @@ public class SearchViewModel: ObservableObject {
     // Signal to close all dropdowns - incremented when Escape is pressed while dropdown is open
     @Published public var closeDropdownsSignal: Int = 0
 
+    // Signal to open a specific filter dropdown via Tab key navigation
+    // Values: 0 = search field, 1 = apps, 2 = date, 3 = tags, 4 = visibility
+    @Published public var openFilterSignal: (index: Int, id: UUID) = (0, UUID())
+
     // Flag to prevent re-search during cache restore
     private var isRestoringFromCache = false
 

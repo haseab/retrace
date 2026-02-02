@@ -38,6 +38,7 @@ public struct SpotlightSearchOverlay: View {
     @State private var isVisible = false
     @State private var resultsHeight: CGFloat = 0
     @State private var isExpanded = false  // Whether to show filters and results (expanded view)
+    @State private var refocusSearchField: UUID = UUID()  // Trigger to refocus search field
 
     private let panelWidth: CGFloat = 900
     private let collapsedWidth: CGFloat = 400
@@ -152,10 +153,18 @@ public struct SpotlightSearchOverlay: View {
             }
         }
         .onExitCommand {
-            Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen)", category: .ui)
+            Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen), searchQuery='\(viewModel.searchQuery)'", category: .ui)
             // If a dropdown is open, close it instead of dismissing the entire overlay
             if viewModel.isDropdownOpen {
                 viewModel.closeDropdownsSignal += 1
+            } else if !viewModel.searchQuery.isEmpty {
+                // Clear search query first before dismissing
+                viewModel.searchQuery = ""
+                viewModel.results = nil
+                viewModel.clearAllFilters()
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    isExpanded = false
+                }
             } else {
                 dismissOverlay()
             }
@@ -170,6 +179,13 @@ public struct SpotlightSearchOverlay: View {
                 if let results = viewModel.results {
                     Log.info("\(searchLog) Results received: \(results.results.count) results, totalCount=\(results.totalCount), searchTime=\(results.searchTimeMs)ms", category: .ui)
                 }
+            }
+        }
+        .onChange(of: viewModel.openFilterSignal.id) { _ in
+            // When Tab cycles back to search field (index 0), trigger refocus
+            if viewModel.openFilterSignal.index == 0 {
+                Log.debug("\(searchLog) Tab navigation returned to search field, triggering refocus", category: .ui)
+                refocusSearchField = UUID()
             }
         }
     }
@@ -196,9 +212,26 @@ public struct SpotlightSearchOverlay: View {
                 onEscape: {
                     if viewModel.isDropdownOpen {
                         viewModel.closeDropdownsSignal += 1
+                    } else if !viewModel.searchQuery.isEmpty {
+                        // Clear search query first before dismissing
+                        viewModel.searchQuery = ""
+                        viewModel.results = nil
+                        viewModel.clearAllFilters()
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            isExpanded = false
+                        }
                     } else {
                         dismissOverlay()
                     }
+                },
+                onTab: {
+                    // Tab from search field opens Apps filter (first filter)
+                    Log.debug("\(searchLog) Tab pressed, opening Apps filter", category: .ui)
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        isExpanded = true
+                    }
+                    // Signal to open Apps filter (index 1)
+                    viewModel.openFilterSignal = (1, UUID())
                 },
                 onFocus: {
                     // Close any open dropdowns when search field gains focus
@@ -206,7 +239,8 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.closeDropdownsSignal += 1
                     }
                 },
-                placeholder: "Search your screen history..."
+                placeholder: "Search your screen history...",
+                refocusTrigger: refocusSearchField
             )
             .frame(height: 24)
 
@@ -911,8 +945,10 @@ struct SpotlightSearchField: NSViewRepresentable {
     @Binding var text: String
     let onSubmit: () -> Void
     let onEscape: () -> Void
+    var onTab: (() -> Void)? = nil
     var onFocus: (() -> Void)? = nil
     var placeholder: String = "Search your screen history..."
+    var refocusTrigger: UUID = UUID()  // Change this to trigger refocus
 
     func makeNSView(context: Context) -> FocusableTextField {
         let textField = FocusableTextField()
@@ -958,6 +994,12 @@ struct SpotlightSearchField: NSViewRepresentable {
         textField.onClickCallback = {
             debugLog("[SpotlightSearchField] mouseDown - text field clicked")
             self.onFocus?()
+        }
+        // Check if refocus was triggered
+        if context.coordinator.lastRefocusTrigger != refocusTrigger {
+            context.coordinator.lastRefocusTrigger = refocusTrigger
+            debugLog("[SpotlightSearchField] Refocus triggered by Tab navigation")
+            focusTextField(textField, attempt: 1)
         }
     }
 
@@ -1015,19 +1057,22 @@ struct SpotlightSearchField: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape, onFocus: onFocus)
+        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape, onTab: onTab, onFocus: onFocus)
     }
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         @Binding var text: String
         let onSubmit: () -> Void
         let onEscape: () -> Void
+        let onTab: (() -> Void)?
         let onFocus: (() -> Void)?
+        var lastRefocusTrigger: UUID = UUID()
 
-        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void, onFocus: (() -> Void)?) {
+        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void, onTab: (() -> Void)?, onFocus: (() -> Void)?) {
             self._text = text
             self.onSubmit = onSubmit
             self.onEscape = onEscape
+            self.onTab = onTab
             self.onFocus = onFocus
         }
 
@@ -1048,6 +1093,9 @@ struct SpotlightSearchField: NSViewRepresentable {
                 return true
             } else if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 onEscape()
+                return true
+            } else if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                onTab?()
                 return true
             }
             return false

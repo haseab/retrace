@@ -103,7 +103,7 @@ struct ContextMenuContent: View {
     }
 
     private func openDashboard() {
-        TimelineWindowController.shared.hide()
+        TimelineWindowController.shared.hideToShowDashboard()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             NotificationCenter.default.post(name: .openDashboard, object: nil)
             DashboardWindowController.shared.show()
@@ -111,7 +111,7 @@ struct ContextMenuContent: View {
     }
 
     private func openSettings() {
-        TimelineWindowController.shared.hide()
+        TimelineWindowController.shared.hideToShowDashboard()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             NotificationCenter.default.post(name: .openSettings, object: nil)
             DashboardWindowController.shared.show()

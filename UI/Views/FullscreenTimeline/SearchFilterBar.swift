@@ -46,6 +46,10 @@ public struct SearchFilterBar: View {
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
     @State private var showSortDropdown = false
+    @State private var tabKeyMonitor: Any?
+
+    /// Filter indices for Tab navigation: 1=Apps, 2=Date, 3=Tags, 4=Visibility, 0=back to search
+    private let filterCount = 4
 
     // MARK: - Body
 
@@ -302,6 +306,95 @@ public struct SearchFilterBar: View {
                 showVisibilityDropdown = false
                 showSortDropdown = false
             }
+        }
+        .onChange(of: viewModel.openFilterSignal.id) { _ in
+            let filterIndex = viewModel.openFilterSignal.index
+            debugLog("[SearchFilterBar] openFilterSignal received: index=\(filterIndex)")
+            openFilterAtIndex(filterIndex)
+        }
+        .onAppear {
+            setupTabKeyMonitor()
+        }
+        .onDisappear {
+            removeTabKeyMonitor()
+        }
+    }
+
+    // MARK: - Tab Key Navigation
+
+    /// Open a specific filter dropdown by index
+    private func openFilterAtIndex(_ index: Int) {
+        withAnimation(.easeOut(duration: 0.15)) {
+            // Close all first
+            showAppsDropdown = false
+            showDatePopover = false
+            showTagsDropdown = false
+            showVisibilityDropdown = false
+            showSortDropdown = false
+
+            // Open the requested one
+            switch index {
+            case 1:
+                showAppsDropdown = true
+                // Lazy load apps when opening via Tab
+                Task {
+                    await viewModel.loadAvailableApps()
+                }
+            case 2:
+                showDatePopover = true
+            case 3:
+                showTagsDropdown = true
+            case 4:
+                showVisibilityDropdown = true
+            default:
+                // Index 0 means focus search field - parent will handle via onChange
+                break
+            }
+        }
+    }
+
+    /// Get the current open filter index (0 if none open)
+    private func currentOpenFilterIndex() -> Int {
+        if showAppsDropdown { return 1 }
+        if showDatePopover { return 2 }
+        if showTagsDropdown { return 3 }
+        if showVisibilityDropdown { return 4 }
+        return 0
+    }
+
+    /// Set up Tab key monitor for cycling through filters
+    private func setupTabKeyMonitor() {
+        // Capture viewModel reference for the closure
+        let vm = viewModel
+        tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Only handle Tab key (keycode 48)
+            guard event.keyCode == 48 else { return event }
+
+            // Check which dropdown is currently open via viewModel's isDropdownOpen
+            guard vm.isDropdownOpen else { return event }
+
+            // Determine current filter by checking the signal's last index
+            // We'll use a simple approach: cycle through 1->2->3->4->0
+            let lastSignal = vm.openFilterSignal.index
+            let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
+
+            debugLog("[SearchFilterBar] Tab pressed in dropdown, lastSignal=\(lastSignal), cycling from \(currentIndex)")
+
+            // Calculate next index (cycle: 1 -> 2 -> 3 -> 4 -> 0 (search))
+            let nextIndex = currentIndex >= 4 ? 0 : currentIndex + 1
+
+            // Signal the change - the onChange handler will open the appropriate dropdown
+            vm.openFilterSignal = (nextIndex, UUID())
+
+            return nil // Consume the event
+        }
+    }
+
+    /// Remove Tab key monitor
+    private func removeTabKeyMonitor() {
+        if let monitor = tabKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            tabKeyMonitor = nil
         }
     }
 

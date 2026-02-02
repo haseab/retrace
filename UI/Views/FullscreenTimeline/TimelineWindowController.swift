@@ -100,6 +100,9 @@ public class TimelineWindowController: NSObject {
     /// Whether the dashboard was the key window when timeline opened
     private var dashboardWasKeyWindow = false
 
+    /// Whether the timeline is hiding to show dashboard/settings (don't auto-hide dashboard in this case)
+    private var isHidingToShowDashboard = false
+
     /// Callback when timeline closes
     public var onClose: (() -> Void)?
 
@@ -239,6 +242,34 @@ public class TimelineWindowController: NSObject {
             name: .activeDisplayDidChange,
             object: nil
         )
+
+        // Listen for dashboard/settings shortcuts to properly hide timeline first
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleToggleDashboard(_:)),
+            name: .toggleDashboard,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOpenSettings(_:)),
+            name: .openSettings,
+            object: nil
+        )
+    }
+
+    /// Handle toggle dashboard notification - if timeline is visible, hide it first
+    @objc private func handleToggleDashboard(_ notification: Notification) {
+        guard isVisible else { return }
+        // Timeline is visible, so hide it properly before showing dashboard
+        hideToShowDashboard()
+    }
+
+    /// Handle open settings notification - if timeline is visible, hide it first
+    @objc private func handleOpenSettings(_ notification: Notification) {
+        guard isVisible else { return }
+        // Timeline is visible, so hide it properly before showing settings
+        hideToShowDashboard()
     }
 
     /// Handle active display change - move hidden window to new screen
@@ -589,12 +620,16 @@ public class TimelineWindowController: NSObject {
             Task { @MainActor in
                 self?.isHiding = false
                 // Only hide dashboard if it wasn't the active window before timeline opened
+                // AND we're not hiding specifically to show the dashboard/settings
                 // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
                 // Also don't hide if a modal sheet (feedback form, etc.) is attached
                 if self?.dashboardWasKeyWindow != true,
+                   self?.isHidingToShowDashboard != true,
                    DashboardWindowController.shared.window?.attachedSheet == nil {
                     DashboardWindowController.shared.hide()
                 }
+                // Reset the flag after use
+                self?.isHidingToShowDashboard = false
 
                 // Hide window but keep it around for instant re-show
                 // This is the key optimization - we don't destroy the window or view model
@@ -753,6 +788,13 @@ public class TimelineWindowController: NSObject {
         } else {
             show()
         }
+    }
+
+    /// Hide the timeline to show dashboard or settings
+    /// This prevents the dashboard from being auto-hidden when the timeline closes
+    public func hideToShowDashboard() {
+        isHidingToShowDashboard = true
+        hide()
     }
 
     /// Show the timeline and navigate to a specific date
