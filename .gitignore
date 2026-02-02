@@ -103,3 +103,9 @@ svg_to_icons.py
 fill_triangles.py
 make_transparent.py
 fix_triangles.py
+
+# DMG creation script (contains credentials)
+scripts/create-dmg.sh
+
+# Release artifacts
+releases/

@@ -45,8 +45,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app
         INFOPLIST_FILE: UI/Info.plist
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.5"
+        CURRENT_PROJECT_VERSION: "3"
         CODE_SIGN_ENTITLEMENTS: UI/Retrace.entitlements
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"
@@ -140,6 +140,8 @@ targets:
     dependencies:
       - target: Shared
       - target: Database
+      - target: Storage
+      - target: Search
     settings:
       base:
         CODE_SIGNING_REQUIRED: NO

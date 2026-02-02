@@ -4,6 +4,24 @@ import App
 
 private let searchLog = "[SpotlightSearch]"
 
+/// Debug logging to file
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
+}
+
 /// Spotlight-style search overlay that appears center-screen
 /// Triggered by Cmd+F or search icon click
 public struct SpotlightSearchOverlay: View {
@@ -176,6 +194,12 @@ public struct SpotlightSearchOverlay: View {
                         viewModel.closeDropdownsSignal += 1
                     } else {
                         dismissOverlay()
+                    }
+                },
+                onFocus: {
+                    // Close any open dropdowns when search field gains focus
+                    if viewModel.isDropdownOpen {
+                        viewModel.closeDropdownsSignal += 1
                     }
                 },
                 placeholder: "Search your screen history..."
@@ -892,6 +916,7 @@ struct SpotlightSearchField: NSViewRepresentable {
     @Binding var text: String
     let onSubmit: () -> Void
     let onEscape: () -> Void
+    var onFocus: (() -> Void)? = nil
     var placeholder: String = "Search your screen history..."
 
     func makeNSView(context: Context) -> FocusableTextField {
@@ -919,6 +944,10 @@ struct SpotlightSearchField: NSViewRepresentable {
         textField.isSelectable = true
 
         textField.onCancelCallback = onEscape
+        textField.onClickCallback = {
+            debugLog("[SpotlightSearchField] mouseDown - text field clicked")
+            self.onFocus?()
+        }
 
         // Focus the text field with retry logic for external monitors
         focusTextField(textField, attempt: 1)
@@ -929,6 +958,11 @@ struct SpotlightSearchField: NSViewRepresentable {
     func updateNSView(_ textField: FocusableTextField, context: Context) {
         if textField.stringValue != text {
             textField.stringValue = text
+        }
+        // Update the click callback in case onFocus changed
+        textField.onClickCallback = {
+            debugLog("[SpotlightSearchField] mouseDown - text field clicked")
+            self.onFocus?()
         }
     }
 
@@ -986,18 +1020,25 @@ struct SpotlightSearchField: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape)
+        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape, onFocus: onFocus)
     }
 
     class Coordinator: NSObject, NSTextFieldDelegate {
         @Binding var text: String
         let onSubmit: () -> Void
         let onEscape: () -> Void
+        let onFocus: (() -> Void)?
 
-        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void) {
+        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void, onFocus: (() -> Void)?) {
             self._text = text
             self.onSubmit = onSubmit
             self.onEscape = onEscape
+            self.onFocus = onFocus
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            debugLog("[SpotlightSearchField] controlTextDidBeginEditing - text field became first responder, calling onFocus")
+            onFocus?()
         }
 
         func controlTextDidChange(_ notification: Notification) {

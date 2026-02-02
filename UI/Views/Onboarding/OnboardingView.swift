@@ -5,6 +5,10 @@ import Database
 import Shared
 import ServiceManagement
 
+/// Softer button color that blends with the dark blue onboarding background
+/// A muted blue that's visible but not as sharp as the primary accent
+private let onboardingButtonColor = Color(red: 35/255, green: 75/255, blue: 145/255)
+
 /// Main onboarding flow with 9 steps
 /// Step 1: Welcome
 /// Step 2: Creator features
@@ -78,49 +82,12 @@ public struct OnboardingView: View {
 
     public var body: some View {
         ZStack {
-            // Background with gradient orbs
+            // Background with gradient orbs (matching dashboard style)
             ZStack {
                 Color.retraceBackground
 
-                // Subtle gradient orbs for depth
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color.retraceAccent.opacity(0.08), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 350
-                        )
-                    )
-                    .frame(width: 700, height: 700)
-                    .offset(x: -250, y: -150)
-                    .blur(radius: 70)
-
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color(red: 139/255, green: 92/255, blue: 246/255).opacity(0.06), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 300
-                        )
-                    )
-                    .frame(width: 600, height: 600)
-                    .offset(x: 300, y: 250)
-                    .blur(radius: 60)
-
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color.retraceSuccess.opacity(0.04), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 200
-                        )
-                    )
-                    .frame(width: 400, height: 400)
-                    .offset(x: 100, y: -300)
-                    .blur(radius: 50)
+                // Dashboard-style ambient glow background
+                onboardingAmbientBackground
             }
             .ignoresSafeArea()
 
@@ -169,7 +136,16 @@ public struct OnboardingView: View {
         HStack {
             // Back button (hidden on step 1)
             if currentStep > 1 {
-                Button(action: { withAnimation { currentStep -= 1 } }) {
+                Button(action: {
+                    withAnimation {
+                        // Skip Rewind data step (6) when going back if no Rewind data exists
+                        if currentStep == 7 && hasRewindData != true {
+                            currentStep = 5
+                        } else {
+                            currentStep -= 1
+                        }
+                    }
+                }) {
                     HStack(spacing: .spacingS) {
                         Image(systemName: "chevron.left")
                         Text("Back")
@@ -210,7 +186,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -230,7 +206,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(hasScreenRecordingPermission && hasAccessibilityPermission ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .background(hasScreenRecordingPermission && hasAccessibilityPermission ? onboardingButtonColor : Color.retraceSecondaryColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -244,25 +220,26 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
 
         case 5:
             // Launch at login - save setting and continue
+            // Skip Rewind data step (6) if no Rewind data exists
             Button(action: {
                 setLaunchAtLogin(enabled: launchAtLogin)
                 let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
                 defaults.set(launchAtLogin, forKey: "launchAtLogin")
-                withAnimation { currentStep = 6 }
+                withAnimation { currentStep = hasRewindData == true ? 6 : 7 }
             }) {
                 Text("Continue")
                     .font(.retraceHeadline)
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -282,7 +259,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background((hasRewindData == false || wantsRewindData != nil) ? Color.retraceAccent : Color.retraceSecondaryColor)
+                    .background((hasRewindData == false || wantsRewindData != nil) ? onboardingButtonColor : Color.retraceSecondaryColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -303,7 +280,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -316,7 +293,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -338,7 +315,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -426,7 +403,7 @@ public struct OnboardingView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, .spacingL)
                     .padding(.vertical, .spacingM)
-                    .background(Color.retraceAccent)
+                    .background(onboardingButtonColor)
                     .cornerRadius(.cornerRadiusM)
             }
             .buttonStyle(.plain)
@@ -561,7 +538,7 @@ public struct OnboardingView: View {
                             .foregroundColor(.white)
                             .padding(.horizontal, .spacingM)
                             .padding(.vertical, .spacingS)
-                            .background(Color.retraceAccent)
+                            .background(onboardingButtonColor)
                             .cornerRadius(.cornerRadiusM)
                     }
                     .buttonStyle(.plain)
@@ -678,10 +655,10 @@ public struct OnboardingView: View {
                 }
                 .padding(.top, .spacingS)
 
-                Text("The left triangle fills in when recording is active.")
-                    .font(.retraceCaption)
-                    .foregroundColor(.retraceSecondary)
-                    .multilineTextAlignment(.center)
+                // Text("The left triangle fills in when recording is active.")
+                //     .font(.retraceCaption)
+                //     .foregroundColor(.retraceSecondary)
+                //     .multilineTextAlignment(.center)
             }
             .padding(.horizontal, .spacingXL)
             .frame(maxWidth: 500)
@@ -697,16 +674,7 @@ public struct OnboardingView: View {
             HStack(spacing: .spacingM) {
                 Spacer()
 
-                // Other menu bar icons (mockup)
-                Image(systemName: "wifi")
-                    .font(.system(size: 14))
-                    .foregroundColor(.retracePrimary.opacity(0.5))
-
-                Image(systemName: "battery.75")
-                    .font(.system(size: 14))
-                    .foregroundColor(.retracePrimary.opacity(0.5))
-
-                // Retrace icon - highlighted
+                // Retrace icon - highlighted (leftmost in the right-side icons)
                 ZStack {
                     RoundedRectangle(cornerRadius: 4)
                         .fill(Color.retraceAccent.opacity(0.2))
@@ -715,6 +683,15 @@ public struct OnboardingView: View {
                     menuBarIconView(recording: true)
                         .frame(width: 26, height: 18)
                 }
+
+                // Other menu bar icons (mockup)
+                Image(systemName: "wifi")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
+
+                Image(systemName: "battery.75")
+                    .font(.system(size: 14))
+                    .foregroundColor(.retracePrimary.opacity(0.5))
 
                 // Clock mockup
                 Text("12:34")
@@ -736,11 +713,16 @@ public struct OnboardingView: View {
                     )
             )
 
-            // Arrow pointing to the icon
-            Image(systemName: "arrow.up")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundColor(.retraceAccent)
-                .padding(.top, .spacingS)
+            // Arrow pointing to the Retrace icon (now leftmost)
+            HStack {
+                Spacer()
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.retraceAccent)
+                Spacer()
+                    .frame(width: 190) // Offset to align with the Retrace icon position
+            }
+            .padding(.top, .spacingS)
         }
     }
 
@@ -755,16 +737,19 @@ public struct OnboardingView: View {
             let gap = width * 0.14
 
             // Left triangle - Points left ◁ (recording indicator)
-            Path { path in
-                let leftTip = width * 0.09
-                let leftBase = leftTip + triangleWidth
-                path.move(to: CGPoint(x: leftTip, y: verticalCenter))
-                path.addLine(to: CGPoint(x: leftBase, y: verticalCenter - triangleHeight / 2))
-                path.addLine(to: CGPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
-                path.closeSubpath()
-            }
-            .fill(recording ? Color.retracePrimary : Color.clear)
-            .overlay(
+            // When recording: filled solid, no border
+            // When paused: outlined only
+            if recording {
+                Path { path in
+                    let leftTip = width * 0.09
+                    let leftBase = leftTip + triangleWidth
+                    path.move(to: CGPoint(x: leftTip, y: verticalCenter))
+                    path.addLine(to: CGPoint(x: leftBase, y: verticalCenter - triangleHeight / 2))
+                    path.addLine(to: CGPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
+                    path.closeSubpath()
+                }
+                .fill(Color.retracePrimary)
+            } else {
                 Path { path in
                     let leftTip = width * 0.09
                     let leftBase = leftTip + triangleWidth
@@ -774,7 +759,7 @@ public struct OnboardingView: View {
                     path.closeSubpath()
                 }
                 .stroke(Color.retracePrimary, lineWidth: 1.2)
-            )
+            }
 
             // Right triangle - Points right ▷ (always outlined)
             Path { path in
@@ -1484,7 +1469,7 @@ public struct OnboardingView: View {
                     )
                 }
 
-                Text("v0.1 - January 2026")
+                Text("v0.5 - February 2026")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
             }
@@ -1514,7 +1499,7 @@ public struct OnboardingView: View {
                         .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 2)
                 )
 
-                Text("Thanks for being an early tester!")
+                Text("Thanks for being an early user!")
                     .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
             }
@@ -1612,7 +1597,7 @@ public struct OnboardingView: View {
                         .foregroundColor(.retracePrimary)
                         .frame(minWidth: 60, minHeight: 40)
                         .padding(.horizontal, .spacingM)
-                        .background(Color.retraceAccent)
+                        .background(onboardingButtonColor)
                         .cornerRadius(.cornerRadiusS)
                 }
             }
@@ -1669,19 +1654,75 @@ public struct OnboardingView: View {
 
     // MARK: - Helper Views
 
-    private var retraceLogo: some View {
-        // Recreate the SVG logo in SwiftUI
-        ZStack {
-            // Background circle with gradient
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [Color.retraceAccent.opacity(0.3), Color.retraceDeepBlue],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
+    /// Dashboard-style ambient background with blue glow orbs
+    private var onboardingAmbientBackground: some View {
+        // Blue theme colors (matching dashboard)
+        let ambientGlowColor = Color(red: 14/255, green: 42/255, blue: 104/255)  // Deeper blue orb: #0e2a68
 
+        return GeometryReader { geometry in
+            ZStack {
+                // Primary accent orb (top-left) - uses theme color
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [Color.retraceAccent.opacity(0.10), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 300
+                        )
+                    )
+                    .frame(width: 600, height: 600)
+                    .offset(x: -200, y: -100)
+                    .blur(radius: 60)
+
+                // Secondary orb (top-left) - theme glow color
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [ambientGlowColor.opacity(0.3), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 250
+                        )
+                    )
+                    .frame(width: 500, height: 500)
+                    .offset(x: -150, y: -50)
+                    .blur(radius: 50)
+
+                // Top edge glow
+                Rectangle()
+                    .fill(
+                        LinearGradient(
+                            colors: [ambientGlowColor.opacity(0.6), Color.clear],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .frame(height: 150)
+                    .frame(maxWidth: .infinity)
+                    .position(x: geometry.size.width / 2, y: 0)
+                    .blur(radius: 30)
+
+                // Bottom-right corner glow
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [ambientGlowColor.opacity(0.5), Color.clear],
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: 400
+                        )
+                    )
+                    .frame(width: 800, height: 800)
+                    .position(x: geometry.size.width, y: geometry.size.height)
+                    .blur(radius: 80)
+            }
+        }
+    }
+
+    private var retraceLogo: some View {
+        // Recreate the SVG logo in SwiftUI - just the triangles, no background circle
+        ZStack {
             // Left triangle pointing left
             Path { path in
                 path.move(to: CGPoint(x: 15, y: 60))

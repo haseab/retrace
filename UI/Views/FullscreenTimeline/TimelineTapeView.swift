@@ -2036,6 +2036,14 @@ class FocusableTextField: NSTextField {
     /// Callback to cancel/close the panel
     var onCancelCallback: (() -> Void)?
 
+    /// Callback when the text field is clicked
+    var onClickCallback: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClickCallback?()
+        super.mouseDown(with: event)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         // Check for Cmd+G to close the panel
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])

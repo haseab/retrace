@@ -564,7 +564,7 @@ public struct AppsFilterPopover: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .frame(maxHeight: 240)
+                .frame(maxHeight: 200)
                 .onChange(of: highlightedItemID) { newID in
                     // Scroll to highlighted item
                     if isAllAppsHighlighted {

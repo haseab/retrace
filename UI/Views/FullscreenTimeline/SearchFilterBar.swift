@@ -3,6 +3,24 @@ import Shared
 import App
 import AppKit
 
+/// Debug logging to file
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    let path = "/tmp/retrace_debug.log"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
+    }
+}
+
 // MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
 
 /// Modifier that hides the focus ring, with availability check for macOS 14.0+
@@ -244,7 +262,9 @@ public struct SearchFilterBar: View {
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showAppsDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            debugLog("[SearchFilterBar] isDropdownOpen now: \(viewModel.isDropdownOpen)")
             // Lazy load apps only when dropdown is opened
             if isOpen {
                 Task {
@@ -252,19 +272,24 @@ public struct SearchFilterBar: View {
                 }
             }
         }
-        .onChange(of: showDatePopover) { _ in
+        .onChange(of: showDatePopover) { isOpen in
+            debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
-        .onChange(of: showTagsDropdown) { _ in
+        .onChange(of: showTagsDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
-        .onChange(of: showVisibilityDropdown) { _ in
+        .onChange(of: showVisibilityDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
-        .onChange(of: showSortDropdown) { _ in
+        .onChange(of: showSortDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showSortDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
         }
-        .onChange(of: viewModel.closeDropdownsSignal) { _ in
+        .onChange(of: viewModel.closeDropdownsSignal) { newValue in
+            debugLog("[SearchFilterBar] closeDropdownsSignal received: \(newValue)")
             // Close all dropdowns when signal is received (from Escape key in parent)
             withAnimation(.easeOut(duration: 0.15)) {
                 showAppsDropdown = false

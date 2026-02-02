@@ -8,6 +8,7 @@ struct AppUsageHardDriveView: View {
     let totalTime: TimeInterval
     var onAppTapped: ((AppUsageData) -> Void)? = nil
     @State private var hoveredApp: AppUsageData? = nil
+    @State private var hoverDebounceTask: DispatchWorkItem? = nil
 
     private let gap: CGFloat = 3
 
@@ -87,13 +88,28 @@ struct AppUsageHardDriveView: View {
         .shadow(color: isHovered ? appColor.opacity(0.4) : .clear, radius: 12, x: 0, y: 4)
         .zIndex(isHovered ? 100 : 0)
         .onHover { hovering in
+            // Cancel any pending hover-off task
+            hoverDebounceTask?.cancel()
+
             if hovering {
                 NSCursor.pointingHand.set()
+                // Immediately set hovered app when entering a block
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    hoveredApp = item.app
+                }
             } else {
-                NSCursor.arrow.set()
-            }
-            withAnimation(.easeInOut(duration: 0.15)) {
-                hoveredApp = hovering ? item.app : nil
+                // Debounce hover-off to prevent flickering when moving between adjacent blocks
+                let task = DispatchWorkItem { [item] in
+                    // Only clear if we're still hovering on the same app (not a new one)
+                    if hoveredApp?.id == item.app.id {
+                        NSCursor.arrow.set()
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            hoveredApp = nil
+                        }
+                    }
+                }
+                hoverDebounceTask = task
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: task)
             }
         }
         .onTapGesture {

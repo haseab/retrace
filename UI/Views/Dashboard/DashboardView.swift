@@ -37,10 +37,10 @@ private enum LayoutSize {
 
     var graphHeight: CGFloat {
         switch self {
-        case .normal: return 77
-        case .large: return 100
-        case .extraLarge: return 120
-        case .massive: return 140
+        case .normal: return 70
+        case .large: return 92
+        case .extraLarge: return 110
+        case .massive: return 128
         }
     }
 

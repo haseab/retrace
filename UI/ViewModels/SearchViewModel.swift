@@ -122,6 +122,7 @@ public class SearchViewModel: ObservableObject {
 
     private let debounceDelay: TimeInterval = 0.3
     private let defaultResultLimit = 50
+    private let maxSearchWords = 15  // Limit search queries to prevent performance issues
 
     // MARK: - Search Results Cache (for restoring on app reopen)
 
@@ -354,6 +355,9 @@ public class SearchViewModel: ObservableObject {
     }
 
     private func buildSearchQuery(_ text: String, offset: Int = 0) -> SearchQuery {
+        // Truncate query to max words to prevent performance issues with very long queries
+        let truncatedText = truncateToMaxWords(text)
+
         // Convert Set to Array for the filter, nil if no apps selected (means all apps)
         // Use appBundleIDs for include mode, excludedAppBundleIDs for exclude mode
         let appBundleIDsArray: [String]?
@@ -400,13 +404,23 @@ public class SearchViewModel: ObservableObject {
         )
 
         return SearchQuery(
-            text: text,
+            text: truncatedText,
             filters: filters,
             limit: defaultResultLimit,
             offset: offset,
             mode: searchMode,
             sortOrder: sortOrder
         )
+    }
+
+    /// Truncate query text to maximum allowed words
+    private func truncateToMaxWords(_ text: String) -> String {
+        let words = text.split(separator: " ", omittingEmptySubsequences: true)
+        guard words.count > maxSearchWords else { return text }
+
+        let truncated = words.prefix(maxSearchWords).joined(separator: " ")
+        Log.warning("[SearchViewModel] Query truncated from \(words.count) to \(maxSearchWords) words", category: .ui)
+        return truncated
     }
 
     /// Switch search mode and re-run search
