@@ -36,6 +36,11 @@ public actor FrameProcessingQueue {
     // This bypasses B-frame reordering issues in fragmented MP4s.
     private var frameDataCache: [Int64: CapturedFrame] = [:]
 
+    // Maximum number of frames to keep in cache to prevent unbounded memory growth
+    // Each CapturedFrame is ~10-30MB, so 50 frames = 500MB-1.5GB max
+    // If processing falls behind, oldest frames will be evicted
+    private let maxFrameDataCacheSize = 50
+
     // MARK: - Initialization
 
     public init(
@@ -65,6 +70,18 @@ public actor FrameProcessingQueue {
 
         // Cache the frame data if provided
         if let frame = capturedFrame {
+            // Evict oldest frames if cache is at capacity to prevent unbounded memory growth
+            // This can happen if OCR processing falls behind the capture rate
+            if frameDataCache.count >= maxFrameDataCacheSize {
+                // Remove oldest entries (lowest frame IDs, since IDs are sequential)
+                let sortedKeys = frameDataCache.keys.sorted()
+                let keysToRemove = sortedKeys.prefix(frameDataCache.count - maxFrameDataCacheSize + 1)
+                for key in keysToRemove {
+                    frameDataCache.removeValue(forKey: key)
+                }
+                Log.warning("[Queue-DIAG] Frame data cache at capacity (\(maxFrameDataCacheSize)), evicted \(keysToRemove.count) oldest frames", category: .processing)
+            }
+
             frameDataCache[frameID] = frame
             Log.debug("[Queue-DIAG] Cached frame data for frameID \(frameID), cache size: \(frameDataCache.count)", category: .processing)
         }

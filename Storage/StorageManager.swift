@@ -399,6 +399,11 @@ public actor StorageManager: StorageProtocol {
         // Read all frames with their PTS
         var framesWithPTS: [(pts: CMTime, image: CGImage)] = []
 
+        // CRITICAL: Create CIContext ONCE outside the loop to avoid memory leak
+        // Each CIContext allocates 20-50MB of Metal/GPU resources
+        // Creating one per frame caused 40GB+ memory usage in VTDecoderXPCService
+        let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
         while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
@@ -407,10 +412,9 @@ public actor StorageManager: StorageProtocol {
                 continue
             }
 
-            // Convert CVPixelBuffer to CGImage
+            // Convert CVPixelBuffer to CGImage using shared context
             let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-            let context = CIContext(options: nil)
-            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
                 Log.warning("[StorageManager] Failed to create CGImage at PTS \(String(format: "%.3f", pts.seconds))s, segment \(segmentID)", category: .storage)
                 continue
             }
