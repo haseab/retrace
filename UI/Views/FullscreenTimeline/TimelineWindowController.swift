@@ -1230,9 +1230,13 @@ public class TimelineWindowController: NSObject {
                     viewModel.isSearchOverlayVisible = false
                     return true
                 }
-                // If search highlight is showing, clear it
+                // If search highlight is showing, clear it and return to search results if available
                 if viewModel.isShowingSearchHighlight {
                     viewModel.clearSearchHighlight()
+                    // If there are search results to return to, reopen the search overlay
+                    if viewModel.searchViewModel.results != nil && !viewModel.searchViewModel.searchQuery.isEmpty {
+                        viewModel.isSearchOverlayVisible = true
+                    }
                     return true
                 }
                 // If delete confirmation is showing, cancel it

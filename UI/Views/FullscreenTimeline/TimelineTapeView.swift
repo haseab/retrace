@@ -2239,7 +2239,7 @@ struct ThemeAwareCircleButtonStyle: ViewModifier {
     @State private var theme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     private var showColoredBorders: Bool {
-        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? false
     }
 
     func body(content: Content) -> some View {
@@ -2270,7 +2270,7 @@ struct ThemeAwareCapsuleButtonStyle: ViewModifier {
     @State private var theme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     private var showColoredBorders: Bool {
-        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+        timelineSettingsStore?.bool(forKey: "timelineColoredBorders") ?? false
     }
 
     func body(content: Content) -> some View {

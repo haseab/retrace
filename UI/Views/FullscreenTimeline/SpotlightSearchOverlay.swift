@@ -150,6 +150,10 @@ public struct SpotlightSearchOverlay: View {
             Log.debug("\(searchLog) Search overlay opened", category: .ui)
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                 isVisible = true
+                // If there are existing results, expand to show them
+                if viewModel.results != nil && !viewModel.searchQuery.isEmpty {
+                    isExpanded = true
+                }
             }
         }
         .onExitCommand {
@@ -157,15 +161,8 @@ public struct SpotlightSearchOverlay: View {
             // If a dropdown is open, close it instead of dismissing the entire overlay
             if viewModel.isDropdownOpen {
                 viewModel.closeDropdownsSignal += 1
-            } else if !viewModel.searchQuery.isEmpty {
-                // Clear search query first before dismissing
-                viewModel.searchQuery = ""
-                viewModel.results = nil
-                viewModel.clearAllFilters()
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                    isExpanded = false
-                }
             } else {
+                // Always dismiss the overlay on Escape (clearing happens in dismissOverlay)
                 dismissOverlay()
             }
         }
@@ -212,15 +209,8 @@ public struct SpotlightSearchOverlay: View {
                 onEscape: {
                     if viewModel.isDropdownOpen {
                         viewModel.closeDropdownsSignal += 1
-                    } else if !viewModel.searchQuery.isEmpty {
-                        // Clear search query first before dismissing
-                        viewModel.searchQuery = ""
-                        viewModel.results = nil
-                        viewModel.clearAllFilters()
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                            isExpanded = false
-                        }
                     } else {
+                        // Always dismiss the overlay on Escape (clearing happens in dismissOverlay)
                         dismissOverlay()
                     }
                 },
@@ -773,7 +763,9 @@ public struct SpotlightSearchOverlay: View {
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current
         Log.info("\(searchLog) Result selected: query='\(query)', frameID=\(result.frameID.stringValue), timestamp=\(df.string(from: result.timestamp)) (epoch: \(result.timestamp.timeIntervalSince1970)), segmentID=\(result.segmentID.stringValue), app=\(result.appName ?? "unknown")", category: .ui)
-        dismissOverlay()
+
+        // Dismiss overlay WITHOUT clearing search state - user selected a result
+        dismissOverlayPreservingSearch()
 
         // Small delay to allow dismiss animation
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -782,6 +774,20 @@ public struct SpotlightSearchOverlay: View {
         }
     }
 
+    /// Dismisses the overlay without clearing search state (used when selecting a result)
+    private func dismissOverlayPreservingSearch() {
+        Log.debug("\(searchLog) Dismissing overlay (preserving search state)", category: .ui)
+
+        withAnimation(.easeOut(duration: 0.15)) {
+            isVisible = false
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            onDismiss()
+        }
+    }
+
+    /// Dismisses the overlay and clears search state (used for explicit dismissal like Escape key)
     private func dismissOverlay() {
         Log.debug("\(searchLog) Dismissing overlay", category: .ui)
 
