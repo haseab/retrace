@@ -38,6 +38,9 @@ public actor AppCoordinator {
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
 
+    // Storage accessibility monitoring - stops recording if storage becomes unavailable
+    private var storageMonitorTask: Task<Void, Never>?
+
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
@@ -292,6 +295,9 @@ public actor AppCoordinator {
         // Save recording state for persistence across restarts
         saveRecordingState(true)
 
+        // Start storage accessibility monitoring (detects disconnected drives)
+        startStorageMonitoring()
+
         Log.info("Capture pipeline started successfully", category: .app)
     }
 
@@ -305,6 +311,9 @@ public actor AppCoordinator {
         }
 
         Log.info("Stopping capture pipeline...", category: .app)
+
+        // Stop storage accessibility monitoring
+        stopStorageMonitoring()
 
         // Stop screen capture
         try await services.capture.stopCapture()
@@ -362,6 +371,48 @@ public actor AppCoordinator {
 
         isRunning = false
         Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
+    }
+
+    // MARK: - Storage Accessibility Monitoring
+
+    /// Monitor storage accessibility and stop recording if storage becomes unavailable
+    /// (e.g., external drive disconnected)
+    private func startStorageMonitoring() {
+        storageMonitorTask?.cancel()
+
+        storageMonitorTask = Task { [weak self] in
+            let checkInterval: UInt64 = 5_000_000_000 // 5 seconds
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: checkInterval)
+                guard !Task.isCancelled else { break }
+
+                let storagePath = AppPaths.expandedStorageRoot
+                var isDirectory: ObjCBool = false
+                let exists = FileManager.default.fileExists(atPath: storagePath, isDirectory: &isDirectory)
+
+                if !exists || !isDirectory.boolValue {
+                    Log.error("[AppCoordinator] Storage path inaccessible: \(storagePath) - stopping recording", category: .app)
+
+                    guard let self = self else { break }
+                    try? await self.stopPipeline()
+
+                    // Post notification so UI can alert user
+                    await MainActor.run {
+                        NotificationCenter.default.post(
+                            name: NSNotification.Name("StorageInaccessible"),
+                            object: nil
+                        )
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    private func stopStorageMonitoring() {
+        storageMonitorTask?.cancel()
+        storageMonitorTask = nil
     }
 
     // MARK: - Pipeline Implementation

@@ -4695,11 +4695,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             return timeOnlyDate
         }
 
+        // Normalize compact time formats (e.g., "827am" -> "8:27am") before passing to NSDataDetector
+        // This allows "827am yesterday" to work the same as "8:27am yesterday"
+        let normalizedText = normalizeCompactTimeFormat(trimmed)
+
         // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
         if let detector = detector {
-            let range = NSRange(text.startIndex..., in: text)
-            if let match = detector.firstMatch(in: text, options: [], range: range),
+            let range = NSRange(normalizedText.startIndex..., in: normalizedText)
+            if let match = detector.firstMatch(in: normalizedText, options: [], range: range),
                let date = match.date {
                 return date
             }
@@ -4825,6 +4829,60 @@ public class SimpleTimelineViewModel: ObservableObject {
         components.second = 0
 
         return calendar.date(from: components)
+    }
+
+    /// Normalize compact time formats in a string to colon format for NSDataDetector
+    /// Converts "827am" -> "8:27am", "1130pm" -> "11:30pm", etc.
+    /// This allows inputs like "827am yesterday" to work the same as "8:27am yesterday"
+    private func normalizeCompactTimeFormat(_ text: String) -> String {
+        // Pattern matches 3-4 digit numbers followed immediately by am/pm (with optional space)
+        // Examples: "827am", "827 am", "1130pm", "1130 pm"
+        let pattern = #"(\d{3,4})\s*(am|pm)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return text
+        }
+
+        var result = text
+        let range = NSRange(text.startIndex..., in: text)
+
+        // Find all matches and replace from end to start to preserve indices
+        let matches = regex.matches(in: text, options: [], range: range)
+        for match in matches.reversed() {
+            guard let numberRange = Range(match.range(at: 1), in: result),
+                  let suffixRange = Range(match.range(at: 2), in: result) else {
+                continue
+            }
+
+            let numberStr = String(result[numberRange])
+            let suffix = String(result[suffixRange])
+
+            guard let numericValue = Int(numberStr) else { continue }
+
+            // Extract hour and minute from compact format
+            let hour: Int
+            let minute: Int
+            if numericValue >= 100 && numericValue <= 1259 {
+                // 3-4 digit time (e.g., 827 -> 8:27, 1130 -> 11:30)
+                hour = numericValue / 100
+                minute = numericValue % 100
+            } else {
+                continue // Invalid format
+            }
+
+            // Validate
+            guard hour >= 1 && hour <= 12 && minute >= 0 && minute <= 59 else {
+                continue
+            }
+
+            // Build normalized time string
+            let normalizedTime = "\(hour):\(String(format: "%02d", minute))\(suffix)"
+
+            // Replace in result
+            let fullMatchRange = Range(match.range, in: result)!
+            result.replaceSubrange(fullMatchRange, with: normalizedTime)
+        }
+
+        return result
     }
 
     /// Find the frame index closest to a target date
