@@ -121,11 +121,9 @@ public struct FeedbackFormView: View {
                     if let error = viewModel.error {
                         errorBanner(error)
                     }
-
-                    Spacer(minLength: 80)
                 }
                 .padding(20)
-                .padding(.bottom, 80) // Extra padding for action buttons
+                .padding(.bottom, 10) // Space for action buttons overlay
             }
             .overlay(alignment: .bottom) {
                 // Action buttons fixed at bottom
