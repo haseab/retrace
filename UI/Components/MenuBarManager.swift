@@ -121,28 +121,34 @@ public class MenuBarManager: ObservableObject {
         // This prevents old shortcuts from persisting after settings changes
         HotkeyManager.shared.unregisterAll()
 
-        // Register timeline global hotkey
-        HotkeyManager.shared.registerHotkey(
-            key: timelineShortcut.key,
-            modifiers: timelineShortcut.modifiers.nsModifiers
-        ) { [weak self] in
-            self?.toggleTimelineOverlay()
+        // Register timeline global hotkey (skip if cleared)
+        if !timelineShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: timelineShortcut.key,
+                modifiers: timelineShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.toggleTimelineOverlay()
+            }
         }
 
-        // Register dashboard global hotkey
-        HotkeyManager.shared.registerHotkey(
-            key: dashboardShortcut.key,
-            modifiers: dashboardShortcut.modifiers.nsModifiers
-        ) { [weak self] in
-            self?.toggleDashboard()
+        // Register dashboard global hotkey (skip if cleared)
+        if !dashboardShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: dashboardShortcut.key,
+                modifiers: dashboardShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.toggleDashboard()
+            }
         }
 
-        // Register recording global hotkey
-        HotkeyManager.shared.registerHotkey(
-            key: recordingShortcut.key,
-            modifiers: recordingShortcut.modifiers.nsModifiers
-        ) { [weak self] in
-            self?.toggleRecording()
+        // Register recording global hotkey (skip if cleared)
+        if !recordingShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: recordingShortcut.key,
+                modifiers: recordingShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.toggleRecording()
+            }
         }
 
         // Also configure the timeline window controller

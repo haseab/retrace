@@ -6,7 +6,7 @@ import ScreenCaptureKit
 import SQLCipher
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
-private let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
 // MARK: - Settings Defaults (Single Source of Truth)
 
@@ -286,6 +286,15 @@ public struct SettingsView: View {
                 launchedWithRetraceDBPath = customRetraceDBLocation
                 launchedPathInitialized = true
             }
+        }
+        .onChange(of: timelineShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: dashboardShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: recordingShortcut) { _ in
+            Task { await saveShortcuts() }
         }
     }
 
@@ -864,6 +873,11 @@ public struct SettingsView: View {
                             .font(.retraceCaption2)
                             .foregroundColor(.white)
                             .frame(minWidth: 100, minHeight: 24)
+                    } else if shortcut.wrappedValue.isEmpty {
+                        Text("None")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.white.opacity(0.5))
+                            .frame(minWidth: 60, minHeight: 24)
                     } else {
                         HStack(spacing: 4) {
                             ForEach(shortcut.wrappedValue.modifierSymbols, id: \.self) { symbol in
@@ -910,14 +924,28 @@ public struct SettingsView: View {
                         shortcutError = "This shortcut is already in use"
                     },
                     onShortcutCaptured: {
-                        // Save the shortcut when captured
-                        Task {
-                            await saveShortcuts()
-                        }
+                        // Saving is now handled by .onChange modifiers
                     }
                 )
                 .frame(width: 0, height: 0)
             )
+
+            // Clear button (×)
+            if !shortcut.wrappedValue.isEmpty && !isRecording.wrappedValue {
+                Button(action: {
+                    shortcut.wrappedValue = .empty
+                    // Saving is now handled by .onChange modifiers
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.5))
+                        .frame(width: 18, height: 18)
+                        .background(Color.white.opacity(0.1))
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+                .help("Clear shortcut")
+            }
         }
     }
 
@@ -929,32 +957,31 @@ public struct SettingsView: View {
 
     private func loadSavedShortcuts() async {
         // Load directly from UserDefaults (same as OnboardingManager)
-        if let data = settingsStore?.data(forKey: Self.timelineShortcutKey),
+        if let data = settingsStore.data(forKey: Self.timelineShortcutKey),
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             timelineShortcut = SettingsShortcutKey(from: config)
         }
-        if let data = settingsStore?.data(forKey: Self.dashboardShortcutKey),
+        if let data = settingsStore.data(forKey: Self.dashboardShortcutKey),
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             dashboardShortcut = SettingsShortcutKey(from: config)
         }
-        if let data = settingsStore?.data(forKey: Self.recordingShortcutKey),
+        if let data = settingsStore.data(forKey: Self.recordingShortcutKey),
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             recordingShortcut = SettingsShortcutKey(from: config)
         }
     }
 
     private func saveShortcuts() async {
-        // Save directly to UserDefaults (same as OnboardingManager)
         if let data = try? JSONEncoder().encode(timelineShortcut.toConfig) {
-            settingsStore?.set(data, forKey: Self.timelineShortcutKey)
+            settingsStore.set(data, forKey: Self.timelineShortcutKey)
         }
         if let data = try? JSONEncoder().encode(dashboardShortcut.toConfig) {
-            settingsStore?.set(data, forKey: Self.dashboardShortcutKey)
+            settingsStore.set(data, forKey: Self.dashboardShortcutKey)
         }
         if let data = try? JSONEncoder().encode(recordingShortcut.toConfig) {
-            settingsStore?.set(data, forKey: Self.recordingShortcutKey)
+            settingsStore.set(data, forKey: Self.recordingShortcutKey)
         }
-        // Re-register hotkeys with MenuBarManager
+        settingsStore.synchronize()
         MenuBarManager.shared?.reloadShortcuts()
     }
 
@@ -3743,8 +3770,8 @@ extension SettingsView {
     func resetAllSettings() {
         // Reset all UserDefaults to their default values
         let domain = "io.retrace.app"
-        settingsStore?.removePersistentDomain(forName: domain)
-        settingsStore?.synchronize()
+        settingsStore.removePersistentDomain(forName: domain)
+        settingsStore.synchronize()
 
         // Reset all pages using SettingsDefaults as source of truth
         resetGeneralSettings()
@@ -4642,6 +4669,14 @@ struct SettingsShortcutKey: Equatable {
     var key: String
     var modifiers: NSEvent.ModifierFlags
 
+    /// An empty shortcut (no key assigned)
+    static let empty = SettingsShortcutKey(key: "", modifiers: [])
+
+    /// Whether this shortcut is empty (cleared)
+    var isEmpty: Bool {
+        key.isEmpty
+    }
+
     /// Create from ShortcutConfig (source of truth)
     init(from config: ShortcutConfig) {
         self.key = config.key
@@ -4655,6 +4690,7 @@ struct SettingsShortcutKey: Equatable {
     }
 
     var displayString: String {
+        if isEmpty { return "None" }
         var parts: [String] = []
         if modifiers.contains(.control) { parts.append("⌃") }
         if modifiers.contains(.option) { parts.append("⌥") }
@@ -4732,7 +4768,18 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
                 return
             }
 
-            // Require at least one modifier key
+            // Delete/Backspace key (without modifiers) clears the shortcut
+            if event.keyCode == 51 && modifiers.isEmpty {
+                parent.capturedShortcut = .empty
+                parent.isRecording = false
+                // Delay callback to allow SwiftUI binding to propagate
+                DispatchQueue.main.async { [self] in
+                    self.parent.onShortcutCaptured()
+                }
+                return
+            }
+
+            // Require at least one modifier key for setting a shortcut
             if modifiers.isEmpty {
                 return
             }
@@ -4748,7 +4795,9 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
 
             parent.capturedShortcut = newShortcut
             parent.isRecording = false
-            parent.onShortcutCaptured()
+            DispatchQueue.main.async { [self] in
+                self.parent.onShortcutCaptured()
+            }
         }
 
         private func mapKeyCodeToString(keyCode: UInt16, characters: String?) -> String {
