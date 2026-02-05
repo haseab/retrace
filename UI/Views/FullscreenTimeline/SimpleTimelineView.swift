@@ -1747,13 +1747,57 @@ struct ZoomActionMenu: View {
 
     private func shareZoomedImage() {
         getZoomedImage { image in
-            guard let image = image else { return }
+            guard let image = image else {
+                print("[Share] No image to share")
+                return
+            }
 
+            print("[Share] Got image, creating picker")
             let picker = NSSharingServicePicker(items: [image])
             if let window = NSApp.keyWindow,
                let contentView = window.contentView {
-                // Show share picker near the menu
-                picker.show(relativeTo: contentView.bounds, of: contentView, preferredEdge: .maxX)
+                print("[Share] Showing picker, window level: \(window.level.rawValue)")
+
+                let windowCountBefore = NSApp.windows.count
+
+                // Show share picker near the right side of the window where the action menu is
+                // Position it roughly where the Share button would be (right side, upper-middle area)
+                let menuRect = CGRect(
+                    x: contentView.bounds.width - 200,
+                    y: contentView.bounds.height / 2,
+                    width: 180,
+                    height: 40
+                )
+                picker.show(relativeTo: menuRect, of: contentView, preferredEdge: .minX)
+
+                // Check multiple times for the picker window to appear
+                for delay in [0.05, 0.1, 0.2, 0.5] {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        print("[Share] Checking windows after \(delay)s, count: \(NSApp.windows.count) (was \(windowCountBefore))")
+                        for appWindow in NSApp.windows {
+                            let className = String(describing: type(of: appWindow))
+                            let objcClassName = appWindow.className
+                            print("[Share] Window: \(className) / \(objcClassName), level: \(appWindow.level.rawValue), visible: \(appWindow.isVisible)")
+
+                            // Raise any window that's not our main windows and is below screenSaver level
+                            // Exclude: status bar, timeline (KeyableWindow), and dashboard (NSWindow at level 0)
+                            let isStatusBar = className == "NSStatusBarWindow"
+                            let isTimeline = className == "KeyableWindow"
+                            let isDashboard = className == "NSWindow" && appWindow.level.rawValue == 0
+
+                            if appWindow.level.rawValue < NSWindow.Level.screenSaver.rawValue &&
+                               appWindow.isVisible &&
+                               !isStatusBar &&
+                               !isTimeline &&
+                               !isDashboard {
+                                print("[Share] Raising window level for: \(className)")
+                                appWindow.level = .screenSaver + 1
+                            }
+                        }
+                    }
+                }
+            } else {
+                print("[Share] No key window or content view")
             }
         }
     }
