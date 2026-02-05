@@ -66,7 +66,7 @@ public actor FrameProcessingQueue {
     ///   - capturedFrame: Optional raw frame data. If provided, OCR uses this directly
     ///                    instead of extracting from video, avoiding B-frame timing issues.
     public func enqueue(frameID: Int64, priority: Int = 0, capturedFrame: CapturedFrame? = nil) async throws {
-        Log.info("[Queue-DIAG] Attempting to enqueue frame \(frameID) with priority \(priority), hasFrameData: \(capturedFrame != nil)", category: .processing)
+        // Log.info("[Queue-DIAG] Attempting to enqueue frame \(frameID) with priority \(priority), hasFrameData: \(capturedFrame != nil)", category: .processing)
 
         // Cache the frame data if provided
         if let frame = capturedFrame {
@@ -83,12 +83,12 @@ public actor FrameProcessingQueue {
             }
 
             frameDataCache[frameID] = frame
-            Log.debug("[Queue-DIAG] Cached frame data for frameID \(frameID), cache size: \(frameDataCache.count)", category: .processing)
+            // Log.debug("[Queue-DIAG] Cached frame data for frameID \(frameID), cache size: \(frameDataCache.count)", category: .processing)
         }
 
         try await databaseManager.enqueueFrameForProcessing(frameID: frameID, priority: priority)
         currentQueueDepth += 1
-        Log.info("[Queue-DIAG] Successfully enqueued frame \(frameID), local depth: \(currentQueueDepth), isRunning: \(isRunning)", category: .processing)
+        // Log.info("[Queue-DIAG] Successfully enqueued frame \(frameID), local depth: \(currentQueueDepth), isRunning: \(isRunning)", category: .processing)
     }
 
     /// Enqueue multiple frames (batch operation)
@@ -117,22 +117,22 @@ public actor FrameProcessingQueue {
     /// Start processing workers
     public func startWorkers() async {
         guard !isRunning else {
-            Log.warning("[Queue-DIAG] Workers already running, skipping startWorkers()", category: .processing)
+            // Log.warning("[Queue-DIAG] Workers already running, skipping startWorkers()", category: .processing)
             return
         }
 
         isRunning = true
 
-        Log.info("[Queue-DIAG] Starting \(config.workerCount) processing workers, isRunning=\(isRunning)", category: .processing)
+        // Log.info("[Queue-DIAG] Starting \(config.workerCount) processing workers, isRunning=\(isRunning)", category: .processing)
 
         for workerID in 0..<config.workerCount {
             let task = Task {
                 await runWorker(id: workerID)
             }
             workers.append(task)
-            Log.info("[Queue-DIAG] Worker \(workerID) task created", category: .processing)
+            // Log.info("[Queue-DIAG] Worker \(workerID) task created", category: .processing)
         }
-        Log.info("[Queue-DIAG] All \(workers.count) worker tasks created", category: .processing)
+        // Log.info("[Queue-DIAG] All \(workers.count) worker tasks created", category: .processing)
     }
 
     /// Stop processing workers
@@ -154,17 +154,17 @@ public actor FrameProcessingQueue {
 
     /// Worker loop - processes frames from queue
     private func runWorker(id: Int) async {
-        Log.info("[Queue-DIAG] Worker \(id) STARTED and entering run loop", category: .processing)
+        // Log.info("[Queue-DIAG] Worker \(id) STARTED and entering run loop", category: .processing)
 
         // Initial delay to ensure database is fully stable
         // This prevents race conditions on first launch after onboarding
         try? await Task.sleep(nanoseconds: 500_000_000) // 500ms - increased for stability
-        Log.info("[Queue-DIAG] Worker \(id) finished initial delay, entering main loop", category: .processing)
+        // Log.info("[Queue-DIAG] Worker \(id) finished initial delay, entering main loop", category: .processing)
 
         while isRunning {
             // Wait for database to be ready before attempting any operations
             guard await databaseManager.isReady() else {
-                Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
+                // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
                 try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
                 continue
             }
@@ -177,7 +177,7 @@ public actor FrameProcessingQueue {
                     continue
                 }
 
-                Log.info("[Queue-DIAG] Worker \(id) dequeued frame \(queuedFrame.frameID) for processing", category: .processing)
+                // Log.info("[Queue-DIAG] Worker \(id) dequeued frame \(queuedFrame.frameID) for processing", category: .processing)
 
                 // Process the frame
                 let startTime = Date()
@@ -222,25 +222,25 @@ public actor FrameProcessingQueue {
     /// Process a single frame (OCR + FTS + Nodes)
     private func processFrame(_ queuedFrame: QueuedFrame) async throws {
         let frameID = queuedFrame.frameID
-        Log.info("[Queue-DIAG] processFrame START for frame \(frameID)", category: .processing)
+        // Log.info("[Queue-DIAG] processFrame START for frame \(frameID)", category: .processing)
 
         // Mark as processing
         try await updateFrameProcessingStatus(frameID, status: .processing)
-        Log.info("[Queue-DIAG] Frame \(frameID) marked as processing", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) marked as processing", category: .processing)
 
         // Get frame reference from database
         guard let frameRef = try await databaseManager.getFrame(id: FrameID(value: frameID)) else {
             Log.error("[Queue-DIAG] Frame \(frameID) not found in database!", category: .processing)
             throw DatabaseError.queryFailed(query: "getFrame", underlying: "Frame \(frameID) not found")
         }
-        Log.info("[Queue-DIAG] Frame \(frameID) found, videoID=\(frameRef.videoID.value), segmentID=\(frameRef.segmentID.value)", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) found, videoID=\(frameRef.videoID.value), segmentID=\(frameRef.segmentID.value)", category: .processing)
 
         // Get video segment for dimensions (needed for node insertion)
         guard let videoSegment = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
             Log.error("[Queue-DIAG] Video segment \(frameRef.videoID.value) not found!", category: .processing)
             throw DatabaseError.queryFailed(query: "getVideoSegment", underlying: "Video segment \(frameRef.videoID) not found")
         }
-        Log.info("[Queue-DIAG] Frame \(frameID) videoPath=\(videoSegment.relativePath)", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) videoPath=\(videoSegment.relativePath)", category: .processing)
 
         // CRITICAL: Verify video file exists before attempting any extraction
         // This prevents infinite retry loops when database points to missing files
@@ -261,10 +261,10 @@ public actor FrameProcessingQueue {
             // Use cached frame data directly - guaranteed correct
             capturedFrame = cachedFrame
             frameDataCache.removeValue(forKey: frameID)  // Clear from cache after use
-            Log.info("[Queue-DIAG] Frame \(frameID) using cached frame data, cache size now: \(frameDataCache.count)", category: .processing)
+            // Log.info("[Queue-DIAG] Frame \(frameID) using cached frame data, cache size now: \(frameDataCache.count)", category: .processing)
         } else {
             // Fallback: extract from video (used for reprocessOCR or crash recovery)
-            Log.info("[Queue-DIAG] Frame \(frameID) no cached data, extracting from video (fallback path)", category: .processing)
+            // Log.info("[Queue-DIAG] Frame \(frameID) no cached data, extracting from video (fallback path)", category: .processing)
 
             // Extract the actual segment ID from the path (last path component is the timestamp-based ID)
             let pathComponents = videoSegment.relativePath.split(separator: "/")
@@ -275,12 +275,12 @@ public actor FrameProcessingQueue {
             }
 
             // Load frame image from video using the actual segment ID from the filename
-            Log.info("[Queue-DIAG] Frame \(frameID) loading image from segment \(actualSegmentID), frameIndex=\(frameRef.frameIndexInSegment)", category: .processing)
+            // Log.info("[Queue-DIAG] Frame \(frameID) loading image from segment \(actualSegmentID), frameIndex=\(frameRef.frameIndexInSegment)", category: .processing)
             let frameData = try await storage.readFrame(
                 segmentID: VideoSegmentID(value: actualSegmentID),
                 frameIndex: frameRef.frameIndexInSegment
             )
-            Log.info("[Queue-DIAG] Frame \(frameID) loaded \(frameData.count) bytes of image data", category: .processing)
+            // Log.info("[Queue-DIAG] Frame \(frameID) loaded \(frameData.count) bytes of image data", category: .processing)
 
             // Convert JPEG data to CapturedFrame for OCR
             guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
@@ -289,24 +289,24 @@ public actor FrameProcessingQueue {
             }
             capturedFrame = convertedFrame
         }
-        Log.info("[Queue-DIAG] Frame \(frameID) ready for OCR, size=\(capturedFrame.width)x\(capturedFrame.height)", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) ready for OCR, size=\(capturedFrame.width)x\(capturedFrame.height)", category: .processing)
 
         // Run OCR
-        Log.info("[Queue-DIAG] Frame \(frameID) starting OCR extraction", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) starting OCR extraction", category: .processing)
         let extractedText = try await processing.extractText(from: capturedFrame)
 
         // Debug: Log first 100 chars of extracted text to verify we're processing the right frame
         let textPreview = extractedText.fullText.prefix(100).replacingOccurrences(of: "\n", with: " ")
-        Log.info("[OCR-TRACE] frameID=\(frameID) OCR found \(extractedText.regions.count) regions, text preview: \"\(textPreview)...\"", category: .processing)
+        // Log.info("[OCR-TRACE] frameID=\(frameID) OCR found \(extractedText.regions.count) regions, text preview: \"\(textPreview)...\"", category: .processing)
 
         // Index in FTS
-        Log.info("[Queue-DIAG] Frame \(frameID) indexing in FTS, segmentId=\(frameRef.segmentID.value)", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) indexing in FTS, segmentId=\(frameRef.segmentID.value)", category: .processing)
         let docid = try await search.index(
             text: extractedText,
             segmentId: frameRef.segmentID.value,
             frameId: frameID
         )
-        Log.info("[Queue-DIAG] Frame \(frameID) FTS indexed with docid=\(docid)", category: .processing)
+        // Log.info("[Queue-DIAG] Frame \(frameID) FTS indexed with docid=\(docid)", category: .processing)
 
         // Insert OCR nodes
         if docid > 0 && !extractedText.regions.isEmpty {
@@ -335,9 +335,9 @@ public actor FrameProcessingQueue {
                 frameWidth: videoSegment.width,
                 frameHeight: videoSegment.height
             )
-            Log.info("[Queue-DIAG] Frame \(frameID) inserted \(nodeData.count) OCR nodes", category: .processing)
+            // Log.info("[Queue-DIAG] Frame \(frameID) inserted \(nodeData.count) OCR nodes", category: .processing)
         } else {
-            Log.warning("[Queue-DIAG] Frame \(frameID) skipped node insertion: docid=\(docid), regions=\(extractedText.regions.count)", category: .processing)
+            // Log.warning("[Queue-DIAG] Frame \(frameID) skipped node insertion: docid=\(docid), regions=\(extractedText.regions.count)", category: .processing)
         }
 
         // Mark as completed

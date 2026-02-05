@@ -51,6 +51,7 @@ enum SettingsDefaults {
     // MARK: Developer
     static let showFrameIDs = false
     static let enableFrameIDSearch = false
+    static let showOCRDebugOverlay = false
 }
 
 /// Main settings view with sidebar navigation
@@ -178,6 +179,7 @@ public struct SettingsView: View {
     // MARK: Developer Settings
     @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
     @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
+    @AppStorage("showOCRDebugOverlay", store: settingsStore) private var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
 
     // MARK: Tag Management
     @State private var tagsForSettings: [Tag] = []
@@ -2261,6 +2263,12 @@ public struct SettingsView: View {
                     title: "Enable frame ID search",
                     subtitle: "Allow jumping to frames by ID in the Go to panel",
                     isOn: $enableFrameIDSearch
+                )
+
+                ModernToggleRow(
+                    title: "Show OCR debug overlay",
+                    subtitle: "Display OCR bounding boxes and tile grid in timeline",
+                    isOn: $showOCRDebugOverlay
                 )
 
                 Divider()

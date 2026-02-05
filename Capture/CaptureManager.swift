@@ -224,7 +224,7 @@ public actor CaptureManager: CaptureProtocol {
             let titlesRelated = lastTitle.contains(currentTitle) || currentTitle.contains(lastTitle)
             if titlesRelated && !lastTitle.isEmpty && !currentTitle.isEmpty {
                 // Titles are related, skip capture - let regular timer handle it
-                Log.debug("[CaptureManager] Window title change skipped (related titles): '\(lastTitle)' -> '\(currentTitle)'", category: .capture)
+                // Log.debug("[CaptureManager] Window title change skipped (related titles): '\(lastTitle)' -> '\(currentTitle)'", category: .capture)
                 return
             }
         }

@@ -230,6 +230,9 @@ public struct SimpleTimelineView: View {
                 // Search highlight overlay
                 searchHighlightOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
+                // OCR debug overlay (dev setting)
+                ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
+
                 // Text selection hint toast (top center)
                 if viewModel.showTextSelectionHint {
                     VStack {
@@ -344,6 +347,19 @@ public struct SimpleTimelineView: View {
     private func searchHighlightOverlay(containerSize: CGSize, actualFrameRect: CGRect) -> some View {
         if viewModel.isShowingSearchHighlight {
             SearchHighlightOverlay(
+                viewModel: viewModel,
+                containerSize: containerSize,
+                actualFrameRect: actualFrameRect
+            )
+            .scaleEffect(viewModel.frameZoomScale)
+            .offset(viewModel.frameZoomOffset)
+        }
+    }
+
+    @ViewBuilder
+    private func ocrDebugOverlay(containerSize: CGSize, actualFrameRect: CGRect) -> some View {
+        if viewModel.showOCRDebugOverlay {
+            OCRDebugOverlay(
                 viewModel: viewModel,
                 containerSize: containerSize,
                 actualFrameRect: actualFrameRect
@@ -3144,6 +3160,209 @@ struct SearchHighlightOverlay: View {
                 highlightScale = 1.0
             }
         }
+    }
+}
+
+// MARK: - OCR Debug Overlay
+
+/// Developer overlay that displays OCR bounding boxes and tile grid for debugging
+/// Shows diff between current and previous frame:
+/// - Green: New nodes (not in previous frame)
+/// - Red: Removed nodes (were in previous frame, not in current)
+/// - Gray: Unchanged nodes (present in both frames)
+/// Only visible when "Show OCR debug overlay" is enabled in Settings > Advanced > Developer
+struct OCRDebugOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let containerSize: CGSize
+    let actualFrameRect: CGRect
+
+    /// Tile size in pixels (matches TileGridConfig.default.tileSize)
+    private let tileSize: CGFloat = 64
+
+    /// Threshold for considering two nodes as "the same" (normalized coordinate tolerance)
+    private let matchTolerance: CGFloat = 0.01
+
+    /// Categorized nodes for diff visualization
+    private var categorizedNodes: (new: [OCRNodeWithText], removed: [OCRNodeWithText], unchanged: [OCRNodeWithText]) {
+        let current = viewModel.ocrNodes
+        let previous = viewModel.previousOcrNodes
+
+        // If no previous nodes, all current are "new" (first frame or debug just enabled)
+        guard !previous.isEmpty else {
+            return (new: current, removed: [], unchanged: [])
+        }
+
+        var newNodes: [OCRNodeWithText] = []
+        var unchangedNodes: [OCRNodeWithText] = []
+        var matchedPreviousIndices = Set<Int>()
+
+        // Find matches between current and previous
+        for currentNode in current {
+            var foundMatch = false
+            for (prevIndex, prevNode) in previous.enumerated() {
+                if nodesMatch(currentNode, prevNode) {
+                    unchangedNodes.append(currentNode)
+                    matchedPreviousIndices.insert(prevIndex)
+                    foundMatch = true
+                    break
+                }
+            }
+            if !foundMatch {
+                newNodes.append(currentNode)
+            }
+        }
+
+        // Removed nodes are previous nodes that weren't matched
+        let removedNodes = previous.enumerated()
+            .filter { !matchedPreviousIndices.contains($0.offset) }
+            .map { $0.element }
+
+        return (new: newNodes, removed: removedNodes, unchanged: unchangedNodes)
+    }
+
+    /// Check if two nodes are approximately the same (by position and size)
+    private func nodesMatch(_ a: OCRNodeWithText, _ b: OCRNodeWithText) -> Bool {
+        abs(a.x - b.x) < matchTolerance &&
+        abs(a.y - b.y) < matchTolerance &&
+        abs(a.width - b.width) < matchTolerance &&
+        abs(a.height - b.height) < matchTolerance
+    }
+
+    var body: some View {
+        ZStack {
+            // 1. Draw tile grid (semi-transparent grid lines)
+            tileGridOverlay
+
+            // 2. Draw OCR bounding boxes with diff colors
+            ocrDiffOverlay
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Draws a grid showing the tile layout used for change detection
+    private var tileGridOverlay: some View {
+        Canvas { context, size in
+            let frameWidth = actualFrameRect.width
+            let frameHeight = actualFrameRect.height
+
+            guard frameWidth > 0, frameHeight > 0 else { return }
+
+            // Estimate original pixel dimensions from frame aspect ratio
+            let estimatedPixelWidth: CGFloat = 2560  // Common MacBook Pro resolution
+            let estimatedPixelHeight = estimatedPixelWidth * (frameHeight / frameWidth)
+
+            // Number of tiles in each dimension
+            let tilesX = Int(ceil(estimatedPixelWidth / tileSize))
+            let tilesY = Int(ceil(estimatedPixelHeight / tileSize))
+
+            // Normalized tile size
+            let normalizedTileWidth = tileSize / estimatedPixelWidth
+            let normalizedTileHeight = tileSize / estimatedPixelHeight
+
+            // Draw vertical lines
+            for col in 0...tilesX {
+                let normalizedX = CGFloat(col) * normalizedTileWidth
+                let screenX = actualFrameRect.origin.x + (normalizedX * frameWidth)
+
+                guard screenX <= actualFrameRect.maxX else { break }
+
+                var path = Path()
+                path.move(to: CGPoint(x: screenX, y: actualFrameRect.origin.y))
+                path.addLine(to: CGPoint(x: screenX, y: actualFrameRect.maxY))
+
+                context.stroke(path, with: .color(.cyan.opacity(0.3)), lineWidth: 0.5)
+            }
+
+            // Draw horizontal lines
+            for row in 0...tilesY {
+                let normalizedY = CGFloat(row) * normalizedTileHeight
+                let screenY = actualFrameRect.origin.y + (normalizedY * frameHeight)
+
+                guard screenY <= actualFrameRect.maxY else { break }
+
+                var path = Path()
+                path.move(to: CGPoint(x: actualFrameRect.origin.x, y: screenY))
+                path.addLine(to: CGPoint(x: actualFrameRect.maxX, y: screenY))
+
+                context.stroke(path, with: .color(.cyan.opacity(0.3)), lineWidth: 0.5)
+            }
+        }
+    }
+
+    /// Draws bounding boxes with diff coloring
+    private var ocrDiffOverlay: some View {
+        let nodes = categorizedNodes
+
+        return ZStack {
+            // Draw removed nodes first (red, dashed) - these are from previous frame
+            ForEach(Array(nodes.removed.enumerated()), id: \.offset) { _, node in
+                nodeBox(node: node, color: .red, isDashed: true, label: "−")
+            }
+
+            // Draw unchanged nodes (gray, solid)
+            ForEach(Array(nodes.unchanged.enumerated()), id: \.offset) { _, node in
+                nodeBox(node: node, color: .gray, isDashed: false, label: nil)
+            }
+
+            // Draw new nodes on top (green, solid)
+            ForEach(Array(nodes.new.enumerated()), id: \.offset) { _, node in
+                nodeBox(node: node, color: .green, isDashed: false, label: "+")
+            }
+
+            // Stats badge in top-right of frame area
+            statsBadge(new: nodes.new.count, removed: nodes.removed.count, unchanged: nodes.unchanged.count)
+        }
+    }
+
+    /// Draw a single node bounding box
+    @ViewBuilder
+    private func nodeBox(node: OCRNodeWithText, color: Color, isDashed: Bool, label: String?) -> some View {
+        let screenX = actualFrameRect.origin.x + (node.x * actualFrameRect.width)
+        let screenY = actualFrameRect.origin.y + (node.y * actualFrameRect.height)
+        let screenWidth = node.width * actualFrameRect.width
+        let screenHeight = node.height * actualFrameRect.height
+
+        // Bounding box rectangle
+        RoundedRectangle(cornerRadius: 2)
+            .stroke(color.opacity(0.8), style: StrokeStyle(lineWidth: isDashed ? 1.5 : 1, dash: isDashed ? [4, 2] : []))
+            .frame(width: screenWidth, height: screenHeight)
+            .position(x: screenX + screenWidth / 2, y: screenY + screenHeight / 2)
+
+        // Label badge for new/removed nodes
+        if let label = label {
+            Text(label)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.white)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(color.opacity(0.9))
+                .cornerRadius(3)
+                .position(x: screenX + 10, y: screenY + 10)
+        }
+    }
+
+    /// Stats badge showing counts
+    @ViewBuilder
+    private func statsBadge(new: Int, removed: Int, unchanged: Int) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Circle().fill(Color.green).frame(width: 8, height: 8)
+                Text("New: \(new)").font(.system(size: 10, weight: .medium, design: .monospaced))
+            }
+            HStack(spacing: 4) {
+                Circle().fill(Color.red).frame(width: 8, height: 8)
+                Text("Removed: \(removed)").font(.system(size: 10, weight: .medium, design: .monospaced))
+            }
+            HStack(spacing: 4) {
+                Circle().fill(Color.gray).frame(width: 8, height: 8)
+                Text("Unchanged: \(unchanged)").font(.system(size: 10, weight: .medium, design: .monospaced))
+            }
+        }
+        .foregroundColor(.white)
+        .padding(8)
+        .background(Color.black.opacity(0.7))
+        .cornerRadius(6)
+        .position(x: actualFrameRect.maxX - 70, y: actualFrameRect.origin.y + 50)
     }
 }
 

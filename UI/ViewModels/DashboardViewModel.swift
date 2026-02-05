@@ -5,6 +5,24 @@ import App
 import Database
 import ApplicationServices
 
+/// Debug logger that writes to /tmp/retrace_debug.log
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logLine = "[\(timestamp)] \(message)\n"
+    let logPath = "/tmp/retrace_debug.log"
+
+    if let handle = FileHandle(forWritingAtPath: logPath) {
+        handle.seekToEndOfFile()
+        if let data = logLine.data(using: .utf8) {
+            handle.write(data)
+        }
+        handle.closeFile()
+    } else {
+        // Create file if it doesn't exist
+        FileManager.default.createFile(atPath: logPath, contents: logLine.data(using: .utf8))
+    }
+}
+
 /// ViewModel for the Dashboard view
 /// Manages weekly app usage statistics from the database
 @MainActor
@@ -175,11 +193,14 @@ public class DashboardViewModel: ObservableObject {
     // MARK: - Data Loading
 
     public func loadStatistics() async {
+        let overallStart = CFAbsoluteTimeGetCurrent()
+        debugLog("loadStatistics() START")
         isLoading = true
         error = nil
 
         // Update recording status
         await updateRecordingStatus()
+        debugLog("Recording status updated in \(Int((CFAbsoluteTimeGetCurrent() - overallStart) * 1000))ms")
 
         do {
             // Calculate last 7 days date range
@@ -193,31 +214,58 @@ public class DashboardViewModel: ObservableObject {
             let formatter = DateFormatter()
             formatter.dateFormat = "MMM d"
             weekDateRange = "\(formatter.string(from: weekStart)) - \(formatter.string(from: weekEnd))"
+            debugLog("Date range: \(weekDateRange)")
 
             // Fire slow queries (storage + dates) in background - don't block
             Task {
+                let bgStart = CFAbsoluteTimeGetCurrent()
+                debugLog("BG: starting getTotalStorageUsed")
                 if let storage = try? await coordinator.getTotalStorageUsed() {
                     await MainActor.run { self.totalStorageBytes = storage }
+                    debugLog("BG: getTotalStorageUsed done in \(Int((CFAbsoluteTimeGetCurrent() - bgStart) * 1000))ms, storage=\(storage)")
+                } else {
+                    debugLog("BG: getTotalStorageUsed FAILED in \(Int((CFAbsoluteTimeGetCurrent() - bgStart) * 1000))ms")
                 }
 
+                let bgStart2 = CFAbsoluteTimeGetCurrent()
+                debugLog("BG: starting getDistinctDates")
                 if let allDates = try? await coordinator.getDistinctDates() {
                     await MainActor.run {
                         self.daysRecorded = allDates.count
                         self.oldestRecordedDate = allDates.last // sorted descending, so last is oldest
                     }
+                    debugLog("BG: getDistinctDates done in \(Int((CFAbsoluteTimeGetCurrent() - bgStart2) * 1000))ms, count=\(allDates.count)")
+                } else {
+                    debugLog("BG: getDistinctDates FAILED in \(Int((CFAbsoluteTimeGetCurrent() - bgStart2) * 1000))ms")
                 }
             }
 
-            // Fire all queries in parallel
+            // Fire all queries in parallel - but log each one individually
             let todayStart = calendar.startOfDay(for: now)
+            debugLog("Starting parallel queries at \(Int((CFAbsoluteTimeGetCurrent() - overallStart) * 1000))ms")
 
-            async let weeklyStorageTask = coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
-            async let appStatsTask = coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
-            async let todayStatsTask = coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
-            async let dailyGraphTask: () = loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
+            // Run queries sequentially to identify which one hangs
+            let queryStart1 = CFAbsoluteTimeGetCurrent()
+            debugLog("Q1: starting getStorageUsedForDateRange")
+            let weeklyStorage = try await coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
+            debugLog("Q1: getStorageUsedForDateRange done in \(Int((CFAbsoluteTimeGetCurrent() - queryStart1) * 1000))ms")
 
-            // Await all results
-            let (weeklyStorage, appStats, todayStats, _) = try await (weeklyStorageTask, appStatsTask, todayStatsTask, dailyGraphTask)
+            let queryStart2 = CFAbsoluteTimeGetCurrent()
+            debugLog("Q2: starting getAppUsageStats (weekly)")
+            let appStats = try await coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
+            debugLog("Q2: getAppUsageStats (weekly) done in \(Int((CFAbsoluteTimeGetCurrent() - queryStart2) * 1000))ms, count=\(appStats.count)")
+
+            let queryStart3 = CFAbsoluteTimeGetCurrent()
+            debugLog("Q3: starting getAppUsageStats (today)")
+            let todayStats = try await coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
+            debugLog("Q3: getAppUsageStats (today) done in \(Int((CFAbsoluteTimeGetCurrent() - queryStart3) * 1000))ms, count=\(todayStats.count)")
+
+            let queryStart4 = CFAbsoluteTimeGetCurrent()
+            debugLog("Q4: starting loadDailyGraphData")
+            await loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
+            debugLog("Q4: loadDailyGraphData done in \(Int((CFAbsoluteTimeGetCurrent() - queryStart4) * 1000))ms")
+
+            debugLog("All queries complete in \(Int((CFAbsoluteTimeGetCurrent() - overallStart) * 1000))ms, appStats.count=\(appStats.count)")
 
             weeklyStorageBytes = weeklyStorage
             totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
@@ -235,8 +283,10 @@ public class DashboardViewModel: ObservableObject {
             }
             .sorted { $0.duration > $1.duration }
 
+            debugLog("loadStatistics() COMPLETE - weeklyAppUsage.count=\(weeklyAppUsage.count)")
             isLoading = false
         } catch {
+            debugLog("loadStatistics() FAILED: \(error)")
             self.error = "Failed to load statistics: \(error.localizedDescription)"
             isLoading = false
         }
@@ -246,6 +296,8 @@ public class DashboardViewModel: ObservableObject {
 
     /// Load 7-day daily data for all metric graphs
     private func loadDailyGraphData(weekStart: Date, weekEnd: Date) async {
+        let graphStart = CFAbsoluteTimeGetCurrent()
+        debugLog("loadDailyGraphData START")
         let calendar = Calendar.current
 
         // Generate all 7 days of the week (Monday through Sunday)
@@ -265,16 +317,24 @@ public class DashboardViewModel: ObservableObject {
 
         do {
             // Load daily screen time data
+            var subStart = CFAbsoluteTimeGetCurrent()
+            debugLog("G1: starting getDailyScreenTime")
             let screenTimeData = try await coordinator.getDailyScreenTime(
                 from: weekStart,
                 to: weekEnd
             )
             dailyScreenTimeData = fillMissingDays(data: screenTimeData, allDays: allDays)
+            debugLog("G1: getDailyScreenTime done in \(Int((CFAbsoluteTimeGetCurrent() - subStart) * 1000))ms")
 
             // Load storage data for each day (just that day's folder size)
+            subStart = CFAbsoluteTimeGetCurrent()
+            debugLog("G2: starting loadDailyStorageData for \(allDays.count) days")
             dailyStorageData = try await loadDailyStorageData(for: allDays)
+            debugLog("G2: loadDailyStorageData done in \(Int((CFAbsoluteTimeGetCurrent() - subStart) * 1000))ms")
 
             // Load timeline opens data
+            subStart = CFAbsoluteTimeGetCurrent()
+            debugLog("G3: starting getDailyMetrics(timelineOpens)")
             let timelineData = try await coordinator.getDailyMetrics(
                 metricType: .timelineOpens,
                 from: weekStart,
@@ -282,8 +342,11 @@ public class DashboardViewModel: ObservableObject {
             )
             dailyTimelineOpensData = fillMissingDays(data: timelineData, allDays: allDays)
             timelineOpensThisWeek = dailyTimelineOpensData.reduce(0) { $0 + $1.value }
+            debugLog("G3: getDailyMetrics(timelineOpens) done in \(Int((CFAbsoluteTimeGetCurrent() - subStart) * 1000))ms")
 
             // Load searches data
+            subStart = CFAbsoluteTimeGetCurrent()
+            debugLog("G4: starting getDailyMetrics(searches)")
             let searchesData = try await coordinator.getDailyMetrics(
                 metricType: .searches,
                 from: weekStart,
@@ -291,8 +354,11 @@ public class DashboardViewModel: ObservableObject {
             )
             dailySearchesData = fillMissingDays(data: searchesData, allDays: allDays)
             searchesThisWeek = dailySearchesData.reduce(0) { $0 + $1.value }
+            debugLog("G4: getDailyMetrics(searches) done in \(Int((CFAbsoluteTimeGetCurrent() - subStart) * 1000))ms")
 
             // Load text copies data
+            subStart = CFAbsoluteTimeGetCurrent()
+            debugLog("G5: starting getDailyMetrics(textCopies)")
             let textCopiesData = try await coordinator.getDailyMetrics(
                 metricType: .textCopies,
                 from: weekStart,
@@ -300,9 +366,11 @@ public class DashboardViewModel: ObservableObject {
             )
             dailyTextCopiesData = fillMissingDays(data: textCopiesData, allDays: allDays)
             textCopiesThisWeek = dailyTextCopiesData.reduce(0) { $0 + $1.value }
+            debugLog("G5: getDailyMetrics(textCopies) done in \(Int((CFAbsoluteTimeGetCurrent() - subStart) * 1000))ms")
 
+            debugLog("loadDailyGraphData COMPLETE in \(Int((CFAbsoluteTimeGetCurrent() - graphStart) * 1000))ms")
         } catch {
-            Log.error("[DashboardViewModel] Failed to load daily graph data: \(error)", category: .ui)
+            debugLog("Failed to load daily graph data in \(Int((CFAbsoluteTimeGetCurrent() - graphStart) * 1000))ms: \(error)")
             // Initialize with empty data on error
             dailyScreenTimeData = allDays.map { DailyDataPoint(date: $0, value: 0) }
             dailyStorageData = allDays.map { DailyDataPoint(date: $0, value: 0) }
@@ -318,9 +386,11 @@ public class DashboardViewModel: ObservableObject {
     /// Load storage for each day's folder
     private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
         var dataPoints: [DailyDataPoint] = []
-        for day in days {
+        for (index, day) in days.enumerated() {
+            let dayStart = CFAbsoluteTimeGetCurrent()
             let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
             dataPoints.append(DailyDataPoint(date: day, value: dayStorage))
+            debugLog("G2-\(index): day \(index) storage done in \(Int((CFAbsoluteTimeGetCurrent() - dayStart) * 1000))ms")
         }
         return dataPoints
     }

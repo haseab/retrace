@@ -233,7 +233,7 @@ public actor SearchManager: SearchProtocol {
             frameId: frameId
         )
 
-        Log.debug("Indexed FTS content \(docid) for frame \(frameId)", category: .search)
+        // Log.debug("Indexed FTS content \(docid) for frame \(frameId)", category: .search)
 
         return docid
     }
