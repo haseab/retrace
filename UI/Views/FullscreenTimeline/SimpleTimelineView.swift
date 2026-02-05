@@ -1822,10 +1822,13 @@ struct ZoomActionMenu: View {
         }
 
         // Crop the full image to the zoom region
+        // zoomRegion coordinates are normalized (0-1) relative to actualFrameRect
+        // Both zoomRegion.origin.y and CGImage use bottom-up coordinate space (0=bottom)
+        // so no Y-flip is needed
         let imageSize = fullImage.size
         let cropRect = CGRect(
             x: zoomRegion.origin.x * imageSize.width,
-            y: (1 - zoomRegion.origin.y - zoomRegion.height) * imageSize.height,  // Flip Y
+            y: zoomRegion.origin.y * imageSize.height,
             width: zoomRegion.width * imageSize.width,
             height: zoomRegion.height * imageSize.height
         )
