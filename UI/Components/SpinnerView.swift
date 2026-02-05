@@ -1,26 +1,17 @@
 import SwiftUI
 
 /// A modern spinning arc loading indicator
-/// Replaces the default ProgressView with a sleek animated spinner
+/// Uses native ProgressView for power efficiency (no idle wakeups)
 struct SpinnerView: View {
     var size: CGFloat = 24
     var lineWidth: CGFloat = 3
     var color: Color = .retraceAccent
 
-    @State private var rotation: Double = 0
-
     var body: some View {
-        Circle()
-            .trim(from: 0, to: 0.7)
-            .stroke(color, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
-            .frame(width: size, height: size)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                rotation = 0
-                withAnimation(.linear(duration: 0.6).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+        ProgressView()
+            .progressViewStyle(.circular)
+            .scaleEffect(size / 24)
+            .tint(color)
     }
 }
 

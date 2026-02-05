@@ -18,6 +18,11 @@ settings:
       OTHER_LDFLAGS: "-Xlinker -export_dynamic"
     Release:
       SWIFT_COMPILATION_MODE: wholemodule
+      STRIP_INSTALLED_PRODUCT: NO
+      COPY_PHASE_STRIP: NO
+      STRIP_SWIFT_SYMBOLS: NO
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+      ARCHS: arm64
 
 targets:
   Retrace:

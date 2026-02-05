@@ -2,6 +2,7 @@ import SwiftUI
 import Combine
 import App
 import Shared
+import Dispatch
 
 /// Manages the pause reminder notification that appears after capture has been paused for 5 minutes
 /// Similar to Rewind AI's "Rewind is paused" notification
@@ -31,7 +32,7 @@ public class PauseReminderManager: ObservableObject {
     private var pauseStartTime: Date?
     private var reminderTimer: Timer?
     private var remindLaterTimer: Timer?
-    private var statusCheckTimer: Timer?
+    private var statusCheckTimer: DispatchSourceTimer?
     private var wasCapturing = false
     private var hasCheckedInitialState = false
 
@@ -46,17 +47,16 @@ public class PauseReminderManager: ObservableObject {
 
     /// Start monitoring capture state changes
     private func startMonitoring() {
-        // Check capture status every 2 seconds
-        statusCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // Check capture status every 2 seconds with leeway for power efficiency
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
             Task { @MainActor in
                 await self?.checkCaptureState()
             }
         }
-
-        // Also check immediately
-        Task {
-            await checkCaptureState()
-        }
+        timer.resume()
+        statusCheckTimer = timer
     }
 
     /// Check the current capture state and manage the reminder timer
@@ -174,6 +174,6 @@ public class PauseReminderManager: ObservableObject {
     deinit {
         reminderTimer?.invalidate()
         remindLaterTimer?.invalidate()
-        statusCheckTimer?.invalidate()
+        statusCheckTimer?.cancel()
     }
 }

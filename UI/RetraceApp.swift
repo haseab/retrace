@@ -2,6 +2,7 @@ import SwiftUI
 import App
 import Shared
 import SQLCipher
+import Darwin
 
 /// Main app entry point
 @main
@@ -95,7 +96,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingDeeplinkURLs: [URL] = []
     private var isInitialized = false
 
+    private static let shouldLogLaunchDiagnostics: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return UserDefaults.standard.bool(forKey: "retrace.debug.launchDiagnostics")
+        #endif
+    }()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Self.shouldLogLaunchDiagnostics {
+            Self.logLaunchDiagnostics()
+        }
+
         // Prompt user to move app to Applications folder if not already there
         AppMover.moveToApplicationsFolderIfNecessary()
 
@@ -598,6 +611,74 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureAppearance() {
         // Force dark mode - the app UI is designed for dark theme
         NSApp.appearance = NSAppearance(named: .darkAqua)
+    }
+}
+
+// MARK: - Launch Diagnostics
+
+extension AppDelegate {
+    private static func logLaunchDiagnostics() {
+        let pid = getpid()
+        let ppid = getppid()
+        let pgid = getpgrp()
+        let sid = getsid(0)
+
+        let stdinIsTTY = isatty(STDIN_FILENO) == 1
+        let stdoutIsTTY = isatty(STDOUT_FILENO) == 1
+        let stderrIsTTY = isatty(STDERR_FILENO) == 1
+
+        let stdinTTY = ttyname(STDIN_FILENO).map { String(cString: $0) } ?? "nil"
+        let stdoutTTY = ttyname(STDOUT_FILENO).map { String(cString: $0) } ?? "nil"
+        let stderrTTY = ttyname(STDERR_FILENO).map { String(cString: $0) } ?? "nil"
+
+        let parentName = processName(pid: ppid) ?? "unknown"
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "nil"
+        let bundlePath = Bundle.main.bundleURL.path
+        let executablePath = Bundle.main.executableURL?.path ?? "nil"
+
+        let lsuiElement = Bundle.main.object(forInfoDictionaryKey: "LSUIElement")
+            .map { "\($0)" } ?? "nil"
+
+        let envKeys = ["TERM", "TERM_PROGRAM", "XPC_SERVICE_NAME", "__CFBundleIdentifier"]
+        let envSummary = envKeys
+            .map { "\($0)=\(ProcessInfo.processInfo.environment[$0] ?? "nil")" }
+            .joined(separator: " ")
+
+        let policy = NSApp.activationPolicy()
+
+        appendDebugFile("[LAUNCH] pid=\(pid) ppid=\(ppid)(\(parentName)) pgid=\(pgid) sid=\(sid)")
+        appendDebugFile("[LAUNCH] stdinTTY=\(stdinIsTTY) (\(stdinTTY)) stdoutTTY=\(stdoutIsTTY) (\(stdoutTTY)) stderrTTY=\(stderrIsTTY) (\(stderrTTY))")
+        appendDebugFile("[LAUNCH] bundleID=\(bundleID) LSUIElement=\(lsuiElement) activationPolicy=\(policy)")
+        appendDebugFile("[LAUNCH] bundlePath=\(bundlePath)")
+        appendDebugFile("[LAUNCH] executablePath=\(executablePath)")
+        appendDebugFile("[LAUNCH] env \(envSummary)")
+        appendDebugFile("[LAUNCH] lowPowerMode=\(ProcessInfo.processInfo.isLowPowerModeEnabled) thermalState=\(ProcessInfo.processInfo.thermalState.rawValue)")
+    }
+
+    private static func processName(pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 1024)
+        let result = proc_name(pid, &buffer, UInt32(buffer.count))
+        guard result > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func appendDebugFile(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        let url = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+
+        guard let data = line.data(using: .utf8) else { return }
+
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            }
+        } else {
+            try? data.write(to: url)
+        }
     }
 }
 

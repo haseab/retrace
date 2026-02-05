@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import App
 import Shared
+import Dispatch
 
 /// Manages the macOS menu bar icon and status menu
 public class MenuBarManager: ObservableObject {
@@ -16,7 +17,7 @@ public class MenuBarManager: ObservableObject {
     private var statusItem: NSStatusItem?
     private let coordinator: AppCoordinator
     private let onboardingManager: OnboardingManager
-    private var refreshTimer: Timer?
+    private var refreshTimer: DispatchSourceTimer?
 
     @Published public var isRecording = false
 
@@ -79,12 +80,14 @@ public class MenuBarManager: ObservableObject {
 
     /// Setup timer to auto-refresh recording status
     private func setupAutoRefresh() {
-        // Sync recording status every 2 seconds
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // Sync recording status every 2 seconds with leeway for power efficiency
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
             self?.syncWithCoordinator()
         }
-        // Also sync immediately
-        syncWithCoordinator()
+        timer.resume()
+        refreshTimer = timer
     }
 
     /// Load shortcuts from OnboardingManager
@@ -631,7 +634,7 @@ public class MenuBarManager: ObservableObject {
     // MARK: - Cleanup
 
     deinit {
-        refreshTimer?.invalidate()
+        refreshTimer?.cancel()
         iconAnimationTimer?.invalidate()
     }
 }

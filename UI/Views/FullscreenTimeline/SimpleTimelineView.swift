@@ -1469,25 +1469,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
     // Freeze a snapshot for the zoom overlay so we don't instantiate a second AVPlayer-backed view.
     @State private var frozenZoomSnapshot: NSImage?
 
-    private func debugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] [ZOOM_OVERLAY] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let path = "/tmp/retrace_debug.log"
-            if FileManager.default.fileExists(atPath: path) {
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: path, contents: data)
-            }
-        }
-    }
-
     @MainActor
     private func startLocalTransitionAnimation() {
         animationProgress = 0
@@ -1524,10 +1505,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // For enter transition, we animate from 0 to 1
         // For final state, progress is 1.0
         let progress: CGFloat = (isTransitioning || isExitTransitioning) ? animationProgress : 1.0
-
-        let _ = {
-            debugLog("render - isTransitioning: \(isTransitioning), isExitTransitioning: \(isExitTransitioning), progress: \(String(format: "%.3f", progress)), animationProgress: \(String(format: "%.3f", animationProgress))")
-        }()
 
         // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
         // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
@@ -1675,7 +1652,6 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         }
         .onChange(of: isExitTransitioning) { newValue in
             if newValue {
-                debugLog("isExitTransitioning changed to true - starting exit animation")
                 startExitAnimation()
             }
         }
@@ -1764,15 +1740,21 @@ struct ZoomActionMenu: View {
     private func shareZoomedImage() {
         getZoomedImage { image in
             guard let image = image else {
+                #if DEBUG
                 print("[Share] No image to share")
+                #endif
                 return
             }
 
+            #if DEBUG
             print("[Share] Got image, creating picker")
+            #endif
             let picker = NSSharingServicePicker(items: [image])
             if let window = NSApp.keyWindow,
                let contentView = window.contentView {
+                #if DEBUG
                 print("[Share] Showing picker, window level: \(window.level.rawValue)")
+                #endif
 
                 let windowCountBefore = NSApp.windows.count
 
@@ -1789,6 +1771,7 @@ struct ZoomActionMenu: View {
                 // Check multiple times for the picker window to appear
                 for delay in [0.05, 0.1, 0.2, 0.5] {
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        #if DEBUG
                         print("[Share] Checking windows after \(delay)s, count: \(NSApp.windows.count) (was \(windowCountBefore))")
                         for appWindow in NSApp.windows {
                             let className = String(describing: type(of: appWindow))
@@ -1810,10 +1793,13 @@ struct ZoomActionMenu: View {
                                 appWindow.level = .screenSaver + 1
                             }
                         }
+                        #endif
                     }
                 }
             } else {
+                #if DEBUG
                 print("[Share] No key window or content view")
+                #endif
             }
         }
     }
@@ -2419,35 +2405,7 @@ struct ZoomRegionDragPreview: View {
     let containerSize: CGSize
     let actualFrameRect: CGRect
 
-    private static var renderCount = 0
-
-    private func debugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] [DRAG_PREVIEW] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let path = "/tmp/retrace_debug.log"
-            if FileManager.default.fileExists(atPath: path) {
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: path, contents: data)
-            }
-        }
-    }
-
     var body: some View {
-        let _ = {
-            Self.renderCount += 1
-            if Self.renderCount % 10 == 1 {
-                debugLog("body render #\(Self.renderCount) - start: \(start), end: \(end)")
-            }
-        }()
-
         let minX = min(start.x, end.x)
         let maxX = max(start.x, end.x)
         let minY = min(start.y, end.y)
@@ -2721,20 +2679,15 @@ class TextSelectionView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        debugLog("acceptsFirstMouse called - returning true")
         return true
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        debugLog("viewDidMoveToWindow - window: \(window != nil), isKeyWindow: \(window?.isKeyWindow ?? false)")
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        let result = super.hitTest(point)
-        let isHit = result === self
-        debugLog("hitTest at \(point) - bounds: \(bounds), isHit: \(isHit), result: \(result.map { String(describing: type(of: $0)) } ?? "nil")")
-        return result
+        return super.hitTest(point)
     }
 
     override func updateTrackingAreas() {
@@ -2789,37 +2742,16 @@ class TextSelectionView: NSView {
         }
     }
 
-    private func debugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: "/tmp/retrace_debug.log") {
-                if let handle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: data)
-            }
-        }
-    }
-
     override func mouseDown(with event: NSEvent) {
-        debugLog("mouseDown called - isFirstResponder: \(window?.firstResponder === self), window: \(window != nil), shift: \(event.modifierFlags.contains(.shift))")
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
-        dragLogCount = 0  // Reset drag counter
 
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
 
         // Check if Shift is held - start zoom region mode
         if event.modifierFlags.contains(.shift) {
-            debugLog("Shift+click detected, starting zoom region at \(normalizedPoint)")
             isZoomDragging = true
             isDragging = false
             onZoomRegionStart?(normalizedPoint)
@@ -2843,8 +2775,6 @@ class TextSelectionView: NSView {
         needsDisplay = true
     }
 
-    private var dragLogCount = 0
-
     override func mouseDragged(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
 
@@ -2862,11 +2792,6 @@ class TextSelectionView: NSView {
         let normalizedPoint = screenToNormalizedCoords(CGPoint(x: clampedX, y: clampedY))
 
         if isZoomDragging {
-            dragLogCount += 1
-            // Log every 10th drag event to avoid spam
-            if dragLogCount % 10 == 1 {
-                debugLog("mouseDragged #\(dragLogCount) - location: \(location), normalized: \(normalizedPoint)")
-            }
             onZoomRegionUpdate?(normalizedPoint)
         } else if isDragging {
             onDragUpdate?(normalizedPoint)
@@ -2875,11 +2800,9 @@ class TextSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        debugLog("mouseUp - isZoomDragging: \(isZoomDragging), hasMoved: \(hasMoved)")
         if isZoomDragging {
             isZoomDragging = false
             if hasMoved {
-                debugLog("Ending zoom region")
                 onZoomRegionEnd?()
             }
         } else if isDragging {
@@ -3460,7 +3383,6 @@ struct DebugFrameIDBadge: View {
 /// Displays when OCR is pending, queued, or processing (not shown when completed)
 struct OCRStatusIndicator: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
-    @State private var rotationAngle: Double = 0
 
     /// Whether the indicator should be visible
     /// Only shows for in-progress states (pending, queued, processing)
@@ -3501,28 +3423,11 @@ struct OCRStatusIndicator: View {
     var body: some View {
         if shouldShow {
             HStack(spacing: 6) {
-                // Icon with rotation animation for processing state
+                // Static icon - no animation to avoid idle wakeups
+                // The status text already indicates processing state
                 Image(systemName: statusIcon)
                     .font(.retraceTinyMedium)
                     .foregroundColor(statusColor)
-                    .rotationEffect(.degrees(viewModel.ocrStatus.state == .processing ? rotationAngle : 0))
-                    .onAppear {
-                        if viewModel.ocrStatus.state == .processing {
-                            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
-                                rotationAngle = 360
-                            }
-                        }
-                    }
-                    .onChange(of: viewModel.ocrStatus) { newStatus in
-                        if newStatus.state == .processing {
-                            rotationAngle = 0
-                            withAnimation(.linear(duration: 2).repeatForever(autoreverses: false)) {
-                                rotationAngle = 360
-                            }
-                        } else {
-                            rotationAngle = 0
-                        }
-                    }
 
                 Text(viewModel.ocrStatus.displayText)
                     .font(.retraceTinyMedium)
@@ -4755,7 +4660,9 @@ struct FilterPanel: View {
                 // If no frame is stored, the dropdown won't position correctly, but will still open
                 let nextAnchorFrame = viewModel.filterAnchorFrames[nextDropdown] ?? .zero
 
+                #if DEBUG
                 print("[FilterPanel] Tab cycling to \(nextDropdown), anchorFrame=\(nextAnchorFrame), storedFrames=\(viewModel.filterAnchorFrames.keys)")
+                #endif
 
                 // Open the next dropdown at its correct position
                 withAnimation(.easeOut(duration: 0.15)) {
@@ -5218,7 +5125,9 @@ struct FilterDropdownOverlay: View {
         Group {
             if viewModel.activeFilterDropdown != .none {
                 let anchor = viewModel.filterDropdownAnchorFrame
+                #if DEBUG
                 let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor)")
+                #endif
 
                 ZStack {
                     // Full-screen dismiss layer (below dropdown)
@@ -5284,9 +5193,13 @@ struct FilterDropdownOverlay: View {
                     if let bundleID = bundleID {
                         viewModel.toggleAppFilter(bundleID)
                     } else {
+                        #if DEBUG
                         print("[Filter] All Apps selected - clearing pendingFilterCriteria.selectedApps (was: \(String(describing: viewModel.pendingFilterCriteria.selectedApps)))")
+                        #endif
                         viewModel.pendingFilterCriteria.selectedApps = nil
+                        #if DEBUG
                         print("[Filter] After clearing: pendingFilterCriteria.selectedApps = \(String(describing: viewModel.pendingFilterCriteria.selectedApps))")
+                        #endif
                     }
                 },
                 onFilterModeChange: { mode in

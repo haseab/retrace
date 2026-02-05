@@ -118,6 +118,23 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Cancellables for Combine subscriptions
     private var cancellables = Set<AnyCancellable>()
 
+    /// Enables very verbose timeline logging (useful for debugging, expensive in production).
+    /// In release builds, this is disabled by default and can be enabled via:
+    /// `defaults write io.retrace.app retrace.debug.timelineVerboseLogs -bool YES`
+    private static let isVerboseTimelineLoggingEnabled: Bool = {
+        #if DEBUG
+        return true
+        #else
+        return UserDefaults.standard.bool(forKey: "retrace.debug.timelineVerboseLogs")
+        #endif
+    }()
+
+    /// Enables expensive state-change tracing (stack traces).
+    /// Enable only when actively debugging:
+    /// `defaults write io.retrace.app retrace.debug.timelineStateTrace -bool YES`
+    private static let isTimelineStateTraceEnabled: Bool =
+        UserDefaults.standard.bool(forKey: "retrace.debug.timelineStateTrace")
+
     // MARK: - Published State
 
     /// All loaded frames with their preloaded video info
@@ -135,9 +152,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
-                Log.debug("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)", category: .ui)
-                if let frame = currentTimelineFrame {
-                    Log.debug("[SimpleTimelineViewModel] New frame: timestamp=\(frame.frame.timestamp), frameIndex=\(frame.videoInfo?.frameIndex ?? -1)", category: .ui)
+                if Self.isVerboseTimelineLoggingEnabled {
+                    Log.debug("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)", category: .ui)
+                    if let frame = currentTimelineFrame {
+                        Log.debug("[SimpleTimelineViewModel] New frame: timestamp=\(frame.frame.timestamp), frameIndex=\(frame.videoInfo?.frameIndex ?? -1)", category: .ui)
+                    }
                 }
 
                 // CRITICAL: Clear previous frame state IMMEDIATELY to prevent old frame from showing
@@ -178,15 +197,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the current frame is not yet available in the video file (still encoding)
     @Published public var frameNotReady: Bool = false {
         willSet {
-            if newValue != frameNotReady {
-                let frameID = currentTimelineFrame?.frame.id.value ?? -1
-                let status = currentTimelineFrame?.processingStatus ?? -1
-                Log.info("[FRAME-READY-CHANGE] ⚠️ frameNotReady changing: \(frameNotReady) -> \(newValue) for frameID=\(frameID), processingStatus=\(status)", category: .ui)
+            guard Self.isTimelineStateTraceEnabled, newValue != frameNotReady else { return }
 
-                // Print stack trace to see where this is being called from
-                let stackTrace = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
-                Log.info("[FRAME-READY-CHANGE] Stack trace:\n\(stackTrace)", category: .ui)
-            }
+            let frameID = currentTimelineFrame?.frame.id.value ?? -1
+            let status = currentTimelineFrame?.processingStatus ?? -1
+            Log.info("[FRAME-READY-CHANGE] ⚠️ frameNotReady changing: \(frameNotReady) -> \(newValue) for frameID=\(frameID), processingStatus=\(status)", category: .ui)
+
+            // Print stack trace to see where this is being called from
+            let stackTrace = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
+            Log.info("[FRAME-READY-CHANGE] Stack trace:\n\(stackTrace)", category: .ui)
         }
     }
 
@@ -603,7 +622,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Show a specific filter dropdown
     public func showFilterDropdown(_ type: FilterDropdownType, anchorFrame: CGRect) {
-        print("[FilterDropdown] showFilterDropdown type=\(type), anchor=\(anchorFrame)")
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug("[FilterDropdown] showFilterDropdown type=\(type), anchor=\(anchorFrame)", category: .ui)
+        }
         filterDropdownAnchorFrame = anchorFrame
         filterAnchorFrames[type] = anchorFrame
         activeFilterDropdown = type
@@ -612,7 +633,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Dismiss any open filter dropdown
     public func dismissFilterDropdown() {
-        print("[FilterDropdown] dismissFilterDropdown")
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug("[FilterDropdown] dismissFilterDropdown", category: .ui)
+        }
         activeFilterDropdown = .none
         isFilterDropdownOpen = false
     }
@@ -783,7 +806,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let oldCount = oldValue.count
             let newCount = imageCache.count
             if oldCount != newCount {
-                Log.debug("[Memory] imageCache changed: \(oldCount) → \(newCount) images", category: .ui)
+                if Self.isVerboseTimelineLoggingEnabled {
+                    Log.debug("[Memory] imageCache changed: \(oldCount) → \(newCount) images", category: .ui)
+                }
             }
         }
     }
@@ -796,6 +821,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Task for preloading nearby frames (cancelled when index changes rapidly)
     private var preloadTask: Task<Void, Never>?
+
+    /// Track frames currently being decoded to prevent duplicate decode operations
+    private var inFlightDecodes: Set<FrameID> = []
 
     // MARK: - Infinite Scroll Window State
 
@@ -2941,11 +2969,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
         guard let timelineFrame = currentTimelineFrame else {
-            Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
+            }
             return
         }
 
-        Log.debug("[TIMELINE-LOAD] ▶️ loadImageIfNeeded() START for frame \(timelineFrame.frame.id.value), currentFrameNotReady=\(frameNotReady), processingStatus=\(timelineFrame.processingStatus)", category: .ui)
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() START for frame \(timelineFrame.frame.id.value), currentFrameNotReady=\(frameNotReady), processingStatus=\(timelineFrame.processingStatus)", category: .ui)
+        }
 
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {
@@ -2966,7 +2998,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Check if frame is not yet readable (processingStatus = 4)
         // This provides instant feedback instead of waiting for async load to fail
         if timelineFrame.processingStatus == 4 {
-            Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=4 (NOT_YET_READABLE), setting frameNotReady=true", category: .ui)
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=4 (NOT_YET_READABLE), setting frameNotReady=true", category: .ui)
+            }
             currentImage = nil
             frameNotReady = true
             // Still preload nearby frames
@@ -2977,21 +3011,38 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Reset frameNotReady immediately when status != 4
         // This prevents stale "still encoding" state from persisting when scrolling
         // from a processingStatus=4 frame to an earlier ready frame
-        Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=\(timelineFrame.processingStatus) (!= 4), setting frameNotReady=false", category: .ui)
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=\(timelineFrame.processingStatus) (!= 4), setting frameNotReady=false", category: .ui)
+        }
         frameNotReady = false
         frameLoadError = false
 
         // Check cache first
         if let cached = imageCache[frame.id] {
-            Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
+            }
             currentImage = cached
             frameNotReady = false
             frameLoadError = false
             return
         }
 
+        // Skip if already being decoded (prevents duplicate work)
+        guard !inFlightDecodes.contains(frame.id) else {
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) decode already in-flight; skipping duplicate request", category: .ui)
+            }
+            return
+        }
+        inFlightDecodes.insert(frame.id)
+
         // Load from disk
+        let frameID = frame.id
+
         Task {
+            defer { inFlightDecodes.remove(frameID) }
+
             do {
                 let imageData: Data
 
@@ -3016,33 +3067,43 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Prune cache if it's getting too large
                     pruneImageCacheIfNeeded()
 
-                    imageCache[frame.id] = image
+                    imageCache[frameID] = image
                     // Only update if we're still on the same frame
                     if currentTimelineFrame?.frame.id == frame.id {
                         currentImage = image
                         frameNotReady = false
                         frameLoadError = false
-                        Log.debug("[TIMELINE-LOAD] Successfully loaded image for frame \(frame.id.value), set frameNotReady=false", category: .ui)
+                        if Self.isVerboseTimelineLoggingEnabled {
+                            Log.debug("[TIMELINE-LOAD] Successfully loaded image for frame \(frame.id.value)", category: .ui)
+                        }
                     }
                 }
             } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("still being written") {
                 // Expected during recording - file not ready yet
-                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video still being written (processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                if Self.isVerboseTimelineLoggingEnabled {
+                    Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video still being written (processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                }
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
                     frameLoadError = false
                     // Don't set frameNotReady=true for completed frames (processingStatus=2)
                     if timelineFrame.processingStatus != 2 {
-                        Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        if Self.isVerboseTimelineLoggingEnabled {
+                            Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        }
                         frameNotReady = true
                     } else {
-                        Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                        if Self.isVerboseTimelineLoggingEnabled {
+                            Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                        }
                     }
                 }
             } catch StorageError.fileReadFailed(_, let underlying) where underlying.contains("out of range") {
                 // Frame not yet written to video file - this is expected for recently captured frames
                 // The frame record exists in DB but the video encoder hasn't flushed it yet
-                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) not yet in video file (still encoding, processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                if Self.isVerboseTimelineLoggingEnabled {
+                    Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) not yet in video file (still encoding, processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                }
 
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
@@ -3059,16 +3120,22 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             } catch let error as NSError where error.domain == "AVFoundationErrorDomain" && error.code == -11829 {
                 // Video file too small / no fragments yet - expected for very recent frames
-                Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video not ready yet (no fragments, processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                if Self.isVerboseTimelineLoggingEnabled {
+                    Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video not ready yet (no fragments, processingStatus=\(timelineFrame.processingStatus))", category: .app)
+                }
                 if currentTimelineFrame?.frame.id == frame.id {
                     currentImage = nil
                     // Don't set frameNotReady=true for completed frames (processingStatus=2)
                     if timelineFrame.processingStatus != 2 {
-                        Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        if Self.isVerboseTimelineLoggingEnabled {
+                            Log.info("[TIMELINE-LOAD] Setting frameNotReady=true (processingStatus != 2)", category: .app)
+                        }
                         frameNotReady = true
                         frameLoadError = false
                     } else {
-                        Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                        if Self.isVerboseTimelineLoggingEnabled {
+                            Log.info("[TIMELINE-LOAD] NOT setting frameNotReady=true because processingStatus=2 (completed)", category: .app)
+                        }
                         frameNotReady = false
                         frameLoadError = false
                     }
@@ -3129,17 +3196,26 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // Check for cancellation
                 if Task.isCancelled { return }
 
-                // Skip if already cached (might have been loaded by another path)
+                // Skip if already cached or being decoded
                 if imageCache[frameData.frameID] != nil { continue }
+                if inFlightDecodes.contains(frameData.frameID) { continue }
+
+                // Mark as in-flight
+                inFlightDecodes.insert(frameData.frameID)
 
                 do {
                     let filename = (frameData.videoPath as NSString).lastPathComponent
-                    guard let filenameID = Int64(filename) else { continue }
+                    guard let filenameID = Int64(filename) else {
+                        inFlightDecodes.remove(frameData.frameID)
+                        continue
+                    }
 
                     let imageData = try await coordinator.getFrameImageDirect(
                         filenameID: filenameID,
                         frameIndex: frameData.frameIndex
                     )
+
+                    inFlightDecodes.remove(frameData.frameID)
 
                     if Task.isCancelled { return }
 
@@ -3148,6 +3224,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         imageCache[frameData.frameID] = image
                     }
                 } catch {
+                    inFlightDecodes.remove(frameData.frameID)
                     // Silently ignore preload errors - frame might not be ready yet
                     // This is expected for frames near the end that are still encoding
                 }
@@ -3310,8 +3387,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             guard let self = self else { return }
 
             while !Task.isCancelled {
-                // Wait 500ms between polls
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                // Wait 2000ms between polls (coalesces with other 2s timers for power efficiency)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
 
                 guard !Task.isCancelled else { return }
 
@@ -4463,7 +4540,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let removedCount = oldCount - imageCache.count
         if removedCount > 0 {
-            Log.info("[Memory] Pruned \(removedCount) images from cache (frames no longer in window)", category: .ui)
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.info("[Memory] Pruned \(removedCount) images from cache (frames no longer in window)", category: .ui)
+            }
         }
 
         // If still too large, remove oldest entries (keep half)
@@ -4471,7 +4550,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             let toRemove = imageCache.count - (Self.maxImageCacheSize / 2)
             let keysToRemove = Array(imageCache.keys.prefix(toRemove))
             keysToRemove.forEach { imageCache.removeValue(forKey: $0) }
-            Log.info("[Memory] Force-pruned \(toRemove) images from cache (cache overflow)", category: .ui)
+            if Self.isVerboseTimelineLoggingEnabled {
+                Log.info("[Memory] Force-pruned \(toRemove) images from cache (cache overflow)", category: .ui)
+            }
         }
     }
 

@@ -183,7 +183,9 @@ public class AppNameResolver {
         }
 
         let elapsed = Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000)
+        #if DEBUG
         print("[AppNameResolver] getInstalledApps: found \(apps.count) apps in \(elapsed)ms, icon cache size: \(AppIconProvider.shared.cacheCount)")
+        #endif
 
         return apps
     }
@@ -261,7 +263,9 @@ public class AppNameResolver {
         // Clear the timestamp so it will be refreshed
         UserDefaults.standard.removeObject(forKey: "search.otherAppsCacheSavedAt")
 
+        #if DEBUG
         print("[AppNameResolver] Cache cleared (\(entriesCleared) entries)")
+        #endif
         return entriesCleared
     }
 }
@@ -294,11 +298,15 @@ public class AppIconProvider {
         if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
             let icon = NSWorkspace.shared.icon(forFile: appURL.path)
             cache[bundleID] = icon
+            #if DEBUG
             print("[AppIconProvider] CACHE MISS for \(bundleID) - resolved in \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
+            #endif
             return icon
         }
 
+        #if DEBUG
         print("[AppIconProvider] CACHE MISS for \(bundleID) - not found, took \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms")
+        #endif
         return nil
     }
 

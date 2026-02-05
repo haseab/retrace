@@ -212,7 +212,9 @@ public struct FilterPopoverContainer<Content: View>: View {
     }
 
     public var body: some View {
+        #if DEBUG
         let _ = print("[FilterPopoverContainer] Rendering with width=\(width)")
+        #endif
         VStack(spacing: 0) {
             content
         }
@@ -1083,18 +1085,26 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
     }
 
     public func body(content: Content) -> some View {
+        #if DEBUG
         let _ = print("[DropdownOverlay] Rendering, isPresented=\(isPresented), opensUpward=\(opensUpward), yOffset=\(yOffset)")
+        #endif
         content
             .background(GeometryReader { geo in
                 Color.clear.onAppear {
+                    #if DEBUG
                     print("[DropdownOverlay] Anchor content frame: \(geo.frame(in: .global))")
+                    #endif
                 }.onChange(of: isPresented) { _ in
+                    #if DEBUG
                     print("[DropdownOverlay] Anchor content frame (on change): \(geo.frame(in: .global))")
+                    #endif
                 }
             })
             .overlay(alignment: opensUpward ? .bottomLeading : .topLeading) {
                 if isPresented {
+                    #if DEBUG
                     let _ = print("[DropdownOverlay] Showing dropdown content with zIndex=1000")
+                    #endif
                     // Wrap content in a background container to ensure solid background
                     ZStack {
                         // Solid background layer
@@ -1116,7 +1126,9 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
                     .zIndex(1000)
                     .background(GeometryReader { geo in
                         Color.clear.onAppear {
+                            #if DEBUG
                             print("[DropdownOverlay] Dropdown content frame: \(geo.frame(in: .global))")
+                            #endif
                         }
                     })
                 }

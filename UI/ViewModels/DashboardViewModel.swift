@@ -4,6 +4,7 @@ import Shared
 import App
 import Database
 import ApplicationServices
+import Dispatch
 
 /// Debug logger that writes to /tmp/retrace_debug.log
 private func debugLog(_ message: String) {
@@ -76,7 +77,7 @@ public class DashboardViewModel: ObservableObject {
 
     private let coordinator: AppCoordinator
     private var cancellables = Set<AnyCancellable>()
-    private var refreshTimer: Timer?
+    private var refreshTimer: DispatchSourceTimer?
 
     // MARK: - Initialization
 
@@ -103,13 +104,17 @@ public class DashboardViewModel: ObservableObject {
     }
 
     private func setupAutoRefresh() {
-        // Refresh recording status and permissions every 2 seconds
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // Refresh recording status and permissions every 2 seconds with leeway for power efficiency
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
+        timer.setEventHandler { [weak self] in
             Task { @MainActor in
                 await self?.updateRecordingStatus()
                 self?.checkPermissions()
             }
         }
+        timer.resume()
+        refreshTimer = timer
     }
 
     private func updateRecordingStatus() async {
@@ -757,7 +762,7 @@ public class DashboardViewModel: ObservableObject {
     // MARK: - Cleanup
 
     deinit {
-        refreshTimer?.invalidate()
+        refreshTimer?.cancel()
         cancellables.removeAll()
     }
 }
