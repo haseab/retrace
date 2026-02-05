@@ -14,6 +14,7 @@ actor DisplaySwitchMonitor {
     private var notificationTask: Task<Void, Never>?
     private var axObserver: AXObserver?
     private var observedApp: NSRunningApplication?
+    private var refWrapper: DisplaySwitchMonitorRef?
 
     /// Callback when display switch is detected
     nonisolated(unsafe) var onDisplaySwitch: (@Sendable (UInt32, UInt32) async -> Void)?
@@ -68,42 +69,56 @@ actor DisplaySwitchMonitor {
     // MARK: - Accessibility Observer
 
     /// Set up AX observer for the frontmost application to detect window moves
+    /// Uses safe wrappers to prevent crashes if permissions are revoked
     private func setupAXObserverForFrontmostApp() async {
         // Remove existing observer first
         await removeCurrentAXObserver()
+
+        // Check permission before attempting any AX operations
+        guard PermissionMonitor.shared.hasAccessibilityPermission() else {
+            if let callback = onAccessibilityPermissionDenied {
+                await callback()
+            }
+            return
+        }
 
         // Get frontmost app on main actor
         let app: NSRunningApplication? = await MainActor.run {
             NSWorkspace.shared.frontmostApplication
         }
 
-        guard let app = app else { return }
+        guard let app = app else {
+            return
+        }
 
         let pid = app.processIdentifier
-        var observer: AXObserver?
 
-        // Create observer
-        let result = AXObserverCreate(pid, { (observer, element, notification, refcon) in
-            // Callback when window moved or focused window changed
-            guard let refcon = refcon else { return }
-            let monitor = Unmanaged<DisplaySwitchMonitorRef>.fromOpaque(refcon).takeUnretainedValue()
-            Task {
-                await monitor.monitor.handleWindowChangeFromAX()
+        // Use safe wrapper to create observer
+        guard let observer = PermissionMonitor.shared.safeCreateAXObserver(
+            pid: pid,
+            callback: { (observer, element, notification, refcon) in
+                // Callback when window moved or focused window changed
+                guard let refcon = refcon else { return }
+                let monitor = Unmanaged<DisplaySwitchMonitorRef>.fromOpaque(refcon).takeUnretainedValue()
+                Task {
+                    await monitor.monitor.handleWindowChangeFromAX()
+                }
             }
-        }, &observer)
-
-        guard result == .success, let observer = observer else {
-            Log.warning("[DisplaySwitchMonitor] Failed to create AX observer for \(app.localizedName ?? "unknown")", category: .capture)
+        ) else {
+            Log.warning("[DisplaySwitchMonitor] Failed to create AX observer for \(app.localizedName ?? "unknown") - permission may have been revoked", category: .capture)
             return
         }
 
         let appElement = AXUIElementCreateApplication(pid)
 
         // Create ref wrapper to pass self to callback
-        let refWrapper = DisplaySwitchMonitorRef(monitor: self)
-        let refPtr = Unmanaged.passRetained(refWrapper).toOpaque()
+        // Store it in the actor so it doesn't get deallocated
+        let wrapper = DisplaySwitchMonitorRef(monitor: self)
+        self.refWrapper = wrapper
+        let refPtr = Unmanaged.passUnretained(wrapper).toOpaque()
 
         // Add notifications for window moved, focused window changed, and title changed
+        // These may fail if permission is revoked mid-setup, but won't crash
         AXObserverAddNotification(observer, appElement, kAXMovedNotification as CFString, refPtr)
         AXObserverAddNotification(observer, appElement, kAXFocusedWindowChangedNotification as CFString, refPtr)
         AXObserverAddNotification(observer, appElement, kAXTitleChangedNotification as CFString, refPtr)
@@ -128,6 +143,7 @@ actor DisplaySwitchMonitor {
         }
         self.axObserver = nil
         self.observedApp = nil
+        self.refWrapper = nil
     }
 
     // MARK: - Private Methods
@@ -135,6 +151,16 @@ actor DisplaySwitchMonitor {
     /// Handle window change from AX observer (window focus change within app)
     /// Triggers immediate capture callback and then checks for display switch
     func handleWindowChangeFromAX() async {
+        // Check permission first - if revoked, clean up and notify
+        guard PermissionMonitor.shared.hasAccessibilityPermission() else {
+            Log.warning("[DisplaySwitchMonitor] AX callback received but permission revoked - cleaning up", category: .capture)
+            await removeCurrentAXObserver()
+            if let callback = onAccessibilityPermissionDenied {
+                await callback()
+            }
+            return
+        }
+
         // Notify window change for immediate capture
         if let callback = onWindowChange {
             await callback()

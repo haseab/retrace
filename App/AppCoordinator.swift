@@ -41,6 +41,9 @@ public actor AppCoordinator {
     // Storage accessibility monitoring - stops recording if storage becomes unavailable
     private var storageMonitorTask: Task<Void, Never>?
 
+    // Permission monitoring - stops recording gracefully if permissions are revoked
+    private var permissionMonitorSetup = false
+
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
@@ -275,6 +278,9 @@ public actor AppCoordinator {
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
 
+        // Start permission monitoring to detect if user revokes permissions while recording
+        await startPermissionMonitoring()
+
         // ⚠️ RELEASE 2 ONLY - Audio capture commented out
         // // Start audio capture
         // let audioConfig = AudioCaptureConfig.default
@@ -311,6 +317,9 @@ public actor AppCoordinator {
         }
 
         Log.info("Stopping capture pipeline...", category: .app)
+
+        // Stop permission monitoring
+        await stopPermissionMonitoring()
 
         // Stop storage accessibility monitoring
         stopStorageMonitoring()
@@ -413,6 +422,53 @@ public actor AppCoordinator {
     private func stopStorageMonitoring() {
         storageMonitorTask?.cancel()
         storageMonitorTask = nil
+    }
+
+    // MARK: - Permission Monitoring
+
+    /// Start monitoring for permission changes while recording
+    /// Gracefully stops the pipeline if permissions are revoked
+    private func startPermissionMonitoring() async {
+        guard !permissionMonitorSetup else { return }
+        permissionMonitorSetup = true
+
+        // Set up callbacks for permission revocation
+        PermissionMonitor.shared.onScreenRecordingRevoked = { [weak self] in
+            guard let self = self else { return }
+            Log.error("[AppCoordinator] Screen recording permission revoked - stopping pipeline gracefully", category: .app)
+            try? await self.stopPipeline()
+
+            // Post notification so UI can alert user
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("ScreenRecordingPermissionRevoked"),
+                    object: nil
+                )
+            }
+        }
+
+        PermissionMonitor.shared.onAccessibilityRevoked = {
+            Log.warning("[AppCoordinator] Accessibility permission revoked - display switching disabled", category: .app)
+
+            // Post notification so UI can alert user
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("AccessibilityPermissionRevoked"),
+                    object: nil
+                )
+            }
+        }
+
+        // Start the periodic permission check
+        await PermissionMonitor.shared.startMonitoring()
+        Log.info("[AppCoordinator] Permission monitoring started", category: .app)
+    }
+
+    /// Stop monitoring for permission changes
+    private func stopPermissionMonitoring() async {
+        await PermissionMonitor.shared.stopMonitoring()
+        permissionMonitorSetup = false
+        Log.info("[AppCoordinator] Permission monitoring stopped", category: .app)
     }
 
     // MARK: - Pipeline Implementation

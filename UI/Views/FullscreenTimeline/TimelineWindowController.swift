@@ -1403,6 +1403,18 @@ public class TimelineWindowController: NSObject {
             }
         }
 
+        // Cmd+Z to undo (go back to last stopped playhead position)
+        if event.keyCode == 6 && modifiers == [.command] { // Z key with Command
+            if let viewModel = timelineViewModel {
+                if viewModel.undoToLastStoppedPosition() {
+                    recordShortcut("cmd+z")
+                    return true
+                }
+            }
+            // Don't consume the event if there's nothing to undo
+            return false
+        }
+
         // Left arrow key - navigate to previous frame (Option = 3x speed)
         if event.keyCode == 123 && (modifiers.isEmpty || modifiers == [.option]) { // Left arrow
             if let viewModel = timelineViewModel {

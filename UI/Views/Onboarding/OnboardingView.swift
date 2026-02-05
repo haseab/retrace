@@ -54,6 +54,8 @@ public struct OnboardingView: View {
     @State private var permissionCheckTimer: Timer? = nil
     @State private var screenRecordingDenied = false  // User explicitly denied in system prompt
     @State private var screenRecordingRequested = false  // User has clicked Enable once
+    @State private var accessibilityRequested = false  // User has clicked Enable Accessibility once
+    @State private var hasTriggeredCaptureDialog = false  // macOS 15+ "Allow to record" dialog triggered
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
@@ -199,6 +201,9 @@ public struct OnboardingView: View {
                 Task {
                     try? await coordinator.startPipeline()
                 }
+                // Now that permissions are granted, setup global hotkeys
+                // This was deferred during MenuBarManager.setup() to avoid triggering AXIsProcessTrusted() too early
+                MenuBarManager.shared?.reloadShortcuts()
                 withAnimation { currentStep = 4 }  // Go to menu bar icon step
             }) {
                 Text("Continue")
@@ -1851,8 +1856,11 @@ public struct OnboardingView: View {
         // Check screen recording
         hasScreenRecordingPermission = await checkScreenRecordingPermission()
 
-        // Check accessibility
-        hasAccessibilityPermission = checkAccessibilityPermission()
+        // Only check accessibility if user has already requested it
+        // This prevents AXIsProcessTrustedWithOptions from triggering an early system prompt
+        if accessibilityRequested {
+            hasAccessibilityPermission = checkAccessibilityPermission()
+        }
     }
 
     private func checkScreenRecordingPermission() async -> Bool {
@@ -1909,6 +1917,9 @@ public struct OnboardingView: View {
     }
 
     private func requestAccessibility() {
+        // Mark that user has requested accessibility - this enables polling for this permission
+        accessibilityRequested = true
+
         // Request accessibility permission with prompt
         let options: NSDictionary = [
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
@@ -1946,16 +1957,35 @@ public struct OnboardingView: View {
                 // Check screen recording
                 hasScreenRecordingPermission = await checkScreenRecordingPermission()
 
-                // Check accessibility
-                let previousAccessibility = hasAccessibilityPermission
-                hasAccessibilityPermission = checkAccessibilityPermission()
+                // Only check accessibility AFTER user has clicked Enable
+                // This prevents AXIsProcessTrustedWithOptions from triggering an early system prompt
+                if accessibilityRequested {
+                    let previousAccessibility = hasAccessibilityPermission
+                    hasAccessibilityPermission = checkAccessibilityPermission()
 
-                // If accessibility was just granted, retry setting up global hotkeys
-                if !previousAccessibility && hasAccessibilityPermission {
-                    HotkeyManager.shared.retrySetupIfNeeded()
+                    // If accessibility was just granted, retry setting up global hotkeys
+                    if !previousAccessibility && hasAccessibilityPermission {
+                        HotkeyManager.shared.retrySetupIfNeeded()
+                    }
+                }
+
+                // On macOS 15+, when both permissions are granted, trigger the capture dialog
+                // This shows "Allow [App] to record screen & audio" dialog while still on permissions step
+                if hasScreenRecordingPermission && hasAccessibilityPermission && !hasTriggeredCaptureDialog {
+                    triggerMacOS15CaptureDialog()
                 }
             }
         }
+    }
+
+    /// Triggers a single screen capture to prompt the macOS 15+ "Allow to record screen & audio" dialog.
+    /// This ensures the dialog appears on the permissions step rather than after moving to the next step.
+    private func triggerMacOS15CaptureDialog() {
+        hasTriggeredCaptureDialog = true
+
+        // A single CGDisplayCreateImage call is enough to trigger the system dialog on macOS 15+
+        // We don't need to use the result - we just need to make the API call
+        _ = CGDisplayCreateImage(CGMainDisplayID())
     }
 
     private func stopPermissionMonitoring() {

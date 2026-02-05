@@ -35,7 +35,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
     private static let lastCountedTimestampKey = "retraceLastCountedTimestamp"
 
     /// UserDefaults suite for app settings
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
     // MARK: - Private State
 
@@ -73,7 +73,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
     private func updateCumulativeTime() async {
         do {
             let lastCountedTimestamp = getLastCountedTimestamp()
-            let cumulativeTime = Self.settingsStore?.double(forKey: Self.cumulativeScreenTimeKey) ?? 0
+            let cumulativeTime = Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
 
             // Get duration of segments created after the last checkpoint
             let newDuration: TimeInterval
@@ -87,11 +87,11 @@ public class LaunchOnLoginReminderManager: ObservableObject {
             // Update cumulative time if there's new time
             if newDuration > 0 {
                 let updatedCumulative = cumulativeTime + newDuration
-                Self.settingsStore?.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
+                Self.settingsStore.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
             }
 
             // Update checkpoint to now
-            Self.settingsStore?.set(Date().timeIntervalSince1970, forKey: Self.lastCountedTimestampKey)
+            Self.settingsStore.set(Date().timeIntervalSince1970, forKey: Self.lastCountedTimestampKey)
 
         } catch {
             Log.error("[LaunchOnLoginReminderManager] Failed to update cumulative time: \(error)", category: .ui)
@@ -100,7 +100,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
 
     /// Get the timestamp of the last counted segment checkpoint
     private func getLastCountedTimestamp() -> Date? {
-        guard let timestamp = Self.settingsStore?.object(forKey: Self.lastCountedTimestampKey) as? TimeInterval,
+        guard let timestamp = Self.settingsStore.object(forKey: Self.lastCountedTimestampKey) as? TimeInterval,
               timestamp > 0 else {
             return nil
         }
@@ -109,7 +109,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
 
     /// Get the total cumulative screen time (persisted across database resets)
     private func getCumulativeScreenTime() -> TimeInterval {
-        Self.settingsStore?.double(forKey: Self.cumulativeScreenTimeKey) ?? 0
+        Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
     }
 
     /// Check if user has enough captured duration to show the reminder
@@ -136,13 +136,13 @@ public class LaunchOnLoginReminderManager: ObservableObject {
 
     /// Check if the reminder has been permanently dismissed
     private func hasBeenDismissed() -> Bool {
-        Self.settingsStore?.bool(forKey: Self.reminderDismissedKey) ?? false
+        Self.settingsStore.bool(forKey: Self.reminderDismissedKey)
     }
 
     /// Check if launch at login is already enabled (via UserDefaults or system status)
     private func isLaunchAtLoginEnabled() -> Bool {
         // Check UserDefaults first
-        if Self.settingsStore?.bool(forKey: Self.launchAtLoginKey) == true {
+        if Self.settingsStore.bool(forKey: Self.launchAtLoginKey) {
             return true
         }
         // Also check actual system status in case user enabled via System Settings
@@ -157,7 +157,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
             if SMAppService.mainApp.status != .enabled {
                 try SMAppService.mainApp.register()
             }
-            Self.settingsStore?.set(true, forKey: Self.launchAtLoginKey)
+            Self.settingsStore.set(true, forKey: Self.launchAtLoginKey)
             shouldShowReminder = false
             markAsDismissed()
             Log.info("[LaunchOnLoginReminderManager] User enabled launch at login", category: .ui)
@@ -175,7 +175,7 @@ public class LaunchOnLoginReminderManager: ObservableObject {
 
     /// Mark the reminder as dismissed in UserDefaults
     private func markAsDismissed() {
-        Self.settingsStore?.set(true, forKey: Self.reminderDismissedKey)
+        Self.settingsStore.set(true, forKey: Self.reminderDismissedKey)
     }
 
     // MARK: - Cleanup

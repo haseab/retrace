@@ -30,13 +30,9 @@ public struct TimelineTapeView: View {
     private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
 
     /// Scrubbing animation duration from settings (0 = no animation, max 0.20)
-    private var scrubbingAnimationDuration: Double {
-        guard let store = Self.settingsStore else { return 0.10 }
-        // Check if key exists, otherwise return default (double(forKey:) returns 0 for missing keys)
-        return store.object(forKey: "scrubbingAnimationDuration") != nil
-            ? store.double(forKey: "scrubbingAnimationDuration")
-            : 0.10
-    }
+    /// Using @AppStorage so the view automatically updates when the setting changes
+    @AppStorage("scrubbingAnimationDuration", store: UserDefaults(suiteName: "io.retrace.app"))
+    private var scrubbingAnimationDuration: Double = 0.10
 
     // MARK: - Body
 

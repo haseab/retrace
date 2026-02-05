@@ -62,7 +62,15 @@ public class MenuBarManager: ObservableObject {
             await loadShortcuts()
             setupMenu()
             setupTimelineNotifications()
-            setupGlobalHotkey()
+
+            // Only setup global hotkeys if onboarding is past the permissions step (step 3)
+            // This prevents HotkeyManager from calling AXIsProcessTrusted() before user grants permission
+            let onboardingStep = UserDefaults.standard.integer(forKey: "onboardingCurrentStep")
+            let hasCompletedOnboarding = await onboardingManager.hasCompletedOnboarding
+            if hasCompletedOnboarding || onboardingStep >= 4 {
+                setupGlobalHotkey()
+            }
+
             setupAutoRefresh()
             // Sync with coordinator to get current recording state
             syncWithCoordinator()

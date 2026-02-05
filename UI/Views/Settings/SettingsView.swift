@@ -4,6 +4,7 @@ import AppKit
 import App
 import ScreenCaptureKit
 import SQLCipher
+import ServiceManagement
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -285,6 +286,12 @@ public struct SettingsView: View {
             if !launchedPathInitialized {
                 launchedWithRetraceDBPath = customRetraceDBLocation
                 launchedPathInitialized = true
+            }
+
+            // Sync launch at login toggle with actual system state
+            let systemLaunchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+            if launchAtLogin != systemLaunchAtLoginEnabled {
+                launchAtLogin = systemLaunchAtLoginEnabled
             }
         }
         .onChange(of: timelineShortcut) { _ in
@@ -3456,7 +3463,11 @@ extension SettingsView {
         task.launchPath = "/usr/bin/open"
         task.arguments = [path]
         task.launch()
-        NSApp.terminate(nil)
+
+        // Give macOS time to launch the new instance before terminating
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApp.terminate(nil)
+        }
     }
 
     func restartAndResumeRecording() {

@@ -602,61 +602,56 @@ public struct SpotlightSearchOverlay: View {
     }
 
     /// Find the OCR node that best matches the search query
-    /// Prioritizes exact word matches, then prefix matches (for stemmed/nominalized words)
+    /// Handles both exact phrase matching (quoted queries) and individual term matching
     private func findMatchingOCRNode(query: String, nodes: [OCRNodeWithText]) -> OCRNodeWithText? {
-        let lowercaseQuery = query.lowercased()
+        let trimmedQuery = query.trimmingCharacters(in: .whitespaces)
 
-        // First pass: find exact word boundary match (e.g., "@glean" or "glean," or " glean ")
-        // This is better than finding "glean" inside "gleanings"
-        for node in nodes {
-            let nodeText = node.text.lowercased()
-            // Check if query appears as a standalone word (with word boundaries)
-            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: lowercaseQuery))\\b"
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-               regex.firstMatch(in: nodeText, options: [], range: NSRange(nodeText.startIndex..., in: nodeText)) != nil {
-                return node
+        // Check if this is an exact phrase search (wrapped in quotes)
+        let isExactPhraseSearch = trimmedQuery.hasPrefix("\"") && trimmedQuery.hasSuffix("\"") && trimmedQuery.count > 2
+
+        if isExactPhraseSearch {
+            // Extract phrase without quotes and search for exact consecutive match
+            let phrase = String(trimmedQuery.dropFirst().dropLast()).lowercased()
+
+            // Only match if the exact phrase appears in the node
+            for node in nodes {
+                if node.text.lowercased().contains(phrase) {
+                    return node
+                }
             }
+
+            // No fallback for exact phrase search - return nil if not found
+            return nil
         }
 
-        // Second pass: find prefix match for stemmed words (e.g., "calling" matches "call", "calls")
-        // FTS5 uses porter stemmer, so "calling" -> "call" which matches "call", "calls", "called"
-        // We check if any word in the node starts with a common stem of the query
-        let queryStem = getWordStem(lowercaseQuery)
-        if queryStem.count >= 3 {  // Only use stems of 3+ characters
-            for node in nodes {
-                let nodeText = node.text.lowercased()
-                // Check if any word in the node starts with the query stem
-                let words = nodeText.components(separatedBy: .alphanumerics.inverted).filter { !$0.isEmpty }
-                for word in words {
-                    if word.hasPrefix(queryStem) || queryStem.hasPrefix(word) {
-                        return node
-                    }
+        // Non-quoted search: split into terms and search for any term
+        let queryTerms = trimmedQuery.lowercased()
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+
+        // First pass: find node containing any query term as exact word
+        for node in nodes {
+            let nodeText = node.text.lowercased()
+            for term in queryTerms {
+                let pattern = "\\b\(NSRegularExpression.escapedPattern(for: term))\\b"
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+                   regex.firstMatch(in: nodeText, options: [], range: NSRange(nodeText.startIndex..., in: nodeText)) != nil {
+                    return node
                 }
             }
         }
 
-        // Third pass: find any substring match as fallback
+        // Second pass: find any substring match as fallback
         for node in nodes {
-            if node.text.lowercased().contains(lowercaseQuery) {
-                return node
+            let nodeText = node.text.lowercased()
+            for term in queryTerms {
+                if nodeText.contains(term) {
+                    return node
+                }
             }
         }
 
         return nil
-    }
-
-    /// Get a simple word stem by removing common suffixes
-    /// This mimics basic porter stemmer behavior for common English suffixes
-    private func getWordStem(_ word: String) -> String {
-        let suffixes = ["ing", "ed", "er", "est", "ly", "tion", "sion", "ness", "ment", "able", "ible", "ful", "less", "ous", "ive", "al", "s"]
-        var stem = word
-        for suffix in suffixes {
-            if stem.hasSuffix(suffix) && stem.count > suffix.count + 2 {
-                stem = String(stem.dropLast(suffix.count))
-                break
-            }
-        }
-        return stem
     }
 
     /// Create a thumbnail cropped around the matching OCR node with a yellow highlight

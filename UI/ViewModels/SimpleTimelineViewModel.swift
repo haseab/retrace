@@ -833,6 +833,32 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Threshold: if user is within this many frames of newest, allow background refresh
     private static let nearLiveEdgeFrameThreshold: Int = 50
 
+    // MARK: - Playhead Position History (for Cmd+Z undo)
+
+    /// Stored position for undo history - contains both frame ID (for precision) and timestamp (for reloading)
+    private struct StoppedPosition {
+        let frameID: FrameID
+        let timestamp: Date
+    }
+
+    /// Stack of positions where the playhead was stopped for 1+ second
+    /// Most recent position is at the end of the array
+    /// Stores frame ID (unique identifier) and timestamp (for reloading frames if needed)
+    private var stoppedPositionHistory: [StoppedPosition] = []
+
+    /// Maximum number of stopped positions to remember
+    private static let maxStoppedPositionHistory = 50
+
+    /// Work item for detecting when playhead has been stationary for 1+ second
+    /// Using DispatchWorkItem instead of Task for lower overhead during rapid navigation
+    private var playheadStoppedDetectionWorkItem: DispatchWorkItem?
+
+    /// The frame ID that was last recorded as a stopped position (to avoid duplicates)
+    private var lastRecordedStoppedFrameID: FrameID?
+
+    /// Time threshold (in seconds) for considering playhead as "stopped"
+    private static let stoppedThresholdSeconds: TimeInterval = 1.0
+
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
@@ -1860,6 +1886,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func openFilterPanel() {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .filter)
+        // Show controls if hidden (user expects to see the filter panel)
+        if areControlsHidden {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                areControlsHidden = false
+            }
+        }
         // Initialize pending with current applied filters
         pendingFilterCriteria = filterCriteria
         // Set visible immediately - animation is handled by the View
@@ -1960,6 +1992,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func openDateSearch() {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .dateSearch)
+        // Show controls if hidden (user expects to see the date search panel)
+        if areControlsHidden {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                areControlsHidden = false
+            }
+        }
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             isDateSearchActive = true
         }
@@ -1988,6 +2026,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func openSearchOverlay() {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .search)
+        // Show controls if hidden (user expects to see the search overlay)
+        if areControlsHidden {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                areControlsHidden = false
+            }
+        }
         isSearchOverlayVisible = true
         // Clear any existing search highlight
         Task { @MainActor in
@@ -2148,6 +2192,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Start at the most recent frame (last in array since sorted ascending, oldest first)
             currentIndex = frames.count - 1
 
+            // Record initial position for undo history
+            scheduleStoppedPositionRecording()
+
             // Check if we need to pre-load more frames (e.g., if loaded window is small)
             checkAndLoadMoreFrames()
 
@@ -2214,6 +2261,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Start at the most recent frame
         currentIndex = frames.count - 1
 
+        // Record initial position for undo history
+        scheduleStoppedPositionRecording()
+
         // Check if we need to pre-load more frames (e.g., if loaded window is small)
         checkAndLoadMoreFrames()
 
@@ -2266,13 +2316,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.info("[TIMELINE-REFRESH] 🔄 Have \(frames.count) cached frames, refreshing current image", category: .ui)
 
             // Background refresh rules:
+            // - With filters active: always respect 1-minute cache expiry (no 50-frame optimization)
             // - Hidden > 1 minute (navigateToNewest=true): always refresh and navigate to newest
             // - Hidden < 1 minute AND within 50 frames: refresh and navigate to newest
             // - Hidden < 1 minute AND > 50 frames away: skip refresh entirely
             let framesFromNewest = frames.count - 1 - currentIndex
             let shouldNavigateToNewest: Bool
+            let hasActiveFilters = filterCriteria.hasActiveFilters
 
-            if !navigateToNewest, currentIndex < frames.count {
+            if !navigateToNewest, currentIndex < frames.count, !hasActiveFilters {
                 if framesFromNewest > Self.nearLiveEdgeFrameThreshold {
                     Log.info("[TIMELINE-REFRESH] 🔄 Skipping background refresh — user is \(framesFromNewest) frames from newest (threshold: \(Self.nearLiveEdgeFrameThreshold))", category: .ui)
                     loadImageIfNeeded()
@@ -2281,6 +2333,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // Within 50 frames - allow refresh AND navigate to newest
                 shouldNavigateToNewest = true
                 Log.info("[TIMELINE-REFRESH] 🔄 Within \(Self.nearLiveEdgeFrameThreshold) frames of newest (\(framesFromNewest)), will navigate to newest", category: .ui)
+            } else if hasActiveFilters {
+                // With filters active, always use navigateToNewest (respects 1-minute cache expiry)
+                shouldNavigateToNewest = navigateToNewest
+                Log.info("[TIMELINE-REFRESH] 🔄 Filters active - using 1-minute cache expiry rule (navigateToNewest: \(navigateToNewest))", category: .ui)
             } else {
                 shouldNavigateToNewest = navigateToNewest
             }
@@ -2497,11 +2553,173 @@ public class SimpleTimelineViewModel: ObservableObject {
                 newestTimestamp: newestLoadedTimestamp
             )
         }
+
+        // Track stopped positions for Cmd+Z undo
+        scheduleStoppedPositionRecording()
+    }
+
+    /// Schedule recording the current position as a "stopped" position after 1 second of inactivity
+    private func scheduleStoppedPositionRecording() {
+        // Cancel any previous work item
+        playheadStoppedDetectionWorkItem?.cancel()
+
+        let indexToRecord = currentIndex
+
+        // Create new work item (lighter weight than Task)
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.recordStoppedPosition(indexToRecord)
+        }
+        playheadStoppedDetectionWorkItem = workItem
+
+        // Schedule after the threshold duration
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.stoppedThresholdSeconds, execute: workItem)
+    }
+
+    /// Record a position as a "stopped" position for undo history
+    private func recordStoppedPosition(_ index: Int) {
+        // Don't record invalid indices
+        guard index >= 0 && index < frames.count else { return }
+
+        let frame = frames[index].frame
+        let frameID = frame.id
+        let timestamp = frame.timestamp
+
+        // Don't record if it's the same as the last recorded frame
+        guard frameID != lastRecordedStoppedFrameID else { return }
+
+        // Add to history
+        stoppedPositionHistory.append(StoppedPosition(frameID: frameID, timestamp: timestamp))
+        lastRecordedStoppedFrameID = frameID
+
+        // Trim history if it exceeds max size
+        if stoppedPositionHistory.count > Self.maxStoppedPositionHistory {
+            stoppedPositionHistory.removeFirst(stoppedPositionHistory.count - Self.maxStoppedPositionHistory)
+        }
+
+        Log.debug("[PlayheadUndo] Recorded stopped position: frameID=\(frameID.stringValue), timestamp=\(timestamp), history size=\(stoppedPositionHistory.count)", category: .ui)
+    }
+
+    /// Undo to the last stopped playhead position (Cmd+Z)
+    /// Returns true if there was a position to undo to, false otherwise
+    @discardableResult
+    public func undoToLastStoppedPosition() -> Bool {
+        // Need at least 2 positions: current (most recent) and one to go back to
+        guard stoppedPositionHistory.count >= 2 else {
+            Log.debug("[PlayheadUndo] No position to undo to (history size: \(stoppedPositionHistory.count))", category: .ui)
+            return false
+        }
+
+        // Remove the current position (most recent)
+        stoppedPositionHistory.removeLast()
+
+        // Get the previous position
+        guard let previousPosition = stoppedPositionHistory.last else {
+            return false
+        }
+
+        // Update lastRecordedStoppedFrameID to prevent re-recording the same position
+        lastRecordedStoppedFrameID = previousPosition.frameID
+
+        // Cancel any pending stopped position recording
+        playheadStoppedDetectionWorkItem?.cancel()
+
+        // Fast path: check if frame exists in current frames array
+        if let index = frames.firstIndex(where: { $0.frame.id == previousPosition.frameID }) {
+            Log.debug("[PlayheadUndo] Fast path: found frame in current array at index \(index)", category: .ui)
+            if index != currentIndex {
+                currentIndex = index
+                loadImageIfNeeded()
+                checkAndLoadMoreFrames()
+            }
+            return true
+        }
+
+        // Slow path: frame not in current array, need to reload frames around the timestamp
+        Log.debug("[PlayheadUndo] Slow path: frame not in current array, reloading around timestamp \(previousPosition.timestamp)", category: .ui)
+
+        Task { @MainActor in
+            await navigateToUndoPosition(previousPosition)
+        }
+
+        return true
+    }
+
+    /// Navigate to an undo position by reloading frames around the timestamp
+    /// Similar to navigateToSearchResult but without search highlighting
+    @MainActor
+    private func navigateToUndoPosition(_ position: StoppedPosition) async {
+        // Exit live mode - we're navigating to a historical frame
+        if isInLiveMode {
+            exitLiveMode()
+        }
+
+        do {
+            isLoading = true
+
+            // Calculate ±10 minute window around target timestamp
+            let calendar = Calendar.current
+            let startDate = calendar.date(byAdding: .minute, value: -10, to: position.timestamp) ?? position.timestamp
+            let endDate = calendar.date(byAdding: .minute, value: 10, to: position.timestamp) ?? position.timestamp
+
+            Log.debug("[PlayheadUndo] Loading frames from \(startDate) to \(endDate)", category: .ui)
+
+            // Fetch frames in the window with current filters applied
+            let framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(from: startDate, to: endDate, limit: 1000, filters: filterCriteria)
+
+            guard !framesWithVideoInfo.isEmpty else {
+                Log.warning("[PlayheadUndo] No frames found in time range", category: .ui)
+                isLoading = false
+                return
+            }
+
+            // Clear old image cache
+            imageCache.removeAll()
+
+            // Convert to TimelineFrame
+            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+
+            // Replace current frames
+            frames = timelineFrames
+
+            // Update window boundaries
+            if let firstFrame = frames.first, let lastFrame = frames.last {
+                oldestLoadedTimestamp = firstFrame.frame.timestamp
+                newestLoadedTimestamp = lastFrame.frame.timestamp
+            }
+
+            // Find and navigate to the target frame by ID
+            if let index = frames.firstIndex(where: { $0.frame.id == position.frameID }) {
+                currentIndex = index
+            } else {
+                // Fallback: find closest frame by timestamp if ID not found (edge case: frame deleted)
+                let closest = frames.enumerated().min(by: {
+                    abs($0.element.frame.timestamp.timeIntervalSince(position.timestamp)) <
+                    abs($1.element.frame.timestamp.timeIntervalSince(position.timestamp))
+                })
+                currentIndex = closest?.offset ?? 0
+                Log.warning("[PlayheadUndo] Frame ID not found, using closest by timestamp", category: .ui)
+            }
+
+            loadImageIfNeeded()
+            checkAndLoadMoreFrames()
+            isLoading = false
+
+            Log.info("[PlayheadUndo] Navigation complete, now at index \(currentIndex)", category: .ui)
+
+        } catch {
+            Log.error("[PlayheadUndo] Failed to navigate: \(error)", category: .ui)
+            isLoading = false
+        }
     }
 
     /// Navigate to a specific frame by ID and highlight the search query
     /// Used when selecting a search result
     public func navigateToSearchResult(frameID: FrameID, timestamp: Date, highlightQuery: String) async {
+        // Exit live mode immediately - we're navigating to a specific historical frame
+        if isInLiveMode {
+            exitLiveMode()
+        }
+
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current

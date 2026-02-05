@@ -56,45 +56,18 @@ struct AppInfoProvider: Sendable {
     // MARK: - Private Helpers
 
     /// Get the title of the focused window using Accessibility API
+    /// Uses safe wrappers to prevent crashes if permissions are revoked
     /// - Parameter pid: Process ID of the application
     /// - Returns: Window title if available
     private func getWindowTitle(for pid: pid_t) -> String? {
-        // Create app reference
-        let appRef = AXUIElementCreateApplication(pid)
-
-        // Get focused window
-        var windowValue: CFTypeRef?
-        let windowResult = AXUIElementCopyAttributeValue(
-            appRef,
-            kAXFocusedWindowAttribute as CFString,
-            &windowValue
-        )
-
-        guard windowResult == .success,
-              let window = windowValue else {
-            return nil
-        }
-
-        // Get window title
-        var titleValue: CFTypeRef?
-        let titleResult = AXUIElementCopyAttributeValue(
-            window as! AXUIElement,
-            kAXTitleAttribute as CFString,
-            &titleValue
-        )
-
-        guard titleResult == .success,
-              let title = titleValue as? String else {
-            return nil
-        }
-
-        return title
+        // Use safe wrapper that checks permissions first
+        return PermissionMonitor.shared.safeGetWindowTitle(for: pid)
     }
 
     /// Check if accessibility permissions are granted
+    /// Uses the central PermissionMonitor for consistent checking
     static func hasAccessibilityPermission() -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
-        return AXIsProcessTrustedWithOptions(options as CFDictionary)
+        return PermissionMonitor.shared.hasAccessibilityPermission()
     }
 
     /// Request accessibility permission (shows system dialog)
