@@ -110,6 +110,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Check if another instance is already running (skip if this is a relaunch)
         let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
         if isRelaunch {
+            Log.info("[AppDelegate] App relaunched successfully", category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
         } else if isAnotherInstanceRunning() {
             Log.info("[AppDelegate] Another instance already running, activating it", category: .app)

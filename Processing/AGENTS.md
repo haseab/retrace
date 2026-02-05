@@ -2,7 +2,7 @@
 
 You are responsible for the **Processing** module of Retrace. Your job is to implement text extraction from captured frames using Vision framework OCR and the Accessibility API.
 
-**v0.1 Status**: ✅ Vision OCR and Accessibility API fully implemented. **No audio transcription in v0.1** (planned for v0.2+).
+**v0.5 Status**: ✅ Vision OCR and Accessibility API fully implemented. **No audio transcription in v0.5** (planned for future release).
 
 ## Your Directory
 

@@ -64,6 +64,7 @@ public class TimelineWindowController: NSObject {
     private var coordinatorWrapper: AppCoordinatorWrapper?
     private var eventMonitor: Any?
     private var localEventMonitor: Any?
+    private var mouseEventMonitor: Any?  // Debug monitor for shift-drag investigation
     private var timelineViewModel: SimpleTimelineViewModel?
     private var hostingView: NSView?
     private var tapeShowAnimationTask: Task<Void, Never>?
@@ -1034,7 +1035,53 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Event Monitoring
 
+    /// Debug log to /tmp/retrace_debug.log for shift-drag investigation
+    private func debugLog(_ message: String) {
+        let timestamp = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: timestamp))] [WINDOW] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            let path = "/tmp/retrace_debug.log"
+            if FileManager.default.fileExists(atPath: path) {
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
+    }
+
     private func setupEventMonitors() {
+        debugLog("setupEventMonitors called - timeline launched")
+
+        // Debug monitor for mouse events to investigate shift-drag issue
+        mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .flagsChanged]) { [weak self] event in
+            guard let self = self else { return event }
+            let shiftHeld = event.modifierFlags.contains(.shift)
+            let location = event.locationInWindow
+            let firstResponder = self.window?.firstResponder
+            let firstResponderDesc = firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+
+            switch event.type {
+            case .flagsChanged:
+                self.debugLog("flagsChanged - shift: \(shiftHeld), firstResponder: \(firstResponderDesc)")
+            case .leftMouseDown:
+                self.debugLog("leftMouseDown - shift: \(shiftHeld), location: \(location), firstResponder: \(firstResponderDesc)")
+            case .leftMouseDragged:
+                // Only log first drag to avoid spam
+                break
+            case .leftMouseUp:
+                self.debugLog("leftMouseUp - shift: \(shiftHeld), location: \(location)")
+            default:
+                break
+            }
+            return event
+        }
+
         // Monitor for all key events globally (when timeline is visible but not key window)
         eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
@@ -1181,6 +1228,10 @@ public class TimelineWindowController: NSObject {
         if let monitor = localEventMonitor {
             NSEvent.removeMonitor(monitor)
             localEventMonitor = nil
+        }
+        if let monitor = mouseEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseEventMonitor = nil
         }
     }
 

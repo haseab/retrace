@@ -1087,7 +1087,8 @@ struct FrameWithURLOverlay<Content: View>: View {
         GeometryReader { geometry in
             let showFinal = viewModel.isZoomRegionActive && viewModel.zoomRegion != nil
             let showTransition = viewModel.isZoomTransitioning && viewModel.zoomRegion != nil
-            let showNormal = !viewModel.isZoomRegionActive && !viewModel.isZoomTransitioning
+            let showExitTransition = viewModel.isZoomExitTransitioning && viewModel.zoomRegion != nil
+            let showNormal = !viewModel.isZoomRegionActive && !viewModel.isZoomTransitioning && !viewModel.isZoomExitTransitioning
 
             // Calculate actual frame rect for coordinate transformations
             let actualFrameRect = calculateActualDisplayedFrameRect(
@@ -1103,15 +1104,16 @@ struct FrameWithURLOverlay<Content: View>: View {
                     .scaleEffect(viewModel.frameZoomScale)
                     .offset(viewModel.frameZoomOffset)
 
-                // Unified zoom overlay - handles BOTH transition AND final state
+                // Unified zoom overlay - handles transition, final state, AND exit animation
                 // Uses the same view instance throughout to avoid VideoView reload flicker
-                if (showFinal || showTransition), let region = viewModel.zoomRegion {
+                if (showFinal || showTransition || showExitTransition), let region = viewModel.zoomRegion {
                     ZoomUnifiedOverlay(
                         viewModel: viewModel,
                         zoomRegion: region,
                         containerSize: geometry.size,
                         actualFrameRect: actualFrameRect,
-                        isTransitioning: showTransition
+                        isTransitioning: showTransition,
+                        isExitTransitioning: showExitTransition
                     ) {
                         content()
                     }
@@ -1137,46 +1139,45 @@ struct FrameWithURLOverlay<Content: View>: View {
                     }
 
                     // Text selection overlay (for drag selection and zoom region creation)
-                    if !viewModel.ocrNodes.isEmpty {
-                        TextSelectionOverlay(
-                            viewModel: viewModel,
-                            containerSize: geometry.size,
-                            actualFrameRect: actualFrameRect,
-                            onDragStart: { point in
-                                viewModel.startDragSelection(at: point)
-                            },
-                            onDragUpdate: { point in
-                                viewModel.updateDragSelection(to: point)
-                                // Show hint banner when user drags through the screen
-                                viewModel.showTextSelectionHintBannerOnce()
-                            },
-                            onDragEnd: {
-                                viewModel.endDragSelection()
-                                viewModel.resetTextSelectionHintState()
-                            },
-                            onClearSelection: {
-                                viewModel.clearTextSelection()
-                            },
-                            onZoomRegionStart: { point in
-                                viewModel.startZoomRegion(at: point)
-                            },
-                            onZoomRegionUpdate: { point in
-                                viewModel.updateZoomRegion(to: point)
-                            },
-                            onZoomRegionEnd: {
-                                viewModel.endZoomRegion()
-                            },
-                            onDoubleClick: { point in
-                                viewModel.selectWordAt(point: point)
-                            },
-                            onTripleClick: { point in
-                                viewModel.selectNodeAt(point: point)
-                            }
-                        )
-                        // Apply the same zoom transformations as the frame content
-                        .scaleEffect(viewModel.frameZoomScale)
-                        .offset(viewModel.frameZoomOffset)
-                    }
+                    // Always render to allow shift-drag zoom region even when OCR nodes are empty (e.g., during/after scrolling)
+                    TextSelectionOverlay(
+                        viewModel: viewModel,
+                        containerSize: geometry.size,
+                        actualFrameRect: actualFrameRect,
+                        onDragStart: { point in
+                            viewModel.startDragSelection(at: point)
+                        },
+                        onDragUpdate: { point in
+                            viewModel.updateDragSelection(to: point)
+                            // Show hint banner when user drags through the screen
+                            viewModel.showTextSelectionHintBannerOnce()
+                        },
+                        onDragEnd: {
+                            viewModel.endDragSelection()
+                            viewModel.resetTextSelectionHintState()
+                        },
+                        onClearSelection: {
+                            viewModel.clearTextSelection()
+                        },
+                        onZoomRegionStart: { point in
+                            viewModel.startZoomRegion(at: point)
+                        },
+                        onZoomRegionUpdate: { point in
+                            viewModel.updateZoomRegion(to: point)
+                        },
+                        onZoomRegionEnd: {
+                            viewModel.endZoomRegion()
+                        },
+                        onDoubleClick: { point in
+                            viewModel.selectWordAt(point: point)
+                        },
+                        onTripleClick: { point in
+                            viewModel.selectNodeAt(point: point)
+                        }
+                    )
+                    // Apply the same zoom transformations as the frame content
+                    .scaleEffect(viewModel.frameZoomScale)
+                    .offset(viewModel.frameZoomOffset)
 
                     // URL bounding box overlay (if URL detected)
                     if let box = viewModel.urlBoundingBox {
@@ -1398,6 +1399,43 @@ struct ZoomTransitionOverlay<Content: View>: View {
 
 // MARK: - Zoom Unified Overlay
 
+/// Shape that fills the entire available rect, with a rounded-rect "cutout" using even-odd fill.
+/// This avoids reliance on `.reverseMask` (destinationOut) which can produce one-frame flashes
+/// during fast state swaps and also ensures the cutout is animatable.
+struct InverseRoundedRectCutout: Shape {
+    var cutoutRect: CGRect
+    var cornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<
+        AnimatablePair<CGFloat, CGFloat>,
+        AnimatablePair<AnimatablePair<CGFloat, CGFloat>, CGFloat>
+    > {
+        get {
+            .init(
+                .init(cutoutRect.origin.x, cutoutRect.origin.y),
+                .init(.init(cutoutRect.size.width, cutoutRect.size.height), cornerRadius)
+            )
+        }
+        set {
+            cutoutRect.origin.x = newValue.first.first
+            cutoutRect.origin.y = newValue.first.second
+            cutoutRect.size.width = newValue.second.first.first
+            cutoutRect.size.height = newValue.second.first.second
+            cornerRadius = newValue.second.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.addRect(rect)
+        path.addRoundedRect(
+            in: cutoutRect,
+            cornerSize: CGSize(width: cornerRadius, height: cornerRadius)
+        )
+        return path
+    }
+}
+
 /// Unified overlay that handles BOTH the transition animation AND the final zoom state
 /// Uses a single view instance throughout to avoid VideoView reload flicker during handoff
 /// When isTransitioning=true, animates based on progress; when false, shows final state with text selection
@@ -1407,12 +1445,73 @@ struct ZoomUnifiedOverlay<Content: View>: View {
     let containerSize: CGSize
     let actualFrameRect: CGRect
     let isTransitioning: Bool
+    let isExitTransitioning: Bool
     let content: () -> Content
 
+    // Local state for animation - this allows SwiftUI to interpolate
+    @State private var animationProgress: CGFloat = 0
+    // Freeze a snapshot for the zoom overlay so we don't instantiate a second AVPlayer-backed view.
+    @State private var frozenZoomSnapshot: NSImage?
+
+    private func debugLog(_ message: String) {
+        let timestamp = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: timestamp))] [ZOOM_OVERLAY] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            let path = "/tmp/retrace_debug.log"
+            if FileManager.default.fileExists(atPath: path) {
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
+    }
+
+    @MainActor
+    private func startLocalTransitionAnimation() {
+        animationProgress = 0
+        // Kick to next run loop so the 0 state is committed before we animate to 1.
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                animationProgress = 1.0
+            }
+        }
+    }
+
+    @MainActor
+    private func startExitAnimation() {
+        // Animate from 1 back to 0
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            animationProgress = 0.0
+        }
+    }
+
+    @ViewBuilder
+    private func zoomedContentView() -> some View {
+        if let snapshot = frozenZoomSnapshot {
+            Image(nsImage: snapshot)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            content()
+        }
+    }
+
     var body: some View {
-        // Use progress for animation, or 1.0 for final state
-        let progress = isTransitioning ? viewModel.zoomTransitionProgress : 1.0
-        let blurOpacity = isTransitioning ? viewModel.zoomTransitionBlurOpacity : 1.0
+        // Use local animationProgress for smooth interpolation
+        // For exit transition, we animate from 1 to 0
+        // For enter transition, we animate from 0 to 1
+        // For final state, progress is 1.0
+        let progress: CGFloat = (isTransitioning || isExitTransitioning) ? animationProgress : 1.0
+
+        let _ = {
+            debugLog("render - isTransitioning: \(isTransitioning), isExitTransitioning: \(isExitTransitioning), progress: \(String(format: "%.3f", progress)), animationProgress: \(String(format: "%.3f", animationProgress))")
+        }()
 
         // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
         // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
@@ -1428,85 +1527,367 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             height: zoomRegion.height * actualFrameRect.height
         )
 
-        // Calculate end position (centered enlarged rectangle)
-        let maxWidth = containerSize.width * 0.75
+        // Calculate end position (offset left to make room for action menu on right)
+        let menuWidth: CGFloat = 180
+        let menuGap: CGFloat = 30  // Gap between zoomed region and menu
+        let maxWidth = containerSize.width * 0.70  // More space for the zoomed image
         let maxHeight = containerSize.height * 0.75
         let regionWidth = zoomRegion.width * actualFrameRect.width
         let regionHeight = zoomRegion.height * actualFrameRect.height
         let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
         let enlargedWidth = regionWidth * scaleToFit
         let enlargedHeight = regionHeight * scaleToFit
+
+        // Offset to the left: center of (available space minus menu area)
+        let availableWidth = containerSize.width - menuWidth - menuGap
         let endRect = CGRect(
-            x: (containerSize.width - enlargedWidth) / 2,
+            x: (availableWidth - enlargedWidth) / 2,
             y: (containerSize.height - enlargedHeight) / 2,
             width: enlargedWidth,
             height: enlargedHeight
         )
 
-        // Interpolate between start and end (or use end values directly if not transitioning)
-        let currentRect = CGRect(
+        // Menu position (to the right of the zoomed region)
+        let menuX = endRect.maxX + menuGap
+        let menuY = endRect.midY
+
+        // Interpolate all values based on progress (0 = start, 1 = end)
+        // This ensures smooth animation without discrete jumps
+        let targetRect = CGRect(
             x: lerp(startRect.origin.x, endRect.origin.x, progress),
             y: lerp(startRect.origin.y, endRect.origin.y, progress),
             width: lerp(startRect.width, endRect.width, progress),
             height: lerp(startRect.height, endRect.height, progress)
         )
-
-        // Current scale factor (1.0 at start, scaleToFit at end)
-        let currentScale = lerp(1.0, scaleToFit, progress)
+        let targetScale = lerp(1.0, scaleToFit, progress)
+        let targetBlur = progress  // 0 to 1 directly
 
         // Center of zoom region in original content (screen coords)
         // Y is already in top-down space, so no flip needed
         let zoomCenterX = actualFrameRect.origin.x + (zoomRegion.origin.x + zoomRegion.width / 2) * actualFrameRect.width
         let zoomCenterY = actualFrameRect.origin.y + (zoomRegion.origin.y + zoomRegion.height / 2) * actualFrameRect.height
 
-        ZStack {
-            // Blur overlay that fades in
-            if blurOpacity > 0 {
-                ZoomBackgroundOverlay()
-                    .opacity(blurOpacity)
-            }
+        // Calculate final offset to position the zoom region center at the endRect center
+        // After scaling, the zoom region center moves. We need to offset so it lands at endRect.midX/Y
+        // The content is centered at containerSize/2 before offset
+        // After scaleEffect, the zoomCenter is at: containerSize/2 + (zoomCenterX - containerSize.width/2) * scaleToFit
+        // We want it at endRect.midX, so offset = endRect.midX - (containerSize.width/2 + (zoomCenterX - containerSize.width/2) * scaleToFit)
+        let scaledZoomCenterX = containerSize.width / 2 + (zoomCenterX - containerSize.width / 2) * scaleToFit
+        let scaledZoomCenterY = containerSize.height / 2 + (zoomCenterY - containerSize.height / 2) * scaleToFit
+        let finalOffsetX = endRect.midX - scaledZoomCenterX
+        let finalOffsetY = endRect.midY - scaledZoomCenterY
+        let targetOffsetX = lerp(0.0, finalOffsetX, progress)
+        let targetOffsetY = lerp(0.0, finalOffsetY, progress)
 
-            // Darkened area outside the rectangle (darken fades in with blur)
-            Color.black.opacity(0.6 * blurOpacity)
-                .reverseMask {
-                    Rectangle()
-                        .frame(width: currentRect.width, height: currentRect.height)
-                        .position(x: currentRect.midX, y: currentRect.midY)
-                }
+        // Content and border animate together from start position
+        // Dimming stays constant throughout - no fade, just like during drag
+        ZStack {
+            // Light blur on the background - fades in as image centers
+            Rectangle()
+                .fill(.regularMaterial)
+                .opacity(progress * 0.3)
+
+            // Darken outside the rectangle - constant opacity to match drag preview
+            InverseRoundedRectCutout(
+                cutoutRect: targetRect,
+                cornerRadius: 12
+            )
+            .fill(Color.black.opacity(0.6), style: FillStyle(eoFill: true))
 
             // The zoomed content that animates from original position to center
-            content()
+            zoomedContentView()
                 .frame(width: containerSize.width, height: containerSize.height)
-                .scaleEffect(currentScale, anchor: .center)
-                .offset(
-                    x: lerp(0, (containerSize.width / 2 - zoomCenterX) * scaleToFit, progress),
-                    y: lerp(0, (containerSize.height / 2 - zoomCenterY) * scaleToFit, progress)
-                )
-                .frame(width: currentRect.width, height: currentRect.height)
-                .clipped()
-                .position(x: currentRect.midX, y: currentRect.midY)
+                .scaleEffect(targetScale, anchor: .center)
+                .offset(x: targetOffsetX, y: targetOffsetY)
+                .compositingGroup()
+                .mask {
+                    RoundedRectangle(cornerRadius: 12)
+                        .frame(width: targetRect.width, height: targetRect.height)
+                        .position(x: targetRect.midX, y: targetRect.midY)
+                }
 
             // White border around the rectangle
-            RoundedRectangle(cornerRadius: lerp(0, 8, progress))
+            RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
-                .frame(width: currentRect.width, height: currentRect.height)
-                .position(x: currentRect.midX, y: currentRect.midY)
+                .frame(width: targetRect.width, height: targetRect.height)
+                .position(x: targetRect.midX, y: targetRect.midY)
 
             // Text selection overlay - only show when NOT transitioning (final state)
-            if !isTransitioning && !viewModel.ocrNodes.isEmpty {
+            if !isTransitioning && !isExitTransitioning && !viewModel.ocrNodes.isEmpty {
                 ZoomedTextSelectionOverlay(
                     viewModel: viewModel,
                     zoomRegion: zoomRegion,
-                    containerSize: containerSize
+                    containerSize: containerSize,
+                    zoomedRect: endRect
                 )
             }
+
+            // Action menu on the right side - animate in with the zoom
+            ZoomActionMenu(
+                viewModel: viewModel,
+                zoomRegion: zoomRegion
+            )
+            .frame(width: menuWidth)
+            .position(x: menuX + menuWidth / 2, y: menuY)
+            .opacity(progress)
+            .offset(x: lerp(30, 0, progress))  // Slide in from right
         }
-        .allowsHitTesting(!isTransitioning) // Only allow interaction in final state
+        .allowsHitTesting(!isTransitioning && !isExitTransitioning)
+        // Animate all interpolated values together
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: animationProgress)
+        .onAppear {
+            if frozenZoomSnapshot == nil {
+                frozenZoomSnapshot = viewModel.currentImage
+            }
+
+            // Start at 0 when appearing during enter transition
+            if isTransitioning {
+                startLocalTransitionAnimation()
+            } else if isExitTransitioning {
+                // Start at 1 when appearing during exit (shouldn't normally happen)
+                animationProgress = 1.0
+                startExitAnimation()
+            } else {
+                animationProgress = 1.0
+            }
+        }
+        .onChange(of: isTransitioning) { newValue in
+            if newValue {
+                frozenZoomSnapshot = viewModel.currentImage
+                startLocalTransitionAnimation()
+            }
+        }
+        .onChange(of: isExitTransitioning) { newValue in
+            if newValue {
+                debugLog("isExitTransitioning changed to true - starting exit animation")
+                startExitAnimation()
+            }
+        }
+        .onChange(of: viewModel.currentImage) { newValue in
+            // If we didn't have a snapshot at transition start (e.g. image still loading),
+            // freeze it as soon as it's available to avoid instantiating a second AVPlayer view.
+            if isTransitioning, frozenZoomSnapshot == nil, let image = newValue {
+                frozenZoomSnapshot = image
+            }
+        }
     }
 
     /// Linear interpolation helper
     private func lerp(_ a: CGFloat, _ b: CGFloat, _ t: CGFloat) -> CGFloat {
         a + (b - a) * t
+    }
+}
+
+// MARK: - Zoom Action Menu
+
+/// Action menu that appears on the right side of the zoomed region
+struct ZoomActionMenu: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            // Share
+            ZoomActionMenuRow(title: "Share", icon: "square.and.arrow.up") {
+                shareZoomedImage()
+            }
+
+            // Copy Image
+            ZoomActionMenuRow(title: "Copy Image", icon: "doc.on.doc") {
+                copyZoomedImageToClipboard()
+            }
+
+            // Copy Text (only if text is selected or OCR nodes exist in region)
+            if hasTextInZoomRegion {
+                ZoomActionMenuRow(title: "Copy Text", icon: "doc.on.clipboard") {
+                    copyTextFromZoomRegion()
+                }
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.vertical, 4)
+
+            // Save Image
+            ZoomActionMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+                saveZoomedImage()
+            }
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
+        .background(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+                .fill(RetraceMenuStyle.backgroundColor)
+                .shadow(
+                    color: RetraceMenuStyle.shadowColor,
+                    radius: RetraceMenuStyle.shadowRadius,
+                    y: RetraceMenuStyle.shadowY
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+                .stroke(Color.white.opacity(0.9), lineWidth: 2)
+        )
+    }
+
+    private var hasTextInZoomRegion: Bool {
+        // Check if there are any OCR nodes within the zoom region
+        !viewModel.ocrNodes.isEmpty && viewModel.ocrNodes.contains { node in
+            let nodeRight = node.x + node.width
+            let nodeBottom = node.y + node.height
+            let regionRight = zoomRegion.origin.x + zoomRegion.width
+            let regionBottom = zoomRegion.origin.y + zoomRegion.height
+
+            return nodeRight > zoomRegion.origin.x &&
+                   node.x < regionRight &&
+                   nodeBottom > zoomRegion.origin.y &&
+                   node.y < regionBottom
+        }
+    }
+
+    private func shareZoomedImage() {
+        getZoomedImage { image in
+            guard let image = image else { return }
+
+            let picker = NSSharingServicePicker(items: [image])
+            if let window = NSApp.keyWindow,
+               let contentView = window.contentView {
+                // Show share picker near the menu
+                picker.show(relativeTo: contentView.bounds, of: contentView, preferredEdge: .maxX)
+            }
+        }
+    }
+
+    private func copyZoomedImageToClipboard() {
+        getZoomedImage { image in
+            guard let image = image else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
+        }
+        viewModel.exitZoomRegion()
+    }
+
+    private func copyTextFromZoomRegion() {
+        // Get text from OCR nodes within the zoom region
+        let textInRegion = viewModel.ocrNodes
+            .filter { node in
+                let nodeRight = node.x + node.width
+                let nodeBottom = node.y + node.height
+                let regionRight = zoomRegion.origin.x + zoomRegion.width
+                let regionBottom = zoomRegion.origin.y + zoomRegion.height
+
+                return nodeRight > zoomRegion.origin.x &&
+                       node.x < regionRight &&
+                       nodeBottom > zoomRegion.origin.y &&
+                       node.y < regionBottom
+            }
+            .sorted { ($0.y, $0.x) < ($1.y, $1.x) }  // Sort top-to-bottom, left-to-right
+            .map { $0.text }
+            .joined(separator: " ")
+
+        if !textInRegion.isEmpty {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(textInRegion, forType: .string)
+        }
+        viewModel.exitZoomRegion()
+    }
+
+    private func saveZoomedImage() {
+        getZoomedImage { image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            savePanel.nameFieldStringValue = "retrace-zoom-\(formattedTimestamp()).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
+                    }
+                }
+            }
+        }
+    }
+
+    private func getZoomedImage(completion: @escaping (NSImage?) -> Void) {
+        guard let fullImage = viewModel.currentImage else {
+            completion(nil)
+            return
+        }
+
+        // Crop the full image to the zoom region
+        let imageSize = fullImage.size
+        let cropRect = CGRect(
+            x: zoomRegion.origin.x * imageSize.width,
+            y: (1 - zoomRegion.origin.y - zoomRegion.height) * imageSize.height,  // Flip Y
+            width: zoomRegion.width * imageSize.width,
+            height: zoomRegion.height * imageSize.height
+        )
+
+        guard let cgImage = fullImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            completion(nil)
+            return
+        }
+
+        guard let croppedCGImage = cgImage.cropping(to: cropRect) else {
+            completion(nil)
+            return
+        }
+
+        let croppedImage = NSImage(cgImage: croppedCGImage, size: NSSize(width: cropRect.width, height: cropRect.height))
+        completion(croppedImage)
+    }
+
+    private func formattedTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.string(from: viewModel.currentTimestamp ?? Date())
+    }
+}
+
+/// Styled menu row for zoom action menu
+struct ZoomActionMenuRow: View {
+    let title: String
+    let icon: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: RetraceMenuStyle.iconTextSpacing) {
+                Image(systemName: icon)
+                    .font(.system(size: RetraceMenuStyle.iconSize, weight: RetraceMenuStyle.fontWeight))
+                    .foregroundColor(isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                    .frame(width: RetraceMenuStyle.iconFrameWidth)
+
+                Text(title)
+                    .font(RetraceMenuStyle.font)
+                    .foregroundColor(isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+
+                Spacer()
+            }
+            .padding(.horizontal, RetraceMenuStyle.itemPaddingH)
+            .padding(.vertical, RetraceMenuStyle.itemPaddingV)
+            .background(
+                RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
+                    .fill(isHovering ? RetraceMenuStyle.itemHoverColor : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: RetraceMenuStyle.hoverAnimationDuration)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
     }
 }
 
@@ -1532,27 +1913,12 @@ struct PureBlurView: NSViewRepresentable {
 // MARK: - Zoom Background Overlay
 
 /// Darkened and blurred overlay for the background when zoom is active
-struct ZoomBackgroundOverlay: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let blurView = NSVisualEffectView()
-        blurView.blendingMode = .behindWindow
-        blurView.material = .hudWindow
-        blurView.state = .active
-        blurView.wantsLayer = true
-
-        // Add dark tint on top of blur
-        let darkLayer = CALayer()
-        darkLayer.backgroundColor = NSColor.black.withAlphaComponent(0.5).cgColor
-        blurView.layer?.addSublayer(darkLayer)
-
-        return blurView
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
-        // Update dark layer frame
-        if let darkLayer = nsView.layer?.sublayers?.first {
-            darkLayer.frame = nsView.bounds
-        }
+struct ZoomBackgroundOverlay: View {
+    var body: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .overlay(Color.black.opacity(0.45))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -1621,7 +1987,8 @@ struct ZoomFinalStateOverlay<Content: View>: View {
                 ZoomedTextSelectionOverlay(
                     viewModel: viewModel,
                     zoomRegion: zoomRegion,
-                    containerSize: containerSize
+                    containerSize: containerSize,
+                    zoomedRect: finalRect
                 )
             }
         }
@@ -1684,26 +2051,17 @@ struct ZoomedTextSelectionOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let zoomRegion: CGRect
     let containerSize: CGSize
+    let zoomedRect: CGRect  // The actual position and size of the zoomed region
 
     var body: some View {
-        // Calculate the same dimensions as ZoomedRegionView
-        let maxWidth = containerSize.width * 0.75
-        let maxHeight = containerSize.height * 0.75
-
-        let regionWidth = zoomRegion.width * containerSize.width
-        let regionHeight = zoomRegion.height * containerSize.height
-
-        let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
-        let enlargedWidth = regionWidth * scaleToFit
-        let enlargedHeight = regionHeight * scaleToFit
-
         ZoomedTextSelectionNSView(
             viewModel: viewModel,
             zoomRegion: zoomRegion,
-            enlargedSize: CGSize(width: enlargedWidth, height: enlargedHeight),
+            enlargedSize: CGSize(width: zoomedRect.width, height: zoomedRect.height),
             containerSize: containerSize
         )
-        .frame(width: enlargedWidth, height: enlargedHeight)
+        .frame(width: zoomedRect.width, height: zoomedRect.height)
+        .position(x: zoomedRect.midX, y: zoomedRect.midY)
     }
 }
 
@@ -1998,7 +2356,35 @@ struct ZoomRegionDragPreview: View {
     let containerSize: CGSize
     let actualFrameRect: CGRect
 
+    private static var renderCount = 0
+
+    private func debugLog(_ message: String) {
+        let timestamp = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: timestamp))] [DRAG_PREVIEW] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            let path = "/tmp/retrace_debug.log"
+            if FileManager.default.fileExists(atPath: path) {
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
+    }
+
     var body: some View {
+        let _ = {
+            Self.renderCount += 1
+            if Self.renderCount % 10 == 1 {
+                debugLog("body render #\(Self.renderCount) - start: \(start), end: \(end)")
+            }
+        }()
+
         let minX = min(start.x, end.x)
         let maxX = max(start.x, end.x)
         let minY = min(start.y, end.y)
@@ -2018,13 +2404,13 @@ struct ZoomRegionDragPreview: View {
             // Darken outside the selection
             Color.black.opacity(0.6)
                 .reverseMask {
-                    Rectangle()
+                    RoundedRectangle(cornerRadius: 12)
                         .frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: rect.midY)
                 }
 
             // White border around selection
-            Rectangle()
+            RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.9), lineWidth: 2)
                 .frame(width: rect.width, height: rect.height)
                 .position(x: rect.midX, y: rect.midY)
@@ -2271,6 +2657,23 @@ class TextSelectionView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        debugLog("acceptsFirstMouse called - returning true")
+        return true
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        debugLog("viewDidMoveToWindow - window: \(window != nil), isKeyWindow: \(window?.isKeyWindow ?? false)")
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let result = super.hitTest(point)
+        let isHit = result === self
+        debugLog("hitTest at \(point) - bounds: \(bounds), isHit: \(isHit), result: \(result.map { String(describing: type(of: $0)) } ?? "nil")")
+        return result
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
 
@@ -2323,16 +2726,37 @@ class TextSelectionView: NSView {
         }
     }
 
+    private func debugLog(_ message: String) {
+        let timestamp = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: timestamp))] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: "/tmp/retrace_debug.log") {
+                if let handle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: data)
+            }
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
+        debugLog("mouseDown called - isFirstResponder: \(window?.firstResponder === self), window: \(window != nil), shift: \(event.modifierFlags.contains(.shift))")
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
+        dragLogCount = 0  // Reset drag counter
 
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
 
         // Check if Shift is held - start zoom region mode
         if event.modifierFlags.contains(.shift) {
+            debugLog("Shift+click detected, starting zoom region at \(normalizedPoint)")
             isZoomDragging = true
             isDragging = false
             onZoomRegionStart?(normalizedPoint)
@@ -2356,6 +2780,8 @@ class TextSelectionView: NSView {
         needsDisplay = true
     }
 
+    private var dragLogCount = 0
+
     override func mouseDragged(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
 
@@ -2373,6 +2799,11 @@ class TextSelectionView: NSView {
         let normalizedPoint = screenToNormalizedCoords(CGPoint(x: clampedX, y: clampedY))
 
         if isZoomDragging {
+            dragLogCount += 1
+            // Log every 10th drag event to avoid spam
+            if dragLogCount % 10 == 1 {
+                debugLog("mouseDragged #\(dragLogCount) - location: \(location), normalized: \(normalizedPoint)")
+            }
             onZoomRegionUpdate?(normalizedPoint)
         } else if isDragging {
             onDragUpdate?(normalizedPoint)
@@ -2381,9 +2812,11 @@ class TextSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        debugLog("mouseUp - isZoomDragging: \(isZoomDragging), hasMoved: \(hasMoved)")
         if isZoomDragging {
             isZoomDragging = false
             if hasMoved {
+                debugLog("Ending zoom region")
                 onZoomRegionEnd?()
             }
         } else if isDragging {
@@ -3843,32 +4276,40 @@ struct FilterPanel: View {
                     CompactAppsFilterDropdown(
                         label: "APPS",
                         selectedApps: viewModel.pendingFilterCriteria.selectedApps,
-                        isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude
-                    ) { frame in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .apps {
-                                viewModel.dismissFilterDropdown()
-                            } else {
-                                viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+                        isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
+                        onTap: { frame in
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                if viewModel.activeFilterDropdown == .apps {
+                                    viewModel.dismissFilterDropdown()
+                                } else {
+                                    viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+                                }
                             }
+                        },
+                        onFrameAvailable: { frame in
+                            viewModel.filterAnchorFrames[.apps] = frame
                         }
-                    }
+                    )
 
                     // Visibility
                     CompactFilterDropdown(
                         label: "VISIBILITY",
                         value: hiddenFilterLabel,
                         icon: "eye",
-                        isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide
-                    ) { frame in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .visibility {
-                                viewModel.dismissFilterDropdown()
-                            } else {
-                                viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                        isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
+                        onTap: { frame in
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                if viewModel.activeFilterDropdown == .visibility {
+                                    viewModel.dismissFilterDropdown()
+                                } else {
+                                    viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                                }
                             }
+                        },
+                        onFrameAvailable: { frame in
+                            viewModel.filterAnchorFrames[.visibility] = frame
                         }
-                    }
+                    )
                 }
                 .frame(maxWidth: .infinity)
 
@@ -3879,32 +4320,40 @@ struct FilterPanel: View {
                         label: "TAGS",
                         value: tagsLabel,
                         icon: "tag",
-                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty
-                    ) { frame in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .tags {
-                                viewModel.dismissFilterDropdown()
-                            } else {
-                                viewModel.showFilterDropdown(.tags, anchorFrame: frame)
+                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
+                        onTap: { frame in
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                if viewModel.activeFilterDropdown == .tags {
+                                    viewModel.dismissFilterDropdown()
+                                } else {
+                                    viewModel.showFilterDropdown(.tags, anchorFrame: frame)
+                                }
                             }
+                        },
+                        onFrameAvailable: { frame in
+                            viewModel.filterAnchorFrames[.tags] = frame
                         }
-                    }
+                    )
 
                     // Date Range
                     CompactFilterDropdown(
                         label: "DATE",
                         value: dateRangeLabel,
                         icon: "calendar",
-                        isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil
-                    ) { frame in
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .dateRange {
-                                viewModel.dismissFilterDropdown()
-                            } else {
-                                viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
+                        isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
+                        onTap: { frame in
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                if viewModel.activeFilterDropdown == .dateRange {
+                                    viewModel.dismissFilterDropdown()
+                                } else {
+                                    viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
+                                }
                             }
+                        },
+                        onFrameAvailable: { frame in
+                            viewModel.filterAnchorFrames[.dateRange] = frame
                         }
-                    }
+                    )
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -4011,20 +4460,40 @@ struct FilterPanel: View {
                 // Only handle Tab key (keycode 48)
                 guard event.keyCode == 48 else { return event }
 
-                // Only handle if a dropdown is currently open
-                guard viewModel.activeFilterDropdown != .none else { return event }
+                // Check if Shift is held for reverse direction
+                let isShiftHeld = event.modifierFlags.contains(.shift)
 
-                // Find current index in filter order
-                let currentDropdown = viewModel.activeFilterDropdown
-                guard let currentIndex = filterOrder.firstIndex(of: currentDropdown) else { return event }
+                // Determine current and next dropdown
+                let nextDropdown: SimpleTimelineViewModel.FilterDropdownType
+                let nextIndex: Int
 
-                // Calculate next index (cycle back to first)
-                let nextIndex = (currentIndex + 1) % filterOrder.count
-                let nextDropdown = filterOrder[nextIndex]
+                if viewModel.activeFilterDropdown == .none {
+                    // No dropdown open - start with first (Tab) or last (Shift+Tab)
+                    nextIndex = isShiftHeld ? filterOrder.count - 1 : 0
+                    nextDropdown = filterOrder[nextIndex]
+                } else {
+                    // Find current index and cycle forward or backward
+                    let currentDropdown = viewModel.activeFilterDropdown
+                    guard let currentIndex = filterOrder.firstIndex(of: currentDropdown) else { return event }
+                    if isShiftHeld {
+                        // Shift+Tab: go backward (wrap to end if at start)
+                        nextIndex = (currentIndex - 1 + filterOrder.count) % filterOrder.count
+                    } else {
+                        // Tab: go forward (wrap to start if at end)
+                        nextIndex = (currentIndex + 1) % filterOrder.count
+                    }
+                    nextDropdown = filterOrder[nextIndex]
+                }
 
-                // Open the next dropdown
+                // Get the anchor frame for the next dropdown (use stored frame if available)
+                // If no frame is stored, the dropdown won't position correctly, but will still open
+                let nextAnchorFrame = viewModel.filterAnchorFrames[nextDropdown] ?? .zero
+
+                print("[FilterPanel] Tab cycling to \(nextDropdown), anchorFrame=\(nextAnchorFrame), storedFrames=\(viewModel.filterAnchorFrames.keys)")
+
+                // Open the next dropdown at its correct position
                 withAnimation(.easeOut(duration: 0.15)) {
-                    viewModel.showFilterDropdown(nextDropdown, anchorFrame: viewModel.filterDropdownAnchorFrame)
+                    viewModel.showFilterDropdown(nextDropdown, anchorFrame: nextAnchorFrame)
                 }
 
                 return nil // Consume the event
@@ -4180,6 +4649,7 @@ struct CompactFilterDropdown: View {
     let icon: String
     let isActive: Bool
     let onTap: (CGRect) -> Void
+    var onFrameAvailable: ((CGRect) -> Void)? = nil
 
     @State private var isHovered = false
 
@@ -4226,6 +4696,12 @@ struct CompactFilterDropdown: View {
                         isHovered = hovering
                     }
                 }
+                .onAppear {
+                    // Delay slightly to ensure geometry is calculated
+                    DispatchQueue.main.async {
+                        onFrameAvailable?(localFrame)
+                    }
+                }
             }
             .frame(height: 38)
         }
@@ -4238,6 +4714,7 @@ struct CompactAppsFilterDropdown: View {
     let selectedApps: Set<String>?
     let isExcludeMode: Bool
     let onTap: (CGRect) -> Void
+    var onFrameAvailable: ((CGRect) -> Void)? = nil
 
     @State private var isHovered = false
 
@@ -4332,6 +4809,12 @@ struct CompactAppsFilterDropdown: View {
                 .onHover { hovering in
                     withAnimation(.easeInOut(duration: 0.1)) {
                         isHovered = hovering
+                    }
+                }
+                .onAppear {
+                    // Delay slightly to ensure geometry is calculated
+                    DispatchQueue.main.async {
+                        onFrameAvailable?(localFrame)
                     }
                 }
             }

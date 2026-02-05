@@ -97,10 +97,6 @@ public struct TimelineTapeView: View {
                     item.rightX >= cullingLeftX && item.leftX <= cullingRightX
                 }
 
-                // === PERF DEBUG ===
-                let _ = print("🔥 [PERF] Block rendering | total=\(blocks.count) | visible=\(visibleBlocks.count) | cullingRange=\(Int(cullingLeftX))...\(Int(cullingRightX))")
-                // === END PERF DEBUG ===
-
                 ForEach(visibleBlocks, id: \.block.id) { item in
                     // Gap indicator before block
                     if item.block.formattedGapBefore != nil {
@@ -210,10 +206,6 @@ public struct TimelineTapeView: View {
             RoundedRectangle(cornerRadius: 4)
                 .fill(color)
                 .frame(width: blockWidth, height: tapeHeight)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(isSelectedBlock ? Color.blue : (isCurrentBlock ? Color.white : Color.clear), lineWidth: isSelectedBlock ? 2 : 1.5)
-                )
                 .opacity(isCurrentBlock || isSelectedBlock ? 1.0 : 0.7)
 
             // Individual frame segments (clickable) - only render visible frames
@@ -245,6 +237,12 @@ public struct TimelineTapeView: View {
                     .frame(width: appIconSize, height: appIconSize)
                     .allowsHitTesting(false) // Allow clicks to pass through to frame segments
             }
+
+            // Selection/current border overlay (on top of frame segments so border is fully visible)
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(isSelectedBlock ? Color.blue : (isCurrentBlock ? Color.white : Color.clear), lineWidth: isSelectedBlock ? 3 : 2)
+                .frame(width: blockWidth, height: tapeHeight)
+                .allowsHitTesting(false)
         }
     }
 

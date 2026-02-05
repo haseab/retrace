@@ -2,7 +2,7 @@
 
 You are responsible for the **Capture** module of Retrace. Your job is to implement screen capture using **CGWindowListCapture**, frame deduplication, and app metadata extraction.
 
-**v0.1 Status**: ✅ Fully implemented using CGWindowListCapture API (legacy, no privacy indicator). No audio capture in v0.1.
+**v0.5 Status**: ✅ Fully implemented using CGWindowListCapture API (legacy, no privacy indicator). No audio capture in v0.5.
 
 ## Your Directory
 
@@ -42,7 +42,7 @@ Capture/
 
 ## Key Implementation Details
 
-### 1. CGWindowListCapture Setup (v0.1 Implementation)
+### 1. CGWindowListCapture Setup (v0.5 Implementation)
 
 **Why CGWindowListCapture instead of ScreenCaptureKit?**
 - No purple privacy indicator
@@ -452,7 +452,7 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 - ❌ Handle video encoding (that's STORAGE's job)
 - ❌ Handle OCR or text extraction (that's PROCESSING's job)
 - ❌ Store frames to disk (that's STORAGE's job)
-- ❌ Implement audio capture (planned for v0.2+, not v0.1)
+- ❌ Implement audio capture (planned for future release)
 
 ## Performance Targets
 
@@ -462,7 +462,7 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 - **CPU**: <10% during capture (mostly idle between 2-second intervals)
 - **Deduplication rate**: ~95% of frames filtered as duplicates
 
-## v0.1 Limitations
+## v0.5 Limitations
 
 - No audio capture (planned for v0.2+)
 - CGWindowListCapture has no streaming API (polling only)
@@ -476,4 +476,4 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 3. Read `AppInfoProvider.swift` - metadata extraction
 4. Read `CaptureManager.swift` - protocol conformance + pipeline
 
-The implementation is complete for v0.1. Focus on understanding the existing code rather than rewriting.
+The implementation is complete for v0.5. Focus on understanding the existing code rather than rewriting.

@@ -119,7 +119,7 @@ public final class FeedbackService {
             return version
         }
         // Fallback to hardcoded version for debug builds
-        return "0.1.0"
+        return "0.5.0"
     }
 
     private var buildNumber: String {

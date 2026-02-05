@@ -45,6 +45,7 @@ enum AppRelaunch {
 
         do {
             try task.run()
+            Log.info("[AppRelaunch] Terminating for relaunch", category: .app)
             exit(0)
         } catch {
             Log.error("[AppRelaunch] Failed to start launch script: \(error)", category: .app)

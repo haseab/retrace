@@ -330,6 +330,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether we're currently animating the zoom transition
     @Published public var isZoomTransitioning: Bool = false
 
+    /// Whether we're animating the exit (reverse) transition
+    @Published public var isZoomExitTransitioning: Bool = false
+
     /// The original rect where the drag ended (for animation start)
     @Published public var zoomTransitionStartRect: CGRect?
 
@@ -586,10 +589,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Position of the currently active dropdown button in "timelineContent" coordinate space (for positioning the dropdown)
     @Published public var filterDropdownAnchorFrame: CGRect = .zero
 
+    /// Stored anchor frames for each filter type (for Tab key navigation)
+    public var filterAnchorFrames: [FilterDropdownType: CGRect] = [:]
+
     /// Show a specific filter dropdown
     public func showFilterDropdown(_ type: FilterDropdownType, anchorFrame: CGRect) {
         print("[FilterDropdown] showFilterDropdown type=\(type), anchor=\(anchorFrame)")
         filterDropdownAnchorFrame = anchorFrame
+        filterAnchorFrames[type] = anchorFrame
         activeFilterDropdown = type
         isFilterDropdownOpen = type != .none
     }
@@ -738,16 +745,8 @@ public class SimpleTimelineViewModel: ObservableObject {
             return cached
         }
 
-        let startTime = CFAbsoluteTimeGetCurrent()
         let blocks = groupFramesIntoBlocks()
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
         _cachedAppBlocks = blocks
-
-        // === PERF DEBUG: Log block computation ===
-        let hasFilter = filterCriteria.hasActiveFilters
-        let filterDesc = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "none"
-        print("🔥 [PERF] appBlocks computed | frames=\(frames.count) | blocks=\(blocks.count) | filtered=\(hasFilter) | filter=\(filterDesc) | took=\(String(format: "%.2f", elapsed))ms")
-        // === END PERF DEBUG ===
 
         return blocks
     }
@@ -802,6 +801,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Flag to prevent concurrent loads in the "newer" direction
     private var isLoadingNewer = false
+
+    /// Flag to prevent duplicate initial frame loading (set synchronously to avoid race conditions)
+    private var isInitialLoadInProgress = false
 
     /// Whether there's more data available in the older direction
     private var hasMoreOlder = true
@@ -2129,6 +2131,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load the most recent frame on startup
     /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
     public func loadMostRecentFrame(clickStartTime: CFAbsoluteTime? = nil) async {
+        // Guard against concurrent calls (e.g., from both TimelineWindowController.prepareWindow and SimpleTimelineView.onAppear)
+        // Use dedicated flag to avoid race conditions with @Published isLoading
+        guard !isInitialLoadInProgress && !isLoading else {
+            Log.debug("[SimpleTimelineViewModel] loadMostRecentFrame skipped - already loading", category: .ui)
+            return
+        }
+        isInitialLoadInProgress = true
+        defer { isInitialLoadInProgress = false }
+
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
         logTabClickTiming("VM_LOAD_START", startTime: startTime)
 
@@ -2225,15 +2236,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     ///   - framesWithVideoInfo: Pre-fetched frames from parallel query
     ///   - clickStartTime: Start time for end-to-end timing
     public func loadFramesDirectly(_ framesWithVideoInfo: [FrameWithVideoInfo], clickStartTime: CFAbsoluteTime? = nil) async {
+        // Guard against concurrent calls - use dedicated flag to avoid race conditions
+        guard !isInitialLoadInProgress && !isLoading else {
+            Log.debug("[SimpleTimelineViewModel] loadFramesDirectly skipped - already loading", category: .ui)
+            return
+        }
+        isInitialLoadInProgress = true
+        defer { isInitialLoadInProgress = false }
+
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
         logTabClickTiming("VM_LOAD_DIRECT_START", startTime: startTime)
-
-        // === PERF DEBUG: Log frame loading ===
-        let hasFilter = filterCriteria.hasActiveFilters
-        let filterDesc = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "none"
-        let imageCacheSize = imageCache.count
-        print("🔥 [PERF] loadFramesDirectly | incoming=\(framesWithVideoInfo.count) | filtered=\(hasFilter) | filter=\(filterDesc) | imageCacheSize=\(imageCacheSize)")
-        // === END PERF DEBUG ===
 
         isLoading = true
         clearError()
@@ -2487,11 +2499,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Frame Navigation
 
-    // === PERF DEBUG: Track navigation frequency ===
-    private static var lastNavLogTime: CFAbsoluteTime = 0
-    private static var navCountSinceLastLog: Int = 0
-    // === END PERF DEBUG ===
-
     /// Navigate to a specific index in the frames array
     public func navigateToFrame(_ index: Int) {
         // Exit live mode on explicit navigation
@@ -2502,18 +2509,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Clamp to valid range
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
-
-        // === PERF DEBUG: Log navigation rate ===
-        Self.navCountSinceLastLog += 1
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - Self.lastNavLogTime >= 1.0 {
-            let rate = Double(Self.navCountSinceLastLog) / (now - Self.lastNavLogTime)
-            let hasFilter = filterCriteria.hasActiveFilters
-            print("🔥 [PERF] Navigation rate | \(String(format: "%.1f", rate)) nav/sec | frames=\(frames.count) | filtered=\(hasFilter)")
-            Self.navCountSinceLastLog = 0
-            Self.lastNavLogTime = now
-        }
-        // === END PERF DEBUG ===
 
         // Clear search highlight when manually navigating
         if isShowingSearchHighlight {
@@ -2860,6 +2855,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func toggleControlsVisibility() {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             areControlsHidden.toggle()
+            // Dismiss filter panel when hiding controls
+            if areControlsHidden && isFilterPanelVisible {
+                dismissFilterPanel()
+            }
         }
     }
 
@@ -2976,18 +2975,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Check cache first
         if let cached = imageCache[frame.id] {
             Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
-            // === PERF DEBUG: Cache hit ===
-            print("🔥 [PERF] Image cache HIT | cacheSize=\(imageCache.count) | frames=\(frames.count)")
-            // === END PERF DEBUG ===
             currentImage = cached
             frameNotReady = false
             frameLoadError = false
             return
         }
-
-        // === PERF DEBUG: Cache miss ===
-        print("🔥 [PERF] Image cache MISS | cacheSize=\(imageCache.count) | frames=\(frames.count) | loading frame \(frame.id.value)")
-        // === END PERF DEBUG ===
 
         // Load from disk
         Task {
@@ -3547,8 +3539,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Zoom Region Methods (Shift+Drag)
 
+    private var zoomUpdateCount = 0
+
     /// Start creating a zoom region (Shift+Drag)
     public func startZoomRegion(at point: CGPoint) {
+        zoomDebugLog("startZoomRegion at \(point)")
+        zoomUpdateCount = 0
         isDraggingZoomRegion = true
         zoomRegionDragStart = point
         zoomRegionDragEnd = point
@@ -3559,12 +3555,39 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Update zoom region drag
     public func updateZoomRegion(to point: CGPoint) {
+        zoomUpdateCount += 1
+        if zoomUpdateCount % 10 == 1 {
+            zoomDebugLog("updateZoomRegion #\(zoomUpdateCount) to \(point)")
+        }
         zoomRegionDragEnd = point
     }
 
     /// Finalize zoom region from drag - triggers animation to centered view
+    /// Debug log to /tmp/retrace_debug.log for zoom animation investigation
+    private func zoomDebugLog(_ message: String) {
+        let timestamp = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        let line = "[\(formatter.string(from: timestamp))] [ZOOM] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            let path = "/tmp/retrace_debug.log"
+            if FileManager.default.fileExists(atPath: path) {
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
+    }
+
     public func endZoomRegion() {
+        zoomDebugLog("endZoomRegion() called - mouseUp received")
+
         guard let start = zoomRegionDragStart, let end = zoomRegionDragEnd else {
+            zoomDebugLog("endZoomRegion() - no start/end points, aborting")
             isDraggingZoomRegion = false
             return
         }
@@ -3578,8 +3601,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         let width = maxX - minX
         let height = maxY - minY
 
+        zoomDebugLog("endZoomRegion() - calculated rect: width=\(width), height=\(height)")
+
         // Only create zoom region if it's large enough (at least 5% of screen)
         guard width > 0.05 && height > 0.05 else {
+            zoomDebugLog("endZoomRegion() - rect too small (<5%), aborting")
             isDraggingZoomRegion = false
             zoomRegionDragStart = nil
             zoomRegionDragEnd = nil
@@ -3591,6 +3617,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // DEBUG: Log the zoom region coordinates
         Log.info("[ZoomRegion] endZoomRegion: start=\(start), end=\(end)", category: .ui)
         Log.info("[ZoomRegion] endZoomRegion: finalRect=\(finalRect) (normalized coords, Y=0 at top)", category: .ui)
+        zoomDebugLog("endZoomRegion() - finalRect=\(finalRect)")
 
         // Record shift+drag zoom region metric
         if let screenSize = NSScreen.main?.frame.size {
@@ -3606,6 +3633,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Store the starting rect for animation
         zoomTransitionStartRect = finalRect
         zoomRegion = finalRect
+        zoomDebugLog("endZoomRegion() - set zoomRegion and zoomTransitionStartRect")
 
         // Clear drag state
         isDraggingZoomRegion = false
@@ -3616,28 +3644,59 @@ public class SimpleTimelineViewModel: ObservableObject {
         isZoomTransitioning = true
         zoomTransitionProgress = 0
         zoomTransitionBlurOpacity = 0
+        zoomDebugLog("endZoomRegion() - starting transition animation (isZoomTransitioning=true)")
 
         // Animate to final state
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
             zoomTransitionProgress = 1.0
             zoomTransitionBlurOpacity = 1.0
         }
+        zoomDebugLog("endZoomRegion() - withAnimation started (progress -> 1.0)")
 
         // After animation completes, switch to final zoom state
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.zoomDebugLog("endZoomRegion() - 0.45s timer fired, setting isZoomRegionActive=true")
             self?.isZoomRegionActive = true
             self?.zoomTransitionStartRect = nil
             // Disable transition on next run loop to ensure smooth handoff
             DispatchQueue.main.async {
+                self?.zoomDebugLog("endZoomRegion() - final state: isZoomTransitioning=false")
                 self?.isZoomTransitioning = false
             }
         }
     }
 
-    /// Exit zoom region mode
+    /// Exit zoom region mode with reverse animation
     public func exitZoomRegion() {
+        // If already exiting or no zoom region, just clear state
+        guard !isZoomExitTransitioning, zoomRegion != nil else {
+            clearZoomRegionState()
+            return
+        }
+
+        zoomDebugLog("exitZoomRegion() - starting exit animation")
+
+        // Clear text selection highlight before starting animation
+        clearTextSelection()
+
+        // Start exit transition
+        isZoomExitTransitioning = true
         isZoomRegionActive = false
+
+        // After animation completes, clear all zoom state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.zoomDebugLog("exitZoomRegion() - animation complete, clearing state")
+            self?.clearZoomRegionState()
+        }
+    }
+
+    /// Clear all zoom region state (called after exit animation completes)
+    private func clearZoomRegionState() {
+        isZoomRegionActive = false
+        isZoomExitTransitioning = false
+        isZoomTransitioning = false
         zoomRegion = nil
+        zoomTransitionStartRect = nil
         isDraggingZoomRegion = false
         zoomRegionDragStart = nil
         zoomRegionDragEnd = nil

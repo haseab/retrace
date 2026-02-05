@@ -373,15 +373,25 @@ public struct SearchFilterBar: View {
             // Check which dropdown is currently open via viewModel's isDropdownOpen
             guard vm.isDropdownOpen else { return event }
 
+            // Check if Shift is held for reverse direction
+            let isShiftHeld = event.modifierFlags.contains(.shift)
+
             // Determine current filter by checking the signal's last index
-            // We'll use a simple approach: cycle through 1->2->3->4->0
+            // Filter indices: 0=Search, 1=Apps, 2=Date, 3=Tags, 4=Visibility
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
-            debugLog("[SearchFilterBar] Tab pressed in dropdown, lastSignal=\(lastSignal), cycling from \(currentIndex)")
+            debugLog("[SearchFilterBar] Tab pressed in dropdown, lastSignal=\(lastSignal), cycling from \(currentIndex), shift=\(isShiftHeld)")
 
-            // Calculate next index (cycle: 1 -> 2 -> 3 -> 4 -> 0 (search))
-            let nextIndex = currentIndex >= 4 ? 0 : currentIndex + 1
+            // Calculate next index based on direction
+            let nextIndex: Int
+            if isShiftHeld {
+                // Shift+Tab: go backward (cycle: 0 -> 4 -> 3 -> 2 -> 1 -> 0)
+                nextIndex = currentIndex <= 0 ? 4 : currentIndex - 1
+            } else {
+                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 0 -> 1)
+                nextIndex = currentIndex >= 4 ? 0 : currentIndex + 1
+            }
 
             // Signal the change - the onChange handler will open the appropriate dropdown
             vm.openFilterSignal = (nextIndex, UUID())
