@@ -1319,6 +1319,29 @@ public struct SettingsView: View {
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
 
+                        // Restart prompt directly under Retrace Database if it changed
+                        if retraceDBLocationChanged {
+                            HStack(spacing: 8) {
+                                Text("Restart the app to apply Retrace database changes")
+                                    .font(.retraceCaption)
+                                    .foregroundColor(.retraceSecondary)
+                                Spacer()
+                                Button(action: restartApp) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 10))
+                                        Text("Restart")
+                                            .font(.retraceCaption)
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.retraceAccent)
+                                .controlSize(.small)
+                            }
+                            .padding(10)
+                            .background(Color.retraceAccent.opacity(0.1))
+                            .cornerRadius(6)
+                        }
                     }
 
                     // Rewind Database Location (only shown when Use Rewind data is enabled)
@@ -1382,30 +1405,6 @@ public struct SettingsView: View {
                         .controlSize(.small)
                         .disabled(coordinatorWrapper.isRunning && customRetraceDBLocation != nil)
                         .help(coordinatorWrapper.isRunning && customRetraceDBLocation != nil ? "Stop recording to reset Retrace database location" : "")
-                    }
-
-                    // Restart prompt for Retrace database changes only
-                    if retraceDBLocationChanged {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("Restart the app to apply Retrace database changes")
-                                .font(.retraceCaption)
-                                .foregroundColor(.retraceSecondary)
-
-                            Button(action: restartApp) {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "arrow.clockwise")
-                                        .font(.system(size: 11))
-                                    Text("Restart")
-                                        .font(.retraceCalloutMedium)
-                                }
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.retraceAccent)
-                            .controlSize(.small)
-                        }
-                        .padding(12)
-                        .background(Color.retraceAccent.opacity(0.1))
-                        .cornerRadius(8)
                     }
                 }
             }
@@ -3457,17 +3456,7 @@ extension SettingsView {
     }
 
     func restartApp() {
-        let url = URL(fileURLWithPath: Bundle.main.resourcePath!)
-        let path = url.deletingLastPathComponent().deletingLastPathComponent().absoluteString
-        let task = Process()
-        task.launchPath = "/usr/bin/open"
-        task.arguments = [path]
-        task.launch()
-
-        // Give macOS time to launch the new instance before terminating
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            NSApp.terminate(nil)
-        }
+        AppRelaunch.relaunch()
     }
 
     func restartAndResumeRecording() {
@@ -3478,7 +3467,7 @@ extension SettingsView {
         Log.info("Set shouldAutoStartRecording flag for restart", category: .ui)
 
         // Restart the app
-        restartApp()
+        AppRelaunch.relaunch()
     }
 
     func selectRetraceDBLocation() {

@@ -107,9 +107,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.accessory)
         }
 
-        // Check if another instance is already running
-        if isAnotherInstanceRunning() {
-            Log.info("[AppDelegate] Another instance of Retrace is already running. Activating existing instance...", category: .app)
+        // Check if another instance is already running (skip if this is a relaunch)
+        let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
+        if isRelaunch {
+            UserDefaults.standard.removeObject(forKey: "isRelaunching")
+        } else if isAnotherInstanceRunning() {
+            Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
             activateExistingInstance()
             NSApp.terminate(nil)
             return
@@ -478,12 +481,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func isAnotherInstanceRunning() -> Bool {
         let runningApps = NSWorkspace.shared.runningApplications
+        let myPID = ProcessInfo.processInfo.processIdentifier
+
         let retraceApps = runningApps.filter { app in
-            // Check for Retrace by bundle identifier or name
-            return (app.bundleIdentifier?.contains("retrace") == true ||
-                    app.localizedName?.contains("Retrace") == true) &&
-                   app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            let isRetrace = app.bundleIdentifier?.contains("retrace") == true ||
+                           app.localizedName?.contains("Retrace") == true
+            return isRetrace && app.processIdentifier != myPID
         }
+
         return !retraceApps.isEmpty
     }
 

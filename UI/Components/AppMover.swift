@@ -135,45 +135,7 @@ enum AppMover {
 
         // Relaunch from new location
         Log.info("[AppMover] Initiating relaunch from new location", category: .app)
-        relaunch(atPath: destinationPath)
-    }
-
-    private static func relaunch(atPath path: String) {
-        Log.info("[AppMover] Relaunching app from: \(path)", category: .app)
-
-        // Remove quarantine attribute that may prevent the app from launching
-        Log.debug("[AppMover] Removing quarantine attribute from: \(path)", category: .app)
-        let quarantineTask = Process()
-        quarantineTask.launchPath = "/usr/bin/xattr"
-        quarantineTask.arguments = ["-dr", "com.apple.quarantine", path]
-        do {
-            try quarantineTask.run()
-            quarantineTask.waitUntilExit()
-            Log.info("[AppMover] Quarantine attribute removal completed with exit code: \(quarantineTask.terminationStatus)", category: .app)
-        } catch {
-            Log.warning("[AppMover] Failed to remove quarantine attribute: \(error) - continuing anyway", category: .app)
-        }
-
-        let task = Process()
-        task.launchPath = "/usr/bin/open"
-        task.arguments = [path]
-
-        Log.debug("[AppMover] Launch command: /usr/bin/open \(path)", category: .app)
-
-        do {
-            try task.run()
-            Log.info("[AppMover] Successfully started new instance - process launched", category: .app)
-            Log.info("[AppMover] Waiting 0.5s before terminating current instance", category: .app)
-
-            // Give the new instance time to start
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                Log.info("[AppMover] Terminating current instance now", category: .app)
-                NSApp.terminate(nil)
-            }
-        } catch {
-            Log.error("[AppMover] Failed to relaunch: \(error)", category: .app)
-            showError("Failed to relaunch: \(error.localizedDescription)")
-        }
+        AppRelaunch.relaunch(atPath: destinationPath)
     }
 
     private static func showError(_ message: String) {
