@@ -1297,24 +1297,47 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Maintenance Operations
 
     /// Checkpoint the WAL file (merge WAL into main database and truncate)
-    /// Call periodically to prevent WAL file from growing too large
-    public func checkpoint() async throws {
+    /// Call periodically to prevent WAL file from growing too large.
+    /// Includes retry logic for external drives that may have slow I/O.
+    public func checkpoint(maxRetries: Int = 3) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
         let sql = "PRAGMA wal_checkpoint(TRUNCATE);"
-        var errorMessage: UnsafeMutablePointer<CChar>?
-        defer {
+        var lastError: String?
+
+        for attempt in 1...maxRetries {
+            let checkpointStart = CFAbsoluteTimeGetCurrent()
+
+            var errorMessage: UnsafeMutablePointer<CChar>?
+            let result = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+            let message = errorMessage.map { String(cString: $0) }
             sqlite3_free(errorMessage)
+
+            if result == SQLITE_OK {
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - checkpointStart) * 1000
+
+                if elapsedMs > 1000 {
+                    Log.warning("[DatabaseManager] Slow WAL checkpoint: \(String(format: "%.0f", elapsedMs))ms (external drive may be slow)", category: .database)
+                }
+
+                Log.info("[DatabaseManager] WAL checkpoint completed in \(String(format: "%.0f", elapsedMs))ms", category: .database)
+                return
+            }
+
+            lastError = message ?? "Unknown error"
+            Log.error("[DatabaseManager] WAL checkpoint failed (attempt \(attempt)/\(maxRetries)): \(lastError!)", category: .database)
+
+            // Exponential backoff before retry
+            if attempt < maxRetries {
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000) // 500ms, 1s, 1.5s
+            }
         }
 
-        guard sqlite3_exec(db, sql, nil, nil, &errorMessage) == SQLITE_OK else {
-            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
-            throw DatabaseError.queryFailed(query: sql, underlying: message)
-        }
-
-        Log.info("[DatabaseManager] Database WAL checkpointed and truncated", category: .database)
+        // All retries exhausted
+        Log.critical("[DatabaseManager] WAL checkpoint failed after \(maxRetries) retries", category: .database)
+        throw StorageError.walCheckpointFailed(retries: maxRetries)
     }
 
     /// Rebuild database file to reclaim space from deleted records

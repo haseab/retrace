@@ -24,14 +24,11 @@ public actor StorageManager: StorageProtocol {
 
     /// Cache for AVAssetImageGenerator instances, keyed by video path
     /// Reusing generators avoids expensive AVAsset initialization per frame
+    /// Cache is invalidated on time mismatch to handle growing video files
     private var generatorCache: [String: GeneratorCacheEntry] = [:]
 
     /// Maximum number of generators to keep cached
     private let maxCachedGenerators = 10
-
-    /// Cache for segment file paths, keyed by segment ID
-    /// Avoids expensive directory enumeration on every frame read
-    private var segmentPathCache: [Int64: URL] = [:]
 
     /// Cached AVAssetImageGenerator entry
     private struct GeneratorCacheEntry {
@@ -39,6 +36,10 @@ public actor StorageManager: StorageProtocol {
         let symlinkURL: URL?  // Keep symlink alive while generator is cached
         var lastAccessTime: Date
     }
+
+    /// Cache for segment file paths, keyed by segment ID
+    /// Avoids expensive directory enumeration on every frame read
+    private var segmentPathCache: [Int64: URL] = [:]
 
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
@@ -125,64 +126,20 @@ public actor StorageManager: StorageProtocol {
 
     /// Fast single-frame extraction using AVAssetImageGenerator
     /// This is much faster than decoding all frames - AVFoundation handles B-frame decoding internally
-    /// Generator instances are cached per video path for efficient scrubbing
+    /// Generator instances are cached per video path for efficient scrubbing.
+    /// Cache is automatically invalidated on time mismatch (stale duration) and retried with a fresh generator.
     private func extractSingleFrame(from videoURL: URL, frameIndex: Int, frameRate: Double = 30.0) async throws -> Data {
         let cacheKey = videoURL.path
 
-        // Get or create cached generator
-        let imageGenerator: AVAssetImageGenerator
-        if var entry = generatorCache[cacheKey] {
-            entry.lastAccessTime = Date()
-            generatorCache[cacheKey] = entry
-            imageGenerator = entry.generator
-        } else {
-            // Check if file exists
-            guard FileManager.default.fileExists(atPath: videoURL.path) else {
-                throw StorageError.fileNotFound(path: videoURL.path)
-            }
+        // Check if file exists
+        guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            throw StorageError.fileNotFound(path: videoURL.path)
+        }
 
-            // Check if file is empty
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
-            if fileSize == 0 {
-                throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
-            }
-
-            // Handle extensionless files by creating symlink
-            let assetURL: URL
-            var symlinkURL: URL? = nil
-
-            if videoURL.pathExtension.lowercased() == "mp4" {
-                assetURL = videoURL
-            } else {
-                // Create symlink with .mp4 extension (kept alive in cache)
-                let tempPath = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString + ".mp4")
-                symlinkURL = tempPath
-
-                try FileManager.default.createSymbolicLink(
-                    at: tempPath,
-                    withDestinationURL: videoURL
-                )
-                assetURL = tempPath
-            }
-
-            // Create and configure the generator
-            let asset = AVAsset(url: assetURL)
-            let generator = AVAssetImageGenerator(asset: asset)
-            generator.appliesPreferredTrackTransform = true
-            generator.requestedTimeToleranceAfter = .zero
-            generator.requestedTimeToleranceBefore = .zero
-
-            // Cache the generator
-            generatorCache[cacheKey] = GeneratorCacheEntry(
-                generator: generator,
-                symlinkURL: symlinkURL,
-                lastAccessTime: Date()
-            )
-            imageGenerator = generator
-
-            // Evict old generators if needed
-            evictOldGenerators()
+        // Check if file is empty
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int64) ?? 0
+        if fileSize == 0 {
+            throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Video file is empty (still being written)")
         }
 
         // Calculate CMTime from frame index
@@ -194,23 +151,100 @@ public actor StorageManager: StorageProtocol {
             time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
         }
 
-        // Extract frame using cached generator
-        let cgImage: CGImage
-        do {
-            cgImage = try imageGenerator.copyCGImage(at: time, actualTime: nil)
-        } catch {
-            // Invalidate cache on error and clean up symlink
-            if let entry = generatorCache.removeValue(forKey: cacheKey),
-               let symlinkURL = entry.symlinkURL {
-                try? FileManager.default.removeItem(at: symlinkURL)
+        // Try with cached generator first, retry with fresh generator on time mismatch
+        for attempt in 0..<2 {
+            let useCached = (attempt == 0)
+
+            let imageGenerator: AVAssetImageGenerator
+            var symlinkURL: URL? = nil
+
+            if useCached, var entry = generatorCache[cacheKey] {
+                // Use cached generator
+                entry.lastAccessTime = Date()
+                generatorCache[cacheKey] = entry
+                imageGenerator = entry.generator
+            } else {
+                // Create fresh generator - invalidate cache first if this is a retry
+                if attempt > 0 {
+                    if let entry = generatorCache.removeValue(forKey: cacheKey),
+                       let oldSymlink = entry.symlinkURL {
+                        try? FileManager.default.removeItem(at: oldSymlink)
+                    }
+                    Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
+                }
+
+                // Handle extensionless files by creating symlink
+                let assetURL: URL
+                if videoURL.pathExtension.lowercased() == "mp4" {
+                    assetURL = videoURL
+                } else {
+                    let tempPath = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString + ".mp4")
+                    symlinkURL = tempPath
+
+                    try FileManager.default.createSymbolicLink(
+                        at: tempPath,
+                        withDestinationURL: videoURL
+                    )
+                    assetURL = tempPath
+                }
+
+                // Create and configure the generator
+                let asset = AVAsset(url: assetURL)
+                let generator = AVAssetImageGenerator(asset: asset)
+                generator.appliesPreferredTrackTransform = true
+                generator.requestedTimeToleranceAfter = .zero
+                generator.requestedTimeToleranceBefore = .zero
+
+                // Cache the generator
+                generatorCache[cacheKey] = GeneratorCacheEntry(
+                    generator: generator,
+                    symlinkURL: symlinkURL,
+                    lastAccessTime: Date()
+                )
+                imageGenerator = generator
+
+                // Evict old generators if needed
+                evictOldGenerators()
             }
-            throw StorageError.fileReadFailed(
-                path: videoURL.path,
-                underlying: "Frame extraction failed: \(error.localizedDescription)"
-            )
+
+            // Extract frame
+            var actualTime = CMTime.zero
+            do {
+                let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: &actualTime)
+
+                // Check for time mismatch
+                let requestedSeconds = time.seconds
+                let actualSeconds = actualTime.seconds
+                let diffMs = abs(requestedSeconds - actualSeconds) * 1000
+
+                if diffMs > 10 { // More than 10ms difference
+                    if useCached {
+                        // Cached generator returned wrong frame - retry with fresh generator
+                        Log.warning("[VideoExtract] ⚠️ TIME MISMATCH (cached): frameIndex=\(frameIndex), requested=\(String(format: "%.3f", requestedSeconds))s, actual=\(String(format: "%.3f", actualSeconds))s, retrying with fresh generator", category: .storage)
+                        continue // Retry with fresh generator
+                    } else {
+                        // Fresh generator also returned wrong frame - video doesn't have this frame yet
+                        Log.warning("[VideoExtract] ⚠️ TIME MISMATCH (fresh): frameIndex=\(frameIndex), requested=\(String(format: "%.3f", requestedSeconds))s, actual=\(String(format: "%.3f", actualSeconds))s, video=\(videoURL.lastPathComponent)", category: .storage)
+                    }
+                }
+
+                return try convertCGImageToJPEG(cgImage)
+            } catch {
+                // Invalidate cache on error
+                if let entry = generatorCache.removeValue(forKey: cacheKey),
+                   let oldSymlink = entry.symlinkURL {
+                    try? FileManager.default.removeItem(at: oldSymlink)
+                }
+                throw StorageError.fileReadFailed(
+                    path: videoURL.path,
+                    underlying: "Frame extraction failed: \(error.localizedDescription)"
+                )
+            }
         }
 
-        return try convertCGImageToJPEG(cgImage)
+        // Should never reach here, but just in case
+        throw StorageError.fileReadFailed(path: videoURL.path, underlying: "Frame extraction failed after retries")
     }
 
     /// Evict oldest generators when cache is full
@@ -857,6 +891,60 @@ public actor StorageManager: StorageProtocol {
 
     public func getStorageDirectory() -> URL {
         storageRootURL
+    }
+
+    // MARK: - Cache Management
+
+    /// Invalidate all caches. Call when storage path may have changed (e.g., volume unmount/remount).
+    public func invalidateAllCaches() {
+        frameCache.removeAll()
+        segmentPathCache.removeAll()
+
+        // Clean up generator cache and remove any symlinks
+        for (_, entry) in generatorCache {
+            if let symlinkURL = entry.symlinkURL {
+                try? FileManager.default.removeItem(at: symlinkURL)
+            }
+        }
+        generatorCache.removeAll()
+
+        Log.info("[StorageManager] All caches invalidated", category: .storage)
+    }
+
+    /// Validate cached paths still exist. Call after drive reconnection to clean stale entries.
+    public func validateCaches() {
+        var invalidSegmentIDs: [Int64] = []
+
+        // Check segment path cache
+        for (segmentID, url) in segmentPathCache {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                invalidSegmentIDs.append(segmentID)
+            }
+        }
+
+        // Remove invalid segment entries
+        for id in invalidSegmentIDs {
+            segmentPathCache.removeValue(forKey: id)
+            frameCache.removeValue(forKey: id)
+        }
+
+        // Validate generator cache
+        var invalidPaths: [String] = []
+        for (path, entry) in generatorCache {
+            if !FileManager.default.fileExists(atPath: path) {
+                invalidPaths.append(path)
+                if let symlinkURL = entry.symlinkURL {
+                    try? FileManager.default.removeItem(at: symlinkURL)
+                }
+            }
+        }
+        for path in invalidPaths {
+            generatorCache.removeValue(forKey: path)
+        }
+
+        if !invalidSegmentIDs.isEmpty || !invalidPaths.isEmpty {
+            Log.warning("[StorageManager] Invalidated \(invalidSegmentIDs.count) segment cache entries and \(invalidPaths.count) generator cache entries", category: .storage)
+        }
     }
 
     // MARK: - Private helpers

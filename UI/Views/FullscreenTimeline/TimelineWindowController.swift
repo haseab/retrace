@@ -538,6 +538,7 @@ public class TimelineWindowController: NSObject {
         window.ignoresMouseEvents = false
 
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         logShowTiming("makeKeyAndOrderFront")
 
@@ -966,6 +967,7 @@ public class TimelineWindowController: NSObject {
         window.alphaValue = 0
         // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
         window.ignoresMouseEvents = false
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         isVisible = true
         Self.isTimelineVisible = true

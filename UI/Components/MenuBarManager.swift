@@ -88,6 +88,41 @@ public class MenuBarManager: ObservableObject {
         }
         timer.resume()
         refreshTimer = timer
+
+        // Setup periodic diagnostics logging (every 5 minutes)
+        setupDiagnosticsLogging()
+    }
+
+    /// Setup periodic logging of UI responsiveness diagnostics
+    private func setupDiagnosticsLogging() {
+        let diagnosticsTimer = DispatchSource.makeTimerSource(queue: .main)
+        diagnosticsTimer.schedule(deadline: .now() + 300, repeating: 300.0)
+        diagnosticsTimer.setEventHandler { [weak self] in
+            self?.logDiagnostics()
+        }
+        diagnosticsTimer.resume()
+        // Store reference to prevent deallocation (reuse refreshTimer pattern)
+        objc_setAssociatedObject(self, "diagnosticsTimer", diagnosticsTimer, .OBJC_ASSOCIATION_RETAIN)
+    }
+
+    /// Log UI responsiveness diagnostics
+    private func logDiagnostics() {
+        let diag = coordinator.statusHolder.diagnostics
+        let status = coordinator.statusHolder.status
+
+        // Always log a health check
+        Log.info("[UI Health] uptime=\(status.startTime.map { Int(-$0.timeIntervalSinceNow / 60) } ?? 0)min frames=\(status.framesProcessed) errors=\(status.errors) maxPendingActorReqs=\(diag.maxPending) slowResponses=\(diag.slowResponses)", category: .ui)
+
+        // Warn if we're seeing signs of potential UI freeze conditions
+        if diag.maxPending > 5 {
+            Log.warning("[UI Health] High actor request pile-up detected: maxPending=\(diag.maxPending). This could indicate UI freeze risk.", category: .ui)
+        }
+        if diag.slowResponses > 10 {
+            Log.warning("[UI Health] Multiple slow actor responses: count=\(diag.slowResponses). Actor may be overloaded.", category: .ui)
+        }
+
+        // Reset counters for next period
+        coordinator.statusHolder.resetDiagnostics()
     }
 
     /// Load shortcuts from OnboardingManager

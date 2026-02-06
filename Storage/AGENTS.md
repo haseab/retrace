@@ -15,7 +15,7 @@ Storage/
 │   └── KeychainHelper.swift     # Keychain key storage
 ├── FileManager/
 │   ├── DirectoryManager.swift   # Directory structure management
-│   └── DiskSpaceMonitor.swift   # Available space tracking
+│   └── StorageHealthMonitor.swift # Disk space + I/O + volume health monitoring
 ├── VideoEncoder/
 │   ├── HEVCEncoder.swift        # VideoToolbox HEVC encoding
 │   └── FrameConverter.swift     # Pixel format conversion

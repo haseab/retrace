@@ -62,6 +62,9 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
         Log.debug("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
 
+        // Track I/O latency for storage health monitoring
+        let writeStart = CFAbsoluteTimeGetCurrent()
+
         // STEP 1: Write to WAL first (crash-safe persistence)
         // This is the critical durability guarantee - frames are safe even if app crashes
         if walSession == nil {
@@ -72,6 +75,10 @@ public actor IncrementalSegmentWriter: SegmentWriter {
         var session = walSession!
         try await walManager.appendFrame(frame, to: &session)
         walSession = session
+
+        // Record write latency for health monitoring
+        let walLatencyMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
+        StorageHealthMonitor.shared.recordWriteLatency(walLatencyMs)
 
         // STEP 2: Initialize encoder on first frame
         if !encoderInitialized {

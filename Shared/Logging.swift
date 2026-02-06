@@ -360,3 +360,114 @@ extension Log {
         debug("Wrote segment \(segmentID.prefix(8)): \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))", category: .storage)
     }
 }
+
+// MARK: - Main Thread Watchdog
+
+/// Detects when the main thread is blocked for too long (potential UI freeze)
+/// Enable this in production to catch UI freeze issues before users report them
+public final class MainThreadWatchdog: @unchecked Sendable {
+    public static let shared = MainThreadWatchdog()
+
+    private var watchdogThread: Thread?
+    private var isRunning = false
+    private let lock = NSLock()
+
+    /// Timestamp of last main thread heartbeat
+    private var lastHeartbeat: Date = Date()
+
+    /// Threshold for warning (in seconds)
+    private let warningThreshold: TimeInterval = 0.5
+
+    /// Threshold for critical alert (in seconds)
+    private let criticalThreshold: TimeInterval = 2.0
+
+    /// Number of times we've detected blocking
+    private var blockingCount = 0
+
+    private init() {}
+
+    /// Start the watchdog - call this once at app startup
+    public func start() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isRunning else { return }
+        isRunning = true
+
+        // Heartbeat on main thread every 100ms
+        let heartbeatTimer = DispatchSource.makeTimerSource(queue: .main)
+        heartbeatTimer.schedule(deadline: .now(), repeating: 0.1)
+        heartbeatTimer.setEventHandler { [weak self] in
+            self?.recordHeartbeat()
+        }
+        heartbeatTimer.resume()
+        objc_setAssociatedObject(self, "heartbeatTimer", heartbeatTimer, .OBJC_ASSOCIATION_RETAIN)
+
+        // Watchdog on background thread checks for missed heartbeats
+        watchdogThread = Thread { [weak self] in
+            while self?.isRunningSnapshot() == true {
+                Thread.sleep(forTimeInterval: 0.2)
+                self?.checkHeartbeat()
+            }
+        }
+        watchdogThread?.name = "MainThreadWatchdog"
+        watchdogThread?.start()
+
+        Log.info("[Watchdog] Main thread watchdog started", category: .ui)
+    }
+
+    /// Stop the watchdog
+    public func stop() {
+        lock.lock()
+        defer { lock.unlock() }
+        isRunning = false
+    }
+
+    private func isRunningSnapshot() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isRunning
+    }
+
+    private func recordHeartbeat() {
+        lock.lock()
+        defer { lock.unlock() }
+        lastHeartbeat = Date()
+    }
+
+    private func checkHeartbeat() {
+        guard isRunningSnapshot() else { return }
+
+        lock.lock()
+        let elapsed = Date().timeIntervalSince(lastHeartbeat)
+        lock.unlock()
+
+        var didBlock = false
+        if elapsed > criticalThreshold {
+            didBlock = true
+        } else if elapsed > warningThreshold {
+            didBlock = true
+        }
+
+        guard didBlock else { return }
+
+        lock.lock()
+        blockingCount += 1
+        let currentCount = blockingCount
+        lock.unlock()
+
+        if elapsed > criticalThreshold {
+            Log.critical("[Watchdog] Main thread BLOCKED for \(String(format: "%.1f", elapsed))s! UI may be frozen. (count=\(currentCount))", category: .ui)
+        } else if elapsed > warningThreshold {
+            Log.warning("[Watchdog] Main thread delayed \(String(format: "%.1f", elapsed * 1000))ms (count=\(currentCount))", category: .ui)
+        }
+    }
+
+    /// Get current blocking statistics
+    public var statistics: (blockingCount: Int, isHealthy: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        let elapsed = Date().timeIntervalSince(lastHeartbeat)
+        return (blockingCount, elapsed < warningThreshold)
+    }
+}

@@ -165,6 +165,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try await wrapper.initialize()
             Log.info("[AppDelegate] Coordinator initialized successfully", category: .app)
 
+            // Start the main thread watchdog to detect UI freezes
+            MainThreadWatchdog.shared.start()
+
             // Setup menu bar icon
             let menuBar = MenuBarManager(
                 coordinator: wrapper.coordinator,

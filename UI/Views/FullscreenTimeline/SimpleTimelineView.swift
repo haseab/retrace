@@ -1629,9 +1629,9 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // Animate all interpolated values together
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: animationProgress)
         .onAppear {
-            if frozenZoomSnapshot == nil {
-                frozenZoomSnapshot = viewModel.currentImage
-            }
+            // Always capture fresh snapshot when appearing - don't reuse stale snapshots
+            // from previous zoom sessions that may have persisted in @State
+            frozenZoomSnapshot = viewModel.currentImage
 
             // Start at 0 when appearing during enter transition
             if isTransitioning {

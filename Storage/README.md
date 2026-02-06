@@ -22,7 +22,7 @@ Storage/
 │   └── KeychainHelper.swift
 ├── FileManager/
 │   ├── DirectoryManager.swift
-│   └── DiskSpaceMonitor.swift
+│   └── StorageHealthMonitor.swift
 ├── VideoEncoder/
 │   ├── HEVCEncoder.swift
 │   └── FrameConverter.swift

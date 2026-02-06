@@ -3018,9 +3018,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check cache first
         if let cached = imageCache[frame.id] {
-            if Self.isVerboseTimelineLoggingEnabled {
-                Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) found in image cache, using cached image (processingStatus=\(timelineFrame.processingStatus))", category: .ui)
-            }
             currentImage = cached
             frameNotReady = false
             frameLoadError = false
@@ -3067,6 +3064,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     pruneImageCacheIfNeeded()
 
                     imageCache[frameID] = image
+
                     // Only update if we're still on the same frame
                     if currentTimelineFrame?.frame.id == frame.id {
                         currentImage = image
@@ -3639,7 +3637,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         zoomRegionDragEnd = point
         // Clear any existing text selection when starting zoom
         clearTextSelection()
-        Log.info("[ZoomRegion] startZoomRegion at point: \(point) (normalized coords, Y=0 at top)", category: .ui)
     }
 
     /// Update zoom region drag

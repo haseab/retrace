@@ -19,6 +19,12 @@ public final class PipelineStatusHolder: @unchecked Sendable {
     private var _errors = 0
     private var _startTime: Date?
 
+    // Diagnostics for UI responsiveness tracking
+    private var _pendingActorRequests = 0
+    private var _maxPendingRequests = 0
+    private var _slowResponseCount = 0
+    private var _lastActorResponseTime: Date?
+
     public var status: PipelineStatus {
         lock.lock()
         defer { lock.unlock() }
@@ -28,6 +34,13 @@ public final class PipelineStatusHolder: @unchecked Sendable {
             errors: _errors,
             startTime: _startTime
         )
+    }
+
+    /// Diagnostics about actor responsiveness (for detecting potential UI freeze conditions)
+    public var diagnostics: (pendingRequests: Int, maxPending: Int, slowResponses: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (_pendingActorRequests, _maxPendingRequests, _slowResponseCount)
     }
 
     func update(isRunning: Bool? = nil, framesProcessed: Int? = nil, errors: Int? = nil, startTime: Date?? = nil) {
@@ -49,6 +62,38 @@ public final class PipelineStatusHolder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         _errors += 1
+    }
+
+    /// Track when an actor request starts (call before await)
+    public func trackActorRequestStart() {
+        lock.lock()
+        defer { lock.unlock() }
+        _pendingActorRequests += 1
+        if _pendingActorRequests > _maxPendingRequests {
+            _maxPendingRequests = _pendingActorRequests
+        }
+    }
+
+    /// Track when an actor request completes (call after await returns)
+    public func trackActorRequestEnd(startTime: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        _pendingActorRequests = max(0, _pendingActorRequests - 1)
+        _lastActorResponseTime = Date()
+
+        // Track slow responses (> 100ms is concerning for UI)
+        let elapsed = Date().timeIntervalSince(startTime)
+        if elapsed > 0.1 {
+            _slowResponseCount += 1
+        }
+    }
+
+    /// Reset diagnostic counters (call periodically, e.g., every hour)
+    public func resetDiagnostics() {
+        lock.lock()
+        defer { lock.unlock() }
+        _maxPendingRequests = _pendingActorRequests
+        _slowResponseCount = 0
     }
 }
 
@@ -85,11 +130,11 @@ public actor AppCoordinator {
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
 
-    // Storage accessibility monitoring - stops recording if storage becomes unavailable
-    private var storageMonitorTask: Task<Void, Never>?
-
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
+
+    // Storage health notifications (volume mount, used to trigger cache validation)
+    private var storageHealthObserverTokens: [NSObjectProtocol] = []
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
@@ -358,8 +403,14 @@ public actor AppCoordinator {
         // Save recording state for persistence across restarts
         saveRecordingState(true)
 
-        // Start storage accessibility monitoring (detects disconnected drives)
-        startStorageMonitoring()
+        // Start unified storage health monitoring (disk space, I/O latency, volume events, keep-alive)
+        startStorageHealthNotifications()
+        StorageHealthMonitor.shared.startMonitoring(
+            storagePath: AppPaths.expandedStorageRoot,
+            onCriticalError: { [weak self] in
+                await self?.handleStorageCriticalError()
+            }
+        )
 
         Log.info("Capture pipeline started successfully", category: .app)
     }
@@ -378,8 +429,9 @@ public actor AppCoordinator {
         // Stop permission monitoring
         await stopPermissionMonitoring()
 
-        // Stop storage accessibility monitoring
-        stopStorageMonitoring()
+        // Stop storage health monitoring
+        StorageHealthMonitor.shared.stopMonitoring()
+        stopStorageHealthNotifications()
 
         // Stop screen capture
         try await services.capture.stopCapture()
@@ -409,6 +461,37 @@ public actor AppCoordinator {
         }
 
         Log.info("Capture pipeline stopped successfully", category: .app)
+    }
+
+    // MARK: - Storage Health Notifications
+
+    private func startStorageHealthNotifications() {
+        stopStorageHealthNotifications()
+
+        let center = NotificationCenter.default
+        let mounted = center.addObserver(forName: .storageVolumeMounted, object: nil, queue: .main) { [weak self] notification in
+            Task { await self?.handleStorageVolumeMounted(notification) }
+        }
+        storageHealthObserverTokens.append(mounted)
+    }
+
+    private func stopStorageHealthNotifications() {
+        let center = NotificationCenter.default
+        for token in storageHealthObserverTokens {
+            center.removeObserver(token)
+        }
+        storageHealthObserverTokens.removeAll()
+    }
+
+    private func handleStorageVolumeMounted(_ notification: Notification) async {
+        Log.info("[AppCoordinator] Storage volume mounted - validating StorageManager caches", category: .app)
+        await services.storage.validateCaches()
+    }
+
+    private func handleStorageCriticalError() async {
+        Log.error("[AppCoordinator] Storage critical error - invalidating StorageManager caches and stopping pipeline", category: .app)
+        await services.storage.invalidateAllCaches()
+        try? await stopPipeline()
     }
 
     /// Shutdown all services
@@ -511,47 +594,13 @@ public actor AppCoordinator {
         Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
     }
 
-    // MARK: - Storage Accessibility Monitoring
-
-    /// Monitor storage accessibility and stop recording if storage becomes unavailable
-    /// (e.g., external drive disconnected)
-    private func startStorageMonitoring() {
-        storageMonitorTask?.cancel()
-
-        storageMonitorTask = Task { [weak self] in
-            let checkInterval: UInt64 = 5_000_000_000 // 5 seconds
-
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: checkInterval)
-                guard !Task.isCancelled else { break }
-
-                let storagePath = AppPaths.expandedStorageRoot
-                var isDirectory: ObjCBool = false
-                let exists = FileManager.default.fileExists(atPath: storagePath, isDirectory: &isDirectory)
-
-                if !exists || !isDirectory.boolValue {
-                    Log.error("[AppCoordinator] Storage path inaccessible: \(storagePath) - stopping recording", category: .app)
-
-                    guard let self = self else { break }
-                    try? await self.stopPipeline()
-
-                    // Post notification so UI can alert user
-                    await MainActor.run {
-                        NotificationCenter.default.post(
-                            name: NSNotification.Name("StorageInaccessible"),
-                            object: nil
-                        )
-                    }
-                    break
-                }
-            }
-        }
-    }
-
-    private func stopStorageMonitoring() {
-        storageMonitorTask?.cancel()
-        storageMonitorTask = nil
-    }
+    // MARK: - Storage Health (delegated to StorageHealthMonitor)
+    // Storage monitoring is now handled by StorageHealthMonitor.shared which provides:
+    // - Volume mount/unmount detection (instant via NSWorkspace notifications)
+    // - Disk space monitoring with thresholds
+    // - I/O latency tracking
+    // - Keep-alive writes to prevent drive spindown
+    // - Periodic health check every 30 seconds as fallback
 
     // MARK: - Permission Monitoring
 
