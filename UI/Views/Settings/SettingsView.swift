@@ -25,7 +25,7 @@ enum SettingsDefaults {
     static let colorTheme = "blue"
     static let timelineColoredBorders = false
     static let scrubbingAnimationDuration: Double = 0.10  // 0 = no animation, max 0.20
-    static let scrollSensitivity: Double = 0.75  // 0.0 = slowest, 1.0 = fastest
+    static let scrollSensitivity: Double = 0.50  // 0.0 = slowest, 1.0 = fastest
 
     // MARK: Capture
     static let pauseReminderDelayMinutes: Double = 30  // 0 = never remind again

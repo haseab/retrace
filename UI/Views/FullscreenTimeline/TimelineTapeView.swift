@@ -68,7 +68,7 @@ public struct TimelineTapeView: View {
 
             // Calculate offset to center current frame
             let currentFrameOffset = offsetForFrame(viewModel.currentIndex, in: blocks)
-            let unclampedTapeOffset = centerX - currentFrameOffset
+            let unclampedTapeOffset = centerX - currentFrameOffset - viewModel.subFrameOffset
 
             // Calculate total tape width
             let totalTapeWidth = calculateTotalTapeWidth(blocks: blocks)
@@ -115,7 +115,7 @@ public struct TimelineTapeView: View {
                 }
             }
             .offset(x: tapeOffset)
-            .animation(scrubbingAnimationDuration > 0 ? .easeOut(duration: scrubbingAnimationDuration) : nil, value: viewModel.currentIndex)
+            .animation(scrubbingAnimationDuration > 0 && !viewModel.isActivelyScrolling ? .easeOut(duration: scrubbingAnimationDuration) : nil, value: viewModel.currentIndex)
             .animation(.easeOut(duration: 0.2), value: viewModel.zoomLevel)
         }
     }

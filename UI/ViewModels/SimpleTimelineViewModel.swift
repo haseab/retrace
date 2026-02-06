@@ -856,8 +856,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Last logged frame ID for currentVideoInfo (prevents duplicate logs from SwiftUI view updates)
     private var _lastLoggedVideoInfoFrameID: Int64?
 
-    /// Scroll accumulator for smooth scrolling
-    private var scrollAccumulator: CGFloat = 0
+    /// Sub-frame pixel offset for continuous tape scrolling.
+    /// Represents how far the tape has moved beyond the current frame center.
+    @Published public var subFrameOffset: CGFloat = 0
 
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
@@ -2604,10 +2605,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Frame Navigation
 
     /// Navigate to a specific index in the frames array
-    public func navigateToFrame(_ index: Int) {
+    public func navigateToFrame(_ index: Int, fromScroll: Bool = false) {
         // Exit live mode on explicit navigation
         if isInLiveMode {
             exitLiveMode()
+        }
+
+        // Reset sub-frame offset for non-scroll navigation (click, keyboard, etc.)
+        if !fromScroll {
+            subFrameOffset = 0
         }
 
         // Clamp to valid range
@@ -4636,61 +4642,85 @@ public class SimpleTimelineViewModel: ObservableObject {
             return // First scroll exits live mode, don't navigate yet
         }
 
-        guard !frames.isEmpty else {
-            // print("[SimpleTimelineViewModel] handleScroll: frames is empty, ignoring")
-            return
-        }
+        guard !frames.isEmpty else { return }
 
-        // Accumulate scroll delta
-        scrollAccumulator += delta
-
-        // Convert to frame steps
-        // Base sensitivity at default zoom level (60%)
-        // Scale sensitivity inversely with pixelsPerFrame to maintain consistent visual scroll speed
-        // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
-        // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
-        // Mouse wheels need higher sensitivity since they send larger discrete deltas less frequently
-        // Scale by user's scroll sensitivity setting (0.1–1.0, default 0.75)
+        // Read user sensitivity setting (0.1–1.0, default 0.50)
         let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
-        let userSensitivity = store.object(forKey: "scrollSensitivity") != nil ? store.double(forKey: "scrollSensitivity") : 0.75
-        let sensitivityMultiplier = CGFloat(userSensitivity / 0.75) // Normalize so 0.75 = current behavior
-        let baseSensitivity: CGFloat = (isTrackpad ? 0.025 : 0.5) * sensitivityMultiplier
-        let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
-        let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
+        let userSensitivity = store.object(forKey: "scrollSensitivity") != nil ? store.double(forKey: "scrollSensitivity") : 0.50
+        let sensitivityMultiplier = CGFloat(userSensitivity / 0.50) // Normalize so 0.50 = current behavior
 
-        var frameStep = Int(scrollAccumulator * zoomAdjustedSensitivity)
-
-        // For mouse wheels, ensure at least 1 frame movement per scroll event
-        if !isTrackpad && frameStep == 0 && abs(scrollAccumulator) > 0.001 {
-            frameStep = scrollAccumulator > 0 ? 1 : -1
+        // Mark as actively scrolling
+        if !isActivelyScrolling {
+            isActivelyScrolling = true
+            dismissContextMenu()
+            dismissTimelineContextMenu()
         }
 
-        // Only process if we have enough scroll to move at least one frame
-        guard frameStep != 0 else { return }
-
-        // Mark as actively scrolling (disables tape animation) - only when actually moving
-        isActivelyScrolling = true
-
-        // Dismiss context menus when scrolling
-        dismissContextMenu()
-        dismissTimelineContextMenu()
-
-        // Cancel previous debounce task since we're moving to a new frame
+        // Cancel previous debounce task
         scrollDebounceTask?.cancel()
 
-        // Subtract only the consumed portion from the accumulator,
-        // preserving the fractional remainder for continuous scrolling
-        scrollAccumulator -= CGFloat(frameStep) / zoomAdjustedSensitivity
+        if isTrackpad {
+            // Continuous scrolling: convert delta to pixel displacement
+            // Scale so trackpad movement maps ~1:1 to tape pixel movement
+            let pixelDelta = delta * sensitivityMultiplier
+            subFrameOffset += pixelDelta
 
-        // Navigate
-        navigateToFrame(currentIndex + frameStep)
+            // Check if we've crossed frame boundaries
+            let ppf = pixelsPerFrame
+            if abs(subFrameOffset) >= ppf / 2 {
+                let framesToCross = Int(round(subFrameOffset / ppf))
+                if framesToCross != 0 {
+                    let prevIndex = currentIndex
+                    let targetIndex = currentIndex + framesToCross
+                    let clampedTarget = max(0, min(frames.count - 1, targetIndex))
+                    let actualFramesMoved = clampedTarget - prevIndex
+
+                    if actualFramesMoved != 0 {
+                        // Only subtract the frames we actually moved
+                        subFrameOffset -= CGFloat(actualFramesMoved) * ppf
+                        navigateToFrame(clampedTarget, fromScroll: true)
+                    }
+
+                    // At boundary: clamp offset so it doesn't accumulate past the edge
+                    if clampedTarget != targetIndex {
+                        Log.debug("[Scroll] Hit boundary: target=\(targetIndex) clamped=\(clampedTarget) offset=\(String(format: "%.1f", subFrameOffset)) delta=\(String(format: "%.1f", delta))", category: .ui)
+                        subFrameOffset = 0
+                    }
+                }
+            }
+
+            // Safety clamp: prevent any residual offset past boundaries
+            if currentIndex == 0 && subFrameOffset < 0 {
+                Log.debug("[Scroll] Safety clamp at start: offset was \(String(format: "%.1f", subFrameOffset))", category: .ui)
+                subFrameOffset = 0
+            } else if currentIndex >= frames.count - 1 && subFrameOffset > 0 {
+                Log.debug("[Scroll] Safety clamp at end: offset was \(String(format: "%.1f", subFrameOffset))", category: .ui)
+                subFrameOffset = 0
+            }
+        } else {
+            // Mouse wheel: discrete frame steps (no sub-frame movement)
+            let baseSensitivity: CGFloat = 0.5 * sensitivityMultiplier
+            let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
+            let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
+
+            // Accumulate in subFrameOffset temporarily for mouse wheel
+            let mouseAccum = delta * zoomAdjustedSensitivity
+            var frameStep = Int(mouseAccum)
+            if frameStep == 0 && abs(delta) > 0.001 {
+                frameStep = delta > 0 ? 1 : -1
+            }
+            if frameStep != 0 {
+                subFrameOffset = 0
+                navigateToFrame(currentIndex + frameStep, fromScroll: true)
+            }
+        }
 
         // Clear search highlight when user manually scrolls
         if isShowingSearchHighlight {
             clearSearchHighlight()
         }
 
-        // Debounce: re-enable animation and load OCR/URL after 100ms of no frame changes
+        // Debounce: settle tape to frame center and load OCR/URL after 100ms of no scroll
         scrollDebounceTask = Task {
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
             if !Task.isCancelled {
