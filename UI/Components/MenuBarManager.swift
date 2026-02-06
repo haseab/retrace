@@ -587,12 +587,12 @@ public class MenuBarManager: ObservableObject {
     }
 
     /// Sync recording status with coordinator
+    /// Uses thread-safe statusHolder to avoid actor hop and prevent task pile-up
     public func syncWithCoordinator() {
-        Task { @MainActor in
-            let status = await coordinator.getStatus()
-            if isRecording != status.isRunning {
-                updateRecordingStatus(status.isRunning)
-            }
+        // Read status directly from thread-safe holder - no actor hop needed
+        let status = coordinator.statusHolder.status
+        if isRecording != status.isRunning {
+            updateRecordingStatus(status.isRunning)
         }
     }
 

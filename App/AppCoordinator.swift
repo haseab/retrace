@@ -8,6 +8,50 @@ import Search
 import Migration
 import CoreGraphics
 
+// MARK: - Thread-Safe Status Holder
+
+/// Thread-safe holder for pipeline status that can be read without actor isolation.
+/// This prevents task pile-up when UI polls for status while the actor is busy.
+public final class PipelineStatusHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isRunning = false
+    private var _framesProcessed = 0
+    private var _errors = 0
+    private var _startTime: Date?
+
+    public var status: PipelineStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        return PipelineStatus(
+            isRunning: _isRunning,
+            framesProcessed: _framesProcessed,
+            errors: _errors,
+            startTime: _startTime
+        )
+    }
+
+    func update(isRunning: Bool? = nil, framesProcessed: Int? = nil, errors: Int? = nil, startTime: Date?? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let isRunning = isRunning { _isRunning = isRunning }
+        if let framesProcessed = framesProcessed { _framesProcessed = framesProcessed }
+        if let errors = errors { _errors = errors }
+        if let startTime = startTime { _startTime = startTime }
+    }
+
+    func incrementFrames() {
+        lock.lock()
+        defer { lock.unlock() }
+        _framesProcessed += 1
+    }
+
+    func incrementErrors() {
+        lock.lock()
+        defer { lock.unlock() }
+        _errors += 1
+    }
+}
+
 /// Main coordinator that wires all modules together
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
 /// Owner: APP integration
@@ -25,6 +69,9 @@ public actor AppCoordinator {
     private var pipelineStartTime: Date?
     private var totalFramesProcessed = 0
     private var totalErrors = 0
+
+    /// Thread-safe status holder for UI polling without actor hop
+    public nonisolated let statusHolder = PipelineStatusHolder()
 
     // Segment tracking (app focus sessions - Rewind compatible)
     private var currentSegmentID: Int64?
@@ -299,6 +346,7 @@ public actor AppCoordinator {
         // Start processing pipelines
         isRunning = true
         pipelineStartTime = Date()
+        statusHolder.update(isRunning: true, startTime: pipelineStartTime)
         captureTask = Task {
             await runPipeline()
         }
@@ -352,6 +400,7 @@ public actor AppCoordinator {
         // Audio processing drains automatically when stream ends
 
         isRunning = false
+        statusHolder.update(isRunning: false)
 
         // Only save recording state as stopped if explicitly requested (user clicked stop)
         // During shutdown, we want to preserve the "recording" state so it auto-starts next launch
@@ -458,6 +507,7 @@ public actor AppCoordinator {
         await services.processing.waitForQueueDrain()
 
         isRunning = false
+        statusHolder.update(isRunning: false)
         Log.info("Pipeline cleanup complete after unexpected stop", category: .app)
     }
 
@@ -794,6 +844,7 @@ public actor AppCoordinator {
 
                 writersByResolution[resolutionKey] = writerState
                 totalFramesProcessed += 1
+                statusHolder.incrementFrames()
 
                 if totalFramesProcessed % 10 == 0 {
                     Log.debug("Pipeline processed \(totalFramesProcessed) frames, \(writersByResolution.count) active writers", category: .app)
@@ -801,6 +852,7 @@ public actor AppCoordinator {
 
             } catch let error as StorageError {
                 totalErrors += 1
+                statusHolder.incrementErrors()
                 Log.error("[Pipeline] Error processing frame", category: .app, error: error)
 
                 // If it's a file write failure, the writer is broken - remove it so a fresh one is created
@@ -815,6 +867,7 @@ public actor AppCoordinator {
                 continue
             } catch {
                 totalErrors += 1
+                statusHolder.incrementErrors()
                 Log.error("[Pipeline] Error processing frame", category: .app, error: error)
                 continue
             }
