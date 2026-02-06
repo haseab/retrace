@@ -4,177 +4,42 @@ import Shared
 
 // MARK: - App Usage Layout Size
 
-/// Responsive layout sizes for app usage list
-/// Matches the dashboard stat card scaling
+/// Fixed layout size for app usage list
+/// Content stays at a consistent size; the dashboard centers when the window is wide
 enum AppUsageLayoutSize {
-    case normal      // < 1100px
-    case large       // 1100-1400px
-    case extraLarge  // 1400-1700px
-    case massive     // > 1700px
+    case normal
 
     static func from(width: CGFloat) -> AppUsageLayoutSize {
-        if width > 1700 {
-            return .massive
-        } else if width > 1400 {
-            return .extraLarge
-        } else if width > 1100 {
-            return .large
-        } else {
-            return .normal
-        }
+        return .normal
     }
 
     // MARK: - Icon Sizes
 
-    var appIconSize: CGFloat {
-        switch self {
-        case .normal: return 32
-        case .large: return 38
-        case .extraLarge: return 44
-        case .massive: return 50
-        }
-    }
+    var appIconSize: CGFloat { 32 }
 
     // MARK: - Text Fonts
 
-    var rankFont: Font {
-        switch self {
-        case .normal: return .retraceCaption2Bold
-        case .large: return .retraceCaptionBold
-        case .extraLarge: return .retraceCalloutBold
-        case .massive: return .retraceBodyBold
-        }
-    }
-
-    var appNameFont: Font {
-        switch self {
-        case .normal: return .retraceCalloutMedium
-        case .large: return .retraceBodyMedium
-        case .extraLarge: return .retraceHeadline
-        case .massive: return .retraceTitle3
-        }
-    }
-
-    var sessionFont: Font {
-        switch self {
-        case .normal: return .retraceCaption2
-        case .large: return .retraceCaption
-        case .extraLarge: return .retraceCallout
-        case .massive: return .retraceBody
-        }
-    }
-
-    var durationFont: Font {
-        switch self {
-        case .normal: return .retraceCalloutBold
-        case .large: return .retraceBodyBold
-        case .extraLarge: return .retraceHeadline
-        case .massive: return .retraceTitle3
-        }
-    }
-
-    var percentageFont: Font {
-        switch self {
-        case .normal: return .retraceCaption2Medium
-        case .large: return .retraceCaptionMedium
-        case .extraLarge: return .retraceCalloutMedium
-        case .massive: return .retraceBodyMedium
-        }
-    }
+    var rankFont: Font { .retraceCaption2Bold }
+    var appNameFont: Font { .retraceCalloutMedium }
+    var sessionFont: Font { .retraceCaption2 }
+    var durationFont: Font { .retraceCalloutBold }
+    var percentageFont: Font { .retraceCaption2Medium }
 
     // MARK: - Window Row Fonts (slightly smaller than app fonts)
 
-    var windowNameFont: Font {
-        switch self {
-        case .normal: return .retraceCaptionMedium  // 12pt (was 11pt)
-        case .large: return .retraceCalloutMedium
-        case .extraLarge: return .retraceBodyMedium
-        case .massive: return .retraceTitle3
-        }
-    }
-
-    var windowDurationFont: Font {
-        switch self {
-        case .normal: return .retraceCaptionBold  // 12pt (was 11pt)
-        case .large: return .retraceCalloutBold
-        case .extraLarge: return .retraceBodyBold
-        case .massive: return .retraceTitle3
-        }
-    }
+    var windowNameFont: Font { .retraceCaptionMedium }
+    var windowDurationFont: Font { .retraceCaptionBold }
 
     // MARK: - Spacing & Padding
 
-    var rowSpacing: CGFloat {
-        switch self {
-        case .normal: return 12
-        case .large: return 14
-        case .extraLarge: return 16
-        case .massive: return 18
-        }
-    }
-
-    var rankWidth: CGFloat {
-        switch self {
-        case .normal: return 20
-        case .large: return 24
-        case .extraLarge: return 28
-        case .massive: return 32
-        }
-    }
-
-    var progressBarWidth: CGFloat {
-        switch self {
-        case .normal: return 120
-        case .large: return 140
-        case .extraLarge: return 160
-        case .massive: return 180
-        }
-    }
-
-    var progressBarHeight: CGFloat {
-        switch self {
-        case .normal: return 6
-        case .large: return 7
-        case .extraLarge: return 8
-        case .massive: return 9
-        }
-    }
-
-    var durationWidth: CGFloat {
-        switch self {
-        case .normal: return 70
-        case .large: return 85
-        case .extraLarge: return 100
-        case .massive: return 115
-        }
-    }
-
-    var horizontalPadding: CGFloat {
-        switch self {
-        case .normal: return 12
-        case .large: return 14
-        case .extraLarge: return 16
-        case .massive: return 18
-        }
-    }
-
-    var verticalPadding: CGFloat {
-        switch self {
-        case .normal: return 10
-        case .large: return 12
-        case .extraLarge: return 14
-        case .massive: return 16
-        }
-    }
-
-    var windowRowIndent: CGFloat {
-        switch self {
-        case .normal: return 52
-        case .large: return 62
-        case .extraLarge: return 72
-        case .massive: return 82
-        }
-    }
+    var rowSpacing: CGFloat { 12 }
+    var rankWidth: CGFloat { 20 }
+    var progressBarWidth: CGFloat { 120 }
+    var progressBarHeight: CGFloat { 6 }
+    var durationWidth: CGFloat { 70 }
+    var horizontalPadding: CGFloat { 12 }
+    var verticalPadding: CGFloat { 10 }
+    var windowRowIndent: CGFloat { 52 }
 }
 
 // MARK: - Scroll Affordance

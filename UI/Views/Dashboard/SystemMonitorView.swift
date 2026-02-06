@@ -11,6 +11,10 @@ public struct SystemMonitorView: View {
         _viewModel = StateObject(wrappedValue: SystemMonitorViewModel(coordinator: coordinator))
     }
 
+    /// Maximum width for the system monitor content area before it centers
+    /// Matches dashboardMaxWidth for consistent layout in the shared window
+    private let monitorMaxWidth: CGFloat = 1100
+
     public var body: some View {
         ZStack {
             // Background matching dashboard - extends under titlebar
@@ -20,6 +24,8 @@ public struct SystemMonitorView: View {
             VStack(spacing: 0) {
                 // Header
                 header
+                    .frame(maxWidth: monitorMaxWidth)
+                    .frame(maxWidth: .infinity)
                     .padding(.horizontal, 32)
                     .padding(.top, 28)
                     .padding(.bottom, 24)
@@ -34,6 +40,8 @@ public struct SystemMonitorView: View {
                         // - Data Transfers
                         // - Migrations
                     }
+                    .frame(maxWidth: monitorMaxWidth)
+                    .frame(maxWidth: .infinity)
                     .padding(.horizontal, 32)
                     .padding(.bottom, 32)
                 }
@@ -231,7 +239,7 @@ public struct SystemMonitorView: View {
                         processingCount: viewModel.processingCount,
                         hoveredIndex: $viewModel.hoveredBarIndex
                     )
-                    .frame(height: 100)
+                    .frame(height: 140)
                 }
                 .padding(16)
 

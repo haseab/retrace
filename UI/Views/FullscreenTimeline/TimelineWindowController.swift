@@ -509,6 +509,10 @@ public class TimelineWindowController: NSObject {
             window.contentView?.addSubview(hostingView)
             hostingView.layoutSubtreeIfNeeded()
             logShowTiming("hosting view reattached")
+            // Force SwiftUI to re-read all @Published properties from the view model.
+            // While detached, SwiftUI missed objectWillChange notifications,
+            // so the timeline tape may show stale/empty state.
+            timelineViewModel?.objectWillChange.send()
         }
 
         timelineViewModel?.isTapeHidden = true
@@ -544,6 +548,14 @@ public class TimelineWindowController: NSObject {
 
         isVisible = true
         Self.isTimelineVisible = true  // For emergency escape tap
+
+        // Log display/screen info for debugging cross-display zoom issues
+        let mousePos = NSEvent.mouseLocation
+        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
+        let windowScreen = window.screen?.frame ?? .zero
+        let scaleFactor = TimelineScaleFactor.current
+        let screenBackingScale = window.screen?.backingScaleFactor ?? -1
+        debugLog("[TIMELINE-LAUNCH] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), windowFrame: \(Int(windowScreen.width))x\(Int(windowScreen.height)), isKeyWindow: \(window.isKeyWindow), zoomScale: \(timelineViewModel?.frameZoomScale ?? -1), timelineScaleFactor: \(String(format: "%.3f", scaleFactor)), backingScale: \(screenBackingScale)")
 
         // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
         if !isLive {
@@ -698,9 +710,10 @@ public class TimelineWindowController: NSObject {
             return
         }
 
+        let screenIndex = NSScreen.screens.firstIndex(of: targetScreen) ?? -1
         if window.frame != targetScreen.frame {
             window.setFrame(targetScreen.frame, display: false)
-            Log.debug("[TIMELINE-CACHE] Moved window to screen: \(targetScreen.frame)", category: .ui)
+            debugLog("[DISPLAY-SWITCH] moved window to display \(screenIndex), screen: \(Int(targetScreen.frame.width))x\(Int(targetScreen.frame.height)) at (\(Int(targetScreen.frame.origin.x)),\(Int(targetScreen.frame.origin.y))), mouse: (\(Int(mouseLocation.x)),\(Int(mouseLocation.y)))")
         }
     }
 
@@ -899,6 +912,7 @@ public class TimelineWindowController: NSObject {
                 hostingView.frame = window.contentView?.bounds ?? .zero
                 window.contentView?.addSubview(hostingView)
                 hostingView.layoutSubtreeIfNeeded()
+                timelineViewModel?.objectWillChange.send()
             }
             // Move window to target screen if needed
             if window.frame != targetScreen.frame {
@@ -949,6 +963,7 @@ public class TimelineWindowController: NSObject {
             hostingView.frame = window.contentView?.bounds ?? .zero
             window.contentView?.addSubview(hostingView)
             hostingView.layoutSubtreeIfNeeded()
+            timelineViewModel?.objectWillChange.send()
         }
 
         // Ensure tape starts hidden and cancel any pending animation
@@ -1554,6 +1569,38 @@ public class TimelineWindowController: NSObject {
             }
         }
 
+        // TEMP: Debug shortcuts for testing detach/reattach fix (uncomment to use)
+        // #if DEBUG
+        // // Option+1 — Detach hosting view + refresh data in background (simulates real hide scenario)
+        // if event.keyCode == 18 && modifiers == [.option] { // 1
+        //     if let hostingView = hostingView, hostingView.superview != nil {
+        //         hostingView.removeFromSuperview()
+        //         Log.info("[DEV-TEST] ⚡ Detached hosting view, now refreshing data while detached...", category: .ui)
+        //         Task { @MainActor in
+        //             await self.timelineViewModel?.refreshFrameData(navigateToNewest: true)
+        //             Log.info("[DEV-TEST] ⚡ Data refreshed while detached. frames=\(self.timelineViewModel?.frames.count ?? 0)", category: .ui)
+        //         }
+        //     }
+        //     return true
+        // }
+        // // Option+2 — Reattach hosting view WITHOUT objectWillChange (should show stale tape)
+        // if event.keyCode == 19 && modifiers == [.option] { // 2
+        //     if let hostingView = hostingView, hostingView.superview == nil, let window = window {
+        //         hostingView.frame = window.contentView?.bounds ?? .zero
+        //         window.contentView?.addSubview(hostingView)
+        //         hostingView.layoutSubtreeIfNeeded()
+        //         Log.info("[DEV-TEST] ⚡ Reattached hosting view (WITHOUT objectWillChange)", category: .ui)
+        //     }
+        //     return true
+        // }
+        // // Option+3 — Send objectWillChange (should fix stale tape)
+        // if event.keyCode == 20 && modifiers == [.option] { // 3
+        //     timelineViewModel?.objectWillChange.send()
+        //     Log.info("[DEV-TEST] ⚡ Sent objectWillChange.send()", category: .ui)
+        //     return true
+        // }
+        // #endif
+
         // Any other key (not a modifier) clears text selection
         if let viewModel = timelineViewModel,
            viewModel.hasSelection,
@@ -1584,6 +1631,9 @@ public class TimelineWindowController: NSObject {
         let isTrackpad = event.hasPreciseScrollingDeltas
 
         if abs(delta) > 0.001 {
+            let mousePos = NSEvent.mouseLocation
+            let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
+            debugLog("[SCROLL] \(source), display: \(screenIndex), delta: \(String(format: "%.1f", delta)), isKeyWindow: \(window?.isKeyWindow ?? false)")
             onScroll?(delta)
             // Forward scroll to view model
             Task { @MainActor in
@@ -1616,6 +1666,9 @@ public class TimelineWindowController: NSObject {
         let anchor = CGPoint(x: normalizedX, y: normalizedY)
 
         // Apply the magnification with anchor point
+        let mousePos = NSEvent.mouseLocation
+        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
+        debugLog("[ZOOM] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), magnification: \(String(format: "%.3f", magnification)), scaleBefore: \(String(format: "%.2f", viewModel.frameZoomScale)), isKeyWindow: \(window.isKeyWindow)")
         viewModel.applyMagnification(scaleFactor, anchor: anchor, frameSize: windowSize)
     }
 

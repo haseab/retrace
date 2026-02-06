@@ -4,142 +4,42 @@ import App
 
 // MARK: - Layout Size
 
-/// Responsive layout sizes for dashboard stat cards
-/// Scales up progressively as screen width increases
+/// Fixed layout size for dashboard stat cards
+/// Content stays at a consistent size and centers in the window
 private enum LayoutSize {
-    case normal      // < 1100px
-    case large       // 1100-1400px
-    case extraLarge  // 1400-1700px
-    case massive     // > 1700px
+    case normal
 
     static func from(width: CGFloat) -> LayoutSize {
-        if width > 1700 {
-            return .massive
-        } else if width > 1400 {
-            return .extraLarge
-        } else if width > 1100 {
-            return .large
-        } else {
-            return .normal
-        }
+        return .normal
     }
 
     // MARK: - Card Dimensions
 
-    var cardWidth: CGFloat {
-        switch self {
-        case .normal: return 280
-        case .large: return 340
-        case .extraLarge: return 400
-        case .massive: return 460
-        }
-    }
-
-    var graphHeight: CGFloat {
-        switch self {
-        case .normal: return 70
-        case .large: return 92
-        case .extraLarge: return 110
-        case .massive: return 128
-        }
-    }
+    var cardWidth: CGFloat { 280 }
+    var graphHeight: CGFloat { 70 }
 
     // MARK: - Icon Sizes
 
-    var iconCircleSize: CGFloat {
-        switch self {
-        case .normal: return 44
-        case .large: return 52
-        case .extraLarge: return 60
-        case .massive: return 68
-        }
-    }
-
-    var iconFont: Font {
-        switch self {
-        case .normal: return .retraceHeadline
-        case .large: return .system(size: 20, weight: .semibold)
-        case .extraLarge: return .system(size: 24, weight: .semibold)
-        case .massive: return .system(size: 28, weight: .semibold)
-        }
-    }
+    var iconCircleSize: CGFloat { 44 }
+    var iconFont: Font { .retraceHeadline }
 
     // MARK: - Text Fonts
 
-    var titleFont: Font {
-        switch self {
-        case .normal: return .retraceCaption2Medium
-        case .large: return .retraceCaptionMedium
-        case .extraLarge: return .retraceCalloutMedium
-        case .massive: return .retraceBodyMedium
-        }
-    }
-
-    var valueFont: Font {
-        switch self {
-        case .normal: return .retraceMediumNumber
-        case .large: return .system(size: 28, weight: .bold, design: .rounded)
-        case .extraLarge: return .system(size: 34, weight: .bold, design: .rounded)
-        case .massive: return .system(size: 40, weight: .bold, design: .rounded)
-        }
-    }
-
-    var subtitleFont: Font {
-        switch self {
-        case .normal: return .retraceCaption2Medium
-        case .large: return .retraceCaptionMedium
-        case .extraLarge: return .retraceCalloutMedium
-        case .massive: return .retraceBodyMedium
-        }
-    }
+    var titleFont: Font { .retraceCaption2Medium }
+    var valueFont: Font { .retraceMediumNumber }
+    var subtitleFont: Font { .retraceCaption2Medium }
 
     // MARK: - Spacing & Padding
 
-    var iconSpacing: CGFloat {
-        switch self {
-        case .normal: return 14
-        case .large: return 16
-        case .extraLarge: return 18
-        case .massive: return 20
-        }
-    }
-
-    var textSpacing: CGFloat {
-        switch self {
-        case .normal: return 2
-        case .large: return 3
-        case .extraLarge: return 4
-        case .massive: return 5
-        }
-    }
-
-    var cardPadding: CGFloat {
-        switch self {
-        case .normal: return 16
-        case .large: return 20
-        case .extraLarge: return 24
-        case .massive: return 28
-        }
-    }
-
-    var graphHorizontalPadding: CGFloat {
-        switch self {
-        case .normal: return 12
-        case .large: return 16
-        case .extraLarge: return 20
-        case .massive: return 24
-        }
-    }
-
-    var graphBottomPadding: CGFloat {
-        switch self {
-        case .normal: return 8
-        case .large: return 12
-        case .extraLarge: return 16
-        case .massive: return 20
-        }
-    }
+    var iconSpacing: CGFloat { 14 }
+    var textSpacing: CGFloat { 2 }
+    var cardPadding: CGFloat { 16 }
+    var graphHorizontalPadding: CGFloat { 12 }
+    var graphBottomPadding: CGFloat { 8 }
 }
+
+/// Maximum width for the dashboard content area before it centers
+private let dashboardMaxWidth: CGFloat = 1100
 
 /// Main dashboard view - analytics and statistics
 /// Default landing screen
@@ -215,7 +115,8 @@ public struct DashboardView: View {
                         viewModel.dismissAccessibilityWarning()
                     }
                 )
-                .padding(.horizontal, 32)
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.top, 20)
             }
 
@@ -231,7 +132,8 @@ public struct DashboardView: View {
                         viewModel.dismissScreenRecordingWarning()
                     }
                 )
-                .padding(.horizontal, 32)
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.top, viewModel.showAccessibilityWarning ? 12 : 20)
             }
 
@@ -247,12 +149,15 @@ public struct DashboardView: View {
                         launchOnLoginReminderManager.dismissReminder()
                     }
                 )
-                .padding(.horizontal, 32)
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
             }
 
             // Header
             header
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 32)
                 .padding(.top, 28)
                 .padding(.bottom, 32)
@@ -263,7 +168,7 @@ public struct DashboardView: View {
                 let layoutSize = LayoutSize.from(width: geometry.size.width)
 
                 HStack(alignment: .top, spacing: 24) {
-                    // Left column: Stats cards (single column, scales with screen size)
+                    // Left column: Stats cards (single column, fixed width)
                     ZStack {
                         ScrollView(showsIndicators: false) {
                             VStack(spacing: 16) {
@@ -291,12 +196,16 @@ public struct DashboardView: View {
                     // Right column: App usage (scrolls internally)
                     appUsageSection(layoutSize: layoutSize)
                 }
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
             }
             .padding(.horizontal, 32)
             .padding(.bottom, 24)
 
             // Footer
             footer
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 32)
                 .padding(.bottom, 24)
         }
@@ -884,15 +793,7 @@ public struct DashboardView: View {
     // MARK: - App Usage Section
 
     private func appUsageSection(layoutSize: LayoutSize) -> some View {
-        // Convert LayoutSize to AppUsageLayoutSize
-        let appUsageLayout: AppUsageLayoutSize = {
-            switch layoutSize {
-            case .normal: return .normal
-            case .large: return .large
-            case .extraLarge: return .extraLarge
-            case .massive: return .massive
-            }
-        }()
+        let appUsageLayout: AppUsageLayoutSize = .normal
 
         return VStack(alignment: .leading, spacing: 0) {
             if viewModel.isLoading && viewModel.weeklyAppUsage.isEmpty {

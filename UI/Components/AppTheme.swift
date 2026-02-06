@@ -1316,7 +1316,7 @@ public struct TimelineScaleFactor {
     private static var _cachedScaleFactor: CGFloat?
     private static let lock = NSLock()
 
-    /// Calculate scale factor based on current screen height
+    /// Calculate scale factor based on the screen where the timeline is displayed
     /// Returns cached value to prevent UI size changes during window lifecycle
     public static var current: CGFloat {
         lock.lock()
@@ -1326,8 +1326,11 @@ public struct TimelineScaleFactor {
             return cached
         }
 
-        // Calculate and cache the scale factor
-        guard let screen = NSScreen.main else { return 1.0 }
+        // Use the screen where the mouse is (where the timeline will open),
+        // not NSScreen.main (which is always the primary display)
+        let mouseLocation = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return 1.0 }
         let screenHeight = screen.frame.height
         let rawScale = screenHeight / referenceHeight
         let scale = min(maxScale, max(minScale, rawScale))

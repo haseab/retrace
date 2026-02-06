@@ -3560,6 +3560,7 @@ struct DeveloperActionsMenu: View {
                 Label("Open Video File", systemImage: "play.rectangle")
             }
             .disabled(viewModel.currentVideoInfo == nil)
+
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "ant.fill")

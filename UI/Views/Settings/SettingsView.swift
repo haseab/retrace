@@ -288,20 +288,31 @@ public struct SettingsView: View {
 
     // MARK: - Body
 
+    /// Max width for the entire settings panel before it detaches and centers
+    private let settingsMaxWidth: CGFloat = 1200
+
     public var body: some View {
-        HStack(spacing: 0) {
-            // Sidebar
-            sidebar
-                .frame(width: 220)
+        GeometryReader { geometry in
+            let windowWidth = geometry.size.width
+            let detached = windowWidth > settingsMaxWidth
+            let _ = Self.logSettingsLayout(windowWidth: windowWidth)
 
-            // Divider
-            Rectangle()
-                .fill(Color.white.opacity(0.06))
-                .frame(width: 1)
+            HStack(spacing: 0) {
+                // Sidebar
+                sidebar
+                    .frame(width: 220)
 
-            // Content
-            content
-                .frame(maxWidth: .infinity)
+                // Divider
+                Rectangle()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: 1)
+
+                // Content
+                content
+                    .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: detached ? settingsMaxWidth : .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
         .frame(minWidth: 900, minHeight: 650)
         .background(
@@ -322,6 +333,7 @@ public struct SettingsView: View {
                     .offset(x: 200, y: -100)
                     .blur(radius: 80)
             }
+            .ignoresSafeArea()
         )
         .onAppear {
             // Capture the Retrace DB path the app was launched with (only once)
@@ -3774,6 +3786,28 @@ private struct RetentionTagsChip<PopoverContent: View>: View {
         }
         .popover(isPresented: $isPopoverShown, arrowEdge: .bottom) {
             popoverContent()
+        }
+    }
+}
+
+extension SettingsView {
+    private static func logSettingsLayout(windowWidth: CGFloat) {
+        let sidebarWidth: CGFloat = 220
+        let dividerWidth: CGFloat = 1
+        let contentWidth = windowWidth - sidebarWidth - dividerWidth
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] [SETTINGS-LAYOUT] windowWidth: \(windowWidth), sidebarWidth: \(sidebarWidth), contentWidth: \(contentWidth)\n"
+        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let handle = try? FileHandle(forWritingTo: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: path)
+            }
         }
     }
 }
