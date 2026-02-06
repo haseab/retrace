@@ -3034,6 +3034,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         isInLiveMode = false
         liveScreenshot = nil
         isLiveOCRProcessing = false
+        liveOCRDebounceTask?.cancel()
+        liveOCRDebounceTask = nil
         isTapeHidden = false  // Reset animation state
 
         // If frames are already loaded, show the most recent
@@ -3046,13 +3048,32 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Live OCR
 
-    /// Timestamp of last live OCR attempt (for 1-second debounce)
-    private var lastLiveOCRTime: Date = .distantPast
+    /// Task for the debounced live OCR - cancelled and re-created on each call
+    private var liveOCRDebounceTask: Task<Void, Never>?
 
-    /// Perform OCR on the live screenshot automatically
+    /// Trigger live OCR with a 1-second debounce
+    /// Each call resets the timer - OCR only fires after 1 second of no new calls
+    public func performLiveOCR() {
+        // Clear stale OCR nodes from previous frame immediately
+        // This prevents interaction with old bounding boxes while debounce waits
+        setOCRNodes([])
+        clearTextSelection()
+
+        liveOCRDebounceTask?.cancel()
+        liveOCRDebounceTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+            } catch {
+                return // Cancelled
+            }
+            await self?.executeLiveOCR()
+        }
+    }
+
+    /// Actually perform OCR on the live screenshot
     /// Uses same .accurate pipeline as frame processing
     /// Results are ephemeral (not persisted to database)
-    public func performLiveOCR() async {
+    private func executeLiveOCR() async {
         guard isInLiveMode, let liveImage = liveScreenshot else {
             Log.debug("[LiveOCR] Skipped - not in live mode or no screenshot", category: .ui)
             return
@@ -3062,15 +3083,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[LiveOCR] Already processing, skipping", category: .ui)
             return
         }
-
-        // 1-second debounce
-        let now = Date()
-        let timeSinceLast = now.timeIntervalSince(lastLiveOCRTime)
-        if timeSinceLast < 1.0 {
-            Log.debug("[LiveOCR] Debounced (\(String(format: "%.2f", timeSinceLast))s since last)", category: .ui)
-            return
-        }
-        lastLiveOCRTime = now
 
         guard let cgImage = liveImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             Log.error("[LiveOCR] Failed to get CGImage from live screenshot", category: .ui)
@@ -3117,6 +3129,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
+        // Skip during live mode - live screenshot is already displayed and OCR is handled separately
+        guard !isInLiveMode else { return }
+
         guard let timelineFrame = currentTimelineFrame else {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
@@ -3437,6 +3452,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load all OCR nodes for the current frame
     private func loadOCRNodes() {
+        // Don't overwrite live OCR results with database results
+        guard !isInLiveMode else { return }
+
         guard currentTimelineFrame != nil else {
             setOCRNodes([])
             ocrStatus = .unknown

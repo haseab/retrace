@@ -108,15 +108,9 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     /// Uses the same .accurate pipeline as frame processing
     /// Returns TextRegions with **normalized coordinates** (0.0-1.0) for direct use with OCRNodeWithText
     public func recognizeTextFromCGImage(_ cgImage: CGImage) async throws -> [TextRegion] {
-        // Downscale same as normal pipeline
-        let ocrImage: CGImage
-        if Self.ocrScaleFactor < 1.0 {
-            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
-        } else {
-            ocrImage = cgImage
-        }
-
-        let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
+        // No downscaling for live screenshot - it's a one-shot operation
+        // and downscaling can introduce subtle bounding box drift from integer rounding
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
 
         return try await withCheckedThrowingContinuation { continuation in
             do {

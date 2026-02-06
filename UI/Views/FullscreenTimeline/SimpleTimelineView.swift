@@ -1164,6 +1164,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                         viewModel: viewModel,
                         containerSize: geometry.size,
                         actualFrameRect: actualFrameRect,
+                        isInteractionDisabled: viewModel.isInLiveMode && viewModel.ocrNodes.isEmpty,
                         onDragStart: { point in
                             viewModel.startDragSelection(at: point)
                         },
@@ -1257,7 +1258,14 @@ struct FrameWithURLOverlay<Content: View>: View {
         // Get the actual frame dimensions from videoInfo (database)
         // Don't use NSImage.size as that requires extracting the frame from video first
         let frameSize: CGSize
-        if let videoInfo = viewModel.currentVideoInfo,
+        if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
+            // Live mode: use screenshot dimensions (must check BEFORE videoInfo,
+            // since videoInfo may still be set from the last recorded frame with a different aspect ratio)
+            frameSize = CGSize(
+                width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
+                height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
+            )
+        } else if let videoInfo = viewModel.currentVideoInfo,
            let width = videoInfo.width,
            let height = videoInfo.height {
             frameSize = CGSize(width: width, height: height)
@@ -2584,6 +2592,7 @@ struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
     let actualFrameRect: CGRect
+    var isInteractionDisabled: Bool = false
     let onDragStart: (CGPoint) -> Void
     let onDragUpdate: (CGPoint) -> Void
     let onDragEnd: () -> Void
@@ -2632,6 +2641,7 @@ struct TextSelectionOverlay: NSViewRepresentable {
         nsView.actualFrameRect = actualFrameRect
         nsView.isDraggingSelection = viewModel.dragStartPoint != nil
         nsView.isDraggingZoomRegion = viewModel.isDraggingZoomRegion
+        nsView.isInteractionDisabled = isInteractionDisabled
 
         nsView.needsDisplay = true
     }
@@ -2653,6 +2663,7 @@ class TextSelectionView: NSView {
     var actualFrameRect: CGRect = .zero
     var isDraggingSelection: Bool = false
     var isDraggingZoomRegion: Bool = false
+    var isInteractionDisabled: Bool = false
 
     // Text selection callbacks
     var onDragStart: ((CGPoint) -> Void)?
@@ -2747,6 +2758,8 @@ class TextSelectionView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard !isInteractionDisabled else { return }
+
         let location = convert(event.locationInWindow, from: nil)
         mouseDownPoint = location
         hasMoved = false
@@ -2780,6 +2793,8 @@ class TextSelectionView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard !isInteractionDisabled else { return }
+
         let location = convert(event.locationInWindow, from: nil)
 
         // Check if mouse actually moved (more than 3 pixels to avoid micro-movements)

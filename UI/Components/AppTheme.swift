@@ -415,8 +415,10 @@ public class FaviconProvider {
         pendingRequests.insert(normalizedDomain)
         lock.unlock()
 
-        // Fetch from Google's favicon API
-        // Using size 64 for good quality on retina displays
+        // PRIVACY NOTE: This sends only the bare domain (no paths, queries, or fragments) to Google's
+        // favicon API. The domain is normalized via normalizeDomain() which strips protocol, "www.",
+        // and any path components. No user-identifiable browsing data beyond the domain name is leaked.
+        // If replacing this, ensure the alternative respects the same privacy guarantees.
         let urlString = "https://www.google.com/s2/favicons?domain=\(normalizedDomain)&sz=64"
         guard let url = URL(string: urlString) else {
             lock.lock()
