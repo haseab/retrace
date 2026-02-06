@@ -4601,8 +4601,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Cancel previous debounce task since we're moving to a new frame
         scrollDebounceTask?.cancel()
 
-        // Reset accumulator after navigating
-        scrollAccumulator = 0
+        // Subtract only the consumed portion from the accumulator,
+        // preserving the fractional remainder for continuous scrolling
+        scrollAccumulator -= CGFloat(frameStep) / zoomAdjustedSensitivity
 
         // Navigate
         navigateToFrame(currentIndex + frameStep)
