@@ -5,8 +5,7 @@ import App
 
 /// Debug logging to file
 private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
+    let line = "[\(Log.timestamp())] \(message)\n"
     let path = "/tmp/retrace_debug.log"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: path) {
@@ -267,11 +266,11 @@ public class SearchViewModel: ObservableObject {
         }
 
         if let startDate = startDate {
-            components.append("\"startDate\":\"\(ISO8601DateFormatter().string(from: startDate))\"")
+            components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
         }
 
         if let endDate = endDate {
-            components.append("\"endDate\":\"\(ISO8601DateFormatter().string(from: endDate))\"")
+            components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
         }
 
         if contentType != .all {

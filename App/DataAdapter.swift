@@ -306,9 +306,8 @@ public actor DataAdapter {
     /// Log timing for tab click filter queries
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String?) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let timestamp = ISO8601DateFormatter().string(from: Date())
         let filterInfo = filter ?? "no-filter"
-        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
 
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {

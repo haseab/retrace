@@ -664,8 +664,7 @@ extension AppDelegate {
     }
 
     private static func appendDebugFile(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
+        let line = "[\(Log.timestamp())] \(message)\n"
         let url = URL(fileURLWithPath: "/tmp/retrace_debug.log")
 
         guard let data = line.data(using: .utf8) else { return }

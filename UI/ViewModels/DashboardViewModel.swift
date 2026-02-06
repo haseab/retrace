@@ -8,8 +8,7 @@ import Dispatch
 
 /// Debug logger that writes to /tmp/retrace_debug.log
 private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let logLine = "[\(timestamp)] \(message)\n"
+    let logLine = "[\(Log.timestamp())] \(message)\n"
     let logPath = "/tmp/retrace_debug.log"
 
     if let handle = FileHandle(forWritingAtPath: logPath) {
@@ -79,6 +78,10 @@ public class DashboardViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var refreshTimer: DispatchSourceTimer?
 
+    /// Whether the dashboard window is currently visible
+    /// Set by DashboardWindowController on show/hide to gate UI updates
+    public var isWindowVisible: Bool = false
+
     // MARK: - Initialization
 
     public init(coordinator: AppCoordinator) {
@@ -109,8 +112,11 @@ public class DashboardViewModel: ObservableObject {
         timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
         timer.setEventHandler { [weak self] in
             Task { @MainActor in
-                await self?.updateRecordingStatus()
-                self?.checkPermissions()
+                guard let self = self else { return }
+                // Skip UI updates when window is hidden to avoid SwiftUI diffing
+                guard self.isWindowVisible else { return }
+                await self.updateRecordingStatus()
+                self.checkPermissions()
             }
         }
         timer.resume()

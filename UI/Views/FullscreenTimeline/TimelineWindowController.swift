@@ -31,8 +31,7 @@ public class TimelineWindowController: NSObject {
     private func logShowTiming(_ checkpoint: String) {
         guard showStartTime > 0 else { return }
         let elapsed = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] \(checkpoint): \(String(format: "%.1f", elapsed))ms\n"
+        let line = "[\(Log.timestamp())] \(checkpoint): \(String(format: "%.1f", elapsed))ms\n"
 
         // Append to file
         if let data = line.data(using: .utf8) {
@@ -51,8 +50,7 @@ public class TimelineWindowController: NSObject {
     /// Start a new performance trace (clears previous entries and logs header)
     private func startPerfTrace() {
         showStartTime = CFAbsoluteTimeGetCurrent()
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let header = "\n--- Timeline Show @ \(timestamp) ---\n"
+        let header = "\n--- Timeline Show @ \(Log.timestamp()) ---\n"
         try? header.data(using: .utf8)?.write(to: Self.perfLogPath)
         Log.info("[TIMELINE-PERF] ⏱️ Logging to: \(Self.perfLogPath.path)", category: .ui)
     }
@@ -504,6 +502,15 @@ public class TimelineWindowController: NSObject {
     private func showPreparedWindow(coordinator: AppCoordinator) {
         logShowTiming("showPreparedWindow started")
         guard let window = window else { return }
+
+        // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
+        if let hostingView = hostingView, hostingView.superview == nil {
+            hostingView.frame = window.contentView?.bounds ?? .zero
+            window.contentView?.addSubview(hostingView)
+            hostingView.layoutSubtreeIfNeeded()
+            logShowTiming("hosting view reattached")
+        }
+
         timelineViewModel?.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
 
@@ -637,6 +644,10 @@ public class TimelineWindowController: NSObject {
                 // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
                 window.ignoresMouseEvents = true
                 window.orderOut(nil)
+                // CRITICAL: Detach SwiftUI view from window to stop display cycle updates
+                // The hosting view stays in memory but is no longer in the view hierarchy,
+                // so AppKit won't trigger layout passes on it (saving significant CPU)
+                self?.hostingView?.removeFromSuperview()
                 self?.isVisible = false
                 Self.isTimelineVisible = false  // For emergency escape tap
                 self?.lastHiddenAt = Date()
@@ -882,6 +893,12 @@ public class TimelineWindowController: NSObject {
 
         // Check if we have a pre-rendered window ready
         if isPrepared, let window = window, let viewModel = timelineViewModel {
+            // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
+            if let hostingView = hostingView, hostingView.superview == nil {
+                hostingView.frame = window.contentView?.bounds ?? .zero
+                window.contentView?.addSubview(hostingView)
+                hostingView.layoutSubtreeIfNeeded()
+            }
             // Move window to target screen if needed
             if window.frame != targetScreen.frame {
                 window.setFrame(targetScreen.frame, display: false)
@@ -925,6 +942,13 @@ public class TimelineWindowController: NSObject {
     /// Fade in the prepared window (called after data is loaded)
     private func fadeInPreparedWindow() {
         guard let window = window, let coordinator = coordinator else { return }
+
+        // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
+        if let hostingView = hostingView, hostingView.superview == nil {
+            hostingView.frame = window.contentView?.bounds ?? .zero
+            window.contentView?.addSubview(hostingView)
+            hostingView.layoutSubtreeIfNeeded()
+        }
 
         // Ensure tape starts hidden and cancel any pending animation
         timelineViewModel?.isTapeHidden = true
@@ -983,9 +1007,8 @@ public class TimelineWindowController: NSObject {
     /// Log timing for tab click filter queries
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, bundleID: String, browserUrl: String?) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let timestamp = ISO8601DateFormatter().string(from: Date())
         let filterInfo = browserUrl ?? bundleID
-        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
 
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {

@@ -38,6 +38,19 @@ public enum Log {
     /// Subsystem for os.log
     private static let subsystem = "io.retrace.app"
 
+    /// Shared ISO8601 formatter for timestamps (avoids expensive allocations per log call)
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    /// Thread-safe timestamp formatting
+    public static func timestamp(from date: Date = Date()) -> String {
+        // ISO8601DateFormatter is thread-safe for string(from:) operations
+        return iso8601Formatter.string(from: date)
+    }
+
     /// Whether to also print to console (always true for both DEBUG and release builds)
     /// This ensures logs are always written to stdout for export capabilities
     private static var printToConsole = true
@@ -213,8 +226,7 @@ public enum Log {
         line: Int
     ) {
         let filename = (file as NSString).lastPathComponent
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let formattedLog = "[\(timestamp)] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
+        let formattedLog = "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
         print(formattedLog)
 
         // Also write to log file for persistence across crashes

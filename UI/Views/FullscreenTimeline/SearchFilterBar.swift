@@ -5,8 +5,7 @@ import AppKit
 
 /// Debug logging to file
 private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
+    let line = "[\(Log.timestamp())] \(message)\n"
     let path = "/tmp/retrace_debug.log"
     if let data = line.data(using: .utf8) {
         if FileManager.default.fileExists(atPath: path) {
@@ -54,7 +53,7 @@ public struct SearchFilterBar: View {
     // MARK: - Body
 
     private func logToFile(_ message: String) {
-        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let logMessage = "[\(Log.timestamp())] \(message)\n"
         if let data = logMessage.data(using: .utf8) {
             let logPath = "/tmp/retrace_debug.log"
             if !FileManager.default.fileExists(atPath: logPath) {
@@ -440,7 +439,7 @@ private struct FilterChip: View {
     @State private var isHovered = false
 
     private func logToFile(_ message: String) {
-        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let logMessage = "[\(Log.timestamp())] \(message)\n"
         if let data = logMessage.data(using: .utf8) {
             let logPath = "/tmp/retrace_debug.log"
             if !FileManager.default.fileExists(atPath: logPath) {
@@ -516,7 +515,7 @@ private struct AppsFilterChip: View {
     }
 
     private func logToFile(_ message: String) {
-        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let logMessage = "[\(Log.timestamp())] \(message)\n"
         if let data = logMessage.data(using: .utf8) {
             let logPath = "/tmp/retrace_debug.log"
             if !FileManager.default.fileExists(atPath: logPath) {
@@ -1155,7 +1154,7 @@ private struct TagsFilterChip: View {
     }
 
     private func logToFile(_ message: String) {
-        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let logMessage = "[\(Log.timestamp())] \(message)\n"
         if let data = logMessage.data(using: .utf8) {
             let logPath = "/tmp/retrace_debug.log"
             if !FileManager.default.fileExists(atPath: logPath) {
@@ -1241,7 +1240,7 @@ private struct VisibilityFilterChip: View {
     }
 
     private func logToFile(_ message: String) {
-        let logMessage = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        let logMessage = "[\(Log.timestamp())] \(message)\n"
         if let data = logMessage.data(using: .utf8) {
             let logPath = "/tmp/retrace_debug.log"
             if !FileManager.default.fileExists(atPath: logPath) {

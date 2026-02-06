@@ -210,9 +210,8 @@ public final class FeedbackService {
                 .suffix(maxEntries)
 
             return entries.map { entry in
-                let timestamp = ISO8601DateFormatter().string(from: entry.date)
                 let level = logLevelString(entry.level)
-                return "[\(timestamp)] [\(level)] [\(entry.category)] \(entry.composedMessage)"
+                return "[\(Log.timestamp(from: entry.date))] [\(level)] [\(entry.category)] \(entry.composedMessage)"
             }
         } catch {
             return ["Failed to collect logs: \(error.localizedDescription)"]
@@ -309,7 +308,7 @@ public final class FeedbackService {
         let diagnostics = collectDiagnostics()
         let content = diagnostics.formattedText()
 
-        let fileName = "retrace-diagnostics-\(ISO8601DateFormatter().string(from: Date())).txt"
+        let fileName = "retrace-diagnostics-\(Log.timestamp()).txt"
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
 
         do {

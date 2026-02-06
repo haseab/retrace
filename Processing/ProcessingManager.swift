@@ -3,8 +3,7 @@ import Shared
 
 /// Debug logger that writes to /tmp/retrace_debug.log
 private func debugLog(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let logLine = "[\(timestamp)] [ProcessingManager] \(message)\n"
+    let logLine = "[\(Log.timestamp())] [ProcessingManager] \(message)\n"
     let logPath = "/tmp/retrace_debug.log"
 
     if let handle = FileHandle(forWritingAtPath: logPath) {

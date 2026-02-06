@@ -309,10 +309,17 @@ public struct DashboardView: View {
             }
         )
         .task {
+            viewModel.isWindowVisible = true
             await viewModel.loadStatistics()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
             Task { await viewModel.loadStatistics() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dashboardDidOpen)) { _ in
+            viewModel.isWindowVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dashboardDidClose)) { _ in
+            viewModel.isWindowVisible = false
         }
         .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { notification in
             if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
@@ -454,8 +461,7 @@ public struct DashboardView: View {
 
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filter))\n"
+        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filter))\n"
 
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {

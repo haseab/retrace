@@ -29,6 +29,10 @@ public actor StorageManager: StorageProtocol {
     /// Maximum number of generators to keep cached
     private let maxCachedGenerators = 10
 
+    /// Cache for segment file paths, keyed by segment ID
+    /// Avoids expensive directory enumeration on every frame read
+    private var segmentPathCache: [Int64: URL] = [:]
+
     /// Cached AVAssetImageGenerator entry
     private struct GeneratorCacheEntry {
         let generator: AVAssetImageGenerator
@@ -478,16 +482,29 @@ public actor StorageManager: StorageProtocol {
     /// Clear the frame cache (useful when video files are modified)
     public func clearFrameCache() {
         frameCache.removeAll()
-        Log.info("[StorageManager] Frame cache cleared", category: .storage)
+        segmentPathCache.removeAll()
+        Log.info("[StorageManager] Frame and segment path caches cleared", category: .storage)
     }
 
     /// Clear cache for a specific segment (call when segment is finalized or modified)
     public func clearFrameCache(for segmentID: VideoSegmentID) {
         frameCache.removeValue(forKey: segmentID.value)
+        segmentPathCache.removeValue(forKey: segmentID.value)
         Log.debug("[StorageManager] Cleared cache for segment \(segmentID.value)", category: .storage)
     }
 
     public func getSegmentPath(id: VideoSegmentID) async throws -> URL {
+        // Check cache first to avoid expensive directory enumeration
+        if let cached = segmentPathCache[id.value] {
+            // Verify file still exists (could have been deleted)
+            if FileManager.default.fileExists(atPath: cached.path) {
+                return cached
+            }
+            // File was deleted, remove from cache
+            segmentPathCache.removeValue(forKey: id.value)
+        }
+
+        // Cache miss - enumerate directory
         let files = try await directoryManager.listAllSegmentFiles()
         // CRITICAL: Use exact match, not substring! Files are named with Int64 ID (e.g., "1768624554519")
         // .contains() would match "8" in "1768624603374" - must use == for exact match
@@ -496,6 +513,8 @@ public actor StorageManager: StorageProtocol {
             $0.lastPathComponent == id.stringValue ||
             $0.lastPathComponent == "\(id.stringValue).mp4"
         }) {
+            // Cache the result
+            segmentPathCache[id.value] = match
             return match
         }
         throw StorageError.fileNotFound(path: id.stringValue)
@@ -505,6 +524,8 @@ public actor StorageManager: StorageProtocol {
         let url = try await getSegmentPath(id: id)
         do {
             try FileManager.default.removeItem(at: url)
+            // Invalidate cache entry
+            segmentPathCache.removeValue(forKey: id.value)
         } catch {
             throw StorageError.fileWriteFailed(path: url.path, underlying: error.localizedDescription)
         }

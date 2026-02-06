@@ -1750,11 +1750,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         if let startDate = filterCriteria.startDate {
-            components.append("\"startDate\":\"\(ISO8601DateFormatter().string(from: startDate))\"")
+            components.append("\"startDate\":\"\(Log.timestamp(from: startDate))\"")
         }
 
         if let endDate = filterCriteria.endDate {
-            components.append("\"endDate\":\"\(ISO8601DateFormatter().string(from: endDate))\"")
+            components.append("\"endDate\":\"\(Log.timestamp(from: endDate))\"")
         }
 
         return "{\(components.joined(separator: ","))}"
@@ -2334,9 +2334,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Log timing for tab click filter queries
     private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime) {
         let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let timestamp = ISO8601DateFormatter().string(from: Date())
         let filterInfo = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "no-filter"
-        let line = "[\(timestamp)] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
+        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
 
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
