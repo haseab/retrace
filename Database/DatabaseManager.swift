@@ -1835,6 +1835,54 @@ public actor DatabaseManager: DatabaseProtocol {
         return Int(sqlite3_column_int(stmt, 0))
     }
 
+    /// Get count of frames that are pending or currently processing (status 0 or 1)
+    public func getPendingFrameCount() async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus IN (0, 1);"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK,
+              sqlite3_step(stmt) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        return Int(sqlite3_column_int(stmt, 0))
+    }
+
+    /// Get separate counts for pending (status 0) and processing (status 1) frames
+    public func getFrameStatusCounts() async throws -> (pending: Int, processing: Int) {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = "SELECT processingStatus, COUNT(*) FROM frame WHERE processingStatus IN (0, 1) GROUP BY processingStatus;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var pending = 0
+        var processing = 0
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let status = Int(sqlite3_column_int(stmt, 0))
+            let count = Int(sqlite3_column_int(stmt, 1))
+            if status == 0 {
+                pending = count
+            } else if status == 1 {
+                processing = count
+            }
+        }
+
+        return (pending: pending, processing: processing)
+    }
+
     /// Clear the entire processing queue (used when changing database location)
     /// WARNING: This removes all pending OCR work! Only call when intentionally switching databases.
     public func clearProcessingQueue() async throws {
@@ -1876,6 +1924,56 @@ public actor DatabaseManager: DatabaseProtocol {
         return frameIDs
     }
 
+    /// Get count of frames processed per minute for the last N minutes
+    /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute
+    public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        // Query frames by processedAt (when OCR completed) in the last N minutes
+        // processedAt is stored as INTEGER Unix timestamp in milliseconds
+        // Use clean minute boundaries (floor to start of minute) for consistent bucketing
+        // e.g., 17:05:23 becomes minute key for 17:05:00
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let currentMinuteMs = (nowMs / 60000) * 60000  // Floor to start of current minute
+        let cutoffMs = currentMinuteMs - Int64(lastMinutes * 60 * 1000)
+
+        // Group by which minute bucket the frame was processed in
+        // minuteOffset 0 = current minute (e.g., 17:05:00 to 17:05:59)
+        // minuteOffset 1 = previous minute (e.g., 17:04:00 to 17:04:59)
+        let sql = """
+            SELECT
+                CAST((\(currentMinuteMs) - (processedAt / 60000) * 60000) / 60000 AS INTEGER) as minuteOffset,
+                COUNT(*) as count
+            FROM frame
+            WHERE processedAt IS NOT NULL
+              AND processedAt >= \(cutoffMs)
+            GROUP BY minuteOffset
+            ORDER BY minuteOffset ASC;
+        """
+
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+
+        var result: [Int: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let minuteOffset = Int(sqlite3_column_int(stmt, 0))
+            let count = Int(sqlite3_column_int(stmt, 1))
+            if minuteOffset >= 0 && minuteOffset < lastMinutes {
+                result[minuteOffset] = count
+            }
+        }
+
+        Log.debug("[DatabaseManager] getFramesProcessedPerMinute returned \(result.count) minute buckets, total: \(result.values.reduce(0, +)) frames", category: .database)
+
+        return result
+    }
+
     /// Retry a frame by re-adding it to the processing queue with incremented retry count
     public func retryFrameProcessing(frameID: Int64, retryCount: Int, errorMessage: String) async throws {
         guard let db = db else {
@@ -1907,12 +2005,21 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     /// Update frame processing status
+    /// When status is 2 (completed), also sets processedAt timestamp
     public func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+        // If status is 2 (completed), also set processedAt timestamp
+        let sql: String
+        if status == 2 {
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+        } else {
+            sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+        }
+
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 

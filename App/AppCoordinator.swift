@@ -44,6 +44,9 @@ public actor AppCoordinator {
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
 
+    // Periodic task to finalize orphaned videos (processingState stuck at 1)
+    private var orphanedVideoCleanupTask: Task<Void, Never>?
+
     // MARK: - Initialization
 
     public init(services: ServiceContainer) {
@@ -106,6 +109,12 @@ public actor AppCoordinator {
         }
 
         Log.info("AppCoordinator initialized successfully", category: .app)
+
+        // Apply power-aware OCR settings
+        await applyPowerSettings()
+
+        // Start periodic orphaned video cleanup (runs every 60s)
+        startOrphanedVideoCleanup()
 
         // Log auto-start state for debugging
         let shouldAutoStart = Self.shouldAutoStartRecording()
@@ -360,9 +369,79 @@ public actor AppCoordinator {
             try await stopPipeline(persistState: false)
         }
 
+        // Stop periodic cleanup tasks
+        stopOrphanedVideoCleanup()
+
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
         Log.info("AppCoordinator shutdown complete", category: .app)
+    }
+
+    // MARK: - Power Settings
+
+    /// Apply power-aware OCR settings to the processing queue
+    /// Called on startup, when settings change, and when power source changes
+    public func applyPowerSettings() async {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
+        // Get OCR enabled state (defaults to true if not set)
+        let ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
+        let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
+        let maxFPS = defaults.double(forKey: "ocrMaxFramesPerSecond")
+
+        // Parse app filter mode and filtered apps
+        let filterModeRaw = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
+        let filterMode = OCRAppFilterMode(rawValue: filterModeRaw) ?? .allApps
+
+        var excludedBundleIDs: Set<String> = []
+        var includedBundleIDs: Set<String> = []
+
+        // ocrFilteredApps is stored as JSON array of {bundleID, name, iconPath} objects
+        struct FilteredAppInfo: Codable {
+            let bundleID: String
+        }
+        let appsString = defaults.string(forKey: "ocrFilteredApps") ?? ""
+        Log.info("[AppCoordinator] Raw ocrFilteredApps from UserDefaults: '\(appsString)'", category: .app)
+        Log.info("[AppCoordinator] Raw ocrAppFilterMode from UserDefaults: '\(filterModeRaw)'", category: .app)
+
+        if !appsString.isEmpty,
+           let data = appsString.data(using: .utf8),
+           let apps = try? JSONDecoder().decode([FilteredAppInfo].self, from: data) {
+            let bundleIDs = apps.map(\.bundleID)
+            Log.info("[AppCoordinator] Parsed bundleIDs: \(bundleIDs)", category: .app)
+            switch filterMode {
+            case .allApps:
+                Log.info("[AppCoordinator] Filter mode is allApps, not applying any filter", category: .app)
+                break // No filtering
+            case .onlyTheseApps:
+                includedBundleIDs = Set(bundleIDs)
+                Log.info("[AppCoordinator] Filter mode is onlyTheseApps, includedBundleIDs=\(includedBundleIDs)", category: .app)
+            case .allExceptTheseApps:
+                excludedBundleIDs = Set(bundleIDs)
+                Log.info("[AppCoordinator] Filter mode is allExceptTheseApps, excludedBundleIDs=\(excludedBundleIDs)", category: .app)
+            }
+        } else {
+            Log.info("[AppCoordinator] No filtered apps configured or failed to parse", category: .app)
+        }
+
+        // Get current power source
+        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+
+        // Apply to processing queue
+        if let queue = await services.processingQueue {
+            await queue.updatePowerConfig(
+                ocrEnabled: ocrEnabled,
+                pauseOnBattery: pauseOnBattery,
+                currentPowerSource: powerSource,
+                maxFPS: maxFPS,
+                excludedBundleIDs: excludedBundleIDs,
+                includedBundleIDs: includedBundleIDs
+            )
+        } else {
+            Log.warning("[AppCoordinator] processingQueue is nil, cannot apply power config", category: .app)
+        }
+
+        Log.info("[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), maxFPS=\(maxFPS), power=\(powerSource), filterMode=\(filterMode), excluded=\(excludedBundleIDs), included=\(includedBundleIDs)", category: .app)
     }
 
     /// Handle capture stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
@@ -469,6 +548,54 @@ public actor AppCoordinator {
         await PermissionMonitor.shared.stopMonitoring()
         permissionMonitorSetup = false
         Log.info("[AppCoordinator] Permission monitoring stopped", category: .app)
+    }
+
+    // MARK: - Orphaned Video Cleanup
+
+    /// Start periodic cleanup of orphaned videos (processingState stuck at 1)
+    /// Runs every 60 seconds to catch videos that weren't finalized properly
+    private func startOrphanedVideoCleanup() {
+        orphanedVideoCleanupTask?.cancel()
+
+        orphanedVideoCleanupTask = Task { [weak self] in
+            let cleanupInterval: UInt64 = 60_000_000_000 // 60 seconds
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: cleanupInterval)
+                guard !Task.isCancelled else { break }
+
+                await self?.cleanupOrphanedVideos()
+            }
+        }
+
+        Log.info("[AppCoordinator] Orphaned video cleanup task started (60s interval)", category: .app)
+    }
+
+    /// Stop the orphaned video cleanup task
+    private func stopOrphanedVideoCleanup() {
+        orphanedVideoCleanupTask?.cancel()
+        orphanedVideoCleanupTask = nil
+    }
+
+    /// Finalize any orphaned videos that have processingState=1 but no active WAL session
+    private func cleanupOrphanedVideos() async {
+        do {
+            // Get active WAL sessions to exclude currently-being-written videos
+            guard let storageManager = services.storage as? StorageManager else {
+                return
+            }
+
+            let walManager = await storageManager.getWALManager()
+            let activeWALSessions = try await walManager.listActiveSessions()
+            let activeVideoIDs = Set(activeWALSessions.map { $0.videoID.value })
+
+            let orphanedCount = try await services.database.finalizeOrphanedVideos(activeVideoIDs: activeVideoIDs)
+            if orphanedCount > 0 {
+                Log.warning("[OrphanCleanup] Finalized \(orphanedCount) orphaned videos (processingState was stuck at 1)", category: .app)
+            }
+        } catch {
+            Log.error("[OrphanCleanup] Failed to cleanup orphaned videos", category: .app, error: error)
+        }
     }
 
     // MARK: - Pipeline Implementation
@@ -693,31 +820,15 @@ public actor AppCoordinator {
             }
         }
 
-        // Save all remaining writers (unfinalised - can be resumed later)
+        // Save and finalize all remaining writers
         for (resolutionKey, var writerState) in writersByResolution {
             do {
-                let finalWidth = await writerState.writer.frameWidth
-                let finalHeight = await writerState.writer.frameHeight
-                let finalSize = await writerState.writer.currentFileSize
-                try await services.database.updateVideoSegment(
-                    id: writerState.videoDBID,
-                    width: finalWidth,
-                    height: finalHeight,
-                    fileSize: finalSize,
-                    frameCount: writerState.frameCount
-                )
-                _ = try await writerState.writer.finalize()
-                Log.info("Video segment for \(resolutionKey) saved (unfinalised, \(writerState.frameCount) frames)", category: .app)
-
-                // After finalization, all frames are readable - mark them and enqueue for OCR
-                if let processingQueue = await services.processingQueue {
-                    for bufferedFrame in writerState.pendingFrames {
-                        try await services.database.markFrameReadable(frameID: bufferedFrame.frameID)
-                        try await processingQueue.enqueue(frameID: bufferedFrame.frameID, capturedFrame: bufferedFrame.capturedFrame)
-                    }
-                }
+                // Use finalizeWriter to properly mark video as finalized (processingState = 0)
+                // This ensures frames can be OCR processed even if pipeline stops mid-video
+                try await finalizeWriter(&writerState, processingQueue: await services.processingQueue)
+                Log.info("Video segment for \(resolutionKey) finalized (\(writerState.frameCount) frames)", category: .app)
             } catch {
-                Log.error("[Pipeline] Failed to save video segment for \(resolutionKey)", category: .app, error: error)
+                Log.error("[Pipeline] Failed to finalize video segment for \(resolutionKey)", category: .app, error: error)
             }
         }
 
@@ -916,6 +1027,32 @@ public actor AppCoordinator {
     //
     //     Log.info("Audio pipeline processing completed", category: .app)
     // }
+
+    // MARK: - Queue Monitoring
+
+    /// Get current OCR processing queue statistics
+    public func getQueueStatistics() async -> QueueStatistics? {
+        guard let queue = await services.processingQueue else {
+            return nil
+        }
+        return await queue.getStatistics()
+    }
+
+    /// Get current power state for monitoring display
+    nonisolated public func getCurrentPowerState() -> (source: PowerStateMonitor.PowerSource, isPaused: Bool) {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
+        let source = PowerStateMonitor.shared.getCurrentPowerSource()
+        let isPaused = pauseOnBattery && source == .battery
+        return (source, isPaused)
+    }
+
+    /// Get frames processed per minute for the last N minutes
+    /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute
+    public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        let db = await services.database
+        return try await db.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
+    }
 
     // MARK: - Search Interface
 

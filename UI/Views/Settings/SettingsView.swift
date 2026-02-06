@@ -52,7 +52,16 @@ enum SettingsDefaults {
     static let showFrameIDs = false
     static let enableFrameIDSearch = false
     static let showOCRDebugOverlay = false
+
+    // MARK: OCR Power
+    static let ocrEnabled = true
+    static let ocrOnlyWhenPluggedIn = false
+    static let ocrMaxFramesPerSecond: Double = 0  // 0 = unlimited
+    static let ocrAppFilterMode: OCRAppFilterMode = .allApps
+    static let ocrFilteredApps = ""  // JSON array of bundle IDs
 }
+
+// OCRAppFilterMode is defined in Shared/PowerStateMonitor.swift
 
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
@@ -60,8 +69,21 @@ public struct SettingsView: View {
 
     // MARK: - Properties
 
+    /// Optional initial tab to open (passed from parent when navigating to specific section)
+    private let initialTab: SettingsTab?
+
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
+
+    // MARK: - Initialization
+
+    public init(initialTab: SettingsTab? = nil) {
+        self.initialTab = initialTab
+        // Set initial selected tab if provided
+        if let tab = initialTab {
+            _selectedTab = State(initialValue: tab)
+        }
+    }
 
     // MARK: General Settings
     @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = SettingsDefaults.launchAtLogin
@@ -180,6 +202,18 @@ public struct SettingsView: View {
     @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
     @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     @AppStorage("showOCRDebugOverlay", store: settingsStore) private var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
+
+    // MARK: OCR Power Settings
+    @AppStorage("ocrEnabled", store: settingsStore) private var ocrEnabled = SettingsDefaults.ocrEnabled
+    @AppStorage("ocrOnlyWhenPluggedIn", store: settingsStore) private var ocrOnlyWhenPluggedIn = SettingsDefaults.ocrOnlyWhenPluggedIn
+    @AppStorage("ocrMaxFramesPerSecond", store: settingsStore) private var ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+    @AppStorage("ocrAppFilterMode", store: settingsStore) private var ocrAppFilterMode: OCRAppFilterMode = SettingsDefaults.ocrAppFilterMode
+    @AppStorage("ocrFilteredApps", store: settingsStore) private var ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
+    @State private var ocrFilteredAppsPopoverShown = false
+    @State private var installedAppsForOCR: [(bundleID: String, name: String)] = []
+    @State private var otherAppsForOCR: [(bundleID: String, name: String)] = []
+    @State private var currentPowerSource: PowerStateMonitor.PowerSource = .unknown
+    @State private var pendingOCRFrameCount: Int = 0
 
     // MARK: Tag Management
     @State private var tagsForSettings: [Tag] = []
@@ -304,6 +338,9 @@ public struct SettingsView: View {
         }
         .onChange(of: recordingShortcut) { _ in
             Task { await saveShortcuts() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
+            selectedTab = .power
         }
     }
 
@@ -497,6 +534,8 @@ public struct SettingsView: View {
                         exportDataSettings
                     case .privacy:
                         privacySettings
+                    case .power:
+                        powerSettings
                     case .tags:
                         tagManagementSettings
                     case .advanced:
@@ -533,6 +572,26 @@ public struct SettingsView: View {
                 }
 
                 Spacer()
+
+                // System Monitor button (only for Power tab)
+                if selectedTab == .power {
+                    Button(action: {
+                        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform.path.ecg")
+                                .font(.system(size: 12))
+                            Text("System Monitor")
+                                .font(.retraceCaption2)
+                        }
+                        .foregroundColor(.white.opacity(0.7))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
 
                 // Reset section button (only for sections with resettable settings)
                 if let resetAction = selectedTab.resetAction(for: self) {
@@ -1907,6 +1966,399 @@ public struct SettingsView: View {
                 await checkPermissions()
             }
         }
+    }
+
+    // MARK: - Power Settings
+
+    private var powerSettings: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            // Prominent energy usage banner
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(Color.orange.opacity(0.2))
+                        .frame(width: 44, height: 44)
+                    Image(systemName: "bolt.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundColor(.orange)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("OCR is the main source of energy usage")
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.retracePrimary)
+                    Text("Screen recording uses minimal power. Text extraction (OCR) uses most CPU. Adjust settings below to reduce energy consumption.")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.orange.opacity(0.08))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
+                    )
+            )
+
+            ModernSettingsCard(title: "OCR Processing", icon: "text.viewfinder") {
+                VStack(spacing: 16) {
+                    ModernToggleRow(
+                        title: "Enable OCR",
+                        subtitle: "Extract text from screen captures for search",
+                        isOn: $ocrEnabled
+                    )
+                    .onChange(of: ocrEnabled) { _ in
+                        notifyPowerSettingsChanged()
+                    }
+
+                    if ocrEnabled {
+                        Divider()
+                            .background(Color.retraceBorder)
+
+                        ModernToggleRow(
+                            title: "Process only when plugged in",
+                            subtitle: "Queue OCR on battery, process when connected to power",
+                            isOn: $ocrOnlyWhenPluggedIn
+                        )
+                        .onChange(of: ocrOnlyWhenPluggedIn) { _ in
+                            notifyPowerSettingsChanged()
+                        }
+
+                        // Show power status when plugged-in mode is enabled
+                        if ocrOnlyWhenPluggedIn {
+                            HStack(spacing: 8) {
+                                Image(systemName: currentPowerSource == .ac ? "bolt.fill" : "battery.50")
+                                    .foregroundColor(currentPowerSource == .ac ? .green : .orange)
+                                    .font(.system(size: 14))
+                                Text(currentPowerSource == .ac ? "On AC power - processing OCR" : "On battery - OCR queued")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.retraceCard)
+                            .cornerRadius(8)
+                        }
+                    }
+                }
+            }
+
+            if ocrEnabled {
+                ModernSettingsCard(title: "Power Efficiency", icon: "leaf.fill") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack {
+                            Text("Max OCR rate")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Spacer()
+                            Text(ocrRateDisplayText)
+                                .font(.retraceCalloutBold)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.retraceAccent.opacity(0.3))
+                                .cornerRadius(8)
+                        }
+
+                        // Slider: left = slow (0.1 FPS), right = fast (unlimited/0)
+                        // We display inverted: slider 0.1 = slow, slider 2 = unlimited
+                        // But storage: 0 = unlimited, 0.1-2 = FPS limit
+                        Slider(value: Binding(
+                            get: { ocrMaxFramesPerSecond == 0 ? 2.0 : (2.1 - ocrMaxFramesPerSecond) },
+                            set: { newValue in
+                                if newValue >= 1.9 {
+                                    ocrMaxFramesPerSecond = 0  // Unlimited
+                                } else {
+                                    ocrMaxFramesPerSecond = max(0.1, 2.1 - newValue)
+                                }
+                            }
+                        ), in: 0.1...2, step: 0.1)
+                            .tint(.retraceAccent)
+                            .onChange(of: ocrMaxFramesPerSecond) { _ in
+                                notifyPowerSettingsChanged()
+                            }
+
+                        HStack {
+                            Text(ocrRateDescriptionText)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                            Spacer()
+
+                            if ocrMaxFramesPerSecond != SettingsDefaults.ocrMaxFramesPerSecond {
+                                Button(action: {
+                                    ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 10))
+                                        Text("Reset")
+                                            .font(.retraceCaption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.7))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+
+                ModernSettingsCard(title: "App Filter", icon: "app.badge") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Skip OCR for specific apps to save power")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+
+                        // Show selected apps as chips
+                        if !ocrFilteredApps.isEmpty {
+                            FlowLayout(spacing: 8) {
+                                ForEach(ocrFilteredApps, id: \.bundleID) { app in
+                                    HStack(spacing: 6) {
+                                        // App icon
+                                        if let icon = AppIconProvider.shared.icon(for: app.bundleID) {
+                                            Image(nsImage: icon)
+                                                .resizable()
+                                                .frame(width: 16, height: 16)
+                                        } else {
+                                            Image(systemName: "app.fill")
+                                                .font(.system(size: 12))
+                                                .foregroundColor(.retraceSecondary)
+                                        }
+                                        Text(app.name)
+                                            .font(.retraceCaption2Medium)
+                                            .foregroundColor(.retracePrimary)
+                                            .lineLimit(1)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                        // Include/Exclude indicator
+                                        Text(ocrAppFilterMode == .onlyTheseApps ? "only" : "skip")
+                                            .font(.system(size: 9, weight: .medium))
+                                            .foregroundColor(ocrAppFilterMode == .onlyTheseApps ? .green : .orange)
+                                        Button(action: {
+                                            removeOCRFilteredApp(app)
+                                        }) {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 8, weight: .bold))
+                                                .foregroundColor(.retraceSecondary)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.retraceCard)
+                                    .cornerRadius(6)
+                                    .fixedSize()
+                                }
+                            }
+                        }
+
+                        // Add app button with popover
+                        Button(action: {
+                            ocrFilteredAppsPopoverShown = true
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "plus.circle.fill")
+                                    .font(.system(size: 14))
+                                Text(ocrFilteredApps.isEmpty ? "Add apps to filter" : "Add more apps")
+                                    .font(.retraceCaption2Medium)
+                            }
+                            .foregroundColor(.retraceAccent)
+                            .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.plain)
+                        .popover(isPresented: $ocrFilteredAppsPopoverShown) {
+                            AppsFilterPopover(
+                                apps: installedAppsForOCR,
+                                otherApps: [],
+                                selectedApps: Set(ocrFilteredApps.map(\.bundleID)),
+                                filterMode: ocrAppFilterMode == .onlyTheseApps ? .include : .exclude,
+                                allowMultiSelect: true,
+                                showAllOption: false,
+                                onSelectApp: { bundleID in
+                                    guard let bundleID = bundleID else { return }
+                                    toggleOCRFilteredApp(bundleID)
+                                },
+                                onFilterModeChange: { mode in
+                                    ocrAppFilterMode = mode == .include ? .onlyTheseApps : .allExceptTheseApps
+                                    notifyPowerSettingsChanged()
+                                },
+                                onDismiss: {
+                                    ocrFilteredAppsPopoverShown = false
+                                }
+                            )
+                        }
+
+                        // Explanation of current mode
+                        if !ocrFilteredApps.isEmpty {
+                            HStack(spacing: 6) {
+                                Image(systemName: ocrAppFilterMode == .onlyTheseApps ? "checkmark.circle" : "minus.circle")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(ocrAppFilterMode == .onlyTheseApps ? .green : .orange)
+                                Text(ocrAppFilterMode == .onlyTheseApps
+                                     ? "OCR runs only for these apps"
+                                     : "OCR skipped for these apps")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary.opacity(0.8))
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tips card
+            HStack(spacing: 12) {
+                Image(systemName: "lightbulb.fill")
+                    .foregroundColor(.yellow)
+                    .font(.system(size: 16))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Tips for reducing energy usage")
+                        .font(.retraceCaption2Medium)
+                        .foregroundColor(.retracePrimary)
+                    Text("• Lower the OCR rate to reduce fan noise\n• Use \"Process only when plugged in\" for laptops\n• Exclude apps where text search isn't needed")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                }
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.yellow.opacity(0.08))
+            .cornerRadius(10)
+        }
+        .onAppear {
+            updatePowerSourceStatus()
+            loadOCRFilteredApps()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PowerSourceDidChange"))) { _ in
+            updatePowerSourceStatus()
+        }
+    }
+
+    private var ocrRateDisplayText: String {
+        if ocrMaxFramesPerSecond == 0 {
+            return "Unlimited"
+        } else if ocrMaxFramesPerSecond < 1 {
+            return String(format: "%.1f FPS", ocrMaxFramesPerSecond)
+        } else {
+            return String(format: "%.0f FPS", ocrMaxFramesPerSecond)
+        }
+    }
+
+    private var ocrRateDescriptionText: String {
+        if ocrMaxFramesPerSecond == 0 {
+            return "Process frames as fast as possible (may cause fan noise)"
+        } else if ocrMaxFramesPerSecond <= 0.5 {
+            return "Quietest mode - minimal CPU and fan activity"
+        } else if ocrMaxFramesPerSecond <= 1.0 {
+            return "Balanced - good performance with low fan noise"
+        } else {
+            return "Higher performance - may increase fan activity"
+        }
+    }
+
+    private var ocrFilteredApps: [ExcludedAppInfo] {
+        guard !ocrFilteredAppsString.isEmpty,
+              let data = ocrFilteredAppsString.data(using: .utf8),
+              let apps = try? JSONDecoder().decode([ExcludedAppInfo].self, from: data) else {
+            return []
+        }
+        return apps
+    }
+
+    private func loadOCRFilteredApps() {
+        // Load apps from capture history (database) - these have the actual bundle IDs
+        // that match what's recorded during screen capture
+        Task {
+            do {
+                let bundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
+                let apps: [(bundleID: String, name: String)] = bundleIDs.map { bundleID in
+                    let name = AppNameResolver.shared.displayName(for: bundleID)
+                    return (bundleID: bundleID, name: name)
+                }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+                await MainActor.run {
+                    installedAppsForOCR = apps
+                }
+            } catch {
+                Log.error("[SettingsView] Failed to load apps for OCR filter: \(error)", category: .ui)
+                // Fallback to installed apps if database query fails
+                let installed = AppNameResolver.shared.getInstalledApps()
+                installedAppsForOCR = installed.map { (bundleID: $0.bundleID, name: $0.name) }
+            }
+        }
+    }
+
+    private func addOCRFilteredApp(_ app: ExcludedAppInfo) {
+        var apps = ocrFilteredApps
+        if !apps.contains(where: { $0.bundleID == app.bundleID }) {
+            apps.append(app)
+            saveOCRFilteredApps(apps)
+            notifyPowerSettingsChanged()
+        }
+    }
+
+    private func removeOCRFilteredApp(_ app: ExcludedAppInfo) {
+        var apps = ocrFilteredApps
+        apps.removeAll { $0.bundleID == app.bundleID }
+        saveOCRFilteredApps(apps)
+        // If no apps left, reset to "all apps" mode
+        if apps.isEmpty {
+            ocrAppFilterMode = .allApps
+        }
+        notifyPowerSettingsChanged()
+    }
+
+    private func toggleOCRFilteredApp(_ bundleID: String) {
+        var apps = ocrFilteredApps
+        if let index = apps.firstIndex(where: { $0.bundleID == bundleID }) {
+            // Remove if already selected
+            apps.remove(at: index)
+            // If no apps left, reset to "all apps" mode
+            if apps.isEmpty {
+                ocrAppFilterMode = .allApps
+            }
+        } else {
+            // Add the app
+            let name = installedAppsForOCR.first(where: { $0.bundleID == bundleID })?.name ?? bundleID
+            apps.append(ExcludedAppInfo(bundleID: bundleID, name: name, iconPath: nil))
+            // If mode is "allApps", switch to exclude mode when first app is added
+            if ocrAppFilterMode == .allApps {
+                ocrAppFilterMode = .allExceptTheseApps
+            }
+        }
+        saveOCRFilteredApps(apps)
+        notifyPowerSettingsChanged()
+    }
+
+    private func saveOCRFilteredApps(_ apps: [ExcludedAppInfo]) {
+        if let data = try? JSONEncoder().encode(apps),
+           let string = String(data: data, encoding: .utf8) {
+            ocrFilteredAppsString = string
+        } else {
+            ocrFilteredAppsString = ""
+        }
+    }
+
+
+    private func updatePowerSourceStatus() {
+        currentPowerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+    }
+
+    private func notifyPowerSettingsChanged() {
+        // Post notification to trigger applyPowerSettings in coordinator
+        NotificationCenter.default.post(name: NSNotification.Name("PowerSettingsDidChange"), object: nil)
+    }
+
+    func resetPowerSettings() {
+        ocrEnabled = SettingsDefaults.ocrEnabled
+        ocrOnlyWhenPluggedIn = SettingsDefaults.ocrOnlyWhenPluggedIn
+        ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+        ocrAppFilterMode = SettingsDefaults.ocrAppFilterMode
+        ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
+        notifyPowerSettingsChanged()
     }
 
     // MARK: - Tag Management Settings
@@ -3869,17 +4321,18 @@ extension SettingsView {
 
 // MARK: - Supporting Types
 
-enum SettingsTab: String, CaseIterable, Identifiable {
+public enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
     case capture = "Capture"
     case storage = "Storage"
     case exportData = "Export & Data"
     case privacy = "Privacy"
+    case power = "Power"
     case tags = "Tags"
     // case search = "Search"  // TODO: Add Search settings later
     case advanced = "Advanced"
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
     var icon: String {
         switch self {
@@ -3888,6 +4341,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return "externaldrive"
         case .exportData: return "square.and.arrow.up"
         case .privacy: return "lock.shield"
+        case .power: return "bolt.fill"
         case .tags: return "tag"
         // case .search: return "magnifyingglass"
         case .advanced: return "wrench.and.screwdriver"
@@ -3901,6 +4355,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return "Retention, limits, and compression"
         case .exportData: return "Export and manage your data"
         case .privacy: return "Encryption, exclusions, and permissions"
+        case .power: return "OCR processing and battery optimization"
         case .tags: return "Manage and delete tags"
         // case .search: return "Search behavior and ranking"
         case .advanced: return "Database, encoding, and developer tools"
@@ -3914,6 +4369,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .storage: return .retraceOrangeGradient
         case .exportData: return .retraceAccentGradient
         case .privacy: return .retraceGreenGradient
+        case .power: return .retraceOrangeGradient
         case .tags: return .retraceAccentGradient
         // case .search: return .retraceAccentGradient
         case .advanced: return .retracePurpleGradient
@@ -3931,6 +4387,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return { view.resetStorageSettings() }
         case .privacy:
             return { view.resetPrivacySettings() }
+        case .power:
+            return { view.resetPowerSettings() }
         case .advanced:
             return { view.resetAdvancedSettings() }
         case .exportData, .tags:

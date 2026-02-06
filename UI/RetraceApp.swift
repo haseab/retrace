@@ -3,6 +3,7 @@ import App
 import Shared
 import SQLCipher
 import Darwin
+import IOKit.ps
 
 /// Main app entry point
 @main
@@ -183,6 +184,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Setup sleep/wake observers to properly handle segment tracking
             setupSleepWakeObservers()
+
+            // Setup power settings change observer
+            setupPowerSettingsObserver()
 
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
 
@@ -445,7 +449,56 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         sleepWakeObservers.append(wakeObserver)
 
+        // Power source change detection - coalesced with sleep/wake observers
+        // NSWorkspace doesn't have a direct power change notification, but we can:
+        // 1. Check power state on wake (covers most plug/unplug during sleep)
+        // 2. Use IOKit's power source notification for real-time detection
+        setupPowerSourceMonitoring()
+
         Log.info("[AppDelegate] Sleep/wake observers registered", category: .app)
+    }
+
+    /// Setup IOKit-based power source monitoring for AC/battery changes
+    private func setupPowerSourceMonitoring() {
+        // Create a run loop source for power source notifications
+        let context = Unmanaged.passUnretained(self).toOpaque()
+
+        if let runLoopSource = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context = context else { return }
+            let delegate = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+            Task { @MainActor in
+                await delegate.handlePowerSourceChange()
+            }
+        }, context)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
+            Log.info("[AppDelegate] Power source monitoring registered", category: .app)
+        }
+    }
+
+    @MainActor
+    private func handlePowerSourceChange() async {
+        guard let wrapper = coordinatorWrapper else { return }
+        let newSource = PowerStateMonitor.shared.getCurrentPowerSource()
+        Log.info("[AppDelegate] Power source changed to: \(newSource)", category: .app)
+        await wrapper.coordinator.applyPowerSettings()
+
+        // Notify UI to update power status display
+        NotificationCenter.default.post(name: NSNotification.Name("PowerSourceDidChange"), object: newSource)
+    }
+
+    /// Setup observer for power settings changes from Settings UI
+    private func setupPowerSettingsObserver() {
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("PowerSettingsDidChange"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let wrapper = self?.coordinatorWrapper else { return }
+                Log.info("[AppDelegate] Power settings changed, applying...", category: .app)
+                await wrapper.coordinator.applyPowerSettings()
+            }
+        }
     }
 
     @MainActor

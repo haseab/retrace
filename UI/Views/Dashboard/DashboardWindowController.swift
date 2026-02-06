@@ -132,7 +132,7 @@ public class DashboardWindowController: NSObject {
 
         // Configure window properties
         window.title = "Retrace"
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window.setContentSize(NSSize(width: 1000, height: 700))
         window.minSize = NSSize(width: 1000, height: 700)
         window.center()
@@ -201,6 +201,7 @@ struct DashboardContentView: View {
     @State private var selectedView: DashboardSelectedView = .dashboard
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
+    @State private var initialSettingsTab: SettingsTab? = nil
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
@@ -233,10 +234,20 @@ struct DashboardContentView: View {
                             )
 
                         case .settings:
-                            SettingsView()
+                            SettingsView(initialTab: initialSettingsTab)
                                 .environmentObject(coordinatorWrapper)
+                                .onDisappear {
+                                    // Clear the initial tab when leaving settings
+                                    initialSettingsTab = nil
+                                }
+
+                        case .monitor:
+                            SystemMonitorView(coordinator: coordinator)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
                         }
                     }
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                    .animation(.easeInOut(duration: 0.2), value: selectedView)
                 }
             } else {
                 // Loading state
@@ -249,26 +260,49 @@ struct DashboardContentView: View {
             await checkOnboarding()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openDashboard)) { _ in
-            selectedView = .dashboard
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .dashboard
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardShowSettings)) { _ in
-            selectedView = .settings
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
-            selectedView = selectedView == .settings ? .dashboard : .settings
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = selectedView == .settings ? .dashboard : .settings
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
-            selectedView = .settings
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
             DashboardWindowController.shared.show()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
-            selectedView = .settings
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
             DashboardWindowController.shared.show()
             // General tab contains Appearance settings - it's the default tab
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
+            initialSettingsTab = .power
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openFeedback)) { _ in
             showFeedbackSheet = true
+            DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSystemMonitor)) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .monitor
+            }
             DashboardWindowController.shared.show()
         }
         .sheet(isPresented: $showFeedbackSheet) {
@@ -290,6 +324,7 @@ struct DashboardContentView: View {
 enum DashboardSelectedView {
     case dashboard
     case settings
+    case monitor
 }
 
 // MARK: - Notifications

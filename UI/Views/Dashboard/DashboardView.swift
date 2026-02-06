@@ -157,6 +157,7 @@ public struct DashboardView: View {
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
+    @State private var showSystemMonitor = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
 
     enum AppUsageViewMode: String, CaseIterable {
@@ -307,6 +308,7 @@ public struct DashboardView: View {
                 // Theme-aware ambient glow background
                 themeAmbientBackground
             }
+            .ignoresSafeArea()
         )
         .task {
             viewModel.isWindowVisible = true
@@ -513,6 +515,7 @@ public struct DashboardView: View {
 
                 // Action buttons
                 refreshButton
+                monitorButton
                 settingsButton
             }
         }
@@ -599,6 +602,12 @@ public struct DashboardView: View {
                 NSCursor.pop()
             }
         }
+    }
+
+    // MARK: - Monitor Button
+
+    private var monitorButton: some View {
+        MonitorButton(isProcessing: viewModel.ocrQueueDepth > 0)
     }
 
     // MARK: - Settings Button
@@ -1373,6 +1382,79 @@ private struct LogoTriangle: Shape {
         path.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
         path.closeSubpath()
         return path
+    }
+}
+
+// MARK: - Monitor Button (isolated to prevent parent re-renders)
+
+/// Extracted to its own view so animation state changes don't cause DashboardView to re-render
+private struct MonitorButton: View {
+    let isProcessing: Bool
+
+    @State private var heartbeatScale: CGFloat = 1.0
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: {
+            NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        }) {
+            ZStack {
+                Image(systemName: "waveform.path.ecg")
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(isProcessing ? .green : .retraceSecondary)
+                    .scaleEffect(isHovering ? 1.15 : (isProcessing ? heartbeatScale : 1.0))
+            }
+            .padding(10)
+            .background(Color.white.opacity(0.05))
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .task(id: isProcessing) {
+            // Heartbeat animation - quick expand then contract like a health monitor
+            while !Task.isCancelled {
+                if isProcessing {
+                    // Beat 1: quick expand
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        heartbeatScale = 1.25
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+
+                    // Contract back
+                    withAnimation(.easeIn(duration: 0.15)) {
+                        heartbeatScale = 1.05
+                    }
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+
+                    // Beat 2: smaller secondary beat
+                    withAnimation(.easeOut(duration: 0.08)) {
+                        heartbeatScale = 1.15
+                    }
+                    try? await Task.sleep(nanoseconds: 80_000_000)
+
+                    // Contract and rest
+                    withAnimation(.easeIn(duration: 0.2)) {
+                        heartbeatScale = 1.05
+                    }
+                    try? await Task.sleep(nanoseconds: 600_000_000)
+                } else {
+                    heartbeatScale = 1.0
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+        }
     }
 }
 

@@ -508,6 +508,15 @@ public class MenuBarManager: ObservableObject {
         dashboardItem.keyEquivalentModifierMask = dashboardShortcut.modifiers.nsModifiers
         menu.addItem(dashboardItem)
 
+        // System Monitor
+        let monitorItem = NSMenuItem(
+            title: "System Monitor",
+            action: #selector(openSystemMonitor),
+            keyEquivalent: ""
+        )
+        monitorItem.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: nil)
+        menu.addItem(monitorItem)
+
         menu.addItem(NSMenuItem.separator())
 
         // Recording toggle with switch
@@ -571,6 +580,10 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func openDashboard() {
         NotificationCenter.default.post(name: .toggleDashboard, object: nil)
+    }
+
+    @objc private func openSystemMonitor() {
+        NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
     }
 
     /// Sync recording status with coordinator
@@ -791,6 +804,8 @@ extension Notification.Name {
     static let toggleDashboard = Notification.Name("toggleDashboard")
     static let openSettings = Notification.Name("openSettings")
     static let openSettingsAppearance = Notification.Name("openSettingsAppearance")
+    static let openSettingsPower = Notification.Name("openSettingsPower")
     static let openFeedback = Notification.Name("openFeedback")
+    static let openSystemMonitor = Notification.Name("openSystemMonitor")
     static let dataSourceDidChange = Notification.Name("dataSourceDidChange")
 }

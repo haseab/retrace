@@ -43,6 +43,11 @@ struct ContextMenuContent: View {
                 openDashboard()
             }
 
+            ContextMenuRow(title: "System Monitor", icon: "waveform.path.ecg") {
+                showMenu = false
+                openSystemMonitor()
+            }
+
             ContextMenuRow(title: "Settings", icon: "gear", shortcut: "⌘,") {
                 showMenu = false
                 openSettings()
@@ -115,6 +120,13 @@ struct ContextMenuContent: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             NotificationCenter.default.post(name: .openSettings, object: nil)
             DashboardWindowController.shared.show()
+        }
+    }
+
+    private func openSystemMonitor() {
+        TimelineWindowController.shared.hideToShowDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
         }
     }
 

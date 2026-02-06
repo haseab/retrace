@@ -29,6 +29,8 @@ public actor FrameProcessingQueue {
     private var totalProcessed: Int = 0
     private var totalFailed: Int = 0
     private var currentQueueDepth: Int = 0
+    private var pendingCount: Int = 0      // Frames with status 0
+    private var processingCount: Int = 0   // Frames with status 1
 
     // Frame data cache - stores raw captured frames to avoid B-frame timing issues
     // When a frame is enqueued with its CapturedFrame data, we cache it here.
@@ -40,6 +42,42 @@ public actor FrameProcessingQueue {
     // Each CapturedFrame is ~10-30MB, so 50 frames = 500MB-1.5GB max
     // If processing falls behind, oldest frames will be evicted
     private let maxFrameDataCacheSize = 50
+
+    // MARK: - Power-Aware Processing Control
+
+    /// Whether OCR processing is enabled globally
+    private var ocrEnabled = true
+
+    /// Whether to pause OCR when on battery power
+    private var pauseOnBattery = false
+
+    /// Current power source (updated by AppCoordinator)
+    private var currentPowerSource: PowerStateMonitor.PowerSource = .unknown
+
+    /// Whether currently paused due to battery (computed from pauseOnBattery && currentPowerSource)
+    private var isPausedForBattery: Bool {
+        pauseOnBattery && currentPowerSource == .battery
+    }
+
+    /// Minimum delay between processing frames (for rate limiting)
+    /// 0 = no delay (unlimited), otherwise nanoseconds between frames
+    private var minDelayBetweenFramesNs: UInt64 = 0
+
+    /// Bundle IDs to exclude from OCR (when ocrAppFilterMode == .allExceptTheseApps)
+    private var ocrExcludedBundleIDs: Set<String> = []
+
+    /// Bundle IDs to include for OCR (when ocrAppFilterMode == .onlyTheseApps)
+    /// Empty set means all apps (default behavior)
+    private var ocrIncludedBundleIDs: Set<String> = []
+
+    /// Whether we're in deferred mode (pauseOnBattery is enabled)
+    /// In deferred mode, we don't cache raw frames and must wait for video finalization
+    private var isDeferredMode: Bool {
+        pauseOnBattery
+    }
+
+    /// Reduced cache size when in deferred mode (raw frames won't be used)
+    private let deferredModeCacheSize = 4
 
     // MARK: - Initialization
 
@@ -57,6 +95,56 @@ public actor FrameProcessingQueue {
         self.config = config
     }
 
+    // MARK: - Power Configuration
+
+    /// Update power-aware processing configuration
+    /// Called by AppCoordinator when power state or settings change
+    public func updatePowerConfig(
+        ocrEnabled: Bool,
+        pauseOnBattery: Bool,
+        currentPowerSource: PowerStateMonitor.PowerSource,
+        maxFPS: Double,
+        excludedBundleIDs: Set<String>,
+        includedBundleIDs: Set<String>
+    ) {
+        self.ocrEnabled = ocrEnabled
+        self.pauseOnBattery = pauseOnBattery
+        self.currentPowerSource = currentPowerSource
+        self.ocrExcludedBundleIDs = excludedBundleIDs
+        self.ocrIncludedBundleIDs = includedBundleIDs
+
+        // Convert FPS to nanosecond delay (0 = unlimited)
+        if maxFPS > 0 {
+            self.minDelayBetweenFramesNs = UInt64(1_000_000_000.0 / maxFPS)
+        } else {
+            self.minDelayBetweenFramesNs = 0
+        }
+
+        Log.info("[Queue] Power config updated: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), power=\(currentPowerSource), maxFPS=\(maxFPS), paused=\(isPausedForBattery), excludedApps=\(ocrExcludedBundleIDs), includedApps=\(ocrIncludedBundleIDs)", category: .processing)
+    }
+
+    /// Check if OCR should be processed for a specific bundle ID
+    private func shouldProcessOCR(forBundleID bundleID: String?) -> Bool {
+        guard let bundleID = bundleID else {
+            Log.debug("[Queue-Filter] bundleID is nil, allowing OCR", category: .processing)
+            return true
+        }
+
+        // If inclusion list is set (onlyTheseApps mode), only process those apps
+        if !ocrIncludedBundleIDs.isEmpty {
+            let allowed = ocrIncludedBundleIDs.contains(bundleID)
+            Log.debug("[Queue-Filter] Include mode: bundleID=\(bundleID), allowed=\(allowed), includedApps=\(ocrIncludedBundleIDs)", category: .processing)
+            return allowed
+        }
+
+        // Otherwise, process all except excluded apps
+        let allowed = !ocrExcludedBundleIDs.contains(bundleID)
+        if !ocrExcludedBundleIDs.isEmpty {
+            Log.debug("[Queue-Filter] Exclude mode: bundleID=\(bundleID), allowed=\(allowed), excludedApps=\(ocrExcludedBundleIDs)", category: .processing)
+        }
+        return allowed
+    }
+
     // MARK: - Queue Operations
 
     /// Enqueue a frame for processing
@@ -65,21 +153,29 @@ public actor FrameProcessingQueue {
     ///   - priority: Processing priority (higher = processed first)
     ///   - capturedFrame: Optional raw frame data. If provided, OCR uses this directly
     ///                    instead of extracting from video, avoiding B-frame timing issues.
+    ///                    In deferred mode (pauseOnBattery enabled), raw frames are NOT cached
+    ///                    since we'll extract from finalized video later.
     public func enqueue(frameID: Int64, priority: Int = 0, capturedFrame: CapturedFrame? = nil) async throws {
         // Log.info("[Queue-DIAG] Attempting to enqueue frame \(frameID) with priority \(priority), hasFrameData: \(capturedFrame != nil)", category: .processing)
 
-        // Cache the frame data if provided
+        // In deferred mode, don't cache raw frames - we'll extract from encoded video later
+        // This saves memory when OCR is deferred until plugged in
+        let effectiveCacheSize = isDeferredMode ? deferredModeCacheSize : maxFrameDataCacheSize
+
+        // Cache the frame data if provided and not in deferred mode (or cache not full in deferred mode)
         if let frame = capturedFrame {
             // Evict oldest frames if cache is at capacity to prevent unbounded memory growth
             // This can happen if OCR processing falls behind the capture rate
-            if frameDataCache.count >= maxFrameDataCacheSize {
+            if frameDataCache.count >= effectiveCacheSize {
                 // Remove oldest entries (lowest frame IDs, since IDs are sequential)
                 let sortedKeys = frameDataCache.keys.sorted()
-                let keysToRemove = sortedKeys.prefix(frameDataCache.count - maxFrameDataCacheSize + 1)
+                let keysToRemove = sortedKeys.prefix(frameDataCache.count - effectiveCacheSize + 1)
                 for key in keysToRemove {
                     frameDataCache.removeValue(forKey: key)
                 }
-                Log.warning("[Queue-DIAG] Frame data cache at capacity (\(maxFrameDataCacheSize)), evicted \(keysToRemove.count) oldest frames", category: .processing)
+                if !isDeferredMode {
+                    Log.warning("[Queue-DIAG] Frame data cache at capacity (\(effectiveCacheSize)), evicted \(keysToRemove.count) oldest frames", category: .processing)
+                }
             }
 
             frameDataCache[frameID] = frame
@@ -123,6 +219,13 @@ public actor FrameProcessingQueue {
 
         isRunning = true
 
+        // Initialize counts from actual frame statuses
+        if let counts = try? await databaseManager.getFrameStatusCounts() {
+            pendingCount = counts.pending
+            processingCount = counts.processing
+            currentQueueDepth = counts.pending + counts.processing
+        }
+
         // Log.info("[Queue-DIAG] Starting \(config.workerCount) processing workers, isRunning=\(isRunning)", category: .processing)
 
         for workerID in 0..<config.workerCount {
@@ -162,6 +265,18 @@ public actor FrameProcessingQueue {
         // Log.info("[Queue-DIAG] Worker \(id) finished initial delay, entering main loop", category: .processing)
 
         while isRunning {
+            // Check if OCR is disabled globally
+            guard ocrEnabled else {
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s poll when disabled
+                continue
+            }
+
+            // Check if paused due to battery power
+            guard !isPausedForBattery else {
+                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s poll when paused for battery
+                continue
+            }
+
             // Wait for database to be ready before attempting any operations
             guard await databaseManager.isReady() else {
                 // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
@@ -182,11 +297,26 @@ public actor FrameProcessingQueue {
                 // Process the frame
                 let startTime = Date()
                 do {
-                    try await processFrame(queuedFrame)
+                    let result = try await processFrame(queuedFrame)
+
+                    // Handle deferred processing result
+                    if case .deferredNotFinalized = result {
+                        // Frame's video not finalized yet - re-enqueue for later
+                        try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
+                        currentQueueDepth += 1
+                        try? await Task.sleep(nanoseconds: 500_000_000) // 500ms before next attempt
+                        continue
+                    }
+
                     totalProcessed += 1
 
                     let elapsed = Date().timeIntervalSince(startTime)
                     Log.info("[Queue-DIAG] Worker \(id) COMPLETED frame \(queuedFrame.frameID) in \(String(format: "%.2f", elapsed))s", category: .processing)
+
+                    // Apply rate limiting delay after successful processing
+                    if minDelayBetweenFramesNs > 0 {
+                        try? await Task.sleep(nanoseconds: minDelayBetweenFramesNs)
+                    }
 
                 } catch {
                     totalFailed += 1
@@ -220,19 +350,41 @@ public actor FrameProcessingQueue {
     // MARK: - Frame Processing
 
     /// Process a single frame (OCR + FTS + Nodes)
-    private func processFrame(_ queuedFrame: QueuedFrame) async throws {
+    /// Returns ProcessFrameResult indicating success, skip, or deferral
+    private func processFrame(_ queuedFrame: QueuedFrame) async throws -> ProcessFrameResult {
         let frameID = queuedFrame.frameID
         // Log.info("[Queue-DIAG] processFrame START for frame \(frameID)", category: .processing)
+
+        // Get frame with video info (includes isVideoFinalized and bundleID in metadata)
+        guard let frameWithInfo = try await databaseManager.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
+            Log.error("[Queue-DIAG] Frame \(frameID) not found in database!", category: .processing)
+            throw DatabaseError.queryFailed(query: "getFrame", underlying: "Frame \(frameID) not found")
+        }
+        let frameRef = frameWithInfo.frame
+
+        // Check app filter - skip OCR for excluded apps (bundleID is in metadata from JOIN)
+        let bundleID = frameRef.metadata.appBundleID
+        if !shouldProcessOCR(forBundleID: bundleID) {
+            // Mark as completed (no OCR needed for this app)
+            try await updateFrameProcessingStatus(frameID, status: .completed)
+            Log.debug("[Queue] Frame \(frameID) skipped - app \(bundleID ?? "unknown") excluded from OCR", category: .processing)
+            return .skippedByAppFilter
+        }
+
+        // In deferred mode (no cached frame data), check if video is finalized
+        // We need presentation-order frames, which requires finalized video
+        let hasCachedFrame = frameDataCache[frameID] != nil
+        if !hasCachedFrame, let videoInfo = frameWithInfo.videoInfo, !videoInfo.isVideoFinalized {
+            // Video not finalized yet - defer processing until it is
+            // Don't mark status, leave as pending so it gets re-queued
+            Log.debug("[Queue] Frame \(frameID) deferred - video not finalized yet", category: .processing)
+            return .deferredNotFinalized
+        }
 
         // Mark as processing
         try await updateFrameProcessingStatus(frameID, status: .processing)
         // Log.info("[Queue-DIAG] Frame \(frameID) marked as processing", category: .processing)
 
-        // Get frame reference from database
-        guard let frameRef = try await databaseManager.getFrame(id: FrameID(value: frameID)) else {
-            Log.error("[Queue-DIAG] Frame \(frameID) not found in database!", category: .processing)
-            throw DatabaseError.queryFailed(query: "getFrame", underlying: "Frame \(frameID) not found")
-        }
         // Log.info("[Queue-DIAG] Frame \(frameID) found, videoID=\(frameRef.videoID.value), segmentID=\(frameRef.segmentID.value)", category: .processing)
 
         // Get video segment for dimensions (needed for node insertion)
@@ -252,7 +404,7 @@ public actor FrameProcessingQueue {
 
             // Mark as failed permanently - don't retry endlessly for missing files
             try await updateFrameProcessingStatus(frameID, status: .failed)
-            return // Stop processing this frame
+            return .success // Return success to not re-queue (it's a permanent failure)
         }
 
         // Check if we have cached frame data (avoids B-frame timing issues)
@@ -263,7 +415,8 @@ public actor FrameProcessingQueue {
             frameDataCache.removeValue(forKey: frameID)  // Clear from cache after use
             // Log.info("[Queue-DIAG] Frame \(frameID) using cached frame data, cache size now: \(frameDataCache.count)", category: .processing)
         } else {
-            // Fallback: extract from video (used for reprocessOCR or crash recovery)
+            // Fallback: extract from video (used for deferred mode, reprocessOCR, or crash recovery)
+            // At this point we've verified the video is finalized, so presentation order is correct
             // Log.info("[Queue-DIAG] Frame \(frameID) no cached data, extracting from video (fallback path)", category: .processing)
 
             // Extract the actual segment ID from the path (last path component is the timestamp-based ID)
@@ -342,6 +495,7 @@ public actor FrameProcessingQueue {
 
         // Mark as completed
         try await updateFrameProcessingStatus(frameID, status: .completed)
+        return .success
     }
 
     /// Convert JPEG data back to CapturedFrame for OCR
@@ -594,9 +748,19 @@ public actor FrameProcessingQueue {
 
     // MARK: - Statistics
 
-    public func getStatistics() -> QueueStatistics {
+    public func getStatistics() async -> QueueStatistics {
+        // Query live counts from database for accuracy
+        var pending = pendingCount
+        var processing = processingCount
+        if let counts = try? await databaseManager.getFrameStatusCounts() {
+            pending = counts.pending
+            processing = counts.processing
+        }
+
         return QueueStatistics(
-            queueDepth: currentQueueDepth,
+            queueDepth: pending + processing,
+            pendingCount: pending,
+            processingCount: processing,
             totalProcessed: totalProcessed,
             totalFailed: totalFailed,
             workerCount: config.workerCount
@@ -611,7 +775,7 @@ public struct ProcessingQueueConfig: Sendable {
     public let maxRetryAttempts: Int
     public let maxQueueSize: Int
 
-    public init(workerCount: Int = 2, maxRetryAttempts: Int = 3, maxQueueSize: Int = 1000) {
+    public init(workerCount: Int = 1, maxRetryAttempts: Int = 3, maxQueueSize: Int = 1000) {
         self.workerCount = workerCount
         self.maxRetryAttempts = maxRetryAttempts
         self.maxQueueSize = maxQueueSize
@@ -631,10 +795,20 @@ public enum FrameProcessingStatus: Int, Sendable {
     case processing = 1
     case completed = 2
     case failed = 3
+    // Note: 4 = "not yet readable" (used elsewhere, don't add new values here)
+}
+
+/// Internal result of processing a frame
+private enum ProcessFrameResult {
+    case success
+    case skippedByAppFilter      // Frame skipped due to app filter, mark as completed (no OCR)
+    case deferredNotFinalized    // Video not finalized yet, re-queue for later
 }
 
 public struct QueueStatistics: Sendable {
     public let queueDepth: Int
+    public let pendingCount: Int      // Frames waiting in queue (status 0)
+    public let processingCount: Int   // Frames currently being processed (status 1)
     public let totalProcessed: Int
     public let totalFailed: Int
     public let workerCount: Int

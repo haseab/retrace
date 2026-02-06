@@ -61,6 +61,12 @@ public class DashboardViewModel: ObservableObject {
     @Published public var isLoading = false
     @Published public var error: String?
 
+    // Queue monitoring
+    @Published public var ocrQueueDepth: Int = 0
+    @Published public var ocrTotalProcessed: Int = 0
+    @Published public var ocrIsPaused: Bool = false
+    @Published public var powerSource: String = "unknown"
+
     // Permission warnings
     @Published public var showAccessibilityWarning = false
     @Published public var showScreenRecordingWarning = false
@@ -116,6 +122,7 @@ public class DashboardViewModel: ObservableObject {
                 // Skip UI updates when window is hidden to avoid SwiftUI diffing
                 guard self.isWindowVisible else { return }
                 await self.updateRecordingStatus()
+                await self.updateQueueStatus()
                 self.checkPermissions()
             }
         }
@@ -125,6 +132,21 @@ public class DashboardViewModel: ObservableObject {
 
     private func updateRecordingStatus() async {
         isRecording = await coordinator.isCapturing()
+    }
+
+    private func updateQueueStatus() async {
+        if let stats = await coordinator.getQueueStatistics() {
+            ocrQueueDepth = stats.queueDepth
+            ocrTotalProcessed = stats.totalProcessed
+        }
+
+        let powerState = coordinator.getCurrentPowerState()
+        ocrIsPaused = powerState.isPaused
+        switch powerState.source {
+        case .ac: powerSource = "AC"
+        case .battery: powerSource = "Battery"
+        case .unknown: powerSource = "Unknown"
+        }
     }
 
     /// Polls accessibility and screen recording permissions and updates warning states.
