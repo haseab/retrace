@@ -421,6 +421,8 @@ public class TimelineWindowController: NSObject {
                 viewModel.isInLiveMode = true
                 viewModel.liveScreenshot = screenshot
                 logShowTiming("live mode activated")
+                // Auto-trigger OCR on the live screenshot
+                Task { await viewModel.performLiveOCR() }
             }
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
@@ -460,6 +462,8 @@ public class TimelineWindowController: NSObject {
             viewModel.isInLiveMode = true
             viewModel.liveScreenshot = screenshot
             logShowTiming("live mode activated (fallback)")
+            // Auto-trigger OCR on the live screenshot
+            Task { await viewModel.performLiveOCR() }
         }
 
         guard let coordinatorWrapper = coordinatorWrapper else {

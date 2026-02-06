@@ -436,15 +436,17 @@ public struct SimpleTimelineView: View {
 	                    }
 	                }
 
-	                // Overlay layer: Live screenshot (covers AVPlayer while it loads)
+	                // Overlay layer: Live screenshot with text selection (covers AVPlayer while it loads)
 	                if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
-	                    Image(nsImage: liveImage)
-	                        .resizable()
-	                        .aspectRatio(contentMode: .fit)
-	                        .onAppear {
-	                            // Mark that live screenshot has appeared, allowing AVPlayer to mount
-	                            liveScreenshotHasAppeared = true
-	                        }
+	                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+	                        Image(nsImage: liveImage)
+	                            .resizable()
+	                            .aspectRatio(contentMode: .fit)
+	                    }
+	                    .onAppear {
+	                        // Mark that live screenshot has appeared, allowing AVPlayer to mount
+	                        liveScreenshotHasAppeared = true
+	                    }
 	                }
 	            }
 	        }

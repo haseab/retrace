@@ -3,6 +3,7 @@ import Combine
 import AVFoundation
 import Shared
 import App
+import Processing
 
 /// Shared timeline configuration
 public enum TimelineConfig {
@@ -190,6 +191,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// The live screenshot captured at timeline launch (only used when isInLiveMode == true)
     @Published public var liveScreenshot: NSImage?
+
+    /// Whether live OCR is currently being processed on the live screenshot
+    @Published public var isLiveOCRProcessing: Bool = false
 
     /// Whether the tape is hidden (off-screen below) - used for slide-up animation in live mode
     @Published public var isTapeHidden: Bool = false
@@ -3029,6 +3033,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[TIMELINE-LIVE] Exiting live mode, transitioning to historical frames", category: .ui)
         isInLiveMode = false
         liveScreenshot = nil
+        isLiveOCRProcessing = false
         isTapeHidden = false  // Reset animation state
 
         // If frames are already loaded, show the most recent
@@ -3037,6 +3042,77 @@ public class SimpleTimelineViewModel: ObservableObject {
             loadImageIfNeeded()
         }
         // If frames are still loading, they'll be displayed when ready
+    }
+
+    // MARK: - Live OCR
+
+    /// Timestamp of last live OCR attempt (for 1-second debounce)
+    private var lastLiveOCRTime: Date = .distantPast
+
+    /// Perform OCR on the live screenshot automatically
+    /// Uses same .accurate pipeline as frame processing
+    /// Results are ephemeral (not persisted to database)
+    public func performLiveOCR() async {
+        guard isInLiveMode, let liveImage = liveScreenshot else {
+            Log.debug("[LiveOCR] Skipped - not in live mode or no screenshot", category: .ui)
+            return
+        }
+
+        guard !isLiveOCRProcessing else {
+            Log.debug("[LiveOCR] Already processing, skipping", category: .ui)
+            return
+        }
+
+        // 1-second debounce
+        let now = Date()
+        let timeSinceLast = now.timeIntervalSince(lastLiveOCRTime)
+        if timeSinceLast < 1.0 {
+            Log.debug("[LiveOCR] Debounced (\(String(format: "%.2f", timeSinceLast))s since last)", category: .ui)
+            return
+        }
+        lastLiveOCRTime = now
+
+        guard let cgImage = liveImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            Log.error("[LiveOCR] Failed to get CGImage from live screenshot", category: .ui)
+            return
+        }
+
+        isLiveOCRProcessing = true
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        do {
+            let ocr = VisionOCR()
+            let textRegions = try await ocr.recognizeTextFromCGImage(cgImage)
+
+            // Only update if still in live mode (user may have scrolled away)
+            guard isInLiveMode else {
+                isLiveOCRProcessing = false
+                return
+            }
+
+            // Convert TextRegion (normalized coords) to OCRNodeWithText
+            let nodes = textRegions.enumerated().map { (index, region) in
+                OCRNodeWithText(
+                    id: index,
+                    frameId: -1,  // Marker for live OCR (not from database)
+                    x: region.bounds.origin.x,
+                    y: region.bounds.origin.y,
+                    width: region.bounds.width,
+                    height: region.bounds.height,
+                    text: region.text
+                )
+            }
+
+            let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            Log.info("[LiveOCR] Completed in \(String(format: "%.0f", elapsed))ms, found \(nodes.count) text regions", category: .ui)
+
+            setOCRNodes(nodes)
+            ocrStatus = .completed
+        } catch {
+            Log.error("[LiveOCR] Failed: \(error)", category: .ui)
+        }
+
+        isLiveOCRProcessing = false
     }
 
     /// Load image for image-based frames (Retrace) if needed

@@ -102,6 +102,65 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         }
     }
 
+    // MARK: - Live Screenshot OCR
+
+    /// Perform OCR directly on a CGImage (for live screenshot use case)
+    /// Uses the same .accurate pipeline as frame processing
+    /// Returns TextRegions with **normalized coordinates** (0.0-1.0) for direct use with OCRNodeWithText
+    public func recognizeTextFromCGImage(_ cgImage: CGImage) async throws -> [TextRegion] {
+        // Downscale same as normal pipeline
+        let ocrImage: CGImage
+        if Self.ocrScaleFactor < 1.0 {
+            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
+        } else {
+            ocrImage = cgImage
+        }
+
+        let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
+
+        return try await withCheckedThrowingContinuation { continuation in
+            do {
+                try handler.perform([self.textRequest])
+
+                guard let observations = self.textRequest.results else {
+                    continuation.resume(returning: [])
+                    return
+                }
+
+                let regions = observations.compactMap { observation -> TextRegion? in
+                    guard observation.confidence >= 0.5 else { return nil }
+                    guard let topCandidate = observation.topCandidates(1).first else { return nil }
+                    let text = topCandidate.string
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+                    let box = observation.boundingBox
+
+                    // Flip Y from Vision's bottom-left origin to top-left origin
+                    let flippedY = 1.0 - box.origin.y - box.height
+
+                    // Return NORMALIZED coordinates (0.0-1.0) for OCRNodeWithText
+                    let normalizedBox = CGRect(
+                        x: box.origin.x,
+                        y: flippedY,
+                        width: box.width,
+                        height: box.height
+                    )
+
+                    return TextRegion(
+                        frameID: FrameID(value: 0),
+                        text: text,
+                        bounds: normalizedBox,
+                        confidence: Double(observation.confidence)
+                    )
+                }
+
+                continuation.resume(returning: regions)
+            } catch {
+                continuation.resume(throwing: ProcessingError.ocrFailed(underlying: error.localizedDescription))
+            }
+        }
+    }
+
     // MARK: - Image Processing
 
     /// Downscale a CGImage using vImage (hardware-accelerated, high quality)
