@@ -392,18 +392,25 @@ public struct TimelineTapeView: View {
                     // Datetime button (center)
                     DatetimeButton(viewModel: viewModel)
 
-                    // Go to Now / Refresh button (right of datetime) - same width as left side
-                    Group {
-                        if viewModel.shouldShowGoToNow {
-                            GoToNowButton(viewModel: viewModel)
-                                .transition(.opacity.combined(with: .scale(scale: 0.8)))
-                        } else {
-                            RefreshButton(viewModel: viewModel)
+                    // Go to Now / Refresh button + Video Controls (right of datetime)
+                    HStack(spacing: TimelineScaleFactor.controlSpacing) {
+                        Group {
+                            if viewModel.shouldShowGoToNow {
+                                GoToNowButton(viewModel: viewModel)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                            } else {
+                                RefreshButton(viewModel: viewModel)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                            }
+                        }
+                        .animation(.easeInOut(duration: 0.2), value: viewModel.shouldShowGoToNow)
+
+                        if viewModel.showVideoControls {
+                            VideoControlsButton(viewModel: viewModel)
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
                     }
-                    .frame(width: TimelineScaleFactor.controlButtonSize * 2 + 6 + 8, alignment: .leading) // Match left side width
-                    .animation(.easeInOut(duration: 0.2), value: viewModel.shouldShowGoToNow)
+                    .frame(width: TimelineScaleFactor.controlButtonSize * 2 + 6 + 8 + (viewModel.showVideoControls ? TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing : 0), alignment: .leading)
                 }
                 .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
@@ -610,6 +617,141 @@ struct RefreshButton: View {
             else { NSCursor.pop() }
         }
         .instantTooltip("Refresh", isVisible: $isHovering)
+    }
+}
+
+// MARK: - Video Controls Button
+
+/// Play/pause button with speed control popover for auto-advancing frames
+/// Only visible when "Show video controls" is enabled in Settings > Advanced
+struct VideoControlsButton: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var isHovering = false
+    @State private var showSpeedPicker = false
+
+    private let availableSpeeds: [Double] = [1, 2, 4, 8]
+    /// Height reserved for the speed picker so it doesn't shift the button
+    private let pickerHeight: CGFloat = 4 * 24 + 16
+
+    var body: some View {
+        // Button sized to match other controls; speed picker floats above via overlay
+        Button(action: {
+            viewModel.dismissContextMenu()
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                viewModel.togglePlayback()
+            }
+        }) {
+            Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
+                .foregroundColor(isHovering || viewModel.isPlaying ? .white : .white.opacity(0.7))
+                .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
+                .themeAwareCircleStyle(isActive: viewModel.isPlaying, isHovering: isHovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering {
+                NSCursor.pointingHand.push()
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                    showSpeedPicker = true
+                }
+            } else {
+                NSCursor.pop()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    if !isHovering {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showSpeedPicker = false
+                        }
+                    }
+                }
+            }
+        }
+        .instantTooltip(
+            viewModel.isPlaying ? "Pause" : "Play (\(formattedSpeed(viewModel.playbackSpeed)))",
+            isVisible: .constant(isHovering && !showSpeedPicker)
+        )
+        // Speed picker floats above via overlay — completely outside the layout flow
+        .overlay(alignment: .bottom) {
+            if showSpeedPicker {
+                VStack(spacing: 2) {
+                    ForEach(availableSpeeds.reversed(), id: \.self) { speed in
+                        SpeedOptionRow(
+                            speed: speed,
+                            isSelected: speed == viewModel.playbackSpeed,
+                            label: formattedSpeed(speed)
+                        ) {
+                            withAnimation(.spring(response: 0.2, dampingFraction: 0.8)) {
+                                viewModel.setPlaybackSpeed(speed)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+                        )
+                )
+                .offset(y: -(TimelineScaleFactor.controlButtonSize + 6))
+                .transition(.opacity.combined(with: .scale(scale: 0.85, anchor: .bottom)).combined(with: .offset(y: 4)))
+                .onHover { hovering in
+                    if hovering {
+                        isHovering = true
+                    } else {
+                        isHovering = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            if !isHovering {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    showSpeedPicker = false
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func formattedSpeed(_ speed: Double) -> String {
+        if speed == 1 { return "1x" }
+        return "\(Int(speed))x"
+    }
+}
+
+/// Individual speed option row with hover highlight and pointer cursor
+private struct SpeedOptionRow: View {
+    let speed: Double
+    let isSelected: Bool
+    let label: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: isSelected ? .bold : .medium, design: .monospaced))
+                .foregroundColor(isSelected || isHovering ? .white : .white.opacity(0.6))
+                .frame(width: 40, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(isSelected ? Color.white.opacity(0.15) : (isHovering ? Color.white.opacity(0.1) : Color.clear))
+                )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovering = hovering
+            }
+            if hovering { NSCursor.pointingHand.push() }
+            else { NSCursor.pop() }
+        }
     }
 }
 

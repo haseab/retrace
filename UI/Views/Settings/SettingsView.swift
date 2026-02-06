@@ -25,8 +25,10 @@ enum SettingsDefaults {
     static let colorTheme = "blue"
     static let timelineColoredBorders = false
     static let scrubbingAnimationDuration: Double = 0.10  // 0 = no animation, max 0.20
+    static let scrollSensitivity: Double = 0.75  // 0.0 = slowest, 1.0 = fastest
 
     // MARK: Capture
+    static let pauseReminderDelayMinutes: Double = 30  // 0 = never remind again
     static let captureIntervalSeconds: Double = 2.0
     static let captureResolution: CaptureResolution = .original
     static let captureActiveDisplayOnly = false
@@ -52,6 +54,7 @@ enum SettingsDefaults {
     static let showFrameIDs = false
     static let enableFrameIDSearch = false
     static let showOCRDebugOverlay = false
+    static let showVideoControls = false
 
     // MARK: OCR Power
     static let ocrEnabled = true
@@ -92,6 +95,7 @@ public struct SettingsView: View {
     @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = SettingsDefaults.colorTheme
     @AppStorage("timelineColoredBorders", store: settingsStore) private var timelineColoredBorders: Bool = SettingsDefaults.timelineColoredBorders
     @AppStorage("scrubbingAnimationDuration", store: settingsStore) private var scrubbingAnimationDuration: Double = SettingsDefaults.scrubbingAnimationDuration
+    @AppStorage("scrollSensitivity", store: settingsStore) private var scrollSensitivity: Double = SettingsDefaults.scrollSensitivity
 
     // Font style - tracked as @State to trigger view refresh on change
     @State private var fontStyle: RetraceFontStyle = RetraceFont.currentStyle
@@ -110,6 +114,7 @@ public struct SettingsView: View {
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
     // MARK: Capture Settings
+    @AppStorage("pauseReminderDelayMinutes", store: settingsStore) private var pauseReminderDelayMinutes: Double = SettingsDefaults.pauseReminderDelayMinutes
     @AppStorage("captureIntervalSeconds", store: settingsStore) private var captureIntervalSeconds: Double = SettingsDefaults.captureIntervalSeconds
     @AppStorage("captureResolution", store: settingsStore) private var captureResolution: CaptureResolution = SettingsDefaults.captureResolution
     @AppStorage("captureActiveDisplayOnly", store: settingsStore) private var captureActiveDisplayOnly = SettingsDefaults.captureActiveDisplayOnly
@@ -202,6 +207,7 @@ public struct SettingsView: View {
     @AppStorage("showFrameIDs", store: settingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
     @AppStorage("enableFrameIDSearch", store: settingsStore) private var enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
     @AppStorage("showOCRDebugOverlay", store: settingsStore) private var showOCRDebugOverlay = SettingsDefaults.showOCRDebugOverlay
+    @AppStorage("showVideoControls", store: settingsStore) private var showVideoControls = SettingsDefaults.showVideoControls
 
     // MARK: OCR Power Settings
     @AppStorage("ocrEnabled", store: settingsStore) private var ocrEnabled = SettingsDefaults.ocrEnabled
@@ -893,6 +899,51 @@ public struct SettingsView: View {
                         }
                     }
                     .animation(.easeInOut(duration: 0.2), value: scrubbingAnimationUpdateMessage)
+
+                    Divider()
+                        .background(Color.retraceBorder)
+
+                    // Scroll Sensitivity Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        HStack {
+                            Text("Scroll sensitivity")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Spacer()
+                            Text(scrollSensitivityDisplayText)
+                                .font(.retraceCalloutBold)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 6)
+                                .background(Color.retraceAccent.opacity(0.3))
+                                .cornerRadius(8)
+                        }
+
+                        ModernSlider(value: $scrollSensitivity, range: 0.1...1.0, step: 0.05)
+
+                        HStack {
+                            Text(scrollSensitivityDescriptionText)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                            Spacer()
+
+                            if scrollSensitivity != SettingsDefaults.scrollSensitivity {
+                                Button(action: {
+                                    scrollSensitivity = SettingsDefaults.scrollSensitivity
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.counterclockwise")
+                                            .font(.system(size: 10))
+                                        Text("Reset to Default")
+                                            .font(.retraceCaption2)
+                                    }
+                                    .foregroundColor(.white.opacity(0.7))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1255,6 +1306,49 @@ public struct SettingsView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.2), value: compressionUpdateMessage)
+            }
+
+            ModernSettingsCard(title: "Pause Reminder", icon: "bell.badge") {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("\"Remind Me Later\" interval")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Spacer()
+                        Text(pauseReminderDisplayText)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
+                    }
+
+                    PauseReminderDelayPicker(selectedMinutes: $pauseReminderDelayMinutes)
+
+                    HStack {
+                        Text("How long to wait before reminding you again when capture is paused")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        if pauseReminderDelayMinutes != SettingsDefaults.pauseReminderDelayMinutes {
+                            Button(action: {
+                                pauseReminderDelayMinutes = SettingsDefaults.pauseReminderDelayMinutes
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
             }
 
             // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
@@ -2704,6 +2798,14 @@ public struct SettingsView: View {
                 .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
             }
 
+            ModernSettingsCard(title: "Timeline", icon: "play.rectangle") {
+                ModernToggleRow(
+                    title: "Show video controls",
+                    subtitle: "Display play/pause button in the timeline to auto-advance frames",
+                    isOn: $showVideoControls
+                )
+            }
+
             ModernSettingsCard(title: "Developer", icon: "hammer") {
                 ModernToggleRow(
                     title: "Show frame IDs in UI",
@@ -3351,6 +3453,47 @@ private struct CaptureIntervalPicker: View {
     }
 }
 
+// MARK: - Pause Reminder Delay Picker
+
+private struct PauseReminderDelayPicker: View {
+    @Binding var selectedMinutes: Double
+
+    // Options: 5m, 15m, 30m, 1h, 2h, 4h, 8h, Never (0)
+    private let options: [(minutes: Double, label: String)] = [
+        (5, "5m"),
+        (15, "15m"),
+        (30, "30m"),
+        (60, "1h"),
+        (120, "2h"),
+        (240, "4h"),
+        (480, "8h"),
+        (0, "Never"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(options, id: \.minutes) { option in
+                Text(option.label)
+                    .font(selectedMinutes == option.minutes ? .retraceCalloutBold : .retraceCalloutMedium)
+                    .foregroundColor(selectedMinutes == option.minutes ? .retracePrimary : .retraceSecondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(selectedMinutes == option.minutes ? Color.white.opacity(0.1) : Color.clear)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedMinutes = option.minutes
+                    }
+            }
+        }
+        .padding(4)
+        .background(Color.white.opacity(0.05))
+        .cornerRadius(10)
+    }
+}
+
 // MARK: - Retention Policy Picker (Sliding Scale)
 
 private struct RetentionPolicyPicker: View {
@@ -3636,6 +3779,17 @@ private struct RetentionTagsChip<PopoverContent: View>: View {
 }
 
 extension SettingsView {
+    var pauseReminderDisplayText: String {
+        if pauseReminderDelayMinutes == 0 {
+            return "Never"
+        } else if pauseReminderDelayMinutes < 60 {
+            return "\(Int(pauseReminderDelayMinutes)) min"
+        } else {
+            let hours = Int(pauseReminderDelayMinutes / 60)
+            return "\(hours) hr"
+        }
+    }
+
     var captureIntervalDisplayText: String {
         if captureIntervalSeconds >= 60 {
             let minutes = Int(captureIntervalSeconds / 60)
@@ -3670,6 +3824,22 @@ extension SettingsView {
             return "Moderate animation for visual feedback"
         } else {
             return "Maximum animation for cinematic feel"
+        }
+    }
+
+    var scrollSensitivityDisplayText: String {
+        return "\(Int(scrollSensitivity * 100))%"
+    }
+
+    var scrollSensitivityDescriptionText: String {
+        if scrollSensitivity <= 0.25 {
+            return "Slow, precise frame-by-frame navigation"
+        } else if scrollSensitivity <= 0.50 {
+            return "Moderate scroll speed for careful browsing"
+        } else if scrollSensitivity <= 0.75 {
+            return "Balanced scroll speed for general use"
+        } else {
+            return "Fast scrolling for quick navigation"
         }
     }
 
@@ -5043,10 +5213,12 @@ extension SettingsView {
         MilestoneCelebrationManager.setColorThemePreference(.blue)
         timelineColoredBorders = SettingsDefaults.timelineColoredBorders
         scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
+        scrollSensitivity = SettingsDefaults.scrollSensitivity
     }
 
     /// Reset all Capture settings to defaults
     func resetCaptureSettings() {
+        pauseReminderDelayMinutes = SettingsDefaults.pauseReminderDelayMinutes
         captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
         videoQuality = SettingsDefaults.videoQuality
         deduplicationThreshold = SettingsDefaults.deduplicationThreshold
@@ -5126,6 +5298,7 @@ extension SettingsView {
     func resetAdvancedSettings() {
         showFrameIDs = SettingsDefaults.showFrameIDs
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
+        showVideoControls = SettingsDefaults.showVideoControls
     }
 }
 

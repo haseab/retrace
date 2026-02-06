@@ -496,6 +496,74 @@ public class SimpleTimelineViewModel: ObservableObject {
         return boundaries
     }
 
+    // MARK: - Video Playback State
+
+    /// Whether video playback (auto-advance) is currently active
+    @Published public var isPlaying: Bool = false
+
+    /// Playback speed multiplier (frames per second)
+    /// Available speeds: 1, 2, 4, 8
+    @Published public var playbackSpeed: Double = 2.0
+
+    /// Timer that drives frame auto-advance during playback
+    private var playbackTimer: Timer?
+
+    /// Whether video controls are enabled (read from UserDefaults)
+    public var showVideoControls: Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return defaults.bool(forKey: "showVideoControls")
+    }
+
+    /// Start auto-advancing frames at the current playback speed
+    public func startPlayback() {
+        guard !isPlaying else { return }
+        isPlaying = true
+        schedulePlaybackTimer()
+    }
+
+    /// Stop auto-advancing frames
+    public func stopPlayback() {
+        isPlaying = false
+        playbackTimer?.invalidate()
+        playbackTimer = nil
+    }
+
+    /// Toggle between play and pause
+    public func togglePlayback() {
+        if isPlaying {
+            stopPlayback()
+        } else {
+            startPlayback()
+        }
+    }
+
+    /// Update the playback speed and reschedule the timer if playing
+    public func setPlaybackSpeed(_ speed: Double) {
+        playbackSpeed = speed
+        if isPlaying {
+            // Reschedule timer with new interval
+            playbackTimer?.invalidate()
+            schedulePlaybackTimer()
+        }
+    }
+
+    /// Schedule the playback timer at the current speed
+    private func schedulePlaybackTimer() {
+        let interval = 1.0 / playbackSpeed
+        playbackTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                let nextIndex = self.currentIndex + 1
+                if nextIndex < self.frames.count {
+                    self.navigateToFrame(nextIndex)
+                } else {
+                    // Reached the end - stop playback
+                    self.stopPlayback()
+                }
+            }
+        }
+    }
+
     /// Copy the current frame ID to clipboard
     public func copyCurrentFrameID() {
         guard let frame = currentFrame else { return }
@@ -4557,6 +4625,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     ///   - delta: The scroll delta value
     ///   - isTrackpad: Whether the scroll came from a trackpad (precise scrolling) vs mouse wheel
     public func handleScroll(delta: CGFloat, isTrackpad: Bool = true) async {
+        // Stop playback on manual scroll
+        if isPlaying {
+            stopPlayback()
+        }
+
         // Exit live mode on first scroll
         if isInLiveMode {
             exitLiveMode()
@@ -4577,7 +4650,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         // When zoomed out (fewer pixels per frame), we need to move more frames per scroll unit
         // When zoomed in (more pixels per frame), we need to move fewer frames per scroll unit
         // Mouse wheels need higher sensitivity since they send larger discrete deltas less frequently
-        let baseSensitivity: CGFloat = isTrackpad ? 0.025 : 0.5
+        // Scale by user's scroll sensitivity setting (0.1–1.0, default 0.75)
+        let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let userSensitivity = store.object(forKey: "scrollSensitivity") != nil ? store.double(forKey: "scrollSensitivity") : 0.75
+        let sensitivityMultiplier = CGFloat(userSensitivity / 0.75) // Normalize so 0.75 = current behavior
+        let baseSensitivity: CGFloat = (isTrackpad ? 0.025 : 0.5) * sensitivityMultiplier
         let referencePixelsPerFrame: CGFloat = TimelineConfig.basePixelsPerFrame * TimelineConfig.defaultZoomLevel + TimelineConfig.minPixelsPerFrame * (1 - TimelineConfig.defaultZoomLevel)
         let zoomAdjustedSensitivity = baseSensitivity * (referencePixelsPerFrame / pixelsPerFrame)
 

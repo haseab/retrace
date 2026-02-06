@@ -313,6 +313,8 @@ public struct SimpleTimelineView: View {
             .onDisappear {
                 // Stop periodic refresh when timeline is closed
                 viewModel.stopPeriodicStatusRefresh()
+                // Stop video playback when timeline is closed
+                viewModel.stopPlayback()
             }
             // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling

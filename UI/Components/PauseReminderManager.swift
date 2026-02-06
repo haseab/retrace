@@ -23,8 +23,16 @@ public class PauseReminderManager: ObservableObject {
     /// NOTE: Set to 10 seconds for testing - change back to 5 * 60 for production
     public static let reminderDelay: TimeInterval = 1 * 60 // 5 minutes for production
 
-    /// Duration after which to show the reminder again when user clicks "Remind Me Later" (30 minutes)
-    public static let remindLaterDelay: TimeInterval = 30 * 60  // 30 minutes
+    /// Read the user's "Remind Me Later" delay from settings (in seconds). 0 = never remind again.
+    private var remindLaterDelay: TimeInterval {
+        let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let minutes = store.double(forKey: "pauseReminderDelayMinutes")
+        // If the key has never been set, default to 30 minutes
+        if minutes == 0 && !store.dictionaryRepresentation().keys.contains("pauseReminderDelayMinutes") {
+            return 30 * 60
+        }
+        return minutes * 60  // 0 means never
+    }
 
     // MARK: - Private State
 
@@ -141,7 +149,7 @@ public class PauseReminderManager: ObservableObject {
         }
     }
 
-    /// Dismiss the reminder and schedule it to appear again after 30 minutes
+    /// Dismiss the reminder and schedule it to appear again based on user setting
     /// Called when user clicks "Remind Me Later"
     public func remindLater() {
         shouldShowReminder = false
@@ -150,8 +158,16 @@ public class PauseReminderManager: ObservableObject {
         // Cancel any existing remind later timer
         remindLaterTimer?.invalidate()
 
-        // Schedule reminder to appear again after 30 minutes
-        remindLaterTimer = Timer.scheduledTimer(withTimeInterval: Self.remindLaterDelay, repeats: false) { [weak self] _ in
+        let delay = remindLaterDelay
+
+        // If delay is 0, user chose "Never" — don't schedule another reminder
+        guard delay > 0 else {
+            Log.debug("[PauseReminderManager] User clicked 'Remind Me Later' with Never setting, won't remind again", category: .ui)
+            return
+        }
+
+        // Schedule reminder to appear again after the configured delay
+        remindLaterTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.isDismissedForSession = false
                 self?.shouldShowReminder = true
@@ -159,7 +175,7 @@ public class PauseReminderManager: ObservableObject {
             }
         }
 
-        Log.debug("[PauseReminderManager] User clicked 'Remind Me Later', will remind again in \(Self.remindLaterDelay) seconds", category: .ui)
+        Log.debug("[PauseReminderManager] User clicked 'Remind Me Later', will remind again in \(delay) seconds", category: .ui)
     }
 
     /// Dismiss the reminder permanently for this pause session (called when user clicks X)
