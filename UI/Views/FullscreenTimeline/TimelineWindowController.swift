@@ -1496,6 +1496,11 @@ public class TimelineWindowController: NSObject {
                     }
                     return true
                 }
+                // If filters are active (but panel is closed), clear them
+                if viewModel.filterCriteria.hasActiveFilters {
+                    viewModel.clearAllFilters()
+                    return true
+                }
             }
             // Otherwise close the timeline
             hide()
