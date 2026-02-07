@@ -67,6 +67,19 @@ enum SettingsDefaults {
 
 // OCRAppFilterMode is defined in Shared/PowerStateMonitor.swift
 
+// MARK: - Settings Search Index
+
+/// Represents a searchable settings entry for Cmd+K search
+struct SettingsSearchEntry: Identifiable {
+    let id: String
+    let tab: SettingsTab
+    let cardTitle: String
+    let cardIcon: String
+    let searchableText: [String]
+
+    var breadcrumb: String { "\(tab.rawValue) > \(cardTitle)" }
+}
+
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
 public struct SettingsView: View {
@@ -78,6 +91,10 @@ public struct SettingsView: View {
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
+
+    // Settings search
+    @State private var showSettingsSearch = false
+    @State private var settingsSearchQuery = ""
 
     // MARK: - Initialization
 
@@ -287,6 +304,76 @@ public struct SettingsView: View {
     // Observe UpdaterManager for automatic updates toggle
     @ObservedObject private var updaterManager = UpdaterManager.shared
 
+    // MARK: - Settings Search
+
+    private static let searchIndex: [SettingsSearchEntry] = [
+        // General
+        SettingsSearchEntry(id: "general.shortcuts", tab: .general, cardTitle: "Keyboard Shortcuts", cardIcon: "command",
+            searchableText: ["keyboard shortcuts", "open timeline", "open dashboard", "toggle recording", "hotkey", "shortcut"]),
+        SettingsSearchEntry(id: "general.updates", tab: .general, cardTitle: "Updates", cardIcon: "arrow.down.circle",
+            searchableText: ["updates", "automatic updates", "check for updates", "check now"]),
+        SettingsSearchEntry(id: "general.startup", tab: .general, cardTitle: "Startup", cardIcon: "power",
+            searchableText: ["startup", "launch at login", "start automatically", "menu bar icon", "show menu bar"]),
+        SettingsSearchEntry(id: "general.appearance", tab: .general, cardTitle: "Appearance", cardIcon: "paintbrush",
+            searchableText: ["appearance", "font style", "accent color", "color theme", "timeline colored borders", "scrubbing animation", "scroll sensitivity", "dark mode", "light mode", "theme"]),
+        // Capture
+        SettingsSearchEntry(id: "capture.rate", tab: .capture, cardTitle: "Capture Rate", cardIcon: "gauge.with.dots.needle.50percent",
+            searchableText: ["capture rate", "capture interval", "capture on window change", "frame rate", "screenshot frequency"]),
+        SettingsSearchEntry(id: "capture.compression", tab: .capture, cardTitle: "Compression", cardIcon: "archivebox",
+            searchableText: ["compression", "video quality", "deduplication", "duplicate frames", "storage size"]),
+        SettingsSearchEntry(id: "capture.pauseReminder", tab: .capture, cardTitle: "Pause Reminder", cardIcon: "bell.badge",
+            searchableText: ["pause reminder", "remind me later", "notification", "reminder interval"]),
+        // Storage
+        SettingsSearchEntry(id: "storage.rewindData", tab: .storage, cardTitle: "Rewind Data", cardIcon: "arrow.counterclockwise",
+            searchableText: ["rewind data", "use rewind", "rewind recordings", "import rewind"]),
+        SettingsSearchEntry(id: "storage.databaseLocations", tab: .storage, cardTitle: "Database Locations", cardIcon: "externaldrive",
+            searchableText: ["database locations", "retrace database folder", "rewind database", "choose folder", "storage location", "db path"]),
+        SettingsSearchEntry(id: "storage.retentionPolicy", tab: .storage, cardTitle: "Retention Policy", cardIcon: "calendar.badge.clock",
+            searchableText: ["retention policy", "keep recordings", "auto delete", "retention days", "data retention", "forever"]),
+        // Export & Data
+        SettingsSearchEntry(id: "exportData.comingSoon", tab: .exportData, cardTitle: "Coming Soon", cardIcon: "clock",
+            searchableText: ["export", "import", "data export"]),
+        // Privacy
+        SettingsSearchEntry(id: "privacy.excludedApps", tab: .privacy, cardTitle: "Excluded Apps", cardIcon: "app.badge.checkmark",
+            searchableText: ["excluded apps", "block app", "privacy", "apps not recorded", "app exclusion"]),
+        SettingsSearchEntry(id: "privacy.quickDelete", tab: .privacy, cardTitle: "Quick Delete", cardIcon: "clock.arrow.circlepath",
+            searchableText: ["quick delete", "delete recent", "last 5 minutes", "last hour", "last 24 hours", "erase"]),
+        SettingsSearchEntry(id: "privacy.permissions", tab: .privacy, cardTitle: "Permissions", cardIcon: "hand.raised",
+            searchableText: ["permissions", "screen recording", "accessibility", "grant permission"]),
+        // Power
+        SettingsSearchEntry(id: "power.ocrProcessing", tab: .power, cardTitle: "OCR Processing", cardIcon: "text.viewfinder",
+            searchableText: ["ocr processing", "enable ocr", "text extraction", "plugged in", "battery", "ocr"]),
+        SettingsSearchEntry(id: "power.powerEfficiency", tab: .power, cardTitle: "Power Efficiency", cardIcon: "leaf.fill",
+            searchableText: ["power efficiency", "max ocr rate", "energy", "fan noise", "cpu usage", "fps"]),
+        SettingsSearchEntry(id: "power.appFilter", tab: .power, cardTitle: "App Filter", cardIcon: "app.badge",
+            searchableText: ["app filter", "skip ocr", "ocr apps", "filter apps", "power saving"]),
+        // Tags
+        SettingsSearchEntry(id: "tags.manageTags", tab: .tags, cardTitle: "Manage Tags", cardIcon: "tag",
+            searchableText: ["manage tags", "create tag", "delete tag", "tag name", "organize"]),
+        // Advanced
+        SettingsSearchEntry(id: "advanced.cache", tab: .advanced, cardTitle: "Cache", cardIcon: "externaldrive",
+            searchableText: ["cache", "clear cache", "app name cache", "refresh"]),
+        SettingsSearchEntry(id: "advanced.timeline", tab: .advanced, cardTitle: "Timeline", cardIcon: "play.rectangle",
+            searchableText: ["timeline", "video controls", "play pause", "auto advance"]),
+        SettingsSearchEntry(id: "advanced.developer", tab: .advanced, cardTitle: "Developer", cardIcon: "hammer",
+            searchableText: ["developer", "frame ids", "ocr debug overlay", "database schema", "debug"]),
+        SettingsSearchEntry(id: "advanced.dangerZone", tab: .advanced, cardTitle: "Danger Zone", cardIcon: "exclamationmark.triangle",
+            searchableText: ["danger zone", "reset all settings", "delete all data", "factory reset"]),
+    ]
+
+    private func searchSettings(query: String) -> [SettingsSearchEntry] {
+        guard !query.isEmpty else { return [] }
+        let queryWords = query.lowercased().split(separator: " ").map(String.init)
+
+        return Self.searchIndex.filter { entry in
+            queryWords.allSatisfy { word in
+                entry.searchableText.contains { $0.lowercased().contains(word) }
+                    || entry.tab.rawValue.lowercased().contains(word)
+                    || entry.cardTitle.lowercased().contains(word)
+            }
+        }
+    }
+
     // MARK: - Body
 
     /// Max width for the entire settings panel before it detaches and centers
@@ -360,6 +447,21 @@ public struct SettingsView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
             selectedTab = .power
+        }
+        .overlay {
+            settingsSearchOverlay
+                .animation(.easeOut(duration: 0.15), value: showSettingsSearch)
+        }
+        .background {
+            // Hidden button for Cmd+K shortcut
+            Button("") {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showSettingsSearch = true
+                }
+            }
+            .keyboardShortcut("k", modifiers: .command)
+            .frame(width: 0, height: 0)
+            .opacity(0)
         }
     }
 
@@ -457,6 +559,45 @@ public struct SettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 20)
             .padding(.vertical, 24)
+
+            // Search button
+            Button(action: {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showSettingsSearch = true
+                }
+            }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 12))
+                        .foregroundColor(.retraceSecondary)
+
+                    Text("Search")
+                        .font(.retraceCaptionMedium)
+                        .foregroundColor(.retraceSecondary)
+                        .lineLimit(1)
+
+                    Spacer()
+
+                    HStack(spacing: 2) {
+                        Text("\u{2318}")
+                            .font(.system(size: 10, weight: .medium))
+                        Text("K")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(4)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.04))
+                .cornerRadius(8)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
 
             // Navigation items
             VStack(spacing: 4) {
@@ -640,321 +781,340 @@ public struct SettingsView: View {
 
     private var generalSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            ModernSettingsCard(title: "Keyboard Shortcuts", icon: "command") {
-                VStack(spacing: 12) {
-                    settingsShortcutRecorderRow(
-                        label: "Open Timeline",
-                        shortcut: $timelineShortcut,
-                        isRecording: $isRecordingTimelineShortcut,
-                        otherShortcuts: [dashboardShortcut, recordingShortcut]
-                    )
+            keyboardShortcutsCard
+            updatesCard
+            startupCard
+            appearanceCard
+        }
+    }
 
-                    Divider()
-                        .background(Color.retraceBorder)
+    // MARK: - General Cards (extracted for search)
 
-                    settingsShortcutRecorderRow(
-                        label: "Open Dashboard",
-                        shortcut: $dashboardShortcut,
-                        isRecording: $isRecordingDashboardShortcut,
-                        otherShortcuts: [timelineShortcut, recordingShortcut]
-                    )
+    @ViewBuilder
+    private var keyboardShortcutsCard: some View {
+        ModernSettingsCard(title: "Keyboard Shortcuts", icon: "command") {
+            VStack(spacing: 12) {
+                settingsShortcutRecorderRow(
+                    label: "Open Timeline",
+                    shortcut: $timelineShortcut,
+                    isRecording: $isRecordingTimelineShortcut,
+                    otherShortcuts: [dashboardShortcut, recordingShortcut]
+                )
 
-                    Divider()
-                        .background(Color.retraceBorder)
+                Divider()
+                    .background(Color.retraceBorder)
 
-                    settingsShortcutRecorderRow(
-                        label: "Toggle Recording",
-                        shortcut: $recordingShortcut,
-                        isRecording: $isRecordingRecordingShortcut,
-                        otherShortcuts: [timelineShortcut, dashboardShortcut]
-                    )
+                settingsShortcutRecorderRow(
+                    label: "Open Dashboard",
+                    shortcut: $dashboardShortcut,
+                    isRecording: $isRecordingDashboardShortcut,
+                    otherShortcuts: [timelineShortcut, recordingShortcut]
+                )
 
-                    if let error = shortcutError {
-                        HStack(spacing: 4) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.retraceTiny)
-                                .foregroundColor(.retraceWarning)
-                            Text(error)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceWarning)
-                        }
-                        .padding(.top, 4)
+                Divider()
+                    .background(Color.retraceBorder)
+
+                settingsShortcutRecorderRow(
+                    label: "Toggle Recording",
+                    shortcut: $recordingShortcut,
+                    isRecording: $isRecordingRecordingShortcut,
+                    otherShortcuts: [timelineShortcut, dashboardShortcut]
+                )
+
+                if let error = shortcutError {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.retraceTiny)
+                            .foregroundColor(.retraceWarning)
+                        Text(error)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceWarning)
+                    }
+                    .padding(.top, 4)
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            // Cancel recording if user clicks outside
+            if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut {
+                isRecordingTimelineShortcut = false
+                isRecordingDashboardShortcut = false
+                isRecordingRecordingShortcut = false
+                recordingTimeoutTask?.cancel()
+            }
+        }
+        .task {
+            // Load saved shortcuts on appear
+            await loadSavedShortcuts()
+        }
+    }
+
+    @ViewBuilder
+    private var updatesCard: some View {
+        ModernSettingsCard(title: "Updates", icon: "arrow.down.circle") {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Check for Updates")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.retracePrimary)
+
+                    if let lastCheck = UpdaterManager.shared.lastUpdateCheckDate {
+                        Text("Last checked: \(lastCheck.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                    } else {
+                        Text("Automatically checks for updates")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
                     }
                 }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                // Cancel recording if user clicks outside
-                if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut {
-                    isRecordingTimelineShortcut = false
-                    isRecordingDashboardShortcut = false
-                    isRecordingRecordingShortcut = false
-                    recordingTimeoutTask?.cancel()
+
+                Spacer()
+
+                ModernButton(
+                    title: UpdaterManager.shared.isCheckingForUpdates ? "Checking..." : "Check Now",
+                    icon: "arrow.clockwise",
+                    style: .secondary
+                ) {
+                    UpdaterManager.shared.checkForUpdates()
                 }
-            }
-            .task {
-                // Load saved shortcuts on appear
-                await loadSavedShortcuts()
+                .disabled(UpdaterManager.shared.isCheckingForUpdates || !UpdaterManager.shared.canCheckForUpdates)
             }
 
-            ModernSettingsCard(title: "Updates", icon: "arrow.down.circle") {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Check for Updates")
+            ModernToggleRow(
+                title: "Automatic Updates",
+                subtitle: "Automatically download and install updates",
+                isOn: $updaterManager.automaticUpdatesEnabled
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var startupCard: some View {
+        ModernSettingsCard(title: "Startup", icon: "power") {
+            ModernToggleRow(
+                title: "Launch at Login",
+                subtitle: "Start Retrace automatically when you log in",
+                isOn: $launchAtLogin
+            )
+            .onChange(of: launchAtLogin) { newValue in
+                setLaunchAtLogin(enabled: newValue)
+            }
+
+            ModernToggleRow(
+                title: "Show Menu Bar Icon",
+                subtitle: "Quick access from your menu bar",
+                isOn: $showMenuBarIcon
+            )
+            .onChange(of: showMenuBarIcon) { newValue in
+                setMenuBarIconVisibility(visible: newValue)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var appearanceCard: some View {
+        ModernSettingsCard(title: "Appearance", icon: "paintbrush") {
+            VStack(alignment: .leading, spacing: 24) {
+                // Font Style Section
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Font Style")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+
+                            Text("Choose your preferred font style")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        Spacer()
+
+                        // Reset to default button
+                        if fontStyle != SettingsDefaults.fontStyle {
+                            Button(action: {
+                                fontStyle = SettingsDefaults.fontStyle
+                                RetraceFont.currentStyle = SettingsDefaults.fontStyle
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    FontStylePicker(selection: $fontStyle)
+                        .onChange(of: fontStyle) { newStyle in
+                            RetraceFont.currentStyle = newStyle
+                        }
+                }
+
+                Divider()
+                    .background(Color.retraceBorder)
+
+                // Tier Theme Section
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Accent Color")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+
+                            Text("Choose your preferred color theme")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        Spacer()
+
+                        // Reset to default button
+                        if colorThemePreference != SettingsDefaults.colorTheme {
+                            Button(action: {
+                                colorThemePreference = SettingsDefaults.colorTheme
+                                MilestoneCelebrationManager.setColorThemePreference(.blue)
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    ColorThemePicker(
+                        selection: Binding(
+                            get: {
+                                MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
+                            },
+                            set: { newValue in
+                                colorThemePreference = newValue.rawValue
+                                MilestoneCelebrationManager.setColorThemePreference(newValue)
+                            }
+                        )
+                    )
+                }
+
+                ModernToggleRow(
+                    title: "Timeline colored button borders",
+                    subtitle: "Show accent-colored borders on timeline control buttons",
+                    isOn: $timelineColoredBorders
+                )
+
+                Divider()
+                    .background(Color.retraceBorder)
+
+                // Scrubbing Animation Section
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("Scrubbing animation")
                             .font(.retraceCalloutMedium)
                             .foregroundColor(.retracePrimary)
-
-                        if let lastCheck = UpdaterManager.shared.lastUpdateCheckDate {
-                            Text("Last checked: \(lastCheck.formatted(date: .abbreviated, time: .shortened))")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        } else {
-                            Text("Automatically checks for updates")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
+                        Spacer()
+                        Text(scrubbingAnimationDisplayText)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
                     }
 
-                    Spacer()
-
-                    ModernButton(
-                        title: UpdaterManager.shared.isCheckingForUpdates ? "Checking..." : "Check Now",
-                        icon: "arrow.clockwise",
-                        style: .secondary
-                    ) {
-                        UpdaterManager.shared.checkForUpdates()
-                    }
-                    .disabled(UpdaterManager.shared.isCheckingForUpdates || !UpdaterManager.shared.canCheckForUpdates)
-                }
-
-                ModernToggleRow(
-                    title: "Automatic Updates",
-                    subtitle: "Automatically download and install updates",
-                    isOn: $updaterManager.automaticUpdatesEnabled
-                )
-            }
-
-            ModernSettingsCard(title: "Startup", icon: "power") {
-                ModernToggleRow(
-                    title: "Launch at Login",
-                    subtitle: "Start Retrace automatically when you log in",
-                    isOn: $launchAtLogin
-                )
-                .onChange(of: launchAtLogin) { newValue in
-                    setLaunchAtLogin(enabled: newValue)
-                }
-
-                ModernToggleRow(
-                    title: "Show Menu Bar Icon",
-                    subtitle: "Quick access from your menu bar",
-                    isOn: $showMenuBarIcon
-                )
-                .onChange(of: showMenuBarIcon) { newValue in
-                    setMenuBarIconVisibility(visible: newValue)
-                }
-            }
-
-            ModernSettingsCard(title: "Appearance", icon: "paintbrush") {
-                VStack(alignment: .leading, spacing: 24) {
-                    // Font Style Section
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Font Style")
-                                    .font(.retraceCalloutMedium)
-                                    .foregroundColor(.retracePrimary)
-
-                                Text("Choose your preferred font style")
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
-                            }
-
-                            Spacer()
-
-                            // Reset to default button
-                            if fontStyle != SettingsDefaults.fontStyle {
-                                Button(action: {
-                                    fontStyle = SettingsDefaults.fontStyle
-                                    RetraceFont.currentStyle = SettingsDefaults.fontStyle
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.counterclockwise")
-                                            .font(.system(size: 10))
-                                        Text("Reset to Default")
-                                            .font(.retraceCaption2)
-                                    }
-                                    .foregroundColor(.white.opacity(0.7))
-                                }
-                                .buttonStyle(.plain)
-                            }
+                    ModernSlider(value: $scrubbingAnimationDuration, range: 0...0.20, step: 0.01)
+                        .onChange(of: scrubbingAnimationDuration) { _ in
+                            showScrubbingAnimationUpdateFeedback()
                         }
 
-                        FontStylePicker(selection: $fontStyle)
-                            .onChange(of: fontStyle) { newStyle in
-                                RetraceFont.currentStyle = newStyle
-                            }
-                    }
+                    HStack {
+                        Text(scrubbingAnimationDescriptionText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
 
-                    Divider()
-                        .background(Color.retraceBorder)
+                        Spacer()
 
-                    // Tier Theme Section
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Accent Color")
-                                    .font(.retraceCalloutMedium)
-                                    .foregroundColor(.retracePrimary)
-
-                                Text("Choose your preferred color theme")
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
-                            }
-
-                            Spacer()
-
-                            // Reset to default button
-                            if colorThemePreference != SettingsDefaults.colorTheme {
-                                Button(action: {
-                                    colorThemePreference = SettingsDefaults.colorTheme
-                                    MilestoneCelebrationManager.setColorThemePreference(.blue)
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.counterclockwise")
-                                            .font(.system(size: 10))
-                                        Text("Reset to Default")
-                                            .font(.retraceCaption2)
-                                    }
-                                    .foregroundColor(.white.opacity(0.7))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        ColorThemePicker(
-                            selection: Binding(
-                                get: {
-                                    MilestoneCelebrationManager.ColorTheme(rawValue: colorThemePreference) ?? .blue
-                                },
-                                set: { newValue in
-                                    colorThemePreference = newValue.rawValue
-                                    MilestoneCelebrationManager.setColorThemePreference(newValue)
-                                }
-                            )
-                        )
-                    }
-
-                    ModernToggleRow(
-                        title: "Timeline colored button borders",
-                        subtitle: "Show accent-colored borders on timeline control buttons",
-                        isOn: $timelineColoredBorders
-                    )
-
-                    Divider()
-                        .background(Color.retraceBorder)
-
-                    // Scrubbing Animation Section
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            Text("Scrubbing animation")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
-                            Spacer()
-                            Text(scrubbingAnimationDisplayText)
-                                .font(.retraceCalloutBold)
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color.retraceAccent.opacity(0.3))
-                                .cornerRadius(8)
-                        }
-
-                        ModernSlider(value: $scrubbingAnimationDuration, range: 0...0.20, step: 0.01)
-                            .onChange(of: scrubbingAnimationDuration) { _ in
+                        if scrubbingAnimationDuration != SettingsDefaults.scrubbingAnimationDuration {
+                            Button(action: {
+                                scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
                                 showScrubbingAnimationUpdateFeedback()
-                            }
-
-                        HStack {
-                            Text(scrubbingAnimationDescriptionText)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-
-                            Spacer()
-
-                            if scrubbingAnimationDuration != SettingsDefaults.scrubbingAnimationDuration {
-                                Button(action: {
-                                    scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
-                                    showScrubbingAnimationUpdateFeedback()
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.counterclockwise")
-                                            .font(.system(size: 10))
-                                        Text("Reset to Default")
-                                            .font(.retraceCaption2)
-                                    }
-                                    .foregroundColor(.white.opacity(0.7))
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
                                 }
-                                .buttonStyle(.plain)
+                                .foregroundColor(.white.opacity(0.7))
                             }
-                        }
-
-                        // Update feedback message
-                        if let message = scrubbingAnimationUpdateMessage {
-                            HStack(spacing: 6) {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(.green)
-                                    .font(.system(size: 12))
-                                Text(message)
-                                    .font(.retraceCaption2)
-                                    .foregroundColor(.retraceSecondary)
-                            }
-                            .transition(.opacity.combined(with: .move(edge: .top)))
+                            .buttonStyle(.plain)
                         }
                     }
-                    .animation(.easeInOut(duration: 0.2), value: scrubbingAnimationUpdateMessage)
 
-                    Divider()
-                        .background(Color.retraceBorder)
-
-                    // Scroll Sensitivity Section
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            Text("Scroll sensitivity")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
-                            Spacer()
-                            Text(scrollSensitivityDisplayText)
-                                .font(.retraceCalloutBold)
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color.retraceAccent.opacity(0.3))
-                                .cornerRadius(8)
-                        }
-
-                        ModernSlider(value: $scrollSensitivity, range: 0.1...1.0, step: 0.05)
-
-                        HStack {
-                            Text(scrollSensitivityDescriptionText)
+                    // Update feedback message
+                    if let message = scrubbingAnimationUpdateMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text(message)
                                 .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: scrubbingAnimationUpdateMessage)
 
-                            Spacer()
+                Divider()
+                    .background(Color.retraceBorder)
 
-                            if scrollSensitivity != SettingsDefaults.scrollSensitivity {
-                                Button(action: {
-                                    scrollSensitivity = SettingsDefaults.scrollSensitivity
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "arrow.counterclockwise")
-                                            .font(.system(size: 10))
-                                        Text("Reset to Default")
-                                            .font(.retraceCaption2)
-                                    }
-                                    .foregroundColor(.white.opacity(0.7))
+                // Scroll Sensitivity Section
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("Scroll sensitivity")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Spacer()
+                        Text(scrollSensitivityDisplayText)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
+                    }
+
+                    ModernSlider(value: $scrollSensitivity, range: 0.1...1.0, step: 0.05)
+
+                    HStack {
+                        Text(scrollSensitivityDescriptionText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        if scrollSensitivity != SettingsDefaults.scrollSensitivity {
+                            Button(action: {
+                                scrollSensitivity = SettingsDefaults.scrollSensitivity
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
                                 }
-                                .buttonStyle(.plain)
+                                .foregroundColor(.white.opacity(0.7))
                             }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -1121,7 +1281,47 @@ public struct SettingsView: View {
 
     private var captureSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            ModernSettingsCard(title: "Capture Rate", icon: "gauge.with.dots.needle.50percent") {
+            captureRateCard
+            compressionCard
+            pauseReminderCard
+
+            // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
+//            ModernSettingsCard(title: "Display Options", icon: "display") {
+//                ModernToggleRow(
+//                    title: "Exclude Cursor",
+//                    subtitle: "Hide the mouse cursor in captures",
+//                    isOn: $excludeCursor
+//                )
+//            }
+
+            // TODO: Add Auto-Pause settings later
+//            ModernSettingsCard(title: "Auto-Pause", icon: "pause.circle") {
+//                ModernToggleRow(
+//                    title: "Screen is locked",
+//                    subtitle: "Pause recording when your Mac is locked",
+//                    isOn: .constant(true)
+//                )
+//
+//                ModernToggleRow(
+//                    title: "On battery (< 20%)",
+//                    subtitle: "Pause when battery is critically low",
+//                    isOn: .constant(false)
+//                )
+//
+//                ModernToggleRow(
+//                    title: "Idle for 10 minutes",
+//                    subtitle: "Pause after extended inactivity",
+//                    isOn: .constant(false)
+//                )
+//            }
+        }
+    }
+
+    // MARK: - Capture Cards (extracted for search)
+
+    @ViewBuilder
+    private var captureRateCard: some View {
+        ModernSettingsCard(title: "Capture Rate", icon: "gauge.with.dots.needle.50percent") {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
                         Text("Capture interval")
@@ -1204,9 +1404,12 @@ public struct SettingsView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.2), value: captureUpdateMessage)
-            }
+        }
+    }
 
-            ModernSettingsCard(title: "Compression", icon: "archivebox") {
+    @ViewBuilder
+    private var compressionCard: some View {
+        ModernSettingsCard(title: "Compression", icon: "archivebox") {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
                         Text("Video quality")
@@ -1319,9 +1522,12 @@ public struct SettingsView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.2), value: compressionUpdateMessage)
-            }
+        }
+    }
 
-            ModernSettingsCard(title: "Pause Reminder", icon: "bell.badge") {
+    @ViewBuilder
+    private var pauseReminderCard: some View {
+        ModernSettingsCard(title: "Pause Reminder", icon: "bell.badge") {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
                         Text("\"Remind Me Later\" interval")
@@ -1362,37 +1568,6 @@ public struct SettingsView: View {
                         }
                     }
                 }
-            }
-
-            // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
-//            ModernSettingsCard(title: "Display Options", icon: "display") {
-//                ModernToggleRow(
-//                    title: "Exclude Cursor",
-//                    subtitle: "Hide the mouse cursor in captures",
-//                    isOn: $excludeCursor
-//                )
-//            }
-
-            // TODO: Add Auto-Pause settings later
-//            ModernSettingsCard(title: "Auto-Pause", icon: "pause.circle") {
-//                ModernToggleRow(
-//                    title: "Screen is locked",
-//                    subtitle: "Pause recording when your Mac is locked",
-//                    isOn: .constant(true)
-//                )
-//
-//                ModernToggleRow(
-//                    title: "On battery (< 20%)",
-//                    subtitle: "Pause when battery is critically low",
-//                    isOn: .constant(false)
-//                )
-//
-//                ModernToggleRow(
-//                    title: "Idle for 10 minutes",
-//                    subtitle: "Pause after extended inactivity",
-//                    isOn: .constant(false)
-//                )
-//            }
         }
     }
 
@@ -1400,8 +1575,17 @@ public struct SettingsView: View {
 
     private var storageSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // Rewind Data Source
-            ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
+            rewindDataCard
+            databaseLocationsCard
+            retentionPolicyCard
+        }
+    }
+
+    // MARK: - Storage Cards (extracted for search)
+
+    @ViewBuilder
+    private var rewindDataCard: some View {
+        ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
                 ModernToggleRow(
                     title: "Use Rewind data",
                     subtitle: "Show your old Rewind recordings in the timeline",
@@ -1427,9 +1611,12 @@ public struct SettingsView: View {
                         }
                     )
                 )
-            }
+        }
+    }
 
-            ModernSettingsCard(title: "Database Locations", icon: "externaldrive") {
+    @ViewBuilder
+    private var databaseLocationsCard: some View {
+        ModernSettingsCard(title: "Database Locations", icon: "externaldrive") {
                 VStack(alignment: .leading, spacing: 16) {
                     // Warning when recording is active (only for Retrace)
                     if coordinatorWrapper.isRunning {
@@ -1575,14 +1762,17 @@ public struct SettingsView: View {
                         .help(coordinatorWrapper.isRunning && customRetraceDBLocation != nil ? "Stop recording to reset Retrace database location" : "")
                     }
                 }
-            }
+        }
+    }
 
-            ModernSettingsCard(title: "Retention Policy", icon: "calendar.badge.clock") {
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Keep recordings for")
-                                .font(.retraceCalloutMedium)
+    @ViewBuilder
+    private var retentionPolicyCard: some View {
+        ModernSettingsCard(title: "Retention Policy", icon: "calendar.badge.clock") {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Keep recordings for")
+                            .font(.retraceCalloutMedium)
                                 .foregroundColor(.retracePrimary)
                             if useRewindData {
                                 (Text("Only applies to Retrace data, not Rewind data. To remove Rewind data, go to ")
@@ -1828,48 +2018,26 @@ public struct SettingsView: View {
                     //     }
                     // }
                 }
+        }
+        // .onAppear {
+        //     loadRetentionExclusionData()
+        // }
+        .alert("Change Retention Policy?", isPresented: $showRetentionConfirmation) {
+            Button("Cancel", role: .cancel) {
+                // Reset preview to original value
+                previewRetentionDays = nil
+                pendingRetentionDays = nil
             }
-            // .onAppear {
-            //     loadRetentionExclusionData()
-            // }
-            .alert("Change Retention Policy?", isPresented: $showRetentionConfirmation) {
-                Button("Cancel", role: .cancel) {
-                    // Reset preview to original value
-                    previewRetentionDays = nil
-                    pendingRetentionDays = nil
+            Button("Confirm", role: .destructive) {
+                if let newDays = pendingRetentionDays {
+                    retentionDays = newDays
+                    retentionSettingChanged = true
                 }
-                Button("Confirm", role: .destructive) {
-                    if let newDays = pendingRetentionDays {
-                        retentionDays = newDays
-                        retentionSettingChanged = true
-                    }
-                    previewRetentionDays = nil
-                    pendingRetentionDays = nil
-                }
-            } message: {
-                Text(retentionConfirmationMessage)
+                previewRetentionDays = nil
+                pendingRetentionDays = nil
             }
-
-            // TODO: Add Storage Limit settings later
-//            ModernSettingsCard(title: "Storage Limit", icon: "externaldrive") {
-//                VStack(alignment: .leading, spacing: 16) {
-//                    HStack {
-//                        Text("Maximum storage")
-//                            .font(.retraceCalloutMedium)
-//                            .foregroundColor(.retracePrimary)
-//                        Spacer()
-//                        Text(String(format: "%.0f GB", maxStorageGB))
-//                            .font(.retraceCalloutBold)
-//                            .foregroundColor(.white)
-//                            .padding(.horizontal, 12)
-//                            .padding(.vertical, 6)
-//                            .background(Color.retraceAccent.opacity(0.3))
-//                            .cornerRadius(8)
-//                    }
-//
-//                    ModernSlider(value: $maxStorageGB, range: 10...500, step: 10)
-//                }
-//            }
+        } message: {
+            Text(retentionConfirmationMessage)
         }
     }
 
@@ -1877,16 +2045,23 @@ public struct SettingsView: View {
 
     private var exportDataSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            ModernSettingsCard(title: "Coming Soon", icon: "clock") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("These settings will be provided in the next update!")
-                        .font(.retraceCalloutMedium)
-                        .foregroundColor(.retracePrimary)
+            comingSoonCard
+        }
+    }
 
-                    Text("Major exporting and importing flexibility")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
-                }
+    // MARK: - Export & Data Cards (extracted for search)
+
+    @ViewBuilder
+    private var comingSoonCard: some View {
+        ModernSettingsCard(title: "Coming Soon", icon: "clock") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("These settings will be provided in the next update!")
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
+
+                Text("Major exporting and importing flexibility")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary.opacity(0.7))
             }
         }
     }
@@ -1895,32 +2070,17 @@ public struct SettingsView: View {
 
     private var privacySettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // COMMENTED OUT - Database Encryption setting removed (no reliable encrypt/decrypt migration)
-            // ModernSettingsCard(title: "Database Encryption", icon: "lock.shield") {
-            //     ModernToggleRow(
-            //         title: "Encrypt database",
-            //         subtitle: "Secure your data with AES-256 encryption",
-            //         isOn: $encryptionEnabled
-            //     )
-            //
-            //     if encryptionEnabled {
-            //         HStack(spacing: 10) {
-            //             Image(systemName: "checkmark.shield.fill")
-            //                 .foregroundColor(.retraceSuccess)
-            //                 .font(.system(size: 14))
-            //
-            //             Text("Database encrypted with SQLCipher (AES-256)")
-            //                 .font(.retraceCaption2Medium)
-            //                 .foregroundColor(.retraceSuccess)
-            //         }
-            //         .padding(12)
-            //         .frame(maxWidth: .infinity, alignment: .leading)
-            //         .background(Color.retraceSuccess.opacity(0.1))
-            //         .cornerRadius(10)
-            //     }
-            // }
+            excludedAppsCard
+            quickDeleteCard
+            permissionsCard
+        }
+    }
 
-            ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
+    // MARK: - Privacy Cards (extracted for search)
+
+    @ViewBuilder
+    private var excludedAppsCard: some View {
+        ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Apps that will not be recorded")
                         .font(.retraceCaption)
@@ -1962,37 +2122,12 @@ public struct SettingsView: View {
                     }
                 }
                 .animation(.easeInOut(duration: 0.2), value: excludedAppsUpdateMessage)
-            }
+        }
+    }
 
-            // TODO: Re-enable once private window detection is more reliable
-            // Currently disabled because title-based detection has false positives
-            // (e.g., pages with "private" in the title) and AX-based detection
-            // doesn't reliably detect Chrome/Safari incognito windows
-            // ModernSettingsCard(title: "Excluded Windows", icon: "eye.slash") {
-            //     ModernToggleRow(
-            //         title: "Exclude Private/Incognito Windows",
-            //         subtitle: "Automatically skip private browsing windows",
-            //         isOn: $excludePrivateWindows
-            //     )
-            //
-            //     if excludePrivateWindows {
-            //         VStack(alignment: .leading, spacing: 8) {
-            //             Text("Detects private windows from:")
-            //                 .font(.retraceCaption2Medium)
-            //                 .foregroundColor(.retraceSecondary)
-            //
-            //             Text("Safari, Chrome, Edge, Firefox, Brave")
-            //                 .font(.retraceCaption2)
-            //                 .foregroundColor(.retraceSecondary.opacity(0.8))
-            //         }
-            //         .padding(12)
-            //         .frame(maxWidth: .infinity, alignment: .leading)
-            //         .background(Color.white.opacity(0.03))
-            //         .cornerRadius(10)
-            //     }
-            // }
-
-            ModernSettingsCard(title: "Quick Delete", icon: "clock.arrow.circlepath") {
+    @ViewBuilder
+    private var quickDeleteCard: some View {
+        ModernSettingsCard(title: "Quick Delete", icon: "clock.arrow.circlepath") {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Permanently delete recent recordings")
                         .font(.retraceCaption)
@@ -2051,26 +2186,28 @@ public struct SettingsView: View {
                     },
                     secondaryButton: .cancel()
                 )
-            }
+        }
+    }
 
-            ModernSettingsCard(title: "Permissions", icon: "hand.raised") {
-                ModernPermissionRow(
-                    label: "Screen Recording",
-                    status: hasScreenRecordingPermission ? .granted : .notDetermined,
-                    enableAction: hasScreenRecordingPermission ? nil : { requestScreenRecordingPermission() },
-                    openSettingsAction: { openScreenRecordingSettings() }
-                )
+    @ViewBuilder
+    private var permissionsCard: some View {
+        ModernSettingsCard(title: "Permissions", icon: "hand.raised") {
+            ModernPermissionRow(
+                label: "Screen Recording",
+                status: hasScreenRecordingPermission ? .granted : .notDetermined,
+                enableAction: hasScreenRecordingPermission ? nil : { requestScreenRecordingPermission() },
+                openSettingsAction: { openScreenRecordingSettings() }
+            )
 
-                ModernPermissionRow(
-                    label: "Accessibility",
-                    status: hasAccessibilityPermission ? .granted : .notDetermined,
-                    enableAction: hasAccessibilityPermission ? nil : { requestAccessibilityPermission() },
-                    openSettingsAction: { openAccessibilitySettings() }
-                )
-            }
-            .task {
-                await checkPermissions()
-            }
+            ModernPermissionRow(
+                label: "Accessibility",
+                status: hasAccessibilityPermission ? .granted : .notDetermined,
+                enableAction: hasAccessibilityPermission ? nil : { requestAccessibilityPermission() },
+                openSettingsAction: { openAccessibilitySettings() }
+            )
+        }
+        .task {
+            await checkPermissions()
         }
     }
 
@@ -2078,8 +2215,32 @@ public struct SettingsView: View {
 
     private var powerSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // Prominent energy usage banner
-            HStack(spacing: 14) {
+            // Energy usage banner (informational, not a settings card)
+            powerEnergyBanner
+
+            ocrProcessingCard
+
+            if ocrEnabled {
+                powerEfficiencyCard
+                appFilterCard
+            }
+
+            // Tips card (informational)
+            powerTipsCard
+        }
+        .onAppear {
+            updatePowerSourceStatus()
+            loadOCRFilteredApps()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PowerSourceDidChange"))) { _ in
+            updatePowerSourceStatus()
+        }
+    }
+
+    // MARK: - Power Cards (extracted for search)
+
+    private var powerEnergyBanner: some View {
+        HStack(spacing: 14) {
                 ZStack {
                     Circle()
                         .fill(Color.orange.opacity(0.2))
@@ -2109,8 +2270,11 @@ public struct SettingsView: View {
                             .strokeBorder(Color.orange.opacity(0.3), lineWidth: 1)
                     )
             )
+    }
 
-            ModernSettingsCard(title: "OCR Processing", icon: "text.viewfinder") {
+    @ViewBuilder
+    private var ocrProcessingCard: some View {
+        ModernSettingsCard(title: "OCR Processing", icon: "text.viewfinder") {
                 VStack(spacing: 16) {
                     ModernToggleRow(
                         title: "Enable OCR",
@@ -2151,10 +2315,12 @@ public struct SettingsView: View {
                         }
                     }
                 }
-            }
+        }
+    }
 
-            if ocrEnabled {
-                ModernSettingsCard(title: "Power Efficiency", icon: "leaf.fill") {
+    @ViewBuilder
+    private var powerEfficiencyCard: some View {
+        ModernSettingsCard(title: "Power Efficiency", icon: "leaf.fill") {
                     VStack(alignment: .leading, spacing: 16) {
                         HStack {
                             Text("Max OCR rate")
@@ -2211,9 +2377,12 @@ public struct SettingsView: View {
                             }
                         }
                     }
-                }
+        }
+    }
 
-                ModernSettingsCard(title: "App Filter", icon: "app.badge") {
+    @ViewBuilder
+    private var appFilterCard: some View {
+        ModernSettingsCard(title: "App Filter", icon: "app.badge") {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Skip OCR for specific apps to save power")
                             .font(.retraceCaption)
@@ -2312,35 +2481,27 @@ public struct SettingsView: View {
                         }
                     }
                 }
-            }
+        }
 
-            // Tips card
-            HStack(spacing: 12) {
-                Image(systemName: "lightbulb.fill")
-                    .foregroundColor(.yellow)
-                    .font(.system(size: 16))
+    private var powerTipsCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "lightbulb.fill")
+                .foregroundColor(.yellow)
+                .font(.system(size: 16))
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Tips for reducing energy usage")
-                        .font(.retraceCaption2Medium)
-                        .foregroundColor(.retracePrimary)
-                    Text("• Lower the OCR rate to reduce fan noise\n• Use \"Process only when plugged in\" for laptops\n• Exclude apps where text search isn't needed")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.retraceSecondary)
-                }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Tips for reducing energy usage")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retracePrimary)
+                Text("• Lower the OCR rate to reduce fan noise\n• Use \"Process only when plugged in\" for laptops\n• Exclude apps where text search isn't needed")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.yellow.opacity(0.08))
-            .cornerRadius(10)
         }
-        .onAppear {
-            updatePowerSourceStatus()
-            loadOCRFilteredApps()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PowerSourceDidChange"))) { _ in
-            updatePowerSourceStatus()
-        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.08))
+        .cornerRadius(10)
     }
 
     private var ocrRateDisplayText: String {
@@ -2470,7 +2631,35 @@ public struct SettingsView: View {
     // MARK: - Tag Management Settings
     private var tagManagementSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            ModernSettingsCard(title: "Manage Tags", icon: "tag") {
+            manageTagsCard
+        }
+        .task {
+            await loadTagsForSettings()
+        }
+        .alert("Delete Tag", isPresented: $showTagDeleteConfirmation, presenting: tagToDelete) { tag in
+            Button("Cancel", role: .cancel) {
+                tagToDelete = nil
+            }
+            Button("Delete", role: .destructive) {
+                Task {
+                    await deleteTag(tag)
+                }
+            }
+        } message: { tag in
+            let count = tagSegmentCounts[tag.id] ?? 0
+            if count == 0 {
+                Text("This tag is not applied to any segments.")
+            } else {
+                Text("This tag is applied to \(count) segment\(count == 1 ? "" : "s"). The segments will remain, but the tag will be removed from them.")
+            }
+        }
+    }
+
+    // MARK: - Tags Cards (extracted for search)
+
+    @ViewBuilder
+    private var manageTagsCard: some View {
+        ModernSettingsCard(title: "Manage Tags", icon: "tag") {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Create and manage tags for organizing your recordings.")
                         .font(.retraceCaption)
@@ -2552,27 +2741,6 @@ public struct SettingsView: View {
                 }
             }
         }
-        .task {
-            await loadTagsForSettings()
-        }
-        .alert("Delete Tag", isPresented: $showTagDeleteConfirmation, presenting: tagToDelete) { tag in
-            Button("Cancel", role: .cancel) {
-                tagToDelete = nil
-            }
-            Button("Delete", role: .destructive) {
-                Task {
-                    await deleteTag(tag)
-                }
-            }
-        } message: { tag in
-            let count = tagSegmentCounts[tag.id] ?? 0
-            if count == 0 {
-                Text("This tag is not applied to any segments.")
-            } else {
-                Text("This tag is applied to \(count) segment\(count == 1 ? "" : "s"). The segments will remain, but the tag will be removed from them.")
-            }
-        }
-    }
 
     private func tagRow(for tag: Tag) -> some View {
         HStack {
@@ -2745,7 +2913,19 @@ public struct SettingsView: View {
 
     private var advancedSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            // TODO: Add Database settings later
+            cacheCard
+            timelineCard
+            developerCard
+            dangerZoneCard
+        }
+    }
+
+    // MARK: - Advanced Cards (extracted for search)
+
+    @ViewBuilder
+    private var cacheCard: some View {
+        // Placeholder for commented-out Database/Encoding cards
+        // TODO: Add Database settings later
 //            ModernSettingsCard(title: "Database", icon: "cylinder") {
 //                HStack(spacing: 12) {
 //                    ModernButton(title: "Vacuum Database", icon: "arrow.triangle.2.circlepath", style: .secondary) {}
@@ -2775,106 +2955,335 @@ public struct SettingsView: View {
 //                }
 //            }
 
-            ModernSettingsCard(title: "Cache", icon: "externaldrive") {
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Clear App Name Cache")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
+        ModernSettingsCard(title: "Cache", icon: "externaldrive") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Clear App Name Cache")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
 
-                            Text("Refresh cached app names if they appear incorrect or outdated")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-
-                        Spacer()
-
-                        ModernButton(title: "Clear Cache", icon: "arrow.clockwise", style: .secondary) {
-                            clearAppNameCache()
-                        }
+                        Text("Refresh cached app names if they appear incorrect or outdated")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
                     }
 
-                    if let message = cacheClearMessage {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 12))
-                            Text(message)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    Spacer()
+
+                    ModernButton(title: "Clear Cache", icon: "arrow.clockwise", style: .secondary) {
+                        clearAppNameCache()
                     }
                 }
-                .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
-            }
 
-            ModernSettingsCard(title: "Timeline", icon: "play.rectangle") {
+                if let message = cacheClearMessage {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 12))
+                        Text(message)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
+        }
+    }
+
+    @ViewBuilder
+    private var timelineCard: some View {
+        ModernSettingsCard(title: "Timeline", icon: "play.rectangle") {
                 ModernToggleRow(
                     title: "Show video controls",
                     subtitle: "Display play/pause button in the timeline to auto-advance frames",
                     isOn: $showVideoControls
                 )
+        }
+    }
+
+    @ViewBuilder
+    private var developerCard: some View {
+        ModernSettingsCard(title: "Developer", icon: "hammer") {
+            ModernToggleRow(
+                title: "Show frame IDs in UI",
+                subtitle: "Display frame IDs in the timeline for debugging",
+                isOn: $showFrameIDs
+            )
+
+            ModernToggleRow(
+                title: "Enable frame ID search",
+                subtitle: "Allow jumping to frames by ID in the Go to panel",
+                isOn: $enableFrameIDSearch
+            )
+
+            ModernToggleRow(
+                title: "Show OCR debug overlay",
+                subtitle: "Display OCR bounding boxes and tile grid in timeline",
+                isOn: $showOCRDebugOverlay
+            )
+
+            Divider()
+                .padding(.vertical, 8)
+
+            ModernButton(title: "Show Database Schema", icon: "doc.text", style: .secondary) {
+                loadDatabaseSchema()
+                showingDatabaseSchema = true
             }
+            .sheet(isPresented: $showingDatabaseSchema) {
+                DatabaseSchemaView(schemaText: databaseSchemaText, isPresented: $showingDatabaseSchema)
+            }
+        }
+    }
 
-            ModernSettingsCard(title: "Developer", icon: "hammer") {
-                ModernToggleRow(
-                    title: "Show frame IDs in UI",
-                    subtitle: "Display frame IDs in the timeline for debugging",
-                    isOn: $showFrameIDs
-                )
-
-                ModernToggleRow(
-                    title: "Enable frame ID search",
-                    subtitle: "Allow jumping to frames by ID in the Go to panel",
-                    isOn: $enableFrameIDSearch
-                )
-
-                ModernToggleRow(
-                    title: "Show OCR debug overlay",
-                    subtitle: "Display OCR bounding boxes and tile grid in timeline",
-                    isOn: $showOCRDebugOverlay
-                )
-
-                Divider()
-                    .padding(.vertical, 8)
-
-                ModernButton(title: "Show Database Schema", icon: "doc.text", style: .secondary) {
-                    loadDatabaseSchema()
-                    showingDatabaseSchema = true
+    @ViewBuilder
+    private var dangerZoneCard: some View {
+        ModernSettingsCard(title: "Danger Zone", icon: "exclamationmark.triangle", dangerous: true) {
+            HStack(spacing: 12) {
+                ModernButton(title: "Reset All Settings", icon: "arrow.counterclockwise", style: .danger) {
+                    showingResetConfirmation = true
                 }
-                .sheet(isPresented: $showingDatabaseSchema) {
-                    DatabaseSchemaView(schemaText: databaseSchemaText, isPresented: $showingDatabaseSchema)
+                ModernButton(title: "Delete All Data", icon: "trash", style: .danger) {
+                    showingDeleteConfirmation = true
                 }
             }
+        }
+        .alert("Reset All Settings?", isPresented: $showingResetConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset", role: .destructive) {
+                resetAllSettings()
+            }
+        } message: {
+            Text("This will reset all settings to their defaults. Your recordings will not be deleted.")
+        }
+        .alert("Delete All Data?", isPresented: $showingDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteAllData()
+            }
+        } message: {
+            Text("This will permanently delete all your recordings and data. This action cannot be undone.")
+        }
+    }
 
-            ModernSettingsCard(title: "Danger Zone", icon: "exclamationmark.triangle", dangerous: true) {
-                HStack(spacing: 12) {
-                    ModernButton(title: "Reset All Settings", icon: "arrow.counterclockwise", style: .danger) {
-                        showingResetConfirmation = true
+    // MARK: - Settings Search Card Resolution
+
+    @ViewBuilder
+    private func cardView(for entry: SettingsSearchEntry) -> some View {
+        switch entry.id {
+        case "general.shortcuts": keyboardShortcutsCard
+        case "general.updates": updatesCard
+        case "general.startup": startupCard
+        case "general.appearance": appearanceCard
+        case "capture.rate": captureRateCard
+        case "capture.compression": compressionCard
+        case "capture.pauseReminder": pauseReminderCard
+        case "storage.rewindData": rewindDataCard
+        case "storage.databaseLocations": databaseLocationsCard
+        case "storage.retentionPolicy": retentionPolicyCard
+        case "exportData.comingSoon": comingSoonCard
+        case "privacy.excludedApps": excludedAppsCard
+        case "privacy.quickDelete": quickDeleteCard
+        case "privacy.permissions": permissionsCard
+        case "power.ocrProcessing": ocrProcessingCard
+        case "power.powerEfficiency": powerEfficiencyCard
+        case "power.appFilter": appFilterCard
+        case "tags.manageTags": manageTagsCard
+        case "advanced.cache": cacheCard
+        case "advanced.timeline": timelineCard
+        case "advanced.developer": developerCard
+        case "advanced.dangerZone": dangerZoneCard
+        default: EmptyView()
+        }
+    }
+
+    // MARK: - Settings Search Overlay
+
+    @ViewBuilder
+    private var settingsSearchOverlay: some View {
+        if showSettingsSearch {
+            ZStack {
+                // Backdrop
+                Color.black.opacity(0.5)
+                    .ignoresSafeArea()
+                    .onTapGesture { dismissSettingsSearch() }
+
+                // Search panel
+                VStack(spacing: 0) {
+                    // Search bar
+                    HStack(spacing: 12) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 18))
+                            .foregroundColor(.white.opacity(0.5))
+
+                        SettingsSearchField(
+                            text: $settingsSearchQuery,
+                            onEscape: { dismissSettingsSearch() }
+                        )
+                        .frame(height: 24)
+
+                        Text("esc")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white.opacity(0.3))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.white.opacity(0.08))
+                            .cornerRadius(4)
                     }
-                    ModernButton(title: "Delete All Data", icon: "trash", style: .danger) {
-                        showingDeleteConfirmation = true
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    // Results
+                    let results = searchSettings(query: settingsSearchQuery)
+
+                    if settingsSearchQuery.isEmpty {
+                        VStack(spacing: 8) {
+                            Text("Search settings...")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retraceSecondary)
+                            Text("Type to find settings like \"OCR\", \"retention\", \"privacy\"")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.6))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                    } else if results.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 32))
+                                .foregroundColor(.retraceSecondary.opacity(0.4))
+                            Text("No settings found for \"\(settingsSearchQuery)\"")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                    } else {
+                        ScrollView(showsIndicators: true) {
+                            VStack(alignment: .leading, spacing: 16) {
+                                ForEach(results) { entry in
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        // Breadcrumb
+                                        HStack(spacing: 6) {
+                                            Image(systemName: entry.tab.icon)
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(entry.tab.gradient)
+                                            Text(entry.breadcrumb)
+                                                .font(.retraceCaption2)
+                                                .foregroundColor(.retraceSecondary)
+
+                                            Spacer()
+
+                                            // Navigate button
+                                            Button(action: {
+                                                dismissSettingsSearch()
+                                                selectedTab = entry.tab
+                                            }) {
+                                                HStack(spacing: 4) {
+                                                    Text("Go to")
+                                                        .font(.system(size: 10, weight: .medium))
+                                                    Image(systemName: "arrow.right")
+                                                        .font(.system(size: 8, weight: .semibold))
+                                                }
+                                                .foregroundColor(.retraceAccent)
+                                            }
+                                            .buttonStyle(.plain)
+                                        }
+
+                                        // Actual settings card with working controls
+                                        cardView(for: entry)
+                                    }
+                                }
+                            }
+                            .padding(20)
+                        }
+                        .frame(maxHeight: 500)
                     }
                 }
+                .frame(width: 600)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(.ultraThinMaterial)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(color: Color.black.opacity(0.5), radius: 20, y: 10)
             }
-            .alert("Reset All Settings?", isPresented: $showingResetConfirmation) {
-                Button("Cancel", role: .cancel) {}
-                Button("Reset", role: .destructive) {
-                    resetAllSettings()
-                }
-            } message: {
-                Text("This will reset all settings to their defaults. Your recordings will not be deleted.")
+            .transition(.opacity)
+            .onExitCommand { dismissSettingsSearch() }
+        }
+    }
+
+    private func dismissSettingsSearch() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            showSettingsSearch = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            settingsSearchQuery = ""
+        }
+    }
+}
+
+// MARK: - Settings Search Field
+
+private struct SettingsSearchField: NSViewRepresentable {
+    @Binding var text: String
+    let onEscape: () -> Void
+
+    func makeNSView(context: Context) -> NSTextField {
+        let textField = NSTextField()
+        textField.placeholderAttributedString = NSAttributedString(
+            string: "Search settings...",
+            attributes: [
+                .foregroundColor: NSColor.white.withAlphaComponent(0.35),
+                .font: NSFont.systemFont(ofSize: 17, weight: .medium)
+            ]
+        )
+        textField.font = .systemFont(ofSize: 17, weight: .medium)
+        textField.textColor = .white
+        textField.backgroundColor = .clear
+        textField.isBordered = false
+        textField.focusRingType = .none
+        textField.delegate = context.coordinator
+        textField.drawsBackground = false
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            textField.window?.makeFirstResponder(textField)
+        }
+
+        return textField
+    }
+
+    func updateNSView(_ textField: NSTextField, context: Context) {
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SettingsSearchField
+        init(_ parent: SettingsSearchField) { self.parent = parent }
+
+        func controlTextDidChange(_ obj: Notification) {
+            if let textField = obj.object as? NSTextField {
+                parent.text = textField.stringValue
             }
-            .alert("Delete All Data?", isPresented: $showingDeleteConfirmation) {
-                Button("Cancel", role: .cancel) {}
-                Button("Delete", role: .destructive) {
-                    deleteAllData()
-                }
-            } message: {
-                Text("This will permanently delete all your recordings and data. This action cannot be undone.")
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                parent.onEscape()
+                return true
             }
+            return false
         }
     }
 }
