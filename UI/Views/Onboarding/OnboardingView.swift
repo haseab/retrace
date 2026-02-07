@@ -956,23 +956,12 @@ public struct OnboardingView: View {
 
     private var creatorHeader: some View {
         VStack(spacing: .spacingM) {
-            // Profile picture centered - preloaded on app launch
-            AsyncImage(url: URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp")) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                case .failure:
-                    creatorPlaceholder
-                case .empty:
-                    creatorPlaceholder
-                @unknown default:
-                    creatorPlaceholder
-                }
-            }
-            .frame(width: 80, height: 80)
-            .clipShape(Circle())
+            // Profile picture centered - bundled locally (no network request needed)
+            Image("CreatorProfile")
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 80, height: 80)
+                .clipShape(Circle())
 
             Text("Hey, thanks for trying Retrace!")
                 .font(.retraceTitle)
@@ -992,13 +981,7 @@ public struct OnboardingView: View {
     }
 
     private func prefetchCreatorImage() async {
-        // Prefetch the image into URLCache
-        guard let url = URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp") else { return }
-        do {
-            let (_, _) = try await URLSession.shared.data(from: url)
-        } catch {
-            // Ignore errors, the AsyncImage will handle fallback
-        }
+        // No-op: creator image is now bundled locally in Assets.xcassets
     }
 
     // MARK: - Step 2: Creator Features
@@ -1481,28 +1464,16 @@ public struct OnboardingView: View {
 
             // Creator section
             VStack(spacing: .spacingM) {
-                // Profile picture
-                AsyncImage(url: URL(string: "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp")) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                    case .failure:
-                        creatorPlaceholder
-                    case .empty:
-                        SpinnerView(size: 20, lineWidth: 2)
-                            .frame(width: 70, height: 70)
-                    @unknown default:
-                        creatorPlaceholder
-                    }
-                }
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .overlay(
-                    Circle()
-                        .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 2)
-                )
+                // Profile picture - bundled locally
+                Image("CreatorProfile")
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 70, height: 70)
+                    .clipShape(Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 2)
+                    )
 
                 Text("Thanks for being an early user!")
                     .font(.retraceHeadline)

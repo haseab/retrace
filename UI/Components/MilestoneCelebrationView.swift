@@ -9,8 +9,7 @@ struct MilestoneCelebrationView: View {
     let onDismiss: () -> Void
     let onSupport: () -> Void
 
-    /// Creator profile image URL
-    private let profileImageURL = "https://cdn.buymeacoffee.com/uploads/profile_pictures/2025/12/TCyQoMlyZfvvIelF.jpg@300w_0e.webp"
+    /// Creator profile image — bundled locally in Assets.xcassets (no network request needed)
 
     // Animation states
     @State private var showIcon = false
@@ -177,28 +176,16 @@ struct MilestoneCelebrationView: View {
 
     private var profileSection: some View {
         HStack(alignment: .center, spacing: 12) {
-            // Profile picture - sized to match text height
-            AsyncImage(url: URL(string: profileImageURL)) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: 40, height: 40)
-                        .clipShape(Circle())
-                        .overlay(
-                            Circle()
-                                .stroke(Color.retraceAccent, lineWidth: 1.5)
-                        )
-                case .failure:
-                    fallbackProfileImage
-                case .empty:
-                    SpinnerView(size: 16, lineWidth: 2)
-                        .frame(width: 40, height: 40)
-                @unknown default:
-                    fallbackProfileImage
-                }
-            }
+            // Profile picture - bundled locally
+            Image("CreatorProfile")
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 40, height: 40)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(Color.retraceAccent, lineWidth: 1.5)
+                )
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("Haseab")

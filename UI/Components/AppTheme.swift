@@ -333,7 +333,9 @@ public class AppIconProvider {
 
 // MARK: - Favicon Provider
 
-/// Provides website favicons using Google's favicon API with caching
+/// Provides website favicons by fetching directly from the website itself (no third-party APIs).
+/// PRIVACY: No browsing data is sent to any third party. Favicon requests go only to the
+/// site the user already visited. Each domain is fetched once and cached to disk.
 public class FaviconProvider {
     public static let shared = FaviconProvider()
 
@@ -342,6 +344,13 @@ public class FaviconProvider {
     private let lock = NSLock()
     private let cacheFileURL: URL
     private var diskCache: [String: Data] = [:]
+
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 10
+        return URLSession(configuration: config)
+    }()
 
     private init() {
         // Store favicon cache in AppPaths.storageRoot (respects custom location)
@@ -415,44 +424,166 @@ public class FaviconProvider {
         pendingRequests.insert(normalizedDomain)
         lock.unlock()
 
-        // PRIVACY NOTE: This sends only the bare domain (no paths, queries, or fragments) to Google's
-        // favicon API. The domain is normalized via normalizeDomain() which strips protocol, "www.",
-        // and any path components. No user-identifiable browsing data beyond the domain name is leaked.
-        // If replacing this, ensure the alternative respects the same privacy guarantees.
-        let urlString = "https://www.google.com/s2/favicons?domain=\(normalizedDomain)&sz=64"
-        guard let url = URL(string: urlString) else {
-            lock.lock()
-            pendingRequests.remove(normalizedDomain)
-            lock.unlock()
-            completion(nil)
+        // Fetch favicon directly from the website — no third-party services involved
+        fetchFaviconFromWebsite(domain: normalizedDomain, completion: completion)
+    }
+
+    /// Fetches favicon directly from the website by:
+    /// 1. Parsing the homepage HTML for <link rel="icon"> / <link rel="shortcut icon"> / <link rel="apple-touch-icon">
+    /// 2. Falling back to /favicon.ico if no <link> tag is found
+    private func fetchFaviconFromWebsite(domain: String, completion: @escaping (NSImage?) -> Void) {
+        let baseURL = "https://\(domain)"
+        guard let homepageURL = URL(string: baseURL) else {
+            finishRequest(domain: domain, completion: completion)
             return
         }
 
-        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+        // Step 1: Fetch the homepage HTML and look for <link> favicon tags
+        var request = URLRequest(url: homepageURL)
+        // Only fetch the head section — we don't need the full page body
+        request.setValue("text/html", forHTTPHeaderField: "Accept")
+
+        session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
 
-            self.lock.lock()
-            self.pendingRequests.remove(normalizedDomain)
-
-            guard let data = data,
-                  let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200,
-                  let image = NSImage(data: data) else {
-                self.lock.unlock()
-                DispatchQueue.main.async { completion(nil) }
+            // Try to parse favicon URL from HTML
+            if let data = data,
+               let html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii),
+               let faviconURL = self.parseFaviconURL(from: html, baseURL: baseURL) {
+                self.downloadFaviconImage(from: faviconURL, domain: domain, completion: completion)
                 return
             }
 
-            // Cache in memory and disk
-            self.cache[normalizedDomain] = image
-            self.diskCache[normalizedDomain] = data
+            // Step 2: Fall back to /favicon.ico
+            let fallbackURL = "\(baseURL)/favicon.ico"
+            guard let icoURL = URL(string: fallbackURL) else {
+                self.finishRequest(domain: domain, completion: completion)
+                return
+            }
+            self.downloadFaviconImage(from: icoURL, domain: domain, completion: completion)
+        }.resume()
+    }
+
+    /// Parse HTML to find the best favicon URL from <link> tags
+    private func parseFaviconURL(from html: String, baseURL: String) -> URL? {
+        // Only scan the <head> section to avoid false matches in body content
+        let searchRange: String
+        if let headEnd = html.range(of: "</head>", options: .caseInsensitive) {
+            searchRange = String(html[html.startIndex..<headEnd.lowerBound])
+        } else {
+            // No closing head tag found — scan first 10KB as a reasonable limit
+            let limit = html.index(html.startIndex, offsetBy: min(10_000, html.count))
+            searchRange = String(html[html.startIndex..<limit])
+        }
+
+        // Match <link> tags with rel containing "icon" and extract href
+        // Priority: apple-touch-icon > icon > shortcut icon (apple-touch-icon is usually highest quality)
+        let pattern = #"<link\s[^>]*rel\s*=\s*["']([^"']*)["'][^>]*href\s*=\s*["']([^"']*)["'][^>]*/?\s*>|<link\s[^>]*href\s*=\s*["']([^"']*)["'][^>]*rel\s*=\s*["']([^"']*)["'][^>]*/?\s*>"#
+
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
+            return nil
+        }
+
+        let nsRange = NSRange(searchRange.startIndex..., in: searchRange)
+        let matches = regex.matches(in: searchRange, options: [], range: nsRange)
+
+        var bestHref: String?
+        var bestPriority = -1
+
+        for match in matches {
+            // Extract rel and href from either pattern variant
+            let rel: String
+            let href: String
+
+            if let relRange = Range(match.range(at: 1), in: searchRange),
+               let hrefRange = Range(match.range(at: 2), in: searchRange) {
+                rel = String(searchRange[relRange]).lowercased()
+                href = String(searchRange[hrefRange])
+            } else if let hrefRange = Range(match.range(at: 3), in: searchRange),
+                      let relRange = Range(match.range(at: 4), in: searchRange) {
+                rel = String(searchRange[relRange]).lowercased()
+                href = String(searchRange[hrefRange])
+            } else {
+                continue
+            }
+
+            guard rel.contains("icon") else { continue }
+
+            let priority: Int
+            if rel.contains("apple-touch-icon") {
+                priority = 2
+            } else if rel == "icon" {
+                priority = 1
+            } else {
+                priority = 0 // "shortcut icon" or other variants
+            }
+
+            if priority > bestPriority {
+                bestPriority = priority
+                bestHref = href
+            }
+        }
+
+        guard let href = bestHref else { return nil }
+        return resolveURL(href, baseURL: baseURL)
+    }
+
+    /// Resolve a potentially relative or protocol-relative URL
+    private func resolveURL(_ href: String, baseURL: String) -> URL? {
+        // Protocol-relative URL (e.g., "//example.com/favicon.png")
+        if href.hasPrefix("//") {
+            return URL(string: "https:\(href)")
+        }
+        // Absolute URL
+        if href.hasPrefix("http://") || href.hasPrefix("https://") {
+            return URL(string: href)
+        }
+        // Root-relative URL (e.g., "/favicon.png")
+        if href.hasPrefix("/") {
+            return URL(string: "\(baseURL)\(href)")
+        }
+        // Relative URL (e.g., "images/favicon.png")
+        return URL(string: "\(baseURL)/\(href)")
+    }
+
+    /// Download the favicon image from the resolved URL
+    private func downloadFaviconImage(from url: URL, domain: String, completion: @escaping (NSImage?) -> Void) {
+        session.dataTask(with: url) { [weak self] data, response, error in
+            guard let self = self else { return }
+
+            guard let data = data,
+                  let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode),
+                  let image = NSImage(data: data) else {
+                // If this was from HTML parsing and it failed, try /favicon.ico as last resort
+                if url.path != "/favicon.ico" {
+                    let fallbackURL = "https://\(domain)/favicon.ico"
+                    if let icoURL = URL(string: fallbackURL) {
+                        self.downloadFaviconImage(from: icoURL, domain: domain, completion: completion)
+                        return
+                    }
+                }
+                self.finishRequest(domain: domain, completion: completion)
+                return
+            }
+
+            self.lock.lock()
+            self.pendingRequests.remove(domain)
+            self.cache[domain] = image
+            self.diskCache[domain] = data
             self.lock.unlock()
 
-            // Save to disk asynchronously
-            self.saveToDiskAsync(domain: normalizedDomain, data: data)
-
+            self.saveToDiskAsync(domain: domain, data: data)
             DispatchQueue.main.async { completion(image) }
         }.resume()
+    }
+
+    /// Clean up a failed request
+    private func finishRequest(domain: String, completion: @escaping (NSImage?) -> Void) {
+        lock.lock()
+        pendingRequests.remove(domain)
+        lock.unlock()
+        DispatchQueue.main.async { completion(nil) }
     }
 
     /// Normalize domain name (remove protocol, www, and path)

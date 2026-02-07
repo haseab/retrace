@@ -409,6 +409,9 @@ public class TimelineWindowController: NSObject {
         }
         logShowTiming("screen detected")
 
+        // Reset scale factor cache so it recalculates for the current display
+        TimelineScaleFactor.resetCache()
+
 	        // Don't stop the background refresh timer - let it keep running
 	        // The timer callback checks isVisible and skips refresh while timeline is open
 
@@ -717,6 +720,8 @@ public class TimelineWindowController: NSObject {
         let screenIndex = NSScreen.screens.firstIndex(of: targetScreen) ?? -1
         if window.frame != targetScreen.frame {
             window.setFrame(targetScreen.frame, display: false)
+            // Reset scale factor cache so it recalculates for the new display
+            TimelineScaleFactor.resetCache()
             debugLog("[DISPLAY-SWITCH] moved window to display \(screenIndex), screen: \(Int(targetScreen.frame.width))x\(Int(targetScreen.frame.height)) at (\(Int(targetScreen.frame.origin.x)),\(Int(targetScreen.frame.origin.y))), mouse: (\(Int(mouseLocation.x)),\(Int(mouseLocation.y)))")
         }
     }

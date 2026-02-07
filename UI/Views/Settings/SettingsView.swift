@@ -1919,50 +1919,49 @@ public struct SettingsView: View {
             //     }
             // }
 
-            // TODO: Re-enable excluded apps in a future version
-            // ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
-            //     VStack(alignment: .leading, spacing: 12) {
-            //         Text("Apps that will not be recorded")
-            //             .font(.retraceCaption)
-            //             .foregroundColor(.retraceSecondary)
-            //
-            //         if excludedApps.isEmpty {
-            //             Text("No apps excluded")
-            //                 .font(.retraceCaption2)
-            //                 .foregroundColor(.retraceSecondary.opacity(0.6))
-            //                 .padding(.vertical, 4)
-            //         } else {
-            //             // Wrap excluded apps in a flow layout
-            //             FlowLayout(spacing: 8) {
-            //                 ForEach(excludedApps) { app in
-            //                     ExcludedAppChip(app: app) {
-            //                         removeExcludedApp(app)
-            //                     }
-            //                 }
-            //             }
-            //         }
-            //
-            //         // Update feedback message
-            //         if let message = excludedAppsUpdateMessage {
-            //             HStack(spacing: 6) {
-            //                 Image(systemName: "checkmark.circle.fill")
-            //                     .foregroundColor(.green)
-            //                     .font(.system(size: 12))
-            //                 Text(message)
-            //                     .font(.retraceCaption2)
-            //                     .foregroundColor(.retraceSecondary)
-            //             }
-            //             .transition(.opacity.combined(with: .move(edge: .top)))
-            //         }
-            //
-            //         ModernButton(title: "Add App", icon: "plus", style: .secondary) {
-            //             showAppPickerMultiple { apps in
-            //                 addExcludedApps(apps)
-            //             }
-            //         }
-            //     }
-            //     .animation(.easeInOut(duration: 0.2), value: excludedAppsUpdateMessage)
-            // }
+            ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Apps that will not be recorded")
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+
+                    if excludedApps.isEmpty {
+                        Text("No apps excluded")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.6))
+                            .padding(.vertical, 4)
+                    } else {
+                        // Wrap excluded apps in a flow layout
+                        FlowLayout(spacing: 8) {
+                            ForEach(excludedApps) { app in
+                                ExcludedAppChip(app: app) {
+                                    removeExcludedApp(app)
+                                }
+                            }
+                        }
+                    }
+
+                    // Update feedback message
+                    if let message = excludedAppsUpdateMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text(message)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    ModernButton(title: "Add App", icon: "plus", style: .secondary) {
+                        showAppPickerMultiple { apps in
+                            addExcludedApps(apps)
+                        }
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: excludedAppsUpdateMessage)
+            }
 
             // TODO: Re-enable once private window detection is more reliable
             // Currently disabled because title-based detection has false positives
