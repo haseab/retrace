@@ -867,6 +867,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
 
+    /// Task for tape drag momentum animation
+    private var tapeDragMomentumTask: Task<Void, Never>?
+
     /// Task for polling OCR status when processing is in progress
     private var ocrStatusPollingTask: Task<Void, Never>?
 
@@ -4825,6 +4828,56 @@ public class SimpleTimelineViewModel: ObservableObject {
                     self.loadOCRNodes()
                 }
             }
+        }
+    }
+
+    /// Cancel any in-progress tape drag momentum (e.g., user clicked again to stop)
+    public func cancelTapeDragMomentum() {
+        tapeDragMomentumTask?.cancel()
+        tapeDragMomentumTask = nil
+    }
+
+    /// End a tape click-drag scrub session, optionally with momentum
+    /// - Parameter velocity: Release velocity in pixels/second (in scroll convention, negated from screen delta)
+    public func endTapeDrag(withVelocity velocity: CGFloat = 0) {
+        // Cancel any existing momentum
+        tapeDragMomentumTask?.cancel()
+
+        let minVelocity: CGFloat = 50 // px/s threshold to trigger momentum
+        if abs(velocity) > minVelocity {
+            // Start momentum animation
+            tapeDragMomentumTask = Task { @MainActor [weak self] in
+                guard let self = self else { return }
+
+                let friction: CGFloat = 0.95 // Per-tick decay factor
+                let tickInterval: UInt64 = 16_000_000 // ~60fps (16ms)
+                var currentVelocity = velocity
+                let stopThreshold: CGFloat = 20 // px/s to stop
+
+                while abs(currentVelocity) > stopThreshold && !Task.isCancelled {
+                    // Convert velocity (px/s) to per-tick delta (px)
+                    let dt: CGFloat = 0.016 // 16ms
+                    let delta = currentVelocity * dt
+
+                    await self.handleScroll(delta: delta, isTrackpad: true)
+
+                    // Apply friction
+                    currentVelocity *= friction
+
+                    try? await Task.sleep(nanoseconds: tickInterval)
+                }
+
+                if !Task.isCancelled {
+                    self.isActivelyScrolling = false
+                    self.loadURLBoundingBox()
+                    self.loadOCRNodes()
+                }
+            }
+        } else {
+            // No meaningful velocity — just re-enable deferred operations
+            isActivelyScrolling = false
+            loadURLBoundingBox()
+            loadOCRNodes()
         }
     }
 

@@ -108,6 +108,29 @@ public class TimelineWindowController: NSObject {
     /// Callback for scroll events (delta value)
     public var onScroll: ((Double) -> Void)?
 
+    // MARK: - Tape Click-Drag State
+
+    /// Whether the user is currently click-dragging the timeline tape
+    private var isTapeDragging = false
+
+    /// The last mouse X position during a tape drag (in window coordinates)
+    private var tapeDragLastX: CGFloat = 0
+
+    /// The mouse X position where the tape drag started (for minimum distance threshold)
+    private var tapeDragStartX: CGFloat = 0
+
+    /// Whether drag has passed the minimum distance threshold to be considered a drag (vs a click)
+    private var tapeDragDidExceedThreshold = false
+
+    /// Minimum pixel distance before a mouseDown+mouseDragged is treated as a drag (not a tap)
+    private static let tapeDragMinDistance: CGFloat = 3.0
+
+    /// Recent drag samples for velocity calculation (timestamp, deltaX)
+    private var tapeDragVelocitySamples: [(time: CFAbsoluteTime, delta: CGFloat)] = []
+
+    /// Maximum age of velocity samples to consider (seconds)
+    private static let velocitySampleWindow: CFAbsoluteTime = 0.08
+
     // MARK: - Initialization
 
     private override init() {
@@ -1107,28 +1130,127 @@ public class TimelineWindowController: NSObject {
     private func setupEventMonitors() {
         debugLog("setupEventMonitors called - timeline launched")
 
-        // Debug monitor for mouse events to investigate shift-drag issue
+        // Monitor for mouse events to handle click-drag scrubbing on the timeline tape
         mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .flagsChanged]) { [weak self] event in
-            guard let self = self else { return event }
-            let shiftHeld = event.modifierFlags.contains(.shift)
-            let location = event.locationInWindow
-            let firstResponder = self.window?.firstResponder
-            let firstResponderDesc = firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+            guard let self = self, self.isVisible else { return event }
 
             switch event.type {
-            case .flagsChanged:
-                self.debugLog("flagsChanged - shift: \(shiftHeld), firstResponder: \(firstResponderDesc)")
             case .leftMouseDown:
-                self.debugLog("leftMouseDown - shift: \(shiftHeld), location: \(location), firstResponder: \(firstResponderDesc)")
+                // Don't start tape drag if Shift is held (Shift+Drag is zoom region)
+                guard !event.modifierFlags.contains(.shift) else { return event }
+
+                // Check if the click is in the tape area
+                if self.isPointInTapeArea(event.locationInWindow) {
+                    // Don't start drag if overlays are open
+                    if let viewModel = self.timelineViewModel,
+                       !viewModel.isSearchOverlayVisible,
+                       !viewModel.isFilterDropdownOpen,
+                       !viewModel.isDateSearchActive,
+                       !viewModel.showTagSubmenu,
+                       !viewModel.isCalendarPickerVisible {
+                        // Cancel any ongoing momentum from a previous drag
+                        viewModel.cancelTapeDragMomentum()
+
+                        self.tapeDragStartX = event.locationInWindow.x
+                        self.tapeDragLastX = event.locationInWindow.x
+                        self.isTapeDragging = true
+                        self.tapeDragDidExceedThreshold = false
+                        self.tapeDragVelocitySamples.removeAll()
+                        // Don't consume — allow tap gestures to fire if user doesn't drag
+                    }
+                }
+                return event
+
             case .leftMouseDragged:
-                // Only log first drag to avoid spam
-                break
+                if self.isTapeDragging {
+                    let currentX = event.locationInWindow.x
+                    let totalDistance = abs(currentX - self.tapeDragStartX)
+
+                    if !self.tapeDragDidExceedThreshold {
+                        // Check if we've moved far enough to be a drag (not a click)
+                        if totalDistance >= Self.tapeDragMinDistance {
+                            self.tapeDragDidExceedThreshold = true
+                            NSCursor.closedHand.push()
+                            // Defer heavy operations during drag
+                            if let viewModel = self.timelineViewModel {
+                                Task { @MainActor in
+                                    if !viewModel.isActivelyScrolling {
+                                        viewModel.isActivelyScrolling = true
+                                        viewModel.dismissContextMenu()
+                                        viewModel.dismissTimelineContextMenu()
+                                    }
+                                }
+                            }
+                        } else {
+                            return event // Not yet a drag, let other handlers process
+                        }
+                    }
+
+                    // Calculate pixel delta since last drag event
+                    let deltaX = currentX - self.tapeDragLastX
+                    self.tapeDragLastX = currentX
+
+                    // Record velocity sample (prune old samples)
+                    let now = CFAbsoluteTimeGetCurrent()
+                    self.tapeDragVelocitySamples.append((time: now, delta: deltaX))
+                    self.tapeDragVelocitySamples.removeAll { now - $0.time > Self.velocitySampleWindow }
+
+                    // Feed delta into the scroll handling system
+                    // Negate: dragging right (positive deltaX) should move tape right (grab-and-pull)
+                    if abs(deltaX) > 0.001, let viewModel = self.timelineViewModel {
+                        Task { @MainActor in
+                            await viewModel.handleScroll(delta: -deltaX, isTrackpad: true)
+                        }
+                    }
+
+                    return nil // Consume the event to prevent other handlers
+                }
+                return event
+
             case .leftMouseUp:
-                self.debugLog("leftMouseUp - shift: \(shiftHeld), location: \(location)")
+                if self.isTapeDragging {
+                    let wasDragging = self.tapeDragDidExceedThreshold
+                    self.isTapeDragging = false
+                    self.tapeDragDidExceedThreshold = false
+
+                    if wasDragging {
+                        NSCursor.pop()
+
+                        // Calculate release velocity from recent samples
+                        let now = CFAbsoluteTimeGetCurrent()
+                        let recentSamples = self.tapeDragVelocitySamples.filter { now - $0.time <= Self.velocitySampleWindow }
+                        self.tapeDragVelocitySamples.removeAll()
+
+                        var velocity: CGFloat = 0
+                        if recentSamples.count >= 2,
+                           let first = recentSamples.first, let last = recentSamples.last {
+                            let dt = last.time - first.time
+                            if dt > 0.001 {
+                                let totalDelta = recentSamples.reduce(0) { $0 + $1.delta }
+                                velocity = totalDelta / CGFloat(dt) // pixels per second
+                            }
+                        }
+
+                        if let viewModel = self.timelineViewModel {
+                            // Negate velocity to match scroll convention (same as drag delta)
+                            let scrollVelocity = -velocity
+                            Task { @MainActor in
+                                viewModel.endTapeDrag(withVelocity: scrollVelocity)
+                            }
+                        }
+                        return nil // Consume the event
+                    }
+                    // If we never exceeded the threshold, let the event through
+                    // so .onTapGesture on FrameSegmentView can handle it
+                }
+                return event
+
+            case .flagsChanged:
+                return event
+
             default:
-                break
+                return event
             }
-            return event
         }
 
         // Monitor for all key events globally (when timeline is visible but not key window)
@@ -1270,6 +1392,9 @@ public class TimelineWindowController: NSObject {
     }
 
     private func removeEventMonitors() {
+        // End any in-progress tape drag before removing monitors
+        forceEndTapeDrag()
+
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
@@ -1627,6 +1752,47 @@ public class TimelineWindowController: NSObject {
         return false
     }
 
+    /// Check if a window-coordinate point is within the timeline tape area
+    private func isPointInTapeArea(_ pointInWindow: CGPoint) -> Bool {
+        guard let viewModel = timelineViewModel else { return false }
+
+        // Don't allow tape dragging when controls are hidden or tape is hidden
+        guard !viewModel.areControlsHidden && !viewModel.isTapeHidden else { return false }
+
+        // In NSWindow coordinates, Y=0 is at the BOTTOM
+        // The tape is positioned at the bottom with .padding(.bottom, tapeBottomPadding)
+        let tapeHeight = TimelineScaleFactor.tapeHeight           // 42 * scale
+        let tapeBottomPadding = TimelineScaleFactor.tapeBottomPadding  // 40 * scale
+
+        let tapeBottomY = tapeBottomPadding
+        let tapeTopY = tapeBottomPadding + tapeHeight
+
+        // Add generous padding for easier grabbing
+        let hitPadding: CGFloat = 10 * TimelineScaleFactor.current
+        let hitBottom = max(0, tapeBottomY - hitPadding)
+        let hitTop = tapeTopY + hitPadding
+
+        return pointInWindow.y >= hitBottom && pointInWindow.y <= hitTop
+    }
+
+    /// Force-end any in-progress tape drag (e.g., on window focus loss)
+    private func forceEndTapeDrag() {
+        guard isTapeDragging else { return }
+        let wasDragging = tapeDragDidExceedThreshold
+        isTapeDragging = false
+        tapeDragDidExceedThreshold = false
+        tapeDragVelocitySamples.removeAll()
+
+        if wasDragging {
+            NSCursor.pop()
+            if let viewModel = timelineViewModel {
+                Task { @MainActor in
+                    viewModel.endTapeDrag(withVelocity: 0)
+                }
+            }
+        }
+    }
+
     private func handleScrollEvent(_ event: NSEvent, source: String) {
         guard isVisible, let viewModel = timelineViewModel else { return }
 
@@ -1640,6 +1806,9 @@ public class TimelineWindowController: NSObject {
         let isTrackpad = event.hasPreciseScrollingDeltas
 
         if abs(delta) > 0.001 {
+            // Cancel any tape drag momentum on real scroll input
+            viewModel.cancelTapeDragMomentum()
+
             let mousePos = NSEvent.mouseLocation
             let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
             debugLog("[SCROLL] \(source), display: \(screenIndex), delta: \(String(format: "%.1f", delta)), isKeyWindow: \(window?.isKeyWindow ?? false)")
