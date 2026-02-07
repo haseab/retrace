@@ -124,6 +124,20 @@ public actor FTSManager: FTSProtocol {
             }
         }
 
+        if let windowNameFilter = filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            let windowPattern = "%\(windowNameFilter)%"
+            sqlite3_bind_text(statement, bindIndex, windowPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        if let browserUrlFilter = filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            let browserPattern = "%\(browserUrlFilter)%"
+            sqlite3_bind_text(statement, bindIndex, browserPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
         // Bind limit and offset
         sqlite3_bind_int(statement, bindIndex, Int32(limit))
         bindIndex += 1
@@ -194,6 +208,20 @@ public actor FTSManager: FTSProtocol {
                 sqlite3_bind_text(statement, bindIndex, appPattern, -1, SQLITE_TRANSIENT)
                 bindIndex += 1
             }
+        }
+
+        if let windowNameFilter = filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            let windowPattern = "%\(windowNameFilter)%"
+            sqlite3_bind_text(statement, bindIndex, windowPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
+
+        if let browserUrlFilter = filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            let browserPattern = "%\(browserUrlFilter)%"
+            sqlite3_bind_text(statement, bindIndex, browserPattern, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
         }
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
@@ -279,6 +307,14 @@ public actor FTSManager: FTSProtocol {
             sql += " AND (\(placeholders))"
         }
 
+        if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.windowName LIKE ?"
+        }
+
+        if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.browserUrl LIKE ?"
+        }
+
         sql += " ORDER BY rank LIMIT ? OFFSET ?"
 
         return sql
@@ -311,6 +347,14 @@ public actor FTSManager: FTSProtocol {
         if let excludedAppBundleIDs = filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
             let placeholders = excludedAppBundleIDs.map { _ in "(s.bundleID NOT LIKE ? AND s.windowName NOT LIKE ?)" }.joined(separator: " AND ")
             sql += " AND (\(placeholders))"
+        }
+
+        if filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.windowName LIKE ?"
+        }
+
+        if filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            sql += " AND s.browserUrl LIKE ?"
         }
 
         return sql

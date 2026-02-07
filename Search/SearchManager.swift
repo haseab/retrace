@@ -75,14 +75,24 @@ public actor SearchManager: SearchProtocol {
                 startDate: filters.startDate ?? parsed.dateRange.start,
                 endDate: filters.endDate ?? parsed.dateRange.end,
                 appBundleIDs: [appFilter],
-                excludedAppBundleIDs: filters.excludedAppBundleIDs
+                excludedAppBundleIDs: filters.excludedAppBundleIDs,
+                selectedTagIds: filters.selectedTagIds,
+                excludedTagIds: filters.excludedTagIds,
+                hiddenFilter: filters.hiddenFilter,
+                windowNameFilter: filters.windowNameFilter,
+                browserUrlFilter: filters.browserUrlFilter
             )
         } else if parsed.dateRange.start != nil || parsed.dateRange.end != nil {
             filters = SearchFilters(
                 startDate: filters.startDate ?? parsed.dateRange.start,
                 endDate: filters.endDate ?? parsed.dateRange.end,
                 appBundleIDs: filters.appBundleIDs,
-                excludedAppBundleIDs: filters.excludedAppBundleIDs
+                excludedAppBundleIDs: filters.excludedAppBundleIDs,
+                selectedTagIds: filters.selectedTagIds,
+                excludedTagIds: filters.excludedTagIds,
+                hiddenFilter: filters.hiddenFilter,
+                windowNameFilter: filters.windowNameFilter,
+                browserUrlFilter: filters.browserUrlFilter
             )
         }
 

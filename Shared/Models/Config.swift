@@ -86,6 +86,18 @@ public struct ShortcutConfig: Codable, Sendable, Equatable {
         key: "R",
         modifiers: [.command, .shift]
     )
+
+    /// Default system monitor shortcut: Cmd+Shift+M
+    public static let defaultSystemMonitor = ShortcutConfig(
+        key: "M",
+        modifiers: [.command, .shift]
+    )
+
+    /// Default feedback shortcut: Cmd+Shift+H
+    public static let defaultFeedback = ShortcutConfig(
+        key: "H",
+        modifiers: [.command, .shift]
+    )
 }
 
 // MARK: - Capture Configuration

@@ -31,6 +31,8 @@ public class MenuBarManager: ObservableObject {
     private var timelineShortcut: ShortcutConfig = .defaultTimeline
     private var dashboardShortcut: ShortcutConfig = .defaultDashboard
     private var recordingShortcut: ShortcutConfig = .defaultRecording
+    private var systemMonitorShortcut: ShortcutConfig = .defaultSystemMonitor
+    private var feedbackShortcut: ShortcutConfig = .defaultFeedback
 
     /// Timer for icon fill animation
     private var iconAnimationTimer: Timer?
@@ -130,7 +132,9 @@ public class MenuBarManager: ObservableObject {
         timelineShortcut = await onboardingManager.timelineShortcut
         dashboardShortcut = await onboardingManager.dashboardShortcut
         recordingShortcut = await onboardingManager.recordingShortcut
-        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString)", category: .ui)
+        systemMonitorShortcut = await onboardingManager.systemMonitorShortcut
+        feedbackShortcut = await onboardingManager.feedbackShortcut
+        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString), Monitor: \(systemMonitorShortcut.displayString), Feedback: \(feedbackShortcut.displayString)", category: .ui)
     }
 
     /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
@@ -194,6 +198,26 @@ public class MenuBarManager: ObservableObject {
                 modifiers: recordingShortcut.modifiers.nsModifiers
             ) { [weak self] in
                 self?.toggleRecording()
+            }
+        }
+
+        // Register system monitor global hotkey (skip if cleared)
+        if !systemMonitorShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: systemMonitorShortcut.key,
+                modifiers: systemMonitorShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.toggleSystemMonitor()
+            }
+        }
+
+        // Register feedback global hotkey (skip if cleared)
+        if !feedbackShortcut.key.isEmpty {
+            HotkeyManager.shared.registerHotkey(
+                key: feedbackShortcut.key,
+                modifiers: feedbackShortcut.modifiers.nsModifiers
+            ) { [weak self] in
+                self?.openFeedbackFromHotkey()
             }
         }
 
@@ -405,14 +429,25 @@ public class MenuBarManager: ObservableObject {
 
         // Label
         let label = NSTextField(labelWithString: "Recording")
-        label.frame = NSRect(x: 40, y: 5, width: 100, height: 20)
+        label.frame = NSRect(x: 40, y: 5, width: 70, height: 20)
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .labelColor
         containerView.addSubview(label)
 
+        // Keyboard shortcut hint
+        if !recordingShortcut.key.isEmpty {
+            let shortcutLabel = NSTextField(labelWithString: recordingShortcut.displayString)
+            shortcutLabel.font = NSFont.systemFont(ofSize: 13)
+            shortcutLabel.textColor = .tertiaryLabelColor
+            shortcutLabel.sizeToFit()
+            let shortcutX = 40 + 70 + 2  // After the "Recording" label
+            shortcutLabel.frame = NSRect(x: CGFloat(shortcutX), y: 5, width: shortcutLabel.frame.width, height: shortcutLabel.frame.height + 3)
+            containerView.addSubview(shortcutLabel)
+        }
+
         // Custom toggle switch view - positioned on the far right
         let toggleWidth: CGFloat = 40
-        let rightPadding: CGFloat = 8
+        let rightPadding: CGFloat = 2
         let toggleView = RecordingToggleSwitch(
             frame: NSRect(x: containerWidth - toggleWidth - rightPadding, y: 5, width: toggleWidth, height: 20),
             isOn: isRecording,
@@ -559,8 +594,11 @@ public class MenuBarManager: ObservableObject {
         let monitorItem = NSMenuItem(
             title: "System Monitor",
             action: #selector(openSystemMonitor),
-            keyEquivalent: ""
+            keyEquivalent: systemMonitorShortcut.key.isEmpty ? "" : systemMonitorShortcut.menuKeyEquivalent
         )
+        if !systemMonitorShortcut.key.isEmpty {
+            monitorItem.keyEquivalentModifierMask = systemMonitorShortcut.modifiers.nsModifiers
+        }
         monitorItem.image = NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: nil)
         menu.addItem(monitorItem)
 
@@ -588,8 +626,11 @@ public class MenuBarManager: ObservableObject {
         let feedbackItem = NSMenuItem(
             title: "Report an Issue...",
             action: #selector(openFeedback),
-            keyEquivalent: ""
+            keyEquivalent: feedbackShortcut.key.isEmpty ? "" : feedbackShortcut.menuKeyEquivalent
         )
+        if !feedbackShortcut.key.isEmpty {
+            feedbackItem.keyEquivalentModifierMask = feedbackShortcut.modifiers.nsModifiers
+        }
         feedbackItem.image = NSImage(systemSymbolName: "exclamationmark.bubble", accessibilityDescription: nil)
         menu.addItem(feedbackItem)
 
@@ -633,6 +674,34 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func openSystemMonitor() {
         NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+    }
+
+    /// Toggle system monitor from global hotkey - hides timeline if open, then toggles monitor view
+    private func toggleSystemMonitor() {
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NotificationCenter.default.post(name: .toggleSystemMonitor, object: nil)
+                }
+            } else {
+                NotificationCenter.default.post(name: .toggleSystemMonitor, object: nil)
+            }
+        }
+    }
+
+    /// Open feedback from global hotkey - hides timeline if open first
+    private func openFeedbackFromHotkey() {
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NotificationCenter.default.post(name: .openFeedback, object: nil)
+                }
+            } else {
+                NotificationCenter.default.post(name: .openFeedback, object: nil)
+            }
+        }
     }
 
     /// Sync recording status with coordinator
@@ -808,6 +877,11 @@ private class RecordingToggleSwitch: NSView {
         blendedColor.setFill()
         trackPath.fill()
 
+        // Draw white border around track
+        NSColor.white.withAlphaComponent(0.5).setStroke()
+        trackPath.lineWidth = 1.0
+        trackPath.stroke()
+
         // Draw knob (circle) - position based on knobProgress
         let offX = trackRect.minX + knobPadding
         let onX = trackRect.maxX - knobDiameter - knobPadding
@@ -856,5 +930,6 @@ extension Notification.Name {
     static let openSettingsPower = Notification.Name("openSettingsPower")
     static let openFeedback = Notification.Name("openFeedback")
     static let openSystemMonitor = Notification.Name("openSystemMonitor")
+    static let toggleSystemMonitor = Notification.Name("toggleSystemMonitor")
     static let dataSourceDidChange = Notification.Name("dataSourceDidChange")
 }

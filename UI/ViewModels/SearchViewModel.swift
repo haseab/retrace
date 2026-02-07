@@ -48,6 +48,8 @@ public class SearchViewModel: ObservableObject {
     @Published public var selectedTags: Set<Int64>?  // nil = all tags
     @Published public var tagFilterMode: TagFilterMode = .include  // include or exclude selected tags
     @Published public var hiddenFilter: HiddenFilter = .hide  // How to handle hidden segments
+    @Published public var windowNameFilter: String?  // Optional window title metadata filter
+    @Published public var browserUrlFilter: String?  // Optional browser URL metadata filter
     @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
 
     // Search mode (tabs)
@@ -98,11 +100,15 @@ public class SearchViewModel: ObservableObject {
     // Used by parent views to handle Escape key properly (dismiss dropdown first, then overlay)
     @Published public var isDropdownOpen = false
 
+    // Whether the DateFilterPopover is actively handling keyboard events (Tab/Enter/arrows)
+    // When true, SearchFilterBar's tab monitor and TimelineWindowController's arrow key handler skip processing
+    public var isDatePopoverHandlingKeys = false
+
     // Signal to close all dropdowns - incremented when Escape is pressed while dropdown is open
     @Published public var closeDropdownsSignal: Int = 0
 
     // Signal to open a specific filter dropdown via Tab key navigation
-    // Values: 0 = search field, 1 = apps, 2 = date, 3 = tags, 4 = visibility
+    // Values: 0 = search field, 1 = apps, 2 = date, 3 = tags, 4 = visibility, 5 = advanced
     @Published public var openFilterSignal: (index: Int, id: UUID) = (0, UUID())
 
     // Flag to prevent re-search during cache restore
@@ -143,12 +149,16 @@ public class SearchViewModel: ObservableObject {
     private static let cachedEndDateKey = "search.cachedEndDate"
     /// Key for storing the cached content type
     private static let cachedContentTypeKey = "search.cachedContentType"
+    /// Key for storing the cached window name filter
+    private static let cachedWindowNameFilterKey = "search.cachedWindowNameFilter"
+    /// Key for storing the cached browser URL filter
+    private static let cachedBrowserUrlFilterKey = "search.cachedBrowserUrlFilter"
     /// Key for storing the cached search mode
     private static let cachedSearchModeKey = "search.cachedSearchMode"
     /// Key for storing the cached sort order
     private static let cachedSearchSortOrderKey = "search.cachedSearchSortOrder"
     /// Cache version - increment when data structure changes to invalidate old caches
-    private static let searchCacheVersion = 3  // v3: Multi-select app filters
+    private static let searchCacheVersion = 4  // v4: Advanced metadata filters (window name + browser URL)
     private static let searchCacheVersionKey = "search.cacheVersion"
     /// How long the cached search results remain valid (2 minutes)
     private static let searchCacheExpirationSeconds: TimeInterval = 120
@@ -207,7 +217,8 @@ public class SearchViewModel: ObservableObject {
             $endDate,
             $contentType
         )
-        .combineLatest($selectedTags, $hiddenFilter)
+        .combineLatest($selectedTags, $hiddenFilter, $windowNameFilter)
+        .combineLatest($browserUrlFilter)
         .dropFirst()  // Skip initial values
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -285,6 +296,16 @@ public class SearchViewModel: ObservableObject {
 
         if hiddenFilter != .hide {
             components.append("\"hiddenFilter\":\"\(hiddenFilter.rawValue)\"")
+        }
+
+        if let windowName = windowNameFilter, !windowName.isEmpty {
+            let escaped = windowName.replacingOccurrences(of: "\"", with: "\\\"")
+            components.append("\"windowName\":\"\(escaped)\"")
+        }
+
+        if let browserUrl = browserUrlFilter, !browserUrl.isEmpty {
+            let escaped = browserUrl.replacingOccurrences(of: "\"", with: "\\\"")
+            components.append("\"browserUrl\":\"\(escaped)\"")
         }
 
         return "{\(components.joined(separator: ","))}"
@@ -403,7 +424,9 @@ public class SearchViewModel: ObservableObject {
             excludedAppBundleIDs: excludedAppBundleIDsArray,
             selectedTagIds: selectedTagIdsArray,
             excludedTagIds: excludedTagIdsArray,
-            hiddenFilter: hiddenFilter
+            hiddenFilter: hiddenFilter,
+            windowNameFilter: windowNameFilter,
+            browserUrlFilter: browserUrlFilter
         )
 
         return SearchQuery(
@@ -684,6 +707,8 @@ public class SearchViewModel: ObservableObject {
         selectedTags = nil
         tagFilterMode = .include
         hiddenFilter = .hide
+        windowNameFilter = nil
+        browserUrlFilter = nil
     }
 
     /// Set app filter mode (include/exclude)
@@ -746,7 +771,21 @@ public class SearchViewModel: ObservableObject {
         (selectedAppFilters != nil && !selectedAppFilters!.isEmpty) ||
         startDate != nil || endDate != nil ||
         (selectedTags != nil && !selectedTags!.isEmpty) ||
-        hiddenFilter != .hide
+        hiddenFilter != .hide ||
+        (windowNameFilter?.isEmpty == false) ||
+        (browserUrlFilter?.isEmpty == false)
+    }
+
+    /// Number of active filter categories (for badge display)
+    public var activeFilterCount: Int {
+        var count = 0
+        if let apps = selectedAppFilters, !apps.isEmpty { count += 1 }
+        if startDate != nil || endDate != nil { count += 1 }
+        if let tags = selectedTags, !tags.isEmpty { count += 1 }
+        if hiddenFilter != .hide { count += 1 }
+        if windowNameFilter?.isEmpty == false { count += 1 }
+        if browserUrlFilter?.isEmpty == false { count += 1 }
+        return count
     }
 
     /// Get the display name for the selected app filter(s)
@@ -1008,6 +1047,16 @@ public class SearchViewModel: ObservableObject {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.cachedEndDateKey)
         }
+        if let windowNameFilter = windowNameFilter, !windowNameFilter.isEmpty {
+            UserDefaults.standard.set(windowNameFilter, forKey: Self.cachedWindowNameFilterKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedWindowNameFilterKey)
+        }
+        if let browserUrlFilter = browserUrlFilter, !browserUrlFilter.isEmpty {
+            UserDefaults.standard.set(browserUrlFilter, forKey: Self.cachedBrowserUrlFilterKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedBrowserUrlFilterKey)
+        }
         UserDefaults.standard.set(contentType.rawValue, forKey: Self.cachedContentTypeKey)
         UserDefaults.standard.set(searchMode.rawValue, forKey: Self.cachedSearchModeKey)
         UserDefaults.standard.set(sortOrder.rawValue, forKey: Self.cachedSearchSortOrderKey)
@@ -1074,6 +1123,8 @@ public class SearchViewModel: ObservableObject {
         }
         let cachedStartDateValue = UserDefaults.standard.double(forKey: Self.cachedStartDateKey)
         let cachedEndDateValue = UserDefaults.standard.double(forKey: Self.cachedEndDateKey)
+        let cachedWindowNameFilter = UserDefaults.standard.string(forKey: Self.cachedWindowNameFilterKey)
+        let cachedBrowserUrlFilter = UserDefaults.standard.string(forKey: Self.cachedBrowserUrlFilterKey)
         let cachedContentTypeRaw = UserDefaults.standard.string(forKey: Self.cachedContentTypeKey)
         let cachedSearchModeRaw = UserDefaults.standard.string(forKey: Self.cachedSearchModeKey)
         let cachedSearchSortOrderRaw = UserDefaults.standard.string(forKey: Self.cachedSearchSortOrderKey)
@@ -1101,6 +1152,8 @@ public class SearchViewModel: ObservableObject {
             selectedAppFilters = cachedAppFilters
             startDate = cachedStartDateValue > 0 ? Date(timeIntervalSince1970: cachedStartDateValue) : nil
             endDate = cachedEndDateValue > 0 ? Date(timeIntervalSince1970: cachedEndDateValue) : nil
+            windowNameFilter = cachedWindowNameFilter?.isEmpty == false ? cachedWindowNameFilter : nil
+            browserUrlFilter = cachedBrowserUrlFilter?.isEmpty == false ? cachedBrowserUrlFilter : nil
             if let rawValue = cachedContentTypeRaw, let type = ContentType(rawValue: rawValue) {
                 contentType = type
             }
@@ -1143,6 +1196,8 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: cachedAppFilterKey)
         UserDefaults.standard.removeObject(forKey: cachedStartDateKey)
         UserDefaults.standard.removeObject(forKey: cachedEndDateKey)
+        UserDefaults.standard.removeObject(forKey: cachedWindowNameFilterKey)
+        UserDefaults.standard.removeObject(forKey: cachedBrowserUrlFilterKey)
         UserDefaults.standard.removeObject(forKey: cachedContentTypeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchModeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchSortOrderKey)

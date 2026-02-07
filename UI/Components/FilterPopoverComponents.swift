@@ -952,11 +952,203 @@ public struct TagsFilterPopover: View {
 
 // MARK: - Visibility Filter Popover (Reusable)
 
+/// Popover for advanced search metadata filters (window name + browser URL)
+public struct AdvancedSearchFilterPopover: View {
+    @Binding var windowNameFilter: String?
+    @Binding var browserUrlFilter: String?
+    @FocusState private var focusedField: Field?
+    @State private var isWindowHovered = false
+    @State private var isBrowserHovered = false
+    @State private var arrowKeyMonitor: Any?
+
+    private enum Field: Hashable {
+        case windowName
+        case browserUrl
+    }
+
+    public init(
+        windowNameFilter: Binding<String?>,
+        browserUrlFilter: Binding<String?>
+    ) {
+        self._windowNameFilter = windowNameFilter
+        self._browserUrlFilter = browserUrlFilter
+    }
+
+    private var hasActiveFilters: Bool {
+        (windowNameFilter?.isEmpty == false) ||
+        (browserUrlFilter?.isEmpty == false)
+    }
+
+    private var windowNameTextBinding: Binding<String> {
+        Binding(
+            get: { windowNameFilter ?? "" },
+            set: { windowNameFilter = $0.isEmpty ? nil : $0 }
+        )
+    }
+
+    private var browserUrlTextBinding: Binding<String> {
+        Binding(
+            get: { browserUrlFilter ?? "" },
+            set: { browserUrlFilter = $0.isEmpty ? nil : $0 }
+        )
+    }
+
+    private func moveFocusDown() {
+        if focusedField == .windowName {
+            focusedField = .browserUrl
+        }
+    }
+
+    private func moveFocusUp() {
+        if focusedField == .browserUrl {
+            focusedField = .windowName
+        }
+    }
+
+    private func setupArrowKeyMonitor() {
+        guard arrowKeyMonitor == nil else { return }
+
+        arrowKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // Ignore modified arrow commands (cmd/opt/ctrl).
+            if event.modifierFlags.contains(.command) ||
+                event.modifierFlags.contains(.option) ||
+                event.modifierFlags.contains(.control) {
+                return event
+            }
+            guard focusedField != nil else { return event }
+
+            switch event.keyCode {
+            case 125: // Down arrow
+                moveFocusDown()
+                return nil
+            case 126: // Up arrow
+                moveFocusUp()
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeArrowKeyMonitor() {
+        if let monitor = arrowKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            arrowKeyMonitor = nil
+        }
+    }
+
+    public var body: some View {
+        FilterPopoverContainer(width: 300) {
+            HStack {
+                Text("Advanced Filters")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+
+                Spacer()
+
+                if hasActiveFilters {
+                    Button("Clear") {
+                        windowNameFilter = nil
+                        browserUrlFilter = nil
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.white.opacity(0.65))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Window Name")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.65))
+
+                    TextField("Search titles...", text: windowNameTextBinding)
+                        .focused($focusedField, equals: .windowName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(
+                                    focusedField == .windowName
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (isWindowHovered
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : RetraceMenuStyle.filterStrokeSubtle),
+                                    lineWidth: 1
+                                )
+                        )
+                        .onHover { hovering in
+                            isWindowHovered = hovering
+                        }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Browser URL")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.65))
+
+                    TextField("Search URLs...", text: browserUrlTextBinding)
+                        .focused($focusedField, equals: .browserUrl)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(
+                                    focusedField == .browserUrl
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (isBrowserHovered
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : RetraceMenuStyle.filterStrokeSubtle),
+                                    lineWidth: 1
+                                )
+                        )
+                        .onHover { hovering in
+                            isBrowserHovered = hovering
+                        }
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 12)
+        }
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                focusedField = .windowName
+            }
+            setupArrowKeyMonitor()
+        }
+        .onDisappear {
+            removeArrowKeyMonitor()
+        }
+    }
+}
+
 /// Popover for selecting visibility filter (visible only, hidden only, all)
 public struct VisibilityFilterPopover: View {
     let currentFilter: HiddenFilter
     let onSelect: (HiddenFilter) -> Void
     var onDismiss: (() -> Void)?
+    var onKeyboardSelect: (() -> Void)?
 
     /// Focus state to capture focus when popover appears - allows main search field to "steal" focus and dismiss
     @FocusState private var isFocused: Bool
@@ -967,17 +1159,23 @@ public struct VisibilityFilterPopover: View {
     public init(
         currentFilter: HiddenFilter,
         onSelect: @escaping (HiddenFilter) -> Void,
-        onDismiss: (() -> Void)? = nil
+        onDismiss: (() -> Void)? = nil,
+        onKeyboardSelect: (() -> Void)? = nil
     ) {
         self.currentFilter = currentFilter
         self.onSelect = onSelect
         self.onDismiss = onDismiss
+        self.onKeyboardSelect = onKeyboardSelect
     }
 
     private func selectHighlightedItem() {
         guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
         onSelect(options[highlightedIndex])
-        onDismiss?()
+        if let onKeyboardSelect {
+            onKeyboardSelect()
+        } else {
+            onDismiss?()
+        }
     }
 
     private func moveHighlight(by offset: Int) {
@@ -1158,15 +1356,25 @@ public struct DateRangeFilterPopover: View {
     let endDate: Date?
     let onApply: (Date?, Date?) -> Void
     let onClear: () -> Void
+    let width: CGFloat
+    let enableKeyboardNavigation: Bool
+    let onMoveToNextFilter: (() -> Void)?
+    let onCalendarEditingChange: ((Bool) -> Void)?
     var onDismiss: (() -> Void)?
 
     @State private var localStartDate: Date
     @State private var localEndDate: Date
     @State private var editingDate: EditingDate? = nil
     @State private var displayedMonth: Date = Date()
+    @State private var backupStartDate: Date?
+    @State private var backupEndDate: Date?
+    @State private var focusedItem: Int = 0
+    @State private var lastFocusBeforeApply: Int?
+    @State private var keyboardMonitor: Any?
 
     private let calendar = Calendar.current
     private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+    private let itemCount = 7
 
     private enum EditingDate {
         case start
@@ -1185,12 +1393,20 @@ public struct DateRangeFilterPopover: View {
         endDate: Date?,
         onApply: @escaping (Date?, Date?) -> Void,
         onClear: @escaping () -> Void,
+        width: CGFloat = 260,
+        enableKeyboardNavigation: Bool = false,
+        onMoveToNextFilter: (() -> Void)? = nil,
+        onCalendarEditingChange: ((Bool) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) {
         self.startDate = startDate
         self.endDate = endDate
         self.onApply = onApply
         self.onClear = onClear
+        self.width = width
+        self.enableKeyboardNavigation = enableKeyboardNavigation
+        self.onMoveToNextFilter = onMoveToNextFilter
+        self.onCalendarEditingChange = onCalendarEditingChange
         self.onDismiss = onDismiss
 
         let now = Date()
@@ -1200,7 +1416,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     public var body: some View {
-        FilterPopoverContainer(width: 260) {
+        FilterPopoverContainer(width: width) {
             // Header
             HStack {
                 Text("Date Range")
@@ -1227,17 +1443,21 @@ public struct DateRangeFilterPopover: View {
 
             // Date selection rows
             VStack(spacing: 6) {
-                dateRow(label: "Start", date: localStartDate, isEditing: editingDate == .start) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .start ? nil : .start
-                        displayedMonth = localStartDate
-                    }
+                dateRow(
+                    label: "Start",
+                    date: localStartDate,
+                    isEditing: editingDate == .start,
+                    isHighlighted: enableKeyboardNavigation && focusedItem == 0
+                ) {
+                    toggleEditingDate(.start)
                 }
-                dateRow(label: "End", date: localEndDate, isEditing: editingDate == .end) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .end ? nil : .end
-                        displayedMonth = localEndDate
-                    }
+                dateRow(
+                    label: "End",
+                    date: localEndDate,
+                    isEditing: editingDate == .end,
+                    isHighlighted: enableKeyboardNavigation && focusedItem == 1
+                ) {
+                    toggleEditingDate(.end)
                 }
             }
             .padding(.horizontal, 14)
@@ -1259,10 +1479,10 @@ public struct DateRangeFilterPopover: View {
 
             // Quick presets (horizontal chips)
             HStack(spacing: 6) {
-                presetChip("All", preset: .anytime)
-                presetChip("Today", preset: .today)
-                presetChip("7d", preset: .lastWeek)
-                presetChip("30d", preset: .lastMonth)
+                presetChip("All", preset: .anytime, isHighlighted: enableKeyboardNavigation && focusedItem == 2)
+                presetChip("Today", preset: .today, isHighlighted: enableKeyboardNavigation && focusedItem == 3)
+                presetChip("7d", preset: .lastWeek, isHighlighted: enableKeyboardNavigation && focusedItem == 4)
+                presetChip("30d", preset: .lastMonth, isHighlighted: enableKeyboardNavigation && focusedItem == 5)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
@@ -1271,14 +1491,29 @@ public struct DateRangeFilterPopover: View {
                 .background(Color.white.opacity(0.1))
 
             // Apply button
-            Button(action: applyCustomRange) {
+            Button(action: {
+                applyCustomRange(moveToNextDropdown: false)
+            }) {
                 Text("Apply")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
-                    .background(RetraceMenuStyle.actionBlue)
+                    .background(
+                        enableKeyboardNavigation && focusedItem == 6
+                            ? RetraceMenuStyle.actionBlue.opacity(0.8)
+                            : RetraceMenuStyle.actionBlue
+                    )
                     .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(
+                                enableKeyboardNavigation && focusedItem == 6
+                                    ? RetraceMenuStyle.filterStrokeMedium
+                                    : Color.clear,
+                                lineWidth: 1
+                            )
+                    )
             }
             .buttonStyle(.plain)
             .padding(10)
@@ -1289,21 +1524,39 @@ public struct DateRangeFilterPopover: View {
             localStartDate = startDate ?? calendar.date(byAdding: .day, value: -7, to: now)!
             localEndDate = endDate ?? now
             displayedMonth = localEndDate
+
+            if enableKeyboardNavigation {
+                focusedItem = 0
+                setupKeyboardMonitor()
+            }
+        }
+        .onDisappear {
+            if enableKeyboardNavigation {
+                removeKeyboardMonitor()
+            }
+            onCalendarEditingChange?(false)
+        }
+        .onChange(of: editingDate) { newValue in
+            onCalendarEditingChange?(newValue != nil)
         }
         .contentShape(Rectangle())
         .onTapGesture {
             // Collapse calendar when tapping outside of it
             if editingDate != nil {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    editingDate = nil
-                }
+                commitCalendarSelection()
             }
         }
     }
 
     // MARK: - Date Row
 
-    private func dateRow(label: String, date: Date, isEditing: Bool, action: @escaping () -> Void) -> some View {
+    private func dateRow(
+        label: String,
+        date: Date,
+        isEditing: Bool,
+        isHighlighted: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: "calendar")
@@ -1326,11 +1579,16 @@ public struct DateRangeFilterPopover: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isEditing ? Color.white.opacity(0.12) : Color.white.opacity(0.05))
+                    .fill(isEditing ? Color.white.opacity(0.12) : (isHighlighted ? Color.white.opacity(0.1) : Color.white.opacity(0.05)))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(isEditing ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        isEditing
+                            ? RetraceMenuStyle.filterStrokeMedium
+                            : (isHighlighted ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
+                        lineWidth: 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1407,7 +1665,7 @@ public struct DateRangeFilterPopover: View {
                 let isFuture = day > Date()
 
                 Button(action: {
-                    selectDay(day)
+                    selectDay(day, collapseCalendar: true)
                 }) {
                     Text("\(calendar.component(.day, from: day))")
                         .font(.system(size: 11, weight: isToday ? .semibold : .regular))
@@ -1445,18 +1703,22 @@ public struct DateRangeFilterPopover: View {
 
     // MARK: - Preset Chip
 
-    private func presetChip(_ label: String, preset: DatePreset) -> some View {
+    private func presetChip(_ label: String, preset: DatePreset, isHighlighted: Bool = false) -> some View {
         Button(action: {
             applyPreset(preset)
         }) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundColor(.white.opacity(0.8))
+                .foregroundColor(isHighlighted ? .white : .white.opacity(0.8))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.white.opacity(0.1))
+                        .fill(isHighlighted ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(isHighlighted ? RetraceMenuStyle.filterStrokeMedium : Color.clear, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
@@ -1516,7 +1778,7 @@ public struct DateRangeFilterPopover: View {
         }
     }
 
-    private func selectDay(_ day: Date) {
+    private func selectDay(_ day: Date, collapseCalendar: Bool) {
         switch editingDate {
         case .start:
             localStartDate = day
@@ -1532,18 +1794,56 @@ public struct DateRangeFilterPopover: View {
             break
         }
 
-        // Close the calendar after selecting a date
-        withAnimation(.easeOut(duration: 0.15)) {
-            editingDate = nil
+        if collapseCalendar {
+            commitCalendarSelection()
         }
     }
 
-    private func applyCustomRange() {
+    private func toggleEditingDate(_ target: EditingDate) {
+        withAnimation(.easeOut(duration: 0.15)) {
+            if editingDate == target {
+                commitCalendarSelection()
+            } else {
+                backupStartDate = localStartDate
+                backupEndDate = localEndDate
+                editingDate = target
+                displayedMonth = (target == .start) ? localStartDate : localEndDate
+            }
+        }
+    }
+
+    private func commitCalendarSelection() {
+        withAnimation(.easeOut(duration: 0.15)) {
+            editingDate = nil
+        }
+        backupStartDate = nil
+        backupEndDate = nil
+    }
+
+    private func cancelCalendarSelection() {
+        if let backupStartDate {
+            localStartDate = backupStartDate
+        }
+        if let backupEndDate {
+            localEndDate = backupEndDate
+        }
+        withAnimation(.easeOut(duration: 0.15)) {
+            editingDate = nil
+        }
+        self.backupStartDate = nil
+        self.backupEndDate = nil
+    }
+
+    private func applyCustomRange(moveToNextDropdown: Bool = false) {
         let start = calendar.startOfDay(for: localStartDate)
         let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: localEndDate) ?? localEndDate
 
         onApply(start, end)
         onDismiss?()
+
+        if moveToNextDropdown {
+            onMoveToNextFilter?()
+        }
     }
 
     private func applyPreset(_ preset: DatePreset) {
@@ -1569,6 +1869,173 @@ public struct DateRangeFilterPopover: View {
                 let start = calendar.startOfDay(for: monthAgo)
                 onApply(start, now)
                 onDismiss?()
+            }
+        }
+    }
+
+    // MARK: - Keyboard Navigation
+
+    private func setupKeyboardMonitor() {
+        keyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            switch event.keyCode {
+            case 53: // Escape
+                if editingDate != nil {
+                    cancelCalendarSelection()
+                    return nil
+                }
+                return event
+
+            case 36: // Return/Enter
+                if editingDate != nil {
+                    commitCalendarSelection()
+                    return nil
+                }
+                activateFocusedItem()
+                return nil
+
+            case 126: // Up arrow
+                if editingDate != nil {
+                    navigateCalendar(byDays: -7)
+                } else {
+                    moveFocusWithArrow(126)
+                }
+                return nil
+
+            case 125: // Down arrow
+                if editingDate != nil {
+                    navigateCalendar(byDays: 7)
+                } else {
+                    moveFocusWithArrow(125)
+                }
+                return nil
+
+            case 123: // Left arrow
+                if editingDate != nil {
+                    navigateCalendar(byDays: -1)
+                } else {
+                    moveFocusWithArrow(123)
+                }
+                return nil
+
+            case 124: // Right arrow
+                if editingDate != nil {
+                    navigateCalendar(byDays: 1)
+                } else {
+                    moveFocusWithArrow(124)
+                }
+                return nil
+
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeKeyboardMonitor() {
+        if let monitor = keyboardMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyboardMonitor = nil
+        }
+    }
+
+    private func activateFocusedItem() {
+        switch focusedItem {
+        case 0: toggleEditingDate(.start)
+        case 1: toggleEditingDate(.end)
+        case 2: applyPreset(.anytime)
+        case 3: applyPreset(.today)
+        case 4: applyPreset(.lastWeek)
+        case 5: applyPreset(.lastMonth)
+        case 6: applyCustomRange(moveToNextDropdown: true)
+        default: break
+        }
+    }
+
+    private func moveFocusedItem(by offset: Int) {
+        withAnimation(.easeOut(duration: 0.1)) {
+            if editingDate != nil {
+                editingDate = nil
+            }
+            focusedItem = max(0, min(itemCount - 1, focusedItem + offset))
+        }
+    }
+
+    private func moveFocusWithArrow(_ keyCode: UInt16) {
+        withAnimation(.easeOut(duration: 0.1)) {
+            switch keyCode {
+            case 123: // Left
+                if (2...5).contains(focusedItem) {
+                    // Stay within preset row when moving left
+                    focusedItem = max(2, focusedItem - 1)
+                } else if focusedItem == 6 {
+                    // Apply -> return to the element that moved focus to Apply
+                    if let previous = lastFocusBeforeApply, (2...5).contains(previous) {
+                        focusedItem = previous
+                    } else {
+                        focusedItem = 5
+                    }
+                } else {
+                    moveFocusedItem(by: -1)
+                }
+
+            case 124: // Right
+                if (2...5).contains(focusedItem) {
+                    // Move across presets, then to Apply from 30d
+                    if focusedItem == 5 {
+                        lastFocusBeforeApply = focusedItem
+                        focusedItem = 6
+                    } else {
+                        focusedItem += 1
+                    }
+                } else if focusedItem == 6 {
+                    focusedItem = 6
+                } else {
+                    moveFocusedItem(by: 1)
+                }
+
+            case 125: // Down
+                if (2...5).contains(focusedItem) {
+                    // Any preset -> Apply
+                    lastFocusBeforeApply = focusedItem
+                    focusedItem = 6
+                } else {
+                    moveFocusedItem(by: 1)
+                }
+
+            case 126: // Up
+                if focusedItem == 6 {
+                    // Apply -> return to the element that moved focus to Apply
+                    if let previous = lastFocusBeforeApply, (2...5).contains(previous) {
+                        focusedItem = previous
+                    } else {
+                        focusedItem = 5
+                    }
+                } else {
+                    moveFocusedItem(by: -1)
+                }
+
+            default:
+                break
+            }
+        }
+    }
+
+    private func navigateCalendar(byDays days: Int) {
+        let currentDate: Date
+        switch editingDate {
+        case .start: currentDate = localStartDate
+        case .end: currentDate = localEndDate
+        case .none: return
+        }
+
+        guard let newDate = calendar.date(byAdding: .day, value: days, to: currentDate),
+              newDate <= Date() else { return }
+
+        selectDay(newDate, collapseCalendar: false)
+
+        if !calendar.isDate(newDate, equalTo: displayedMonth, toGranularity: .month) {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                displayedMonth = newDate
             }
         }
     }

@@ -1686,6 +1686,27 @@ public struct RetraceMenuStyle {
     /// Same hue as brand blue but lower saturation for less visual noise
     public static let uiBlue = Color(red: 0.4, green: 0.55, blue: 0.7)
 
+    /// Base accent color for filter control strokes (buttons and fields).
+    /// Uses the lighter Retrace accent for consistent focus/hover/open outlines.
+    public static var filterStrokeAccent: Color {
+        Color.retraceAccent
+    }
+
+    /// Strong stroke color for hovered/focused/open filter controls.
+    public static var filterStrokeStrong: Color {
+        filterStrokeAccent.opacity(0.95)
+    }
+
+    /// Medium stroke color for active/selected filter controls.
+    public static var filterStrokeMedium: Color {
+        filterStrokeAccent.opacity(0.45)
+    }
+
+    /// Subtle resting stroke color for filter controls.
+    public static var filterStrokeSubtle: Color {
+        filterStrokeAccent.opacity(0.18)
+    }
+
     // MARK: - Search Field Styling (within menus)
 
     /// Search field background

@@ -150,6 +150,87 @@ final class FTSManagerTests: XCTestCase {
         return (videoSegment.id, frame1.id, frame2.id, frame3.id)
     }
 
+    private func createMetadataFilterTestData() async throws -> (frameIDGitHub: FrameID, frameIDApple: FrameID) {
+        let baseTime = Date()
+
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: baseTime,
+            endTime: baseTime.addingTimeInterval(120),
+            frameCount: 2,
+            fileSizeBytes: 2048,
+            relativePath: "segments/metadata_filters.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        try await database.insertVideoSegment(videoSegment)
+
+        let segmentGitHub = try await database.insertSegment(
+            bundleID: "com.google.Chrome",
+            startDate: baseTime,
+            endDate: baseTime.addingTimeInterval(60),
+            windowName: "GitHub - retrace issue",
+            browserUrl: "https://github.com/retrace/retrace/issues/123",
+            type: 0
+        )
+
+        let segmentApple = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: baseTime.addingTimeInterval(60),
+            endDate: baseTime.addingTimeInterval(120),
+            windowName: "Apple Docs - SwiftUI",
+            browserUrl: "https://developer.apple.com/documentation/swiftui",
+            type: 0
+        )
+
+        let frameGitHub = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: baseTime,
+            segmentID: AppSegmentID(value: segmentGitHub),
+            videoID: videoSegment.id,
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: FrameMetadata(appName: "Chrome", windowName: "GitHub - retrace issue")
+        )
+
+        let frameApple = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: baseTime.addingTimeInterval(60),
+            segmentID: AppSegmentID(value: segmentApple),
+            videoID: videoSegment.id,
+            frameIndexInSegment: 1,
+            encodingStatus: .success,
+            metadata: FrameMetadata(appName: "Safari", windowName: "Apple Docs - SwiftUI")
+        )
+
+        try await database.insertFrame(frameGitHub)
+        try await database.insertFrame(frameApple)
+
+        let gitHubDoc = IndexedDocument(
+            id: 0,
+            frameID: frameGitHub.id,
+            timestamp: baseTime,
+            content: "debugging issue reproduction steps and error details",
+            appName: "Chrome",
+            windowName: "GitHub - retrace issue"
+        )
+
+        let appleDoc = IndexedDocument(
+            id: 0,
+            frameID: frameApple.id,
+            timestamp: baseTime.addingTimeInterval(60),
+            content: "debugging issue reproduction steps and error details",
+            appName: "Safari",
+            windowName: "Apple Docs - SwiftUI"
+        )
+
+        _ = try await database.insertDocument(gitHubDoc)
+        _ = try await database.insertDocument(appleDoc)
+
+        return (frameIDGitHub: frameGitHub.id, frameIDApple: frameApple.id)
+    }
+
     // ┌─────────────────────────────────────────────────────────────────────────┐
     // │ BASIC SEARCH TESTS                                                      │
     // └─────────────────────────────────────────────────────────────────────────┘
@@ -453,6 +534,40 @@ final class FTSManagerTests: XCTestCase {
         for result in results {
             XCTAssertNotEqual(result.appName, "Terminal")
         }
+    }
+
+    func testSearchWithWindowNameMetadataFilter() async throws {
+        let testData = try await createMetadataFilterTestData()
+
+        let filters = SearchFilters(windowNameFilter: "GitHub")
+        let results = try await ftsManager.search(
+            query: "debugging",
+            filters: filters,
+            limit: 10,
+            offset: 0
+        )
+
+        XCTAssertEqual(results.count, 1)
+        guard results.count == 1 else { return }
+        XCTAssertEqual(results[0].frameID, testData.frameIDGitHub)
+        XCTAssertTrue(results[0].windowName?.contains("GitHub") == true)
+    }
+
+    func testSearchWithBrowserUrlMetadataFilter() async throws {
+        let testData = try await createMetadataFilterTestData()
+
+        let filters = SearchFilters(browserUrlFilter: "developer.apple.com")
+        let results = try await ftsManager.search(
+            query: "debugging",
+            filters: filters,
+            limit: 10,
+            offset: 0
+        )
+
+        XCTAssertEqual(results.count, 1)
+        guard results.count == 1 else { return }
+        XCTAssertEqual(results[0].frameID, testData.frameIDApple)
+        XCTAssertTrue(results[0].windowName?.contains("Apple Docs") == true)
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────┐

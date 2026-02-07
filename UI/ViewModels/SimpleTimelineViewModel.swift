@@ -480,6 +480,37 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether to show video segment boundaries on the timeline tape
     @Published public var showVideoBoundaries: Bool = false
 
+    // MARK: - Toast Feedback
+    @Published public var toastMessage: String? = nil
+    @Published public var toastIcon: String? = nil
+    @Published public var toastVisible: Bool = false
+    private var toastDismissTask: Task<Void, Never>?
+
+    /// Show a brief toast notification overlay
+    public func showToast(_ message: String, icon: String = "checkmark.circle.fill") {
+        toastDismissTask?.cancel()
+        // Set content first, then animate in
+        toastMessage = message
+        toastIcon = icon
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+            toastVisible = true
+        }
+        toastDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000) // 1.2s
+            if !Task.isCancelled {
+                withAnimation(.easeIn(duration: 0.3)) {
+                    self.toastVisible = false
+                }
+                // Clear content after fade-out completes
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                if !Task.isCancelled {
+                    self.toastMessage = nil
+                    self.toastIcon = nil
+                }
+            }
+        }
+    }
+
     /// Frame indices where video boundaries occur (first frame of each new video)
     /// A boundary exists when the videoPath changes between consecutive frames
     public var videoBoundaryIndices: Set<Int> {
@@ -668,9 +699,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the filter panel is visible
     @Published public var isFilterPanelVisible: Bool = false
 
-    /// Whether any filter dropdown (apps, tags, visibility) is open in the filter panel
+    /// Whether any popover filter dropdown (apps, tags, visibility, date) is open in the filter panel
+    /// Note: `.advanced` is inline, not a popover dropdown.
     /// Set by FilterPanel view to allow TimelineWindowController to skip escape handling
     @Published public var isFilterDropdownOpen: Bool = false
+
+    /// Whether the date range calendar grid is expanded inside the date dropdown.
+    /// Used so Escape can close the calendar first instead of closing the full dropdown.
+    @Published public var isDateRangeCalendarEditing: Bool = false
 
     // MARK: - Filter Dropdown State (lifted to ViewModel for proper rendering outside FilterPanel)
 
@@ -681,6 +717,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         case tags
         case visibility
         case dateRange
+        case advanced
     }
 
     /// The currently active filter dropdown
@@ -700,7 +737,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         filterDropdownAnchorFrame = anchorFrame
         filterAnchorFrames[type] = anchorFrame
         activeFilterDropdown = type
-        isFilterDropdownOpen = type != .none
+        // `.advanced` is rendered inline in the panel, not as a popover.
+        isFilterDropdownOpen = type != .none && type != .advanced
+        if type != .dateRange {
+            isDateRangeCalendarEditing = false
+        }
     }
 
     /// Dismiss any open filter dropdown
@@ -710,7 +751,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         activeFilterDropdown = .none
         isFilterDropdownOpen = false
+        isDateRangeCalendarEditing = false
     }
+
+    /// Which advanced field is currently focused (0=none, 1=windowName, 2=browserUrl)
+    /// Used by FilterPanel tab monitor to know when to cycle out of advanced
+    @Published public var advancedFocusedFieldIndex: Int = 0
 
     /// Apps available for filtering (installed apps only)
     @Published public var availableAppsForFilter: [(bundleID: String, name: String)] = []
@@ -1964,6 +2010,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Dismiss filter panel
         if except != .filter && isFilterPanelVisible {
             pendingFilterCriteria = filterCriteria
+            dismissFilterDropdown()
             isFilterPanelVisible = false
         }
 
@@ -1994,6 +2041,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func dismissFilterPanel() {
         // Reset pending first - animation is handled by the View
         pendingFilterCriteria = filterCriteria
+        dismissFilterDropdown()
         isFilterPanelVisible = false
     }
 
@@ -2001,6 +2049,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func openFilterPanel() {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .filter)
+        // Always reset dropdown/popover state when opening the panel
+        dismissFilterDropdown()
         // Show controls if hidden (user expects to see the filter panel)
         if areControlsHidden {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {

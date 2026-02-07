@@ -1457,7 +1457,7 @@ public struct OnboardingView: View {
                     )
                 }
 
-                Text("v0.5 - February 2026")
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
             }

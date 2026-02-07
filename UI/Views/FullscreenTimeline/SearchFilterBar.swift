@@ -44,11 +44,13 @@ public struct SearchFilterBar: View {
     @State private var showDatePopover = false
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
+    @State private var showAdvancedDropdown = false
     @State private var showSortDropdown = false
+    @State private var isClearFiltersHovered = false
     @State private var tabKeyMonitor: Any?
 
-    /// Filter indices for Tab navigation: 1=Apps, 2=Date, 3=Tags, 4=Visibility, 0=back to search
-    private let filterCount = 4
+    /// Filter indices for Tab navigation: 1=Apps, 2=Date, 3=Tags, 4=Visibility, 5=Advanced, 0=back to search
+    private let filterCount = 5
 
     // MARK: - Body
 
@@ -77,6 +79,7 @@ public struct SearchFilterBar: View {
             if viewModel.searchMode == .all {
                 SortOrderChip(
                     currentOrder: viewModel.sortOrder,
+                    isOpen: showSortDropdown,
                     action: {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showSortDropdown.toggle()
@@ -84,6 +87,7 @@ public struct SearchFilterBar: View {
                             showDatePopover = false
                             showTagsDropdown = false
                             showVisibilityDropdown = false
+                            showAdvancedDropdown = false
                         }
                     }
                 )
@@ -112,6 +116,7 @@ public struct SearchFilterBar: View {
                 selectedApps: viewModel.selectedAppFilters,
                 filterMode: viewModel.appFilterMode,
                 isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
+                isOpen: showAppsDropdown,
                 action: {
                     logToFile("[SearchFilterBar] Apps chip CLICKED! showAppsDropdown was \(showAppsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -119,6 +124,7 @@ public struct SearchFilterBar: View {
                         showDatePopover = false
                         showTagsDropdown = false
                         showVisibilityDropdown = false
+                        showAdvancedDropdown = false
                     }
                     logToFile("[SearchFilterBar] Apps chip after toggle: showAppsDropdown=\(showAppsDropdown)")
                 }
@@ -149,6 +155,7 @@ public struct SearchFilterBar: View {
                 icon: "calendar",
                 label: dateFilterLabel,
                 isActive: viewModel.startDate != nil || viewModel.endDate != nil,
+                isOpen: showDatePopover,
                 showChevron: true
             ) {
                 logToFile("[SearchFilterBar] Date chip CLICKED! showDatePopover was \(showDatePopover), toggling...")
@@ -157,13 +164,30 @@ public struct SearchFilterBar: View {
                     showAppsDropdown = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
+                    showAdvancedDropdown = false
                 }
                 logToFile("[SearchFilterBar] Date chip after toggle: showDatePopover=\(showDatePopover)")
             }
             .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
-                DateFilterPopover(
-                    viewModel: viewModel,
-                    isPresented: $showDatePopover
+                DateRangeFilterPopover(
+                    startDate: viewModel.startDate,
+                    endDate: viewModel.endDate,
+                    onApply: { start, end in
+                        viewModel.setDateRange(start: start, end: end)
+                    },
+                    onClear: {
+                        viewModel.setDateRange(start: nil, end: nil)
+                    },
+                    width: 280,
+                    enableKeyboardNavigation: true,
+                    onMoveToNextFilter: {
+                        viewModel.openFilterSignal = (3, UUID())
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showDatePopover = false
+                        }
+                    }
                 )
             }
 
@@ -173,6 +197,7 @@ public struct SearchFilterBar: View {
                 availableTags: viewModel.availableTags,
                 filterMode: viewModel.tagFilterMode,
                 isActive: viewModel.selectedTags != nil && !viewModel.selectedTags!.isEmpty,
+                isOpen: showTagsDropdown,
                 action: {
                     logToFile("[SearchFilterBar] Tags chip CLICKED! showTagsDropdown was \(showTagsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -180,6 +205,7 @@ public struct SearchFilterBar: View {
                         showAppsDropdown = false
                         showDatePopover = false
                         showVisibilityDropdown = false
+                        showAdvancedDropdown = false
                     }
                     logToFile("[SearchFilterBar] Tags chip after toggle: showTagsDropdown=\(showTagsDropdown)")
                 }
@@ -208,6 +234,7 @@ public struct SearchFilterBar: View {
             VisibilityFilterChip(
                 currentFilter: viewModel.hiddenFilter,
                 isActive: viewModel.hiddenFilter != .hide,
+                isOpen: showVisibilityDropdown,
                 action: {
                     logToFile("[SearchFilterBar] Visibility chip CLICKED! showVisibilityDropdown was \(showVisibilityDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -215,6 +242,7 @@ public struct SearchFilterBar: View {
                         showAppsDropdown = false
                         showDatePopover = false
                         showTagsDropdown = false
+                        showAdvancedDropdown = false
                     }
                     logToFile("[SearchFilterBar] Visibility chip after toggle: showVisibilityDropdown=\(showVisibilityDropdown)")
                 }
@@ -230,6 +258,29 @@ public struct SearchFilterBar: View {
                             showVisibilityDropdown = false
                         }
                     }
+                )
+            }
+
+            // Advanced metadata filters (window name + browser URL)
+            FilterChip(
+                icon: "slider.horizontal.3",
+                label: "Advanced",
+                isActive: hasActiveAdvancedFilters,
+                isOpen: showAdvancedDropdown,
+                showChevron: true
+            ) {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showAdvancedDropdown.toggle()
+                    showAppsDropdown = false
+                    showDatePopover = false
+                    showTagsDropdown = false
+                    showVisibilityDropdown = false
+                }
+            }
+            .dropdownOverlay(isPresented: $showAdvancedDropdown, yOffset: 56) {
+                AdvancedSearchFilterPopover(
+                    windowNameFilter: $viewModel.windowNameFilter,
+                    browserUrlFilter: $viewModel.browserUrlFilter
                 )
             }
 
@@ -257,8 +308,22 @@ public struct SearchFilterBar: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Color.white.opacity(0.1))
-                .cornerRadius(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.1))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(
+                            isClearFiltersHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
+                            lineWidth: 1.2
+                        )
+                )
+                .onHover { hovering in
+                    withAnimation(.easeOut(duration: 0.1)) {
+                        isClearFiltersHovered = hovering
+                    }
+                }
             }
         }
         .padding(.horizontal, 20)
@@ -270,10 +335,11 @@ public struct SearchFilterBar: View {
         }
         .onChange(of: showAppsDropdown) { isOpen in
             debugLog("[SearchFilterBar] showAppsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
             debugLog("[SearchFilterBar] isDropdownOpen now: \(viewModel.isDropdownOpen)")
             // Lazy load apps only when dropdown is opened
             if isOpen {
+                viewModel.openFilterSignal = (1, UUID())
                 Task {
                     await viewModel.loadAvailableApps()
                 }
@@ -281,19 +347,35 @@ public struct SearchFilterBar: View {
         }
         .onChange(of: showDatePopover) { isOpen in
             debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (2, UUID())
+            }
         }
         .onChange(of: showTagsDropdown) { isOpen in
             debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (3, UUID())
+            }
         }
         .onChange(of: showVisibilityDropdown) { isOpen in
             debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (4, UUID())
+            }
+        }
+        .onChange(of: showAdvancedDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showAdvancedDropdown changed to: \(isOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (5, UUID())
+            }
         }
         .onChange(of: showSortDropdown) { isOpen in
             debugLog("[SearchFilterBar] showSortDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
             debugLog("[SearchFilterBar] closeDropdownsSignal received: \(newValue)")
@@ -303,6 +385,7 @@ public struct SearchFilterBar: View {
                 showDatePopover = false
                 showTagsDropdown = false
                 showVisibilityDropdown = false
+                showAdvancedDropdown = false
                 showSortDropdown = false
             }
         }
@@ -329,6 +412,7 @@ public struct SearchFilterBar: View {
             showDatePopover = false
             showTagsDropdown = false
             showVisibilityDropdown = false
+            showAdvancedDropdown = false
             showSortDropdown = false
 
             // Open the requested one
@@ -345,6 +429,8 @@ public struct SearchFilterBar: View {
                 showTagsDropdown = true
             case 4:
                 showVisibilityDropdown = true
+            case 5:
+                showAdvancedDropdown = true
             default:
                 // Index 0 means focus search field - parent will handle via onChange
                 break
@@ -358,6 +444,7 @@ public struct SearchFilterBar: View {
         if showDatePopover { return 2 }
         if showTagsDropdown { return 3 }
         if showVisibilityDropdown { return 4 }
+        if showAdvancedDropdown { return 5 }
         return 0
     }
 
@@ -376,7 +463,7 @@ public struct SearchFilterBar: View {
             let isShiftHeld = event.modifierFlags.contains(.shift)
 
             // Determine current filter by checking the signal's last index
-            // Filter indices: 0=Search, 1=Apps, 2=Date, 3=Tags, 4=Visibility
+            // Filter indices: 0=Search, 1=Apps, 2=Date, 3=Tags, 4=Visibility, 5=Advanced
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
@@ -385,11 +472,11 @@ public struct SearchFilterBar: View {
             // Calculate next index based on direction
             let nextIndex: Int
             if isShiftHeld {
-                // Shift+Tab: go backward (cycle: 0 -> 4 -> 3 -> 2 -> 1 -> 0)
-                nextIndex = currentIndex <= 0 ? 4 : currentIndex - 1
+                // Shift+Tab: go backward (cycle: 0 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0)
+                nextIndex = currentIndex <= 0 ? filterCount : currentIndex - 1
             } else {
-                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 0 -> 1)
-                nextIndex = currentIndex >= 4 ? 0 : currentIndex + 1
+                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 5 -> 0 -> 1)
+                nextIndex = currentIndex >= filterCount ? 0 : currentIndex + 1
             }
 
             // Signal the change - the onChange handler will open the appropriate dropdown
@@ -425,6 +512,10 @@ public struct SearchFilterBar: View {
         }
         return "Date"
     }
+
+    private var hasActiveAdvancedFilters: Bool {
+        (viewModel.windowNameFilter?.isEmpty == false) || (viewModel.browserUrlFilter?.isEmpty == false)
+    }
 }
 
 // MARK: - Filter Chip Button
@@ -433,6 +524,7 @@ private struct FilterChip: View {
     let icon: String
     let label: String
     let isActive: Bool
+    let isOpen: Bool
     let showChevron: Bool
     let action: () -> Void
 
@@ -476,11 +568,16 @@ private struct FilterChip: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        (isHovered || isOpen)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
+                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -498,6 +595,7 @@ private struct AppsFilterChip: View {
     let selectedApps: Set<String>?
     let filterMode: AppFilterMode
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -594,11 +692,16 @@ private struct AppsFilterChip: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        (isHovered || isOpen)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
+                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -630,440 +733,6 @@ private struct AppsFilterChip: View {
         // Fallback: extract last component of bundle ID
         return bundleID.components(separatedBy: ".").last ?? bundleID
     }
-}
-
-// MARK: - Date Filter Popover
-
-private struct DateFilterPopover: View {
-    @ObservedObject var viewModel: SearchViewModel
-    @Binding var isPresented: Bool
-
-    @State private var startDate: Date = Date()
-    @State private var endDate: Date = Date()
-    @State private var editingDate: EditingDate? = nil
-    @State private var displayedMonth: Date = Date()
-
-    /// Focus state to capture focus when popover appears - allows main search field to "steal" focus and dismiss
-    @FocusState private var isFocused: Bool
-
-    private let calendar = Calendar.current
-    private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
-
-    private enum EditingDate {
-        case start
-        case end
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Text("Date Range")
-                    .font(.retraceCalloutBold)
-                    .foregroundColor(.primary)
-
-                Spacer()
-
-                if viewModel.startDate != nil || viewModel.endDate != nil {
-                    Button("Clear") {
-                        viewModel.setDateRange(start: nil, end: nil)
-                        isPresented = false
-                    }
-                    .buttonStyle(.plain)
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.white.opacity(0.6))
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Date selection rows
-            VStack(spacing: 8) {
-                dateRow(label: "Start", date: startDate, isEditing: editingDate == .start) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .start ? nil : .start
-                        displayedMonth = startDate
-                    }
-                }
-                dateRow(label: "End", date: endDate, isEditing: editingDate == .end) {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        editingDate = editingDate == .end ? nil : .end
-                        displayedMonth = endDate
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
-            // Inline calendar (shown when editing)
-            if editingDate != nil {
-                Divider()
-                    .background(Color.white.opacity(0.1))
-
-                inlineCalendar
-                    .padding(12)
-                    .contentShape(Rectangle())
-                    .onTapGesture { } // Prevent tap from bubbling up
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Quick presets (horizontal chips)
-            HStack(spacing: 6) {
-                presetChip("All", preset: .anytime)
-                presetChip("Today", preset: .today)
-                presetChip("7d", preset: .lastWeek)
-                presetChip("30d", preset: .lastMonth)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-
-            // Apply button
-            Button(action: applyCustomRange) {
-                Text("Apply")
-                    .font(.retraceCaptionBold)
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(Color.retraceSubmitAccent)
-                    .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
-            .padding(12)
-        }
-        .frame(width: 280)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .focusable()
-        .focused($isFocused)
-        .modifier(FocusEffectDisabledModifier())
-        .onAppear {
-            initializeDates()
-            // Capture focus when popover appears
-            // This allows clicking elsewhere (like main search field) to dismiss by stealing focus
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isFocused = true
-            }
-        }
-        .onChange(of: isFocused) { focused in
-            // Dismiss when focus is lost (e.g., clicking on main search field)
-            if !focused {
-                isPresented = false
-            }
-        }
-        .onExitCommand {
-            if editingDate != nil {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    editingDate = nil
-                }
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // Collapse calendar when tapping outside of it
-            if editingDate != nil {
-                withAnimation(.easeOut(duration: 0.15)) {
-                    editingDate = nil
-                }
-            }
-        }
-    }
-
-    // MARK: - Date Row
-
-    private func dateRow(label: String, date: Date, isEditing: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: "calendar")
-                    .font(.system(size: 14))
-                    .foregroundColor(isEditing ? .accentColor : .secondary)
-                    .frame(width: 20)
-
-                Text(label)
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(.secondary)
-                    .frame(width: 36, alignment: .leading)
-
-                Spacer()
-
-                Text(formatDate(date))
-                    .font(.retraceCalloutMedium)
-                    .foregroundColor(isEditing ? .accentColor : .primary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isEditing ? Color.accentColor.opacity(0.1) : Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isEditing ? Color.accentColor.opacity(0.5) : Color.clear, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .onHover { h in
-            if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-        }
-    }
-
-    // MARK: - Inline Calendar
-
-    private var inlineCalendar: some View {
-        VStack(spacing: 8) {
-            // Month navigation
-            HStack {
-                Button(action: { changeMonth(by: -1) }) {
-                    Image(systemName: "chevron.left")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.white.opacity(0.6))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
-
-                Spacer()
-
-                Text(monthYearString)
-                    .font(.retraceCaptionMedium)
-                    .foregroundColor(.white.opacity(0.8))
-
-                Spacer()
-
-                Button(action: { changeMonth(by: 1) }) {
-                    Image(systemName: "chevron.right")
-                        .font(.retraceCaption2Bold)
-                        .foregroundColor(.white.opacity(0.6))
-                        .frame(width: 24, height: 24)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .onHover { h in if h { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
-            }
-
-            // Weekday headers
-            HStack(spacing: 0) {
-                ForEach(weekdaySymbols, id: \.self) { day in
-                    Text(day)
-                        .font(.retraceTinyMedium)
-                        .foregroundColor(.white.opacity(0.4))
-                        .frame(maxWidth: .infinity)
-                }
-            }
-
-            // Calendar grid
-            let days = daysInMonth()
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 7), spacing: 2) {
-                ForEach(days.indices, id: \.self) { index in
-                    dayCell(for: days[index])
-                }
-            }
-        }
-    }
-
-    // MARK: - Day Cell
-
-    private func dayCell(for day: Date?) -> some View {
-        Group {
-            if let day = day {
-                let isToday = calendar.isDateInToday(day)
-                let isSelected = isDateSelected(day)
-                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
-                let isFuture = day > Date()
-
-                Button(action: {
-                    selectDay(day)
-                }) {
-                    Text("\(calendar.component(.day, from: day))")
-                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
-                        .foregroundColor(
-                            isFuture
-                                ? .white.opacity(0.2)
-                                : (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.8 : 0.3))
-                        )
-                        .frame(width: 30, height: 30)
-                        .background(
-                            ZStack {
-                                if isSelected {
-                                    Circle()
-                                        .fill(Color.accentColor)
-                                } else if isToday {
-                                    Circle()
-                                        .stroke(Color.accentColor, lineWidth: 1)
-                                }
-                            }
-                        )
-                }
-                .buttonStyle(.plain)
-                .disabled(isFuture)
-                .onHover { h in
-                    if !isFuture {
-                        if h { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                    }
-                }
-            } else {
-                Color.clear
-                    .frame(width: 30, height: 30)
-            }
-        }
-    }
-
-    // MARK: - Preset Chip
-
-    private func presetChip(_ label: String, preset: DatePreset) -> some View {
-        Button(action: {
-            applyPreset(preset)
-        }) {
-            Text(label)
-                .font(.retraceCaption2Medium)
-                .foregroundColor(.white.opacity(0.8))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.white.opacity(0.1))
-                )
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovered in
-            if isHovered { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-        }
-    }
-
-    // MARK: - Helpers
-
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy"
-        return formatter.string(from: date)
-    }
-
-    private var monthYearString: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMMM yyyy"
-        return formatter.string(from: displayedMonth)
-    }
-
-    private func changeMonth(by value: Int) {
-        if let newMonth = calendar.date(byAdding: .month, value: value, to: displayedMonth) {
-            withAnimation(.easeInOut(duration: 0.15)) {
-                displayedMonth = newMonth
-            }
-        }
-    }
-
-    private func daysInMonth() -> [Date?] {
-        var days: [Date?] = []
-
-        guard let monthInterval = calendar.dateInterval(of: .month, for: displayedMonth),
-              let monthFirstWeek = calendar.dateInterval(of: .weekOfMonth, for: monthInterval.start) else {
-            return days
-        }
-
-        var currentDate = monthFirstWeek.start
-
-        for _ in 0..<42 {
-            days.append(currentDate)
-            currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate) ?? currentDate
-        }
-
-        return days
-    }
-
-    private func isDateSelected(_ day: Date) -> Bool {
-        switch editingDate {
-        case .start:
-            return calendar.isDate(day, inSameDayAs: startDate)
-        case .end:
-            return calendar.isDate(day, inSameDayAs: endDate)
-        case .none:
-            return false
-        }
-    }
-
-    private func selectDay(_ day: Date) {
-        switch editingDate {
-        case .start:
-            startDate = day
-            if startDate > endDate {
-                endDate = startDate
-            }
-        case .end:
-            endDate = day
-            if endDate < startDate {
-                startDate = endDate
-            }
-        case .none:
-            break
-        }
-    }
-
-    private func initializeDates() {
-        let now = Date()
-        let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) ?? now
-
-        startDate = viewModel.startDate ?? weekAgo
-        endDate = viewModel.endDate ?? now
-        displayedMonth = endDate
-    }
-
-    private func applyCustomRange() {
-        let start = calendar.startOfDay(for: startDate)
-        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDate) ?? endDate
-
-        viewModel.setDateRange(start: start, end: end)
-        isPresented = false
-    }
-
-    private func applyPreset(_ preset: DatePreset) {
-        let now = Date()
-
-        switch preset {
-        case .anytime:
-            viewModel.setDateRange(start: nil, end: nil)
-        case .today:
-            let start = calendar.startOfDay(for: now)
-            let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: now)
-            viewModel.setDateRange(start: start, end: end)
-        case .yesterday:
-            if let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
-                let start = calendar.startOfDay(for: yesterday)
-                let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: yesterday)
-                viewModel.setDateRange(start: start, end: end)
-            }
-        case .lastWeek:
-            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                let start = calendar.startOfDay(for: weekAgo)
-                viewModel.setDateRange(start: start, end: now)
-            }
-        case .lastMonth:
-            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                let start = calendar.startOfDay(for: monthAgo)
-                viewModel.setDateRange(start: start, end: now)
-            }
-        }
-
-        isPresented = false
-    }
-}
-
-// MARK: - Date Preset Enum
-
-private enum DatePreset {
-    case anytime
-    case today
-    case yesterday
-    case lastWeek
-    case lastMonth
 }
 
 // MARK: - Search Mode Tabs
@@ -1130,6 +799,7 @@ private struct TagsFilterChip: View {
     let availableTags: [Tag]
     let filterMode: TagFilterMode
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1198,11 +868,16 @@ private struct TagsFilterChip: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        (isHovered || isOpen)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
+                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1219,6 +894,7 @@ private struct TagsFilterChip: View {
 private struct VisibilityFilterChip: View {
     let currentFilter: HiddenFilter
     let isActive: Bool
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1275,11 +951,16 @@ private struct VisibilityFilterChip: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity(isHovered ? 0.15 : 0.1))
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isActive ? Color.white.opacity(0.3) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        (isHovered || isOpen)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
+                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1295,6 +976,7 @@ private struct VisibilityFilterChip: View {
 
 private struct SortOrderChip: View {
     let currentOrder: SearchSortOrder
+    let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1331,7 +1013,14 @@ private struct SortOrderChip: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.white.opacity(isHovered ? 0.15 : 0.1))
+                    .fill(Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(
+                        (isHovered || isOpen) ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
+                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -1412,4 +1101,3 @@ private struct SortOrderPopover: View {
         )
     }
 }
-

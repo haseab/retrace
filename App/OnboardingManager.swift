@@ -18,6 +18,8 @@ public actor OnboardingManager {
     private static let timelineShortcutKey = "timelineShortcutConfig"
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
     private static let recordingShortcutKey = "recordingShortcutConfig"
+    private static let systemMonitorShortcutKey = "systemMonitorShortcutConfig"
+    private static let feedbackShortcutKey = "feedbackShortcutConfig"
     private static let hasRewindDataKey = "hasRewindData"
     private static let rewindMigrationCompletedKey = "rewindMigrationCompleted"
 
@@ -62,6 +64,24 @@ public actor OnboardingManager {
         guard let data = settingsDefaults.data(forKey: Self.recordingShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
             return .defaultRecording
+        }
+        return config
+    }
+
+    /// System monitor shortcut configuration (key + modifiers)
+    public var systemMonitorShortcut: ShortcutConfig {
+        guard let data = settingsDefaults.data(forKey: Self.systemMonitorShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultSystemMonitor
+        }
+        return config
+    }
+
+    /// Feedback shortcut configuration (key + modifiers)
+    public var feedbackShortcut: ShortcutConfig {
+        guard let data = settingsDefaults.data(forKey: Self.feedbackShortcutKey),
+              let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
+            return .defaultFeedback
         }
         return config
     }
@@ -128,6 +148,22 @@ public actor OnboardingManager {
         if let data = try? JSONEncoder().encode(config) {
             settingsDefaults.set(data, forKey: Self.recordingShortcutKey)
             Log.info("Recording shortcut set to: \(config.displayString)", category: .app)
+        }
+    }
+
+    /// Set system monitor shortcut (full config with key + modifiers)
+    public func setSystemMonitorShortcut(_ config: ShortcutConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            settingsDefaults.set(data, forKey: Self.systemMonitorShortcutKey)
+            Log.info("System monitor shortcut set to: \(config.displayString)", category: .app)
+        }
+    }
+
+    /// Set feedback shortcut (full config with key + modifiers)
+    public func setFeedbackShortcut(_ config: ShortcutConfig) {
+        if let data = try? JSONEncoder().encode(config) {
+            settingsDefaults.set(data, forKey: Self.feedbackShortcutKey)
+            Log.info("Feedback shortcut set to: \(config.displayString)", category: .app)
         }
     }
 

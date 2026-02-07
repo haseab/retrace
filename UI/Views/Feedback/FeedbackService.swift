@@ -118,8 +118,8 @@ public final class FeedbackService {
         if let version = appBundle.infoDictionary?["CFBundleShortVersionString"] as? String, !version.isEmpty {
             return version
         }
-        // Fallback to hardcoded version for debug builds
-        return "0.5.0"
+        // Fallback for debug builds where bundle info isn't available
+        return "unknown"
     }
 
     private var buildNumber: String {

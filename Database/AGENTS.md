@@ -2,7 +2,7 @@
 
 You are responsible for the **Database** module of Retrace. Your job is to implement SQLite database operations including schema, migrations, CRUD operations, and full-text search indexing.
 
-**v0.5 Status**: ✅ Core tables fully implemented (segments, frames, searchRanking FTS5). Uses SQLCipher for optional encryption and Rewind database import compatibility. **Advanced tables not yet implemented** (app_sessions, encoding_queue, junction tables - planned for future release). Audio tables exist in schema but are not used in v0.5.
+**Status**: ✅ Core tables fully implemented (segments, frames, searchRanking FTS5). Uses SQLCipher for optional encryption and Rewind database import compatibility. **Advanced tables not yet implemented** (app_sessions, encoding_queue, junction tables - planned for future release). Audio tables exist in schema but are not yet used.
 
 ## Your Directory
 

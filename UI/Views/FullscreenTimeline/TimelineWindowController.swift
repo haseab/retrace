@@ -3,6 +3,8 @@ import SwiftUI
 import App
 import Shared
 import CoreGraphics
+import AVFoundation
+import UniformTypeIdentifiers
 
 /// Manages the full-screen timeline overlay window
 /// This is a singleton that can be triggered from anywhere via keyboard shortcut
@@ -1332,7 +1334,19 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Cmd+C to copy (handle before system can intercept)
-                if event.keyCode == 8 && modifiers == [.command] {
+                if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+S to save image (handle before system can intercept)
+                if event.charactersIgnoringModifiers == "s" && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+L to copy moment link (handle before system can intercept)
+                if event.charactersIgnoringModifiers == "l" && modifiers == [.command] {
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1364,22 +1378,22 @@ public class TimelineWindowController: NSObject {
                     return nil // Consume the event
                 }
             } else if event.type == .scrollWheel {
-                // Allow scrolling timeline while search overlay is open (don't block)
-                // Don't intercept scroll events when a filter dropdown is open
-                // Let SwiftUI ScrollView handle them for scrolling through the dropdown list
-                if let viewModel = self?.timelineViewModel, viewModel.isFilterDropdownOpen {
-                    return event // Let the dropdown ScrollView handle it
-                }
-                // Don't intercept scroll events when the tag submenu is open
-                // Let SwiftUI ScrollView handle them for scrolling through tags
-                if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
-                    return event // Let the tag submenu ScrollView handle it
-                }
-                // Don't intercept scroll events when search overlay is open with results
-                // Prioritize scrolling the search results over timeline navigation
-                if let viewModel = self?.timelineViewModel,
-                   viewModel.isSearchOverlayVisible && !viewModel.searchViewModel.searchQuery.isEmpty {
-                    return event // Let the search results ScrollView handle it
+                // Let UI overlays consume scrolling before timeline navigation.
+                if let viewModel = self?.timelineViewModel {
+                    // Filter-panel popovers are ScrollViews.
+                    if viewModel.isFilterDropdownOpen {
+                        return event
+                    }
+                    // Timeline context-menu tag submenu is also scrollable.
+                    if viewModel.showTagSubmenu {
+                        return event
+                    }
+                    // Search overlay dropdowns/results should own wheel events.
+                    if viewModel.isSearchOverlayVisible &&
+                        (viewModel.searchViewModel.isDropdownOpen ||
+                         !viewModel.searchViewModel.searchQuery.isEmpty) {
+                        return event
+                    }
                 }
                 self?.handleScrollEvent(event, source: "LOCAL")
                 return nil // Consume scroll events
@@ -1594,13 +1608,31 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        // Cmd+C to copy selected text
-        if event.keyCode == 8 && modifiers == [.command] { // C key with Command
+        // Cmd+C to copy selected text, or copy image if no selection
+        if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
             recordShortcut("cmd+c")
-            if let viewModel = timelineViewModel, viewModel.hasSelection {
-                viewModel.copySelectedText()
+            if let viewModel = timelineViewModel {
+                if viewModel.hasSelection {
+                    viewModel.copySelectedText()
+                } else {
+                    copyCurrentFrameImage()
+                }
                 return true
             }
+        }
+
+        // Cmd+S to save image
+        if event.charactersIgnoringModifiers == "s" && modifiers == [.command] {
+            recordShortcut("cmd+s")
+            saveCurrentFrameImage()
+            return true
+        }
+
+        // Cmd+L to copy moment link
+        if event.charactersIgnoringModifiers == "l" && modifiers == [.command] {
+            recordShortcut("cmd+l")
+            copyMomentLink()
+            return true
         }
 
         // Cmd+H to toggle timeline controls visibility
@@ -1645,8 +1677,53 @@ public class TimelineWindowController: NSObject {
             return false
         }
 
-        // Left arrow key - navigate to previous frame (Option = 3x speed)
-        if event.keyCode == 123 && (modifiers.isEmpty || modifiers == [.option]) { // Left arrow
+        // Space bar to toggle play/pause (only when video controls are enabled)
+        if event.keyCode == 49 && modifiers.isEmpty { // Space
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                viewModel.togglePlayback()
+                return true
+            }
+        }
+
+        // Shift+> to increase playback speed (only when video controls are enabled)
+        if event.characters == ">" {
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                let speeds: [Double] = [1, 2, 4, 8]
+                if let currentIdx = speeds.firstIndex(of: viewModel.playbackSpeed), currentIdx < speeds.count - 1 {
+                    let newSpeed = speeds[currentIdx + 1]
+                    viewModel.setPlaybackSpeed(newSpeed)
+                    viewModel.showToast("Speed: \(Int(newSpeed))x")
+                }
+                return true
+            }
+        }
+
+        // Shift+< to decrease playback speed (only when video controls are enabled)
+        if event.characters == "<" {
+            if let viewModel = timelineViewModel, viewModel.showVideoControls {
+                let speeds: [Double] = [1, 2, 4, 8]
+                if let currentIdx = speeds.firstIndex(of: viewModel.playbackSpeed), currentIdx > 0 {
+                    let newSpeed = speeds[currentIdx - 1]
+                    viewModel.setPlaybackSpeed(newSpeed)
+                    viewModel.showToast("Speed: \(Int(newSpeed))x")
+                }
+                return true
+            }
+        }
+
+        // Left arrow key or J - navigate to previous frame (Option = 3x speed)
+        // Skip when search UI is open so overlay controls can own arrow keys.
+        if let viewModel = timelineViewModel,
+           viewModel.isSearchOverlayVisible,
+           !viewModel.searchViewModel.searchQuery.isEmpty,
+           (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
+        }
+        // Skip when a search filter dropdown is open (e.g., DateFilterPopover uses arrow keys for calendar navigation)
+        if let viewModel = timelineViewModel, viewModel.searchViewModel.isDropdownOpen, (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
+        }
+        if (event.keyCode == 123 || event.charactersIgnoringModifiers == "j") && (modifiers.isEmpty || modifiers == [.option]) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex - step)
@@ -1655,11 +1732,11 @@ public class TimelineWindowController: NSObject {
                     DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
                 }
             }
-            return true // Always consume arrow keys to prevent system "bonk" sound
+            return true // Always consume to prevent system "bonk" sound
         }
 
-        // Right arrow key - navigate to next frame (Option = 3x speed)
-        if event.keyCode == 124 && (modifiers.isEmpty || modifiers == [.option]) { // Right arrow
+        // Right arrow key or K - navigate to next frame (Option = 3x speed)
+        if (event.keyCode == 124 || event.charactersIgnoringModifiers == "k") && (modifiers.isEmpty || modifiers == [.option]) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
                 viewModel.navigateToFrame(viewModel.currentIndex + step)
@@ -1668,7 +1745,7 @@ public class TimelineWindowController: NSObject {
                     DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
                 }
             }
-            return true // Always consume arrow keys to prevent system "bonk" sound
+            return true // Always consume to prevent system "bonk" sound
         }
 
         // Ctrl+0 to reset frame zoom to 100%
@@ -1748,7 +1825,7 @@ public class TimelineWindowController: NSObject {
            !event.modifierFlags.contains(.control),
            event.keyCode != 53 { // Don't clear on Escape (handled above)
             // Only clear for non-navigation keys
-            let navigationKeys: Set<UInt16> = [123, 124, 125, 126] // Arrow keys
+            let navigationKeys: Set<UInt16> = [123, 124, 125, 126, 38, 40, 49] // Arrow keys + J, K + Space
             if !navigationKeys.contains(event.keyCode) {
                 viewModel.clearTextSelection()
             }
@@ -1923,6 +2000,124 @@ public class TimelineWindowController: NSObject {
     // MARK: - Keyboard Shortcut Tracking
 
     /// Record keyboard shortcut usage
+    // MARK: - Image & Link Actions (Keyboard Shortcuts)
+
+    private func copyCurrentFrameImage() {
+        guard let viewModel = timelineViewModel else { return }
+        getCurrentFrameImage(viewModel: viewModel) { [weak self] image in
+            guard let image = image else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([image])
+            viewModel.showToast("Image copied")
+            if let coordinator = self?.coordinator {
+                DashboardViewModel.recordImageCopy(coordinator: coordinator, frameID: viewModel.currentFrame?.id.value)
+            }
+        }
+    }
+
+    private func saveCurrentFrameImage() {
+        guard let viewModel = timelineViewModel else { return }
+        getCurrentFrameImage(viewModel: viewModel) { [weak self] image in
+            guard let image = image else { return }
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [.png]
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+            let timestamp = formatter.string(from: viewModel.currentTimestamp ?? Date())
+            savePanel.nameFieldStringValue = "retrace-\(timestamp).png"
+            savePanel.level = .screenSaver + 1
+
+            savePanel.begin { response in
+                if response == .OK, let url = savePanel.url {
+                    if let tiffData = image.tiffRepresentation,
+                       let bitmap = NSBitmapImageRep(data: tiffData),
+                       let pngData = bitmap.representation(using: .png, properties: [:]) {
+                        try? pngData.write(to: url)
+                        if let coordinator = self?.coordinator {
+                            DashboardViewModel.recordImageSave(coordinator: coordinator, frameID: viewModel.currentFrame?.id.value)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func copyMomentLink() {
+        guard let viewModel = timelineViewModel,
+              let timestamp = viewModel.currentTimestamp,
+              let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
+        viewModel.showToast("Moment Link copied")
+        if let coordinator = coordinator {
+            DashboardViewModel.recordDeeplinkCopy(coordinator: coordinator, url: url.absoluteString)
+        }
+    }
+
+    private func getCurrentFrameImage(viewModel: SimpleTimelineViewModel, completion: @escaping (NSImage?) -> Void) {
+        if let image = viewModel.currentImage {
+            completion(image)
+            return
+        }
+
+        guard let videoInfo = viewModel.currentVideoInfo else {
+            completion(nil)
+            return
+        }
+
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                completion(nil)
+                return
+            }
+        }
+
+        let url: URL
+        if actualVideoPath.hasSuffix(".mp4") {
+            url = URL(fileURLWithPath: actualVideoPath)
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = (actualVideoPath as NSString).lastPathComponent
+            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+            if !FileManager.default.fileExists(atPath: symlinkPath) {
+                do {
+                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                } catch {
+                    completion(nil)
+                    return
+                }
+            }
+            url = URL(fileURLWithPath: symlinkPath)
+        }
+
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        let time = videoInfo.frameTimeCMTime
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            DispatchQueue.main.async {
+                if let cgImage = cgImage {
+                    let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    completion(nsImage)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
     private func recordShortcut(_ shortcut: String) {
         if let coordinator = coordinator {
             DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)

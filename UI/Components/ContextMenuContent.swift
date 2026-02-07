@@ -14,17 +14,17 @@ struct ContextMenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ContextMenuRow(title: "Copy Moment Link", icon: "link") {
+            ContextMenuRow(title: "Copy Moment Link", icon: "link", shortcut: "⌘L") {
                 showMenu = false
                 copyMomentLink()
             }
 
-            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc") {
+            ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⌘C") {
                 showMenu = false
                 copyImageToClipboard()
             }
 
-            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down") {
+            ContextMenuRow(title: "Save Image", icon: "square.and.arrow.down", shortcut: "⌘S") {
                 showMenu = false
                 saveImage()
             }
@@ -43,7 +43,7 @@ struct ContextMenuContent: View {
                 openDashboard()
             }
 
-            ContextMenuRow(title: "System Monitor", icon: "waveform.path.ecg") {
+            ContextMenuRow(title: "System Monitor", icon: "waveform.path.ecg", shortcut: "⌘⇧M") {
                 showMenu = false
                 openSystemMonitor()
             }
@@ -51,6 +51,11 @@ struct ContextMenuContent: View {
             ContextMenuRow(title: "Settings", icon: "gear", shortcut: "⌘,") {
                 showMenu = false
                 openSettings()
+            }
+
+            ContextMenuRow(title: "Report an Issue", icon: "exclamationmark.bubble", shortcut: "⌘⇧H") {
+                showMenu = false
+                openFeedback()
             }
         }
     }
@@ -127,6 +132,13 @@ struct ContextMenuContent: View {
         TimelineWindowController.shared.hideToShowDashboard()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+        }
+    }
+
+    private func openFeedback() {
+        TimelineWindowController.shared.hideToShowDashboard()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NotificationCenter.default.post(name: .openFeedback, object: nil)
         }
     }
 

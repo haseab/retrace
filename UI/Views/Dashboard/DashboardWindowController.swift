@@ -198,16 +198,21 @@ struct DashboardContentView: View {
     /// Manager for milestone celebrations
     @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
 
+    /// Dashboard view model - hoisted here so it persists across tab switches
+    @StateObject private var dashboardViewModel: DashboardViewModel
+
     @State private var selectedView: DashboardSelectedView = .dashboard
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
     @State private var initialSettingsTab: SettingsTab? = nil
+    @State private var hasLoadedDashboard = false
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
+        self._dashboardViewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
     }
 
     var body: some View {
@@ -224,13 +229,19 @@ struct DashboardContentView: View {
                     }
                 } else {
                     // Main content based on selected view
+                    // Persistent background prevents titlebar flash during tab transitions
+                    Color.retraceBackground
+                        .ignoresSafeArea()
+
                     Group {
                         switch selectedView {
                         case .dashboard:
                             DashboardView(
+                                viewModel: dashboardViewModel,
                                 coordinator: coordinator,
                                 launchOnLoginReminderManager: launchOnLoginReminderManager,
-                                milestoneCelebrationManager: milestoneCelebrationManager
+                                milestoneCelebrationManager: milestoneCelebrationManager,
+                                hasLoadedInitialData: $hasLoadedDashboard
                             )
 
                         case .settings:
@@ -304,6 +315,23 @@ struct DashboardContentView: View {
                 selectedView = .monitor
             }
             DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .toggleSystemMonitor)) { _ in
+            if selectedView == .monitor,
+               DashboardWindowController.shared.isVisible,
+               let window = DashboardWindowController.shared.window,
+               (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
+                // Already showing monitor and frontmost — go back to dashboard
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    selectedView = .dashboard
+                }
+            } else {
+                // Show system monitor
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    selectedView = .monitor
+                }
+                DashboardWindowController.shared.show()
+            }
         }
         .sheet(isPresented: $showFeedbackSheet) {
             FeedbackFormView()

@@ -2,7 +2,7 @@
 
 You are responsible for the **Capture** module of Retrace. Your job is to implement screen capture using **CGWindowListCapture**, frame deduplication, and app metadata extraction.
 
-**v0.5 Status**: ✅ Fully implemented using CGWindowListCapture API (legacy, no privacy indicator). No audio capture in v0.5.
+**Status**: ✅ Fully implemented using CGWindowListCapture API (legacy, no privacy indicator). No audio capture yet.
 
 ## Your Directory
 
@@ -42,7 +42,7 @@ Capture/
 
 ## Key Implementation Details
 
-### 1. CGWindowListCapture Setup (v0.5 Implementation)
+### 1. CGWindowListCapture Setup (Current Implementation)
 
 **Why CGWindowListCapture instead of ScreenCaptureKit?**
 - No purple privacy indicator
@@ -462,9 +462,9 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 - **CPU**: <10% during capture (mostly idle between 2-second intervals)
 - **Deduplication rate**: ~95% of frames filtered as duplicates
 
-## v0.5 Limitations
+## Current Limitations
 
-- No audio capture (planned for v0.2+)
+- No audio capture (planned for future release)
 - CGWindowListCapture has no streaming API (polling only)
 - Limited private window detection (heuristic-based)
 - No multi-display support optimizations
@@ -476,4 +476,4 @@ throw CaptureError.captureSessionFailed(underlying: error.localizedDescription)
 3. Read `AppInfoProvider.swift` - metadata extraction
 4. Read `CaptureManager.swift` - protocol conformance + pipeline
 
-The implementation is complete for v0.5. Focus on understanding the existing code rather than rewriting.
+The implementation is complete. Focus on understanding the existing code rather than rewriting.

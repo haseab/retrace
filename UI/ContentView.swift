@@ -13,6 +13,7 @@ public struct ContentView: View {
     @StateObject private var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @StateObject private var milestoneCelebrationManager: MilestoneCelebrationManager
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
+    @StateObject private var dashboardViewModel: DashboardViewModel
 
     private let coordinator: AppCoordinator
 
@@ -23,6 +24,7 @@ public struct ContentView: View {
         self._launchOnLoginReminderManager = StateObject(wrappedValue: LaunchOnLoginReminderManager(coordinator: coordinator))
         self._milestoneCelebrationManager = StateObject(wrappedValue: MilestoneCelebrationManager(coordinator: coordinator))
         self._coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+        self._dashboardViewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
     }
 
     // MARK: - Body
@@ -46,6 +48,7 @@ public struct ContentView: View {
                         switch selectedView {
                         case .dashboard:
                             DashboardView(
+                                viewModel: dashboardViewModel,
                                 coordinator: coordinator,
                                 launchOnLoginReminderManager: launchOnLoginReminderManager,
                                 milestoneCelebrationManager: milestoneCelebrationManager

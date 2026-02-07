@@ -296,6 +296,43 @@ public struct SimpleTimelineView: View {
 	                    )
 	                }
 
+                // Toast feedback overlay (e.g. "Copied!")
+                if viewModel.toastMessage != nil {
+                    VStack {
+                        HStack(spacing: 8) {
+                            if let icon = viewModel.toastIcon {
+                                Image(systemName: icon)
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundColor(.green)
+                            }
+                            if let message = viewModel.toastMessage {
+                                Text(message)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .background(
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(.ultraThinMaterial)
+                                    .environment(\.colorScheme, .dark)
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(Color.black.opacity(0.4))
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+                            }
+                        )
+                        .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+                        .scaleEffect(viewModel.toastVisible ? 1.0 : 0.8)
+                        .opacity(viewModel.toastVisible ? 1.0 : 0.0)
+                        .padding(.top, 60)
+                        Spacer()
+                    }
+                    .allowsHitTesting(false)
+                }
+
 	            }
             .coordinateSpace(name: "timelineContent")
             .background(Color.black)
@@ -1590,7 +1627,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             // Light blur on the background - fades in as image centers
             Rectangle()
                 .fill(.regularMaterial)
-                .opacity(progress * 0.3)
+                .opacity(targetBlur * 0.3)
 
             // Darken outside the rectangle - constant opacity to match drag preview
             InverseRoundedRectCutout(
@@ -4305,9 +4342,19 @@ struct FilterPanel: View {
     @State private var panelPosition: CGSize = .zero
     @State private var escapeMonitor: Any?
     @State private var tabKeyMonitor: Any?
+    @State private var isCloseHovered = false
+    @State private var isClearHovered = false
+    @State private var isApplyHovered = false
+    @State private var focusedActionButton: ActionButtonFocus?
 
-    /// Filter order for Tab navigation: Apps(1) → Tags(2) → Visibility(3) → Date(4) → back to Apps
-    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .dateRange]
+    private enum ActionButtonFocus: Hashable {
+        case clear
+        case apply
+    }
+
+    /// Filter order for Tab navigation:
+    /// Apps(1) → Tags(2) → Visibility(3) → Date(4) → Advanced(5) → Action buttons → back to Apps
+    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .dateRange, .advanced]
 
     /// Border color for filter panel
     private var themeBorderColor: Color {
@@ -4377,6 +4424,11 @@ struct FilterPanel: View {
         return "Any Time"
     }
 
+    /// Clear button is only visible when there are active pending filters
+    private var hasClearButton: Bool {
+        viewModel.pendingFilterCriteria.hasActiveFilters
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
@@ -4396,10 +4448,22 @@ struct FilterPanel: View {
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.white.opacity(0.4))
                         .frame(width: 22, height: 22)
-                        .background(Color.white.opacity(0.1))
-                        .clipShape(Circle())
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.1))
+                        )
+                        .overlay(
+                            Circle()
+                                .stroke(
+                                    isCloseHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
+                                    lineWidth: 1.2
+                                )
+                        )
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    isCloseHovered = hovering
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -4468,6 +4532,7 @@ struct FilterPanel: View {
                         label: "APPS",
                         selectedApps: viewModel.pendingFilterCriteria.selectedApps,
                         isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
+                        isOpen: viewModel.activeFilterDropdown == .apps,
                         onTap: { frame in
                             withAnimation(.easeOut(duration: 0.15)) {
                                 if viewModel.activeFilterDropdown == .apps {
@@ -4488,6 +4553,7 @@ struct FilterPanel: View {
                         value: hiddenFilterLabel,
                         icon: "eye",
                         isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
+                        isOpen: viewModel.activeFilterDropdown == .visibility,
                         onTap: { frame in
                             withAnimation(.easeOut(duration: 0.15)) {
                                 if viewModel.activeFilterDropdown == .visibility {
@@ -4512,6 +4578,7 @@ struct FilterPanel: View {
                         value: tagsLabel,
                         icon: "tag",
                         isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
+                        isOpen: viewModel.activeFilterDropdown == .tags,
                         onTap: { frame in
                             withAnimation(.easeOut(duration: 0.15)) {
                                 if viewModel.activeFilterDropdown == .tags {
@@ -4532,6 +4599,7 @@ struct FilterPanel: View {
                         value: dateRangeLabel,
                         icon: "calendar",
                         isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
+                        isOpen: viewModel.activeFilterDropdown == .dateRange,
                         onTap: { frame in
                             withAnimation(.easeOut(duration: 0.15)) {
                                 if viewModel.activeFilterDropdown == .dateRange {
@@ -4570,8 +4638,9 @@ struct FilterPanel: View {
             // Action buttons
             HStack(spacing: 10) {
                 // Clear button (only when pending filters are active)
-                if viewModel.pendingFilterCriteria.hasActiveFilters {
+                if hasClearButton {
                     Button(action: {
+                        focusedActionButton = nil
                         viewModel.clearPendingFilters()
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.applyFilters()
@@ -4584,14 +4653,31 @@ struct FilterPanel: View {
                             .padding(.vertical, 11)
                             .background(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .fill(Color.white.opacity(0.1))
+                                    .fill(
+                                        (focusedActionButton == .clear || isClearHovered)
+                                            ? Color.white.opacity(0.16)
+                                            : Color.white.opacity(0.1)
+                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(
+                                        (focusedActionButton == .clear || isClearHovered)
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : Color.clear,
+                                        lineWidth: 1.4
+                                    )
                             )
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isClearHovered = hovering
+                    }
                 }
 
                 // Apply button
                 Button(action: {
+                    focusedActionButton = nil
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.applyFilters()
                     }
@@ -4603,10 +4689,32 @@ struct FilterPanel: View {
                         .padding(.vertical, 11)
                         .background(
                             RoundedRectangle(cornerRadius: 8)
-                                .fill(RetraceMenuStyle.actionBlue.opacity(0.8))
+                                .fill(
+                                    (focusedActionButton == .apply || isApplyHovered)
+                                        ? RetraceMenuStyle.actionBlue
+                                        : RetraceMenuStyle.actionBlue.opacity(0.8)
+                                )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(
+                                    (focusedActionButton == .apply || isApplyHovered)
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : Color.clear,
+                                    lineWidth: 2.25
+                                )
+                        )
+                        .shadow(
+                            color: (focusedActionButton == .apply || isApplyHovered)
+                                ? RetraceMenuStyle.actionBlue.opacity(0.65)
+                                : .clear,
+                            radius: 8
                         )
                 }
                 .buttonStyle(.plain)
+                .onHover { hovering in
+                    isApplyHovered = hovering
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -4630,6 +4738,11 @@ struct FilterPanel: View {
             // Set up escape key monitor
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 if event.keyCode == 53 { // Escape key
+                    // Let date popover handle Escape when calendar grid is open (cancel edit only).
+                    if viewModel.activeFilterDropdown == .dateRange && viewModel.isDateRangeCalendarEditing {
+                        return event
+                    }
+
                     // Close any open dropdown first
                     if viewModel.activeFilterDropdown != .none {
                         withAnimation(.easeOut(duration: 0.15)) {
@@ -4648,11 +4761,107 @@ struct FilterPanel: View {
 
             // Set up Tab key monitor for cycling through filters
             tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Handle Enter on Advanced highlight (expand and focus Window Name)
+                if (event.keyCode == 36 || event.keyCode == 76) &&
+                    viewModel.activeFilterDropdown == .advanced &&
+                    viewModel.advancedFocusedFieldIndex == 0 {
+                    // Enter on highlighted Advanced header → signal expand
+                    viewModel.advancedFocusedFieldIndex = -1  // Signal to expand
+                    return nil
+                }
+
+                // Handle Enter while action buttons are keyboard-highlighted.
+                if (event.keyCode == 36 || event.keyCode == 76), let focusedButton = focusedActionButton {
+                    if focusedButton == .clear {
+                        focusedActionButton = nil
+                        viewModel.clearPendingFilters()
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.applyFilters()
+                        }
+                    } else {
+                        focusedActionButton = nil
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.applyFilters()
+                        }
+                    }
+                    return nil
+                }
+
                 // Only handle Tab key (keycode 48)
                 guard event.keyCode == 48 else { return event }
 
                 // Check if Shift is held for reverse direction
                 let isShiftHeld = event.modifierFlags.contains(.shift)
+
+                // Handle Tab while action buttons are focused
+                if let focusedButton = focusedActionButton {
+                    if isShiftHeld {
+                        if focusedButton == .apply && hasClearButton {
+                            focusedActionButton = .clear
+                            return nil
+                        }
+                        // Shift+Tab from Clear (or Apply when Clear is hidden) -> Browser URL field
+                        // (Advanced section will focus Browser URL on this sentinel value).
+                        focusedActionButton = nil
+                        if viewModel.activeFilterDropdown == .advanced {
+                            viewModel.advancedFocusedFieldIndex = -2
+                            return nil
+                        }
+                    } else {
+                        if focusedButton == .clear {
+                            focusedActionButton = .apply
+                            return nil
+                        }
+                        // Tab on Apply -> cycle to Apps dropdown
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
+                        let nextAnchorFrame = viewModel.filterAnchorFrames[.apps] ?? .zero
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showFilterDropdown(.apps, anchorFrame: nextAnchorFrame)
+                        }
+                        return nil
+                    }
+                }
+
+                // Handle Tab within advanced fields (Window Name / Browser URL)
+                if viewModel.activeFilterDropdown == .advanced {
+                    let fieldIndex = viewModel.advancedFocusedFieldIndex
+                    if fieldIndex == 0 {
+                        // Advanced header is highlighted: Tab goes to action buttons first.
+                        if !isShiftHeld {
+                            focusedActionButton = hasClearButton ? .clear : .apply
+                            return nil
+                        }
+                    } else if !isShiftHeld && fieldIndex == 1 {
+                        // Tab on Window Name → let SwiftUI move focus to Browser URL
+                        return event
+                    } else if !isShiftHeld && fieldIndex == 2 {
+                        // Tab on Browser URL -> action buttons first (Clear, then Apply).
+                        viewModel.advancedFocusedFieldIndex = 0
+                        focusedActionButton = hasClearButton ? .clear : .apply
+                        return nil
+                    } else if isShiftHeld && fieldIndex == 2 {
+                        // Shift+Tab on Browser URL -> explicitly focus Window Name.
+                        viewModel.advancedFocusedFieldIndex = -3
+                        return nil
+                    } else if isShiftHeld && fieldIndex == 1 {
+                        // Shift+Tab on Window Name → cycle to Date Range
+                        let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
+                        }
+                        return nil
+                    }
+                }
+
+                // Shift+Tab on Apps dropdown should go to Submit (Apply button), not Advanced.
+                if isShiftHeld && viewModel.activeFilterDropdown == .apps {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                    focusedActionButton = .apply
+                    return nil
+                }
 
                 // Determine current and next dropdown
                 let nextDropdown: SimpleTimelineViewModel.FilterDropdownType
@@ -4692,6 +4901,12 @@ struct FilterPanel: View {
                 return nil // Consume the event
             }
         }
+        .onChange(of: viewModel.pendingFilterCriteria.hasActiveFilters) { hasActive in
+            // If Clear disappears while focused, move focus to Apply.
+            if !hasActive && focusedActionButton == .clear {
+                focusedActionButton = .apply
+            }
+        }
         .onDisappear {
             // Clean up escape key monitor
             if let monitor = escapeMonitor {
@@ -4703,6 +4918,7 @@ struct FilterPanel: View {
                 NSEvent.removeMonitor(monitor)
                 tabKeyMonitor = nil
             }
+            focusedActionButton = nil
         }
     }
 }
@@ -4713,10 +4929,24 @@ struct FilterPanel: View {
 struct AdvancedFiltersSection: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isExpanded: Bool = false
+    @State private var isHeaderHovered = false
+    @State private var isWindowFieldHovered = false
+    @State private var isBrowserFieldHovered = false
+
+    private enum AdvancedField: Hashable {
+        case windowName
+        case browserUrl
+    }
+    @FocusState private var focusedField: AdvancedField?
 
     /// Whether any advanced filter is active
     private var hasActiveAdvancedFilters: Bool {
         viewModel.pendingFilterCriteria.hasAdvancedFilters
+    }
+
+    /// Whether the advanced dropdown is active (for highlight)
+    private var isAdvancedActive: Bool {
+        viewModel.activeFilterDropdown == .advanced
     }
 
     var body: some View {
@@ -4726,12 +4956,19 @@ struct AdvancedFiltersSection: View {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     isExpanded.toggle()
                 }
+                if isExpanded {
+                    // Focus window name field when manually expanding
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        focusedField = .windowName
+                    }
+                }
             }) {
                 HStack {
                     Text("ADVANCED")
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(isAdvancedActive ? .white.opacity(0.8) : .white.opacity(0.4))
                         .tracking(0.5)
+                        .padding(.leading, 4)
 
                     if hasActiveAdvancedFilters {
                         Circle()
@@ -4743,7 +4980,7 @@ struct AdvancedFiltersSection: View {
 
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.4))
+                        .foregroundColor(isAdvancedActive ? .white.opacity(0.6) : .white.opacity(0.4))
                 }
                 .contentShape(Rectangle())
             }
@@ -4751,6 +4988,19 @@ struct AdvancedFiltersSection: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, isExpanded ? 8 : 12)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isAdvancedActive && !isExpanded ? Color.white.opacity(0.08) : Color.clear)
+                    .padding(.horizontal, 16)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isHeaderHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear, lineWidth: 1.2)
+                    .padding(.horizontal, 16)
+            )
+            .onHover { hovering in
+                isHeaderHovered = hovering
+            }
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
@@ -4764,6 +5014,7 @@ struct AdvancedFiltersSection: View {
                             get: { viewModel.pendingFilterCriteria.windowNameFilter ?? "" },
                             set: { viewModel.pendingFilterCriteria.windowNameFilter = $0.isEmpty ? nil : $0 }
                         ))
+                        .focused($focusedField, equals: .windowName)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13))
                         .foregroundColor(.white)
@@ -4776,12 +5027,19 @@ struct AdvancedFiltersSection: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(
-                                    viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
-                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
-                                        : Color.white.opacity(0.1),
+                                    focusedField == .windowName
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (isWindowFieldHovered
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : (viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
+                                                ? RetraceMenuStyle.filterStrokeMedium
+                                                : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
                                 )
                         )
+                        .onHover { hovering in
+                            isWindowFieldHovered = hovering
+                        }
                         .onSubmit {
                             viewModel.applyFilters()
                         }
@@ -4797,6 +5055,7 @@ struct AdvancedFiltersSection: View {
                             get: { viewModel.pendingFilterCriteria.browserUrlFilter ?? "" },
                             set: { viewModel.pendingFilterCriteria.browserUrlFilter = $0.isEmpty ? nil : $0 }
                         ))
+                        .focused($focusedField, equals: .browserUrl)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13))
                         .foregroundColor(.white)
@@ -4809,12 +5068,19 @@ struct AdvancedFiltersSection: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
                                 .stroke(
-                                    viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
-                                        ? RetraceMenuStyle.actionBlue.opacity(0.5)
-                                        : Color.white.opacity(0.1),
+                                    focusedField == .browserUrl
+                                        ? RetraceMenuStyle.filterStrokeStrong
+                                        : (isBrowserFieldHovered
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : (viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
+                                                ? RetraceMenuStyle.filterStrokeMedium
+                                                : RetraceMenuStyle.filterStrokeSubtle)),
                                     lineWidth: 1
                                 )
                         )
+                        .onHover { hovering in
+                            isBrowserFieldHovered = hovering
+                        }
                         .onSubmit {
                             viewModel.applyFilters()
                         }
@@ -4830,6 +5096,55 @@ struct AdvancedFiltersSection: View {
                 isExpanded = true
             }
         }
+        .onChange(of: viewModel.activeFilterDropdown) { newValue in
+            if newValue != .advanced {
+                // Leaving advanced: collapse section and unfocus fields
+                focusedField = nil
+                if newValue != .none {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded = false
+                    }
+                }
+            }
+        }
+        .onChange(of: viewModel.advancedFocusedFieldIndex) { newValue in
+            if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
+                // Enter was pressed on the Advanced header — expand and focus Window Name
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedField = .windowName
+                }
+            } else if newValue == 0 && viewModel.activeFilterDropdown == .advanced {
+                // Tab moved focus to panel action buttons; clear text field focus/caret.
+                focusedField = nil
+            } else if newValue == -2 && viewModel.activeFilterDropdown == .advanced {
+                // Shift+Tab from filter action buttons -> focus Browser URL.
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedField = .browserUrl
+                }
+            } else if newValue == -3 && viewModel.activeFilterDropdown == .advanced {
+                // Shift+Tab from Browser URL -> focus Window Name.
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    focusedField = .windowName
+                }
+            }
+        }
+        .onChange(of: focusedField) { newValue in
+            // Sync focus state to viewModel for tab monitor
+            switch newValue {
+            case .windowName: viewModel.advancedFocusedFieldIndex = 1
+            case .browserUrl: viewModel.advancedFocusedFieldIndex = 2
+            case nil: viewModel.advancedFocusedFieldIndex = 0
+            }
+        }
     }
 }
 
@@ -4841,6 +5156,7 @@ struct CompactFilterDropdown: View {
     let value: String
     let icon: String
     let isActive: Bool
+    let isOpen: Bool
     let onTap: (CGRect) -> Void
     var onFrameAvailable: ((CGRect) -> Void)? = nil
 
@@ -4876,11 +5192,16 @@ struct CompactFilterDropdown: View {
                     .padding(.vertical, 9)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
+                            .fill(isActive ? Color.white.opacity(0.15) : ((isHovered || isOpen) ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
+                            .stroke(
+                                (isHovered || isOpen)
+                                    ? RetraceMenuStyle.filterStrokeStrong
+                                    : (isActive ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                                lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            )
                     )
                 }
                 .buttonStyle(.plain)
@@ -4906,6 +5227,7 @@ struct CompactAppsFilterDropdown: View {
     let label: String
     let selectedApps: Set<String>?
     let isExcludeMode: Bool
+    let isOpen: Bool
     let onTap: (CGRect) -> Void
     var onFrameAvailable: ((CGRect) -> Void)? = nil
 
@@ -4991,11 +5313,16 @@ struct CompactAppsFilterDropdown: View {
                     .padding(.vertical, 9)
                     .background(
                         RoundedRectangle(cornerRadius: 8)
-                            .fill(isActive ? Color.white.opacity(0.15) : (isHovered ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
+                            .fill(isActive ? Color.white.opacity(0.15) : ((isHovered || isOpen) ? Color.white.opacity(0.12) : Color.white.opacity(0.08)))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(isActive ? 0.25 : 0.1), lineWidth: 1)
+                            .stroke(
+                                (isHovered || isOpen)
+                                    ? RetraceMenuStyle.filterStrokeStrong
+                                    : (isActive ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                                lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            )
                     )
                 }
                 .buttonStyle(.plain)
@@ -5064,7 +5391,12 @@ struct FilterToggleChipCompact: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
+                    .stroke(
+                        isHovered
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isSelected ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                        lineWidth: isHovered ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -5080,6 +5412,7 @@ struct SourceFilterChip: View {
     let isRetrace: Bool
     let isSelected: Bool
     let action: () -> Void
+    @State private var isHovered = false
 
     private var retraceIcon: NSImage {
         // Load Retrace app icon from /Applications
@@ -5126,10 +5459,18 @@ struct SourceFilterChip: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isSelected ? Color.white.opacity(0.2) : Color.white.opacity(0.08), lineWidth: 1)
+                    .stroke(
+                        isHovered
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isSelected ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
+                        lineWidth: isHovered ? 1.2 : 1
+                    )
             )
         }
         .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
     }
 }
 
@@ -5138,65 +5479,145 @@ struct SourceFilterChip: View {
 /// Renders filter dropdowns at the top level of SimpleTimelineView to avoid clipping issues
 /// The dropdowns are positioned absolutely based on the anchor frame from the ViewModel
 /// Using the "timelineContent" coordinate space for proper alignment
+private struct FilterDropdownSizePreferenceKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        value = nextValue()
+    }
+}
+
 struct FilterDropdownOverlay: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    @State private var measuredDropdownSize: CGSize = .zero
 
     var body: some View {
-        Group {
-            if viewModel.activeFilterDropdown != .none {
-                let anchor = viewModel.filterDropdownAnchorFrame
-                #if DEBUG
-                let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor)")
-                #endif
+        GeometryReader { proxy in
+            Group {
+                if viewModel.activeFilterDropdown != .none && viewModel.activeFilterDropdown != .advanced {
+                    let anchor = viewModel.filterDropdownAnchorFrame
+                    let fallbackSize = estimatedDropdownSize(for: viewModel.activeFilterDropdown)
+                    let dropdownSize = resolvedDropdownSize(fallback: fallbackSize)
+                    let origin = dropdownOrigin(containerSize: proxy.size, anchor: anchor, dropdownSize: dropdownSize)
+                    #if DEBUG
+                    let _ = print("[FilterDropdownOverlay] Rendering dropdown=\(viewModel.activeFilterDropdown), anchor=\(anchor), size=\(dropdownSize), origin=\(origin)")
+                    #endif
 
-                ZStack {
-                    // Full-screen dismiss layer (below dropdown)
-                    Color.black.opacity(0.001)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                viewModel.dismissFilterDropdown()
+                    ZStack(alignment: .topLeading) {
+                        // Full-screen dismiss layer (below dropdown)
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    viewModel.dismissFilterDropdown()
+                                }
                             }
-                        }
 
-                    // All dropdowns open downward
-                    VStack(spacing: 0) {
-                        // Top spacer to push content down to anchor.maxY + gap
-                        Spacer()
-                            .frame(height: anchor.maxY + 8)
-
-                        HStack(spacing: 0) {
-                            // Left spacer to push content to anchor.minX
-                            Spacer()
-                                .frame(width: anchor.minX)
-
-                            // The actual dropdown content
-                            // Scroll events are handled at TimelineWindowController level
-                            dropdownContent
-                                .background(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .fill(Color(white: 0.12))
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-                                .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                                )
-                                .fixedSize()
-
-                            Spacer()
-                        }
-
-                        Spacer()
+                        // Scroll events are handled at TimelineWindowController level
+                        dropdownContent
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color(white: 0.12))
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                            .shadow(color: .black.opacity(0.5), radius: 15, y: 8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                            )
+                            .fixedSize()
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear
+                                        .preference(key: FilterDropdownSizePreferenceKey.self, value: geo.size)
+                                }
+                            )
+                            .offset(x: origin.x, y: origin.y)
                     }
+                    .onPreferenceChange(FilterDropdownSizePreferenceKey.self) { size in
+                        guard size.width > 0, size.height > 0 else { return }
+                        measuredDropdownSize = size
+                    }
+                    .transition(.opacity)
+                    .zIndex(2000)
                 }
-                .transition(.opacity)
-                .zIndex(2000)
             }
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.activeFilterDropdown)
+        .animation(.easeOut(duration: 0.15), value: viewModel.isDateRangeCalendarEditing)
+        .onChange(of: viewModel.activeFilterDropdown) { _ in
+            measuredDropdownSize = .zero
+        }
+        .onChange(of: viewModel.isDateRangeCalendarEditing) { _ in
+            if viewModel.activeFilterDropdown == .dateRange {
+                measuredDropdownSize = .zero
+            }
+        }
+    }
+
+    private func resolvedDropdownSize(fallback: CGSize) -> CGSize {
+        if measuredDropdownSize.width > 0, measuredDropdownSize.height > 0 {
+            return measuredDropdownSize
+        }
+        return fallback
+    }
+
+    private func estimatedDropdownSize(for type: SimpleTimelineViewModel.FilterDropdownType) -> CGSize {
+        switch type {
+        case .apps:
+            return CGSize(width: 220, height: 320)
+        case .tags:
+            return CGSize(width: 220, height: 320)
+        case .visibility:
+            return CGSize(width: 240, height: 180)
+        case .dateRange:
+            let height: CGFloat = viewModel.isDateRangeCalendarEditing ? 430 : 250
+            return CGSize(width: 260, height: height)
+        case .advanced, .none:
+            return CGSize(width: 260, height: 200)
+        }
+    }
+
+    private func dropdownOrigin(containerSize: CGSize, anchor: CGRect, dropdownSize: CGSize) -> CGPoint {
+        // Keep the date popover's bottom edge stable while the inline calendar expands/collapses.
+        // This prevents visual jumping when height changes.
+        if viewModel.activeFilterDropdown == .dateRange, viewModel.isDateRangeCalendarEditing {
+            let collapsedHeight: CGFloat = 250
+            let collapsedSize = CGSize(width: dropdownSize.width, height: collapsedHeight)
+            let baseOrigin = defaultDropdownOrigin(containerSize: containerSize, anchor: anchor, dropdownSize: collapsedSize)
+            let baseBottomY = baseOrigin.y + collapsedHeight
+
+            let margin: CGFloat = 8
+            let maxY = max(margin, containerSize.height - dropdownSize.height - margin)
+            let anchoredY = baseBottomY - dropdownSize.height
+            let clampedY = min(max(anchoredY, margin), maxY)
+
+            return CGPoint(x: baseOrigin.x, y: clampedY)
+        }
+
+        return defaultDropdownOrigin(containerSize: containerSize, anchor: anchor, dropdownSize: dropdownSize)
+    }
+
+    private func defaultDropdownOrigin(containerSize: CGSize, anchor: CGRect, dropdownSize: CGSize) -> CGPoint {
+        let margin: CGFloat = 8
+        let gap: CGFloat = 8
+
+        let availableBelow = containerSize.height - anchor.maxY - margin
+        let availableAbove = anchor.minY - margin
+        let openUpward = availableBelow < (dropdownSize.height + gap) && availableAbove > availableBelow
+
+        let rawY = openUpward
+            ? (anchor.minY - gap - dropdownSize.height)
+            : (anchor.maxY + gap)
+        let maxY = max(margin, containerSize.height - dropdownSize.height - margin)
+        let clampedY = min(max(rawY, margin), maxY)
+
+        let rawX = anchor.minX
+        let maxX = max(margin, containerSize.width - dropdownSize.width - margin)
+        let clampedX = min(max(rawX, margin), maxX)
+
+        return CGPoint(x: clampedX, y: clampedY)
     }
 
     @ViewBuilder
@@ -5253,6 +5674,12 @@ struct FilterDropdownOverlay: View {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterDropdown()
                     }
+                },
+                onKeyboardSelect: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
+                    }
                 }
             )
         case .dateRange:
@@ -5265,12 +5692,19 @@ struct FilterDropdownOverlay: View {
                 onClear: {
                     viewModel.setDateRange(start: nil, end: nil)
                 },
+                enableKeyboardNavigation: true,
+                onCalendarEditingChange: { isEditing in
+                    viewModel.isDateRangeCalendarEditing = isEditing
+                },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterDropdown()
                     }
                 }
             )
+        case .advanced:
+            // Advanced filters are inline in the FilterPanel, not a dropdown popover
+            EmptyView()
         case .none:
             EmptyView()
         }

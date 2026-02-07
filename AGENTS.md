@@ -4,7 +4,7 @@
 
 Retrace is a local-first screen recording and search application for macOS, inspired by Rewind AI. It captures screens, extracts text via OCR, and makes everything searchable—all locally on-device.
 
-**v0.5 Status**: Core screen capture (CGWindowListCapture), OCR (Vision), full-text search (FTS5), HEVC encoding, and Rewind import are working. Audio transcription and vector search are planned for future releases.
+**Status**: Core screen capture (CGWindowListCapture), OCR (Vision), full-text search (FTS5), HEVC encoding, and Rewind import are working. Audio transcription and vector search are planned for future releases.
 
 ---
 
@@ -159,9 +159,9 @@ retrace/
 | **DATABASE** | `Database/` | `Database/AGENTS.md` | SQLite schema, FTS5, CRUD operations, migrations |
 | **STORAGE** | `Storage/` | `Storage/AGENTS.md` | File I/O, HEVC video encoding (working, not optimized), encryption |
 | **CAPTURE** | `Capture/` | `Capture/AGENTS.md` | CGWindowListCapture API, frame deduplication, metadata extraction |
-| **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (v0.5: no audio transcription) |
-| **SEARCH** | `Search/` | `Search/AGENTS.md` | Query parsing, FTS5 queries, result ranking (v0.5: no vector search) |
-| **MIGRATION** | `Migration/` | `Migration/AGENTS.md` | Import from Rewind AI (v0.5: Rewind only, others planned) |
+| **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (no audio transcription yet) |
+| **SEARCH** | `Search/` | `Search/AGENTS.md` | Query parsing, FTS5 queries, result ranking (no vector search yet) |
+| **MIGRATION** | `Migration/` | `Migration/AGENTS.md` | Import from Rewind AI (Rewind only, others planned) |
 | **APP** | `App/` | — | Coordinator, DI container, data adapter, lifecycle management |
 | **UI** | `UI/` | `UI/AGENTS.md` | SwiftUI interface (timeline, dashboard, settings, search) |
 
@@ -292,14 +292,14 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 | Component | Technology | Notes |
 |-----------|------------|-------|
 | Language | Swift 5.9+ | Actors, async/await, Sendable required |
-| UI Framework | SwiftUI | Fully implemented in v0.5 |
+| UI Framework | SwiftUI | Fully implemented |
 | Screen Capture | CGWindowListCapture | Legacy API, no privacy indicator |
 | Video Encoding | VideoToolbox (HEVC) | Hardware encoding on Apple Silicon |
 | OCR | Vision framework | macOS native OCR |
 | Database | SQLite + FTS5 | Full-text search built-in |
 | Encryption | CryptoKit (AES-256-GCM) | Optional on-device encryption |
-| Audio Transcription | whisper.cpp | Planned for v0.2+ (bundled but disabled) |
-| Vector Search | llama.cpp | Planned for v0.2+ (prepared but not active) |
+| Audio Transcription | whisper.cpp | Planned (bundled but disabled) |
+| Vector Search | llama.cpp | Planned (prepared but not active) |
 
 ---
 

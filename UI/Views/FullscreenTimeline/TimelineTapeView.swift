@@ -616,7 +616,7 @@ struct RefreshButton: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
-        .instantTooltip("Refresh", isVisible: $isHovering)
+        .instantTooltip("Refresh (⌘J)", isVisible: $isHovering)
     }
 }
 
@@ -692,7 +692,7 @@ struct VideoControlsButton: View {
                 .padding(.horizontal, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
-                        .fill(.ultraThinMaterial)
+                        .fill(RetraceMenuStyle.backgroundColor)
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
@@ -1361,13 +1361,14 @@ struct InstantTooltip: ViewModifier {
                         .padding(.vertical, 6)
                         .background(
                             Capsule()
-                                .fill(Color.black)
+                                .fill(Color(white: 0.11))
                         )
                         .offset(y: -44)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .offset(y: 4)))
                         .allowsHitTesting(false)
                 }
             }
+            .animation(.easeOut(duration: 0.15), value: isVisible)
     }
 }
 

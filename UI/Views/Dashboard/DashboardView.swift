@@ -47,7 +47,7 @@ public struct DashboardView: View {
 
     // MARK: - Properties
 
-    @StateObject private var viewModel: DashboardViewModel
+    @ObservedObject var viewModel: DashboardViewModel
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
     @ObservedObject var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @ObservedObject var milestoneCelebrationManager: MilestoneCelebrationManager
@@ -59,6 +59,7 @@ public struct DashboardView: View {
     @State private var showSessionsSheet = false
     @State private var showSystemMonitor = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
+    @Binding var hasLoadedInitialData: Bool
 
     enum AppUsageViewMode: String, CaseIterable {
         case list = "list"
@@ -89,14 +90,17 @@ public struct DashboardView: View {
     // MARK: - Initialization
 
     public init(
+        viewModel: DashboardViewModel,
         coordinator: AppCoordinator,
         launchOnLoginReminderManager: LaunchOnLoginReminderManager,
-        milestoneCelebrationManager: MilestoneCelebrationManager
+        milestoneCelebrationManager: MilestoneCelebrationManager,
+        hasLoadedInitialData: Binding<Bool> = .constant(false)
     ) {
-        _viewModel = StateObject(wrappedValue: DashboardViewModel(coordinator: coordinator))
+        self.viewModel = viewModel
         _coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
         self.launchOnLoginReminderManager = launchOnLoginReminderManager
         self.milestoneCelebrationManager = milestoneCelebrationManager
+        self._hasLoadedInitialData = hasLoadedInitialData
     }
 
     // MARK: - Body
@@ -219,11 +223,29 @@ public struct DashboardView: View {
             }
             .ignoresSafeArea()
         )
+        .background(
+            Button("") {
+                withAnimation(.easeInOut(duration: 0.5)) {
+                    refreshRotation += 360
+                }
+                Task { await viewModel.loadStatistics() }
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+        )
         .task {
             viewModel.isWindowVisible = true
-            await viewModel.loadStatistics()
+            if !hasLoadedInitialData {
+                hasLoadedInitialData = true
+                Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
+                await viewModel.loadStatistics()
+            } else {
+                Log.debug("[Dashboard] Tab switch - skipping reload", category: .ui)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidBecomeKey)) { _ in
+            Log.debug("[Dashboard] Window became key - refreshing", category: .ui)
             Task { await viewModel.loadStatistics() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .dashboardDidOpen)) { _ in
@@ -503,6 +525,7 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        // .instantTooltip("Refresh  ⌘R", isVisible: $isHoveringRefresh)
         .onHover { hovering in
             isHoveringRefresh = hovering
             if hovering {
@@ -544,6 +567,7 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        // .instantTooltip("Settings  ⌘,", isVisible: $isHoveringSettings)
         .onHover { hovering in
             isHoveringSettings = hovering
             if hovering {
@@ -596,6 +620,7 @@ public struct DashboardView: View {
         .buttonStyle(.plain)
         .animation(.easeInOut(duration: 0.15), value: isHoveringRecordingIndicator)
         .animation(.easeInOut(duration: 0.15), value: viewModel.isRecording)
+        // .instantTooltip("Toggle Recording  ⌘⇧R", isVisible: $isHoveringRecordingIndicator)
         .onHover { hovering in
             isHoveringRecordingIndicator = hovering
             if hovering {
@@ -1315,6 +1340,7 @@ private struct MonitorButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        // .instantTooltip("System Monitor  ⌘⇧M", isVisible: $isHovering)
         .onHover { hovering in
             isHovering = hovering
             if hovering {
@@ -1367,6 +1393,7 @@ struct DashboardView_Previews: PreviewProvider {
         let milestoneManager = MilestoneCelebrationManager(coordinator: coordinator)
 
         DashboardView(
+            viewModel: DashboardViewModel(coordinator: coordinator),
             coordinator: coordinator,
             launchOnLoginReminderManager: launchOnLoginManager,
             milestoneCelebrationManager: milestoneManager

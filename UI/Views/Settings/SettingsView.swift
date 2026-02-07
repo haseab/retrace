@@ -128,6 +128,10 @@ public struct SettingsView: View {
     @State private var isRecordingTimelineShortcut = false
     @State private var isRecordingDashboardShortcut = false
     @State private var isRecordingRecordingShortcut = false
+    @State private var systemMonitorShortcut = SettingsShortcutKey(from: .defaultSystemMonitor)
+    @State private var isRecordingSystemMonitorShortcut = false
+    @State private var feedbackShortcut = SettingsShortcutKey(from: .defaultFeedback)
+    @State private var isRecordingFeedbackShortcut = false
     @State private var shortcutError: String? = nil
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
@@ -447,6 +451,12 @@ public struct SettingsView: View {
             Task { await saveShortcuts() }
         }
         .onChange(of: recordingShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: systemMonitorShortcut) { _ in
+            Task { await saveShortcuts() }
+        }
+        .onChange(of: feedbackShortcut) { _ in
             Task { await saveShortcuts() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
@@ -802,7 +812,7 @@ public struct SettingsView: View {
                     label: "Open Timeline",
                     shortcut: $timelineShortcut,
                     isRecording: $isRecordingTimelineShortcut,
-                    otherShortcuts: [dashboardShortcut, recordingShortcut]
+                    otherShortcuts: [dashboardShortcut, recordingShortcut, systemMonitorShortcut, feedbackShortcut]
                 )
 
                 Divider()
@@ -812,7 +822,7 @@ public struct SettingsView: View {
                     label: "Open Dashboard",
                     shortcut: $dashboardShortcut,
                     isRecording: $isRecordingDashboardShortcut,
-                    otherShortcuts: [timelineShortcut, recordingShortcut]
+                    otherShortcuts: [timelineShortcut, recordingShortcut, systemMonitorShortcut, feedbackShortcut]
                 )
 
                 Divider()
@@ -822,7 +832,27 @@ public struct SettingsView: View {
                     label: "Toggle Recording",
                     shortcut: $recordingShortcut,
                     isRecording: $isRecordingRecordingShortcut,
-                    otherShortcuts: [timelineShortcut, dashboardShortcut]
+                    otherShortcuts: [timelineShortcut, dashboardShortcut, systemMonitorShortcut, feedbackShortcut]
+                )
+
+                Divider()
+                    .background(Color.retraceBorder)
+
+                settingsShortcutRecorderRow(
+                    label: "System Monitor",
+                    shortcut: $systemMonitorShortcut,
+                    isRecording: $isRecordingSystemMonitorShortcut,
+                    otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, feedbackShortcut]
+                )
+
+                Divider()
+                    .background(Color.retraceBorder)
+
+                settingsShortcutRecorderRow(
+                    label: "Report an Issue",
+                    shortcut: $feedbackShortcut,
+                    isRecording: $isRecordingFeedbackShortcut,
+                    otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, systemMonitorShortcut]
                 )
 
                 if let error = shortcutError {
@@ -841,10 +871,12 @@ public struct SettingsView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             // Cancel recording if user clicks outside
-            if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut {
+            if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut || isRecordingSystemMonitorShortcut || isRecordingFeedbackShortcut {
                 isRecordingTimelineShortcut = false
                 isRecordingDashboardShortcut = false
                 isRecordingRecordingShortcut = false
+                isRecordingSystemMonitorShortcut = false
+                isRecordingFeedbackShortcut = false
                 recordingTimeoutTask?.cancel()
             }
         }
@@ -1147,6 +1179,8 @@ public struct SettingsView: View {
                 isRecordingTimelineShortcut = false
                 isRecordingDashboardShortcut = false
                 isRecordingRecordingShortcut = false
+                isRecordingSystemMonitorShortcut = false
+                isRecordingFeedbackShortcut = false
                 shortcutError = nil
                 recordingTimeoutTask?.cancel()
 
@@ -1250,6 +1284,8 @@ public struct SettingsView: View {
     private static let timelineShortcutKey = "timelineShortcutConfig"
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
     private static let recordingShortcutKey = "recordingShortcutConfig"
+    private static let systemMonitorShortcutKey = "systemMonitorShortcutConfig"
+    private static let feedbackShortcutKey = "feedbackShortcutConfig"
 
     private func loadSavedShortcuts() async {
         // Load directly from UserDefaults (same as OnboardingManager)
@@ -1265,6 +1301,14 @@ public struct SettingsView: View {
            let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
             recordingShortcut = SettingsShortcutKey(from: config)
         }
+        if let data = settingsStore.data(forKey: Self.systemMonitorShortcutKey),
+           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
+            systemMonitorShortcut = SettingsShortcutKey(from: config)
+        }
+        if let data = settingsStore.data(forKey: Self.feedbackShortcutKey),
+           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
+            feedbackShortcut = SettingsShortcutKey(from: config)
+        }
     }
 
     private func saveShortcuts() async {
@@ -1276,6 +1320,12 @@ public struct SettingsView: View {
         }
         if let data = try? JSONEncoder().encode(recordingShortcut.toConfig) {
             settingsStore.set(data, forKey: Self.recordingShortcutKey)
+        }
+        if let data = try? JSONEncoder().encode(systemMonitorShortcut.toConfig) {
+            settingsStore.set(data, forKey: Self.systemMonitorShortcutKey)
+        }
+        if let data = try? JSONEncoder().encode(feedbackShortcut.toConfig) {
+            settingsStore.set(data, forKey: Self.feedbackShortcutKey)
         }
         settingsStore.synchronize()
         MenuBarManager.shared?.reloadShortcuts()
@@ -5643,6 +5693,8 @@ extension SettingsView {
         timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
         dashboardShortcut = SettingsShortcutKey(from: .defaultDashboard)
         recordingShortcut = SettingsShortcutKey(from: .defaultRecording)
+        systemMonitorShortcut = SettingsShortcutKey(from: .defaultSystemMonitor)
+        feedbackShortcut = SettingsShortcutKey(from: .defaultFeedback)
         Task { await saveShortcuts() }
 
         // Startup

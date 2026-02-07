@@ -1,6 +1,7 @@
 import SwiftUI
 import Shared
 import App
+import AppKit
 
 private let searchLog = "[SpotlightSearch]"
 
@@ -38,6 +39,10 @@ public struct SpotlightSearchOverlay: View {
     @State private var resultsHeight: CGFloat = 0
     @State private var isExpanded = false  // Whether to show filters and results (expanded view)
     @State private var refocusSearchField: UUID = UUID()  // Trigger to refocus search field
+    @State private var keyboardSelectedResultIndex: Int?
+    @State private var isResultKeyboardNavigationActive = false
+    @State private var shouldFocusFirstResultAfterSubmit = false
+    @State private var keyEventMonitor: Any?
 
     private let panelWidth: CGFloat = 900
     private let collapsedWidth: CGFloat = 400
@@ -154,6 +159,11 @@ public struct SpotlightSearchOverlay: View {
                     isExpanded = true
                 }
             }
+            installKeyEventMonitor()
+        }
+        .onDisappear {
+            removeKeyEventMonitor()
+            clearResultKeyboardNavigation()
         }
         .onExitCommand {
             Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen), searchQuery='\(viewModel.searchQuery)'", category: .ui)
@@ -167,6 +177,9 @@ public struct SpotlightSearchOverlay: View {
         }
         .onChange(of: viewModel.searchQuery) { newValue in
             Log.debug("\(searchLog) Query changed to: '\(newValue)'", category: .ui)
+            if newValue != viewModel.committedSearchQuery {
+                clearResultKeyboardNavigation()
+            }
         }
         .onChange(of: viewModel.isSearching) { isSearching in
             Log.debug("\(searchLog) isSearching: \(isSearching)", category: .ui)
@@ -175,12 +188,24 @@ public struct SpotlightSearchOverlay: View {
                 if let results = viewModel.results {
                     Log.info("\(searchLog) Results received: \(results.results.count) results, totalCount=\(results.totalCount), searchTime=\(results.searchTimeMs)ms", category: .ui)
                 }
+                if shouldFocusFirstResultAfterSubmit {
+                    focusFirstResultIfAvailable()
+                }
             }
+        }
+        .onChange(of: viewModel.results?.results.count ?? 0) { _ in
+            syncKeyboardSelectionWithCurrentResults()
         }
         .onChange(of: viewModel.openFilterSignal.id) { _ in
             // When Tab cycles back to search field (index 0), trigger refocus
             if viewModel.openFilterSignal.index == 0 {
                 Log.debug("\(searchLog) Tab navigation returned to search field, triggering refocus", category: .ui)
+                refocusSearchField = UUID()
+            }
+        }
+        .onChange(of: viewModel.isDropdownOpen) { isOpen in
+            // When a dropdown closes (Escape or Enter selection), refocus the search field
+            if !isOpen {
                 refocusSearchField = UUID()
             }
         }
@@ -202,6 +227,7 @@ public struct SpotlightSearchOverlay: View {
                         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                             isExpanded = true
                         }
+                        prepareResultKeyboardNavigationAfterSubmit()
                         viewModel.submitSearch()
                     }
                 },
@@ -223,6 +249,7 @@ public struct SpotlightSearchOverlay: View {
                     viewModel.openFilterSignal = (1, UUID())
                 },
                 onFocus: {
+                    clearResultKeyboardNavigation()
                     // Close any open dropdowns when search field gains focus
                     if viewModel.isDropdownOpen {
                         viewModel.closeDropdownsSignal += 1
@@ -247,12 +274,23 @@ public struct SpotlightSearchOverlay: View {
             }) {
                 ZStack {
                     Circle()
-                        .fill(isExpanded ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
+                        .fill(isExpanded || viewModel.hasActiveFilters ? Color.white.opacity(0.2) : Color.white.opacity(0.1))
                     Image(systemName: "line.3.horizontal.decrease")
                         .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(isExpanded ? .white : .white.opacity(0.6))
+                        .foregroundColor(isExpanded || viewModel.hasActiveFilters ? .white : .white.opacity(0.6))
                 }
                 .frame(width: 24, height: 24)
+                .overlay(alignment: .topTrailing) {
+                    if viewModel.activeFilterCount > 0 {
+                        Text("\(viewModel.activeFilterCount)")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 14, height: 14)
+                            .background(Color.red)
+                            .clipShape(Circle())
+                            .offset(x: 4, y: -4)
+                    }
+                }
             }
             .buttonStyle(.plain)
 
@@ -342,13 +380,17 @@ public struct SpotlightSearchOverlay: View {
                             thumbnailKey: thumbnailKey(for: result),
                             thumbnailSize: thumbnailSize,
                             index: index,
+                            isKeyboardSelected: isResultKeyboardNavigationActive && keyboardSelectedResultIndex == index,
                             onSelect: {
                                 // Save scroll position before selecting result
                                 viewModel.savedScrollPosition = CGFloat(index)
+                                keyboardSelectedResultIndex = index
+                                isResultKeyboardNavigationActive = true
                                 selectResult(result)
                             },
                             viewModel: viewModel
                         )
+                        .id(index)
                         .onAppear {
                             Log.debug("\(searchLog) Result card appeared: index=\(index), frameID=\(result.frameID.stringValue), generation=\(viewModel.searchGeneration)", category: .ui)
                             loadThumbnail(for: result)
@@ -391,6 +433,12 @@ public struct SpotlightSearchOverlay: View {
                             proxy.scrollTo(targetIndex, anchor: .center)
                         }
                     }
+                }
+            }
+            .onChange(of: keyboardSelectedResultIndex) { selectedIndex in
+                guard let selectedIndex else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo(selectedIndex)
                 }
             }
         }
@@ -787,6 +835,7 @@ public struct SpotlightSearchOverlay: View {
 
         // Cancel any in-flight search tasks to prevent blocking
         viewModel.cancelSearch()
+        clearResultKeyboardNavigation()
 
         // Clear search query and filters when dismissing
         viewModel.searchQuery = ""
@@ -800,6 +849,120 @@ public struct SpotlightSearchOverlay: View {
             onDismiss()
         }
     }
+
+    // MARK: - Keyboard Navigation
+
+    private var keyboardNavigableResults: [SearchResult] {
+        guard let results = viewModel.results else { return [] }
+        return filterURLOnlyResults(results.results)
+    }
+
+    private func prepareResultKeyboardNavigationAfterSubmit() {
+        shouldFocusFirstResultAfterSubmit = true
+        isResultKeyboardNavigationActive = true
+        keyboardSelectedResultIndex = nil
+        resignSearchFieldFocus()
+    }
+
+    private func focusFirstResultIfAvailable() {
+        let results = keyboardNavigableResults
+        shouldFocusFirstResultAfterSubmit = false
+
+        guard !results.isEmpty else {
+            clearResultKeyboardNavigation()
+            return
+        }
+
+        isResultKeyboardNavigationActive = true
+        keyboardSelectedResultIndex = 0
+        resignSearchFieldFocus()
+    }
+
+    private func syncKeyboardSelectionWithCurrentResults() {
+        let results = keyboardNavigableResults
+
+        if shouldFocusFirstResultAfterSubmit {
+            focusFirstResultIfAvailable()
+            return
+        }
+
+        guard isResultKeyboardNavigationActive else { return }
+        guard !results.isEmpty else {
+            clearResultKeyboardNavigation()
+            return
+        }
+
+        if let index = keyboardSelectedResultIndex {
+            keyboardSelectedResultIndex = min(index, results.count - 1)
+        } else {
+            keyboardSelectedResultIndex = 0
+        }
+    }
+
+    private func clearResultKeyboardNavigation() {
+        shouldFocusFirstResultAfterSubmit = false
+        isResultKeyboardNavigationActive = false
+        keyboardSelectedResultIndex = nil
+    }
+
+    private func resignSearchFieldFocus() {
+        DispatchQueue.main.async {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        }
+    }
+
+    private func installKeyEventMonitor() {
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard isResultKeyboardNavigationActive,
+                  !viewModel.isDropdownOpen,
+                  !viewModel.isDatePopoverHandlingKeys else {
+                return event
+            }
+
+            let results = keyboardNavigableResults
+            guard !results.isEmpty else {
+                return event
+            }
+
+            switch event.keyCode {
+            case 123: // left
+                moveSelection(in: results, offset: -1)
+                return nil
+            case 124: // right
+                moveSelection(in: results, offset: 1)
+                return nil
+            case 125: // down
+                moveSelection(in: results, offset: gridColumns.count)
+                return nil
+            case 126: // up
+                moveSelection(in: results, offset: -gridColumns.count)
+                return nil
+            case 36, 76: // return / enter
+                let selectedIndex = min(keyboardSelectedResultIndex ?? 0, results.count - 1)
+                keyboardSelectedResultIndex = selectedIndex
+                viewModel.savedScrollPosition = CGFloat(selectedIndex)
+                selectResult(results[selectedIndex])
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeKeyEventMonitor() {
+        if let monitor = keyEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyEventMonitor = nil
+        }
+    }
+
+    private func moveSelection(in results: [SearchResult], offset: Int) {
+        guard !results.isEmpty else { return }
+        let currentIndex = keyboardSelectedResultIndex ?? 0
+        let nextIndex = max(0, min(results.count - 1, currentIndex + offset))
+        keyboardSelectedResultIndex = nextIndex
+    }
 }
 
 // MARK: - Gallery Result Card
@@ -809,6 +972,7 @@ private struct GalleryResultCard: View {
     let thumbnailKey: String
     let thumbnailSize: CGSize
     let index: Int
+    let isKeyboardSelected: Bool
     let onSelect: () -> Void
     @ObservedObject var viewModel: SearchViewModel
 
@@ -898,6 +1062,11 @@ private struct GalleryResultCard: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
                     .stroke(isHovered ? Color.white.opacity(0.3) : Color.white.opacity(0.1), lineWidth: isHovered ? 2 : 1)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.retraceAccent, lineWidth: 2)
+                    .opacity(isKeyboardSelected ? 1 : 0)
             )
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .shadow(color: .black.opacity(isHovered ? 0.4 : 0.2), radius: isHovered ? 8 : 4, x: 0, y: 2)
@@ -1041,6 +1210,12 @@ struct SpotlightSearchField: NSViewRepresentable {
         // Ensure field editor exists for caret to appear
         if window.fieldEditor(false, for: textField) == nil {
             _ = window.fieldEditor(true, for: textField)
+        }
+
+        // Move caret to end of text instead of selecting all
+        if let fieldEditor = window.fieldEditor(false, for: textField) as? NSTextView {
+            let endPosition = fieldEditor.string.count
+            fieldEditor.setSelectedRange(NSRange(location: endPosition, length: 0))
         }
 
         // If the window isn't key yet (activation is async on external monitors),

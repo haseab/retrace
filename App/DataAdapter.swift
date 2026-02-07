@@ -2424,7 +2424,7 @@ public actor DataAdapter {
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let relevanceLimit = 50
 
-        Log.info("[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? [])", category: .app)
+        Log.info("[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? []), windowNameFilter=\(query.filters.windowNameFilter ?? "nil"), browserUrlFilter=\(query.filters.browserUrlFilter ?? "nil")", category: .app)
 
         // Build WHERE conditions for the outer query (filters applied after FTS subquery)
         var outerWhereConditions: [String] = []
@@ -2456,6 +2456,20 @@ public actor DataAdapter {
             let appPlaceholders = excludedAppBundleIDs.map { _ in "?" }.joined(separator: ", ")
             outerWhereConditions.append("s.bundleID NOT IN (\(appPlaceholders))")
             outerBindValues.append(contentsOf: excludedAppBundleIDs)
+        }
+
+        // Window name filter (partial match)
+        if let windowNameFilter = query.filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            outerWhereConditions.append("s.windowName LIKE ?")
+            outerBindValues.append("%\(windowNameFilter)%")
+        }
+
+        // Browser URL filter (partial match)
+        if let browserUrlFilter = query.filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            outerWhereConditions.append("s.browserUrl LIKE ?")
+            outerBindValues.append("%\(browserUrlFilter)%")
         }
 
         // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
@@ -2528,6 +2542,7 @@ public actor DataAdapter {
                 s.id as segment_id,
                 s.bundleID as app_bundle_id,
                 s.windowName as window_title,
+                s.browserUrl as browser_url,
                 f.videoId as video_id,
                 f.videoFrameIndex as frame_index,
                 fts.rank
@@ -2596,9 +2611,10 @@ public actor DataAdapter {
             let segmentId = sqlite3_column_int64(statement, 3)
             let appBundleID = sqlite3_column_text(statement, 4).map { String(cString: $0) }
             let windowName = sqlite3_column_text(statement, 5).map { String(cString: $0) }
-            let videoId = sqlite3_column_int64(statement, 6)
-            let frameIndex = Int(sqlite3_column_int(statement, 7))
-            let rank = sqlite3_column_double(statement, 8)
+            let browserUrl = sqlite3_column_text(statement, 6).map { String(cString: $0) }
+            let videoId = sqlite3_column_int64(statement, 7)
+            let frameIndex = Int(sqlite3_column_int(statement, 8))
+            let rank = sqlite3_column_double(statement, 9)
 
             let appName = appBundleID?.components(separatedBy: ".").last
             let timestamp = config.parseDate(from: statement, column: 2) ?? Date()
@@ -2613,7 +2629,7 @@ public actor DataAdapter {
                     appBundleID: appBundleID,
                     appName: appName,
                     windowName: windowName,
-                    browserURL: nil,
+                    browserURL: browserUrl,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: segmentId),
@@ -2685,6 +2701,20 @@ public actor DataAdapter {
             }
         }
 
+        // Window name filter (partial match)
+        if let windowNameFilter = query.filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !windowNameFilter.isEmpty {
+            whereConditions.append("s.windowName LIKE ?")
+            bindValues.append("%\(windowNameFilter)%")
+        }
+
+        // Browser URL filter (partial match)
+        if let browserUrlFilter = query.filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !browserUrlFilter.isEmpty {
+            whereConditions.append("s.browserUrl LIKE ?")
+            bindValues.append("%\(browserUrlFilter)%")
+        }
+
         // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
         // When no tags selected, tagJoin is empty and no join happens
         let hasTagIncludeFilter = query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
@@ -2746,6 +2776,9 @@ public actor DataAdapter {
         let hasTagFilters = hasTagIncludeFilter ||
             (query.filters.excludedTagIds != nil && !query.filters.excludedTagIds!.isEmpty) ||
             query.filters.hiddenFilter != .showAll
+        let hasMetadataFilters =
+            (query.filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ||
+            (query.filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
 
         let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
 
@@ -2756,7 +2789,7 @@ public actor DataAdapter {
         let sortOrderClause = query.sortOrder == .newestFirst ? "DESC" : "ASC"
 
         let sql: String
-        if hasAppFilter || hasTagFilters {
+        if hasAppFilter || hasTagFilters || hasMetadataFilters {
             // With app/tag filter: CTE MATERIALIZED for FTS first, then join all tables and filter
             sql = """
                 WITH fts_matches AS MATERIALIZED (
@@ -2863,6 +2896,7 @@ public actor DataAdapter {
             let segmentMeta = segmentMetadata[frame.segmentId]
             let appBundleID = segmentMeta?.bundleID
             let windowName = segmentMeta?.windowName
+            let browserUrl = segmentMeta?.browserUrl
             let appName = appBundleID?.components(separatedBy: ".").last
 
             let result = SearchResult(
@@ -2875,7 +2909,7 @@ public actor DataAdapter {
                     appBundleID: appBundleID,
                     appName: appName,
                     windowName: windowName,
-                    browserURL: nil,
+                    browserURL: browserUrl,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: frame.segmentId),
@@ -2893,11 +2927,11 @@ public actor DataAdapter {
         return SearchResults(query: query, results: results, totalCount: totalCount, searchTimeMs: elapsed)
     }
 
-    private func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?)] {
+    private func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] {
         guard !segmentIds.isEmpty else { return [:] }
 
         let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")
-        let sql = "SELECT id, bundleID, windowName FROM segment WHERE id IN (\(placeholders))"
+        let sql = "SELECT id, bundleID, windowName, browserUrl FROM segment WHERE id IN (\(placeholders))"
 
         guard let statement = try? connection.prepare(sql: sql) else { return [:] }
         defer { connection.finalize(statement) }
@@ -2906,13 +2940,14 @@ public actor DataAdapter {
             sqlite3_bind_int64(statement, Int32(index + 1), segmentId)
         }
 
-        var metadata: [Int64: (bundleID: String?, windowName: String?)] = [:]
+        var metadata: [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] = [:]
 
         while sqlite3_step(statement) == SQLITE_ROW {
             let id = sqlite3_column_int64(statement, 0)
             let bundleID = sqlite3_column_text(statement, 1).map { String(cString: $0) }
             let windowName = sqlite3_column_text(statement, 2).map { String(cString: $0) }
-            metadata[id] = (bundleID: bundleID, windowName: windowName)
+            let browserUrl = sqlite3_column_text(statement, 3).map { String(cString: $0) }
+            metadata[id] = (bundleID: bundleID, windowName: windowName, browserUrl: browserUrl)
         }
 
         return metadata

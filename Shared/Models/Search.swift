@@ -49,6 +49,8 @@ public struct SearchFilters: Codable, Sendable {
     public let selectedTagIds: [Int64]?  // nil means all tags
     public let excludedTagIds: [Int64]?  // Tags to exclude
     public let hiddenFilter: HiddenFilter  // How to handle hidden segments
+    public let windowNameFilter: String?  // Partial match on segment.windowName
+    public let browserUrlFilter: String?  // Partial match on segment.browserUrl
 
     public init(
         startDate: Date? = nil,
@@ -57,7 +59,9 @@ public struct SearchFilters: Codable, Sendable {
         excludedAppBundleIDs: [String]? = nil,
         selectedTagIds: [Int64]? = nil,
         excludedTagIds: [Int64]? = nil,
-        hiddenFilter: HiddenFilter = .hide
+        hiddenFilter: HiddenFilter = .hide,
+        windowNameFilter: String? = nil,
+        browserUrlFilter: String? = nil
     ) {
         self.startDate = startDate
         self.endDate = endDate
@@ -66,6 +70,8 @@ public struct SearchFilters: Codable, Sendable {
         self.selectedTagIds = selectedTagIds
         self.excludedTagIds = excludedTagIds
         self.hiddenFilter = hiddenFilter
+        self.windowNameFilter = windowNameFilter
+        self.browserUrlFilter = browserUrlFilter
     }
 
     public static let none = SearchFilters()
@@ -74,7 +80,9 @@ public struct SearchFilters: Codable, Sendable {
         startDate != nil || endDate != nil ||
         appBundleIDs != nil || excludedAppBundleIDs != nil ||
         selectedTagIds != nil || excludedTagIds != nil ||
-        hiddenFilter != .hide
+        hiddenFilter != .hide ||
+        (windowNameFilter?.isEmpty == false) ||
+        (browserUrlFilter?.isEmpty == false)
     }
 }
 
@@ -245,4 +253,3 @@ public struct GroupedSearchResults: Codable, Sendable {
 
     public var isEmpty: Bool { daySections.isEmpty }
 }
-

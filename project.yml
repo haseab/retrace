@@ -50,7 +50,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app
         INFOPLIST_FILE: UI/Info.plist
-        MARKETING_VERSION: "0.5.1"
+        MARKETING_VERSION: "0.6.0"
         CURRENT_PROJECT_VERSION: "4"
         CODE_SIGN_ENTITLEMENTS: UI/Retrace.entitlements
         CODE_SIGN_STYLE: Manual
