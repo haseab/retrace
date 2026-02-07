@@ -15,7 +15,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
 
     /// Scale factor for downscaling images before OCR (0.9 = 90% of original size)
     /// Lower values = less energy, slightly lower precision on bounding boxes
-    private static let ocrScaleFactor: CGFloat = 0.9
+    private static let ocrScaleFactor: CGFloat = 1.0
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
         self.textRequest = VNRecognizeTextRequest()
