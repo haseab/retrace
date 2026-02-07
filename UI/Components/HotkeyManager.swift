@@ -193,12 +193,10 @@ public class HotkeyManager: NSObject {
 
         // Check if this matches any registered hotkey using character-based comparison
         let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
-        Log.info("[HotkeyManager] Key pressed: keyCode=\(keyCode) pressedKey='\(pressedKey)' eventModifiers=\(modifierDescription(eventModifiers))", category: .ui)
         for hotkey in hotkeys {
             // Compare characters case-insensitively for letter keys
             let keysMatch = pressedKey.lowercased() == hotkey.key.lowercased()
             let modifiersMatch = eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers)
-            Log.info("[HotkeyManager] Comparing: pressedKey='\(pressedKey)' vs hotkeyKey='\(hotkey.key)' keysMatch=\(keysMatch) | eventMods=\(modifierDescription(eventModifiers)) vs hotkeyMods=\(modifierDescription(hotkey.modifiers)) modifiersMatch=\(modifiersMatch)", category: .ui)
 
             if keysMatch && modifiersMatch {
                 // Execute callback on main thread

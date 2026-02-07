@@ -306,6 +306,10 @@ public struct SettingsView: View {
 
     // MARK: - Settings Search
 
+    // NOTE: When adding a new settings card, you must also:
+    // 1. Add a SettingsSearchEntry below with searchable keywords
+    // 2. Extract the card as a @ViewBuilder property (see "Cards extracted for search" sections)
+    // 3. Add a case in cardView(for:) to map the entry ID to the card view
     private static let searchIndex: [SettingsSearchEntry] = [
         // General
         SettingsSearchEntry(id: "general.shortcuts", tab: .general, cardTitle: "Keyboard Shortcuts", cardIcon: "command",
@@ -3068,6 +3072,7 @@ public struct SettingsView: View {
 
     // MARK: - Settings Search Card Resolution
 
+    // NOTE: Add a case here when creating a new settings card (must match the id from searchIndex)
     @ViewBuilder
     private func cardView(for entry: SettingsSearchEntry) -> some View {
         switch entry.id {
