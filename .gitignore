@@ -53,7 +53,7 @@ temp/
 
 # Downloaded AI models (runtime downloads)
 # Models are downloaded on first launch, not bundled in repo
-models/
+/models/
 *.bin
 *.gguf
 
