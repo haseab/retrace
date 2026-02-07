@@ -1643,7 +1643,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         .onAppear {
             // Always capture fresh snapshot when appearing - don't reuse stale snapshots
             // from previous zoom sessions that may have persisted in @State
-            frozenZoomSnapshot = viewModel.currentImage
+            frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage
 
             // Start at 0 when appearing during enter transition
             if isTransitioning {
@@ -1658,7 +1658,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         }
         .onChange(of: isTransitioning) { newValue in
             if newValue {
-                frozenZoomSnapshot = viewModel.currentImage
+                frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage
                 startLocalTransitionAnimation()
             }
         }
@@ -1874,7 +1874,7 @@ struct ZoomActionMenu: View {
     }
 
     private func getZoomedImage(completion: @escaping (NSImage?) -> Void) {
-        guard let fullImage = viewModel.currentImage else {
+        guard let fullImage = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage else {
             completion(nil)
             return
         }
