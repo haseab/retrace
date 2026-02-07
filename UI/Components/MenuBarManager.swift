@@ -393,9 +393,19 @@ public class MenuBarManager: ObservableObject {
         let containerWidth: CGFloat = 235
         let containerView = NSView(frame: NSRect(x: 0, y: 0, width: containerWidth, height: 30))
 
+        // Icon
+        let iconSize: CGFloat = 16
+        let iconView = NSImageView(frame: NSRect(x: 17, y: 7, width: iconSize, height: iconSize))
+        if let iconImage = NSImage(systemSymbolName: "record.circle", accessibilityDescription: nil) {
+            let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+            iconView.image = iconImage.withSymbolConfiguration(config)
+            iconView.contentTintColor = .secondaryLabelColor
+        }
+        containerView.addSubview(iconView)
+
         // Label
         let label = NSTextField(labelWithString: "Recording")
-        label.frame = NSRect(x: 14, y: 5, width: 100, height: 20)
+        label.frame = NSRect(x: 40, y: 5, width: 100, height: 20)
         label.font = NSFont.systemFont(ofSize: 13)
         label.textColor = .labelColor
         containerView.addSubview(label)
@@ -532,6 +542,7 @@ public class MenuBarManager: ObservableObject {
             keyEquivalent: timelineShortcut.menuKeyEquivalent
         )
         timelineItem.keyEquivalentModifierMask = timelineShortcut.modifiers.nsModifiers
+        timelineItem.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
         menu.addItem(timelineItem)
 
         // Open Dashboard
@@ -541,6 +552,7 @@ public class MenuBarManager: ObservableObject {
             keyEquivalent: dashboardShortcut.menuKeyEquivalent
         )
         dashboardItem.keyEquivalentModifierMask = dashboardShortcut.modifiers.nsModifiers
+        dashboardItem.image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: nil)
         menu.addItem(dashboardItem)
 
         // System Monitor
@@ -569,6 +581,7 @@ public class MenuBarManager: ObservableObject {
             keyEquivalent: ","
         )
         settingsItem.keyEquivalentModifierMask = .command
+        settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         menu.addItem(settingsItem)
 
         // Report an Issue / Get Help
@@ -577,6 +590,7 @@ public class MenuBarManager: ObservableObject {
             action: #selector(openFeedback),
             keyEquivalent: ""
         )
+        feedbackItem.image = NSImage(systemSymbolName: "exclamationmark.bubble", accessibilityDescription: nil)
         menu.addItem(feedbackItem)
 
         menu.addItem(NSMenuItem.separator())
