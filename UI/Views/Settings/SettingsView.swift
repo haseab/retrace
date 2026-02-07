@@ -2,6 +2,7 @@ import SwiftUI
 import Shared
 import AppKit
 import App
+import Carbon.HIToolbox
 import ScreenCaptureKit
 import SQLCipher
 import ServiceManagement
@@ -5433,6 +5434,7 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
 
             let keyName = mapKeyCodeToString(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers)
             let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            Log.info("[ShortcutCapture] keyCode=\(event.keyCode) charactersIgnoringModifiers='\(event.charactersIgnoringModifiers ?? "nil")' resolvedKey='\(keyName)' modifiers=\(modifiers.rawValue)", category: .ui)
 
             // Escape key cancels recording
             if event.keyCode == 53 {
@@ -5474,6 +5476,7 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
 
         private func mapKeyCodeToString(keyCode: UInt16, characters: String?) -> String {
             switch keyCode {
+            // Special keys
             case 49: return "Space"
             case 36: return "Return"
             case 53: return "Escape"
@@ -5494,8 +5497,33 @@ struct SettingsShortcutCaptureField: NSViewRepresentable {
             case 25: return "9"
             case 29: return "0"
             default:
-                if let chars = characters, !chars.isEmpty {
-                    return chars.uppercased()
+                // Use UCKeyTranslate to get the keyboard-layout-aware base character
+                // without any modifier influence. NSEvent.charactersIgnoringModifiers
+                // still applies Option key (e.g., Option+D = "∂"), and CGEvent created
+                // with CGEvent(keyboardEventSource:) picks up physically-held modifiers.
+                // UCKeyTranslate with modifierKeyState=0 gives us the true base character.
+                if let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+                   let layoutDataPtr = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData) {
+                    let layoutData = unsafeBitCast(layoutDataPtr, to: CFData.self)
+                    let keyboardLayout = unsafeBitCast(CFDataGetBytePtr(layoutData), to: UnsafePointer<UCKeyboardLayout>.self)
+                    var deadKeyState: UInt32 = 0
+                    var length: Int = 0
+                    var chars = [UniChar](repeating: 0, count: 4)
+                    let status = UCKeyTranslate(
+                        keyboardLayout,
+                        keyCode,
+                        UInt16(kUCKeyActionDown),
+                        0, // No modifiers
+                        UInt32(LMGetKbdType()),
+                        UInt32(kUCKeyTranslateNoDeadKeysMask),
+                        &deadKeyState,
+                        4,
+                        &length,
+                        &chars
+                    )
+                    if status == noErr, length > 0 {
+                        return String(utf16CodeUnits: chars, count: length).uppercased()
+                    }
                 }
                 return "Key\(keyCode)"
             }

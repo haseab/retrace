@@ -193,10 +193,12 @@ public class HotkeyManager: NSObject {
 
         // Check if this matches any registered hotkey using character-based comparison
         let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
+        Log.info("[HotkeyManager] Key pressed: keyCode=\(keyCode) pressedKey='\(pressedKey)' eventModifiers=\(modifierDescription(eventModifiers))", category: .ui)
         for hotkey in hotkeys {
             // Compare characters case-insensitively for letter keys
             let keysMatch = pressedKey.lowercased() == hotkey.key.lowercased()
             let modifiersMatch = eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers)
+            Log.info("[HotkeyManager] Comparing: pressedKey='\(pressedKey)' vs hotkeyKey='\(hotkey.key)' keysMatch=\(keysMatch) | eventMods=\(modifierDescription(eventModifiers)) vs hotkeyMods=\(modifierDescription(hotkey.modifiers)) modifiersMatch=\(modifiersMatch)", category: .ui)
 
             if keysMatch && modifiersMatch {
                 // Execute callback on main thread
@@ -249,21 +251,37 @@ public class HotkeyManager: NSObject {
             break
         }
 
-        // For regular keys, get the character from the event using keyboard layout
-        // This respects DVORAK, Colemak, and other keyboard layouts
-        var length: Int = 0
-        var chars = [UniChar](repeating: 0, count: 4)
-
-        // Get the keyboard layout-aware character
-        // We use the event's Unicode string which respects the current input source
-        event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &chars)
-
-        if length > 0 {
-            let character = String(utf16CodeUnits: chars, count: length)
-            return character.uppercased()
+        // Use UCKeyTranslate to get the keyboard-layout-aware base character
+        // without any modifier influence. CGEvent.keyboardGetUnicodeString returns
+        // the already-computed character with modifiers applied (e.g., Option+D = "∂"),
+        // and setting event.flags doesn't change the cached Unicode string.
+        // UCKeyTranslate with modifierKeyState=0 gives us the true base character,
+        // respecting Dvorak/Colemak/etc. layouts.
+        if let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           let layoutDataPtr = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData) {
+            let layoutData = unsafeBitCast(layoutDataPtr, to: CFData.self)
+            let keyboardLayout = unsafeBitCast(CFDataGetBytePtr(layoutData), to: UnsafePointer<UCKeyboardLayout>.self)
+            var deadKeyState: UInt32 = 0
+            var length: Int = 0
+            var chars = [UniChar](repeating: 0, count: 4)
+            let status = UCKeyTranslate(
+                keyboardLayout,
+                keyCode,
+                UInt16(kUCKeyActionDown),
+                0, // No modifiers
+                UInt32(LMGetKbdType()),
+                UInt32(kUCKeyTranslateNoDeadKeysMask),
+                &deadKeyState,
+                4,
+                &length,
+                &chars
+            )
+            if status == noErr, length > 0 {
+                return String(utf16CodeUnits: chars, count: length).uppercased()
+            }
         }
 
-        // Fallback: use positional key code mapping (shouldn't normally reach here)
+        // Fallback: use positional key code mapping
         return stringForKeyCode(keyCode)
     }
 
