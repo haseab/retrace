@@ -47,10 +47,18 @@ final class DatabaseManagerTests: XCTestCase {
     // └─────────────────────────────────────────────────────────────────────────┘
 
     func testActualDatabaseMigration() async throws {
-        let dbPath = AppPaths.databasePath
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDatabaseMigrationTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+
+        let dbPath = testRoot.appendingPathComponent("retrace.db").path
         let db = DatabaseManager(databasePath: dbPath)
 
         try await db.initialize()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dbPath))
         print("✅ Database migration completed successfully at: \(dbPath)")
         try await db.close()
     }
