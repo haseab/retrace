@@ -2832,6 +2832,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             exitLiveMode()
         }
 
+        // Clear any active filters so the target frame is guaranteed to be found
+        if filterCriteria.hasActiveFilters {
+            Log.info("[SearchNavigation] Clearing active filters before navigating to search result", category: .ui)
+            clearFilterState()
+            isFilterPanelVisible = false
+        }
+
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         df.timeZone = .current
