@@ -77,7 +77,7 @@ retrace/
 │   ├── FTSManager.swift         # Full-text search management
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
-│   ├── Migrations/              # Schema migration scripts
+│   ├── Migrations/              # Schema migration scripts (V1...V7_MultiDisplaySupport.swift)
 │   ├── Queries/                 # Query implementations
 │   └── Tests/
 │
@@ -142,7 +142,7 @@ retrace/
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback)
     ├── Views/
     │   ├── Dashboard/           # App usage analytics views
-    │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
+    │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (includes PIPThumbnailView.swift)
     │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
     │   ├── Settings/            # Settings panel
     │   ├── Onboarding/          # Onboarding flow

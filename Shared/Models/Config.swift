@@ -133,6 +133,11 @@ public struct CaptureConfig: Codable, Sendable {
     /// Default is true.
     public let captureOnWindowChange: Bool
 
+    /// Whether to record all connected displays simultaneously.
+    /// When false (default), only the active/focused display is recorded (current behavior).
+    /// When true, one capture instance runs per connected display.
+    public let recordAllDisplays: Bool
+
     public init(
         captureIntervalSeconds: Double = 2.0,
         adaptiveCaptureEnabled: Bool = true,
@@ -143,7 +148,8 @@ public struct CaptureConfig: Codable, Sendable {
         customPrivateWindowPatterns: [String] = [],
         showCursor: Bool = true,
         idleThresholdSeconds: Double = 120.0,
-        captureOnWindowChange: Bool = true
+        captureOnWindowChange: Bool = true,
+        recordAllDisplays: Bool = false
     ) {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.adaptiveCaptureEnabled = adaptiveCaptureEnabled
@@ -155,6 +161,7 @@ public struct CaptureConfig: Codable, Sendable {
         self.showCursor = showCursor
         self.idleThresholdSeconds = idleThresholdSeconds
         self.captureOnWindowChange = captureOnWindowChange
+        self.recordAllDisplays = recordAllDisplays
     }
 
     /// Default deduplication threshold (99.85% similarity)

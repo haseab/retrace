@@ -82,6 +82,12 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
     /// Date range end (nil = no end limit)
     public var endDate: Date?
 
+    /// Filter to a specific display ID (nil = all displays)
+    public var displayID: UInt32?
+
+    /// Filter to focused frames only (nil/false = no focus predicate)
+    public var focusedOnly: Bool?
+
     public init(
         selectedApps: Set<String>? = nil,
         appFilterMode: AppFilterMode = .include,
@@ -92,7 +98,9 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         windowNameFilter: String? = nil,
         browserUrlFilter: String? = nil,
         startDate: Date? = nil,
-        endDate: Date? = nil
+        endDate: Date? = nil,
+        displayID: UInt32? = nil,
+        focusedOnly: Bool? = nil
     ) {
         self.selectedApps = selectedApps
         self.appFilterMode = appFilterMode
@@ -104,6 +112,8 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         self.browserUrlFilter = browserUrlFilter
         self.startDate = startDate
         self.endDate = endDate
+        self.displayID = displayID
+        self.focusedOnly = focusedOnly
     }
 
     /// Returns true if any filter is active (different from default)
@@ -115,7 +125,9 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         (windowNameFilter != nil && !windowNameFilter!.isEmpty) ||
         (browserUrlFilter != nil && !browserUrlFilter!.isEmpty) ||
         startDate != nil ||
-        endDate != nil
+        endDate != nil ||
+        displayID != nil ||
+        focusedOnly == true
     }
 
     /// Returns true if any advanced filter is active
@@ -134,6 +146,8 @@ public struct FilterCriteria: Codable, Equatable, Sendable {
         if windowNameFilter != nil && !windowNameFilter!.isEmpty { count += 1 }
         if browserUrlFilter != nil && !browserUrlFilter!.isEmpty { count += 1 }
         if startDate != nil || endDate != nil { count += 1 }
+        if displayID != nil { count += 1 }
+        if focusedOnly == true { count += 1 }
         return count
     }
 

@@ -155,7 +155,7 @@ public actor CGWindowListCapture {
         let height = cgImage.height
         let bytesPerRow = width * 4
 
-        Log.debug("[CGWindowListCapture] Frame captured: \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
+        Log.debug("[CGWindowListCapture] Raw frame captured (pre-ingestion): \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
 
         // Create captured frame
         let frame = CapturedFrame(

@@ -71,7 +71,7 @@ public protocol DatabaseProtocol: Actor {
     // MARK: - Video Segment Operations (Video Files)
 
     /// Insert a new video segment (150-frame video chunk) and return the auto-generated ID
-    func insertVideoSegment(_ segment: VideoSegment) async throws -> Int64
+    func insertVideoSegment(_ segment: VideoSegment, displayID: UInt32) async throws -> Int64
 
     /// Get video segment by ID
     func getVideoSegment(id: VideoSegmentID) async throws -> VideoSegment?
@@ -94,6 +94,10 @@ public protocol DatabaseProtocol: Actor {
     /// Returns nil if no unfinalised video exists for this resolution
     /// Used to resume writing to an existing video when a frame with matching resolution comes in
     func getUnfinalisedVideoByResolution(width: Int, height: Int) async throws -> UnfinalisedVideo?
+
+    /// Get an unfinalised video matching the given display ID and resolution
+    /// Used in multi-display mode to prevent resuming the wrong display's video
+    func getUnfinalisedVideoByDisplayAndResolution(displayID: UInt32, width: Int, height: Int) async throws -> UnfinalisedVideo?
 
     /// Get all unfinalised videos (for recovery on app startup)
     func getAllUnfinalisedVideos() async throws -> [UnfinalisedVideo]
@@ -216,10 +220,27 @@ public protocol DatabaseProtocol: Actor {
     /// Delete FTS content for a frame
     func deleteFTSContent(frameId: Int64) async throws
 
+    // MARK: - Display Metadata
+
+    /// Persist or update a user-facing name for a captured display ID.
+    func upsertDisplayName(displayID: UInt32, name: String, seenAt: Date) async throws
+
+    /// Get persisted display names for the provided display IDs.
+    func getDisplayNames(displayIDs: [UInt32]) async throws -> [UInt32: String]
+
     // MARK: - Statistics
 
     /// Get database statistics
     func getStatistics() async throws -> DatabaseStatistics
+}
+
+// MARK: - DatabaseProtocol Default Values
+
+extension DatabaseProtocol {
+    /// Convenience overload with default displayID = 0 for backward compatibility
+    public func insertVideoSegment(_ segment: VideoSegment) async throws -> Int64 {
+        try await insertVideoSegment(segment, displayID: 0)
+    }
 }
 
 // MARK: - FTS Protocol

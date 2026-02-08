@@ -579,14 +579,6 @@ public class TimelineWindowController: NSObject {
         isVisible = true
         Self.isTimelineVisible = true  // For emergency escape tap
 
-        // Log display/screen info for debugging cross-display zoom issues
-        let mousePos = NSEvent.mouseLocation
-        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-        let windowScreen = window.screen?.frame ?? .zero
-        let scaleFactor = TimelineScaleFactor.current
-        let screenBackingScale = window.screen?.backingScaleFactor ?? -1
-        debugLog("[TIMELINE-LAUNCH] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), windowFrame: \(Int(windowScreen.width))x\(Int(windowScreen.height)), isKeyWindow: \(window.isKeyWindow), zoomScale: \(timelineViewModel?.frameZoomScale ?? -1), timelineScaleFactor: \(String(format: "%.3f", scaleFactor)), backingScale: \(screenBackingScale)")
-
         // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
         if !isLive {
             NSAnimationContext.runAnimationGroup({ context in
@@ -740,19 +732,19 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        let screenIndex = NSScreen.screens.firstIndex(of: targetScreen) ?? -1
         if window.frame != targetScreen.frame {
             window.setFrame(targetScreen.frame, display: false)
             // Reset scale factor cache so it recalculates for the new display
             TimelineScaleFactor.resetCache()
-            debugLog("[DISPLAY-SWITCH] moved window to display \(screenIndex), screen: \(Int(targetScreen.frame.width))x\(Int(targetScreen.frame.height)) at (\(Int(targetScreen.frame.origin.x)),\(Int(targetScreen.frame.origin.y))), mouse: (\(Int(mouseLocation.x)),\(Int(mouseLocation.y)))")
         }
     }
 
     /// Capture a live screenshot for seamless timeline launch
-    /// Returns NSImage of the current screen, or nil on failure
+    /// Returns NSImage of the active screen, or nil on failure
     private func captureLiveScreenshot() -> NSImage? {
-        // Get the screen where the mouse cursor is located
+        // Always capture the active screen for live mode OCR.
+        // This avoids combining text from multiple displays into one OCR pass.
+        // "Active" here is the screen currently under the mouse, matching where timeline opens.
         let mouseLocation = NSEvent.mouseLocation
         guard let targetScreen = NSScreen.screens.first(where: {
             NSMouseInRect(mouseLocation, $0.frame, false)
@@ -902,13 +894,13 @@ public class TimelineWindowController: NSObject {
             viewModel.pendingFilterCriteria = criteria
             logTabClickTiming("TIMELINE_FILTER_SET", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            // Query and load frames
+            // Query and load timeline payloads
             logTabClickTiming("QUERY_START", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
-            let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: criteria)
-            logTabClickTiming("QUERY_DONE (count=\(frames?.count ?? 0))", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
+            let timelinePayloads = try? await coordinator.getMostRecentTimelineFramesWithSecondaries(limit: 500, filters: criteria)
+            logTabClickTiming("QUERY_DONE (count=\(timelinePayloads?.count ?? 0))", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
             // Load frames directly into viewModel
-            await viewModel.loadFramesDirectly(frames ?? [], clickStartTime: startTime)
+            await viewModel.loadFramesDirectly(timelinePayloads ?? [], clickStartTime: startTime)
             logTabClickTiming("FRAMES_LOADED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
             // Small delay to let the view settle before fade-in
@@ -1107,29 +1099,7 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Event Monitoring
 
-    /// Debug log to /tmp/retrace_debug.log for shift-drag investigation
-    private func debugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] [WINDOW] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let path = "/tmp/retrace_debug.log"
-            if FileManager.default.fileExists(atPath: path) {
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: path, contents: data)
-            }
-        }
-    }
-
     private func setupEventMonitors() {
-        debugLog("setupEventMonitors called - timeline launched")
-
         // Monitor for mouse events to handle click-drag scrubbing on the timeline tape
         mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .flagsChanged]) { [weak self] event in
             guard let self = self, self.isVisible else { return event }
@@ -1263,7 +1233,7 @@ public class TimelineWindowController: NSObject {
                    (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen || viewModel.showTagSubmenu) {
                     return // Let SwiftUI handle it
                 }
-                self?.handleScrollEvent(event, source: "GLOBAL")
+                self?.handleScrollEvent(event)
             } else if event.type == .magnify {
                 self?.handleMagnifyEvent(event)
             }
@@ -1381,7 +1351,7 @@ public class TimelineWindowController: NSObject {
                    viewModel.isSearchOverlayVisible && !viewModel.searchViewModel.searchQuery.isEmpty {
                     return event // Let the search results ScrollView handle it
                 }
-                self?.handleScrollEvent(event, source: "LOCAL")
+                self?.handleScrollEvent(event)
                 return nil // Consume scroll events
             } else if event.type == .magnify {
                 self?.handleMagnifyEvent(event)
@@ -1793,7 +1763,7 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    private func handleScrollEvent(_ event: NSEvent, source: String) {
+    private func handleScrollEvent(_ event: NSEvent) {
         guard isVisible, let viewModel = timelineViewModel else { return }
 
         let deltaX = event.scrollingDeltaX
@@ -1809,9 +1779,6 @@ public class TimelineWindowController: NSObject {
             // Cancel any tape drag momentum on real scroll input
             viewModel.cancelTapeDragMomentum()
 
-            let mousePos = NSEvent.mouseLocation
-            let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-            debugLog("[SCROLL] \(source), display: \(screenIndex), delta: \(String(format: "%.1f", delta)), isKeyWindow: \(window?.isKeyWindow ?? false)")
             onScroll?(delta)
             // Forward scroll to view model
             Task { @MainActor in
@@ -1844,9 +1811,6 @@ public class TimelineWindowController: NSObject {
         let anchor = CGPoint(x: normalizedX, y: normalizedY)
 
         // Apply the magnification with anchor point
-        let mousePos = NSEvent.mouseLocation
-        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-        debugLog("[ZOOM] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), magnification: \(String(format: "%.3f", magnification)), scaleBefore: \(String(format: "%.2f", viewModel.frameZoomScale)), isKeyWindow: \(window.isKeyWindow)")
         viewModel.applyMagnification(scaleFactor, anchor: anchor, frameSize: windowSize)
     }
 

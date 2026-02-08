@@ -256,6 +256,65 @@ public actor DatabaseManager: DatabaseProtocol {
         return try FrameQueries.getMostRecent(db: db, limit: limit)
     }
 
+    // MARK: - Display Metadata
+
+    public func upsertDisplayName(displayID: UInt32, name: String, seenAt: Date) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try DisplayQueries.upsertName(db: db, displayID: displayID, name: name, seenAt: seenAt)
+    }
+
+    public func getDisplayNames(displayIDs: [UInt32]) async throws -> [UInt32: String] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.getNames(db: db, displayIDs: displayIDs)
+    }
+
+    /// Open a display session segment if one is not already open for this display.
+    /// - Returns: true when a new segment row is inserted.
+    public func openDisplaySegment(displayID: UInt32, connectedAt: Date) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.openSegment(db: db, displayID: displayID, connectedAt: connectedAt)
+    }
+
+    /// Close any currently open display segment for a display.
+    /// - Returns: true when an open segment row is closed.
+    public func closeOpenDisplaySegment(displayID: UInt32, disconnectedAt: Date) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.closeOpenSegment(db: db, displayID: displayID, disconnectedAt: disconnectedAt)
+    }
+
+    /// Close all currently open display segments.
+    /// - Returns: number of segments closed.
+    public func closeAllOpenDisplaySegments(disconnectedAt: Date) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.closeAllOpenSegments(db: db, disconnectedAt: disconnectedAt)
+    }
+
+    /// Get display IDs that are connected at a specific timestamp.
+    public func getConnectedDisplayIDs(at timestamp: Date) async throws -> [UInt32] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.getConnectedDisplayIDs(db: db, at: timestamp)
+    }
+
+    /// Get display IDs with currently open display segments.
+    public func getOpenDisplaySegmentIDs() async throws -> [UInt32] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try DisplayQueries.getOpenDisplaySegmentIDs(db: db)
+    }
+
     // MARK: - Optimized Frame Queries with Video Info (Rewind-inspired)
 
     public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
@@ -454,11 +513,11 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Video Segment Operations (Video Files)
 
-    public func insertVideoSegment(_ segment: VideoSegment) async throws -> Int64 {
+    public func insertVideoSegment(_ segment: VideoSegment, displayID: UInt32 = 0) async throws -> Int64 {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try SegmentQueries.insert(db: db, segment: segment)
+        return try SegmentQueries.insert(db: db, segment: segment, displayID: displayID)
     }
 
     public func updateVideoSegment(id: Int64, width: Int, height: Int, fileSize: Int64) async throws {
@@ -510,6 +569,13 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getUnfinalisedByResolution(db: db, width: width, height: height)
+    }
+
+    public func getUnfinalisedVideoByDisplayAndResolution(displayID: UInt32, width: Int, height: Int) async throws -> UnfinalisedVideo? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.getUnfinalisedByDisplayAndResolution(db: db, displayID: displayID, width: width, height: height)
     }
 
     public func getAllUnfinalisedVideos() async throws -> [UnfinalisedVideo] {

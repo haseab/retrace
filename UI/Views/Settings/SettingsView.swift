@@ -141,6 +141,7 @@ public struct SettingsView: View {
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = SettingsDefaults.deleteDuplicateFrames
     @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = SettingsDefaults.deduplicationThreshold
     @AppStorage("captureOnWindowChange", store: settingsStore) private var captureOnWindowChange: Bool = SettingsDefaults.captureOnWindowChange
+    @AppStorage("recordAllDisplays", store: settingsStore) private var recordAllDisplays: Bool = false
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = SettingsDefaults.retentionDays
@@ -278,6 +279,7 @@ public struct SettingsView: View {
     // Danger zone confirmation states
     @State private var showingResetConfirmation = false
     @State private var showingDeleteConfirmation = false
+    @State private var showingRecordAllDisplaysPowerWarning = false
 
     // Database schema display
     @State private var showingDatabaseSchema = false
@@ -518,6 +520,22 @@ public struct SettingsView: View {
 
             return message
         }
+    }
+
+    /// Intercepts enabling "Record all displays" so we can require power-impact acknowledgement.
+    private var recordAllDisplaysToggleBinding: Binding<Bool> {
+        Binding(
+            get: { recordAllDisplays },
+            set: { newValue in
+                if newValue && !recordAllDisplays {
+                    showingRecordAllDisplaysPowerWarning = true
+                    return
+                }
+
+                recordAllDisplays = newValue
+                updateRecordAllDisplaysSetting()
+            }
+        )
     }
 
     /// Theme-aware base background color
@@ -1406,8 +1424,36 @@ public struct SettingsView: View {
                                 updateCaptureOnWindowChangeSetting()
                             }
                     }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    // Record all displays toggle
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Record all displays simultaneously")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Text("Capture all connected monitors simultaneously")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+                        }
+                        Spacer()
+                        Toggle("", isOn: recordAllDisplaysToggleBinding)
+                            .toggleStyle(SwitchToggleStyle(tint: .retraceAccent))
+                            .labelsHidden()
+                    }
                 }
                 .animation(.easeInOut(duration: 0.2), value: captureUpdateMessage)
+                .alert("High Power Usage Warning", isPresented: $showingRecordAllDisplaysPowerWarning) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Enable Anyway", role: .destructive) {
+                        recordAllDisplays = true
+                        updateRecordAllDisplaysSetting()
+                    }
+                } message: {
+                    Text("Recording all displays can double or triple power usage and memory. Each additional display increases battery drain, heat, memory and storage usage. \n\nRetrace already records the active display by default. It is recommended to NOT turn this on unless you need to record all displays at the same time.")
+                }
         }
     }
 
@@ -5293,7 +5339,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+                captureOnWindowChange: currentConfig.captureOnWindowChange,
+                recordAllDisplays: currentConfig.recordAllDisplays
             )
 
             do {
@@ -5519,7 +5566,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+                captureOnWindowChange: currentConfig.captureOnWindowChange,
+                recordAllDisplays: currentConfig.recordAllDisplays
             )
 
             // Update the capture manager config
@@ -5550,7 +5598,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+                captureOnWindowChange: currentConfig.captureOnWindowChange,
+                recordAllDisplays: currentConfig.recordAllDisplays
             )
 
             // Update the capture manager config
@@ -5582,7 +5631,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: captureOnWindowChange
+                captureOnWindowChange: captureOnWindowChange,
+                recordAllDisplays: currentConfig.recordAllDisplays
             )
 
             // Update the capture manager config
@@ -5592,6 +5642,35 @@ extension SettingsView {
                 showCaptureUpdateFeedback()
             } catch {
                 Log.error("[SettingsView] Failed to update capture on window change: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Update record all displays setting in capture config
+    private func updateRecordAllDisplaysSetting() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor,
+                captureOnWindowChange: currentConfig.captureOnWindowChange,
+                recordAllDisplays: recordAllDisplays
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Record all displays updated to: \(recordAllDisplays)", category: .ui)
+                showCaptureUpdateFeedback()
+            } catch {
+                Log.error("[SettingsView] Failed to update record all displays: \(error)", category: .ui)
             }
         }
     }
@@ -5687,7 +5766,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: SettingsDefaults.captureOnWindowChange
+                captureOnWindowChange: SettingsDefaults.captureOnWindowChange,
+                recordAllDisplays: false
             )
 
             do {
@@ -5730,7 +5810,8 @@ extension SettingsView {
                 excludePrivateWindows: SettingsDefaults.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+                captureOnWindowChange: currentConfig.captureOnWindowChange,
+                recordAllDisplays: currentConfig.recordAllDisplays
             )
 
             do {

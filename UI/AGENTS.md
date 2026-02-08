@@ -9,6 +9,8 @@ You are the **UI** agent responsible for building the SwiftUI interface for Retr
 ```
 UI/
 ├── Views/
+│   ├── FullscreenTimeline/
+│   │   └── PIPThumbnailView.swift      # Secondary-display thumbnail swap UI
 │   ├── Timeline/
 │   │   ├── TimelineView.swift           # Main timeline scrubber
 │   │   ├── TimelineBar.swift            # Horizontal scrollable bar

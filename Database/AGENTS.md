@@ -13,11 +13,13 @@ Database/
 ├── Schema.swift               # Table definitions
 ├── Migrations/
 │   ├── MigrationRunner.swift  # Run migrations in order
-│   └── V1_InitialSchema.swift # Initial schema migration
+│   ├── V1_InitialSchema.swift # Initial schema migration
+│   └── V7_MultiDisplaySupport.swift # displayID/isFocused + display metadata table/indexes
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
-│   └── DocumentQueries.swift  # Document/FTS operations
+│   ├── DocumentQueries.swift  # Document/FTS operations
+│   └── DisplayQueries.swift   # Display metadata upsert/fetch
 └── Tests/
     ├── DatabaseManagerTests.swift
     └── FTSManagerTests.swift

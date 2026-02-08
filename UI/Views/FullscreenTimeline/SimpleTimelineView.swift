@@ -14,6 +14,12 @@ public struct SimpleTimelineView: View {
     @State private var hasInitialized = false
     /// Tracks whether the live screenshot has been displayed, allowing AVPlayer to pre-mount underneath
     @State private var liveScreenshotHasAppeared = false
+    /// Persistent offset for draggable secondary display stack
+    @State private var displayStackOffset: CGSize = .zero
+    /// Active drag translation while moving secondary display stack
+    @GestureState private var displayStackDragOffset: CGSize = .zero
+    /// Hover state for the floating display stack panel.
+    @State private var isDisplayStackHovering = false
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -35,11 +41,122 @@ public struct SimpleTimelineView: View {
             let actualFrameRect = calculateActualDisplayedFrameRectForView(
                 containerSize: geometry.size
             )
+            let displayPreviewItems = resolvedDisplayPreviewItems()
+            let displayCardsBottomPadding: CGFloat = 10
+            let displayStackLayout = displayStackLayout(
+                containerSize: geometry.size,
+                items: displayPreviewItems,
+                bottomPadding: displayCardsBottomPadding
+            )
 
             ZStack {
                 // Full screen frame display
                 frameDisplay
+                    .transition(.opacity)
+                    .animation(.easeInOut(duration: 0.22), value: viewModel.primaryDisplayID)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // Floating display switcher/pin panel (shows all displays)
+                if displayPreviewItems.count > 1 && !viewModel.isInLiveMode {
+                    VStack(spacing: 10) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white.opacity(isDisplayStackHovering ? 0.96 : 0.8))
+                            Text("Displays")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundColor(.white.opacity(isDisplayStackHovering ? 0.98 : 0.85))
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(isDisplayStackHovering ? 0.24 : 0.08))
+                        .clipShape(Capsule())
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(isDisplayStackHovering ? 0.26 : 0.12), lineWidth: 0.8)
+                        )
+                        .animation(.easeOut(duration: 0.16), value: isDisplayStackHovering)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                                .updating($displayStackDragOffset) { value, state, _ in
+                                    state = value.translation
+                                }
+                                .onEnded { value in
+                                    displayStackOffset.width += value.translation.width
+                                    displayStackOffset.height += value.translation.height
+                                }
+                        )
+
+                        ScrollView(.vertical, showsIndicators: false) {
+                            VStack(spacing: 8) {
+                                ForEach(displayPreviewItems, id: \.displayID) { display in
+                                    if display.presentationMode == .listRow {
+                                        CurrentDisplayRowView(
+                                            displayLabel: viewModel.displayLabel(for: display.displayID),
+                                            isPinnedDisplay: display.isPinnedDisplay,
+                                            onPrimaryAction: {
+                                                handleDisplayPrimaryAction(display)
+                                            }
+                                        )
+                                        .transition(.asymmetric(
+                                            insertion: .displayRoleExpand,
+                                            removal: .displayRoleCompress
+                                        ))
+                                    } else {
+                                        PIPThumbnailView(
+                                            displayLabel: viewModel.displayLabel(for: display.displayID),
+                                            videoInfo: display.videoInfo,
+                                            isCurrentDisplay: display.isCurrentDisplay,
+                                            isPinnedDisplay: display.isPinnedDisplay,
+                                            onPrimaryAction: {
+                                                handleDisplayPrimaryAction(display)
+                                            }
+                                        )
+                                        .transition(.asymmetric(
+                                            insertion: .displayRoleExpand,
+                                            removal: .displayRoleCompress
+                                        ))
+                                    }
+                                }
+                            }
+                            .animation(.spring(response: 0.28, dampingFraction: 0.85), value: viewModel.primaryDisplayID)
+                            .padding(.bottom, displayCardsBottomPadding)
+                        }
+                        .frame(maxHeight: displayStackLayout.visibleCardsHeight)
+                    }
+                    .frame(width: displayStackLayout.panelWidth)
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color.black.opacity(0.8))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.45), radius: 12, x: 0, y: 4)
+                    .onHover { hovering in
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            isDisplayStackHovering = hovering
+                        }
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                    .padding(.top, 80)
+                    .padding(.trailing, 40)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .offset(
+                        x: displayStackOffset.width + displayStackDragOffset.width,
+                        y: displayStackOffset.height + displayStackDragOffset.height
+                    )
+                    .allowsHitTesting(!viewModel.areControlsHidden)
+                    .opacity(viewModel.areControlsHidden ? 0.5 : 1)
+                }
 
                 // Bottom blur + gradient backdrop (behind timeline controls)
                 VStack {
@@ -184,6 +301,20 @@ public struct SimpleTimelineView: View {
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isPeeking)
                 }
 
+                // Global timeline HUD toast (top center)
+                if let message = viewModel.timelineHUDToastMessage {
+                    VStack {
+                        Spacer()
+                        TimelineHUDToastBanner(message: message)
+                            .opacity(viewModel.showTimelineHUDToast ? 1 : 0)
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    .padding(.spacingL)
+                    .animation(.easeInOut(duration: 0.45), value: viewModel.showTimelineHUDToast)
+                }
+
                 // Close button (top-right) - always visible
                 VStack {
                     HStack {
@@ -321,6 +452,35 @@ public struct SimpleTimelineView: View {
         }
     }
 
+    private struct DisplayStackLayout {
+        let panelWidth: CGFloat
+        let visibleCardsHeight: CGFloat
+    }
+
+    private func displayStackLayout(
+        containerSize: CGSize,
+        items: [DisplayPreviewItem],
+        bottomPadding: CGFloat
+    ) -> DisplayStackLayout {
+        let panelWidth = max(220, containerSize.width * 0.16)
+        let thumbnailWidth = panelWidth - 20
+        let thumbnailHeight = thumbnailWidth * (10.0 / 16.0)
+        let rowHeight: CGFloat = 54
+        let verticalSlack: CGFloat = 18
+        let thumbnailCount = items.filter { $0.presentationMode == .thumbnail }.count
+        let rowCount = items.count - thumbnailCount
+        let contentHeight =
+            (CGFloat(thumbnailCount) * thumbnailHeight) +
+            (CGFloat(rowCount) * rowHeight) +
+            (CGFloat(max(0, items.count - 1)) * 8) +
+            bottomPadding
+        let visibleCardsHeight = min(contentHeight + verticalSlack, containerSize.height * 0.52)
+        return DisplayStackLayout(
+            panelWidth: panelWidth,
+            visibleCardsHeight: visibleCardsHeight
+        )
+    }
+
     // MARK: - Search Overlay
 
     @ViewBuilder
@@ -409,7 +569,7 @@ public struct SimpleTimelineView: View {
 	                // Base layer: Video or static image (loads in background during live mode)
 	                // Only mount after live screenshot has appeared to prevent initial black flash
 	                if liveScreenshotHasAppeared || !viewModel.isInLiveMode {
-	                    if let videoInfo = viewModel.currentVideoInfo {
+	                    if let videoInfo = viewModel.displayedPrimaryVideoInfo {
 	                        videoFrameContent(videoInfo: videoInfo)
 	                    } else if let image = viewModel.currentImage {
 	                        // Static image (Retrace) with URL overlay
@@ -594,12 +754,65 @@ public struct SimpleTimelineView: View {
 
     // MARK: - Helper Methods
 
+    /// Display preview model for the floating display panel.
+    private struct DisplayPreviewItem {
+        enum PresentationMode {
+            case listRow
+            case thumbnail
+        }
+
+        let displayID: UInt32
+        let videoInfo: FrameVideoInfo?
+        let isCurrentDisplay: Bool
+        let isPinnedDisplay: Bool
+        let presentationMode: PresentationMode
+    }
+
+    /// Build display previews for all known displays (current + non-current).
+    private func resolvedDisplayPreviewItems() -> [DisplayPreviewItem] {
+        var displayIDs = viewModel.availableDisplayIDs.filter { $0 != 0 }
+        if displayIDs.isEmpty {
+            let fallbackIDs = [viewModel.primaryDisplayID] + viewModel.secondaryDisplayFrames.map(\.displayID)
+            displayIDs = fallbackIDs.filter { $0 != 0 }
+        }
+
+        let orderedDisplayIDs = Array(Set(displayIDs)).sorted()
+        let secondaryFramesByDisplay = Dictionary(uniqueKeysWithValues: viewModel.secondaryDisplayFrames.map { ($0.displayID, $0.videoInfo) })
+
+        return orderedDisplayIDs.map { displayID in
+            let isCurrentDisplay = displayID == viewModel.primaryDisplayID
+            let previewVideoInfo: FrameVideoInfo? = isCurrentDisplay
+                ? viewModel.displayedPrimaryVideoInfo
+                : (secondaryFramesByDisplay[displayID] ?? nil)
+            return DisplayPreviewItem(
+                displayID: displayID,
+                videoInfo: previewVideoInfo,
+                isCurrentDisplay: isCurrentDisplay,
+                isPinnedDisplay: isCurrentDisplay && viewModel.isPrimaryDisplayPinned,
+                presentationMode: isCurrentDisplay ? .listRow : .thumbnail
+            )
+        }
+    }
+
+    private func handleDisplayPrimaryAction(_ display: DisplayPreviewItem) {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            if display.isPinnedDisplay {
+                viewModel.unpinPrimaryDisplay()
+            } else {
+                viewModel.swapToDisplay(
+                    display.displayID,
+                    preferredVideoInfo: display.videoInfo
+                )
+            }
+        }
+    }
+
     /// Calculate the actual displayed frame rect within the container for the main view
     private func calculateActualDisplayedFrameRectForView(containerSize: CGSize) -> CGRect {
         // Get the actual frame dimensions from videoInfo (database)
         // Don't use NSImage.size as that requires extracting the frame from video first
         let frameSize: CGSize
-        if let videoInfo = viewModel.currentVideoInfo,
+        if let videoInfo = viewModel.displayedPrimaryVideoInfo,
            let width = videoInfo.width,
            let height = videoInfo.height {
             frameSize = CGSize(width: width, height: height)
@@ -657,6 +870,32 @@ public struct SimpleTimelineView: View {
             RoundedRectangle(cornerRadius: .cornerRadiusM)
                 .fill(Color.black.opacity(0.8))
         )
+    }
+}
+
+private extension AnyTransition {
+    static var displayRoleExpand: AnyTransition {
+        .modifier(
+            active: VerticalScaleTransitionModifier(scaleY: 0.15),
+            identity: VerticalScaleTransitionModifier(scaleY: 1.0)
+        )
+    }
+
+    static var displayRoleCompress: AnyTransition {
+        .modifier(
+            active: VerticalScaleTransitionModifier(scaleY: 0.1),
+            identity: VerticalScaleTransitionModifier(scaleY: 1.0)
+        )
+    }
+}
+
+private struct VerticalScaleTransitionModifier: ViewModifier {
+    let scaleY: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(x: 1, y: scaleY, anchor: .center)
+            .clipped()
     }
 }
 
@@ -784,6 +1023,102 @@ struct PeekModeBanner: View {
         .overlay(
             Capsule()
                 .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+        )
+    }
+}
+
+private struct TimelineHUDToastBanner: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(message)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white.opacity(0.95))
+        }
+        .padding(.horizontal, 15)
+        .padding(.vertical, 10)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.58))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
+                )
+        )
+        .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 2)
+    }
+}
+
+private struct CurrentDisplayRowView: View {
+    let displayLabel: String
+    let isPinnedDisplay: Bool
+    let onPrimaryAction: () -> Void
+
+    @State private var isHovering = false
+
+    private var primaryActionLabel: String {
+        isPinnedDisplay ? "Unpin" : "Pin"
+    }
+
+    private var primaryActionIcon: String {
+        isPinnedDisplay ? "pin.slash.fill" : "pin.fill"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Label("Current", systemImage: "eye.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.95))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(0.45))
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.2), lineWidth: 0.7)
+                        )
+                )
+
+            Text(displayLabel)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white.opacity(0.95))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 8)
+
+            Button(action: onPrimaryAction) {
+                Label(primaryActionLabel, systemImage: primaryActionIcon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(isHovering ? 0.8 : 0.68))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.22), lineWidth: 0.8)
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovering = hovering
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, minHeight: 54)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.8)
+                )
         )
     }
 }
@@ -1265,7 +1600,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                 width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
                 height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
             )
-        } else if let videoInfo = viewModel.currentVideoInfo,
+        } else if let videoInfo = viewModel.displayedPrimaryVideoInfo,
            let width = videoInfo.width,
            let height = videoInfo.height {
             frameSize = CGSize(width: width, height: height)
@@ -3348,7 +3683,7 @@ struct DebugFrameIDBadge: View {
                     }
 
                     // Debug: Show video frame index being requested
-                    if let videoInfo = viewModel.currentVideoInfo {
+                    if let videoInfo = viewModel.displayedPrimaryVideoInfo {
                         Text("VidIdx: \(videoInfo.frameIndex)")
                             .font(.retraceMonoSmall)
                             .foregroundColor(.orange.opacity(0.8))
@@ -3525,7 +3860,7 @@ struct DeveloperActionsMenu: View {
 
             // Open Video File button - opens in QuickTime at the current frame's timestamp
             Button(action: {
-                guard let videoInfo = viewModel.currentVideoInfo else { return }
+                guard let videoInfo = viewModel.displayedPrimaryVideoInfo else { return }
                 let originalPath = videoInfo.videoPath
                 let timeInSeconds = videoInfo.timeInSeconds
 
@@ -3576,7 +3911,7 @@ struct DeveloperActionsMenu: View {
             }) {
                 Label("Open Video File", systemImage: "play.rectangle")
             }
-            .disabled(viewModel.currentVideoInfo == nil)
+            .disabled(viewModel.displayedPrimaryVideoInfo == nil)
 
         } label: {
             HStack(spacing: 4) {

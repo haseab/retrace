@@ -709,6 +709,765 @@ public actor DataAdapter {
         return bundleIDs
     }
 
+    // MARK: - Multi-Display Queries
+
+    private enum TimelinePrimaryMode {
+        case mostRecent
+        case range(start: Date, end: Date)
+        case before(timestamp: Date)
+        case after(timestamp: Date)
+
+        var orderDirection: String {
+            switch self {
+            case .after, .range:
+                return "ASC"
+            case .before, .mostRecent:
+                return "DESC"
+            }
+        }
+    }
+
+    /// Get timeline payloads in a time range with secondaries from one denormalized query.
+    public func getTimelineFramesWithSecondaries(
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int = 500,
+        filters: FilterCriteria? = nil
+    ) async throws -> [TimelineFramePayload] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if shouldFallbackTimelineQueryToLegacy(
+            mode: .range(start: startDate, end: endDate),
+            filters: filters
+        ) {
+            let frames = try await getFramesWithVideoInfo(from: startDate, to: endDate, limit: limit, filters: filters)
+            return frames.map {
+                TimelineFramePayload(
+                    frame: $0.frame,
+                    videoInfo: $0.videoInfo,
+                    processingStatus: $0.processingStatus,
+                    secondaryFrames: []
+                )
+            }
+        }
+
+        return try queryTimelineFramesWithSecondariesNative(
+            mode: .range(start: startDate, end: endDate),
+            limit: limit,
+            filters: filters
+        )
+    }
+
+    /// Get most recent timeline payloads with secondaries from one denormalized query.
+    public func getMostRecentTimelineFramesWithSecondaries(
+        limit: Int = 250,
+        filters: FilterCriteria? = nil
+    ) async throws -> [TimelineFramePayload] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if shouldFallbackTimelineQueryToLegacy(mode: .mostRecent, filters: filters) {
+            let frames = try await getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
+            return frames.map {
+                TimelineFramePayload(
+                    frame: $0.frame,
+                    videoInfo: $0.videoInfo,
+                    processingStatus: $0.processingStatus,
+                    secondaryFrames: []
+                )
+            }
+        }
+
+        return try queryTimelineFramesWithSecondariesNative(
+            mode: .mostRecent,
+            limit: limit,
+            filters: filters
+        )
+    }
+
+    /// Get timeline payloads before timestamp with secondaries from one denormalized query.
+    public func getTimelineFramesWithSecondariesBefore(
+        timestamp: Date,
+        limit: Int = 300,
+        filters: FilterCriteria? = nil
+    ) async throws -> [TimelineFramePayload] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if shouldFallbackTimelineQueryToLegacy(mode: .before(timestamp: timestamp), filters: filters) {
+            let frames = try await getFramesWithVideoInfoBefore(timestamp: timestamp, limit: limit, filters: filters)
+            return frames.map {
+                TimelineFramePayload(
+                    frame: $0.frame,
+                    videoInfo: $0.videoInfo,
+                    processingStatus: $0.processingStatus,
+                    secondaryFrames: []
+                )
+            }
+        }
+
+        return try queryTimelineFramesWithSecondariesNative(
+            mode: .before(timestamp: timestamp),
+            limit: limit,
+            filters: filters
+        )
+    }
+
+    /// Get timeline payloads after timestamp with secondaries from one denormalized query.
+    public func getTimelineFramesWithSecondariesAfter(
+        timestamp: Date,
+        limit: Int = 300,
+        filters: FilterCriteria? = nil
+    ) async throws -> [TimelineFramePayload] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        if shouldFallbackTimelineQueryToLegacy(mode: .after(timestamp: timestamp), filters: filters) {
+            let frames = try await getFramesWithVideoInfoAfter(timestamp: timestamp, limit: limit, filters: filters)
+            return frames.map {
+                TimelineFramePayload(
+                    frame: $0.frame,
+                    videoInfo: $0.videoInfo,
+                    processingStatus: $0.processingStatus,
+                    secondaryFrames: []
+                )
+            }
+        }
+
+        return try queryTimelineFramesWithSecondariesNative(
+            mode: .after(timestamp: timestamp),
+            limit: limit,
+            filters: filters
+        )
+    }
+
+    /// Cross-source (Rewind + native) windows cannot be served by a single SQL statement.
+    /// We fallback to legacy multi-query behavior for those cases.
+    private func shouldFallbackTimelineQueryToLegacy(mode: TimelinePrimaryMode, filters: FilterCriteria?) -> Bool {
+        guard rewindConnection != nil, let cutoff = cutoffDate else { return false }
+
+        if let selectedSources = filters?.selectedSources, !selectedSources.isEmpty {
+            let includesNative = selectedSources.contains(.native)
+            let includesRewind = selectedSources.contains(.rewind)
+            if includesRewind && !includesNative {
+                return true
+            }
+            if includesRewind && includesNative {
+                return true
+            }
+            return false
+        }
+
+        switch mode {
+        case .mostRecent:
+            return false
+        case .range(let start, let end):
+            return start < cutoff || end < cutoff
+        case .before(let timestamp):
+            return timestamp <= cutoff
+        case .after(let timestamp):
+            return timestamp < cutoff
+        }
+    }
+
+    private func queryTimelineFramesWithSecondariesNative(
+        mode: TimelinePrimaryMode,
+        limit: Int,
+        filters: FilterCriteria?
+    ) throws -> [TimelineFramePayload] {
+        let config = retraceConfig
+        let connection = retraceConnection
+
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        typealias Binder = (OpaquePointer, Int32) -> Void
+        var prefixBinders: [Binder] = []
+        var binders: [Binder] = []
+        var whereClauses: [String] = []
+
+        func bindDate(_ date: Date, to target: inout [Binder]) {
+            target.append { stmt, idx in
+                config.bindDate(date, to: stmt, at: idx)
+            }
+        }
+
+        func bindText(_ value: String, to target: inout [Binder]) {
+            target.append { stmt, idx in
+                sqlite3_bind_text(stmt, idx, value, -1, sqliteTransient)
+            }
+        }
+
+        func bindInt(_ value: Int32, to target: inout [Binder]) {
+            target.append { stmt, idx in
+                sqlite3_bind_int(stmt, idx, value)
+            }
+        }
+
+        func bindInt64(_ value: Int64, to target: inout [Binder]) {
+            target.append { stmt, idx in
+                sqlite3_bind_int64(stmt, idx, value)
+            }
+        }
+
+        switch mode {
+        case .range(let start, let end):
+            whereClauses.append("f.createdAt >= ?")
+            bindDate(start, to: &binders)
+            whereClauses.append("f.createdAt <= ?")
+            bindDate(config.applyCutoff(to: end), to: &binders)
+        case .before(let timestamp):
+            whereClauses.append("f.createdAt < ?")
+            bindDate(config.applyCutoff(to: timestamp), to: &binders)
+        case .after(let timestamp):
+            whereClauses.append("f.createdAt > ?")
+            bindDate(timestamp, to: &binders)
+        case .mostRecent:
+            break
+        }
+
+        if let apps = filters?.selectedApps, !apps.isEmpty {
+            whereClauses.append(buildAppFilterClause(apps: apps, mode: filters?.appFilterMode ?? .include))
+            for app in apps {
+                bindText(app, to: &binders)
+            }
+        }
+
+        if let browserUrlPattern = filters?.browserUrlFilter, !browserUrlPattern.isEmpty {
+            let urlFilter = buildBrowserUrlFilterClause(urlPattern: browserUrlPattern)
+            whereClauses.append(urlFilter.clause)
+            bindText("%\(browserUrlPattern)%", to: &binders)
+        }
+
+        if let windowName = filters?.windowNameFilter, !windowName.isEmpty {
+            whereClauses.append("s.windowName LIKE ?")
+            bindText("%\(windowName)%", to: &binders)
+        }
+
+        if let startDate = filters?.startDate {
+            whereClauses.append("f.createdAt >= ?")
+            bindDate(startDate, to: &binders)
+        }
+        if let endDate = filters?.endDate {
+            whereClauses.append("f.createdAt <= ?")
+            bindDate(endDate, to: &binders)
+        }
+
+        if let displayID = filters?.displayID {
+            whereClauses.append("f.displayID = ?")
+            bindInt(Int32(displayID), to: &binders)
+        }
+        if filters?.focusedOnly == true {
+            whereClauses.append("f.isFocused = 1")
+        }
+
+        let hiddenTagId = cachedHiddenTagId
+        var tagsToFilter = filters?.selectedTags ?? Set<Int64>()
+        if filters?.hiddenFilter == .onlyHidden, let hiddenTagId {
+            tagsToFilter = [hiddenTagId]
+        }
+        let sortedTags = Array(tagsToFilter).sorted()
+        let hasTagFilter = !sortedTags.isEmpty
+        let tagFilterMode = filters?.tagFilterMode ?? .include
+
+        var cteParts: [String] = []
+        var tagJoin = ""
+        if hasTagFilter && tagFilterMode == .include {
+            let placeholders = Array(repeating: "?", count: sortedTags.count).joined(separator: ", ")
+            cteParts.append(
+                """
+                tagged_segments AS (
+                    SELECT DISTINCT segmentId
+                    FROM segment_tag
+                    WHERE tagId IN (\(placeholders))
+                )
+                """
+            )
+            tagJoin = "INNER JOIN tagged_segments ts ON f.segmentId = ts.segmentId"
+            for tag in sortedTags {
+                bindInt64(tag, to: &prefixBinders)
+            }
+        }
+
+        if hasTagFilter && tagFilterMode == .exclude {
+            let placeholders = Array(repeating: "?", count: sortedTags.count).joined(separator: ", ")
+            whereClauses.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                      AND st_exclude.tagId IN (\(placeholders))
+                )
+                """
+            )
+            for tag in sortedTags {
+                bindInt64(tag, to: &binders)
+            }
+        }
+
+        if filters?.hiddenFilter == .hide, let hiddenTagId {
+            whereClauses.append(
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                      AND st_hidden.tagId = ?
+                )
+                """
+            )
+            bindInt64(hiddenTagId, to: &binders)
+        }
+
+        // Always exclude non-readable frames for native timeline queries.
+        whereClauses.append("f.processingStatus != 4")
+
+        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
+        bindInt(Int32(limit), to: &binders)
+
+        let orderDirection = mode.orderDirection
+        cteParts.append(
+            """
+            primary_frames AS (
+                SELECT
+                    f.id,
+                    f.createdAt,
+                    f.segmentId,
+                    f.videoId,
+                    f.videoFrameIndex,
+                    f.encodingStatus,
+                    f.processingStatus,
+                    s.bundleID,
+                    s.windowName,
+                    s.browserUrl,
+                    v.path,
+                    v.frameRate,
+                    v.width,
+                    v.height,
+                    f.displayID,
+                    f.isFocused
+                FROM frame f
+                INNER JOIN segment s ON f.segmentId = s.id
+                \(tagJoin)
+                LEFT JOIN video v ON f.videoId = v.id
+                \(whereClause)
+                ORDER BY f.createdAt \(orderDirection)
+                LIMIT ?
+            ),
+            connected_secondary AS (
+                SELECT
+                    p.id AS primary_id,
+                    p.createdAt AS primary_ts,
+                    ds.displayID AS secondary_display_id
+                FROM primary_frames p
+                JOIN display_session ds
+                  ON ds.connectedAt <= p.createdAt
+                 AND (ds.disconnectedAt IS NULL OR ds.disconnectedAt >= p.createdAt)
+                 AND ds.displayID <> p.displayID
+            ),
+            ranked_secondary AS (
+                SELECT
+                    cs.primary_id,
+                    cs.secondary_display_id,
+                    sf.id AS secondary_frame_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY cs.primary_id, cs.secondary_display_id
+                        ORDER BY sf.createdAt DESC, sf.id DESC
+                    ) AS rn
+                FROM connected_secondary cs
+                LEFT JOIN frame sf
+                  ON sf.displayID = cs.secondary_display_id
+                 AND sf.createdAt <= cs.primary_ts
+            )
+            """
+        )
+
+        let sql = """
+            WITH \(cteParts.joined(separator: ",\n"))
+            SELECT
+                p.id,
+                p.createdAt,
+                p.segmentId,
+                p.videoId,
+                p.videoFrameIndex,
+                p.encodingStatus,
+                p.processingStatus,
+                p.bundleID,
+                p.windowName,
+                p.browserUrl,
+                p.path,
+                p.frameRate,
+                p.width,
+                p.height,
+                p.displayID,
+                p.isFocused,
+                rs.secondary_display_id,
+                sf.videoFrameIndex,
+                sv.path,
+                sv.frameRate,
+                sv.width,
+                sv.height
+            FROM primary_frames p
+            LEFT JOIN ranked_secondary rs
+              ON rs.primary_id = p.id AND rs.rn = 1
+            LEFT JOIN frame sf ON sf.id = rs.secondary_frame_id
+            LEFT JOIN video sv ON sv.id = sf.videoId
+            ORDER BY p.createdAt \(orderDirection), rs.secondary_display_id ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+        for binder in prefixBinders {
+            binder(statement, bindIndex)
+            bindIndex += 1
+        }
+        for binder in binders {
+            binder(statement, bindIndex)
+            bindIndex += 1
+        }
+
+        struct TimelinePrimaryAccumulator {
+            let frame: FrameReference
+            let videoInfo: FrameVideoInfo?
+            let processingStatus: Int
+            var secondaryFrames: [SecondaryDisplayFrameInfo]
+        }
+
+        var orderedPrimaryIDs: [Int64] = []
+        var primaryByID: [Int64: TimelinePrimaryAccumulator] = [:]
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let primaryID = sqlite3_column_int64(statement, 0)
+
+            if primaryByID[primaryID] == nil {
+                guard let timestamp = config.parseDate(from: statement, column: 1) else { continue }
+
+                let segmentID = AppSegmentID(value: sqlite3_column_int64(statement, 2))
+                let videoID = VideoSegmentID(value: sqlite3_column_int64(statement, 3))
+                let frameIndexInSegment = Int(sqlite3_column_int(statement, 4))
+
+                let encodingStatusText = sqlite3_column_text(statement, 5)
+                let encodingStatusString = encodingStatusText != nil ? String(cString: encodingStatusText!) : "pending"
+                let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
+
+                let processingStatus = Int(sqlite3_column_int(statement, 6))
+                let bundleID = getTextOrNil(statement, 7) ?? ""
+                let windowName = getTextOrNil(statement, 8)
+                let browserURL = getTextOrNil(statement, 9)
+                let displayID = UInt32(sqlite3_column_int(statement, 14))
+                let isFocused = sqlite3_column_int(statement, 15) != 0
+
+                let metadata = FrameMetadata(
+                    appBundleID: bundleID.isEmpty ? nil : bundleID,
+                    appName: bundleID.components(separatedBy: ".").last,
+                    windowName: windowName,
+                    browserURL: browserURL,
+                    displayID: displayID,
+                    isFocused: isFocused
+                )
+
+                let frame = FrameReference(
+                    id: FrameID(value: primaryID),
+                    timestamp: timestamp,
+                    segmentID: segmentID,
+                    videoID: videoID,
+                    frameIndexInSegment: frameIndexInSegment,
+                    encodingStatus: encodingStatus,
+                    metadata: metadata,
+                    source: .native
+                )
+
+                let videoInfo: FrameVideoInfo?
+                if let relativePath = getTextOrNil(statement, 10) {
+                    let frameRate = sqlite3_column_double(statement, 11)
+                    let width = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
+                    let height = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
+
+                    videoInfo = FrameVideoInfo(
+                        videoPath: "\(config.storageRoot)/\(relativePath)",
+                        frameIndex: frameIndexInSegment,
+                        frameRate: frameRate,
+                        width: width,
+                        height: height
+                    )
+                } else {
+                    videoInfo = nil
+                }
+
+                primaryByID[primaryID] = TimelinePrimaryAccumulator(
+                    frame: frame,
+                    videoInfo: videoInfo,
+                    processingStatus: processingStatus,
+                    secondaryFrames: []
+                )
+                orderedPrimaryIDs.append(primaryID)
+            }
+
+            if sqlite3_column_type(statement, 16) != SQLITE_NULL {
+                let secondaryDisplayID = UInt32(sqlite3_column_int(statement, 16))
+                if secondaryDisplayID != 0 {
+                    let secondaryVideoInfo: FrameVideoInfo?
+                    if let secondaryPath = getTextOrNil(statement, 18) {
+                        let secondaryFrameIndex = Int(sqlite3_column_int(statement, 17))
+                        let secondaryFrameRate = sqlite3_column_double(statement, 19)
+                        let secondaryWidth = sqlite3_column_type(statement, 20) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 20)) : nil
+                        let secondaryHeight = sqlite3_column_type(statement, 21) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 21)) : nil
+
+                        secondaryVideoInfo = FrameVideoInfo(
+                            videoPath: "\(config.storageRoot)/\(secondaryPath)",
+                            frameIndex: secondaryFrameIndex,
+                            frameRate: secondaryFrameRate,
+                            width: secondaryWidth,
+                            height: secondaryHeight
+                        )
+                    } else {
+                        secondaryVideoInfo = nil
+                    }
+
+                    if var primary = primaryByID[primaryID],
+                       !primary.secondaryFrames.contains(where: { $0.displayID == secondaryDisplayID }) {
+                        primary.secondaryFrames.append(
+                            SecondaryDisplayFrameInfo(
+                                displayID: secondaryDisplayID,
+                                videoInfo: secondaryVideoInfo
+                            )
+                        )
+                        primaryByID[primaryID] = primary
+                    }
+                }
+            }
+        }
+
+        return orderedPrimaryIDs.compactMap { primaryID in
+            guard let primary = primaryByID[primaryID] else { return nil }
+            return TimelineFramePayload(
+                frame: primary.frame,
+                videoInfo: primary.videoInfo,
+                processingStatus: primary.processingStatus,
+                secondaryFrames: primary.secondaryFrames
+            )
+        }
+    }
+
+    /// Get the nearest frame for a specific display at or before a given timestamp.
+    /// Used for PIP carry-forward when a secondary display has no exact frame at the current timestamp.
+    public func getNearestFrame(displayID: UInt32, before timestamp: Date) async throws -> FrameWithVideoInfo? {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let config = retraceConfig
+        let connection = retraceConnection
+
+        let processingStatusColumn = "f.processingStatus"
+
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height,
+                   f.displayID, f.isFocused
+            FROM frame f
+            LEFT JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE f.displayID = ? AND f.createdAt <= ?
+            ORDER BY f.createdAt DESC
+            LIMIT 1
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return nil }
+        defer { connection.finalize(statement) }
+
+        sqlite3_bind_int(statement, 1, Int32(displayID))
+        config.bindDate(timestamp, to: statement, at: 2)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+
+        return try parseFrameWithVideoInfo(statement: statement, config: config)
+    }
+
+    /// Get secondary display payloads for a set of primary frame IDs using one SQL query.
+    /// For each primary frame and connected secondary display, returns the exact timestamp match
+    /// when available, otherwise nearest frame at or before the primary timestamp.
+    public func getSecondaryDisplayFrames(forPrimaryFrameIDs primaryFrameIDs: [FrameID]) async throws -> [Int64: [SecondaryDisplayFrameInfo]] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        guard !primaryFrameIDs.isEmpty else {
+            return [:]
+        }
+
+        let config = retraceConfig
+        let connection = retraceConnection
+        let frameIDList = primaryFrameIDs.map { String($0.value) }.joined(separator: ", ")
+
+        let sql = """
+            WITH primary_frames AS (
+                SELECT f.id, f.createdAt, f.displayID
+                FROM frame f
+                WHERE f.id IN (\(frameIDList))
+            ),
+            connected_secondary AS (
+                SELECT
+                    p.id AS primary_id,
+                    p.createdAt AS primary_ts,
+                    ds.displayID AS secondary_display_id
+                FROM primary_frames p
+                JOIN display_session ds
+                  ON ds.connectedAt <= p.createdAt
+                 AND (ds.disconnectedAt IS NULL OR ds.disconnectedAt >= p.createdAt)
+                 AND ds.displayID <> p.displayID
+            ),
+            ranked_secondary AS (
+                SELECT
+                    cs.primary_id,
+                    cs.secondary_display_id,
+                    sf.id AS secondary_frame_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY cs.primary_id, cs.secondary_display_id
+                        ORDER BY sf.createdAt DESC, sf.id DESC
+                    ) AS rn
+                FROM connected_secondary cs
+                LEFT JOIN frame sf
+                  ON sf.displayID = cs.secondary_display_id
+                 AND sf.createdAt <= cs.primary_ts
+            )
+            SELECT
+                rs.primary_id,
+                rs.secondary_display_id,
+                sf.videoFrameIndex,
+                v.path,
+                v.frameRate,
+                v.width,
+                v.height
+            FROM ranked_secondary rs
+            LEFT JOIN frame sf ON sf.id = rs.secondary_frame_id
+            LEFT JOIN video v ON v.id = sf.videoId
+            WHERE rs.rn = 1
+            ORDER BY rs.primary_id ASC, rs.secondary_display_id ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else {
+            return [:]
+        }
+        defer { connection.finalize(statement) }
+
+        var secondaryByPrimaryFrameID: [Int64: [SecondaryDisplayFrameInfo]] = [:]
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let primaryFrameID = sqlite3_column_int64(statement, 0)
+            let secondaryDisplayID = UInt32(sqlite3_column_int(statement, 1))
+            guard secondaryDisplayID != 0 else { continue }
+
+            let videoInfo: FrameVideoInfo?
+            if sqlite3_column_type(statement, 3) != SQLITE_NULL {
+                let frameIndex = Int(sqlite3_column_int(statement, 2))
+                let relativePath = String(cString: sqlite3_column_text(statement, 3))
+                let frameRate = sqlite3_column_double(statement, 4)
+                let width = sqlite3_column_type(statement, 5) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 5)) : nil
+                let height = sqlite3_column_type(statement, 6) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 6)) : nil
+
+                videoInfo = FrameVideoInfo(
+                    videoPath: "\(config.storageRoot)/\(relativePath)",
+                    frameIndex: frameIndex,
+                    frameRate: frameRate,
+                    width: width,
+                    height: height
+                )
+            } else {
+                videoInfo = nil
+            }
+
+            secondaryByPrimaryFrameID[primaryFrameID, default: []].append(
+                SecondaryDisplayFrameInfo(
+                    displayID: secondaryDisplayID,
+                    videoInfo: videoInfo
+                )
+            )
+        }
+
+        return secondaryByPrimaryFrameID
+    }
+
+    /// Get distinct display IDs that have frames in the given time range.
+    /// Used to discover which displays were active for PIP display.
+    public func getDistinctDisplayIDs(from startDate: Date, to endDate: Date) async throws -> [UInt32] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let config = retraceConfig
+        let connection = retraceConnection
+
+        let sql = """
+            SELECT DISTINCT displayID
+            FROM frame
+            WHERE createdAt >= ? AND createdAt <= ?
+            ORDER BY displayID ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(startDate, to: statement, at: 1)
+        config.bindDate(endDate, to: statement, at: 2)
+
+        var displayIDs: [UInt32] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let displayID = UInt32(sqlite3_column_int(statement, 0))
+            displayIDs.append(displayID)
+        }
+
+        return displayIDs
+    }
+
+    /// Get distinct display IDs for a time range with persisted display names.
+    /// Uses a CTE so range filtering happens before joining the display lookup table.
+    public func getDistinctDisplaysWithNames(from startDate: Date, to endDate: Date) async throws -> [(displayID: UInt32, displayName: String?)] {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let config = retraceConfig
+        let connection = retraceConnection
+
+        let sql = """
+            WITH display_ids AS (
+                SELECT DISTINCT f.displayID
+                FROM frame f
+                WHERE f.createdAt >= ? AND f.createdAt <= ?
+            )
+            SELECT ids.displayID, d.name
+            FROM display_ids ids
+            LEFT JOIN display d ON d.displayID = ids.displayID
+            ORDER BY ids.displayID ASC
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        config.bindDate(startDate, to: statement, at: 1)
+        config.bindDate(endDate, to: statement, at: 2)
+
+        var displays: [(displayID: UInt32, displayName: String?)] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let displayID = UInt32(sqlite3_column_int(statement, 0))
+            let displayName: String?
+            if let nameCString = sqlite3_column_text(statement, 1) {
+                displayName = String(cString: nameCString)
+            } else {
+                displayName = nil
+            }
+            displays.append((displayID: displayID, displayName: displayName))
+        }
+
+        return displays
+    }
+
     // MARK: - URL Bounding Box Detection
 
     /// Get bounding box for URL in a frame's OCR text
@@ -870,6 +1629,60 @@ public actor DataAdapter {
 
     // MARK: - Private SQL Query Methods
 
+    private func displayColumnProjection(config: DatabaseConfig, tableAlias: String = "f") -> String {
+        if config.source == .rewind {
+            return "0 AS displayID, 1 AS isFocused"
+        }
+        return "\(tableAlias).displayID, \(tableAlias).isFocused"
+    }
+
+    private func subqueryDisplayColumnProjection(config: DatabaseConfig) -> String {
+        if config.source == .rewind {
+            return "0 AS displayID, 1 AS isFocused"
+        }
+        return "displayID, isFocused"
+    }
+
+    /// Appends display-focused predicates and returns true when query should short-circuit to empty.
+    private func applyDisplayFilters(
+        filters: FilterCriteria?,
+        config: DatabaseConfig,
+        whereClauses: inout [String],
+        tableAlias: String = "f"
+    ) -> Bool {
+        guard let filters = filters else { return false }
+
+        if let displayID = filters.displayID {
+            if config.source == .rewind {
+                if displayID != 0 {
+                    return true
+                }
+            } else {
+                whereClauses.append("\(tableAlias).displayID = ?")
+            }
+        }
+
+        if filters.focusedOnly == true, config.source != .rewind {
+            whereClauses.append("\(tableAlias).isFocused = 1")
+        }
+
+        return false
+    }
+
+    private func bindDisplayFilters(
+        filters: FilterCriteria?,
+        config: DatabaseConfig,
+        statement: OpaquePointer,
+        bindIndex: inout Int
+    ) {
+        guard let filters = filters else { return }
+
+        if let displayID = filters.displayID, config.source != .rewind {
+            sqlite3_bind_int(statement, Int32(bindIndex), Int32(displayID))
+            bindIndex += 1
+        }
+    }
+
     private func queryFramesWithVideoInfo(
         from startDate: Date,
         to endDate: Date,
@@ -889,6 +1702,10 @@ public actor DataAdapter {
         if let apps = filters?.selectedApps, !apps.isEmpty {
             let filterMode = filters?.appFilterMode ?? .include
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
+        }
+
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
         }
 
         // Tag filter - need to join with segment_tag
@@ -922,7 +1739,8 @@ public actor DataAdapter {
                 v.path,
                 v.frameRate,
                 v.width,
-                v.height
+                v.height,
+                \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -945,6 +1763,8 @@ public actor DataAdapter {
             }
             bindIndex += apps.count
         }
+
+        bindDisplayFilters(filters: filters, config: config, statement: statement, bindIndex: &bindIndex)
 
         // Bind tag IDs
         if let tags = filters?.selectedTags, !tags.isEmpty {
@@ -973,6 +1793,12 @@ public actor DataAdapter {
         config: DatabaseConfig,
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        var whereClauses: [String] = []
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+        let whereClause = whereClauses.isEmpty ? "" : "WHERE " + whereClauses.joined(separator: " AND ")
+
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
@@ -980,15 +1806,18 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus),
+                       \(subqueryDisplayColumnProjection(config: config))
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
+            \(whereClause)
             ORDER BY f.createdAt DESC
             """
 
@@ -996,6 +1825,8 @@ public actor DataAdapter {
         defer { connection.finalize(statement) }
 
         sqlite3_bind_int(statement, 1, Int32(limit))
+        var bindIndex = 2
+        bindDisplayFilters(filters: filters, config: config, statement: statement, bindIndex: &bindIndex)
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1104,6 +1935,10 @@ public actor DataAdapter {
             whereClauses.append("f.createdAt <= ?")
         }
 
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+
         // Tag exclude filter: Exclude segments that have any of the selected tags
         if hasTagFilter && tagFilterMode == .exclude {
             let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
@@ -1143,7 +1978,8 @@ public actor DataAdapter {
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1225,6 +2061,8 @@ public actor DataAdapter {
             config.bindDate(endDate, to: stmt, at: Int32(bindIndex))
             bindIndex += 1
         }
+
+        bindDisplayFilters(filters: filters, config: config, statement: stmt, bindIndex: &bindIndex)
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
@@ -1376,6 +2214,10 @@ public actor DataAdapter {
             whereClauses.append("f.createdAt <= ?")
         }
 
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+
         // Tag exclude filter: Exclude segments that have any of the selected tags
         if hasTagFilter && tagFilterMode == .exclude {
             let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
@@ -1415,7 +2257,8 @@ public actor DataAdapter {
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1473,6 +2316,8 @@ public actor DataAdapter {
             config.bindDate(endDate, to: statement, at: Int32(currentBindIndex))
             currentBindIndex += 1
         }
+
+        bindDisplayFilters(filters: filters, config: config, statement: statement, bindIndex: &currentBindIndex)
 
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
@@ -1597,6 +2442,10 @@ public actor DataAdapter {
             whereClauses.append("f.createdAt <= ?")
         }
 
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+
         // Tag exclude filter: Exclude segments that have any of the selected tags
         if hasTagFilter && tagFilterMode == .exclude {
             let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
@@ -1636,7 +2485,8 @@ public actor DataAdapter {
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1695,6 +2545,8 @@ public actor DataAdapter {
             currentBindIndex += 1
         }
 
+        bindDisplayFilters(filters: filters, config: config, statement: statement, bindIndex: &currentBindIndex)
+
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
             for (index, tagId) in tagsToFilter.enumerated() {
@@ -1738,11 +2590,13 @@ public actor DataAdapter {
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
         var bindIndex = 1
 
-        // Build tag filter including hidden filter logic
-        var tagsToFilter = filters.selectedTags ?? Set<Int64>()
+        // Build tag filter including hidden filter logic.
+        // Rewind database doesn't have segment_tag, so skip tag predicates there.
+        let shouldApplyTagFilters = config.source != .rewind
+        var tagsToFilter = shouldApplyTagFilters ? (filters.selectedTags ?? Set<Int64>()) : Set<Int64>()
 
         // Apply hidden filter logic
-        if let hiddenTagId = cachedHiddenTagId {
+        if shouldApplyTagFilters, let hiddenTagId = cachedHiddenTagId {
             switch filters.hiddenFilter {
             case .hide:
                 break
@@ -1807,6 +2661,10 @@ public actor DataAdapter {
             whereClauses.append("s.windowName LIKE ?")
         }
 
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+
         // Tag exclude filter: Exclude segments that have any of the selected tags
         if hasTagFilter && tagFilterMode == .exclude {
             let tagPlaceholders = tagsToFilter.map { _ in "?" }.joined(separator: ", ")
@@ -1841,7 +2699,8 @@ public actor DataAdapter {
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -1894,6 +2753,8 @@ public actor DataAdapter {
             currentBindIndex += 1
         }
 
+        bindDisplayFilters(filters: filters, config: config, statement: statement, bindIndex: &currentBindIndex)
+
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
             for (index, tagId) in tagsToFilter.enumerated() {
@@ -1941,6 +2802,10 @@ public actor DataAdapter {
             whereClauses.append(buildAppFilterClause(apps: apps, mode: filterMode))
         }
 
+        if applyDisplayFilters(filters: filters, config: config, whereClauses: &whereClauses) {
+            return []
+        }
+
         // Tag filter - need to join with segment_tag
         let needsTagJoin = filters?.selectedTags != nil && !(filters?.selectedTags!.isEmpty ?? true)
         let tagJoin = needsTagJoin ? """
@@ -1952,6 +2817,19 @@ public actor DataAdapter {
             whereClauses.append("st.tagId IN (\(placeholders))")
         }
 
+        if let displayID = filters?.displayID {
+            if config.source == .rewind {
+                if displayID != 0 {
+                    return []
+                }
+            } else {
+                whereClauses.append("displayID = ?")
+            }
+        }
+        if filters?.focusedOnly == true, config.source != .rewind {
+            whereClauses.append("isFocused = 1")
+        }
+
         let whereClause = whereClauses.joined(separator: " AND ")
 
         // Rewind database doesn't have processingStatus column
@@ -1961,9 +2839,11 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus),
+                       \(subqueryDisplayColumnProjection(config: config))
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -1995,6 +2875,11 @@ public actor DataAdapter {
                 sqlite3_bind_int64(statement, Int32(bindIndex + index), tagId)
             }
             bindIndex += tags.count
+        }
+
+        if let displayID = filters?.displayID, config.source != .rewind {
+            sqlite3_bind_int(statement, Int32(bindIndex), Int32(displayID))
+            bindIndex += 1
         }
 
         // Bind limit
@@ -2038,6 +2923,19 @@ public actor DataAdapter {
             whereClauses.append("st.tagId IN (\(placeholders))")
         }
 
+        if let displayID = filters?.displayID {
+            if config.source == .rewind {
+                if displayID != 0 {
+                    return []
+                }
+            } else {
+                whereClauses.append("displayID = ?")
+            }
+        }
+        if filters?.focusedOnly == true, config.source != .rewind {
+            whereClauses.append("isFocused = 1")
+        }
+
         let whereClause = whereClauses.joined(separator: " AND ")
 
         // Rewind database doesn't have processingStatus column
@@ -2047,9 +2945,11 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus),
+                       \(subqueryDisplayColumnProjection(config: config))
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2083,6 +2983,11 @@ public actor DataAdapter {
             bindIndex += tags.count
         }
 
+        if let displayID = filters?.displayID, config.source != .rewind {
+            sqlite3_bind_int(statement, Int32(bindIndex), Int32(displayID))
+            bindIndex += 1
+        }
+
         // Bind limit
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
@@ -2107,7 +3012,8 @@ public actor DataAdapter {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
                    s.bundleID, s.windowName, s.browserUrl,
-                   v.path, v.frameRate, v.width, v.height
+                   v.path, v.frameRate, v.width, v.height,
+                   \(displayColumnProjection(config: config, tableAlias: "f"))
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
@@ -3084,12 +3990,16 @@ public actor DataAdapter {
         let width = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
         let height = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
 
+        let displayID = UInt32(sqlite3_column_int(statement, 14))
+        let isFocused = sqlite3_column_int(statement, 15) != 0
+
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
             appName: bundleID.components(separatedBy: ".").last,
             windowName: windowName,
             browserURL: browserUrl,
-            displayID: 0
+            displayID: displayID,
+            isFocused: isFocused
         )
 
         let frame = FrameReference(

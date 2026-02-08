@@ -616,6 +616,9 @@ extension CaptureConfig {
         // Capture on window change - instantly capture when switching apps/windows
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
 
+        // Multi-display recording - opt-in via settings
+        let recordAllDisplays = defaults.object(forKey: "recordAllDisplays") as? Bool ?? false
+
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
@@ -624,7 +627,8 @@ extension CaptureConfig {
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,
             showCursor: showCursor,
-            captureOnWindowChange: captureOnWindowChange
+            captureOnWindowChange: captureOnWindowChange,
+            recordAllDisplays: recordAllDisplays
         )
     }
 }

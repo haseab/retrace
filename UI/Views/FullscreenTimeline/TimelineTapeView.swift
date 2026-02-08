@@ -37,25 +37,39 @@ public struct TimelineTapeView: View {
     // MARK: - Body
 
     public var body: some View {
-        ZStack {
-            // Background (tap to clear selection)
-            Rectangle()
-                .fill(Color.clear)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    viewModel.clearSelection()
+        VStack(spacing: 0) {
+            ZStack {
+                // Background (tap to clear selection)
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        viewModel.clearSelection()
+                    }
+
+                // Scrollable tape content (right-click handled per-frame)
+                // Use id to force view recreation on peek toggle, enabling transition animation
+                tapeContent
+                    .id("tape-\(viewModel.isPeeking)")
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+
+                // Fixed center playhead (on top of everything)
+                playhead
+            }
+            .frame(height: tapeHeight)
+
+            // Secondary display activity strip (thin indicator below tape)
+            if viewModel.availableDisplayIDs.count > 1 {
+                HStack(spacing: 4) {
+                    ForEach(viewModel.secondaryDisplayFrames, id: \.displayID) { secondary in
+                        Circle()
+                            .fill(secondary.videoInfo != nil ? Color.cyan.opacity(0.7) : Color.gray.opacity(0.3))
+                            .frame(width: 5, height: 5)
+                    }
                 }
-
-            // Scrollable tape content (right-click handled per-frame)
-            // Use id to force view recreation on peek toggle, enabling transition animation
-            tapeContent
-                .id("tape-\(viewModel.isPeeking)")
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-
-            // Fixed center playhead (on top of everything)
-            playhead
+                .frame(height: 8)
+            }
         }
-        .frame(height: tapeHeight)
         .animation(.easeInOut(duration: 0.2), value: viewModel.isPeeking)
     }
 

@@ -14,8 +14,8 @@ enum FrameQueries {
     static func insert(db: OpaquePointer, frame: FrameReference) throws -> Int64 {
         let sql = """
             INSERT INTO frame (
-                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, processingStatus
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 4);
+                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, processingStatus, displayID, isFocused
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 4, ?, ?);
             """
 
         var statement: OpaquePointer?
@@ -58,6 +58,12 @@ enum FrameQueries {
 
         // encodingStatus: "pending", "success", "failed"
         sqlite3_bind_text(statement, 7, frame.encodingStatus.rawValue, -1, SQLITE_TRANSIENT)
+
+        // displayID: which physical display captured this frame
+        sqlite3_bind_int(statement, 8, Int32(frame.metadata.displayID))
+
+        // isFocused: was user looking at this display (1 = yes, 0 = secondary)
+        sqlite3_bind_int(statement, 9, frame.metadata.isFocused ? 1 : 0)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -107,7 +113,8 @@ enum FrameQueries {
     static func getByID(db: OpaquePointer, id: FrameID) throws -> FrameReference? {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.id = ?;
@@ -144,7 +151,8 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -186,7 +194,8 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt < ?
@@ -227,7 +236,8 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ?
@@ -264,7 +274,8 @@ enum FrameQueries {
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             ORDER BY f.createdAt DESC
@@ -304,7 +315,8 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             WHERE s.bundleID = ?
@@ -343,7 +355,8 @@ enum FrameQueries {
     static func getFramesPendingVideoEncoding(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   s.bundleID, s.windowName, s.browserUrl,
+                   f.displayID, f.isFocused
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.videoId IS NULL
@@ -580,11 +593,17 @@ enum FrameQueries {
         let windowName = getTextOrNil(statement, 8)
         let browserURL = getTextOrNil(statement, 9)
 
+        // Columns 10-11: multi-display fields
+        let displayID = UInt32(sqlite3_column_int(statement, 10))
+        let isFocused = sqlite3_column_int(statement, 11) != 0
+
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
             appName: nil, // Not stored in Rewind schema
             windowName: windowName,
-            browserURL: browserURL
+            browserURL: browserURL,
+            displayID: displayID,
+            isFocused: isFocused
         )
 
         return FrameReference(
@@ -860,7 +879,8 @@ enum FrameQueries {
             appName: nil,  // App name not stored in segment table
             windowName: windowName,
             browserURL: nil,  // Browser URL not stored in simple segment table
-            displayID: 0  // Display ID not stored in segment table
+            displayID: 0,  // Display ID populated from frame table when available
+            isFocused: true  // Default to focused for backward compatibility
         )
 
         let frame = FrameReference(

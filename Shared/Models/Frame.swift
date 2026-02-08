@@ -42,18 +42,24 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Display ID that was captured
     public let displayID: UInt32
 
+    /// Whether this frame was captured from the focused (active) display
+    /// true = user was looking at this display, false = secondary display
+    public let isFocused: Bool
+
     public init(
         appBundleID: String? = nil,
         appName: String? = nil,
         windowName: String? = nil,
         browserURL: String? = nil,
-        displayID: UInt32 = 0
+        displayID: UInt32 = 0,
+        isFocused: Bool = true
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
         self.windowName = windowName
         self.browserURL = browserURL
         self.displayID = displayID
+        self.isFocused = isFocused
     }
 
     public static let empty = FrameMetadata()
@@ -332,17 +338,26 @@ public struct UnfinalisedVideo: Sendable, Equatable {
     /// Video height in pixels
     public let height: Int
 
-    /// Resolution string for use as dictionary key
+    /// Display ID that produced this video (for multi-display support)
+    public let displayID: UInt32
+
+    /// Writer key combining displayID and resolution for unique video writer lookup
+    public var writerKey: String {
+        "\(displayID)_\(width)x\(height)"
+    }
+
+    /// Legacy resolution-only key (for backward compatibility)
     public var resolutionKey: String {
         "\(width)x\(height)"
     }
 
-    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int) {
+    public init(id: Int64, relativePath: String, frameCount: Int, width: Int, height: Int, displayID: UInt32 = 0) {
         self.id = id
         self.relativePath = relativePath
         self.frameCount = frameCount
         self.width = width
         self.height = height
+        self.displayID = displayID
     }
 }
 

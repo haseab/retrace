@@ -109,3 +109,4 @@ scripts/create-dmg.sh
 
 # Release artifacts
 releases/
+.build_codex_check/

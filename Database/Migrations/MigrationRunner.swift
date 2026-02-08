@@ -93,7 +93,8 @@ actor MigrationRunner {
             V3_TagSystem(),
             V4_DailyMetrics(),
             V5_FTSUnicode61(),
-            V6_FrameProcessedAt()
+            V6_FrameProcessedAt(),
+            V7_MultiDisplaySupport()
         ]
     }
 
