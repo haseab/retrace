@@ -42,6 +42,7 @@ rm -rf .build/
 ```
 retrace/
 ├── AGENTS.md                    # This file - main agent coordination
+├── .env.example                 # Template for local release credentials (copy to .env)
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration

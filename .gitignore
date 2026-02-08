@@ -1,3 +1,6 @@
+# Wrangler
+.wrangler/
+
 # Dependencies
 .build
 node_modules/

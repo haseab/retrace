@@ -32,6 +32,18 @@ DMG_NAME="Retrace-v${VERSION}.dmg"
 DMG_PATH="${PROJECT_DIR}/build/${DMG_NAME}"
 SPARKLE_SIGN="/Users/haseab/Library/Developer/Xcode/DerivedData/Retrace-geulxxkzgiewidaakescdtxvqmpc/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
 R2_BUCKET="retrace"
+ENV_FILE="${PROJECT_DIR}/.env"
+
+# Load local environment variables for release credentials.
+if [ -f "${ENV_FILE}" ]; then
+    set -a
+    source "${ENV_FILE}"
+    set +a
+fi
+
+: "${APPLE_ID:?Missing APPLE_ID. Set it in ${ENV_FILE} or export it in your shell.}"
+: "${APPLE_TEAM_ID:?Missing APPLE_TEAM_ID. Set it in ${ENV_FILE} or export it in your shell.}"
+: "${APPLE_APP_PASSWORD:?Missing APPLE_APP_PASSWORD. Set it in ${ENV_FILE} or export it in your shell.}"
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  Retrace Release Script v${VERSION}${NC}"
@@ -101,9 +113,9 @@ echo -e "${GREEN}✓ DMG created${NC}"
 # Step 6: Notarize
 echo -e "${YELLOW}[6/10] Notarizing DMG (this may take a few minutes)...${NC}"
 xcrun notarytool submit "${DMG_PATH}" \
-    --apple-id "haseab.amin@gmail.com" \
-    --team-id "5X5W7C3L9D" \
-    --password "hdxm-irfu-tcao-dqma" \
+    --apple-id "${APPLE_ID}" \
+    --team-id "${APPLE_TEAM_ID}" \
+    --password "${APPLE_APP_PASSWORD}" \
     --wait
 echo -e "${GREEN}✓ Notarization complete${NC}"
 
