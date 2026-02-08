@@ -1345,14 +1345,20 @@ public class TimelineWindowController: NSObject {
                     return nil // Always consume the event to prevent propagation
                 }
 
-                // Cmd+L to copy moment link (handle before system can intercept)
+                // Cmd+L to open current browser link (handle before system can intercept)
                 if event.charactersIgnoringModifiers == "l" && modifiers == [.command] {
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
 
-                // Cmd+O to open current browser link (handle before system can intercept)
-                if event.charactersIgnoringModifiers == "o" && modifiers == [.command] {
+                // Cmd+Shift+L to copy moment link (handle before system can intercept)
+                if event.charactersIgnoringModifiers == "l" && modifiers == [.command, .shift] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+; to toggle more options menu (handle before system can intercept)
+                if event.charactersIgnoringModifiers == ";" && modifiers == [.command] {
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1634,18 +1640,28 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Cmd+L to copy moment link
+        // Cmd+L to open current browser link
         if event.charactersIgnoringModifiers == "l" && modifiers == [.command] {
             recordShortcut("cmd+l")
+            if let viewModel = timelineViewModel, viewModel.openCurrentBrowserURL() {
+                hide()
+                return true
+            }
+            return false
+        }
+
+        // Cmd+Shift+L to copy moment link
+        if event.charactersIgnoringModifiers == "l" && modifiers == [.command, .shift] {
+            recordShortcut("cmd+shift+l")
             copyMomentLink()
             return true
         }
 
-        // Cmd+O to open current browser link
-        if event.charactersIgnoringModifiers == "o" && modifiers == [.command] {
-            recordShortcut("cmd+o")
-            if let viewModel = timelineViewModel, viewModel.openCurrentBrowserURL() {
-                hide()
+        // Cmd+; to toggle more options menu
+        if event.charactersIgnoringModifiers == ";" && modifiers == [.command] {
+            recordShortcut("cmd+;")
+            if let viewModel = timelineViewModel {
+                viewModel.toggleMoreOptionsMenu()
                 return true
             }
             return false

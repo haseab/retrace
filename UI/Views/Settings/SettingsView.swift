@@ -849,7 +849,7 @@ public struct SettingsView: View {
                     .background(Color.retraceBorder)
 
                 settingsShortcutRecorderRow(
-                    label: "Report an Issue",
+                    label: "Help",
                     shortcut: $feedbackShortcut,
                     isRecording: $isRecordingFeedbackShortcut,
                     otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, systemMonitorShortcut]

@@ -852,7 +852,7 @@ struct CurrentAppBadge: View {
                         }
                     }
                 }
-                .instantTooltip("Open Link (⌘O)", isVisible: .constant(isHovering))
+                .instantTooltip("Open Link (⌘L)", isVisible: .constant(isHovering))
                 .id(bundleID)
             }
         }
@@ -1280,7 +1280,6 @@ struct MoreOptionsMenu: View {
     @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
     @State private var isButtonHovering = false
     @State private var isMenuHovering = false
-    @State private var showMenu = false
 
     var body: some View {
         Button(action: {
@@ -1288,29 +1287,35 @@ struct MoreOptionsMenu: View {
         }) {
             Image(systemName: "ellipsis")
                 .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
-                .foregroundColor(isButtonHovering || showMenu ? .white : .white.opacity(0.6))
+                .foregroundColor(isButtonHovering || viewModel.isMoreOptionsMenuVisible ? .white : .white.opacity(0.6))
                 .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                .themeAwareCircleStyle(isActive: showMenu, isHovering: isButtonHovering)
+                .themeAwareCircleStyle(isActive: viewModel.isMoreOptionsMenuVisible, isHovering: isButtonHovering)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             isButtonHovering = hovering
             if hovering {
                 NSCursor.pointingHand.push()
-                showMenu = true
+                viewModel.isMoreOptionsMenuVisible = true
             } else {
                 NSCursor.pop()
                 // Delay hiding to allow moving to menu
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                     if !isMenuHovering && !isButtonHovering {
-                        showMenu = false
+                        viewModel.isMoreOptionsMenuVisible = false
                     }
                 }
             }
         }
         .overlay(alignment: .bottomTrailing) {
-            if showMenu {
-                ContextMenuContent(viewModel: viewModel, showMenu: $showMenu)
+            if viewModel.isMoreOptionsMenuVisible {
+                ContextMenuContent(
+                    viewModel: viewModel,
+                    showMenu: Binding(
+                        get: { viewModel.isMoreOptionsMenuVisible },
+                        set: { viewModel.isMoreOptionsMenuVisible = $0 }
+                    )
+                )
                     .retraceMenuContainer()
                     .frame(width: 205)
                     .clipped()
@@ -1321,7 +1326,7 @@ struct MoreOptionsMenu: View {
                             // Delay hiding to allow moving back to button
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                                 if !isMenuHovering && !isButtonHovering {
-                                    showMenu = false
+                                    viewModel.isMoreOptionsMenuVisible = false
                                 }
                             }
                         }
@@ -1330,7 +1335,7 @@ struct MoreOptionsMenu: View {
                     .offset(y: -TimelineScaleFactor.controlButtonSize - 8)
             }
         }
-        .animation(.easeOut(duration: 0.12), value: showMenu)
+        .animation(.easeOut(duration: 0.12), value: viewModel.isMoreOptionsMenuVisible)
     }
 }
 

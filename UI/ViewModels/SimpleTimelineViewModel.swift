@@ -646,6 +646,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Toggle the top-right "more options" menu visibility
+    public func toggleMoreOptionsMenu() {
+        isMoreOptionsMenuVisible.toggle()
+    }
+
+    /// Dismiss the top-right "more options" menu if visible
+    public func dismissMoreOptionsMenu() {
+        isMoreOptionsMenuVisible = false
+    }
+
     // MARK: - Timeline Context Menu State (for right-click on timeline tape)
 
     /// Whether the timeline context menu is visible
