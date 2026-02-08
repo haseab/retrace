@@ -21,11 +21,10 @@ UI/
 │   ├── TimelineViewModel.swift
 │   ├── ThumbnailView.swift
 │   └── TimelineControls.swift
-├── Search/
-│   ├── SearchView.swift
-│   ├── SearchViewModel.swift
-│   ├── SearchResultRow.swift
-│   └── SearchFiltersView.swift
+├── FullscreenTimeline/
+│   ├── SpotlightSearchOverlay.swift
+│   ├── SearchFilterBar.swift
+│   └── TimelineTapeView.swift
 ├── Playback/
 │   ├── PlaybackView.swift
 │   ├── PlaybackViewModel.swift

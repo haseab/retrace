@@ -45,12 +45,12 @@ public struct SearchFilterBar: View {
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
     @State private var showAdvancedDropdown = false
-    @State private var showSortDropdown = false
+    @State private var showSearchOrderDropdown = false
     @State private var isClearFiltersHovered = false
     @State private var tabKeyMonitor: Any?
 
-    /// Filter indices for Tab navigation: 1=Apps, 2=Date, 3=Tags, 4=Visibility, 5=Advanced, 0=back to search
-    private let filterCount = 5
+    /// Filter indices for Tab navigation: 1=Relevance/Newest/Oldest, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Advanced, 0=back to search
+    private let filterCount = 6
 
     // MARK: - Body
 
@@ -72,39 +72,45 @@ public struct SearchFilterBar: View {
     public var body: some View {
         let _ = logToFile("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover), showTagsDropdown=\(showTagsDropdown), showVisibilityDropdown=\(showVisibilityDropdown)")
         HStack(spacing: 10) {
-            // Search mode tabs (Relevant / All)
-            SearchModeTabs(viewModel: viewModel)
-
-            // Sort order dropdown (only visible in "All" mode)
-            if viewModel.searchMode == .all {
-                SortOrderChip(
-                    currentOrder: viewModel.sortOrder,
-                    isOpen: showSortDropdown,
-                    action: {
+            SearchOrderChip(
+                selection: SearchOrderOption.from(
+                    mode: viewModel.searchMode,
+                    sortOrder: viewModel.sortOrder
+                ),
+                isOpen: showSearchOrderDropdown,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showSearchOrderDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showTagsDropdown = false
+                        showVisibilityDropdown = false
+                        showAdvancedDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(isPresented: $showSearchOrderDropdown, yOffset: 56) {
+                SearchOrderPopover(
+                    selection: SearchOrderOption.from(
+                        mode: viewModel.searchMode,
+                        sortOrder: viewModel.sortOrder
+                    ),
+                    onSelect: { option in
+                        switch option {
+                        case .relevance:
+                            viewModel.setSearchModeAndSort(mode: .relevant, sortOrder: nil)
+                        case .newest:
+                            viewModel.setSearchModeAndSort(mode: .all, sortOrder: .newestFirst)
+                        case .oldest:
+                            viewModel.setSearchModeAndSort(mode: .all, sortOrder: .oldestFirst)
+                        }
+                    },
+                    onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
-                            showSortDropdown.toggle()
-                            showAppsDropdown = false
-                            showDatePopover = false
-                            showTagsDropdown = false
-                            showVisibilityDropdown = false
-                            showAdvancedDropdown = false
+                            showSearchOrderDropdown = false
                         }
                     }
                 )
-                .dropdownOverlay(isPresented: $showSortDropdown, yOffset: 56) {
-                    SortOrderPopover(
-                        currentOrder: viewModel.sortOrder,
-                        onSelect: { order in
-                            viewModel.setSearchSortOrder(order)
-                        },
-                        onDismiss: {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                showSortDropdown = false
-                            }
-                        }
-                    )
-                }
-                .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
 
             Divider()
@@ -335,11 +341,11 @@ public struct SearchFilterBar: View {
         }
         .onChange(of: showAppsDropdown) { isOpen in
             debugLog("[SearchFilterBar] showAppsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             debugLog("[SearchFilterBar] isDropdownOpen now: \(viewModel.isDropdownOpen)")
             // Lazy load apps only when dropdown is opened
             if isOpen {
-                viewModel.openFilterSignal = (1, UUID())
+                viewModel.openFilterSignal = (2, UUID())
                 Task {
                     await viewModel.loadAvailableApps()
                 }
@@ -347,35 +353,35 @@ public struct SearchFilterBar: View {
         }
         .onChange(of: showDatePopover) { isOpen in
             debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
-            if isOpen {
-                viewModel.openFilterSignal = (2, UUID())
-            }
-        }
-        .onChange(of: showTagsDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (3, UUID())
             }
         }
-        .onChange(of: showVisibilityDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+        .onChange(of: showTagsDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (4, UUID())
             }
         }
-        .onChange(of: showAdvancedDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showAdvancedDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+        .onChange(of: showVisibilityDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (5, UUID())
             }
         }
-        .onChange(of: showSortDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showSortDropdown changed to: \(isOpen)")
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSortDropdown
+        .onChange(of: showAdvancedDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showAdvancedDropdown changed to: \(isOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (6, UUID())
+            }
+        }
+        .onChange(of: showSearchOrderDropdown) { isOpen in
+            debugLog("[SearchFilterBar] showSearchOrderDropdown changed to: \(isOpen)")
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
             debugLog("[SearchFilterBar] closeDropdownsSignal received: \(newValue)")
@@ -386,7 +392,7 @@ public struct SearchFilterBar: View {
                 showTagsDropdown = false
                 showVisibilityDropdown = false
                 showAdvancedDropdown = false
-                showSortDropdown = false
+                showSearchOrderDropdown = false
             }
         }
         .onChange(of: viewModel.openFilterSignal.id) { _ in
@@ -413,23 +419,25 @@ public struct SearchFilterBar: View {
             showTagsDropdown = false
             showVisibilityDropdown = false
             showAdvancedDropdown = false
-            showSortDropdown = false
+            showSearchOrderDropdown = false
 
             // Open the requested one
             switch index {
             case 1:
+                showSearchOrderDropdown = true
+            case 2:
                 showAppsDropdown = true
                 // Lazy load apps when opening via Tab
                 Task {
                     await viewModel.loadAvailableApps()
                 }
-            case 2:
-                showDatePopover = true
             case 3:
-                showTagsDropdown = true
+                showDatePopover = true
             case 4:
-                showVisibilityDropdown = true
+                showTagsDropdown = true
             case 5:
+                showVisibilityDropdown = true
+            case 6:
                 showAdvancedDropdown = true
             default:
                 // Index 0 means focus search field - parent will handle via onChange
@@ -463,7 +471,7 @@ public struct SearchFilterBar: View {
             let isShiftHeld = event.modifierFlags.contains(.shift)
 
             // Determine current filter by checking the signal's last index
-            // Filter indices: 0=Search, 1=Apps, 2=Date, 3=Tags, 4=Visibility, 5=Advanced
+            // Filter indices: 0=Search, 1=Relevance/Newest/Oldest, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Advanced
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
@@ -472,10 +480,10 @@ public struct SearchFilterBar: View {
             // Calculate next index based on direction
             let nextIndex: Int
             if isShiftHeld {
-                // Shift+Tab: go backward (cycle: 0 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0)
+                // Shift+Tab: go backward (cycle: 0 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0)
                 nextIndex = currentIndex <= 0 ? filterCount : currentIndex - 1
             } else {
-                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 5 -> 0 -> 1)
+                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 0 -> 1)
                 nextIndex = currentIndex >= filterCount ? 0 : currentIndex + 1
             }
 
@@ -735,60 +743,42 @@ private struct AppsFilterChip: View {
     }
 }
 
-// MARK: - Search Mode Tabs
+// MARK: - Search Order Dropdown
 
-private struct SearchModeTabs: View {
-    @ObservedObject var viewModel: SearchViewModel
+private enum SearchOrderOption: CaseIterable {
+    case relevance
+    case newest
+    case oldest
 
-    var body: some View {
-        HStack(spacing: 4) {
-            SearchModeTab(
-                label: "Relevant",
-                isSelected: viewModel.searchMode == .relevant
-            ) {
-                viewModel.setSearchMode(.relevant)
-            }
-
-            SearchModeTab(
-                label: "All",
-                isSelected: viewModel.searchMode == .all
-            ) {
-                viewModel.setSearchMode(.all)
-            }
+    var icon: String {
+        switch self {
+        case .relevance: return "arrow.up.arrow.down"
+        case .newest: return "arrow.down"
+        case .oldest: return "arrow.up"
         }
-        .padding(3)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.08))
-        )
     }
-}
 
-private struct SearchModeTab: View {
-    let label: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    @State private var isHovered = false
-
-    var body: some View {
-        Button(action: action) {
-            Text(label)
-                .font(isSelected ? .retraceCalloutBold : .retraceCalloutMedium)
-                .foregroundColor(isSelected ? .white : .white.opacity(0.6))
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isSelected ? Color.white.opacity(0.2) : (isHovered ? Color.white.opacity(0.1) : Color.clear))
-                )
+    var title: String {
+        switch self {
+        case .relevance: return "Relevance"
+        case .newest: return "Newest"
+        case .oldest: return "Oldest"
         }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            withAnimation(.easeOut(duration: 0.1)) {
-                isHovered = hovering
-            }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .relevance: return "Best semantic match"
+        case .newest: return "Most recent results first"
+        case .oldest: return "Oldest results first"
         }
+    }
+
+    static func from(mode: SearchMode, sortOrder: SearchSortOrder) -> SearchOrderOption {
+        if mode == .relevant {
+            return .relevance
+        }
+        return sortOrder == .oldestFirst ? .oldest : .newest
     }
 }
 
@@ -972,36 +962,20 @@ private struct VisibilityFilterChip: View {
     }
 }
 
-// MARK: - Sort Order Chip
-
-private struct SortOrderChip: View {
-    let currentOrder: SearchSortOrder
+private struct SearchOrderChip: View {
+    let selection: SearchOrderOption
     let isOpen: Bool
     let action: () -> Void
 
     @State private var isHovered = false
 
-    private var icon: String {
-        switch currentOrder {
-        case .newestFirst: return "arrow.down"
-        case .oldestFirst: return "arrow.up"
-        }
-    }
-
-    private var label: String {
-        switch currentOrder {
-        case .newestFirst: return "Newest"
-        case .oldestFirst: return "Oldest"
-        }
-    }
-
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                Image(systemName: icon)
+                Image(systemName: selection.icon)
                     .font(.system(size: 14))
 
-                Text(label)
+                Text(selection.title)
                     .font(.retraceCalloutMedium)
                     .lineLimit(1)
 
@@ -1032,17 +1006,15 @@ private struct SortOrderChip: View {
     }
 }
 
-// MARK: - Sort Order Popover
-
-private struct SortOrderPopover: View {
-    let currentOrder: SearchSortOrder
-    let onSelect: (SearchSortOrder) -> Void
+private struct SearchOrderPopover: View {
+    let selection: SearchOrderOption
+    let onSelect: (SearchOrderOption) -> Void
     var onDismiss: (() -> Void)?
 
     @FocusState private var isFocused: Bool
     @State private var highlightedIndex: Int = 0
 
-    private let options: [SearchSortOrder] = [.newestFirst, .oldestFirst]
+    private let options: [SearchOrderOption] = SearchOrderOption.allCases
 
     private func selectHighlightedItem() {
         guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
@@ -1057,41 +1029,31 @@ private struct SortOrderPopover: View {
     var body: some View {
         FilterPopoverContainer(width: 200) {
             VStack(spacing: 0) {
-                // Newest First option (default)
-                FilterRow(
-                    systemIcon: "arrow.down",
-                    title: "Newest First",
-                    subtitle: "Most recent results first",
-                    isSelected: currentOrder == .newestFirst,
-                    isKeyboardHighlighted: highlightedIndex == 0
-                ) {
-                    onSelect(.newestFirst)
-                    onDismiss?()
-                }
-                .id(0)
+                ForEach(Array(options.enumerated()), id: \.offset) { index, option in
+                    if index > 0 {
+                        Divider()
+                            .padding(.vertical, 4)
+                    }
 
-                Divider()
-                    .padding(.vertical, 4)
-
-                // Oldest First option
-                FilterRow(
-                    systemIcon: "arrow.up",
-                    title: "Oldest First",
-                    subtitle: "Oldest results first",
-                    isSelected: currentOrder == .oldestFirst,
-                    isKeyboardHighlighted: highlightedIndex == 1
-                ) {
-                    onSelect(.oldestFirst)
-                    onDismiss?()
+                    FilterRow(
+                        systemIcon: option.icon,
+                        title: option.title,
+                        subtitle: option.subtitle,
+                        isSelected: selection == option,
+                        isKeyboardHighlighted: highlightedIndex == index
+                    ) {
+                        onSelect(option)
+                        onDismiss?()
+                    }
+                    .id(index)
                 }
-                .id(1)
             }
             .padding(.vertical, 8)
         }
         .focused($isFocused)
         .onAppear {
             // Set initial highlight to current selection
-            highlightedIndex = options.firstIndex(of: currentOrder) ?? 0
+            highlightedIndex = options.firstIndex(of: selection) ?? 0
             isFocused = true
         }
         .keyboardNavigation(

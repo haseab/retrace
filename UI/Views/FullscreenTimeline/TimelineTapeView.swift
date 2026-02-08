@@ -774,12 +774,6 @@ struct CurrentAppBadge: View {
         viewModel.currentFrame?.metadata.appBundleID
     }
 
-    /// Get the app name for tooltip using AppNameResolver
-    private var currentAppName: String? {
-        guard let bundleID = currentBundleID else { return nil }
-        return AppNameResolver.shared.displayName(for: bundleID)
-    }
-
     /// Get the browser URL if available
     private var currentBrowserURL: String? {
         viewModel.currentFrame?.metadata.browserURL
@@ -805,9 +799,8 @@ struct CurrentAppBadge: View {
             // Only show the badge for browsers with an openable URL
             if let bundleID = currentBundleID, hasOpenableURL {
                 Button(action: {
-                    if hasOpenableURL, let urlString = currentBrowserURL, let url = URL(string: urlString) {
+                    if hasOpenableURL, viewModel.openCurrentBrowserURL() {
                         TimelineWindowController.shared.hide()
-                        NSWorkspace.shared.open(url)
                     }
                 }) {
                     // Fixed-size container with trailing alignment - pill expands leftward
@@ -826,7 +819,6 @@ struct CurrentAppBadge: View {
                             }
                             appIconView(for: bundleID)
                                 .frame(width: iconSize, height: iconSize)
-                                .instantTooltip(hasOpenableURL ? "Open in browser" : (currentAppName ?? "App"), isVisible: .constant(isHovering && !shouldShowExpanded))
                         }
                         .frame(height: buttonSize)
                         .padding(.leading, shouldShowExpanded ? 12 : 0)
@@ -860,6 +852,7 @@ struct CurrentAppBadge: View {
                         }
                     }
                 }
+                .instantTooltip("Open Link (⌘O)", isVisible: .constant(isHovering))
                 .id(bundleID)
             }
         }

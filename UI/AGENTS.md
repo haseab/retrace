@@ -14,12 +14,9 @@ UI/
 │   │   ├── TimelineBar.swift            # Horizontal scrollable bar
 │   │   ├── FrameThumbnail.swift         # Individual frame preview
 │   │   └── SessionIndicator.swift       # App session markers
-│   ├── Search/
-│   │   ├── SearchView.swift             # Search interface
-│   │   ├── SearchBar.swift              # Search input
-│   │   ├── SearchResults.swift          # Results list
-│   │   ├── ResultRow.swift              # Individual result
-│   │   └── FrameViewer.swift            # Full frame with highlights
+│   ├── FullscreenTimeline/
+│   │   ├── SpotlightSearchOverlay.swift # Primary search overlay UI
+│   │   └── SearchFilterBar.swift        # Search filters and controls
 │   ├── Dashboard/
 │   │   ├── DashboardView.swift          # Main dashboard
 │   │   ├── AnalyticsCard.swift          # Stats widgets
@@ -571,7 +568,7 @@ You depend on:
 
 1. Create SwiftUI views starting with `TimelineView`
 2. Implement `DeeplinkHandler` for URL routing
-3. Build `SearchView` with FTS integration
+3. Build `SpotlightSearchOverlay` with FTS integration
 4. Add `BoundingBoxOverlay` component
 5. Create `SettingsView` with all preferences
 6. Build `DashboardView` with analytics

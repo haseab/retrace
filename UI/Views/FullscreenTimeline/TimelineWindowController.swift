@@ -1351,6 +1351,12 @@ public class TimelineWindowController: NSObject {
                     return nil // Always consume the event to prevent propagation
                 }
 
+                // Cmd+O to open current browser link (handle before system can intercept)
+                if event.charactersIgnoringModifiers == "o" && modifiers == [.command] {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
                 // Cmd+H to toggle controls visibility (handle before system can intercept)
                 if event.keyCode == 4 && modifiers == [.command] {
                     _ = self?.handleKeyEvent(event)
@@ -1633,6 +1639,16 @@ public class TimelineWindowController: NSObject {
             recordShortcut("cmd+l")
             copyMomentLink()
             return true
+        }
+
+        // Cmd+O to open current browser link
+        if event.charactersIgnoringModifiers == "o" && modifiers == [.command] {
+            recordShortcut("cmd+o")
+            if let viewModel = timelineViewModel, viewModel.openCurrentBrowserURL() {
+                hide()
+                return true
+            }
+            return false
         }
 
         // Cmd+H to toggle timeline controls visibility

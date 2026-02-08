@@ -15,6 +15,7 @@ public class MenuBarManager: ObservableObject {
     // MARK: - Properties
 
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
     private let coordinator: AppCoordinator
     private let onboardingManager: OnboardingManager
     private var refreshTimer: DispatchSourceTimer?
@@ -58,6 +59,7 @@ public class MenuBarManager: ObservableObject {
         if statusItem?.button != nil {
             // Start with icon showing current recording state
             updateIcon(recording: isRecording)
+            configureStatusItemButton()
         }
 
         // Load shortcuts then setup menu and hotkeys
@@ -650,7 +652,30 @@ public class MenuBarManager: ObservableObject {
             item.target = self
         }
 
-        statusItem?.menu = menu
+        statusMenu = menu
+    }
+
+    /// Configure explicit click handling so single and double-click both show the status menu.
+    private func configureStatusItemButton() {
+        guard let button = statusItem?.button else { return }
+        button.target = self
+        button.action = #selector(handleStatusItemClick(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
+        guard let statusItem, let menu = statusMenu else { return }
+        guard let event = NSApp.currentEvent else { return }
+
+        switch event.type {
+        case .leftMouseUp, .rightMouseUp:
+            // Show menu for both normal click and double-click.
+            statusItem.menu = menu
+            sender.performClick(nil)
+            statusItem.menu = nil
+        default:
+            break
+        }
     }
 
     // MARK: - Actions

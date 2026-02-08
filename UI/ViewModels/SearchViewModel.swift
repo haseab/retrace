@@ -55,15 +55,6 @@ public class SearchViewModel: ObservableObject {
     // Search mode (tabs)
     @Published public var searchMode: SearchMode = .relevant
 
-    // View mode (flat vs grouped)
-    @Published public var viewMode: SearchViewMode = .grouped
-
-    // Grouped search results (when viewMode == .grouped)
-    @Published public var groupedResults: GroupedSearchResults?
-
-    // Expanded segment IDs (for tracking which stacks are open in grouped view)
-    @Published public var expandedSegmentIDs: Set<Int64> = []
-
     // Sort order (for "all" mode)
     @Published public var sortOrder: SearchSortOrder = .newestFirst
 
@@ -351,17 +342,11 @@ public class SearchViewModel: ObservableObject {
                 Log.debug("[SearchViewModel] First result: frameID=\(firstResult.frameID.stringValue), timestamp=\(firstResult.timestamp), snippet='\(firstResult.snippet.prefix(50))...'", category: .ui)
             }
 
-            // Create grouped results from flat results
-            let grouped = groupResultsByDayAndSegment(searchResults.results, query: searchResults.query, searchTimeMs: searchResults.searchTimeMs)
-            debugLog("[SearchViewModel] Created grouped results: \(grouped.daySections.count) day sections, \(grouped.totalSegmentCount) segments, \(grouped.totalMatchCount) matches")
-
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 results = searchResults
-                groupedResults = grouped
-                expandedSegmentIDs.removeAll()  // Reset expansion state for new search
                 isSearching = false
-                debugLog("[SearchViewModel] UI updated - viewMode=\(viewMode), groupedResults=\(groupedResults != nil ? "set" : "nil")")
+                debugLog("[SearchViewModel] UI updated with \(searchResults.results.count) flat results")
             }
         } catch is CancellationError {
             Log.debug("[SearchViewModel] Search was cancelled", category: .ui)
@@ -468,6 +453,30 @@ public class SearchViewModel: ObservableObject {
         guard order != sortOrder else { return }
         sortOrder = order
         // Re-search with new sort order (only if user has submitted a search)
+        if !searchQuery.isEmpty && hasSubmittedSearch {
+            currentSearchTask?.cancel()
+            currentSearchTask = Task {
+                await performSearch(query: searchQuery)
+            }
+        }
+    }
+
+    /// Set search mode and sort order in one update, then run at most one re-search.
+    public func setSearchModeAndSort(mode: SearchMode, sortOrder: SearchSortOrder?) {
+        var didChange = false
+
+        if self.searchMode != mode {
+            self.searchMode = mode
+            didChange = true
+        }
+
+        if let sortOrder, self.sortOrder != sortOrder {
+            self.sortOrder = sortOrder
+            didChange = true
+        }
+
+        guard didChange else { return }
+
         if !searchQuery.isEmpty && hasSubmittedSearch {
             currentSearchTask?.cancel()
             currentSearchTask = Task {
@@ -857,156 +866,6 @@ public class SearchViewModel: ObservableObject {
 
     public var isEmpty: Bool {
         !hasResults && !isSearching
-    }
-
-    // MARK: - Grouped Results
-
-    /// Date formatter for day keys (yyyy-MM-dd)
-    private static let dateKeyFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }()
-
-    /// Format a date as a human-readable day label
-    private func formatDayLabel(_ date: Date) -> String {
-        let calendar = Calendar.current
-        if calendar.isDateInToday(date) {
-            return "Today"
-        } else if calendar.isDateInYesterday(date) {
-            return "Yesterday"
-        } else {
-            let formatter = DateFormatter()
-            // Show year if not current year
-            if !calendar.isDate(date, equalTo: Date(), toGranularity: .year) {
-                formatter.dateFormat = "MMM d, yyyy"
-            } else {
-                formatter.dateFormat = "MMM d"
-            }
-            return formatter.string(from: date)
-        }
-    }
-
-    /// Convert flat search results to grouped structure (by time clusters and day)
-    /// Groups results that are within a time window AND from the same app into a single stack
-    private func groupResultsByDayAndSegment(_ results: [SearchResult], query: SearchQuery, searchTimeMs: Int) -> GroupedSearchResults {
-        guard !results.isEmpty else {
-            return GroupedSearchResults(
-                query: query,
-                daySections: [],
-                totalMatchCount: 0,
-                totalSegmentCount: 0,
-                searchTimeMs: searchTimeMs
-            )
-        }
-
-        // Step 1: Sort results by timestamp (newest first)
-        let sortedResults = results.sorted { $0.timestamp > $1.timestamp }
-
-        // Step 2: Group into time-based clusters (5 minute window, same app)
-        let timeWindowSeconds: TimeInterval = 5 * 60  // 5 minutes
-        var clusters: [[SearchResult]] = []
-        var currentCluster: [SearchResult] = []
-
-        for result in sortedResults {
-            if currentCluster.isEmpty {
-                currentCluster.append(result)
-            } else {
-                let lastResult = currentCluster.last!
-                let timeDiff = abs(result.timestamp.timeIntervalSince(lastResult.timestamp))
-                let sameApp = result.appBundleID == lastResult.appBundleID
-
-                // Group if within time window AND same app
-                if timeDiff <= timeWindowSeconds && sameApp {
-                    currentCluster.append(result)
-                } else {
-                    clusters.append(currentCluster)
-                    currentCluster = [result]
-                }
-            }
-        }
-        // Don't forget the last cluster
-        if !currentCluster.isEmpty {
-            clusters.append(currentCluster)
-        }
-
-        // Step 3: Create SegmentSearchStack for each cluster
-        let segmentStacks: [SegmentSearchStack] = clusters.enumerated().compactMap { (index, clusterResults) in
-            // Pick the highest relevance match as representative
-            guard let bestMatch = clusterResults.max(by: { $0.relevanceScore < $1.relevanceScore }) else {
-                return nil
-            }
-
-            // Use a synthetic cluster ID based on index (since we're not using segmentID anymore)
-            // We'll use the first result's segmentID as the cluster identifier
-            let clusterSegmentID = clusterResults.first?.segmentID ?? AppSegmentID(value: Int64(index))
-
-            return SegmentSearchStack(
-                segmentID: clusterSegmentID,
-                representativeResult: bestMatch,
-                matchCount: clusterResults.count,
-                expandedResults: clusterResults.count > 1 ? clusterResults : nil,
-                isExpanded: false
-            )
-        }
-
-        // Step 4: Group stacks by day
-        let byDay = Dictionary(grouping: segmentStacks) { stack -> String in
-            let date = stack.representativeResult.timestamp
-            return Self.dateKeyFormatter.string(from: date)
-        }
-
-        // Step 4: Create day sections
-        let daySections: [SearchDaySection] = byDay.map { (dateKey, stacks) in
-            let date = Self.dateKeyFormatter.date(from: dateKey) ?? Date()
-            let displayLabel = formatDayLabel(date)
-            // Sort stacks by timestamp (newest first)
-            let sortedStacks = stacks.sorted { $0.representativeResult.timestamp > $1.representativeResult.timestamp }
-            return SearchDaySection(
-                dateKey: dateKey,
-                displayLabel: displayLabel,
-                date: date,
-                segmentStacks: sortedStacks
-            )
-        }.sorted { $0.date > $1.date }  // Sort days newest first
-
-        return GroupedSearchResults(
-            query: query,
-            daySections: daySections,
-            totalMatchCount: results.count,
-            totalSegmentCount: segmentStacks.count,
-            searchTimeMs: searchTimeMs
-        )
-    }
-
-    /// Toggle expansion of a segment stack
-    public func toggleStackExpansion(segmentID: AppSegmentID) {
-        let segmentValue = segmentID.value
-
-        if expandedSegmentIDs.contains(segmentValue) {
-            expandedSegmentIDs.remove(segmentValue)
-        } else {
-            expandedSegmentIDs.insert(segmentValue)
-        }
-
-        // Update the isExpanded flag in groupedResults
-        updateStackExpansionState(segmentID: segmentID)
-    }
-
-    /// Update isExpanded state in groupedResults to match expandedSegmentIDs
-    private func updateStackExpansionState(segmentID: AppSegmentID) {
-        guard var grouped = groupedResults else { return }
-
-        for sectionIdx in grouped.daySections.indices {
-            for stackIdx in grouped.daySections[sectionIdx].segmentStacks.indices {
-                if grouped.daySections[sectionIdx].segmentStacks[stackIdx].segmentID.value == segmentID.value {
-                    grouped.daySections[sectionIdx].segmentStacks[stackIdx].isExpanded =
-                        expandedSegmentIDs.contains(segmentID.value)
-                }
-            }
-        }
-
-        groupedResults = grouped
     }
 
     // MARK: - Search Results Cache

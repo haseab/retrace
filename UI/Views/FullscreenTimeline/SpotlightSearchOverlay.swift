@@ -240,13 +240,21 @@ public struct SpotlightSearchOverlay: View {
                     }
                 },
                 onTab: {
-                    // Tab from search field opens Apps filter (first filter)
-                    Log.debug("\(searchLog) Tab pressed, opening Apps filter", category: .ui)
+                    // Tab from search field opens search-order dropdown (first filter)
+                    Log.debug("\(searchLog) Tab pressed, opening Relevance/Newest/Oldest filter", category: .ui)
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         isExpanded = true
                     }
-                    // Signal to open Apps filter (index 1)
+                    // Signal to open search-order filter (index 1)
                     viewModel.openFilterSignal = (1, UUID())
+                },
+                onBackTab: {
+                    // Shift+Tab from search field opens Advanced filter (last filter)
+                    Log.debug("\(searchLog) Shift+Tab pressed, opening Advanced filter", category: .ui)
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        isExpanded = true
+                    }
+                    viewModel.openFilterSignal = (6, UUID())
                 },
                 onFocus: {
                     clearResultKeyboardNavigation()
@@ -1007,11 +1015,11 @@ private struct GalleryResultCard: View {
                         Image(nsImage: icon)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .frame(width: 20, height: 20)
+                            .frame(width: 30, height: 30)
                     } else {
                         Circle()
                             .fill(Color.segmentColor(for: result.appBundleID ?? ""))
-                            .frame(width: 20, height: 20)
+                            .frame(width: 30, height: 30)
                     }
 
                     // Title and timestamp
@@ -1115,6 +1123,7 @@ struct SpotlightSearchField: NSViewRepresentable {
     let onSubmit: () -> Void
     let onEscape: () -> Void
     var onTab: (() -> Void)? = nil
+    var onBackTab: (() -> Void)? = nil
     var onFocus: (() -> Void)? = nil
     var placeholder: String = "Search your screen history..."
     var refocusTrigger: UUID = UUID()  // Change this to trigger refocus
@@ -1232,7 +1241,7 @@ struct SpotlightSearchField: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape, onTab: onTab, onFocus: onFocus)
+        Coordinator(text: $text, onSubmit: onSubmit, onEscape: onEscape, onTab: onTab, onBackTab: onBackTab, onFocus: onFocus)
     }
 
     class Coordinator: NSObject, NSTextFieldDelegate {
@@ -1240,14 +1249,16 @@ struct SpotlightSearchField: NSViewRepresentable {
         let onSubmit: () -> Void
         let onEscape: () -> Void
         let onTab: (() -> Void)?
+        let onBackTab: (() -> Void)?
         let onFocus: (() -> Void)?
         var lastRefocusTrigger: UUID = UUID()
 
-        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void, onTab: (() -> Void)?, onFocus: (() -> Void)?) {
+        init(text: Binding<String>, onSubmit: @escaping () -> Void, onEscape: @escaping () -> Void, onTab: (() -> Void)?, onBackTab: (() -> Void)?, onFocus: (() -> Void)?) {
             self._text = text
             self.onSubmit = onSubmit
             self.onEscape = onEscape
             self.onTab = onTab
+            self.onBackTab = onBackTab
             self.onFocus = onFocus
         }
 
@@ -1271,6 +1282,9 @@ struct SpotlightSearchField: NSViewRepresentable {
                 return true
             } else if commandSelector == #selector(NSResponder.insertTab(_:)) {
                 onTab?()
+                return true
+            } else if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                onBackTab?()
                 return true
             }
             return false

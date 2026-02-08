@@ -982,14 +982,22 @@ public struct AdvancedSearchFilterPopover: View {
     private var windowNameTextBinding: Binding<String> {
         Binding(
             get: { windowNameFilter ?? "" },
-            set: { windowNameFilter = $0.isEmpty ? nil : $0 }
+            set: { newValue in
+                let normalized = newValue.isEmpty ? nil : newValue
+                guard normalized != windowNameFilter else { return }
+                windowNameFilter = normalized
+            }
         )
     }
 
     private var browserUrlTextBinding: Binding<String> {
         Binding(
             get: { browserUrlFilter ?? "" },
-            set: { browserUrlFilter = $0.isEmpty ? nil : $0 }
+            set: { newValue in
+                let normalized = newValue.isEmpty ? nil : newValue
+                guard normalized != browserUrlFilter else { return }
+                browserUrlFilter = normalized
+            }
         )
     }
 

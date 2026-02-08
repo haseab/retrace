@@ -3498,6 +3498,21 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.info("[URLBoundingBox] Opened URL in browser: \(box.url)", category: .ui)
     }
 
+    /// Open the current frame's browser URL in the default browser.
+    /// - Returns: `true` if a valid URL was opened.
+    @discardableResult
+    public func openCurrentBrowserURL() -> Bool {
+        guard let urlString = currentFrame?.metadata.browserURL,
+              !urlString.isEmpty,
+              let url = URL(string: urlString) else {
+            return false
+        }
+
+        NSWorkspace.shared.open(url)
+        Log.info("[Timeline] Opened current browser URL: \(urlString)", category: .ui)
+        return true
+    }
+
     // MARK: - OCR Node Loading and Text Selection
 
     /// Set OCR nodes and invalidate the selection cache
