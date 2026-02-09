@@ -112,3 +112,4 @@ scripts/create-dmg.sh
 
 # Release artifacts
 releases/
+local/

@@ -2698,6 +2698,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
 
+        let oldIndex = currentIndex
+        let oldTimestamp = frames[oldIndex].frame.timestamp
+        let newTimestamp = frames[clampedIndex].frame.timestamp
+
+        if fromScroll && abs(clampedIndex - oldIndex) > 5 {
+            Log.debug("[NAV] navigateToFrame: \(oldIndex)→\(clampedIndex) (Δ\(clampedIndex - oldIndex)), fromScroll=\(fromScroll), oldTime=\(oldTimestamp), newTime=\(newTimestamp)", category: .ui)
+        }
+
         // Clear search highlight when manually navigating
         if isShowingSearchHighlight {
             clearSearchHighlight()
@@ -4841,6 +4849,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Mark as actively scrolling
         if !isActivelyScrolling {
+            Log.info("[SCROLL] Starting scroll: currentIndex=\(currentIndex)/\(frames.count), timestamp=\(currentTimelineFrame?.frame.timestamp.description ?? "nil")", category: .ui)
             isActivelyScrolling = true
             dismissContextMenu()
             dismissTimelineContextMenu()
@@ -4866,6 +4875,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     let actualFramesMoved = clampedTarget - prevIndex
 
                     if actualFramesMoved != 0 {
+                        Log.debug("[SCROLL] Crossing frame boundary: prevIndex=\(prevIndex) → targetIndex=\(targetIndex) → clampedTarget=\(clampedTarget), framesToCross=\(framesToCross), actualFramesMoved=\(actualFramesMoved)", category: .ui)
                         // Only subtract the frames we actually moved
                         subFrameOffset -= CGFloat(actualFramesMoved) * ppf
                         navigateToFrame(clampedTarget, fromScroll: true)
@@ -5101,6 +5111,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func navigateToDate(_ targetDate: Date) async {
         isLoading = true
         clearError()
+
+        // Exit live mode if active (we're navigating to a specific time, not "now")
+        if isInLiveMode {
+            isInLiveMode = false
+            liveScreenshot = nil
+            isTapeHidden = false
+        }
 
         do {
             let calendar = Calendar.current
@@ -5694,6 +5711,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func checkAndLoadMoreFrames() {
         // Check if approaching the older end (left side of timeline)
         if currentIndex < WindowConfig.loadThreshold && hasMoreOlder && !isLoadingOlder {
+            Log.info("[INFINITE-SCROLL] Triggering loadOlderFrames: currentIndex=\(currentIndex) < threshold=\(WindowConfig.loadThreshold)", category: .ui)
             Task {
                 await loadOlderFrames()
             }
@@ -5701,6 +5719,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if approaching the newer end (right side of timeline)
         if currentIndex > frames.count - WindowConfig.loadThreshold && hasMoreNewer && !isLoadingNewer {
+            Log.info("[INFINITE-SCROLL] Triggering loadNewerFrames: currentIndex=\(currentIndex) > threshold=\(frames.count - WindowConfig.loadThreshold)", category: .ui)
             Task {
                 await loadNewerFrames()
             }
@@ -5742,12 +5761,16 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Prepend to existing frames
             // Use insert(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
+            let oldCurrentIndex = currentIndex
+            let oldTimestamp = frames[currentIndex].frame.timestamp
+
             frames.insert(contentsOf: newTimelineFrames, at: 0)
 
             // Adjust currentIndex to maintain position
             currentIndex += newTimelineFrames.count
 
-            Log.info("[Memory] LOADED OLDER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count)), index adjusted to \(currentIndex)", category: .ui)
+            Log.info("[Memory] LOADED OLDER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count)), index adjusted from \(oldCurrentIndex) to \(currentIndex), maintaining timestamp=\(oldTimestamp)", category: .ui)
+            Log.info("[INFINITE-SCROLL] After load older: new first frame=\(frames.first?.frame.timestamp.description ?? "nil"), new last frame=\(frames.last?.frame.timestamp.description ?? "nil")", category: .ui)
             MemoryTracker.logMemoryState(
                 context: "AFTER LOAD OLDER",
                 frameCount: frames.count,
