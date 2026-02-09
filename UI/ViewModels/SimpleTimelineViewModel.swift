@@ -2529,12 +2529,23 @@ public class SimpleTimelineViewModel: ObservableObject {
             if let newestCachedTimestamp = frames.last?.frame.timestamp {
                 do {
                     // Query for frames newer than our newest cached frame
-                    let newerFrames = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 50, filters: filterCriteria)
+                    let refreshLimit = 50
+                    let newerFrames = try await coordinator.getMostRecentFramesWithVideoInfo(limit: refreshLimit, filters: filterCriteria)
 
                     // Filter to only truly new frames
                     let newFrames = newerFrames.filter { $0.frame.timestamp > newestCachedTimestamp }
 
                     if !newFrames.isEmpty {
+                        // If ALL fetched frames are new, we likely missed frames in between
+                        // (e.g., timeline was hidden for a long time). Do a full reload to avoid
+                        // creating a phantom gap in the timeline.
+                        if newFrames.count >= refreshLimit {
+                            Log.info("[TIMELINE-REFRESH] 🔄 Too many new frames (\(newFrames.count) >= \(refreshLimit)) — doing full reload to avoid gap", category: .ui)
+                            await loadMostRecentFrame()
+                            Log.info("[TIMELINE-REFRESH] 🔄 Full reload completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - refreshStartTime) * 1000))ms", category: .ui)
+                            return
+                        }
+
                         Log.info("[TIMELINE-REFRESH] 🔄 Found \(newFrames.count) new frames since last view", category: .ui)
 
                         // Add new frames to the end (they're newer, so they go at the end)
@@ -2565,7 +2576,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
                         trimWindowIfNeeded(preserveDirection: .newer)
                     } else {
-                        Log.info("[TIMELINE-REFRESH] 🔄 No new frames found (all 50 queried frames already cached)", category: .ui)
+                        Log.info("[TIMELINE-REFRESH] 🔄 No new frames found (all \(refreshLimit) queried frames already cached)", category: .ui)
                     }
                 } catch {
                     Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
