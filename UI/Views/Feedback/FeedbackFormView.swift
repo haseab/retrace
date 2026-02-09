@@ -95,64 +95,55 @@ public struct FeedbackFormView: View {
     // MARK: - Form View
 
     private var formView: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 14) {
-                    // Header
-                    header
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 14) {
+                // Header
+                header
 
-                    // Feedback Type Picker
-                    feedbackTypeSection
+                // Feedback Type Picker
+                feedbackTypeSection
 
-                    // Email
-                    emailSection
+                // Email
+                emailSection
 
-                    // Description
-                    descriptionSection
+                // Description
+                descriptionSection
 
-                    // Diagnostics Preview - expands downward only
+                // Diagnostics are only shown for bug reports.
+                if viewModel.feedbackType == .bug {
                     diagnosticsSection
-                        .id("diagnostics")
-
-                    // Image Attachment
-                    imageAttachmentSection
-
-                    // Error
-                    if let error = viewModel.error {
-                        errorBanner(error)
-                    }
                 }
-                .padding(20)
-                .padding(.bottom, 10) // Space for action buttons overlay
-            }
-            .overlay(alignment: .bottom) {
-                // Action buttons fixed at bottom
-                VStack(spacing: 0) {
-                    // Gradient fade at top of button area
-                    LinearGradient(
-                        colors: [
-                            Color.retraceBackground.opacity(0),
-                            Color.retraceBackground.opacity(0.8),
-                            Color.retraceBackground
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 40)
 
-                    actionButtons
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 20)
-                        .background(Color.retraceBackground)
+                // Image Attachment
+                imageAttachmentSection
+
+                // Error
+                if let error = viewModel.error {
+                    errorBanner(error)
                 }
             }
-            .onChange(of: viewModel.showDiagnosticsDetail) { isExpanded in
-                if isExpanded {
-                    // Scroll to diagnostics section when expanded
-                    withAnimation {
-                        scrollProxy.scrollTo("diagnostics", anchor: .top)
-                    }
-                }
+            .padding(20)
+            .padding(.bottom, 10) // Space for action buttons overlay
+        }
+        .overlay(alignment: .bottom) {
+            // Action buttons fixed at bottom
+            VStack(spacing: 0) {
+                // Gradient fade at top of button area
+                LinearGradient(
+                    colors: [
+                        Color.retraceBackground.opacity(0),
+                        Color.retraceBackground.opacity(0.8),
+                        Color.retraceBackground
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 40)
+
+                actionButtons
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 20)
+                    .background(Color.retraceBackground)
             }
         }
     }
@@ -216,7 +207,7 @@ public struct FeedbackFormView: View {
     private func feedbackTypeButton(_ type: FeedbackType) -> some View {
         let isSelected = viewModel.feedbackType == type
 
-        return Button(action: { viewModel.feedbackType = type }) {
+        return Button(action: { viewModel.setFeedbackType(type) }) {
             HStack(spacing: 5) {
                 Image(systemName: type.icon)
                     .font(.system(size: 11, weight: .medium))
@@ -340,7 +331,9 @@ public struct FeedbackFormView: View {
                 diagnosticChip(icon: "app.badge", text: "Version")
                 diagnosticChip(icon: "desktopcomputer", text: "Device")
                 diagnosticChip(icon: "cylinder", text: "Stats")
-                diagnosticChip(icon: "doc.text", text: "Logs")
+                if viewModel.includesLogsInDiagnostics {
+                    diagnosticChip(icon: "doc.text", text: "Logs")
+                }
             }
 
             // Expanded details (lazy loaded)
@@ -362,14 +355,15 @@ public struct FeedbackFormView: View {
                         .background(Color.black.opacity(0.2))
                         .cornerRadius(6)
 
-                        // Log count indicator
-                        HStack {
-                            Spacer()
-                            Text("(Last \(diagnostics.recentLogs.count) log entries)")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.5))
+                        if viewModel.includesLogsInDiagnostics {
+                            HStack {
+                                Spacer()
+                                Text("(Last \(diagnostics.recentLogs.count) log entries)")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                            }
+                            .padding(.top, 4)
                         }
-                        .padding(.top, 4)
                     }
                 } else {
                     HStack {

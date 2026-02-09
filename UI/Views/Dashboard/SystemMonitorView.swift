@@ -386,6 +386,9 @@ struct ProcessingBarChart: View {
 
     // Cap for each backlog bar
     private let backlogBarCap = 100
+    private let tooltipEstimatedHeight: CGFloat = 56
+    private let tooltipGapAboveBar: CGFloat = 8
+    private let tooltipTopOverflowAllowance: CGFloat = 14
 
     var body: some View {
         GeometryReader { geometry in
@@ -398,7 +401,7 @@ struct ProcessingBarChart: View {
 
             // Reserve space for backlog section if there's pending work
             let hasBacklog = pendingCount > 0
-            // Calculate number of backlog bars needed (each bar shows up to 150)
+            // Calculate number of backlog bars needed (each bar shows up to backlogBarCap)
             let backlogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
             let singleBarWidth: CGFloat = 28
             let backlogSpacing: CGFloat = 2
@@ -414,8 +417,7 @@ struct ProcessingBarChart: View {
             let liveProcessedCount = dataPoints.last?.count ?? 0
             let liveTotalForScaling = liveProcessedCount + processingCount
 
-            // Scale based on max of historical data, live total, or backlog cap (150)
-            // Backlog bars are capped at 150, so use that for scaling
+            // Scale based on max of historical data, live total, or backlog cap
             let historicalMax = dataPoints.map(\.count).max() ?? 1
             let maxValue = max(historicalMax, liveTotalForScaling, backlogBarCap, 1)
 
@@ -469,11 +471,17 @@ struct ProcessingBarChart: View {
                             let point = dataPoints[index]
                             let isLive = index == lastIndex
                             let xPosition = CGFloat(index) * (barWidth + spacing) + barWidth / 2
+                            let yPosition = mainTooltipYOffset(
+                                for: point,
+                                isLive: isLive,
+                                maxValue: maxValue,
+                                chartHeight: chartHeight
+                            )
 
                             tooltipView(for: point, isLive: isLive)
-                                .offset(x: clampTooltipOffset(xPosition, in: chartWidth), y: 0)
-                                .transition(.opacity)
-                                .animation(.easeOut(duration: 0.1), value: hoveredIndex)
+                                .offset(x: clampTooltipOffset(xPosition, in: chartWidth), y: yPosition)
+                                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
+                                .animation(.spring(response: 0.18, dampingFraction: 0.86), value: hoveredIndex)
                         }
                     }
 
@@ -633,7 +641,9 @@ struct ProcessingBarChart: View {
         .overlay(alignment: .top) {
             if isHoveringBacklog {
                 backlogTooltipView(pendingCount: pendingCount)
-                    .offset(y: 4)
+                    .offset(y: backlogTooltipYOffset(pendingCount: pendingCount, maxValue: maxValue, chartHeight: height))
+                    .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
+                    .animation(.spring(response: 0.18, dampingFraction: 0.86), value: isHoveringBacklog)
             }
         }
     }
@@ -641,47 +651,154 @@ struct ProcessingBarChart: View {
     // MARK: - Tooltips
 
     private func tooltipView(for point: ProcessingDataPoint, isLive: Bool) -> some View {
-        HStack(spacing: 4) {
-            Text("\(point.count)")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.retraceAccent)
-            if isLive && processingCount > 0 {
-                Text("+\(processingCount)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.green)
-            }
-            if isLive {
-                Text("now")
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundColor(.retraceSecondary)
+        floatingTooltip {
+            VStack(spacing: 5) {
+                Text(isLive ? "LIVE NOW" : point.minute.formatted(date: .omitted, time: .shortened))
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .tracking(0.45)
+                    .foregroundColor(.white.opacity(0.72))
+
+                HStack(spacing: 6) {
+                    tooltipMetricChip(
+                        text: "\(point.count)",
+                        tint: .retraceAccent
+                    )
+                    if isLive && processingCount > 0 {
+                        tooltipMetricChip(
+                            text: "+\(processingCount)",
+                            tint: .green
+                        )
+                    }
+                }
             }
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color.black.opacity(0.85))
-        )
     }
 
     private func backlogTooltipView(pendingCount: Int) -> some View {
-        Text("\(pendingCount)")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundColor(.orange)
-            .padding(.horizontal, 6)
+        floatingTooltip {
+            tooltipMetricChip(
+                text: "\(pendingCount)",
+                tint: .orange
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func floatingTooltip<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 0) {
+            content()
+                .padding(.horizontal, 10)
+                .padding(.top, 7)
+                .padding(.bottom, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.15, green: 0.18, blue: 0.24).opacity(0.98),
+                                    Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .shadow(color: Color.black.opacity(0.34), radius: 14, x: 0, y: 8)
+                )
+
+            TooltipPointer()
+                .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98))
+                .frame(width: 12, height: 7)
+                .overlay(
+                    TooltipPointer()
+                        .stroke(Color.white.opacity(0.14), lineWidth: 0.8)
+                )
+                .offset(y: -1)
+        }
+    }
+
+    private func tooltipMetricChip(text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundColor(tint)
+            .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.black.opacity(0.85))
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.18))
             )
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(tint.opacity(0.35), lineWidth: 1)
+            )
+    }
+
+    private func mainTooltipYOffset(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        let barHeight = mainBarVisualHeight(for: point, isLive: isLive, maxValue: maxValue, chartHeight: chartHeight)
+        let barTopY = chartHeight - barHeight
+        let desiredY = barTopY - tooltipEstimatedHeight - tooltipGapAboveBar
+        return max(-tooltipTopOverflowAllowance, desiredY)
+    }
+
+    private func backlogTooltipYOffset(
+        pendingCount: Int,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        let normalizedHeight = CGFloat(min(max(pendingCount, 0), backlogBarCap)) / CGFloat(max(maxValue, 1))
+        let barHeight = max(chartHeight * normalizedHeight, 6)
+        let barTopY = chartHeight - barHeight
+        let desiredY = barTopY - tooltipEstimatedHeight - tooltipGapAboveBar
+        return max(-tooltipTopOverflowAllowance, desiredY)
+    }
+
+    private func mainBarVisualHeight(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        maxValue: Int,
+        chartHeight: CGFloat
+    ) -> CGFloat {
+        if isLive {
+            let processedNormalized = CGFloat(point.count) / CGFloat(max(maxValue, 1))
+            let processingNormalized = CGFloat(processingCount) / CGFloat(max(maxValue, 1))
+            let processedHeight = chartHeight * processedNormalized
+            let processingHeight = chartHeight * processingNormalized
+
+            let visibleProcessingHeight = processingCount > 0 ? max(processingHeight, 3) : 0
+            let visibleProcessedHeight = (point.count > 0 || processingCount == 0) ? max(processedHeight, point.count > 0 ? 3 : 1) : 0
+            return max(visibleProcessingHeight + visibleProcessedHeight, 1)
+        }
+
+        let normalizedHeight = CGFloat(point.count) / CGFloat(max(maxValue, 1))
+        let barHeight = chartHeight * normalizedHeight
+        return max(barHeight, point.count > 0 ? 3 : 1)
     }
 
     private func clampTooltipOffset(_ x: CGFloat, in width: CGFloat) -> CGFloat {
         let center = width / 2
         let offset = x - center
-        let tooltipHalfWidth: CGFloat = 30
-        let maxOffset = (width / 2) - tooltipHalfWidth
+        let tooltipHalfWidth: CGFloat = 66
+        let maxOffset = max(0, (width / 2) - tooltipHalfWidth)
         return min(max(offset, -maxOffset), maxOffset)
+    }
+}
+
+private struct TooltipPointer: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.closeSubpath()
+        return path
     }
 }
 

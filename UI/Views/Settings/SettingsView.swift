@@ -2275,7 +2275,8 @@ public struct SettingsView: View {
             ocrProcessingCard
 
             if ocrEnabled {
-                powerEfficiencyCard
+                // Temporarily hidden:
+                // powerEfficiencyCard
                 appFilterCard
             }
 

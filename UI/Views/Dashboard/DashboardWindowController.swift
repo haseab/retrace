@@ -321,10 +321,8 @@ struct DashboardContentView: View {
                DashboardWindowController.shared.isVisible,
                let window = DashboardWindowController.shared.window,
                (window.isKeyWindow || window.attachedSheet != nil) && NSApp.isActive {
-                // Already showing monitor and frontmost — go back to dashboard
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    selectedView = .dashboard
-                }
+                // Already showing monitor and frontmost — toggle monitor off by hiding window
+                DashboardWindowController.shared.hide()
             } else {
                 // Show system monitor
                 withAnimation(.easeInOut(duration: 0.2)) {

@@ -83,7 +83,7 @@ public struct DiagnosticInfo: Codable {
 
     /// Format as readable text for display (summary without full logs)
     public func formattedText() -> String {
-        """
+        var text = """
         App Version: \(appVersion) (\(buildNumber))
         macOS: \(macOSVersion)
         Device: \(deviceModel)
@@ -96,8 +96,13 @@ public struct DiagnosticInfo: Codable {
         - Size: \(String(format: "%.1f", databaseStats.databaseSizeMB)) MB
 
         Recent Errors: \(recentErrors.isEmpty ? "None" : "\(recentErrors.count) error(s)")
-        Recent Logs: \(recentLogs.count) entries from last hour
         """
+
+        if !recentLogs.isEmpty {
+            text += "\nRecent Logs: \(recentLogs.count) entries from last hour"
+        }
+
+        return text
     }
 
     /// Full formatted text including all logs

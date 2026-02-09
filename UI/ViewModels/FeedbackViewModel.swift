@@ -53,9 +53,23 @@ public final class FeedbackViewModel: ObservableObject {
         return !trimmed.isEmpty && !isValidEmailFormat(trimmed)
     }
 
+    /// Include logs only for bug reports.
+    public var includesLogsInDiagnostics: Bool {
+        feedbackType == .bug
+    }
+
     public var diagnosticsSummary: String {
         guard let diagnostics = diagnostics else { return "Loading..." }
         return "v\(diagnostics.appVersion) • macOS \(diagnostics.macOSVersion) • \(diagnostics.deviceModel)"
+    }
+
+    private var fallbackDatabaseStats: DiagnosticInfo.DatabaseStats {
+        diagnostics?.databaseStats ?? DiagnosticInfo.DatabaseStats(
+            sessionCount: 0,
+            frameCount: 0,
+            segmentCount: 0,
+            databaseSizeMB: 0
+        )
     }
 
     // MARK: - Email Validation
@@ -86,16 +100,32 @@ public final class FeedbackViewModel: ObservableObject {
         }
     }
 
+    /// Update feedback type and refresh diagnostics preview for the selected type.
+    public func setFeedbackType(_ type: FeedbackType) {
+        guard feedbackType != type else { return }
+        feedbackType = type
+        diagnostics = nil
+        if showDiagnosticsDetail {
+            loadDiagnosticsIfNeeded()
+        }
+    }
+
     // MARK: - Actions
 
     /// Load diagnostic information with placeholder stats
     public func loadDiagnostics() {
-        diagnostics = feedbackService.collectDiagnostics()
+        let includeLogs = includesLogsInDiagnostics
+        let stats = fallbackDatabaseStats
+        diagnostics = includeLogs
+            ? feedbackService.collectDiagnostics()
+            : feedbackService.collectDiagnosticsNoLogs(with: stats)
     }
 
     /// Load diagnostics quickly for preview (5-minute log window, optimized query)
     /// This is fast enough for the "Details" button
     private func loadDiagnosticsQuick() async {
+        let includeLogs = includesLogsInDiagnostics
+
         guard let wrapper = coordinatorWrapper else {
             // Fallback to basic diagnostics without coordinator
             let stats = DiagnosticInfo.DatabaseStats(
@@ -104,7 +134,9 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+            diagnostics = includeLogs
+                ? feedbackService.collectDiagnosticsQuick(with: stats)
+                : feedbackService.collectDiagnosticsNoLogs(with: stats)
             return
         }
 
@@ -128,7 +160,9 @@ public final class FeedbackViewModel: ObservableObject {
             )
 
             // Use quick diagnostics with file-based log buffer (instant)
-            self.diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+            self.diagnostics = includeLogs
+                ? feedbackService.collectDiagnosticsQuick(with: stats)
+                : feedbackService.collectDiagnosticsNoLogs(with: stats)
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load quick stats: \(error)", category: .ui)
             let stats = DiagnosticInfo.DatabaseStats(
@@ -138,14 +172,20 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: 0
             )
             // Still use quick diagnostics - it uses file-based buffer now
-            diagnostics = feedbackService.collectDiagnosticsQuick(with: stats)
+            diagnostics = includeLogs
+                ? feedbackService.collectDiagnosticsQuick(with: stats)
+                : feedbackService.collectDiagnosticsNoLogs(with: stats)
         }
     }
 
-    /// Load full diagnostic information with complete stats and logs (for submission)
-    private func loadDiagnosticsWithRealStats() async {
+    /// Load full diagnostic information with complete stats.
+    private func loadDiagnosticsWithRealStats(includeLogs: Bool) async {
         guard let wrapper = coordinatorWrapper else {
-            diagnostics = feedbackService.collectDiagnostics()
+            if includeLogs {
+                diagnostics = feedbackService.collectDiagnostics()
+            } else {
+                diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackDatabaseStats)
+            }
             return
         }
 
@@ -167,10 +207,16 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = feedbackService.collectDiagnostics(with: stats)
+            self.diagnostics = includeLogs
+                ? feedbackService.collectDiagnostics(with: stats)
+                : feedbackService.collectDiagnosticsNoLogs(with: stats)
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load real stats: \(error)", category: .ui)
-            diagnostics = feedbackService.collectDiagnostics()
+            if includeLogs {
+                diagnostics = feedbackService.collectDiagnostics()
+            } else {
+                diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackDatabaseStats)
+            }
         }
     }
 
@@ -181,8 +227,11 @@ public final class FeedbackViewModel: ObservableObject {
         isSubmitting = true
         error = nil
 
-        // Always collect full diagnostics (with complete logs) for submission
-        await loadDiagnosticsWithRealStats()
+        let submissionType = feedbackType
+        let includeLogs = submissionType == .bug
+
+        // Collect full diagnostics, but only include logs for bug reports.
+        await loadDiagnosticsWithRealStats(includeLogs: includeLogs)
 
         guard let diagnostics = diagnostics else {
             self.error = "Failed to collect diagnostics"
@@ -192,7 +241,7 @@ public final class FeedbackViewModel: ObservableObject {
 
         do {
             let submission = FeedbackSubmission(
-                type: feedbackType,
+                type: submissionType,
                 email: email.trimmingCharacters(in: .whitespacesAndNewlines),
                 description: description,
                 diagnostics: diagnostics,
@@ -232,7 +281,7 @@ public final class FeedbackViewModel: ObservableObject {
         isSubmitted = false
         error = nil
         Task {
-            await loadDiagnosticsWithRealStats()
+            await loadDiagnosticsWithRealStats(includeLogs: true)
         }
     }
 
