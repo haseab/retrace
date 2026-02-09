@@ -270,6 +270,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the user is actively scrolling (disables tape animation during rapid scrolling)
     @Published public var isActivelyScrolling = false
 
+    /// Whether the pointer is currently over the floating multi-display stack.
+    /// Used by the window controller to avoid hijacking stack scroll events.
+    @Published public var isDisplayStackHovering = false
+
     /// Currently selected frame index (for deletion, etc.) - nil means no selection
     @Published public var selectedFrameIndex: Int? = nil
 
@@ -766,18 +770,21 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Timeline loads should default to focused stream in native multi-display mode.
     /// Rewind remains visible because it aliases frames as focused.
+    ///
+    /// In pinned mode we intentionally keep a union timeline (do NOT force displayID)
+    /// so scrubbing span is not reduced to the pinned display's sparse frame count.
+    /// The pinned primary view is resolved via carry-forward nearest-frame logic.
     private var effectiveTimelineFilters: FilterCriteria {
         var effective = filterCriteria
-        if isMultiDisplayEnabled {
-            if isPrimaryDisplayPinned, primaryDisplayID != 0 {
-                // Pinned mode rewrites the timeline tape to the pinned display stream.
-                effective.displayID = primaryDisplayID
-                // Show full stream for pinned display (not only globally-focused frames).
-                effective.focusedOnly = nil
-            } else if effective.focusedOnly == nil {
-                // Default tape remains focused stream only.
-                effective.focusedOnly = true
-            }
+        if isPrimaryDisplayPinned, primaryDisplayID != 0 {
+            // Keep union tape while pinned, otherwise sparse displays collapse timeline length.
+            // Clearing displayID preserves full scrubbing range across active displays.
+            effective.displayID = nil
+            // Show full stream while pinned (not only globally-focused frames).
+            effective.focusedOnly = nil
+        } else if isMultiDisplayEnabled, effective.focusedOnly == nil {
+            // Default tape remains focused stream only in active multi-display mode.
+            effective.focusedOnly = true
         }
         return effective
     }
@@ -933,7 +940,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             available.isEmpty || available.contains(id)
         }
 
-        if isPrimaryDisplayPinned, primaryDisplayID != 0, isAvailable(primaryDisplayID) {
+        // User pin is authoritative. Do not auto-remap pinned primary to another
+        // display just because the currently loaded window doesn't include it yet.
+        if isPrimaryDisplayPinned, primaryDisplayID != 0 {
             return primaryDisplayID
         }
 
@@ -1513,21 +1522,18 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             if displayIDs.count <= 1 {
-                isPrimaryDisplayPinned = false
                 primaryDisplayVideoInfoOverride = nil
                 secondaryDisplayFrames = []
                 clearPIPDisplayFrameCache()
-                if let onlyDisplay = displayIDs.first {
-                    primaryDisplayID = onlyDisplay
-                } else {
-                    primaryDisplayID = 0
+                // Keep explicit pin stable; only auto-select when unpinned.
+                if !isPrimaryDisplayPinned {
+                    if let onlyDisplay = displayIDs.first {
+                        primaryDisplayID = onlyDisplay
+                    } else {
+                        primaryDisplayID = 0
+                    }
                 }
                 return
-            }
-
-            // If pinned display disappeared, drop pin and resume active display mode.
-            if isPrimaryDisplayPinned && !displayIDs.contains(primaryDisplayID) {
-                isPrimaryDisplayPinned = false
             }
 
             syncPrimaryDisplaySelection()
@@ -3517,16 +3523,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                     continue
                 }
 
-                // Resolve the current location by ID right before mutation (array may have changed).
-                guard let currentIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) else {
-                    continue
-                }
-
-                let currentEntry = frames[currentIndex]
-
                 // Re-fetch the full frame with updated videoInfo
                 if let updatedFrame = try await coordinator.getFrameWithVideoInfoByID(id: snapshotFrame.frame.id) {
-                    // Re-fetch the full frame with updated videoInfo
+                    // Re-resolve by ID after await; array may have changed while suspended.
+                    guard let currentIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) else {
+                        continue
+                    }
+                    let currentEntry = frames[currentIndex]
                     frames[currentIndex] = TimelineFrame(
                         frame: updatedFrame.frame,
                         videoInfo: updatedFrame.videoInfo,
@@ -3534,6 +3537,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                         secondaryFrames: currentEntry.secondaryFrames
                     )
                 } else {
+                    // No refreshed row, but status changed; still re-resolve current index safely.
+                    guard let currentIndex = frames.firstIndex(where: { $0.frame.id.value == frameID }) else {
+                        continue
+                    }
+                    let currentEntry = frames[currentIndex]
                     // Still update the status even if we can't get fresh videoInfo.
                     frames[currentIndex] = TimelineFrame(
                         frame: currentEntry.frame,
@@ -4477,11 +4485,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        let frame = timelineFrame.frame
+        guard let context = currentOCRRequestContext() else {
+            setOCRNodes([])
+            ocrStatus = .unknown
+            return
+        }
+
+        let frame = await resolveOCRFrameTarget(for: timelineFrame)
         let videoInfo = timelineFrame.videoInfo
 
         // DEBUG: Log which frame we're loading OCR for
-        Log.debug("[OCR-LOAD-DEBUG] Loading OCR nodes for frameID=\(frame.id.value), videoFrameIndex=\(videoInfo?.frameIndex ?? -1), source=\(frame.source)", category: .ui)
+        Log.debug(
+            "[OCR-LOAD-DEBUG] Loading OCR nodes for frameID=\(frame.id.value), videoFrameIndex=\(videoInfo?.frameIndex ?? -1), source=\(frame.source), pinned=\(isPrimaryDisplayPinned), primaryDisplayID=\(primaryDisplayID)",
+            category: .ui
+        )
 
         do {
             // Fetch OCR status and nodes concurrently
@@ -4501,14 +4518,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             Log.debug("[SimpleTimelineViewModel] Loaded \(nodes.count) OCR nodes for frame \(frame.id.value) source=\(frame.source)", category: .ui)
 
-            // Only update if we're still on the same frame
-            if currentTimelineFrame?.frame.id == frame.id {
+            // Only update if OCR target context is unchanged
+            if currentOCRRequestContext() == context {
                 // Update OCR status
                 ocrStatus = status
 
                 // Start polling if OCR is in progress
                 if status.isInProgress {
-                    startOCRStatusPolling(for: frame.id)
+                    startOCRStatusPolling(for: frame.id, source: frame.source, context: context)
                 }
 
                 // Filter out nodes with invalid coordinates (multi-monitor captures)
@@ -4537,7 +4554,46 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Start polling for OCR status updates
     /// Polls every 500ms until OCR completes or frame changes
-    private func startOCRStatusPolling(for frameID: FrameID) {
+    private struct OCRRequestContext: Equatable {
+        let timelineFrameID: Int64
+        let isPinned: Bool
+        let primaryDisplayID: UInt32
+    }
+
+    private func currentOCRRequestContext() -> OCRRequestContext? {
+        guard let timelineFrame = currentTimelineFrame else { return nil }
+        return OCRRequestContext(
+            timelineFrameID: timelineFrame.frame.id.value,
+            isPinned: isPrimaryDisplayPinned,
+            primaryDisplayID: primaryDisplayID
+        )
+    }
+
+    /// Resolve which frame OCR should use for the current timeline position.
+    /// In pinned mode, this follows the pinned display's nearest frame at/before timestamp.
+    private func resolveOCRFrameTarget(for timelineFrame: TimelineFrame) async -> FrameReference {
+        let timelineDisplayID = timelineFrame.frame.metadata.displayID
+        guard isPrimaryDisplayPinned,
+              primaryDisplayID != 0,
+              timelineDisplayID != primaryDisplayID else {
+            return timelineFrame.frame
+        }
+
+        do {
+            if let nearest = try await coordinator.getNearestFrame(
+                displayID: primaryDisplayID,
+                before: timelineFrame.frame.timestamp
+            ) {
+                return nearest.frame
+            }
+        } catch {
+            Log.error("[OCR] Failed to resolve pinned OCR frame for display \(primaryDisplayID): \(error)", category: .ui)
+        }
+
+        return timelineFrame.frame
+    }
+
+    private func startOCRStatusPolling(for frameID: FrameID, source: FrameSource, context: OCRRequestContext) {
         ocrStatusPollingTask?.cancel()
 
         ocrStatusPollingTask = Task { [weak self] in
@@ -4549,9 +4605,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Check if we're still on the same frame
-                guard let currentFrame = await MainActor.run(body: { self.currentTimelineFrame?.frame }),
-                      currentFrame.id == frameID else {
+                // Check if OCR target context is still valid (frame + pin state + selected display)
+                guard let currentContext = await MainActor.run(body: { self.currentOCRRequestContext() }),
+                      currentContext == context else {
                     return
                 }
 
@@ -4560,15 +4616,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                     let status = try await self.coordinator.getOCRStatus(frameID: frameID)
 
                     await MainActor.run {
-                        // Only update if still on the same frame
-                        guard self.currentTimelineFrame?.frame.id == frameID else { return }
+                        // Only update if context still matches
+                        guard self.currentOCRRequestContext() == context else { return }
 
                         self.ocrStatus = status
 
                         // If completed, also reload the OCR nodes
                         if !status.isInProgress {
                             Task {
-                                await self.reloadOCRNodesOnly(for: frameID)
+                                await self.reloadOCRNodesOnly(for: frameID, source: source, context: context)
                             }
                         }
                     }
@@ -4585,17 +4641,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Reload only OCR nodes without fetching status (used after OCR completes)
-    private func reloadOCRNodesOnly(for frameID: FrameID) async {
-        guard let frame = currentTimelineFrame?.frame, frame.id == frameID else { return }
+    private func reloadOCRNodesOnly(for frameID: FrameID, source: FrameSource, context: OCRRequestContext) async {
+        guard currentOCRRequestContext() == context else { return }
 
         do {
             let nodes = try await coordinator.getAllOCRNodes(
-                frameID: frame.id,
-                source: frame.source
+                frameID: frameID,
+                source: source
             )
 
-            // Only update if still on the same frame
-            guard currentTimelineFrame?.frame.id == frameID else { return }
+            // Only update if OCR target context is unchanged
+            guard currentOCRRequestContext() == context else { return }
 
             let filteredNodes = nodes.filter { node in
                 node.x >= 0.0 && node.x <= 1.0 &&

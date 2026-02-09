@@ -27,12 +27,16 @@ struct PIPThumbnailView: View {
                             onLoadFailed: nil,
                             onLoadSuccess: nil
                         )
-                        .aspectRatio(16/10, contentMode: .fit)
+                        .aspectRatio(16/10, contentMode: .fill)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
                     } else {
                         // No frame available — show placeholder
                         Rectangle()
                             .fill(Color.black.opacity(0.6))
-                            .aspectRatio(16/10, contentMode: .fit)
+                            .aspectRatio(16/10, contentMode: .fill)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .clipped()
                             .overlay(
                                 Image(systemName: "display")
                                     .font(.title3)
@@ -63,29 +67,12 @@ struct PIPThumbnailView: View {
             .opacity(isCurrentDisplay ? 1.0 : 0.92)
 
             if isThumbnailHovering {
-                Button(action: triggerPrimaryAction) {
-                    Label(primaryActionLabel, systemImage: primaryActionIcon)
-                        .font(.caption.weight(.semibold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            Capsule()
-                                .fill(Color.black.opacity(isPinButtonHovering ? 0.78 : 0.68))
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.22), lineWidth: 0.8)
-                        )
-                        .shadow(
-                            color: .black.opacity(isPinButtonHovering ? 0.42 : 0.25),
-                            radius: isPinButtonHovering ? 10 : 6,
-                            x: 0,
-                            y: isPinButtonHovering ? 5 : 3
-                        )
-                        .scaleEffect(isPinButtonHovering ? 1.03 : 1.0)
-                }
-                .buttonStyle(.plain)
+                DisplayPinActionButton(
+                    label: primaryActionLabel,
+                    systemImage: primaryActionIcon,
+                    isHovering: isPinButtonHovering,
+                    action: triggerPrimaryAction
+                )
                 .onHover { hovering in
                     isPinButtonHovering = hovering
                 }
@@ -133,7 +120,7 @@ struct PIPThumbnailView: View {
     }
 
     private var primaryActionLabel: String {
-        isPinnedDisplay ? "Unpin Display" : "Pin Display"
+        isPinnedDisplay ? "Unpin" : "Pin"
     }
 
     private var primaryActionIcon: String {
@@ -157,5 +144,41 @@ struct PIPThumbnailView: View {
                 Capsule()
                     .stroke(Color.white.opacity(0.25), lineWidth: 0.6)
             )
+    }
+}
+
+/// Shared pin/unpin action button used by display thumbnails and current-display cards.
+struct DisplayPinActionButton: View {
+    let label: String
+    let systemImage: String
+    let isHovering: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 11)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(isHovering ? 0.78 : 0.68))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.22), lineWidth: 0.8)
+                )
+                .shadow(
+                    color: .black.opacity(isHovering ? 0.42 : 0.25),
+                    radius: isHovering ? 12 : 8,
+                    x: 0,
+                    y: isHovering ? 6 : 4
+                )
+                .scaleEffect(isHovering ? 1.05 : 1.0)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .help(label)
     }
 }

@@ -1228,9 +1228,12 @@ public class TimelineWindowController: NSObject {
             if event.type == .keyDown {
                 self?.handleKeyEvent(event)
             } else if event.type == .scrollWheel {
-                // Don't handle scroll events when search overlay, filter dropdown, or tag submenu is open
+                // Don't handle scroll events when SwiftUI overlays need native ScrollView handling.
                 if let viewModel = self?.timelineViewModel,
-                   (viewModel.isSearchOverlayVisible || viewModel.isFilterDropdownOpen || viewModel.showTagSubmenu) {
+                   (viewModel.isSearchOverlayVisible ||
+                    viewModel.isFilterDropdownOpen ||
+                    viewModel.showTagSubmenu ||
+                    viewModel.isDisplayStackHovering) {
                     return // Let SwiftUI handle it
                 }
                 self?.handleScrollEvent(event)
@@ -1344,6 +1347,11 @@ public class TimelineWindowController: NSObject {
                 // Let SwiftUI ScrollView handle them for scrolling through tags
                 if let viewModel = self?.timelineViewModel, viewModel.showTagSubmenu {
                     return event // Let the tag submenu ScrollView handle it
+                }
+                // Don't intercept scroll events while hovering the display stack panel.
+                // Let its internal ScrollView consume wheel/trackpad input.
+                if let viewModel = self?.timelineViewModel, viewModel.isDisplayStackHovering {
+                    return event
                 }
                 // Don't intercept scroll events when search overlay is open with results
                 // Prioritize scrolling the search results over timeline navigation

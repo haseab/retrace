@@ -1067,19 +1067,19 @@ public actor DataAdapter {
                  AND (ds.disconnectedAt IS NULL OR ds.disconnectedAt >= p.createdAt)
                  AND ds.displayID <> p.displayID
             ),
-            ranked_secondary AS (
+            nearest_secondary AS (
                 SELECT
                     cs.primary_id,
                     cs.secondary_display_id,
-                    sf.id AS secondary_frame_id,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY cs.primary_id, cs.secondary_display_id
-                        ORDER BY sf.createdAt DESC, sf.id DESC
-                    ) AS rn
+                    (
+                        SELECT sf2.id
+                        FROM frame sf2
+                        WHERE sf2.displayID = cs.secondary_display_id
+                          AND sf2.createdAt <= cs.primary_ts
+                        ORDER BY sf2.createdAt DESC, sf2.id DESC
+                        LIMIT 1
+                    ) AS secondary_frame_id
                 FROM connected_secondary cs
-                LEFT JOIN frame sf
-                  ON sf.displayID = cs.secondary_display_id
-                 AND sf.createdAt <= cs.primary_ts
             )
             """
         )
@@ -1110,8 +1110,8 @@ public actor DataAdapter {
                 sv.width,
                 sv.height
             FROM primary_frames p
-            LEFT JOIN ranked_secondary rs
-              ON rs.primary_id = p.id AND rs.rn = 1
+            LEFT JOIN nearest_secondary rs
+              ON rs.primary_id = p.id
             LEFT JOIN frame sf ON sf.id = rs.secondary_frame_id
             LEFT JOIN video sv ON sv.id = sf.videoId
             ORDER BY p.createdAt \(orderDirection), rs.secondary_display_id ASC
