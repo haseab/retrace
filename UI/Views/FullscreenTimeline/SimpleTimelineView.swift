@@ -174,9 +174,7 @@ public struct SimpleTimelineView: View {
                                     .frame(height: targetHeight)
                                     .clipped()
                                     .animation(
-                                        shouldRoleAnimate
-                                            ? .easeInOut(duration: displayRoleAnimationDuration)
-                                            : nil,
+                                        .easeInOut(duration: displayRoleAnimationDuration),
                                         value: isCurrentDisplay
                                     )
                                     .transition(
@@ -563,6 +561,29 @@ public struct SimpleTimelineView: View {
                 logDisplayAnimationDebug(
                     "primaryDisplayID changed \(oldPrimaryDisplayID) -> \(newPrimaryDisplayID), roleParticipants=\(roleAnimatingDisplayIDs.sorted())"
                 )
+
+                // If no role animation is already in progress (i.e. this wasn't triggered
+                // by handleDisplayPrimaryAction), start one so scrubbing gets the same
+                // fade+height card transitions.
+                if roleAnimatingDisplayIDs.isEmpty,
+                   oldPrimaryDisplayID != 0,
+                   newPrimaryDisplayID != 0,
+                   oldPrimaryDisplayID != newPrimaryDisplayID {
+                    displayAnimationSessionID += 1
+                    let sessionID = displayAnimationSessionID
+                    activeDisplayAnimationSessionID = sessionID
+                    var participants = Set<UInt32>()
+                    participants.insert(oldPrimaryDisplayID)
+                    participants.insert(newPrimaryDisplayID)
+                    roleAnimatingDisplayIDs = participants
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + displayRoleAnimationGateDuration) {
+                        if activeDisplayAnimationSessionID == sessionID,
+                           roleAnimatingDisplayIDs == participants {
+                            roleAnimatingDisplayIDs.removeAll()
+                        }
+                    }
+                }
             }
             .onChange(of: roleAnimatingDisplayIDs) { newParticipants in
                 logDisplayAnimationDebug("roleParticipants now=\(newParticipants.sorted())")
@@ -914,6 +935,12 @@ public struct SimpleTimelineView: View {
         // Keep role-participating displays mounted during the transition window
         // so cards don't get removed/reinserted mid-swap.
         displayIDSet.formUnion(roleAnimatingDisplayIDs.filter { $0 != 0 })
+        // Bridge the one-frame gap before .onChange sets roleAnimatingDisplayIDs:
+        // previousPrimaryDisplayIDForDebug still holds the old primary at this point.
+        if previousPrimaryDisplayIDForDebug != 0,
+           previousPrimaryDisplayIDForDebug != viewModel.primaryDisplayID {
+            displayIDSet.insert(previousPrimaryDisplayIDForDebug)
+        }
         let orderedDisplayIDs = Array(displayIDSet).sorted()
         let secondaryFramesByDisplay = Dictionary(uniqueKeysWithValues: viewModel.secondaryDisplayFrames.map { ($0.displayID, $0.videoInfo) })
 
