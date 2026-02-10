@@ -91,6 +91,10 @@ public struct SettingsView: View {
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
+    @State private var pendingScrollTargetID: String?
+    @State private var isScrollingToTarget = false
+    @State private var isPauseReminderCardHighlighted = false
+    @State private var pauseReminderHighlightTask: Task<Void, Never>? = nil
 
     // Settings search
     @State private var showSettingsSearch = false
@@ -98,12 +102,13 @@ public struct SettingsView: View {
 
     // MARK: - Initialization
 
-    public init(initialTab: SettingsTab? = nil) {
+    public init(initialTab: SettingsTab? = nil, initialScrollTargetID: String? = nil) {
         self.initialTab = initialTab
         // Set initial selected tab if provided
         if let tab = initialTab {
             _selectedTab = State(initialValue: tab)
         }
+        _pendingScrollTargetID = State(initialValue: initialScrollTargetID)
     }
 
     // MARK: General Settings
@@ -386,6 +391,8 @@ public struct SettingsView: View {
 
     /// Max width for the entire settings panel before it detaches and centers
     private let settingsMaxWidth: CGFloat = 1200
+    static let pauseReminderIntervalTargetID = "settings.pauseReminderInterval"
+    private static let pauseReminderCardAnchorID = "settings.pauseReminderCard"
 
     public var body: some View {
         GeometryReader { geometry in
@@ -461,6 +468,15 @@ public struct SettingsView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
             selectedTab = .power
+            pendingScrollTargetID = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+            requestNavigation(to: Self.pauseReminderIntervalTargetID)
+        }
+        .onDisappear {
+            pauseReminderHighlightTask?.cancel()
+            pauseReminderHighlightTask = nil
+            isPauseReminderCardHighlighted = false
         }
         .overlay {
             settingsSearchOverlay
@@ -690,35 +706,114 @@ public struct SettingsView: View {
 
     @ViewBuilder
     private var content: some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                // Content header
-                contentHeader
+        ScrollViewReader { proxy in
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Content header
+                    contentHeader
 
-                // Settings content
-                VStack(alignment: .leading, spacing: 24) {
-                    switch selectedTab {
-                    case .general:
-                        generalSettings
-                    case .capture:
-                        captureSettings
-                    case .storage:
-                        storageSettings
-                    case .exportData:
-                        exportDataSettings
-                    case .privacy:
-                        privacySettings
-                    case .power:
-                        powerSettings
-                    case .tags:
-                        tagManagementSettings
-                    case .advanced:
-                        advancedSettings
+                    // Settings content
+                    VStack(alignment: .leading, spacing: 24) {
+                        switch selectedTab {
+                        case .general:
+                            generalSettings
+                        case .capture:
+                            captureSettings
+                        case .storage:
+                            storageSettings
+                        case .exportData:
+                            exportDataSettings
+                        case .privacy:
+                            privacySettings
+                        case .power:
+                            powerSettings
+                        case .tags:
+                            tagManagementSettings
+                        case .advanced:
+                            advancedSettings
+                        }
                     }
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 32)
                 }
-                .padding(.horizontal, 32)
-                .padding(.bottom, 32)
             }
+            .onAppear {
+                scrollToPendingTarget(using: proxy)
+            }
+            .onChange(of: selectedTab) { _ in
+                scrollToPendingTarget(using: proxy)
+            }
+            .onChange(of: pendingScrollTargetID) { _ in
+                scrollToPendingTarget(using: proxy)
+            }
+        }
+    }
+
+    private func requestNavigation(to targetID: String) {
+        switch targetID {
+        case Self.pauseReminderIntervalTargetID:
+            selectedTab = .capture
+        default:
+            break
+        }
+        pendingScrollTargetID = targetID
+    }
+
+    private func scrollToPendingTarget(using proxy: ScrollViewProxy) {
+        guard let targetID = pendingScrollTargetID, !isScrollingToTarget else { return }
+
+        // Ensure tab content is visible before scrolling to a row inside it.
+        switch targetID {
+        case Self.pauseReminderIntervalTargetID:
+            guard selectedTab == .capture else { return }
+        default:
+            pendingScrollTargetID = nil
+            return
+        }
+
+        let anchorID: String
+        switch targetID {
+        case Self.pauseReminderIntervalTargetID:
+            anchorID = Self.pauseReminderCardAnchorID
+        default:
+            pendingScrollTargetID = nil
+            return
+        }
+
+        isScrollingToTarget = true
+        Task { @MainActor in
+            // Wait one layout pass so the target row is in the tree.
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(anchorID, anchor: .top)
+            }
+            if targetID == Self.pauseReminderIntervalTargetID {
+                try? await Task.sleep(nanoseconds: 140_000_000)
+                triggerPauseReminderCardHighlight()
+            }
+            pendingScrollTargetID = nil
+            isScrollingToTarget = false
+        }
+    }
+
+    private func triggerPauseReminderCardHighlight() {
+        pauseReminderHighlightTask?.cancel()
+        pauseReminderHighlightTask = nil
+
+        isPauseReminderCardHighlighted = false
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.22)) {
+                isPauseReminderCardHighlighted = true
+            }
+        }
+
+        pauseReminderHighlightTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.38)) {
+                isPauseReminderCardHighlighted = false
+            }
+            pauseReminderHighlightTask = nil
         }
     }
 
@@ -1337,6 +1432,9 @@ public struct SettingsView: View {
         VStack(alignment: .leading, spacing: 20) {
             captureRateCard
             compressionCard
+            Color.clear
+                .frame(height: 0)
+                .id(Self.pauseReminderCardAnchorID)
             pauseReminderCard
 
             // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
@@ -1622,6 +1720,18 @@ public struct SettingsView: View {
                         }
                     }
                 }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(
+                    Color.retraceAccent.opacity(isPauseReminderCardHighlighted ? 0.92 : 0),
+                    lineWidth: isPauseReminderCardHighlighted ? 2.5 : 0
+                )
+                .shadow(
+                    color: Color.retraceAccent.opacity(isPauseReminderCardHighlighted ? 0.45 : 0),
+                    radius: 12
+                )
+                .animation(.easeInOut(duration: 0.2), value: isPauseReminderCardHighlighted)
         }
     }
 

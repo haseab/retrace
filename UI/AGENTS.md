@@ -38,7 +38,8 @@ UI/
 │   ├── DashboardViewModel.swift
 │   └── SettingsViewModel.swift
 └── Tests/
-    └── UITests.swift
+    ├── TestLogger.swift                  # UI behavior + deeplink parsing tests
+    └── ManualShowSearchSimulationTests.swift # Manual dev harness for showSearch deeplink simulation
 ```
 
 ## Feature Requirements
@@ -145,11 +146,12 @@ UI/
 
 **Deeplinks**:
 
-Format: `retrace://search?q={query}&timestamp={unix_ms}&app={bundle_id}`
+Format (canonical): `retrace://search?q={query}&t={unix_ms}&app={bundle_id}`
+Legacy compatibility: `timestamp={unix_ms}` is also accepted.
 
 Examples:
 ```
-retrace://search?q=error&timestamp=1704067200000
+retrace://search?q=error&t=1704067200000
 retrace://search?q=password&app=com.google.Chrome
 retrace://search?timestamp=1704067200000
 ```
@@ -160,15 +162,17 @@ Implementation:
 func handleURL(_ url: URL) {
     guard url.scheme == "retrace" else { return }
 
+    let params = url.queryParameters
+    let timestampMs = params["t"] ?? params["timestamp"]   // support both keys
+    let timestamp = timestampMs.flatMap(Int64.init).map { Date(timeIntervalSince1970: TimeInterval($0) / 1000.0) }
+
     switch url.host {
     case "search":
-        let query = url.queryParameters["q"]
-        let timestamp = url.queryParameters["timestamp"].flatMap(Int64.init).map(Date.init)
-        let app = url.queryParameters["app"]
+        let query = params["q"]
+        let app = params["app"]
 
         openSearch(query: query, timestamp: timestamp, app: app)
     case "timeline":
-        let timestamp = url.queryParameters["timestamp"].flatMap(Int64.init).map(Date.init)
         openTimeline(at: timestamp)
     default:
         break

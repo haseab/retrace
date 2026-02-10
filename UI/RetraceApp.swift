@@ -96,6 +96,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var wasRecordingBeforeSleep = false
     private var pendingDeeplinkURLs: [URL] = []
     private var isInitialized = false
+    private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
 
     private static let shouldLogLaunchDiagnostics: Bool = {
         #if DEBUG
@@ -197,13 +198,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             isInitialized = true
 
             // Process any deeplinks that arrived before initialization completed
+            var didHandleInitialDeeplink = false
             if !pendingDeeplinkURLs.isEmpty {
                 Log.info("[AppDelegate] Processing \(pendingDeeplinkURLs.count) pending deeplink(s)", category: .app)
                 for url in pendingDeeplinkURLs {
                     handleDeeplink(url)
                 }
                 pendingDeeplinkURLs.removeAll()
-            } else {
+                didHandleInitialDeeplink = true
+            }
+
+            // Dev-only startup deeplink simulation from terminal:
+            // RETRACE_DEV_DEEPLINK_URL='retrace://search?...' swift run Retrace
+            if processDevDeeplinkFromEnvironment() {
+                didHandleInitialDeeplink = true
+            }
+
+            if !didHandleInitialDeeplink {
                 // Show dashboard on first launch (only if no deeplinks)
                 DashboardWindowController.shared.show()
             }
@@ -608,44 +619,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func handleDeeplink(_ url: URL) {
-        guard url.scheme == "retrace" else {
-            Log.warning("[AppDelegate] Invalid URL scheme: \(url.scheme ?? "none")", category: .app)
+        guard let route = DeeplinkHandler.route(for: url) else {
             return
         }
 
-        guard let host = url.host else {
-            Log.warning("[AppDelegate] No host in URL: \(url)", category: .app)
-            return
-        }
-
-        let queryParams = url.queryParameters
-
-        switch host.lowercased() {
-        case "timeline":
-            // Parse timestamp from query params (t=unix_ms)
-            let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
-            Log.info("[AppDelegate] Opening timeline at timestamp: \(String(describing: timestamp))", category: .app)
-
-            if let timestamp = timestamp {
+        switch route {
+        case let .timeline(timestamp):
+            Log.info("[AppDelegate] Opening timeline deeplink at timestamp: \(String(describing: timestamp))", category: .app)
+            if let timestamp {
                 TimelineWindowController.shared.showAndNavigate(to: timestamp)
             } else {
                 TimelineWindowController.shared.show()
             }
 
-        case "search":
-            // Parse search parameters
-            let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0) / 1000) }
-            Log.info("[AppDelegate] Opening search/timeline at timestamp: \(String(describing: timestamp))", category: .app)
-
-            if let timestamp = timestamp {
-                TimelineWindowController.shared.showAndNavigate(to: timestamp)
-            } else {
-                TimelineWindowController.shared.show()
-            }
-
-        default:
-            Log.warning("[AppDelegate] Unknown deeplink route: \(host)", category: .app)
+        case let .search(query, timestamp, appBundleID):
+            Log.info("[AppDelegate] Opening search deeplink: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .app)
+            TimelineWindowController.shared.showSearch(
+                query: query,
+                timestamp: timestamp,
+                appBundleID: appBundleID,
+                source: "AppDelegate.openURLs"
+            )
         }
+    }
+
+    /// Process a dev deeplink URL from environment for local interactive testing.
+    /// Example:
+    /// RETRACE_DEV_DEEPLINK_URL='retrace://search?q=test&app=com.google.Chrome&t=1704067200000' swift run Retrace
+    @MainActor
+    private func processDevDeeplinkFromEnvironment() -> Bool {
+        guard let rawValue = ProcessInfo.processInfo.environment[Self.devDeeplinkEnvKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawValue.isEmpty else {
+            return false
+        }
+
+        guard let url = URL(string: rawValue) else {
+            Log.warning("[AppDelegate] Ignoring invalid \(Self.devDeeplinkEnvKey): \(rawValue)", category: .app)
+            return false
+        }
+
+        Log.info("[AppDelegate] Processing dev deeplink from env: \(url)", category: .app)
+        handleDeeplink(url)
+        return true
     }
 
     // MARK: - Permissions

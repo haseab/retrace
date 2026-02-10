@@ -181,10 +181,13 @@ public struct TimelineTapeView: View {
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
         let isSelectedBlock = viewModel.selectedFrameIndex.map { $0 >= block.startIndex && $0 <= block.endIndex } ?? false
         let color = blockColor(for: block)
-        let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
+        let collapseFactor = collapseFactor(for: block)
+        let isHidingBlock = collapseFactor < 0.999
+        let effectivePixelsPerFrame = pixelsPerFrame * collapseFactor
+        let blockWidth = displayedWidth(for: block)
 
         // Calculate this block's position in tape-space for frame culling
-        let blockLeftX = offsetForFrame(block.startIndex, in: blocks) - pixelsPerFrame / 2
+        let blockLeftX = offsetForFrame(block.startIndex, in: blocks) - effectivePixelsPerFrame / 2
         let blockRightX = blockLeftX + blockWidth
 
         // Calculate visible frame range within this block
@@ -209,7 +212,7 @@ public struct TimelineTapeView: View {
                 .opacity(isCurrentBlock || isSelectedBlock ? 1.0 : 0.7)
 
             // Individual frame segments (clickable) - only render visible frames
-            if blockVisible && renderStart <= renderEnd {
+            if blockVisible && renderStart <= renderEnd && !isHidingBlock {
                 HStack(spacing: 0) {
                     // Spacer for frames before visible range
                     if renderStart > block.startIndex {
@@ -232,7 +235,7 @@ public struct TimelineTapeView: View {
             }
 
             // App icon (only show if block is wide enough)
-            if blockWidth > iconDisplayThreshold, let bundleID = block.bundleID {
+            if !isHidingBlock, blockWidth > iconDisplayThreshold, let bundleID = block.bundleID {
                 appIcon(for: bundleID)
                     .frame(width: appIconSize, height: appIconSize)
                     .allowsHitTesting(false) // Allow clicks to pass through to frame segments
@@ -244,6 +247,12 @@ public struct TimelineTapeView: View {
                 .frame(width: blockWidth, height: tapeHeight)
                 .allowsHitTesting(false)
         }
+        .scaleEffect(
+            y: isHidingBlock ? 0.82 : 1.0,
+            anchor: .center
+        )
+        .opacity(isHidingBlock ? 0.12 : 1.0)
+        .animation(.easeInOut(duration: 0.16), value: collapseFactor)
     }
 
     // MARK: - Frame Segment View
@@ -287,7 +296,7 @@ public struct TimelineTapeView: View {
             }
 
             let blockLeftX = x
-            let blockWidth = block.width(pixelsPerFrame: pixelsPerFrame)
+            let blockWidth = displayedWidth(for: block)
             let blockRightX = x + blockWidth
 
             positions.append(BlockPosition(
@@ -308,7 +317,7 @@ public struct TimelineTapeView: View {
         guard !blocks.isEmpty else { return 0 }
 
         // Sum all block widths plus spacing between blocks
-        let blocksWidth = blocks.reduce(0) { $0 + $1.width(pixelsPerFrame: pixelsPerFrame) }
+        let blocksWidth = blocks.reduce(0) { $0 + displayedWidth(for: $1) }
 
         // Count gap indicators (blocks with formattedGapBefore)
         let gapCount = blocks.filter { $0.formattedGapBefore != nil }.count
@@ -327,6 +336,10 @@ public struct TimelineTapeView: View {
         var spacingCount = 0
 
         for block in blocks {
+            let collapse = collapseFactor(for: block)
+            let effectivePixelsPerFrame = pixelsPerFrame * collapse
+            let effectiveBlockWidth = displayedWidth(for: block)
+
             // Add gap indicator width if this block has one
             // Note: Don't add blockSpacing here - spacingBeforeBlock handles all spacing
             // The HStack applies blockSpacing between [previousBlock, gapIndicator, currentBlock]
@@ -341,16 +354,30 @@ public struct TimelineTapeView: View {
                 // Add spacing for all blocks/gaps before this one
                 let spacingBeforeBlock = CGFloat(spacingCount) * blockSpacing
                 // Add exact pixel position within this block (centered on the frame's pixel)
-                offset += CGFloat(framePositionInBlock) * pixelsPerFrame + pixelsPerFrame / 2 + spacingBeforeBlock
+                offset += CGFloat(framePositionInBlock) * effectivePixelsPerFrame + effectivePixelsPerFrame / 2 + spacingBeforeBlock
                 break
             } else {
                 // Add full block width (spacing handled separately)
-                offset += block.width(pixelsPerFrame: pixelsPerFrame)
+                offset += effectiveBlockWidth
                 spacingCount += 1
             }
         }
 
         return offset
+    }
+
+    private func collapseFactor(for block: AppBlock) -> CGFloat {
+        guard let hidingRange = viewModel.hidingSegmentBlockRange else {
+            return 1.0
+        }
+        if hidingRange.lowerBound == block.startIndex && hidingRange.upperBound == block.endIndex {
+            return 0.05
+        }
+        return 1.0
+    }
+
+    private func displayedWidth(for block: AppBlock) -> CGFloat {
+        max(2, block.width(pixelsPerFrame: pixelsPerFrame) * collapseFactor(for: block))
     }
 
     private func blockColor(for block: AppBlock) -> Color {
@@ -1090,7 +1117,7 @@ struct FilterButton: View {
                 }
             }
         }
-        .instantTooltip(viewModel.activeFilterCount > 0 && isBadgeHovering ? "Clear filters" : "Filter (⌘F)", isVisible: .constant(isHovering || isBadgeHovering))
+        .instantTooltip(viewModel.activeFilterCount > 0 && isBadgeHovering ? "Clear filters" : "Filter (⌥F)", isVisible: .constant(isHovering || isBadgeHovering))
     }
 }
 

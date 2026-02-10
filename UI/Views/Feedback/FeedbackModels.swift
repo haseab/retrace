@@ -47,6 +47,8 @@ public struct DiagnosticInfo: Codable {
     public let totalDiskSpace: String
     public let freeDiskSpace: String
     public let databaseStats: DatabaseStats
+    /// Sanitized settings snapshot (whitelisted keys only) for debugging misconfiguration reports.
+    public let settingsSnapshot: [String: String]
     public let recentErrors: [String]
     public let recentLogs: [String]
     public let timestamp: Date
@@ -66,6 +68,7 @@ public struct DiagnosticInfo: Codable {
         totalDiskSpace: String,
         freeDiskSpace: String,
         databaseStats: DatabaseStats,
+        settingsSnapshot: [String: String] = [:],
         recentErrors: [String],
         recentLogs: [String] = []
     ) {
@@ -76,6 +79,7 @@ public struct DiagnosticInfo: Codable {
         self.totalDiskSpace = totalDiskSpace
         self.freeDiskSpace = freeDiskSpace
         self.databaseStats = databaseStats
+        self.settingsSnapshot = settingsSnapshot
         self.recentErrors = recentErrors
         self.recentLogs = recentLogs
         self.timestamp = Date()
@@ -97,6 +101,15 @@ public struct DiagnosticInfo: Codable {
 
         Recent Errors: \(recentErrors.isEmpty ? "None" : "\(recentErrors.count) error(s)")
         """
+
+        if !settingsSnapshot.isEmpty {
+            text += "\n\nSettings Snapshot:"
+            for key in settingsSnapshot.keys.sorted() {
+                if let value = settingsSnapshot[key] {
+                    text += "\n- \(key): \(value)"
+                }
+            }
+        }
 
         if !recentLogs.isEmpty {
             text += "\nRecent Logs: \(recentLogs.count) entries from last hour"

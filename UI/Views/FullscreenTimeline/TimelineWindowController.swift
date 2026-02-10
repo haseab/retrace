@@ -98,6 +98,9 @@ public class TimelineWindowController: NSObject {
     /// Whether the timeline overlay is currently visible
     public private(set) var isVisible = false
 
+    /// Monotonic counter for deeplink search invocations (debug tracing).
+    private var deeplinkSearchInvocationCounter = 0
+
     /// Whether the dashboard was the key window when timeline opened
     private var dashboardWasKeyWindow = false
 
@@ -278,6 +281,12 @@ public class TimelineWindowController: NSObject {
             self,
             selector: #selector(handleOpenSettings(_:)),
             name: .openSettings,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOpenSettings(_:)),
+            name: .openSettingsPauseReminderInterval,
             object: nil
         )
     }
@@ -573,6 +582,12 @@ public class TimelineWindowController: NSObject {
         // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
         window.ignoresMouseEvents = false
 
+        // Always start visible sessions with context menus closed.
+        if let viewModel = timelineViewModel {
+            viewModel.dismissContextMenu()
+            viewModel.dismissTimelineContextMenu()
+        }
+
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -659,6 +674,9 @@ public class TimelineWindowController: NSObject {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                 viewModel.isTapeHidden = true
             }
+            // Ensure right-click menus don't persist across timeline sessions.
+            viewModel.dismissContextMenu()
+            viewModel.dismissTimelineContextMenu()
         }
 
         // Remove event monitors
@@ -868,6 +886,206 @@ public class TimelineWindowController: NSObject {
         }
     }
 
+    /// Show timeline and apply deeplink search state (`q`, `app`, `t`/`timestamp`).
+    public func showSearch(query: String?, timestamp: Date?, appBundleID: String?, source: String = "unknown") {
+        deeplinkSearchInvocationCounter += 1
+        let invocationID = deeplinkSearchInvocationCounter
+        Log.info(
+            "[DeeplinkSearch] Invocation #\(invocationID) source=\(source), query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")",
+            category: .ui
+        )
+
+        if let timestamp {
+            showAndNavigate(to: timestamp)
+        } else {
+            show()
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            // Wait briefly for the pre-rendered view model to be ready on first launch.
+            var attempts = 0
+            while self.timelineViewModel == nil && attempts < 20 {
+                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+                attempts += 1
+            }
+
+            guard let viewModel = self.timelineViewModel else {
+                Log.warning("[DeeplinkSearch] Invocation #\(invocationID) failed - timeline view model unavailable", category: .ui)
+                return
+            }
+
+            Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
+            viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
+        }
+    }
+
+    private func isSingleAppOnlyIncludeFilter(_ criteria: FilterCriteria, matching bundleID: String? = nil) -> Bool {
+        guard criteria.appFilterMode == .include,
+              let selectedApps = criteria.selectedApps,
+              selectedApps.count == 1 else {
+            return false
+        }
+        if let bundleID {
+            guard selectedApps.contains(bundleID) else { return false }
+        }
+
+        let hasNoSources = criteria.selectedSources == nil || criteria.selectedSources?.isEmpty == true
+        let hasNoTags = criteria.selectedTags == nil || criteria.selectedTags?.isEmpty == true
+        let hasNoWindowFilter = criteria.windowNameFilter?.isEmpty ?? true
+        let hasNoBrowserFilter = criteria.browserUrlFilter?.isEmpty ?? true
+
+        return hasNoSources &&
+            criteria.hiddenFilter == .hide &&
+            hasNoTags &&
+            criteria.tagFilterMode == .include &&
+            hasNoWindowFilter &&
+            hasNoBrowserFilter &&
+            criteria.startDate == nil &&
+            criteria.endDate == nil
+    }
+
+    private func summarizeFilterCriteria(_ criteria: FilterCriteria) -> String {
+        let selectedApps = (criteria.selectedApps ?? []).sorted()
+        let selectedSources = (criteria.selectedSources ?? []).map { $0.rawValue }.sorted()
+        let selectedTags = (criteria.selectedTags ?? []).sorted()
+        return "apps=\(selectedApps), appMode=\(criteria.appFilterMode.rawValue), sources=\(selectedSources), hidden=\(criteria.hiddenFilter.rawValue), tags=\(selectedTags), tagMode=\(criteria.tagFilterMode.rawValue), window=\(criteria.windowNameFilter ?? "nil"), browser=\(criteria.browserUrlFilter ?? "nil"), start=\(criteria.startDate?.description ?? "nil"), end=\(criteria.endDate?.description ?? "nil")"
+    }
+
+    /// Resolve quick app filter trigger key from an NSEvent.
+    /// Supports Cmd+F.
+    private func quickAppFilterTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+        if modifiers == [.command] && (key == "f" || event.keyCode == 3) {
+            return "Cmd+F"
+        }
+        return nil
+    }
+
+    /// Resolve add-tag shortcut key from an NSEvent.
+    /// Supports Cmd+T.
+    private func addTagShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
+        guard event.keyCode == 17 else { // T key
+            return nil
+        }
+        if modifiers == [.command] {
+            return "Cmd+T"
+        }
+        return nil
+    }
+
+    /// Toggle quick app filter for the app at the current playhead.
+    /// First press applies a single-app include filter, second press clears it.
+    private func togglePlayheadAppFilter(trigger _: String) {
+        guard let viewModel = timelineViewModel else {
+            return
+        }
+
+        recordShortcut("cmd+f")
+
+        guard let currentFrame = viewModel.currentTimelineFrame else {
+            return
+        }
+
+        guard let bundleID = currentFrame.frame.metadata.appBundleID, !bundleID.isEmpty else {
+            return
+        }
+
+        if isSingleAppOnlyIncludeFilter(viewModel.filterCriteria, matching: bundleID) {
+            viewModel.clearAllFilters()
+            return
+        }
+
+        var criteria = FilterCriteria()
+        criteria.selectedApps = Set([bundleID])
+        criteria.appFilterMode = .include
+
+        // Use the same pending+apply path as the filter panel's Apply button.
+        viewModel.pendingFilterCriteria = criteria
+        viewModel.applyFilters()
+    }
+
+    /// Hide or unhide the visible segment block at the current playhead index.
+    private func hidePlayheadSegment(trigger _: String) {
+        guard let viewModel = timelineViewModel else { return }
+        guard !viewModel.frames.isEmpty else { return }
+
+        let clampedIndex = max(0, min(viewModel.currentIndex, viewModel.frames.count - 1))
+        viewModel.timelineContextMenuSegmentIndex = clampedIndex
+
+        let isShowingHiddenSegments = viewModel.filterCriteria.hiddenFilter != .hide
+        let isPlayheadSegmentHidden = viewModel.isFrameHidden(at: clampedIndex)
+
+        if isShowingHiddenSegments && isPlayheadSegmentHidden {
+            viewModel.unhideSelectedTimelineSegment()
+        } else {
+            viewModel.hideSelectedTimelineSegment()
+        }
+    }
+
+    /// Open the timeline segment "Add Tag" submenu for the current playhead index.
+    private func openAddTagSubmenuAtPlayhead(trigger _: String) {
+        guard let viewModel = timelineViewModel else {
+            return
+        }
+        guard !viewModel.frames.isEmpty else {
+            return
+        }
+
+        let clampedIndex = max(0, min(viewModel.currentIndex, viewModel.frames.count - 1))
+        let menuLocation = defaultTimelineContextMenuLocation()
+
+        viewModel.dismissOtherDialogs()
+
+        // Reset menu state before re-opening to avoid stale/half-mounted submenu state.
+        viewModel.timelineContextMenuSegmentIndex = clampedIndex
+        viewModel.timelineContextMenuLocation = menuLocation
+        viewModel.selectedFrameIndex = clampedIndex
+        viewModel.showTimelineContextMenu = false
+        viewModel.showTagSubmenu = false
+        viewModel.showNewTagInput = false
+        viewModel.newTagName = ""
+        viewModel.isHoveringAddTagButton = false
+
+        // Open context menu on next runloop, then load tags, then open submenu.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let viewModel = self.timelineViewModel else {
+                return
+            }
+            let liveIndex = max(0, min(viewModel.currentIndex, max(0, viewModel.frames.count - 1)))
+            viewModel.timelineContextMenuSegmentIndex = liveIndex
+            viewModel.timelineContextMenuLocation = menuLocation
+            viewModel.selectedFrameIndex = liveIndex
+            viewModel.showTimelineContextMenu = true
+            viewModel.isHoveringAddTagButton = true
+
+            Task { @MainActor in
+                await viewModel.loadTags()
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let viewModel = self.timelineViewModel else {
+                        return
+                    }
+                    // Re-assert menu visibility before opening submenu.
+                    viewModel.showTimelineContextMenu = true
+                    viewModel.isHoveringAddTagButton = true
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.showTagSubmenu = true
+                    }
+                }
+            }
+        }
+    }
+
+    private func defaultTimelineContextMenuLocation() -> CGPoint {
+        guard let contentView = window?.contentView else {
+            return .zero
+        }
+        let size = contentView.bounds.size
+        return CGPoint(x: size.width * 0.5, y: max(48, size.height - 140))
+    }
+
     /// Show the timeline with a pre-applied filter for an app and window name
     /// This instantly opens a filtered timeline view without showing a dialog
     /// - Parameters:
@@ -920,7 +1138,6 @@ public class TimelineWindowController: NSObject {
             fadeInPreparedWindow()
             logTabClickTiming("FADE_IN_STARTED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
-            Log.info("[TIMELINE-FILTER] Applied filter for bundleID=\(bundleID), windowName=\(windowName ?? "nil"), browserUrl=\(browserUrl ?? "nil"), dateRange=\(String(describing: startDate))-\(String(describing: endDate))", category: .ui)
         }
     }
 
@@ -1274,17 +1491,23 @@ public class TimelineWindowController: NSObject {
         // Also monitor local events (when our window is key)
         localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel, .magnify]) { [weak self] event in
             if event.type == .keyDown {
-                // Check if a text field is currently active
-                let isTextFieldActive: Bool
-                if let window = self?.window,
-                   let firstResponder = window.firstResponder {
-                    isTextFieldActive = firstResponder is NSTextView || firstResponder is NSTextField
-                } else {
-                    isTextFieldActive = false
-                }
+                let isTextFieldActive: Bool = {
+                    guard let window = self?.window,
+                          let firstResponder = window.firstResponder else {
+                        return false
+                    }
+                    return firstResponder is NSTextView || firstResponder is NSTextField
+                }()
 
                 // Always handle certain shortcuts even when text field is active
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+                if event.keyCode == 53 { // Escape
+                    if self?.handleKeyEvent(event) == true {
+                        return nil // Always consume when handled
+                    }
+
+                    return event
+                }
 
                 // Cmd+K to toggle search overlay
                 if event.keyCode == 40 && modifiers == [.command] { // Cmd+K
@@ -1292,8 +1515,26 @@ public class TimelineWindowController: NSObject {
                     return nil // Always consume the event to prevent propagation
                 }
 
-                // Cmd+F to toggle filter panel
-                if event.keyCode == 3 && modifiers == [.command] { // Cmd+F
+                // Option+H to hide the segment at playhead
+                if event.keyCode == 4 && modifiers == [.option] { // Option+H
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Add Tag submenu shortcut for segment at playhead (Cmd+T)
+                if self?.addTagShortcutTrigger(for: event, modifiers: modifiers) != nil {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Cmd+F to quick-filter by the app at playhead
+                if self?.quickAppFilterTrigger(for: event, modifiers: modifiers) != nil {
+                    _ = self?.handleKeyEvent(event)
+                    return nil // Always consume the event to prevent propagation
+                }
+
+                // Option+F to toggle filter panel
+                if event.keyCode == 3 && modifiers == [.option] { // Option+F
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
@@ -1437,6 +1678,10 @@ public class TimelineWindowController: NSObject {
 
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        let addTagTrigger = addTagShortcutTrigger(for: event, modifiers: modifiers)
+        let isAddTagShortcut = addTagTrigger != nil
+
         // Don't handle escape if a modal panel (save panel, etc.) is open
         if NSApp.modalWindow != nil {
             return false
@@ -1444,12 +1689,36 @@ public class TimelineWindowController: NSObject {
 
         // Don't handle escape if our window is not the key window (e.g., save panel is open)
         if let keyWindow = NSApp.keyWindow, keyWindow != window {
-            return false
+            if isAddTagShortcut {
+                NSApp.activate(ignoringOtherApps: true)
+                window?.makeKeyAndOrderFront(nil)
+            } else {
+                return false
+            }
         }
 
         // Escape key - cascading behavior based on current state
         if event.keyCode == 53 { // Escape
             if let viewModel = timelineViewModel {
+                // If the tag submenu is open, close only the submenu first and keep
+                // the parent right-click menu visible.
+                if viewModel.showTagSubmenu {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.showTagSubmenu = false
+                        viewModel.showNewTagInput = false
+                        viewModel.newTagName = ""
+                        viewModel.isHoveringAddTagButton = false
+                    }
+                    return true
+                }
+                // Right-click menus should dismiss before any higher-level escape behavior.
+                if viewModel.showTimelineContextMenu || viewModel.showContextMenu {
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        viewModel.dismissContextMenu()
+                        viewModel.dismissTimelineContextMenu()
+                    }
+                    return true
+                }
                 // If currently dragging to create zoom region, cancel the drag
                 if viewModel.isDraggingZoomRegion {
                     viewModel.cancelZoomRegionDrag()
@@ -1474,6 +1743,16 @@ public class TimelineWindowController: NSObject {
                 // If date search is active, close it with animation
                 if viewModel.isDateSearchActive {
                     viewModel.closeDateSearch()
+                    return true
+                }
+                // If search overlay is visible and a filter dropdown is open, close the dropdown first.
+                if viewModel.isSearchOverlayVisible && viewModel.searchViewModel.isDropdownOpen {
+                    // When date popover calendar is open, let the popover consume Escape first
+                    // so it can collapse calendar before the entire dropdown is dismissed.
+                    if viewModel.searchViewModel.isDatePopoverHandlingKeys {
+                        return false
+                    }
+                    viewModel.searchViewModel.closeDropdownsSignal += 1
                     return true
                 }
                 // If search overlay is showing, close it
@@ -1510,10 +1789,14 @@ public class TimelineWindowController: NSObject {
                     viewModel.exitPeek()
                     return true
                 }
-                // If filter panel is visible with open dropdown, let the panel handle it
+                // If filter panel is visible with an open dropdown, close dropdown first.
+                // This avoids falling through to timeline close when a dropdown-level Escape
+                // handler does not consume the event in time.
                 if viewModel.isFilterPanelVisible && viewModel.isFilterDropdownOpen {
-                    // The FilterPanel's NSEvent monitor will handle this
-                    return false
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                    return true
                 }
                 // If filter panel is visible (no dropdown), close it
                 if viewModel.isFilterPanelVisible {
@@ -1534,7 +1817,6 @@ public class TimelineWindowController: NSObject {
         }
 
         // Check if it's the toggle shortcut (uses saved shortcut config)
-        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let shortcutConfig = loadTimelineShortcut()
         let expectedKeyCode = keyCodeForString(shortcutConfig.key)
         if event.keyCode == expectedKeyCode && modifiers == shortcutConfig.modifiers.nsModifiers {
@@ -1567,9 +1849,29 @@ public class TimelineWindowController: NSObject {
             return true
         }
 
-        // Cmd+F to toggle filter panel
-        if event.keyCode == 3 && modifiers == [.command] { // F key with Command
-            recordShortcut("cmd+f")
+        // Option+H to hide segment block at playhead
+        if event.keyCode == 4 && modifiers == [.option] { // H key with Option
+            recordShortcut("opt+h")
+            hidePlayheadSegment(trigger: "Option+H")
+            return true
+        }
+
+        // Add Tag submenu for segment block at playhead (Cmd+T)
+        if let trigger = addTagTrigger {
+            recordShortcut("cmd+t")
+            openAddTagSubmenuAtPlayhead(trigger: trigger)
+            return true
+        }
+
+        // Cmd+F to toggle app filter for the current playhead frame
+        if let trigger = quickAppFilterTrigger(for: event, modifiers: modifiers) {
+            togglePlayheadAppFilter(trigger: trigger)
+            return true
+        }
+
+        // Option+F to toggle filter panel
+        if event.keyCode == 3 && modifiers == [.option] { // F key with Option
+            recordShortcut("opt+f")
             if let viewModel = timelineViewModel {
                 if viewModel.isFilterPanelVisible {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -1755,6 +2057,17 @@ public class TimelineWindowController: NSObject {
         if let viewModel = timelineViewModel, viewModel.searchViewModel.isDropdownOpen, (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
             return false
         }
+        // Cmd+Left: jump to the start of the previous consecutive timeline block
+        if event.keyCode == 123 && modifiers == [.command] {
+            if let viewModel = timelineViewModel, viewModel.navigateToPreviousBlockStart() {
+                recordShortcut("cmd+left")
+                if let coordinator = coordinator {
+                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "left")
+                }
+            }
+            return true // Consume even at boundary to avoid system "bonk" sound
+        }
+
         if (event.keyCode == 123 || event.charactersIgnoringModifiers == "j") && (modifiers.isEmpty || modifiers == [.option]) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1
@@ -1768,6 +2081,17 @@ public class TimelineWindowController: NSObject {
         }
 
         // Right arrow key or K - navigate to next frame (Option = 3x speed)
+        // Cmd+Right: jump to the start of the next consecutive timeline block
+        if event.keyCode == 124 && modifiers == [.command] {
+            if let viewModel = timelineViewModel, viewModel.navigateToNextBlockStartOrNewestFrame() {
+                recordShortcut("cmd+right")
+                if let coordinator = coordinator {
+                    DashboardViewModel.recordArrowKeyNavigation(coordinator: coordinator, direction: "right")
+                }
+            }
+            return true // Consume even at boundary to avoid system "bonk" sound
+        }
+
         if (event.keyCode == 124 || event.charactersIgnoringModifiers == "k") && (modifiers.isEmpty || modifiers == [.option]) {
             if let viewModel = timelineViewModel {
                 let step = modifiers.contains(.option) ? 3 : 1

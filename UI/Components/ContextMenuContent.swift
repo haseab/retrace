@@ -232,13 +232,19 @@ struct ContextMenuRow: View {
                 Text(title)
                     .font(RetraceMenuStyle.font)
                     .foregroundColor(isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
                 Spacer()
 
                 if let shortcut = shortcut {
                     Text(shortcut)
-                        .font(.system(size: 11))
+                        .font(RetraceMenuStyle.shortcutFont)
                         .foregroundColor(.white.opacity(0.4))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: RetraceMenuStyle.shortcutColumnMinWidth, alignment: .trailing)
+                        .layoutPriority(1)
                 }
             }
             .padding(.horizontal, RetraceMenuStyle.itemPaddingH)

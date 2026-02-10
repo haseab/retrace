@@ -1004,8 +1004,18 @@ extension Color {
     // Original brand blue (for cases where we always want blue)
     public static let retraceBrandBlue = Color(red: 11/255, green: 51/255, blue: 108/255)
 
-    // Submit button accent - darker blue for submit/action buttons (#0b336c)
-    public static let retraceSubmitAccent = Color(red: 11/255, green: 51/255, blue: 108/255)
+    // Submit/action button accent - slightly deeper tones for filled buttons
+    public static var retraceSubmitAccent: Color {
+        let theme = MilestoneCelebrationManager.getCurrentTheme()
+        switch theme {
+        case .blue:
+            return Color(red: 59/255, green: 130/255, blue: 246/255)
+        case .gold:
+            return Color(red: 245/255, green: 180/255, blue: 0/255)
+        case .purple:
+            return Color(red: 148/255, green: 84/255, blue: 242/255)
+        }
+    }
 
     // Card background: hsl(222, 47%, 7%)
     public static let retraceCard = Color(red: 9/255, green: 18/255, blue: 38/255)
@@ -1648,6 +1658,13 @@ public struct RetraceMenuStyle {
     /// Font size value (for non-SwiftUI contexts)
     public static let fontSize: CGFloat = 13
 
+    /// Font for keyboard shortcut hints shown on the right side of menu rows
+    /// Use default system design so symbol glyphs like "⌫" and "⌘" render cleanly.
+    public static let shortcutFont = Font.system(size: 14, weight: .semibold)
+
+    /// Reserved width for the right-aligned shortcut column
+    public static let shortcutColumnMinWidth: CGFloat = 38
+
     /// Font weight
     public static let fontWeight: Font.Weight = .medium
 
@@ -1735,6 +1752,7 @@ public struct RetraceMenuStyle {
 public struct RetraceMenuButton: View {
     let icon: String
     let title: String
+    var shortcut: String? = nil
     var showChevron: Bool = false
     var isDestructive: Bool = false
     var isDisabled: Bool = false
@@ -1746,6 +1764,7 @@ public struct RetraceMenuButton: View {
     public init(
         icon: String,
         title: String,
+        shortcut: String? = nil,
         showChevron: Bool = false,
         isDestructive: Bool = false,
         isDisabled: Bool = false,
@@ -1754,6 +1773,7 @@ public struct RetraceMenuButton: View {
     ) {
         self.icon = icon
         self.title = title
+        self.shortcut = shortcut
         self.showChevron = showChevron
         self.isDestructive = isDestructive
         self.isDisabled = isDisabled
@@ -1772,8 +1792,20 @@ public struct RetraceMenuButton: View {
                 Text(title)
                     .font(RetraceMenuStyle.font)
                     .foregroundColor(foregroundColor)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
                 Spacer()
+
+                if let shortcut {
+                    Text(shortcut)
+                        .font(RetraceMenuStyle.shortcutFont)
+                        .foregroundColor(shortcutColor)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: RetraceMenuStyle.shortcutColumnMinWidth, alignment: .trailing)
+                        .layoutPriority(1)
+                }
 
                 if showChevron {
                     Image(systemName: "chevron.right")
@@ -1809,6 +1841,13 @@ public struct RetraceMenuButton: View {
         } else {
             return isHovering ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted
         }
+    }
+
+    private var shortcutColor: Color {
+        if isDisabled {
+            return RetraceMenuStyle.textColorMuted.opacity(0.4)
+        }
+        return RetraceMenuStyle.textColorMuted.opacity(isHovering ? 0.95 : 0.7)
     }
 }
 

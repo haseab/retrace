@@ -953,6 +953,7 @@ extension Notification.Name {
     static let openSettings = Notification.Name("openSettings")
     static let openSettingsAppearance = Notification.Name("openSettingsAppearance")
     static let openSettingsPower = Notification.Name("openSettingsPower")
+    static let openSettingsPauseReminderInterval = Notification.Name("openSettingsPauseReminderInterval")
     static let openFeedback = Notification.Name("openFeedback")
     static let openSystemMonitor = Notification.Name("openSystemMonitor")
     static let toggleSystemMonitor = Notification.Name("toggleSystemMonitor")

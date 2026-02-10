@@ -3,8 +3,9 @@ import SwiftUI
 import Shared
 
 /// Handles deeplink URL routing for Retrace
-/// Supports: retrace://search?q={query}&timestamp={unix_ms}&app={bundle_id}
-///           retrace://timeline?timestamp={unix_ms}
+/// Supports: retrace://search?q={query}&t={unix_ms}&app={bundle_id}
+///           retrace://timeline?t={unix_ms}
+///           (legacy timestamp key `timestamp` is also accepted)
 @MainActor
 public class DeeplinkHandler: ObservableObject {
 
@@ -15,54 +16,61 @@ public class DeeplinkHandler: ObservableObject {
     // MARK: - URL Handling
 
     public func handle(_ url: URL) {
+        guard let route = Self.route(for: url) else { return }
+        activeRoute = route
+
+        switch route {
+        case let .search(query, timestamp, appBundleID):
+            Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
+        case let .timeline(timestamp):
+            Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
+        }
+    }
+
+    /// Parse a deeplink URL into a route, accepting both `t` and `timestamp`.
+    public static func route(for url: URL) -> DeeplinkRoute? {
         guard url.scheme == "retrace" else {
             Log.warning("[DeeplinkHandler] Invalid scheme: \(url.scheme ?? "none")", category: .ui)
-            return
+            return nil
         }
 
         guard let host = url.host else {
             Log.warning("[DeeplinkHandler] No host in URL: \(url)", category: .ui)
-            return
+            return nil
         }
 
         let queryParams = url.queryParameters
 
         switch host.lowercased() {
         case "search":
-            handleSearchRoute(queryParams: queryParams)
+            let query = queryParams["q"].flatMap { $0.trimmedOrNil }
+            let timestamp = parseTimestamp(queryParams: queryParams)
+            let appBundleID = queryParams["app"].flatMap { $0.trimmedOrNil }
+            return .search(query: query, timestamp: timestamp, appBundleID: appBundleID)
 
         case "timeline":
-            handleTimelineRoute(queryParams: queryParams)
+            let timestamp = parseTimestamp(queryParams: queryParams)
+            return .timeline(timestamp: timestamp)
 
         default:
             Log.warning("[DeeplinkHandler] Unknown route: \(host)", category: .ui)
+            return nil
         }
     }
 
-    // MARK: - Route Handlers
+    private static func parseTimestamp(queryParams: [String: String]) -> Date? {
+        let canonicalTimestamp = queryParams["t"].flatMap { $0.trimmedOrNil }
+        let legacyTimestamp = queryParams["timestamp"].flatMap { $0.trimmedOrNil }
+        guard let rawTimestamp = canonicalTimestamp ?? legacyTimestamp else {
+            return nil
+        }
 
-    private func handleSearchRoute(queryParams: [String: String]) {
-        let query = queryParams["q"]
-        let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0 / 1000)) }
-        let appBundleID = queryParams["app"]
+        guard let unixMs = Int64(rawTimestamp) else {
+            Log.warning("[DeeplinkHandler] Invalid timestamp value: \(rawTimestamp)", category: .ui)
+            return nil
+        }
 
-        let route = DeeplinkRoute.search(
-            query: query,
-            timestamp: timestamp,
-            appBundleID: appBundleID
-        )
-
-        activeRoute = route
-        Log.info("[DeeplinkHandler] Navigating to search: query=\(query ?? "nil"), timestamp=\(String(describing: timestamp)), app=\(appBundleID ?? "nil")", category: .ui)
-    }
-
-    private func handleTimelineRoute(queryParams: [String: String]) {
-        let timestamp = queryParams["t"].flatMap { Int64($0) }.map { Date(timeIntervalSince1970: TimeInterval($0 / 1000)) }
-
-        let route = DeeplinkRoute.timeline(timestamp: timestamp)
-
-        activeRoute = route
-        Log.info("[DeeplinkHandler] Navigating to timeline: timestamp=\(String(describing: timestamp))", category: .ui)
+        return Date(timeIntervalSince1970: TimeInterval(unixMs) / 1000.0)
     }
 
     // MARK: - URL Generation
@@ -145,5 +153,12 @@ extension URL {
             params[item.name] = item.value
         }
         return params
+    }
+}
+
+private extension String {
+    var trimmedOrNil: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

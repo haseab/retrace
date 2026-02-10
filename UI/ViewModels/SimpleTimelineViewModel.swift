@@ -114,6 +114,11 @@ public struct AppBlock: Identifiable {
 @MainActor
 public class SimpleTimelineViewModel: ObservableObject {
 
+    private enum ScrollBoundaryEdge: String {
+        case start
+        case end
+    }
+
     // MARK: - Private Properties
 
     /// Cancellables for Combine subscriptions
@@ -642,7 +647,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Dismiss the context menu if it's visible
     public func dismissContextMenu() {
         if showContextMenu {
-            showContextMenu = false
+            withAnimation(.easeOut(duration: 0.16)) {
+                showContextMenu = false
+            }
         }
     }
 
@@ -688,14 +695,30 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Set of segment IDs that are hidden
     @Published public var hiddenSegmentIds: Set<SegmentID> = []
 
+    /// Range of frame indices for the segment block currently being hidden with squeeze animation
+    @Published public var hidingSegmentBlockRange: ClosedRange<Int>? = nil
+
+    private static let timelineMenuDismissAnimationDuration: TimeInterval = 0.15
+
     /// Dismiss the timeline context menu
     public func dismissTimelineContextMenu() {
-        showTimelineContextMenu = false
-        showTagSubmenu = false
-        showNewTagInput = false
-        newTagName = ""
-        isHoveringAddTagButton = false
-        selectedSegmentTags = []
+        let resetMenuState = {
+            self.showTimelineContextMenu = false
+            self.showTagSubmenu = false
+            self.showNewTagInput = false
+            self.newTagName = ""
+            self.isHoveringAddTagButton = false
+            self.selectedSegmentTags = []
+        }
+
+        let shouldAnimate = showTimelineContextMenu || showTagSubmenu || showNewTagInput
+        if shouldAnimate {
+            withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
+                resetMenuState()
+            }
+        } else {
+            resetMenuState()
+        }
     }
 
     // MARK: - Filter State
@@ -920,6 +943,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Represents how far the tape has moved beyond the current frame center.
     @Published public var subFrameOffset: CGFloat = 0
 
+    /// Dedupes boundary debug logs while scrubbing against the same edge.
+    private var lastBoundaryHitLogEdge: ScrollBoundaryEdge?
+
+    /// Dedupes safety clamp debug logs while scrubbing against the same edge.
+    private var lastSafetyClampLogEdge: ScrollBoundaryEdge?
+
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
 
@@ -1079,7 +1108,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             $isDateSearchActive
         )
         .combineLatest($isCalendarPickerVisible)
-        .sink { [weak self] combined, isCalendarVisible in
+        .sink { combined, isCalendarVisible in
             let (isSearch, isFilter, isTag, isDateSearch) = combined
             let isAnyDialogOpen = isSearch || isFilter || isTag || isDateSearch || isCalendarVisible
             TimelineWindowController.shared.setDialogOpen(isAnyDialogOpen)
@@ -1289,6 +1318,61 @@ public class SimpleTimelineViewModel: ObservableObject {
         return appBlocks.first { index >= $0.startIndex && index <= $0.endIndex }
     }
 
+    /// Jump to the start of the previous consecutive app block.
+    /// Returns true when navigation occurred, false when already at the oldest block.
+    @discardableResult
+    public func navigateToPreviousBlockStart() -> Bool {
+        guard !frames.isEmpty else { return false }
+        let blocks = appBlocks
+        guard !blocks.isEmpty else { return false }
+        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }),
+              currentBlockIndex > 0 else {
+            return false
+        }
+
+        navigateToFrame(blocks[currentBlockIndex - 1].startIndex)
+        return true
+    }
+
+    /// Jump to the start of the next consecutive app block.
+    /// Returns true when navigation occurred, false when already at the newest block.
+    @discardableResult
+    public func navigateToNextBlockStart() -> Bool {
+        guard !frames.isEmpty else { return false }
+        let blocks = appBlocks
+        guard !blocks.isEmpty else { return false }
+        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }),
+              currentBlockIndex < blocks.count - 1 else {
+            return false
+        }
+
+        navigateToFrame(blocks[currentBlockIndex + 1].startIndex)
+        return true
+    }
+
+    /// Jump to the start of the next consecutive app block.
+    /// If already in the newest block, jump to the newest frame.
+    /// Returns true when navigation occurred, false when already at the newest frame.
+    @discardableResult
+    public func navigateToNextBlockStartOrNewestFrame() -> Bool {
+        guard !frames.isEmpty else { return false }
+        let blocks = appBlocks
+        guard !blocks.isEmpty else { return false }
+        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }) else {
+            return false
+        }
+
+        if currentBlockIndex < blocks.count - 1 {
+            navigateToFrame(blocks[currentBlockIndex + 1].startIndex)
+            return true
+        }
+
+        let newestFrameIndex = frames.count - 1
+        guard currentIndex < newestFrameIndex else { return false }
+        navigateToFrame(newestFrameIndex)
+        return true
+    }
+
     /// Get all unique segment IDs within a visible block
     public func getSegmentIds(inBlock block: AppBlock) -> Set<SegmentID> {
         var segmentIds = Set<SegmentID>()
@@ -1422,6 +1506,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        if hidingSegmentBlockRange != nil {
+            Log.debug("[Tags] Hide ignored - hide animation already in progress", category: .ui)
+            dismissTimelineContextMenu()
+            return
+        }
+
         // Get all unique segment IDs in this visible block
         let segmentIds = getSegmentIds(inBlock: block)
 
@@ -1433,29 +1523,48 @@ public class SimpleTimelineViewModel: ObservableObject {
         let removeCount = block.frameCount
         let startIndex = block.startIndex
 
-        // Remove all frames in the block from the array
-        if block.endIndex < frames.count {
-            frames.removeSubrange(block.startIndex...block.endIndex)
-        }
-
-        // Clear cached blocks since frames changed
-        _cachedAppBlocks = nil
-
-        // Adjust current index
-        if currentIndex >= startIndex + removeCount {
-            // Current was after deleted block
-            currentIndex -= removeCount
-        } else if currentIndex >= startIndex {
-            // Current was within deleted block - move to start of where block was
-            currentIndex = max(0, min(startIndex, frames.count - 1))
-        }
-
-        // Load image for new current frame
-        loadImageIfNeeded()
-
         dismissTimelineContextMenu()
 
-        Log.debug("[Tags] Hidden \(segmentIds.count) segments in block, removed \(removeCount) frames from UI", category: .ui)
+        // Animate a quick "squeeze" before removing the block from the tape.
+        withAnimation(.easeInOut(duration: 0.16)) {
+            hidingSegmentBlockRange = block.startIndex...block.endIndex
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 160_000_000)
+
+            let previousCurrentFrameID = currentTimelineFrame?.frame.id
+            let beforeCount = frames.count
+            frames.removeAll { frame in
+                let segmentID = SegmentID(value: frame.frame.segmentID.value)
+                return segmentIds.contains(segmentID)
+            }
+            let removedCount = beforeCount - frames.count
+
+            // Clear cached blocks since frames changed
+            _cachedAppBlocks = nil
+
+            // Preserve current frame if still present after removal; otherwise clamp safely.
+            if let previousCurrentFrameID,
+               let preservedIndex = frames.firstIndex(where: { $0.frame.id == previousCurrentFrameID }) {
+                currentIndex = preservedIndex
+            } else if frames.isEmpty {
+                currentIndex = 0
+            } else if currentIndex >= startIndex + removeCount {
+                currentIndex = max(0, currentIndex - removedCount)
+            } else if currentIndex >= startIndex {
+                currentIndex = max(0, min(startIndex, frames.count - 1))
+            } else {
+                currentIndex = max(0, min(currentIndex, frames.count - 1))
+            }
+
+            hidingSegmentBlockRange = nil
+
+            // Load image for new current frame
+            loadImageIfNeeded()
+
+            Log.debug("[Tags] Hidden \(segmentIds.count) segments in block, removed \(removedCount) frames from UI", category: .ui)
+        }
 
         // Persist to database in background
         Task {
@@ -1464,6 +1573,100 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.debug("[Tags] \(segmentIds.count) segments hidden in database", category: .ui)
             } catch {
                 Log.error("[Tags] Failed to hide segments in database: \(error)", category: .ui)
+            }
+        }
+    }
+
+    /// Unhide all hidden segments in the visible block at the current timeline context menu selection.
+    /// When filtering to only hidden segments, unhidden frames are removed from the current view.
+    public func unhideSelectedTimelineSegment() {
+        guard let index = timelineContextMenuSegmentIndex,
+              let block = getBlock(forFrameAt: index) else {
+            dismissTimelineContextMenu()
+            return
+        }
+
+        if hidingSegmentBlockRange != nil {
+            Log.debug("[Tags] Unhide ignored - hide/unhide animation already in progress", category: .ui)
+            dismissTimelineContextMenu()
+            return
+        }
+
+        let segmentIds = getSegmentIds(inBlock: block)
+        let segmentIdsToUnhide = Set(segmentIds.filter { hiddenSegmentIds.contains($0) })
+        guard !segmentIdsToUnhide.isEmpty else {
+            Log.debug("[Tags] Unhide ignored - no hidden segments found in selected block", category: .ui)
+            dismissTimelineContextMenu()
+            return
+        }
+
+        // Remove from hidden set immediately (optimistic UI update)
+        for segmentId in segmentIdsToUnhide {
+            hiddenSegmentIds.remove(segmentId)
+        }
+
+        let shouldRemoveFromCurrentView = filterCriteria.hiddenFilter == .onlyHidden
+        let removeCount = block.frameCount
+        let startIndex = block.startIndex
+
+        dismissTimelineContextMenu()
+
+        if shouldRemoveFromCurrentView {
+            // In "Only Hidden" mode, unhidden segments should disappear from the timeline immediately.
+            withAnimation(.easeInOut(duration: 0.16)) {
+                hidingSegmentBlockRange = block.startIndex...block.endIndex
+            }
+
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 160_000_000)
+
+                let previousCurrentFrameID = currentTimelineFrame?.frame.id
+                let beforeCount = frames.count
+                frames.removeAll { frame in
+                    let segmentID = SegmentID(value: frame.frame.segmentID.value)
+                    return segmentIdsToUnhide.contains(segmentID)
+                }
+                let removedCount = beforeCount - frames.count
+
+                // Clear cached blocks since frames changed
+                _cachedAppBlocks = nil
+
+                // Preserve current frame if still present after removal; otherwise clamp safely.
+                if let previousCurrentFrameID,
+                   let preservedIndex = frames.firstIndex(where: { $0.frame.id == previousCurrentFrameID }) {
+                    currentIndex = preservedIndex
+                } else if frames.isEmpty {
+                    currentIndex = 0
+                } else if currentIndex >= startIndex + removeCount {
+                    currentIndex = max(0, currentIndex - removedCount)
+                } else if currentIndex >= startIndex {
+                    currentIndex = max(0, min(startIndex, frames.count - 1))
+                } else {
+                    currentIndex = max(0, min(currentIndex, frames.count - 1))
+                }
+
+                hidingSegmentBlockRange = nil
+
+                // Load image for new current frame
+                loadImageIfNeeded()
+
+                Log.debug("[Tags] Unhidden \(segmentIdsToUnhide.count) segments in block, removed \(removedCount) frames from Only Hidden view", category: .ui)
+            }
+        } else {
+            Log.debug("[Tags] Unhidden \(segmentIdsToUnhide.count) segments in block (kept visible in current filter mode)", category: .ui)
+        }
+
+        // Persist to database in background
+        Task {
+            do {
+                guard let hiddenTag = try await coordinator.getTag(name: Tag.hiddenTagName) else {
+                    Log.debug("[Tags] Hidden tag missing during unhide; nothing to remove in database", category: .ui)
+                    return
+                }
+                try await coordinator.removeTagFromSegments(segmentIds: Array(segmentIdsToUnhide), tagId: hiddenTag.id)
+                Log.debug("[Tags] \(segmentIdsToUnhide.count) segments unhidden in database", category: .ui)
+            } catch {
+                Log.error("[Tags] Failed to unhide segments in database: \(error)", category: .ui)
             }
         }
     }
@@ -1594,6 +1797,58 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     // MARK: - Filter Operations
+
+    /// Apply or clear a single-app quick filter for the app in the selected timeline context-menu segment.
+    /// Mirrors the Cmd+F quick-filter behavior: first press applies app-only filter, second clears it.
+    public func toggleQuickAppFilterForSelectedTimelineSegment() {
+        guard let index = timelineContextMenuSegmentIndex,
+              index >= 0,
+              index < frames.count else {
+            dismissTimelineContextMenu()
+            return
+        }
+
+        dismissTimelineContextMenu()
+
+        let bundleID = frames[index].frame.metadata.appBundleID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !bundleID.isEmpty else {
+            return
+        }
+
+        if isSingleAppOnlyIncludeFilter(filterCriteria, matching: bundleID) {
+            clearAllFilters()
+            return
+        }
+
+        var criteria = FilterCriteria()
+        criteria.selectedApps = Set([bundleID])
+        criteria.appFilterMode = .include
+        pendingFilterCriteria = criteria
+        applyFilters()
+    }
+
+    private func isSingleAppOnlyIncludeFilter(_ criteria: FilterCriteria, matching bundleID: String) -> Bool {
+        guard criteria.appFilterMode == .include,
+              let selectedApps = criteria.selectedApps,
+              selectedApps.count == 1,
+              selectedApps.contains(bundleID) else {
+            return false
+        }
+
+        let hasNoSources = criteria.selectedSources == nil || criteria.selectedSources?.isEmpty == true
+        let hasNoTags = criteria.selectedTags == nil || criteria.selectedTags?.isEmpty == true
+        let hasNoWindowFilter = criteria.windowNameFilter?.isEmpty ?? true
+        let hasNoBrowserFilter = criteria.browserUrlFilter?.isEmpty ?? true
+
+        return hasNoSources &&
+            criteria.hiddenFilter == .hide &&
+            hasNoTags &&
+            criteria.tagFilterMode == .include &&
+            hasNoWindowFilter &&
+            hasNoBrowserFilter &&
+            criteria.startDate == nil &&
+            criteria.endDate == nil
+    }
 
     /// Check if a frame at a given index is in a hidden segment
     public func isFrameHidden(at index: Int) -> Bool {
@@ -2042,7 +2297,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Dialog types for mutual exclusion
     public enum DialogType {
-        case filter      // Cmd+F - Filter panel
+        case filter      // Option+F - Filter panel
         case dateSearch  // Cmd+G - Date search
         case search      // Cmd+K - Search overlay
     }
@@ -2226,6 +2481,49 @@ public class SimpleTimelineViewModel: ObservableObject {
         } else {
             openSearchOverlay()
         }
+    }
+
+    /// Apply deeplink search state from `retrace://search`.
+    /// This resets stale query/filter state first, then applies deeplink values.
+    public func applySearchDeeplink(query: String?, appBundleID: String?, source: String = "unknown") {
+        let deeplinkID = String(UUID().uuidString.prefix(8))
+        let normalizedQuery: String? = {
+            guard let query else { return nil }
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }()
+        let normalizedAppBundleID: String? = {
+            guard let appBundleID else { return nil }
+            let trimmed = appBundleID.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }()
+
+        Log.info(
+            "[SearchDeeplink][\(deeplinkID)] begin source=\(source), query=\(normalizedQuery ?? "nil"), app=\(normalizedAppBundleID ?? "nil")",
+            category: .ui
+        )
+        openSearchOverlay()
+        Log.debug("[SearchDeeplink][\(deeplinkID)] overlay opened", category: .ui)
+
+        // Reset prior transient search state so deeplinks are deterministic.
+        searchViewModel.cancelSearch()
+        searchViewModel.searchQuery = ""
+        searchViewModel.clearAllFilters()
+        Log.debug("[SearchDeeplink][\(deeplinkID)] reset search query + filters", category: .ui)
+
+        if let normalizedAppBundleID {
+            searchViewModel.setAppFilter(normalizedAppBundleID)
+            Log.debug("[SearchDeeplink][\(deeplinkID)] set app filter: \(normalizedAppBundleID)", category: .ui)
+        }
+
+        guard let normalizedQuery else {
+            Log.info("[SearchDeeplink][\(deeplinkID)] completed with no query (app=\(normalizedAppBundleID ?? "nil"))", category: .ui)
+            return
+        }
+
+        searchViewModel.searchQuery = normalizedQuery
+        searchViewModel.submitSearch(trigger: "deeplink:\(source)")
+        Log.info("[SearchDeeplink][\(deeplinkID)] submitted query='\(normalizedQuery)' app=\(normalizedAppBundleID ?? "nil")", category: .ui)
     }
 
     // MARK: - State Cache Methods
@@ -3140,8 +3438,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Task for the debounced live OCR - cancelled and re-created on each call
     private var liveOCRDebounceTask: Task<Void, Never>?
 
-    /// Trigger live OCR with a 1-second debounce
-    /// Each call resets the timer - OCR only fires after 1 second of no new calls
+    /// Trigger live OCR with a 350ms debounce
+    /// Each call resets the timer - OCR only fires after 350ms of no new calls
     public func performLiveOCR() {
         // Clear stale OCR nodes from previous frame immediately
         // This prevents interaction with old bounding boxes while debounce waits
@@ -3151,7 +3449,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         liveOCRDebounceTask?.cancel()
         liveOCRDebounceTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+                try await Task.sleep(nanoseconds: 350_000_000) // 350ms
             } catch {
                 return // Cancelled
             }
@@ -4851,6 +5149,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         if !isActivelyScrolling {
             Log.info("[SCROLL] Starting scroll: currentIndex=\(currentIndex)/\(frames.count), timestamp=\(currentTimelineFrame?.frame.timestamp.description ?? "nil")", category: .ui)
             isActivelyScrolling = true
+            lastBoundaryHitLogEdge = nil
+            lastSafetyClampLogEdge = nil
             dismissContextMenu()
             dismissTimelineContextMenu()
         }
@@ -4879,23 +5179,39 @@ public class SimpleTimelineViewModel: ObservableObject {
                         // Only subtract the frames we actually moved
                         subFrameOffset -= CGFloat(actualFramesMoved) * ppf
                         navigateToFrame(clampedTarget, fromScroll: true)
+                        lastBoundaryHitLogEdge = nil
+                        lastSafetyClampLogEdge = nil
                     }
 
                     // At boundary: clamp offset so it doesn't accumulate past the edge
                     if clampedTarget != targetIndex {
-                        Log.debug("[Scroll] Hit boundary: target=\(targetIndex) clamped=\(clampedTarget) offset=\(String(format: "%.1f", subFrameOffset)) delta=\(String(format: "%.1f", delta))", category: .ui)
+                        let boundaryEdge: ScrollBoundaryEdge = clampedTarget == 0 ? .start : .end
+                        if lastBoundaryHitLogEdge != boundaryEdge {
+                            Log.debug("[SCROLL] Boundary clamp at \(boundaryEdge.rawValue): target=\(targetIndex) clamped=\(clampedTarget) delta=\(String(format: "%.1f", delta))", category: .ui)
+                            lastBoundaryHitLogEdge = boundaryEdge
+                        }
                         subFrameOffset = 0
+                    } else {
+                        lastBoundaryHitLogEdge = nil
                     }
                 }
             }
 
             // Safety clamp: prevent any residual offset past boundaries
             if currentIndex == 0 && subFrameOffset < 0 {
-                Log.debug("[Scroll] Safety clamp at start: offset was \(String(format: "%.1f", subFrameOffset))", category: .ui)
+                if lastSafetyClampLogEdge != .start {
+                    Log.debug("[SCROLL] Safety clamp at start: offset=\(String(format: "%.1f", subFrameOffset))", category: .ui)
+                    lastSafetyClampLogEdge = .start
+                }
                 subFrameOffset = 0
             } else if currentIndex >= frames.count - 1 && subFrameOffset > 0 {
-                Log.debug("[Scroll] Safety clamp at end: offset was \(String(format: "%.1f", subFrameOffset))", category: .ui)
+                if lastSafetyClampLogEdge != .end {
+                    Log.debug("[SCROLL] Safety clamp at end: offset=\(String(format: "%.1f", subFrameOffset))", category: .ui)
+                    lastSafetyClampLogEdge = .end
+                }
                 subFrameOffset = 0
+            } else {
+                lastSafetyClampLogEdge = nil
             }
         } else {
             // Mouse wheel: discrete frame steps (no sub-frame movement)

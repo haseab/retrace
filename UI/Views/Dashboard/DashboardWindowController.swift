@@ -205,6 +205,7 @@ struct DashboardContentView: View {
     @State private var showFeedbackSheet = false
     @State private var showOnboarding: Bool? = nil
     @State private var initialSettingsTab: SettingsTab? = nil
+    @State private var initialSettingsScrollTargetID: String? = nil
     @State private var hasLoadedDashboard = false
 
     init(coordinator: AppCoordinator) {
@@ -245,11 +246,15 @@ struct DashboardContentView: View {
                             )
 
                         case .settings:
-                            SettingsView(initialTab: initialSettingsTab)
+                            SettingsView(
+                                initialTab: initialSettingsTab,
+                                initialScrollTargetID: initialSettingsScrollTargetID
+                            )
                                 .environmentObject(coordinatorWrapper)
                                 .onDisappear {
                                     // Clear the initial tab when leaving settings
                                     initialSettingsTab = nil
+                                    initialSettingsScrollTargetID = nil
                                 }
 
                         case .monitor:
@@ -287,12 +292,16 @@ struct DashboardContentView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettings)) { _ in
+            initialSettingsTab = nil
+            initialSettingsScrollTargetID = nil
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
             DashboardWindowController.shared.show()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsAppearance)) { _ in
+            initialSettingsTab = nil
+            initialSettingsScrollTargetID = nil
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }
@@ -301,6 +310,15 @@ struct DashboardContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
             initialSettingsTab = .power
+            initialSettingsScrollTargetID = nil
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+            initialSettingsTab = .capture
+            initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }

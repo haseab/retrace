@@ -9,6 +9,7 @@ public struct PauseReminderView: View {
 
     let onResumeCapturing: () -> Void
     let onRemindMeLater: () -> Void
+    let onEditIntervalInSettings: () -> Void
     let onDismiss: () -> Void
 
     @State private var isHovering = false
@@ -70,6 +71,15 @@ public struct PauseReminderView: View {
                         )
                 }
                 .buttonStyle(.plain)
+
+                // Settings shortcut link
+                Button(action: onEditIntervalInSettings) {
+                    Text("Edit interval in Settings")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.white.opacity(0.65))
+                        .underline()
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 20)
@@ -102,6 +112,7 @@ struct PauseReminderView_Previews: PreviewProvider {
                     PauseReminderView(
                         onResumeCapturing: { print("Resume") },
                         onRemindMeLater: { print("Remind me later") },
+                        onEditIntervalInSettings: { print("Open settings") },
                         onDismiss: { print("Dismiss") }
                     )
                     .padding()

@@ -21,7 +21,7 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
 
     // Window dimensions
     private let windowWidth: CGFloat = 220
-    private let windowHeight: CGFloat = 160
+    private let windowHeight: CGFloat = 188
     private let topMargin: CGFloat = 40      // Below menu bar
     private let rightMargin: CGFloat = 16
 
@@ -74,6 +74,13 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
             },
             onRemindMeLater: { [weak self] in
                 self?.pauseReminderManager?.remindLater()
+            },
+            onEditIntervalInSettings: { [weak self] in
+                self?.pauseReminderManager?.dismissReminder()
+                DashboardWindowController.shared.show()
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .openSettingsPauseReminderInterval, object: nil)
+                }
             },
             onDismiss: { [weak self] in
                 self?.pauseReminderManager?.remindLater()

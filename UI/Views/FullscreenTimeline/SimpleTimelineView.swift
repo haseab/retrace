@@ -353,7 +353,7 @@ public struct SimpleTimelineView: View {
                 // Stop video playback when timeline is closed
                 viewModel.stopPlayback()
             }
-            // Note: Keyboard shortcuts (Cmd+F, Escape) are handled by TimelineWindowController
+            // Note: Keyboard shortcuts (Option+F, Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
     }
@@ -1262,7 +1262,9 @@ struct FrameWithURLOverlay<Content: View>: View {
             }
             .onRightClick { location in
                 viewModel.contextMenuLocation = location
-                viewModel.showContextMenu = true
+                withAnimation(.easeOut(duration: 0.16)) {
+                    viewModel.showContextMenu = true
+                }
             }
             .overlay(
                 // Floating context menu at click location
@@ -3852,8 +3854,8 @@ struct FloatingContextMenu: View {
                 .fixedSize()
                 .position(adjustedPosition)
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
-        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.16), value: isPresented)
     }
 
     /// Whether menu should appear above the click (bottom-left at cursor) vs below (top-left at cursor)
@@ -3887,10 +3889,6 @@ struct FloatingContextMenu: View {
         return CGPoint(x: x, y: y)
     }
 
-    /// Determine anchor point for animation based on position
-    private var anchorPoint: UnitPoint {
-        shouldShowAbove ? .bottomLeading : .topLeading
-    }
 }
 
 // MARK: - Context Menu Dismiss Overlay
@@ -3918,9 +3916,7 @@ class ContextMenuDismissNSView: NSView {
         // Left-click dismisses the menu
         guard let viewModel = viewModel else { return }
         DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.15)) {
-                viewModel.dismissTimelineContextMenu()
-            }
+            viewModel.dismissTimelineContextMenu()
         }
     }
 
@@ -3969,6 +3965,7 @@ struct TimelineSegmentContextMenu: View {
                 TimelineMenuButton(
                     icon: "tag",
                     title: "Add Tag",
+                    shortcut: "⌘T",
                     showChevron: true,
                     onHoverChanged: { isHovering in
                         viewModel.isHoveringAddTagButton = isHovering
@@ -3988,7 +3985,8 @@ struct TimelineSegmentContextMenu: View {
                 // Filter button
                 TimelineMenuButton(
                     icon: "line.3.horizontal.decrease",
-                    title: "Filter",
+                    title: "Filter App",
+                    shortcut: "⌘F",
                     onHoverChanged: { isHovering in
                         // Close tag submenu when hovering over other items
                         if isHovering && viewModel.showTagSubmenu {
@@ -4000,14 +3998,14 @@ struct TimelineSegmentContextMenu: View {
                         }
                     }
                 ) {
-                    viewModel.dismissTimelineContextMenu()
-                    viewModel.openFilterPanel()
+                    viewModel.toggleQuickAppFilterForSelectedTimelineSegment()
                 }
 
                 // Hide button
                 TimelineMenuButton(
                     icon: "eye.slash",
                     title: "Hide",
+                    shortcut: "⌥H",
                     onHoverChanged: { isHovering in
                         // Close tag submenu when hovering over other items
                         if isHovering && viewModel.showTagSubmenu {
@@ -4030,6 +4028,7 @@ struct TimelineSegmentContextMenu: View {
                 TimelineMenuButton(
                     icon: "trash",
                     title: "Delete",
+                    shortcut: "⌫",
                     isDestructive: true,
                     onHoverChanged: { isHovering in
                         // Close tag submenu when hovering over other items
@@ -4057,8 +4056,13 @@ struct TimelineSegmentContextMenu: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .leading)))
             }
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)))
-        .animation(.spring(response: 0.2, dampingFraction: 0.8), value: isPresented)
+        .transition(
+            .asymmetric(
+                insertion: .opacity.combined(with: .scale(scale: 0.95, anchor: anchorPoint)),
+                removal: .opacity.combined(with: .scale(scale: 0.98, anchor: anchorPoint))
+            )
+        )
+        .animation(.easeOut(duration: 0.15), value: isPresented)
         .animation(.spring(response: 0.2, dampingFraction: 0.8), value: viewModel.showTagSubmenu)
     }
 
@@ -4738,18 +4742,22 @@ struct FilterPanel: View {
             // Set up escape key monitor
             escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 if event.keyCode == 53 { // Escape key
-                    // Let date popover handle Escape when calendar grid is open (cancel edit only).
+                    // While date-range calendar is open, Escape should dismiss the date dropdown.
                     if viewModel.activeFilterDropdown == .dateRange && viewModel.isDateRangeCalendarEditing {
-                        return event
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.dismissFilterDropdown()
+                        }
+                        return nil // Consume the event
                     }
 
-                    // Close any open dropdown first
+                    // Close any open dropdown
                     if viewModel.activeFilterDropdown != .none {
                         withAnimation(.easeOut(duration: 0.15)) {
                             viewModel.dismissFilterDropdown()
                         }
                         return nil // Consume the event
                     }
+
                     // No dropdowns open - close the filter panel and consume event
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterPanel()
@@ -5573,7 +5581,7 @@ struct FilterDropdownOverlay: View {
             return CGSize(width: 240, height: 180)
         case .dateRange:
             let height: CGFloat = viewModel.isDateRangeCalendarEditing ? 430 : 250
-            return CGSize(width: 260, height: height)
+            return CGSize(width: 300, height: height)
         case .advanced, .none:
             return CGSize(width: 260, height: 200)
         }

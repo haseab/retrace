@@ -44,8 +44,8 @@ public struct SpotlightSearchOverlay: View {
     @State private var shouldFocusFirstResultAfterSubmit = false
     @State private var keyEventMonitor: Any?
 
-    private let panelWidth: CGFloat = 900
-    private let collapsedWidth: CGFloat = 400
+    private let panelWidth: CGFloat = 950
+    private let collapsedWidth: CGFloat = 450
     private let maxResultsHeight: CGFloat = 550
     private let thumbnailSize = CGSize(width: 280, height: 175)
     private let gridColumns = [
@@ -183,6 +183,11 @@ public struct SpotlightSearchOverlay: View {
         }
         .onChange(of: viewModel.isSearching) { isSearching in
             Log.debug("\(searchLog) isSearching: \(isSearching)", category: .ui)
+            if isSearching && !isExpanded {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    isExpanded = true
+                }
+            }
             // Log results when search completes
             if !isSearching {
                 if let results = viewModel.results {
@@ -194,7 +199,17 @@ public struct SpotlightSearchOverlay: View {
             }
         }
         .onChange(of: viewModel.results?.results.count ?? 0) { _ in
+            Log.info(
+                "\(searchLog) Results count changed: generation=\(viewModel.searchGeneration), isSearching=\(viewModel.isSearching), count=\(viewModel.results?.results.count ?? 0), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
+                category: .ui
+            )
             syncKeyboardSelectionWithCurrentResults()
+        }
+        .onChange(of: viewModel.searchGeneration) { generation in
+            Log.info(
+                "\(searchLog) searchGeneration changed to \(generation) (query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)', currentResults=\(viewModel.results?.results.count ?? 0))",
+                category: .ui
+            )
         }
         .onChange(of: viewModel.openFilterSignal.id) { _ in
             // When Tab cycles back to search field (index 0), trigger refocus
@@ -414,6 +429,18 @@ public struct SpotlightSearchOverlay: View {
                     }
                 }
                 .id(viewModel.searchGeneration)  // Force recreate entire grid when search changes
+                .onAppear {
+                    Log.info(
+                        "\(searchLog) Results grid appear: generation=\(viewModel.searchGeneration), filteredCount=\(filteredResults.count), totalCount=\(results.count), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
+                        category: .ui
+                    )
+                }
+                .onDisappear {
+                    Log.info(
+                        "\(searchLog) Results grid disappear: generation=\(viewModel.searchGeneration), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
+                        category: .ui
+                    )
+                }
                 .padding(16)
 
                 // Loading more indicator

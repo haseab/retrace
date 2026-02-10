@@ -26,6 +26,7 @@ public final class FeedbackService {
     public func collectDiagnostics() -> DiagnosticInfo {
         let logs = collectRecentLogs()
         let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
+        let settingsSnapshot = collectSanitizedSettingsSnapshot()
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -35,6 +36,7 @@ public final class FeedbackService {
             totalDiskSpace: totalDiskSpace,
             freeDiskSpace: freeDiskSpace,
             databaseStats: collectDatabaseStats(),
+            settingsSnapshot: settingsSnapshot,
             recentErrors: errors,
             recentLogs: logs
         )
@@ -45,6 +47,7 @@ public final class FeedbackService {
         // Use file-based logs for submission (more complete, includes all logs)
         let logs = Log.getRecentLogs(maxCount: 500)
         let errors = Log.getRecentErrors(maxCount: 50)
+        let settingsSnapshot = collectSanitizedSettingsSnapshot()
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -54,6 +57,7 @@ public final class FeedbackService {
             totalDiskSpace: totalDiskSpace,
             freeDiskSpace: freeDiskSpace,
             databaseStats: stats,
+            settingsSnapshot: settingsSnapshot,
             recentErrors: errors,
             recentLogs: logs
         )
@@ -65,6 +69,7 @@ public final class FeedbackService {
         // Use the fast file-based log buffer instead of OSLogStore
         let logs = Log.getRecentLogs(maxCount: 100)
         let errors = Log.getRecentErrors(maxCount: 20)
+        let settingsSnapshot = collectSanitizedSettingsSnapshot()
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -74,6 +79,7 @@ public final class FeedbackService {
             totalDiskSpace: totalDiskSpace,
             freeDiskSpace: freeDiskSpace,
             databaseStats: stats,
+            settingsSnapshot: settingsSnapshot,
             recentErrors: errors,
             recentLogs: logs
         )
@@ -82,6 +88,8 @@ public final class FeedbackService {
     /// Collect diagnostics without any logs (instant, for immediate display)
     /// Database stats should be passed in, logs will show as empty
     public func collectDiagnosticsNoLogs(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
+        let settingsSnapshot = collectSanitizedSettingsSnapshot()
+
         return DiagnosticInfo(
             appVersion: appVersion,
             buildNumber: buildNumber,
@@ -90,6 +98,7 @@ public final class FeedbackService {
             totalDiskSpace: totalDiskSpace,
             freeDiskSpace: freeDiskSpace,
             databaseStats: stats,
+            settingsSnapshot: settingsSnapshot,
             recentErrors: [],
             recentLogs: []
         )
@@ -229,6 +238,73 @@ public final class FeedbackService {
         case .fault: return "FAULT"
         default: return "UNKNOWN"
         }
+    }
+
+    // MARK: - Settings Snapshot
+
+    /// Collect a sanitized settings snapshot for support diagnostics.
+    /// Includes only whitelisted keys and avoids raw paths/query text/app lists.
+    private func collectSanitizedSettingsSnapshot() -> [String: String] {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
+        var settings: [String: String] = [:]
+
+        func boolString(_ value: Bool) -> String { value ? "true" : "false" }
+
+        // Capture + OCR behavior (effective values)
+        settings["ocrEnabled"] = boolString(defaults.object(forKey: "ocrEnabled") as? Bool ?? true)
+        settings["ocrOnlyWhenPluggedIn"] = boolString(defaults.bool(forKey: "ocrOnlyWhenPluggedIn"))
+        settings["ocrMaxFramesPerSecond"] = String(format: "%.2f", defaults.double(forKey: "ocrMaxFramesPerSecond"))
+        settings["ocrAppFilterMode"] = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
+
+        // Include counts, never raw app lists
+        let ocrFilteredAppsRaw = defaults.string(forKey: "ocrFilteredApps") ?? ""
+        settings["ocrFilteredAppsCount"] = String(jsonArrayCount(from: ocrFilteredAppsRaw) ?? 0)
+
+        settings["captureIntervalSeconds"] = String(format: "%.2f", defaults.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0)
+        settings["deleteDuplicateFrames"] = boolString(defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true)
+        settings["deduplicationThreshold"] = String(format: "%.4f", defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold)
+        settings["captureOnWindowChange"] = boolString(defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true)
+        settings["excludePrivateWindows"] = boolString(defaults.object(forKey: "excludePrivateWindows") as? Bool ?? false)
+        settings["excludeCursor"] = boolString(defaults.object(forKey: "excludeCursor") as? Bool ?? false)
+
+        // Include count for excluded apps, never raw values
+        let excludedAppsRaw = defaults.string(forKey: "excludedApps") ?? ""
+        settings["excludedAppsCount"] = String(jsonArrayCount(from: excludedAppsRaw) ?? 0)
+
+        // Storage + retention behavior
+        let retentionDays = defaults.object(forKey: "retentionDays") as? Int ?? 0
+        settings["retentionDays"] = String(retentionDays)
+        settings["maxStorageGB"] = String(format: "%.1f", defaults.object(forKey: "maxStorageGB") as? Double ?? 500.0)
+        settings["videoQuality"] = String(format: "%.2f", defaults.object(forKey: "videoQuality") as? Double ?? 0.5)
+
+        // Integration + startup flags
+        settings["useRewindData"] = boolString(defaults.bool(forKey: "useRewindData"))
+        settings["launchAtLogin"] = boolString(defaults.bool(forKey: "launchAtLogin"))
+        settings["shouldAutoStartRecording"] = boolString(defaults.bool(forKey: "shouldAutoStartRecording"))
+
+        // Privacy-preserving path diagnostics (flag only)
+        settings["customRetraceDBLocationSet"] = boolString((defaults.string(forKey: "customRetraceDBLocation") ?? "").isEmpty == false)
+        settings["customRewindDBLocationSet"] = boolString((defaults.string(forKey: "customRewindDBLocation") ?? "").isEmpty == false)
+
+        // UI toggles helpful for reproducing behavior
+        settings["timelineColoredBorders"] = boolString(defaults.bool(forKey: "timelineColoredBorders"))
+        settings["showVideoControls"] = boolString(defaults.bool(forKey: "showVideoControls"))
+        settings["enableFrameIDSearch"] = boolString(defaults.bool(forKey: "enableFrameIDSearch"))
+
+        return settings
+    }
+
+    private func jsonArrayCount(from jsonString: String) -> Int? {
+        guard !jsonString.isEmpty, let data = jsonString.data(using: .utf8) else {
+            return nil
+        }
+
+        guard let array = try? JSONSerialization.jsonObject(with: data) as? [Any] else {
+            return nil
+        }
+
+        return array.count
     }
 
     // MARK: - Submission

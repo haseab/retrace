@@ -184,15 +184,19 @@ public struct SearchFilterBar: View {
                     onClear: {
                         viewModel.setDateRange(start: nil, end: nil)
                     },
-                    width: 280,
+                    width: 300,
                     enableKeyboardNavigation: true,
                     onMoveToNextFilter: {
                         viewModel.openFilterSignal = (3, UUID())
+                    },
+                    onCalendarEditingChange: { isEditing in
+                        viewModel.isDatePopoverHandlingKeys = isEditing
                     },
                     onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showDatePopover = false
                         }
+                        viewModel.isDatePopoverHandlingKeys = false
                     }
                 )
             }
@@ -354,6 +358,9 @@ public struct SearchFilterBar: View {
         .onChange(of: showDatePopover) { isOpen in
             debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if !isOpen {
+                viewModel.isDatePopoverHandlingKeys = false
+            }
             if isOpen {
                 viewModel.openFilterSignal = (3, UUID())
             }
