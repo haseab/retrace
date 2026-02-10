@@ -18,10 +18,17 @@ struct AppUsageHardDriveView: View {
             treemapVisualization
                 .frame(maxHeight: .infinity)
 
-            // Hover tooltip (shown below treemap)
-            if let app = hoveredApp {
-                tooltipView(for: app)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            // Hover tooltip (shown below treemap) - always reserve space
+            ZStack {
+                // Invisible placeholder to reserve space
+                tooltipPlaceholder
+                    .opacity(0)
+
+                // Actual tooltip (visible only when hovering)
+                if let app = hoveredApp {
+                    tooltipView(for: app)
+                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                }
             }
         }
         .padding(16)
@@ -120,6 +127,32 @@ struct AppUsageHardDriveView: View {
     private func iconSize(for blockSize: CGSize) -> CGFloat {
         let minDimension = min(blockSize.width, blockSize.height)
         return max(16, min(48, minDimension * 0.4))
+    }
+
+    private var tooltipPlaceholder: some View {
+        HStack(spacing: 12) {
+            Color.clear
+                .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Placeholder")
+                    .font(.retraceCalloutBold)
+
+                HStack(spacing: 8) {
+                    Text("00h 00m")
+                        .font(.retraceCaptionMedium)
+                    Text("•")
+                    Text("0.0%")
+                        .font(.retraceCaptionMedium)
+                    Text("•")
+                    Text("0 tabs")
+                        .font(.retraceCaption2)
+                }
+            }
+
+            Spacer()
+        }
+        .padding(12)
     }
 
     private func tooltipView(for app: AppUsageData) -> some View {

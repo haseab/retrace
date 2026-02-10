@@ -2385,8 +2385,7 @@ public struct SettingsView: View {
             ocrProcessingCard
 
             if ocrEnabled {
-                // Temporarily hidden:
-                // powerEfficiencyCard
+                powerEfficiencyCard
                 appFilterCard
             }
 
@@ -2501,19 +2500,18 @@ public struct SettingsView: View {
                                 .cornerRadius(8)
                         }
 
-                        // Slider: left = slow (0.1 FPS), right = fast (unlimited/0)
-                        // We display inverted: slider 0.1 = slow, slider 2 = unlimited
-                        // But storage: 0 = unlimited, 0.1-2 = FPS limit
+                        // Slider: left = slow (0.5 FPS), right = fast (2 FPS/unlimited)
+                        // Storage: 0 = unlimited, 0.5-2 = FPS limit
                         Slider(value: Binding(
-                            get: { ocrMaxFramesPerSecond == 0 ? 2.0 : (2.1 - ocrMaxFramesPerSecond) },
+                            get: { ocrMaxFramesPerSecond == 0 ? 2.0 : ocrMaxFramesPerSecond },
                             set: { newValue in
                                 if newValue >= 1.9 {
-                                    ocrMaxFramesPerSecond = 0  // Unlimited
+                                    ocrMaxFramesPerSecond = 0  // Unlimited (treated as 2 FPS)
                                 } else {
-                                    ocrMaxFramesPerSecond = max(0.1, 2.1 - newValue)
+                                    ocrMaxFramesPerSecond = max(0.5, newValue)
                                 }
                             }
-                        ), in: 0.1...2, step: 0.1)
+                        ), in: 0.5...2, step: 0.1)
                             .tint(.retraceAccent)
                             .onChange(of: ocrMaxFramesPerSecond) { _ in
                                 notifyPowerSettingsChanged()

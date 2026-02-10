@@ -609,7 +609,7 @@ public struct DashboardView: View {
                     .frame(width: 65, alignment: .center)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
             .background(Color.white.opacity(0.05))
             .cornerRadius(8)
             .overlay(

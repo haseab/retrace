@@ -115,11 +115,6 @@ public struct AppBlock: Identifiable {
 @MainActor
 public class SimpleTimelineViewModel: ObservableObject {
 
-    private enum ScrollBoundaryEdge: String {
-        case start
-        case end
-    }
-
     // MARK: - Private Properties
 
     /// Cancellables for Combine subscriptions
@@ -943,12 +938,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Sub-frame pixel offset for continuous tape scrolling.
     /// Represents how far the tape has moved beyond the current frame center.
     @Published public var subFrameOffset: CGFloat = 0
-
-    /// Dedupes boundary debug logs while scrubbing against the same edge.
-    private var lastBoundaryHitLogEdge: ScrollBoundaryEdge?
-
-    /// Dedupes safety clamp debug logs while scrubbing against the same edge.
-    private var lastSafetyClampLogEdge: ScrollBoundaryEdge?
 
     /// Task for debouncing scroll end detection
     private var scrollDebounceTask: Task<Void, Never>?
@@ -2440,6 +2429,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             isDateSearchActive = false
         }
         dateSearchText = ""
+        // Clear any date search errors when closing
+        error = nil
+        errorDismissTask?.cancel()
     }
 
     /// Toggle the date search panel with animation
@@ -2996,14 +2988,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Clamp to valid range
         let clampedIndex = max(0, min(frames.count - 1, index))
         guard clampedIndex != currentIndex else { return }
-
-        let oldIndex = currentIndex
-        let oldTimestamp = frames[oldIndex].frame.timestamp
-        let newTimestamp = frames[clampedIndex].frame.timestamp
-
-        if fromScroll && abs(clampedIndex - oldIndex) > 5 {
-            Log.debug("[NAV] navigateToFrame: \(oldIndex)→\(clampedIndex) (Δ\(clampedIndex - oldIndex)), fromScroll=\(fromScroll), oldTime=\(oldTimestamp), newTime=\(newTimestamp)", category: .ui)
-        }
 
         // Clear search highlight when manually navigating
         if isShowingSearchHighlight {
@@ -5148,10 +5132,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Mark as actively scrolling
         if !isActivelyScrolling {
-            Log.info("[SCROLL] Starting scroll: currentIndex=\(currentIndex)/\(frames.count), timestamp=\(currentTimelineFrame?.frame.timestamp.description ?? "nil")", category: .ui)
             isActivelyScrolling = true
-            lastBoundaryHitLogEdge = nil
-            lastSafetyClampLogEdge = nil
             dismissContextMenu()
             dismissTimelineContextMenu()
         }
@@ -5176,43 +5157,23 @@ public class SimpleTimelineViewModel: ObservableObject {
                     let actualFramesMoved = clampedTarget - prevIndex
 
                     if actualFramesMoved != 0 {
-                        Log.debug("[SCROLL] Crossing frame boundary: prevIndex=\(prevIndex) → targetIndex=\(targetIndex) → clampedTarget=\(clampedTarget), framesToCross=\(framesToCross), actualFramesMoved=\(actualFramesMoved)", category: .ui)
                         // Only subtract the frames we actually moved
                         subFrameOffset -= CGFloat(actualFramesMoved) * ppf
                         navigateToFrame(clampedTarget, fromScroll: true)
-                        lastBoundaryHitLogEdge = nil
-                        lastSafetyClampLogEdge = nil
                     }
 
                     // At boundary: clamp offset so it doesn't accumulate past the edge
                     if clampedTarget != targetIndex {
-                        let boundaryEdge: ScrollBoundaryEdge = clampedTarget == 0 ? .start : .end
-                        if lastBoundaryHitLogEdge != boundaryEdge {
-                            Log.debug("[SCROLL] Boundary clamp at \(boundaryEdge.rawValue): target=\(targetIndex) clamped=\(clampedTarget) delta=\(String(format: "%.1f", delta))", category: .ui)
-                            lastBoundaryHitLogEdge = boundaryEdge
-                        }
                         subFrameOffset = 0
-                    } else {
-                        lastBoundaryHitLogEdge = nil
                     }
                 }
             }
 
             // Safety clamp: prevent any residual offset past boundaries
             if currentIndex == 0 && subFrameOffset < 0 {
-                if lastSafetyClampLogEdge != .start {
-                    Log.debug("[SCROLL] Safety clamp at start: offset=\(String(format: "%.1f", subFrameOffset))", category: .ui)
-                    lastSafetyClampLogEdge = .start
-                }
                 subFrameOffset = 0
             } else if currentIndex >= frames.count - 1 && subFrameOffset > 0 {
-                if lastSafetyClampLogEdge != .end {
-                    Log.debug("[SCROLL] Safety clamp at end: offset=\(String(format: "%.1f", subFrameOffset))", category: .ui)
-                    lastSafetyClampLogEdge = .end
-                }
                 subFrameOffset = 0
-            } else {
-                lastSafetyClampLogEdge = nil
             }
         } else {
             // Mouse wheel: discrete frame steps (no sub-frame movement)
@@ -5499,7 +5460,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Parse natural language date
             guard let targetDate = parseNaturalLanguageDate(searchText) else {
-                error = "Could not understand: \(searchText)"
+                showErrorWithAutoDismiss("Could not understand: \(searchText)")
                 isLoading = false
                 return
             }
@@ -5974,7 +5935,6 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func checkAndLoadMoreFrames() {
         // Check if approaching the older end (left side of timeline)
         if currentIndex < WindowConfig.loadThreshold && hasMoreOlder && !isLoadingOlder {
-            Log.info("[INFINITE-SCROLL] Triggering loadOlderFrames: currentIndex=\(currentIndex) < threshold=\(WindowConfig.loadThreshold)", category: .ui)
             Task {
                 await loadOlderFrames()
             }
@@ -5982,7 +5942,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Check if approaching the newer end (right side of timeline)
         if currentIndex > frames.count - WindowConfig.loadThreshold && hasMoreNewer && !isLoadingNewer {
-            Log.info("[INFINITE-SCROLL] Triggering loadNewerFrames: currentIndex=\(currentIndex) > threshold=\(frames.count - WindowConfig.loadThreshold)", category: .ui)
             Task {
                 await loadNewerFrames()
             }
