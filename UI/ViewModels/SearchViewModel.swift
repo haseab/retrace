@@ -3,23 +3,6 @@ import Combine
 import Shared
 import App
 
-/// Debug logging to file
-private func debugLog(_ message: String) {
-    let line = "[\(Log.timestamp())] \(message)\n"
-    let path = "/tmp/retrace_debug.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: path, contents: data)
-        }
-    }
-}
-
 /// Lightweight struct for caching app info to disk
 private struct CachedAppInfo: Codable {
     let bundleID: String
@@ -112,11 +95,6 @@ public class SearchViewModel: ObservableObject {
     // One-shot suppression window for filter-change auto-search.
     // Used to avoid immediate duplicate re-search after deeplink applies filters + submits.
     private var suppressFilterAutoSearchUntil: Date?
-    private var suppressFilterAutoSearchReason: String?
-
-    // Debug counters for tracing duplicate search/rerender paths
-    private var searchRunCounter = 0
-    private var filterChangeCounter = 0
 
     // MARK: - Dependencies
 
@@ -223,52 +201,29 @@ public class SearchViewModel: ObservableObject {
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
             guard let self = self else { return }
-            self.filterChangeCounter += 1
-            let eventID = self.filterChangeCounter
-            Log.debug(
-                "[SearchTrace] Filter-change event #\(eventID): query='\(self.searchQuery)', committed='\(self.committedSearchQuery)', hasSubmitted=\(self.hasSubmittedSearch), restoring=\(self.isRestoringFromCache), isSearching=\(self.isSearching), \(self.debugFilterSummary())",
-                category: .ui
-            )
 
             if let until = self.suppressFilterAutoSearchUntil {
                 if Date() <= until {
-                    let reason = self.suppressFilterAutoSearchReason ?? "unspecified"
-                    Log.info(
-                        "[SearchTrace] Filter-change event #\(eventID) suppressed (reason=\(reason))",
-                        category: .ui
-                    )
                     self.suppressFilterAutoSearchUntil = nil
-                    self.suppressFilterAutoSearchReason = nil
                     return
                 }
 
                 // Suppression window expired without a matching event.
                 self.suppressFilterAutoSearchUntil = nil
-                self.suppressFilterAutoSearchReason = nil
             }
 
             // Only auto-trigger re-search if:
             // 1. Query is not empty
             // 2. Not restoring from cache
             // 3. User has already submitted a search at least once
-            guard !self.searchQuery.isEmpty else {
-                Log.debug("[SearchTrace] Filter-change event #\(eventID) skipped (empty query)", category: .ui)
-                return
-            }
-            guard !self.isRestoringFromCache else {
-                Log.debug("[SearchTrace] Filter-change event #\(eventID) skipped (restoring cache)", category: .ui)
-                return
-            }
-            guard self.hasSubmittedSearch else {
-                Log.debug("[SearchTrace] Filter-change event #\(eventID) skipped (no prior submit)", category: .ui)
-                return
-            }
+            guard !self.searchQuery.isEmpty,
+                  !self.isRestoringFromCache,
+                  self.hasSubmittedSearch else { return }
 
             // Cancel any existing search before starting a new one
             self.currentSearchTask?.cancel()
-            Log.info("[SearchTrace] Filter-change event #\(eventID) triggering re-search", category: .ui)
             self.currentSearchTask = Task {
-                await self.performSearch(query: self.searchQuery, trigger: "filter-change#\(eventID)")
+                await self.performSearch(query: self.searchQuery, trigger: "filter-change")
             }
         }
         .store(in: &cancellables)
@@ -281,23 +236,17 @@ public class SearchViewModel: ObservableObject {
         // Cancel any existing search before starting a new one
         currentSearchTask?.cancel()
 
-        let hadSubmittedSearch = hasSubmittedSearch
-
         // Mark that user has submitted a search - enables filter auto-refresh
         hasSubmittedSearch = true
 
         // Deeplink flow updates filters + query, then submits immediately.
         // Debounced filter observers can otherwise trigger a second redundant search.
         if trigger.hasPrefix("deeplink:") {
-            armFilterAutoSearchSuppression(reason: trigger)
+            armFilterAutoSearchSuppression()
         }
 
         // Track search event only on explicit submit (Enter key)
         let query = searchQuery
-        Log.info(
-            "[SearchTrace] submitSearch(trigger=\(trigger)): query='\(query)', hadSubmitted=\(hadSubmittedSearch), \(debugFilterSummary())",
-            category: .ui
-        )
         if !query.isEmpty {
             DashboardViewModel.recordSearch(coordinator: coordinator, query: query)
 
@@ -358,21 +307,10 @@ public class SearchViewModel: ObservableObject {
         return "{\(components.joined(separator: ","))}"
     }
 
-    private func debugFilterSummary() -> String {
-        let selectedApps = (selectedAppFilters ?? []).sorted()
-        let selectedTags = (selectedTags ?? []).sorted()
-        return "apps=\(selectedApps), appMode=\(appFilterMode.rawValue), tags=\(selectedTags), tagMode=\(tagFilterMode.rawValue), hidden=\(hiddenFilter.rawValue), start=\(startDate?.timeIntervalSince1970.description ?? "nil"), end=\(endDate?.timeIntervalSince1970.description ?? "nil"), window=\(windowNameFilter ?? "nil"), browser=\(browserUrlFilter ?? "nil")"
-    }
-
-    private func armFilterAutoSearchSuppression(reason: String) {
+    private func armFilterAutoSearchSuppression() {
         // Debounce is 300ms; use a slightly wider window to absorb the immediate post-deeplink filter event.
         let windowSeconds = debounceDelay + 0.35
         suppressFilterAutoSearchUntil = Date().addingTimeInterval(windowSeconds)
-        suppressFilterAutoSearchReason = reason
-        Log.debug(
-            "[SearchTrace] Armed filter-change suppression for ~\(String(format: "%.2f", windowSeconds))s (reason=\(reason))",
-            category: .ui
-        )
     }
 
     public func performSearch(query: String, trigger: String = "unknown") async {
@@ -383,13 +321,6 @@ public class SearchViewModel: ObservableObject {
             return
         }
 
-        searchRunCounter += 1
-        let runID = searchRunCounter
-        let previousGeneration = searchGeneration
-        Log.info(
-            "[SearchTrace] Run #\(runID) START trigger=\(trigger), query='\(query)', prevGeneration=\(previousGeneration), resultsBefore=\(results?.results.count ?? 0), \(debugFilterSummary())",
-            category: .ui
-        )
         isSearching = true
         error = nil
 
@@ -398,7 +329,6 @@ public class SearchViewModel: ObservableObject {
         thumbnailCache.removeAll()  // Clear thumbnail cache for new search
         loadingThumbnails.removeAll()  // Clear loading state for new search
         searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
-        Log.debug("[SearchTrace] Run #\(runID) bumped generation to \(searchGeneration)", category: .ui)
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
 
         do {
@@ -415,11 +345,6 @@ public class SearchViewModel: ObservableObject {
             // Check for cancellation after the search completes
             try Task.checkCancellation()
 
-            Log.info(
-                "[SearchTrace] Run #\(runID) END trigger=\(trigger), elapsedMs=\(Int(elapsed)), results=\(searchResults.results.count), total=\(searchResults.totalCount), generation=\(searchGeneration)",
-                category: .ui
-            )
-
             if !searchResults.results.isEmpty {
                 let firstResult = searchResults.results[0]
                 Log.debug("[SearchViewModel] First result: frameID=\(firstResult.frameID.stringValue), timestamp=\(firstResult.timestamp), snippet='\(firstResult.snippet.prefix(50))...'", category: .ui)
@@ -429,15 +354,14 @@ public class SearchViewModel: ObservableObject {
             await MainActor.run {
                 results = searchResults
                 isSearching = false
-                debugLog("[SearchTrace] Run #\(runID) UI updated with \(searchResults.results.count) results, generation=\(searchGeneration), trigger=\(trigger)")
             }
         } catch is CancellationError {
-            Log.debug("[SearchTrace] Run #\(runID) CANCELLED trigger=\(trigger)", category: .ui)
+            Log.debug("[SearchViewModel] Search was cancelled", category: .ui)
             await MainActor.run {
                 isSearching = false
             }
         } catch {
-            Log.error("[SearchTrace] Run #\(runID) FAILED trigger=\(trigger): \(error.localizedDescription)", category: .ui)
+            Log.error("[SearchViewModel] Search failed: \(error.localizedDescription)", category: .ui)
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 self.error = "Search failed: \(error.localizedDescription)"
