@@ -4,6 +4,7 @@ import AVFoundation
 import Shared
 import App
 import Processing
+import SwiftyChrono
 
 /// Shared timeline configuration
 public enum TimelineConfig {
@@ -5663,89 +5664,35 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Parse natural language date strings
     private func parseNaturalLanguageDate(_ text: String) -> Date? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let calendar = Calendar.current
         let now = Date()
 
-        // === RELATIVE DATES ===
-
-        if trimmed == "now" || trimmed == "today" {
-            return now
-        }
-        if trimmed == "yesterday" {
-            if let targetDate = calendar.date(byAdding: .day, value: -1, to: now) {
-                return calendar.startOfDay(for: targetDate)
-            }
-            return nil
-        }
-        if trimmed == "last week" {
-            if let targetDate = calendar.date(byAdding: .day, value: -7, to: now) {
-                return calendar.startOfDay(for: targetDate)
-            }
-            return nil
-        }
-        if trimmed == "last month" {
-            if let targetDate = calendar.date(byAdding: .month, value: -1, to: now) {
-                return calendar.startOfDay(for: targetDate)
-            }
-            return nil
+        // === PRIMARY: SwiftyChrono NLP Parser ===
+        // Try SwiftyChrono first for comprehensive natural language parsing
+        // Handles: "next Friday", "3 days from now", "last Monday", "in 2 weeks", etc.
+        let chrono = Chrono()
+        if let result = chrono.parseDate(text: trimmed, refDate: now) {
+            Log.debug("[DateSearch] SwiftyChrono parsed '\(trimmed)' as \(result)", category: .ui)
+            return result
         }
 
-        // "X hours ago", "X hour ago", "an hour ago"
-        // Returns the START of that hour (e.g., "2 hours ago" at 3:45pm returns 1:00pm)
-        if trimmed.contains("hour") {
-            let hours = extractNumber(from: trimmed) ?? 1
-            if let targetTime = calendar.date(byAdding: .hour, value: -hours, to: now) {
-                // Return start of that hour
-                return calendar.date(bySetting: .minute, value: 0, of: targetTime).flatMap {
-                    calendar.date(bySetting: .second, value: 0, of: $0)
-                }
-            }
-            return nil
-        }
+        // === FALLBACK: Time-only and absolute date parsing ===
+        // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
+        // We only need fallback for compact time formats and explicit date strings
+        let trimmedLower = trimmed.lowercased()
 
-        // "X minutes ago", "X min ago", "30 min ago"
-        if trimmed.contains("minute") || trimmed.contains("min") {
-            if let minutes = extractNumber(from: trimmed) {
-                return calendar.date(byAdding: .minute, value: -minutes, to: now)
-            }
-            return calendar.date(byAdding: .minute, value: -1, to: now)
-        }
-
-        // "X days ago"
-        // Returns the START of that day (midnight)
-        if trimmed.contains("day") && trimmed.contains("ago") {
-            if let days = extractNumber(from: trimmed) {
-                if let targetDate = calendar.date(byAdding: .day, value: -days, to: now) {
-                    // Return start of that day (midnight)
-                    return calendar.startOfDay(for: targetDate)
-                }
-            }
-            return nil
-        }
-
-        // "X weeks ago"
-        // Returns the START of that day (midnight)
-        if trimmed.contains("week") {
-            let weeks = extractNumber(from: trimmed) ?? 1
-            if let targetDate = calendar.date(byAdding: .day, value: -weeks * 7, to: now) {
-                // Return start of that day (midnight)
-                return calendar.startOfDay(for: targetDate)
-            }
-            return nil
-        }
-
-        // === ABSOLUTE DATES ===
+        // === TIME-ONLY INPUT ===
 
         // Try parsing time-only input (assumes "today" if just time is given)
         // Handles: "938pm", "9:38pm", "938 pm", "9:38 pm", "938", "9:38", "21:38"
-        if let timeOnlyDate = parseTimeOnly(trimmed, relativeTo: now) {
+        if let timeOnlyDate = parseTimeOnly(trimmedLower, relativeTo: now) {
             return timeOnlyDate
         }
 
         // Normalize compact time formats (e.g., "827am" -> "8:27am") before passing to NSDataDetector
         // This allows "827am yesterday" to work the same as "8:27am yesterday"
-        let normalizedText = normalizeCompactTimeFormat(trimmed)
+        let normalizedText = normalizeCompactTimeFormat(trimmedLower)
 
         // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
@@ -5785,11 +5732,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return date
             }
             // Try lowercased
-            if let date = df.date(from: trimmed) {
+            if let date = df.date(from: trimmedLower) {
                 return date
             }
             // Try with first letter capitalized (for month names)
-            let capitalized = trimmed.prefix(1).uppercased() + trimmed.dropFirst()
+            let capitalized = trimmedLower.prefix(1).uppercased() + trimmedLower.dropFirst()
             if let date = df.date(from: capitalized) {
                 return date
             }

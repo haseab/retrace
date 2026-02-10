@@ -41,7 +41,9 @@ let package = Package(
         // SQLCipher for reading encrypted Rewind database
         .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0"),
         // Sparkle for auto-updates
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.0")
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.0"),
+        // SwiftyChrono for natural language date parsing (batmac fork with Swift 5.5+ support)
+        .package(url: "https://github.com/batmac/SwiftyChrono.git", revision: "e1bf3bde0f09112909157360b6bf39302f10ae5f")
     ],
     targets: [
         // MARK: - Shared models and protocols
@@ -221,7 +223,8 @@ let package = Package(
                 "Processing",
                 "Search",
                 "Migration",
-                .product(name: "Sparkle", package: "Sparkle")
+                .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "SwiftyChrono", package: "SwiftyChrono")
             ],
             path: "UI",
             exclude: [
