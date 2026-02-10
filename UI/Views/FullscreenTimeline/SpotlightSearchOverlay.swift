@@ -44,7 +44,7 @@ public struct SpotlightSearchOverlay: View {
     @State private var shouldFocusFirstResultAfterSubmit = false
     @State private var keyEventMonitor: Any?
 
-    private let panelWidth: CGFloat = 950
+    private let panelWidth: CGFloat = 1000
     private let collapsedWidth: CGFloat = 450
     private let maxResultsHeight: CGFloat = 550
     private let thumbnailSize = CGSize(width: 280, height: 175)
