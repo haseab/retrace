@@ -14,9 +14,11 @@ struct ContextMenuContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ContextMenuRow(title: "Copy Moment Link", icon: "link", shortcut: "⌘L") {
-                showMenu = false
-                copyMomentLink()
+            if !viewModel.isInLiveMode {
+                ContextMenuRow(title: "Copy Moment Link", icon: "link", shortcut: "⌘L") {
+                    showMenu = false
+                    copyMomentLink()
+                }
             }
 
             ContextMenuRow(title: "Copy Image", icon: "doc.on.doc", shortcut: "⌘C") {
@@ -63,6 +65,7 @@ struct ContextMenuContent: View {
     // MARK: - Actions
 
     private func copyMomentLink() {
+        guard !viewModel.isInLiveMode else { return }
         guard let timestamp = viewModel.currentTimestamp else { return }
 
         if let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) {
@@ -143,6 +146,11 @@ struct ContextMenuContent: View {
     }
 
     private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        if viewModel.isInLiveMode {
+            completion(viewModel.liveScreenshot)
+            return
+        }
+
         if let image = viewModel.currentImage {
             completion(image)
             return

@@ -26,10 +26,14 @@ public struct SpotlightSearchOverlay: View {
     @State private var isResultKeyboardNavigationActive = false
     @State private var shouldFocusFirstResultAfterSubmit = false
     @State private var keyEventMonitor: Any?
+    @State private var overlayOpenStartTime: CFAbsoluteTime?
+    @State private var didRecordOpenLatency = false
+    @State private var isDismissing = false
 
     private let panelWidth: CGFloat = 1000
     private let collapsedWidth: CGFloat = 450
     private let maxResultsHeight: CGFloat = 550
+    private let dismissAnimationDuration: TimeInterval = 0.15
     private let thumbnailSize = CGSize(width: 280, height: 175)
     private let gridColumns = [
         GridItem(.flexible(), spacing: 16),
@@ -64,7 +68,8 @@ public struct SpotlightSearchOverlay: View {
                         if viewModel.isDropdownOpen {
                             viewModel.closeDropdownsSignal += 1
                         } else {
-                            dismissOverlay()
+                            // Outside click should dismiss with animation but preserve search state.
+                            dismissOverlayPreservingSearch()
                         }
                     }
             }
@@ -135,6 +140,8 @@ public struct SpotlightSearchOverlay: View {
         }
         .onAppear {
             Log.debug("\(searchLog) Search overlay opened", category: .ui)
+            overlayOpenStartTime = CFAbsoluteTimeGetCurrent()
+            didRecordOpenLatency = false
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                 isVisible = true
                 // If there are existing results, expand to show them
@@ -143,10 +150,13 @@ public struct SpotlightSearchOverlay: View {
                 }
             }
             installKeyEventMonitor()
+            scheduleOpenLatencyMeasurement()
         }
         .onDisappear {
             removeKeyEventMonitor()
             clearResultKeyboardNavigation()
+            overlayOpenStartTime = nil
+            didRecordOpenLatency = false
         }
         .onExitCommand {
             Log.debug("\(searchLog) Exit command received, isDropdownOpen=\(viewModel.isDropdownOpen), searchQuery='\(viewModel.searchQuery)'", category: .ui)
@@ -181,9 +191,9 @@ public struct SpotlightSearchOverlay: View {
                 }
             }
         }
-        .onChange(of: viewModel.results?.results.count ?? 0) { _ in
+        .onChange(of: viewModel.visibleResults.count) { _ in
             Log.info(
-                "\(searchLog) Results count changed: generation=\(viewModel.searchGeneration), isSearching=\(viewModel.isSearching), count=\(viewModel.results?.results.count ?? 0), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
+                "\(searchLog) Results count changed: generation=\(viewModel.searchGeneration), isSearching=\(viewModel.isSearching), filteredCount=\(viewModel.visibleResults.count), totalCount=\(viewModel.results?.results.count ?? 0), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
                 category: .ui
             )
             syncKeyboardSelectionWithCurrentResults()
@@ -206,6 +216,9 @@ public struct SpotlightSearchOverlay: View {
             if !isOpen {
                 refocusSearchField = UUID()
             }
+        }
+        .onChange(of: viewModel.dismissOverlaySignal.id) { _ in
+            dismissOverlay(clearSearchState: viewModel.dismissOverlaySignal.clearSearchState)
         }
     }
 
@@ -325,62 +338,46 @@ public struct SpotlightSearchOverlay: View {
         !viewModel.searchQuery.isEmpty && (viewModel.isSearching || viewModel.results != nil)
     }
 
+    /// Records first-frame overlay open latency once per presentation.
+    /// Uses next runloop turn so timing includes view construction/layout cost.
+    private func scheduleOpenLatencyMeasurement() {
+        DispatchQueue.main.async {
+            guard !didRecordOpenLatency, let startTime = overlayOpenStartTime else { return }
+            didRecordOpenLatency = true
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+            Log.recordLatency(
+                "search.overlay.open.first_frame_ms",
+                valueMs: elapsedMs,
+                category: .ui,
+                summaryEvery: 5,
+                warningThresholdMs: 120,
+                criticalThresholdMs: 300
+            )
+        }
+    }
+
     @ViewBuilder
     private var resultsArea: some View {
         if viewModel.isSearching && viewModel.results == nil {
             searchingView
                 .frame(height: 150)
-        } else if let results = viewModel.results {
-            if results.isEmpty {
+        } else if viewModel.results != nil {
+            if viewModel.visibleResults.isEmpty {
                 noResultsView
                     .frame(height: 150)
             } else {
-                resultsList(results.results)
+                resultsList(viewModel.visibleResults)
             }
         }
     }
 
     // MARK: - Results List
 
-    /// Filter out results where the search term only appears in a URL (not in actual content)
-    private func filterURLOnlyResults(_ results: [SearchResult]) -> [SearchResult] {
-        let query = viewModel.searchQuery.lowercased()
-        return results.filter { result in
-            // Check if the match appears in the snippet (actual content)
-            let snippetContainsQuery = result.snippet.lowercased().contains(query)
-
-            // If it's in the snippet, keep it
-            if snippetContainsQuery {
-                return true
-            }
-
-            // If it's NOT in the snippet, check if it's only in the URL
-            // If url contains query but snippet doesn't, filter it out
-            if let url = result.url, url.lowercased().contains(query) {
-                Log.debug("\(searchLog) Filtering out URL-only result: '\(url)'", category: .ui)
-                return false
-            }
-
-            // Also check window name for URL patterns
-            if let windowName = result.windowName,
-               windowName.lowercased().contains(query),
-               (windowName.contains("http://") || windowName.contains("https://") || windowName.contains("www.")) {
-                Log.debug("\(searchLog) Filtering out window title URL result: '\(windowName)'", category: .ui)
-                return false
-            }
-
-            // Keep the result (match might be in other metadata)
-            return true
-        }
-    }
-
-    private func resultsList(_ results: [SearchResult]) -> some View {
-        let filteredResults = filterURLOnlyResults(results)
-
+    private func resultsList(_ visibleResults: [SearchResult]) -> some View {
         return ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: true) {
                 LazyVGrid(columns: gridColumns, spacing: 16) {
-                    ForEach(Array(filteredResults.enumerated()), id: \.offset) { index, result in
+                    ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, result in
                         GalleryResultCard(
                             result: result,
                             thumbnailKey: thumbnailKey(for: result),
@@ -396,14 +393,13 @@ public struct SpotlightSearchOverlay: View {
                             },
                             viewModel: viewModel
                         )
-                        .id(index)
                         .onAppear {
                             Log.debug("\(searchLog) Result card appeared: index=\(index), frameID=\(result.frameID.stringValue), generation=\(viewModel.searchGeneration)", category: .ui)
                             loadThumbnail(for: result)
                             loadAppIcon(for: result)
 
                             // Infinite scroll: load more when near the end
-                            if index >= filteredResults.count - 3 && viewModel.canLoadMore {
+                            if index >= visibleResults.count - 3 && viewModel.canLoadMore {
                                 Task {
                                     await viewModel.loadMore()
                                 }
@@ -411,10 +407,9 @@ public struct SpotlightSearchOverlay: View {
                         }
                     }
                 }
-                .id(viewModel.searchGeneration)  // Force recreate entire grid when search changes
                 .onAppear {
                     Log.info(
-                        "\(searchLog) Results grid appear: generation=\(viewModel.searchGeneration), filteredCount=\(filteredResults.count), totalCount=\(results.count), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
+                        "\(searchLog) Results grid appear: generation=\(viewModel.searchGeneration), filteredCount=\(visibleResults.count), totalCount=\(viewModel.results?.results.count ?? 0), query='\(viewModel.searchQuery)', committed='\(viewModel.committedSearchQuery)'",
                         category: .ui
                     )
                 }
@@ -445,18 +440,22 @@ public struct SpotlightSearchOverlay: View {
                 // Restore scroll position when overlay appears
                 if viewModel.savedScrollPosition > 0 {
                     let targetIndex = Int(viewModel.savedScrollPosition)
+                    guard visibleResults.indices.contains(targetIndex) else { return }
+                    let targetResultID = visibleResults[targetIndex].id
                     // Scroll to the saved position with a slight delay to ensure layout is complete
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(targetIndex, anchor: .center)
+                            proxy.scrollTo(targetResultID, anchor: .center)
                         }
                     }
                 }
             }
             .onChange(of: keyboardSelectedResultIndex) { selectedIndex in
                 guard let selectedIndex else { return }
+                guard visibleResults.indices.contains(selectedIndex) else { return }
+                let selectedResultID = visibleResults[selectedIndex].id
                 withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo(selectedIndex)
+                    proxy.scrollTo(selectedResultID, anchor: .center)
                 }
             }
         }
@@ -822,43 +821,43 @@ public struct SpotlightSearchOverlay: View {
 
     /// Dismisses the overlay without clearing search state (used when selecting a result)
     private func dismissOverlayPreservingSearch() {
-        Log.debug("\(searchLog) Dismissing overlay (preserving search state)", category: .ui)
-
-        withAnimation(.easeOut(duration: 0.15)) {
-            isVisible = false
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            onDismiss()
-        }
+        dismissOverlay(clearSearchState: false)
     }
 
     /// Dismisses the overlay and clears search state (used for explicit dismissal like Escape key)
     private func dismissOverlay() {
-        Log.debug("\(searchLog) Dismissing overlay", category: .ui)
+        dismissOverlay(clearSearchState: true)
+    }
 
-        // Cancel any in-flight search tasks to prevent blocking
+    private func dismissOverlay(clearSearchState: Bool) {
+        guard !isDismissing else { return }
+        isDismissing = true
+
+        Log.debug("\(searchLog) Dismissing overlay (clearSearchState=\(clearSearchState))", category: .ui)
+
+        // Cancel any in-flight search tasks to prevent blocking while the overlay fades out.
         viewModel.cancelSearch()
         clearResultKeyboardNavigation()
 
-        // Clear search query and filters when dismissing
-        viewModel.searchQuery = ""
-        viewModel.clearAllFilters()
-
-        withAnimation(.easeOut(duration: 0.15)) {
+        withAnimation(.easeOut(duration: dismissAnimationDuration)) {
             isVisible = false
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + dismissAnimationDuration) {
+            // Clear only after fade-out completes so dismiss is visually smooth.
+            if clearSearchState {
+                viewModel.searchQuery = ""
+                viewModel.clearAllFilters()
+            }
             onDismiss()
+            isDismissing = false
         }
     }
 
     // MARK: - Keyboard Navigation
 
     private var keyboardNavigableResults: [SearchResult] {
-        guard let results = viewModel.results else { return [] }
-        return filterURLOnlyResults(results.results)
+        viewModel.visibleResults
     }
 
     private func prepareResultKeyboardNavigationAfterSubmit() {

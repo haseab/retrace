@@ -298,13 +298,16 @@ public struct SimpleTimelineView: View {
 
                 // Toast feedback overlay (centered, larger for errors)
                 if viewModel.toastMessage != nil {
+                    let isErrorToast = viewModel.toastTone == .error
+                    let toastAccentColor = isErrorToast ? Color.red : Color.green
+
                     VStack {
                         Spacer()
                         HStack(spacing: 12) {
                             if let icon = viewModel.toastIcon {
                                 Image(systemName: icon)
                                     .font(.system(size: 22, weight: .semibold))
-                                    .foregroundColor(.red)
+                                    .foregroundColor(toastAccentColor)
                             }
                             if let message = viewModel.toastMessage {
                                 Text(message)
@@ -322,7 +325,7 @@ public struct SimpleTimelineView: View {
                                 RoundedRectangle(cornerRadius: 16)
                                     .fill(Color.black.opacity(0.5))
                                 RoundedRectangle(cornerRadius: 16)
-                                    .stroke(Color.red.opacity(0.3), lineWidth: 1)
+                                    .stroke(toastAccentColor.opacity(0.35), lineWidth: 1)
                             }
                         )
                         .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
@@ -333,9 +336,9 @@ public struct SimpleTimelineView: View {
                     .allowsHitTesting(false)
                 }
 
-	            }
+            }
             .coordinateSpace(name: "timelineContent")
-            .background(Color.black)
+            .background(frameCanvasBackgroundColor)
             .ignoresSafeArea()
             .onAppear {
                 if !hasInitialized {
@@ -356,6 +359,14 @@ public struct SimpleTimelineView: View {
             // Note: Keyboard shortcuts (Option+F, Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
         }
+    }
+
+    private var isAwaitingLiveScreenshot: Bool {
+        viewModel.isInLiveMode && viewModel.liveScreenshot == nil
+    }
+
+    private var frameCanvasBackgroundColor: Color {
+        isAwaitingLiveScreenshot ? .clear : .black
     }
 
     // MARK: - Search Overlay
@@ -412,82 +423,90 @@ public struct SimpleTimelineView: View {
 
 	    @ViewBuilder
 	    private var frameDisplay: some View {
-	        // Error states shown without layering
-	        if viewModel.frameLoadError {
-	            // Frame failed to load - show error message on black background
-	            VStack(spacing: .spacingM) {
-	                Image(systemName: "clock")
-	                    .font(.retraceDisplay)
-	                    .foregroundColor(.white.opacity(0.3))
-	                Text("Come back in a few frames")
-	                    .font(.retraceBody)
-	                    .foregroundColor(.white.opacity(0.5))
-	                Text("This frame is still being processed")
-	                    .font(.retraceCaption)
-	                    .foregroundColor(.white.opacity(0.3))
-	            }
-	        } else if viewModel.frameNotReady {
-	            // Frame not yet written to video file - show placeholder
-	            VStack(spacing: .spacingM) {
-	                Image(systemName: "clock")
-	                    .font(.retraceDisplay)
-	                    .foregroundColor(.white.opacity(0.3))
-	                Text("Frame not ready yet")
-	                    .font(.retraceBody)
-	                    .foregroundColor(.white.opacity(0.5))
-	                Text("Still encoding...")
-	                    .font(.retraceCaption)
-	                    .foregroundColor(.white.opacity(0.3))
-	            }
-	        } else {
-	            // Main content with live mode overlay using ZStack
-	            // AVPlayer mounts underneath and preloads while live screenshot is visible
-	            ZStack {
-	                // Base layer: Video or static image (loads in background during live mode)
-	                // Only mount after live screenshot has appeared to prevent initial black flash
-	                if liveScreenshotHasAppeared || !viewModel.isInLiveMode {
-	                    if let videoInfo = viewModel.currentVideoInfo {
-	                        videoFrameContent(videoInfo: videoInfo)
-	                    } else if let image = viewModel.currentImage {
-	                        // Static image (Retrace) with URL overlay
-	                        FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                            Image(nsImage: image)
-	                                .resizable()
-	                                .aspectRatio(contentMode: .fit)
-	                        }
-	                    } else if !viewModel.isLoading {
-	                        // Empty state - no video or image available
-	                        VStack(spacing: .spacingM) {
-	                            Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
-	                                .font(.retraceDisplay)
-	                                .foregroundColor(.white.opacity(0.3))
-	                            Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not ready yet")
-	                                .font(.retraceBody)
-	                                .foregroundColor(.white.opacity(0.5))
-	                            if !viewModel.frames.isEmpty {
-	                                Text("Relaunch timeline in a few seconds")
-	                                    .font(.retraceCaption)
-	                                    .foregroundColor(.white.opacity(0.3))
-	                            }
-	                        }
-	                    }
-	                }
+            if isAwaitingLiveScreenshot {
+                // Live-mode launch: hide the frame canvas until live screenshot arrives.
+                // The tape and controls still render above this.
+                Color.clear
+            } else {
+                // Main content with live mode overlay using ZStack.
+                // Live screenshot always overlays historical/error content when available.
+                ZStack {
+                    // Base layer: historical frame/error content.
+                    // Only mount after live screenshot has appeared to prevent initial black flash.
+                    if liveScreenshotHasAppeared || !viewModel.isInLiveMode {
+                        historicalFrameContent
+                    }
 
-	                // Overlay layer: Live screenshot with text selection (covers AVPlayer while it loads)
-	                if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
-	                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                        Image(nsImage: liveImage)
-	                            .resizable()
-	                            .aspectRatio(contentMode: .fit)
-	                    }
-	                    .onAppear {
-	                        // Mark that live screenshot has appeared, allowing AVPlayer to mount
-	                        liveScreenshotHasAppeared = true
-	                    }
-	                }
-	            }
-	        }
+                    // Overlay layer: Live screenshot with text selection.
+                    if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
+                        FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                            Image(nsImage: liveImage)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                        }
+                        .onAppear {
+                            // Mark that live screenshot has appeared, allowing AVPlayer to mount.
+                            liveScreenshotHasAppeared = true
+                        }
+                    }
+                }
+            }
 	    }
+
+    @ViewBuilder
+    private var historicalFrameContent: some View {
+        if viewModel.frameLoadError {
+            // Frame failed to load.
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Come back in a few frames")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("This frame is still being processed")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if viewModel.frameNotReady {
+            // Frame not yet written to video file.
+            VStack(spacing: .spacingM) {
+                Image(systemName: "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text("Frame not ready yet")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                Text("Still encoding...")
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.3))
+            }
+        } else if let videoInfo = viewModel.currentVideoInfo {
+            videoFrameContent(videoInfo: videoInfo)
+        } else if let image = viewModel.currentImage {
+            // Static image (Retrace) with URL overlay.
+            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+        } else if !viewModel.isLoading {
+            // Empty state - no video or image available.
+            VStack(spacing: .spacingM) {
+                Image(systemName: viewModel.frames.isEmpty ? "photo.on.rectangle.angled" : "clock")
+                    .font(.retraceDisplay)
+                    .foregroundColor(.white.opacity(0.3))
+                Text(viewModel.frames.isEmpty ? "No frames recorded" : "Frame not ready yet")
+                    .font(.retraceBody)
+                    .foregroundColor(.white.opacity(0.5))
+                if !viewModel.frames.isEmpty {
+                    Text("Relaunch timeline in a few seconds")
+                        .font(.retraceCaption)
+                        .foregroundColor(.white.opacity(0.3))
+                }
+            }
+        }
+    }
 
 	    /// Video frame content extracted to separate view builder for cleaner code
 	    @ViewBuilder
@@ -3778,10 +3797,10 @@ struct RightClickOverlay: ViewModifier {
                 GeometryReader { geo in
                     Color.clear
                         .onAppear {
-                            viewBounds = geo.frame(in: .global)
+                            updateViewBoundsIfNeeded(geo.frame(in: .global))
                         }
                         .onChange(of: geo.frame(in: .global)) { newFrame in
-                            viewBounds = newFrame
+                            updateViewBoundsIfNeeded(newFrame)
                         }
                 }
             )
@@ -3791,6 +3810,19 @@ struct RightClickOverlay: ViewModifier {
             .onDisappear {
                 removeEventMonitor()
             }
+    }
+
+    private func updateViewBoundsIfNeeded(_ newFrame: CGRect) {
+        let epsilon: CGFloat = 0.5
+        let hasMeaningfulDelta =
+            abs(viewBounds.minX - newFrame.minX) > epsilon ||
+            abs(viewBounds.minY - newFrame.minY) > epsilon ||
+            abs(viewBounds.width - newFrame.width) > epsilon ||
+            abs(viewBounds.height - newFrame.height) > epsilon
+
+        if hasMeaningfulDelta || viewBounds == .zero {
+            viewBounds = newFrame
+        }
     }
 
     private func setupEventMonitor() {
@@ -5261,6 +5293,7 @@ struct CompactAppsFilterDropdown: View {
     let onTap: (CGRect) -> Void
     var onFrameAvailable: ((CGRect) -> Void)? = nil
 
+    @StateObject private var appMetadata = AppMetadataCache.shared
     @State private var isHovered = false
 
     private let maxVisibleIcons = 5
@@ -5370,28 +5403,24 @@ struct CompactAppsFilterDropdown: View {
             }
             .frame(height: 38)
         }
+        .onAppear {
+            appMetadata.prefetch(bundleIDs: sortedApps)
+        }
+        .onChange(of: sortedApps) { bundleIDs in
+            appMetadata.prefetch(bundleIDs: bundleIDs)
+        }
     }
 
-    @ViewBuilder
     private func appIcon(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-        } else {
-            Image(systemName: "app.fill")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundColor(.white.opacity(0.6))
-        }
+        AppIconView(bundleID: bundleID, size: iconSize)
     }
 
     private func appName(for bundleID: String) -> String {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: appURL.path)
-        }
-        // Fallback: extract last component of bundle ID
-        return bundleID.components(separatedBy: ".").last ?? bundleID
+        appMetadata.name(for: bundleID) ?? fallbackName(for: bundleID)
+    }
+
+    private func fallbackName(for bundleID: String) -> String {
+        bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 
@@ -5442,40 +5471,19 @@ struct SourceFilterChip: View {
     let isRetrace: Bool
     let isSelected: Bool
     let action: () -> Void
+    @StateObject private var appMetadata = AppMetadataCache.shared
     @State private var isHovered = false
 
-    private var retraceIcon: NSImage {
-        // Load Retrace app icon from /Applications
-        NSWorkspace.shared.icon(forFile: "/Applications/Retrace.app")
-    }
-
-    private var rewindIcon: NSImage? {
-        // Load Rewind app icon from /Applications, fallback to nil (will use system icon)
-        let rewindPath = "/Applications/Rewind.app"
-        if FileManager.default.fileExists(atPath: rewindPath) {
-            return NSWorkspace.shared.icon(forFile: rewindPath)
-        }
-        return nil
-    }
+    private let retraceAppPath = "/Applications/Retrace.app"
+    private let rewindAppPath = "/Applications/Rewind.app"
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
                 if isRetrace {
-                    // Retrace app icon from /Applications
-                    Image(nsImage: retraceIcon)
-                        .resizable()
-                        .frame(width: 16, height: 16)
+                    sourceAppIcon(for: retraceAppPath, fallbackSystemName: "app.fill")
                 } else {
-                    // Rewind app icon - load from /Applications
-                    if let icon = rewindIcon {
-                        Image(nsImage: icon)
-                            .resizable()
-                            .frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: "arrow.counterclockwise")
-                            .font(.system(size: 11))
-                    }
+                    sourceAppIcon(for: rewindAppPath, fallbackSystemName: "arrow.counterclockwise")
                 }
                 Text(label)
                     .font(.system(size: 12, weight: .medium))
@@ -5500,6 +5508,23 @@ struct SourceFilterChip: View {
         .buttonStyle(.plain)
         .onHover { hovering in
             isHovered = hovering
+        }
+        .onAppear {
+            let path = isRetrace ? retraceAppPath : rewindAppPath
+            appMetadata.requestIcon(forAppPath: path)
+        }
+    }
+
+    @ViewBuilder
+    private func sourceAppIcon(for appPath: String, fallbackSystemName: String) -> some View {
+        if let icon = appMetadata.icon(forAppPath: appPath) {
+            Image(nsImage: icon)
+                .resizable()
+                .frame(width: 16, height: 16)
+        } else {
+            Image(systemName: fallbackSystemName)
+                .font(.system(size: 11))
+                .frame(width: 16, height: 16)
         }
     }
 }
@@ -5567,7 +5592,9 @@ struct FilterDropdownOverlay: View {
                     }
                     .onPreferenceChange(FilterDropdownSizePreferenceKey.self) { size in
                         guard size.width > 0, size.height > 0 else { return }
-                        measuredDropdownSize = size
+                        let normalizedSize = normalizedDropdownSize(size)
+                        guard shouldUpdateMeasuredDropdownSize(to: normalizedSize) else { return }
+                        measuredDropdownSize = normalizedSize
                     }
                     .transition(.opacity)
                     .zIndex(2000)
@@ -5577,13 +5604,30 @@ struct FilterDropdownOverlay: View {
         .animation(.easeOut(duration: 0.15), value: viewModel.activeFilterDropdown)
         .animation(.easeOut(duration: 0.15), value: viewModel.isDateRangeCalendarEditing)
         .onChange(of: viewModel.activeFilterDropdown) { _ in
-            measuredDropdownSize = .zero
-        }
-        .onChange(of: viewModel.isDateRangeCalendarEditing) { _ in
-            if viewModel.activeFilterDropdown == .dateRange {
+            if measuredDropdownSize != .zero {
                 measuredDropdownSize = .zero
             }
         }
+        .onChange(of: viewModel.isDateRangeCalendarEditing) { _ in
+            if viewModel.activeFilterDropdown == .dateRange, measuredDropdownSize != .zero {
+                measuredDropdownSize = .zero
+            }
+        }
+    }
+
+    private func normalizedDropdownSize(_ size: CGSize) -> CGSize {
+        // Round to half-points so tiny float jitter does not churn layout.
+        let width = (size.width * 2).rounded() / 2
+        let height = (size.height * 2).rounded() / 2
+        return CGSize(width: width, height: height)
+    }
+
+    private func shouldUpdateMeasuredDropdownSize(to newSize: CGSize) -> Bool {
+        let epsilon: CGFloat = 0.5
+        return
+            abs(measuredDropdownSize.width - newSize.width) > epsilon ||
+            abs(measuredDropdownSize.height - newSize.height) > epsilon ||
+            measuredDropdownSize == .zero
     }
 
     private func resolvedDropdownSize(fallback: CGSize) -> CGSize {
@@ -5723,6 +5767,12 @@ struct FilterDropdownOverlay: View {
                     viewModel.setDateRange(start: nil, end: nil)
                 },
                 enableKeyboardNavigation: true,
+                onMoveToNextFilter: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.advanced] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.advanced, anchorFrame: nextAnchorFrame)
+                    }
+                },
                 onCalendarEditingChange: { isEditing in
                     viewModel.isDateRangeCalendarEditing = isEditing
                 },

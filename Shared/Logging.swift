@@ -216,6 +216,59 @@ public enum Log {
         return result
     }
 
+    // MARK: - Latency Distribution Tracking
+
+    public struct LatencySnapshot: Sendable {
+        public let metric: String
+        public let sampleCount: Int
+        public let totalCount: Int
+        public let latestMs: Double
+        public let p50Ms: Double
+        public let p95Ms: Double
+        public let minMs: Double
+        public let maxMs: Double
+        public let shouldEmitSummary: Bool
+    }
+
+    private static let latencyRecorder = LatencyRecorder()
+
+    /// Record a latency sample and periodically emit p50/p95 summaries.
+    /// Keeps a bounded in-memory window per metric for low overhead.
+    public static func recordLatency(
+        _ metric: String,
+        valueMs: Double,
+        category: Category = .app,
+        summaryEvery: Int = 10,
+        warningThresholdMs: Double? = nil,
+        criticalThresholdMs: Double? = nil
+    ) {
+        let snapshot = latencyRecorder.record(
+            metric: metric,
+            sampleMs: valueMs,
+            summaryEvery: max(1, summaryEvery)
+        )
+
+        let latest = String(format: "%.1f", valueMs)
+        if let criticalThresholdMs, valueMs >= criticalThresholdMs {
+            critical(
+                "[PERF] \(metric) slow sample: \(latest)ms (critical >= \(String(format: "%.1f", criticalThresholdMs))ms)",
+                category: category
+            )
+        } else if let warningThresholdMs, valueMs >= warningThresholdMs {
+            warning(
+                "[PERF] \(metric) slow sample: \(latest)ms (warning >= \(String(format: "%.1f", warningThresholdMs))ms)",
+                category: category
+            )
+        }
+
+        guard snapshot.shouldEmitSummary else { return }
+
+        info(
+            "[PERF] \(metric) n=\(snapshot.sampleCount) total=\(snapshot.totalCount) latest=\(String(format: "%.1f", snapshot.latestMs))ms p50=\(String(format: "%.1f", snapshot.p50Ms))ms p95=\(String(format: "%.1f", snapshot.p95Ms))ms min=\(String(format: "%.1f", snapshot.minMs))ms max=\(String(format: "%.1f", snapshot.maxMs))ms",
+            category: category
+        )
+    }
+
     // MARK: - Private Helpers
 
     private static func printFormatted(
@@ -231,6 +284,60 @@ public enum Log {
 
         // Also write to log file for persistence across crashes
         LogFile.shared.append(formattedLog)
+    }
+}
+
+// MARK: - Latency Recorder
+
+private final class LatencyRecorder: @unchecked Sendable {
+    private struct Bucket {
+        var samples: [Double] = []
+        var totalCount = 0
+    }
+
+    private let lock = NSLock()
+    private var buckets: [String: Bucket] = [:]
+    private let maxSamplesPerMetric = 200
+
+    func record(metric: String, sampleMs: Double, summaryEvery: Int) -> Log.LatencySnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var bucket = buckets[metric] ?? Bucket()
+        bucket.totalCount += 1
+        bucket.samples.append(sampleMs)
+
+        if bucket.samples.count > maxSamplesPerMetric {
+            bucket.samples.removeFirst(bucket.samples.count - maxSamplesPerMetric)
+        }
+
+        buckets[metric] = bucket
+
+        let sorted = bucket.samples.sorted()
+        let p50 = percentile(sorted, p: 0.50)
+        let p95 = percentile(sorted, p: 0.95)
+        let minMs = sorted.first ?? sampleMs
+        let maxMs = sorted.last ?? sampleMs
+        let shouldEmitSummary = bucket.totalCount % summaryEvery == 0
+
+        return Log.LatencySnapshot(
+            metric: metric,
+            sampleCount: bucket.samples.count,
+            totalCount: bucket.totalCount,
+            latestMs: sampleMs,
+            p50Ms: p50,
+            p95Ms: p95,
+            minMs: minMs,
+            maxMs: maxMs,
+            shouldEmitSummary: shouldEmitSummary
+        )
+    }
+
+    private func percentile(_ sorted: [Double], p: Double) -> Double {
+        guard !sorted.isEmpty else { return 0 }
+        let clampedP = min(max(p, 0), 1)
+        let index = Int(round(clampedP * Double(sorted.count - 1)))
+        return sorted[index]
     }
 }
 

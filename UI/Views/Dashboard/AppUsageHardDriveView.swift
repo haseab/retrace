@@ -12,6 +12,26 @@ struct AppUsageHardDriveView: View {
 
     private let gap: CGFloat = 3
 
+    private struct TreemapItem {
+        let app: AppUsageData
+        let rect: CGRect
+        let targetArea: CGFloat  // Store target area for validation
+    }
+
+    private final class TreemapLayoutCacheEntry {
+        let items: [TreemapItem]
+
+        init(items: [TreemapItem]) {
+            self.items = items
+        }
+    }
+
+    private static let treemapLayoutCache: NSCache<NSString, TreemapLayoutCacheEntry> = {
+        let cache = NSCache<NSString, TreemapLayoutCacheEntry>()
+        cache.countLimit = 64
+        return cache
+    }()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Treemap visualization - fills all available space
@@ -37,8 +57,9 @@ struct AppUsageHardDriveView: View {
 
     private var treemapVisualization: some View {
         GeometryReader { geometry in
-            let layout = calculateTreemap(
-                apps: Array(apps.prefix(12)),
+            let visibleApps = Array(apps.prefix(12))
+            let layout = memoizedTreemapLayout(
+                apps: visibleApps,
                 in: CGRect(x: 0, y: 0, width: geometry.size.width, height: geometry.size.height)
             )
 
@@ -200,10 +221,29 @@ struct AppUsageHardDriveView: View {
 
     // MARK: - Squarified Treemap Algorithm with Proportion-Preserving Fitting
 
-    private struct TreemapItem {
-        let app: AppUsageData
-        let rect: CGRect
-        let targetArea: CGFloat  // Store target area for validation
+    private func memoizedTreemapLayout(apps: [AppUsageData], in rect: CGRect) -> [TreemapItem] {
+        guard rect.width > 0, rect.height > 0 else { return [] }
+
+        let cacheKey = treemapCacheKey(apps: apps, containerSize: rect.size)
+        if let cached = Self.treemapLayoutCache.object(forKey: cacheKey) {
+            return cached.items
+        }
+
+        let layout = calculateTreemap(apps: apps, in: rect)
+        Self.treemapLayoutCache.setObject(TreemapLayoutCacheEntry(items: layout), forKey: cacheKey)
+        return layout
+    }
+
+    private func treemapCacheKey(apps: [AppUsageData], containerSize: CGSize) -> NSString {
+        let quantizedWidth = Int((containerSize.width * 2).rounded())
+        let quantizedHeight = Int((containerSize.height * 2).rounded())
+        let appsSignature = apps.map { app in
+            let percentage = Int((app.percentage * 10_000).rounded())
+            let duration = Int(app.duration.rounded())
+            return "\(app.appBundleID)|\(percentage)|\(duration)|\(app.uniqueItemCount)"
+        }.joined(separator: ";")
+
+        return "\(quantizedWidth)x\(quantizedHeight)|\(apps.count)|\(appsSignature)" as NSString
     }
 
     private func calculateTreemap(apps: [AppUsageData], in rect: CGRect) -> [TreemapItem] {

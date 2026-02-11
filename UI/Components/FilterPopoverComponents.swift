@@ -1472,15 +1472,7 @@ public struct DateRangeFilterPopover: View {
                             }
                         }
                         .onSubmit {
-                            let trimmed = rangeInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if trimmed.isEmpty {
-                                // If empty, clear the filter and dismiss
-                                onClear()
-                                onDismiss?()
-                            } else {
-                                // Try to parse and apply
-                                _ = applyInputTextToLocalRange(applyImmediately: true)
-                            }
+                            applyCurrentSelection(moveToNextDropdown: true)
                         }
                         .onChange(of: rangeInputText) { _ in
                             parseError = nil
@@ -1912,7 +1904,13 @@ public struct DateRangeFilterPopover: View {
             return
         }
 
-        guard applyInputTextToLocalRange(applyImmediately: false) else { return }
+        guard applyInputTextToLocalRange(applyImmediately: false) else {
+            if moveToNextDropdown {
+                onDismiss?()
+                onMoveToNextFilter?()
+            }
+            return
+        }
         applyCustomRange(moveToNextDropdown: moveToNextDropdown)
     }
 
@@ -2286,15 +2284,8 @@ public struct DateRangeFilterPopover: View {
 
             case 36, 76: // Return/Enter
                 if isRangeInputFocused {
-                    let trimmed = rangeInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty {
-                        // If empty, clear the filter and dismiss
-                        onClear()
-                        onDismiss?()
-                    } else {
-                        // Try to parse and apply
-                        _ = applyInputTextToLocalRange(applyImmediately: true)
-                    }
+                    // Match Tab behavior: apply/clear from input, then advance to next filter.
+                    applyCurrentSelection(moveToNextDropdown: true)
                     return nil
                 }
 

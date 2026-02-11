@@ -145,7 +145,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Clear cached blocks when frames change
             // Note: This is necessary because blocks depend on frame ranges
             // The slight performance hit is acceptable for correctness
-            _cachedAppBlocks = nil
+            _cachedAppBlockSnapshot = nil
         }
     }
 
@@ -482,17 +482,27 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var showVideoBoundaries: Bool = false
 
     // MARK: - Toast Feedback
+    public enum ToastTone: Sendable {
+        case success
+        case error
+    }
+
     @Published public var toastMessage: String? = nil
     @Published public var toastIcon: String? = nil
+    @Published public var toastTone: ToastTone = .success
     @Published public var toastVisible: Bool = false
     private var toastDismissTask: Task<Void, Never>?
 
     /// Show a brief toast notification overlay
-    public func showToast(_ message: String, icon: String = "xmark.circle.fill") {
+    public func showToast(_ message: String, icon: String? = nil) {
         toastDismissTask?.cancel()
+        let tone = classifyToastTone(message: message, icon: icon)
+        let resolvedIcon = icon ?? (tone == .error ? "xmark.circle.fill" : "checkmark.circle.fill")
+
         // Set content first, then animate in
         toastMessage = message
-        toastIcon = icon
+        toastIcon = resolvedIcon
+        toastTone = tone
         withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
             toastVisible = true
         }
@@ -507,29 +517,51 @@ public class SimpleTimelineViewModel: ObservableObject {
                 if !Task.isCancelled {
                     self.toastMessage = nil
                     self.toastIcon = nil
+                    self.toastTone = .success
                 }
             }
         }
     }
 
-    /// Frame indices where video boundaries occur (first frame of each new video)
-    /// A boundary exists when the videoPath changes between consecutive frames
-    public var videoBoundaryIndices: Set<Int> {
-        guard frames.count > 1 else { return [] }
-
-        var boundaries = Set<Int>()
-        var previousVideoPath: String? = nil
-
-        for (index, frame) in frames.enumerated() {
-            let currentVideoPath = frame.videoInfo?.videoPath
-            if let prev = previousVideoPath, let curr = currentVideoPath, prev != curr {
-                // Video changed - this frame is a boundary (first frame of new video)
-                boundaries.insert(index)
+    private func classifyToastTone(message: String, icon: String?) -> ToastTone {
+        if let icon {
+            if icon.contains("xmark") || icon.contains("exclamationmark") {
+                return .error
             }
-            previousVideoPath = currentVideoPath
+            if icon.contains("checkmark") {
+                return .success
+            }
         }
 
-        return boundaries
+        let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let errorKeywords = [
+            "cannot",
+            "can't",
+            "failed",
+            "error",
+            "unable",
+            "invalid",
+            "denied",
+            "missing",
+            "not found"
+        ]
+
+        if errorKeywords.contains(where: { normalizedMessage.contains($0) }) {
+            return .error
+        }
+
+        return .success
+    }
+
+    /// Ordered frame indices where video boundaries occur (first frame of each new video)
+    /// A boundary exists when the videoPath changes between consecutive frames.
+    public var orderedVideoBoundaryIndices: [Int] {
+        appBlockSnapshot.videoBoundaryIndices
+    }
+
+    /// Set form of video boundaries for existing call sites.
+    public var videoBoundaryIndices: Set<Int> {
+        Set(orderedVideoBoundaryIndices)
     }
 
     // MARK: - Video Playback State
@@ -914,20 +946,36 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Computed Properties for Timeline Tape
 
-    /// Cached app blocks - only recomputed when frames change
-    private var _cachedAppBlocks: [AppBlock]?
+    private struct AppBlockSnapshot {
+        let blocks: [AppBlock]
+        let frameToBlockIndex: [Int]
+        let videoBoundaryIndices: [Int]
+    }
+
+    /// Cached block snapshot - recomputed when frames change.
+    private var _cachedAppBlockSnapshot: AppBlockSnapshot?
+    private var _cachedAppBlockSnapshotRevision: Int = 0
+
+    /// Increments when a new block snapshot is built. Useful for view-level layout caching.
+    public var appBlockSnapshotRevision: Int {
+        _cachedAppBlockSnapshotRevision
+    }
+
+    private var appBlockSnapshot: AppBlockSnapshot {
+        if let cached = _cachedAppBlockSnapshot {
+            return cached
+        }
+
+        let snapshot = buildAppBlockSnapshot(from: frames)
+        _cachedAppBlockSnapshot = snapshot
+        _cachedAppBlockSnapshotRevision &+= 1
+        return snapshot
+    }
 
     /// App blocks grouped by consecutive bundle IDs
     /// Note: Since we do server-side filtering, frames already contains only filtered results when filters are active
     public var appBlocks: [AppBlock] {
-        if let cached = _cachedAppBlocks {
-            return cached
-        }
-
-        let blocks = groupFramesIntoBlocks()
-        _cachedAppBlocks = blocks
-
-        return blocks
+        appBlockSnapshot.blocks
     }
 
     // MARK: - Private State
@@ -992,6 +1040,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Flag to prevent duplicate initial frame loading (set synchronously to avoid race conditions)
     private var isInitialLoadInProgress = false
+    /// Waiters for the current initial most-recent load. Overlapping callers await completion
+    /// instead of being dropped, preventing missed-load races between multiple launch paths.
+    private var initialMostRecentLoadWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Whether there's more data available in the older direction
     private var hasMoreOlder = true
@@ -1129,8 +1180,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         Log.debug("[DataSourceChange] Image cache cleared, new count: \(imageCache.count)", category: .ui)
 
         // Clear app blocks cache
-        let hadAppBlocks = _cachedAppBlocks != nil
-        _cachedAppBlocks = nil
+        let hadAppBlocks = _cachedAppBlockSnapshot != nil
+        _cachedAppBlockSnapshot = nil
         Log.debug("[DataSourceChange] Cleared app blocks cache (had cached: \(hadAppBlocks))", category: .ui)
 
         // Clear search results (data source changed, results may no longer be valid)
@@ -1251,7 +1302,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         frames.remove(at: index)
 
         // Clear cached blocks since frames changed
-        _cachedAppBlocks = nil
+        _cachedAppBlockSnapshot = nil
 
         // Adjust current index if needed
         if currentIndex >= frames.count {
@@ -1305,7 +1356,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Get the app block containing a frame at the given index
     public func getBlock(forFrameAt index: Int) -> AppBlock? {
-        return appBlocks.first { index >= $0.startIndex && index <= $0.endIndex }
+        guard let blockIndex = blockIndexForFrame(index) else { return nil }
+        let blocks = appBlockSnapshot.blocks
+        guard blockIndex >= 0 && blockIndex < blocks.count else { return nil }
+        return blocks[blockIndex]
+    }
+
+    private func blockIndexForFrame(_ index: Int) -> Int? {
+        let mapping = appBlockSnapshot.frameToBlockIndex
+        guard index >= 0 && index < mapping.count else { return nil }
+        return mapping[index]
     }
 
     /// Jump to the start of the previous consecutive app block.
@@ -1313,9 +1373,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func navigateToPreviousBlockStart() -> Bool {
         guard !frames.isEmpty else { return false }
-        let blocks = appBlocks
+        let snapshot = appBlockSnapshot
+        let blocks = snapshot.blocks
         guard !blocks.isEmpty else { return false }
-        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }),
+        guard let currentBlockIndex = blockIndexForFrame(currentIndex),
               currentBlockIndex > 0 else {
             return false
         }
@@ -1329,9 +1390,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func navigateToNextBlockStart() -> Bool {
         guard !frames.isEmpty else { return false }
-        let blocks = appBlocks
+        let snapshot = appBlockSnapshot
+        let blocks = snapshot.blocks
         guard !blocks.isEmpty else { return false }
-        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }),
+        guard let currentBlockIndex = blockIndexForFrame(currentIndex),
               currentBlockIndex < blocks.count - 1 else {
             return false
         }
@@ -1346,9 +1408,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     @discardableResult
     public func navigateToNextBlockStartOrNewestFrame() -> Bool {
         guard !frames.isEmpty else { return false }
-        let blocks = appBlocks
+        let snapshot = appBlockSnapshot
+        let blocks = snapshot.blocks
         guard !blocks.isEmpty else { return false }
-        guard let currentBlockIndex = blocks.firstIndex(where: { currentIndex >= $0.startIndex && currentIndex <= $0.endIndex }) else {
+        guard let currentBlockIndex = blockIndexForFrame(currentIndex) else {
             return false
         }
 
@@ -1405,7 +1468,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         frames.removeSubrange(block.startIndex...min(block.endIndex, frames.count - 1))
 
         // Clear cached blocks since frames changed
-        _cachedAppBlocks = nil
+        _cachedAppBlockSnapshot = nil
 
         // Adjust current index
         if currentIndex >= startIndex + deleteCount {
@@ -1553,7 +1616,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let removedCount = beforeCount - frames.count
 
             // Clear cached blocks since frames changed
-            _cachedAppBlocks = nil
+            _cachedAppBlockSnapshot = nil
 
             // Preserve current frame if still present after removal; otherwise clamp safely.
             if let previousCurrentFrameID,
@@ -1652,7 +1715,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let removedCount = beforeCount - frames.count
 
                 // Clear cached blocks since frames changed
-                _cachedAppBlocks = nil
+                _cachedAppBlockSnapshot = nil
 
                 // Preserve current frame if still present after removal; otherwise clamp safely.
                 if let previousCurrentFrameID,
@@ -1902,17 +1965,40 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Group frames into app blocks (parameterized version for filtered frames)
     /// Splits on app change OR time gaps ≥2 min
     private func groupFramesIntoBlocks(from frameList: [TimelineFrame]) -> [AppBlock] {
-        guard !frameList.isEmpty else { return [] }
+        buildAppBlockSnapshot(from: frameList).blocks
+    }
+
+    /// Build app blocks, frame->block index mapping, and video boundaries in one pass.
+    private func buildAppBlockSnapshot(from frameList: [TimelineFrame]) -> AppBlockSnapshot {
+        guard !frameList.isEmpty else {
+            return AppBlockSnapshot(blocks: [], frameToBlockIndex: [], videoBoundaryIndices: [])
+        }
 
         var blocks: [AppBlock] = []
+        var frameToBlockIndex = Array(repeating: 0, count: frameList.count)
+        var boundaries: [Int] = []
+
         var currentBundleID: String? = frameList[0].frame.metadata.appBundleID
         var blockStartIndex = 0
+        var currentBlockIndex = 0
         var gapBeforeCurrentBlock: TimeInterval? = nil
+        var previousVideoPath = frameList[0].videoInfo?.videoPath
 
-        for (index, timelineFrame) in frameList.enumerated() {
+        for index in frameList.indices {
+            let timelineFrame = frameList[index]
             let frameBundleID = timelineFrame.frame.metadata.appBundleID
 
-            // Check for time gap between this frame and the previous one
+            // Track boundary when video path changes from previous frame.
+            if index > 0 {
+                let currentVideoPath = timelineFrame.videoInfo?.videoPath
+                if let previousVideoPath,
+                   let currentVideoPath,
+                   previousVideoPath != currentVideoPath {
+                    boundaries.append(index)
+                }
+                previousVideoPath = currentVideoPath
+            }
+
             var gapDuration: TimeInterval = 0
             if index > 0 {
                 let previousTimestamp = frameList[index - 1].frame.timestamp
@@ -1923,9 +2009,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             let hasSignificantGap = gapDuration >= Self.minimumGapThreshold
             let appChanged = frameBundleID != currentBundleID
 
-            // Start a new block if: app changed OR significant time gap
             if (appChanged || hasSignificantGap) && index > 0 {
-                // Close previous block
                 blocks.append(AppBlock(
                     bundleID: currentBundleID,
                     appName: frameList[blockStartIndex].frame.metadata.appName,
@@ -1935,14 +2019,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                     gapBeforeSeconds: gapBeforeCurrentBlock
                 ))
 
-                // Start new block
+                currentBlockIndex += 1
                 currentBundleID = frameBundleID
                 blockStartIndex = index
                 gapBeforeCurrentBlock = hasSignificantGap ? gapDuration : nil
             }
+
+            frameToBlockIndex[index] = currentBlockIndex
         }
 
-        // Add final block
         blocks.append(AppBlock(
             bundleID: currentBundleID,
             appName: frameList[blockStartIndex].frame.metadata.appName,
@@ -1952,7 +2037,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             gapBeforeSeconds: gapBeforeCurrentBlock
         ))
 
-        return blocks
+        return AppBlockSnapshot(
+            blocks: blocks,
+            frameToBlockIndex: frameToBlockIndex,
+            videoBoundaryIndices: boundaries
+        )
     }
 
     /// Load apps available for filtering
@@ -2644,17 +2733,41 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Initial Load
 
+    private func waitForInFlightMostRecentLoad() async {
+        await withCheckedContinuation { continuation in
+            initialMostRecentLoadWaiters.append(continuation)
+        }
+    }
+
+    private func completeMostRecentLoadWaiters() {
+        guard !initialMostRecentLoadWaiters.isEmpty else { return }
+        let waiters = initialMostRecentLoadWaiters
+        initialMostRecentLoadWaiters.removeAll(keepingCapacity: false)
+        waiters.forEach { $0.resume() }
+    }
+
     /// Load the most recent frame on startup
     /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
     public func loadMostRecentFrame(clickStartTime: CFAbsoluteTime? = nil) async {
-        // Guard against concurrent calls (e.g., from both TimelineWindowController.prepareWindow and SimpleTimelineView.onAppear)
-        // Use dedicated flag to avoid race conditions with @Published isLoading
-        guard !isInitialLoadInProgress && !isLoading else {
-            Log.debug("[SimpleTimelineViewModel] loadMostRecentFrame skipped - already loading", category: .ui)
+        // Coalesce concurrent startup loads (e.g., TimelineWindowController.prepareWindow + SimpleTimelineView.onAppear).
+        // Joining avoids skipping a caller and makes the load semantics deterministic.
+        if isInitialLoadInProgress {
+            Log.debug("[SimpleTimelineViewModel] loadMostRecentFrame joining in-flight initial load", category: .ui)
+            await waitForInFlightMostRecentLoad()
             return
         }
+
+        // If some other non-initial load is in progress, preserve existing behavior and skip.
+        guard !isLoading else {
+            Log.debug("[SimpleTimelineViewModel] loadMostRecentFrame skipped - another load is already in progress", category: .ui)
+            return
+        }
+
         isInitialLoadInProgress = true
-        defer { isInitialLoadInProgress = false }
+        defer {
+            isInitialLoadInProgress = false
+            completeMostRecentLoadWaiters()
+        }
         _ = clickStartTime
 
         isLoading = true
@@ -3449,6 +3562,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Task for the debounced live OCR - cancelled and re-created on each call
     private var liveOCRDebounceTask: Task<Void, Never>?
 
+    /// Wrapper for safely passing CGImage into detached tasks.
+    private struct LiveOCRCGImage: @unchecked Sendable {
+        let image: CGImage
+    }
+
     /// Trigger live OCR with a 350ms debounce
     /// Each call resets the timer - OCR only fires after 350ms of no new calls
     public func performLiveOCR() {
@@ -3491,8 +3609,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         let startTime = CFAbsoluteTimeGetCurrent()
 
         do {
-            let ocr = VisionOCR()
-            let textRegions = try await ocr.recognizeTextFromCGImage(cgImage)
+            let detachedImage = LiveOCRCGImage(image: cgImage)
+            let textRegions = try await Task.detached(priority: .userInitiated) {
+                let ocr = VisionOCR()
+                return try await ocr.recognizeTextFromCGImage(detachedImage.image)
+            }.value
 
             // Only update if still in live mode (user may have scrolled away)
             guard isInLiveMode else {
@@ -3515,6 +3636,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
             Log.info("[LiveOCR] Completed in \(String(format: "%.0f", elapsed))ms, found \(nodes.count) text regions", category: .ui)
+            Log.recordLatency(
+                "timeline.live_ocr.total_ms",
+                valueMs: elapsed,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 250,
+                criticalThresholdMs: 500
+            )
 
             setOCRNodes(nodes)
             ocrStatus = .completed
@@ -5852,57 +5981,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Group consecutive frames into blocks, splitting on app change OR time gaps ≥2 min
     private func groupFramesIntoBlocks() -> [AppBlock] {
-        guard !frames.isEmpty else { return [] }
-
-        var blocks: [AppBlock] = []
-        var currentBundleID: String? = frames[0].frame.metadata.appBundleID
-        var blockStartIndex = 0
-        var gapBeforeCurrentBlock: TimeInterval? = nil
-
-        for (index, timelineFrame) in frames.enumerated() {
-            let frameBundleID = timelineFrame.frame.metadata.appBundleID
-
-            // Check for time gap between this frame and the previous one
-            var gapDuration: TimeInterval = 0
-            if index > 0 {
-                let previousTimestamp = frames[index - 1].frame.timestamp
-                let currentTimestamp = timelineFrame.frame.timestamp
-                gapDuration = currentTimestamp.timeIntervalSince(previousTimestamp)
-            }
-
-            let hasSignificantGap = gapDuration >= Self.minimumGapThreshold
-            let appChanged = frameBundleID != currentBundleID
-
-            // Start a new block if: app changed OR significant time gap
-            if (appChanged || hasSignificantGap) && index > 0 {
-                // Close previous block
-                blocks.append(AppBlock(
-                    bundleID: currentBundleID,
-                    appName: frames[blockStartIndex].frame.metadata.appName,
-                    startIndex: blockStartIndex,
-                    endIndex: index - 1,
-                    frameCount: index - blockStartIndex,
-                    gapBeforeSeconds: gapBeforeCurrentBlock
-                ))
-
-                // Start new block
-                currentBundleID = frameBundleID
-                blockStartIndex = index
-                gapBeforeCurrentBlock = hasSignificantGap ? gapDuration : nil
-            }
-        }
-
-        // Add final block
-        blocks.append(AppBlock(
-            bundleID: currentBundleID,
-            appName: frames[blockStartIndex].frame.metadata.appName,
-            startIndex: blockStartIndex,
-            endIndex: frames.count - 1,
-            frameCount: frames.count - blockStartIndex,
-            gapBeforeSeconds: gapBeforeCurrentBlock
-        ))
-
-        return blocks
+        buildAppBlockSnapshot(from: frames).blocks
     }
 
     // MARK: - Infinite Scroll

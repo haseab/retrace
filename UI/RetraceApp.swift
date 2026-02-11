@@ -96,6 +96,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var wasRecordingBeforeSleep = false
     private var pendingDeeplinkURLs: [URL] = []
     private var isInitialized = false
+    private var isTerminationFlushInProgress = false
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -144,7 +145,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func initializeApp() async {
         // Pre-flight check: Ensure custom storage path is accessible (if set)
-        if !checkStoragePathAvailable() {
+        if !(await checkStoragePathAvailable()) {
             return // User chose to quit or we're waiting for them to reconnect
         }
 
@@ -217,12 +218,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isTerminationFlushInProgress {
+            return .terminateNow
+        }
+
+        isTerminationFlushInProgress = true
+
+        // Save timeline state (filters, search) for cross-session persistence.
+        TimelineWindowController.shared.saveStateForTermination()
+
+        // Flush active timeline metrics asynchronously with a bounded timeout.
+        // Use terminateLater to avoid blocking the main thread during shutdown.
+        Task { @MainActor [weak self] in
+            _ = await TimelineWindowController.shared.forceRecordSessionMetrics(timeoutMs: 350)
+            self?.isTerminationFlushInProgress = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+
+        return .terminateLater
+    }
+
     // MARK: - Storage Path Validation
 
     /// Pre-flight check to ensure custom storage path is accessible
     /// Returns true if app should continue, false if user chose to quit
     @MainActor
-    private func checkStoragePathAvailable() -> Bool {
+    private func checkStoragePathAvailable() async -> Bool {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
         // Only check if user has set a custom path (not new users)
@@ -278,14 +300,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         switch response {
         case .alertFirstButtonReturn:
             // Browse for folder - open at parent of the missing path
-            if let newPath = browseForDatabaseFolder(startingAt: parentDir) {
+            if let newPath = await browseForDatabaseFolder(startingAt: parentDir) {
                 defaults.set(newPath, forKey: "customRetraceDBLocation")
                 defaults.synchronize()
                 Log.info("[AppDelegate] User selected new storage location: \(newPath)", category: .app)
                 return true
             } else {
                 // User cancelled - show dialog again
-                return checkStoragePathAvailable()
+                return await checkStoragePathAvailable()
             }
 
         case .alertSecondButtonReturn:
@@ -306,7 +328,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows folder picker for selecting database location
     /// Returns the selected path if valid, nil if cancelled or invalid
     @MainActor
-    private func browseForDatabaseFolder(startingAt directory: String?) -> String? {
+    private func browseForDatabaseFolder(startingAt directory: String?) async -> String? {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -325,14 +347,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let selectedPath = url.path
-        let fm = FileManager.default
-        let dbPath = "\(selectedPath)/retrace.db"
-        let chunksPath = "\(selectedPath)/chunks"
-        let hasDatabase = fm.fileExists(atPath: dbPath)
-        let hasChunks = fm.fileExists(atPath: chunksPath)
+        let validationResult = await validateRetraceFolderSelection(at: selectedPath)
 
-        // If has database but no chunks, ask if they want to continue
-        if hasDatabase && !hasChunks {
+        switch validationResult {
+        case .valid:
+            return selectedPath
+
+        case .missingChunks:
             let alert = NSAlert()
             alert.messageText = "Missing Chunks Folder"
             alert.informativeText = "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?"
@@ -342,51 +363,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             if alert.runModal() != .alertFirstButtonReturn {
                 // User cancelled - let them pick again
-                return browseForDatabaseFolder(startingAt: directory)
+                return await browseForDatabaseFolder(startingAt: directory)
             }
+            return selectedPath
+
+        case .invalidFolder:
+            let alert = NSAlert()
+            alert.messageText = "Invalid Folder Selection"
+            alert.informativeText = "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+
+            // Let them pick again
+            return await browseForDatabaseFolder(startingAt: directory)
+
+        case .invalidDatabase(let error):
+            let alert = NSAlert()
+            alert.messageText = "Invalid Retrace Database"
+            alert.informativeText = error
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+
+            // Let them pick again
+            return await browseForDatabaseFolder(startingAt: directory)
         }
+    }
 
-        // If no database, check if directory is empty or has other files
-        if !hasDatabase {
-            let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
-            // Filter out hidden files like .DS_Store
-            let visibleContents = contents.filter { !$0.hasPrefix(".") }
+    private enum RetraceFolderValidationResult: Sendable {
+        case valid
+        case missingChunks
+        case invalidFolder
+        case invalidDatabase(error: String)
+    }
 
-            if !visibleContents.isEmpty {
-                // Folder has other files - show error dialog
-                let alert = NSAlert()
-                alert.messageText = "Invalid Folder Selection"
-                alert.informativeText = "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
-                alert.alertStyle = .critical
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+    private func validateRetraceFolderSelection(at selectedPath: String) async -> RetraceFolderValidationResult {
+        await Task.detached(priority: .userInitiated) {
+            Self.validateRetraceFolderSelectionSync(at: selectedPath)
+        }.value
+    }
 
-                // Let them pick again
-                return browseForDatabaseFolder(startingAt: directory)
-            }
-        }
+    private static func validateRetraceFolderSelectionSync(at selectedPath: String) -> RetraceFolderValidationResult {
+        let fm = FileManager.default
+        let dbPath = "\(selectedPath)/retrace.db"
+        let chunksPath = "\(selectedPath)/chunks"
+        let hasDatabase = fm.fileExists(atPath: dbPath)
+        let hasChunks = fm.fileExists(atPath: chunksPath)
 
-        // Verify it's a valid Retrace database
         if hasDatabase {
             let verification = verifyRetraceDatabase(at: dbPath)
-            if !verification.isValid {
-                let alert = NSAlert()
-                alert.messageText = "Invalid Retrace Database"
-                alert.informativeText = verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database."
-                alert.alertStyle = .critical
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-
-                // Let them pick again
-                return browseForDatabaseFolder(startingAt: directory)
+            guard verification.isValid else {
+                return .invalidDatabase(error: verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database.")
             }
+            return hasChunks ? .valid : .missingChunks
         }
 
-        return selectedPath
+        let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
+        let visibleContents = contents.filter { !$0.hasPrefix(".") }
+        return visibleContents.isEmpty ? .valid : .invalidFolder
     }
 
     /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)
-    private func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
+    private static func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
         var db: OpaquePointer?
 
         // Try to open the database
@@ -578,12 +617,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             workspaceCenter.removeObserver(observer)
         }
         sleepWakeObservers.removeAll()
-
-        // Save timeline state (filters, search) for cross-session persistence
-        TimelineWindowController.shared.saveStateForTermination()
-
-        // Force record any active timeline session before terminating
-        TimelineWindowController.shared.forceRecordSessionMetrics()
 
         Log.info("[AppDelegate] Application terminating", category: .app)
     }

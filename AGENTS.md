@@ -12,6 +12,7 @@ Retrace is a local-first screen recording and search application for macOS, insp
 
 - **Module-Specific Instructions**: Each module has its own `AGENTS.md` file in its directory
 - **Human Documentation**: [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Technical Audit Docs**: `local/docs/` (includes deep-dive implementation and performance audit notes)
 
 ---
 
@@ -383,6 +384,23 @@ Then check which path actually executes and fix the right code.
 - If you notice AGENTS.md is out of date while working, fix it immediately — don't leave it for later
 - The project structure tree, module ownership table, and shared type listings must always reflect reality
 
+### 6. Main Thread & Hang Prevention (Mandatory)
+- Treat the main thread as **UI-only**: state publication, view updates, input handling, and presentation.
+- **Never** do blocking work on main for timeline/search open paths, startup checks, or settings pickers.
+- Move heavy work off main (`Task.detached`, actors, background queues): SQLite/file validation, OCR, screenshot capture, metadata/icon lookup, image decode, and large layout calculations.
+- **Do not use blocking primitives on UI paths**: `DispatchSemaphore.wait()`, `DispatchQueue.sync`, `Thread.sleep`, or equivalent blocking waits.
+- For duplicate triggers (`onAppear` + controller calls), **coalesce** with an in-flight task/join pattern; do not silently skip important loads.
+- In SwiftUI render paths (`body`, cell builders), avoid synchronous system/file APIs (`NSWorkspace`, `FileManager`, SQLite, image decoding). Use async caches/view models.
+- Keep list/grid identity stable (`result.id`, model IDs). Avoid index-based IDs and avoid forcing full subtree recreation via generation `.id(...)` on large containers.
+- Guard geometry/preference-driven state writes with an epsilon to prevent layout/preference feedback loops.
+- Cache expensive derived layout data (timeline/treemap block geometry) with explicit invalidation keys (snapshot revision, frame count, zoom, etc.).
+- Prefer natural `@Published` updates; avoid manual broad invalidation (`objectWillChange.send()`) unless there is a documented, minimal-scope reason.
+- Instrument critical UX paths with `Log.recordLatency` and watch p50/p95 (timeline open, search open, live screenshot/OCR, picker validation). Regressions should block merge.
+- Required smoke checks before merge for UI/perf-sensitive changes:
+  - Timeline close → reopen (prerendered path): no stale tape, no hitching.
+  - Search overlay open and navigate: no full-grid teardown thrash.
+  - Settings/storage picker validation: no UI freeze while verifying paths.
+
 ---
 
 ## Additional Resources
@@ -393,4 +411,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-01-28*
+*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-02-11*

@@ -150,7 +150,9 @@ public struct SearchFilterBar: View {
                     width: 300,
                     enableKeyboardNavigation: true,
                     onMoveToNextFilter: {
-                        viewModel.openFilterSignal = (3, UUID())
+                        // Tab order: Relevance -> Apps -> Date -> Tags -> Visibility -> Advanced.
+                        // Enter from Date input should advance to Tags, matching Tab behavior.
+                        viewModel.openFilterSignal = (4, UUID())
                     },
                     onCalendarEditingChange: { isEditing in
                         viewModel.isDatePopoverHandlingKeys = isEditing
@@ -546,6 +548,7 @@ private struct AppsFilterChip: View {
     let isOpen: Bool
     let action: () -> Void
 
+    @StateObject private var appMetadata = AppMetadataCache.shared
     @State private var isHovered = false
 
     private let maxVisibleIcons = 5
@@ -642,28 +645,24 @@ private struct AppsFilterChip: View {
                 isHovered = hovering
             }
         }
+        .onAppear {
+            appMetadata.prefetch(bundleIDs: sortedApps)
+        }
+        .onChange(of: sortedApps) { bundleIDs in
+            appMetadata.prefetch(bundleIDs: bundleIDs)
+        }
     }
 
-    @ViewBuilder
     private func appIcon(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-        } else {
-            Image(systemName: "app.fill")
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .foregroundColor(.white.opacity(0.6))
-        }
+        AppIconView(bundleID: bundleID, size: iconSize)
     }
 
     private func appName(for bundleID: String) -> String {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: appURL.path)
-        }
-        // Fallback: extract last component of bundle ID
-        return bundleID.components(separatedBy: ".").last ?? bundleID
+        appMetadata.name(for: bundleID) ?? fallbackName(for: bundleID)
+    }
+
+    private func fallbackName(for bundleID: String) -> String {
+        bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 

@@ -16,8 +16,16 @@ public class SearchViewModel: ObservableObject {
 
     // MARK: - Published State
 
-    @Published public var searchQuery: String = ""
-    @Published public var results: SearchResults?
+    @Published public var searchQuery: String = "" {
+        didSet {
+            updateVisibleResults()
+        }
+    }
+    @Published public var results: SearchResults? {
+        didSet {
+            updateVisibleResults()
+        }
+    }
     @Published public var isSearching = false
     @Published public var isLoadingMore = false
     @Published public var error: String?
@@ -68,7 +76,15 @@ public class SearchViewModel: ObservableObject {
 
     // The committed search query (set when user presses Enter)
     // Used for thumbnail cache keys so thumbnails don't reload while typing
-    @Published public var committedSearchQuery: String = ""
+    @Published public var committedSearchQuery: String = "" {
+        didSet {
+            updateVisibleResults()
+        }
+    }
+
+    /// Search results shown by the overlay.
+    /// Kept as a derived cache so SwiftUI reads a stable array.
+    @Published public private(set) var visibleResults: [SearchResult] = []
 
     // Dropdown state - tracks whether any filter dropdown is open
     // Used by parent views to handle Escape key properly (dismiss dropdown first, then overlay)
@@ -84,6 +100,10 @@ public class SearchViewModel: ObservableObject {
     // Signal to open a specific filter dropdown via Tab key navigation
     // Values: 0 = search field, 1 = apps, 2 = date, 3 = tags, 4 = visibility, 5 = advanced
     @Published public var openFilterSignal: (index: Int, id: UUID) = (0, UUID())
+
+    // Signal to dismiss the search overlay from parent-level handlers (e.g. global Escape).
+    // clearSearchState=true clears query/results/filters after the overlay fade-out completes.
+    @Published public var dismissOverlaySignal: (clearSearchState: Bool, id: UUID) = (false, UUID())
 
     // Flag to prevent re-search during cache restore
     private var isRestoringFromCache = false
@@ -227,6 +247,24 @@ public class SearchViewModel: ObservableObject {
             }
         }
         .store(in: &cancellables)
+    }
+
+    private func updateVisibleResults() {
+        guard let allResults = results?.results, !allResults.isEmpty else {
+            visibleResults = []
+            return
+        }
+
+        // URL-only filtering was removed from the client path.
+        // Search now scopes MATCH to FTS column `text`, so metadata-only hits
+        // (window title / URL columns) are excluded by the query itself.
+        visibleResults = allResults
+    }
+
+    /// Ask the overlay view to run its own dismiss animation.
+    /// - Parameter clearSearchState: Whether to clear query/results/filters after fade-out.
+    public func requestOverlayDismiss(clearSearchState: Bool = true) {
+        dismissOverlaySignal = (clearSearchState, UUID())
     }
 
     // MARK: - Search

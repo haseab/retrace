@@ -331,6 +331,98 @@ public class AppIconProvider {
     }
 }
 
+// MARK: - App Metadata Cache (UI-friendly async access)
+
+private struct NSImageBox: @unchecked Sendable {
+    let image: NSImage?
+}
+
+/// Main-actor cache for app names/icons used by SwiftUI render paths.
+/// Views read cached values synchronously and trigger async resolution on demand.
+@MainActor
+public final class AppMetadataCache: ObservableObject {
+    public static let shared = AppMetadataCache()
+
+    @Published private var appIcons: [String: NSImage] = [:]
+    @Published private var appNames: [String: String] = [:]
+    @Published private var fileIcons: [String: NSImage] = [:]
+
+    private var pendingBundleIDs: Set<String> = []
+    private var pendingAppPaths: Set<String> = []
+    private var resolvedBundleIDs: Set<String> = []
+    private var resolvedAppPaths: Set<String> = []
+
+    private init() {}
+
+    public func icon(for bundleID: String) -> NSImage? {
+        appIcons[bundleID]
+    }
+
+    public func name(for bundleID: String) -> String? {
+        appNames[bundleID]
+    }
+
+    public func icon(forAppPath appPath: String) -> NSImage? {
+        fileIcons[appPath]
+    }
+
+    public func prefetch(bundleIDs: [String]) {
+        for bundleID in Set(bundleIDs) where !bundleID.isEmpty {
+            requestMetadata(for: bundleID)
+        }
+    }
+
+    public func requestMetadata(for bundleID: String) {
+        guard !bundleID.isEmpty else { return }
+        if resolvedBundleIDs.contains(bundleID) || pendingBundleIDs.contains(bundleID) {
+            return
+        }
+
+        pendingBundleIDs.insert(bundleID)
+
+        Task.detached(priority: .utility) {
+            let resolvedName = AppNameResolver.shared.displayName(for: bundleID)
+            let resolvedIcon = NSImageBox(image: AppIconProvider.shared.icon(for: bundleID))
+
+            await MainActor.run {
+                self.appNames[bundleID] = resolvedName
+                if let icon = resolvedIcon.image {
+                    self.appIcons[bundleID] = icon
+                }
+                self.pendingBundleIDs.remove(bundleID)
+                self.resolvedBundleIDs.insert(bundleID)
+            }
+        }
+    }
+
+    public func requestIcon(forAppPath appPath: String) {
+        guard !appPath.isEmpty else { return }
+        if resolvedAppPaths.contains(appPath) || pendingAppPaths.contains(appPath) {
+            return
+        }
+
+        pendingAppPaths.insert(appPath)
+
+        Task.detached(priority: .utility) {
+            let icon: NSImage?
+            if FileManager.default.fileExists(atPath: appPath) {
+                icon = NSWorkspace.shared.icon(forFile: appPath)
+            } else {
+                icon = nil
+            }
+            let boxedIcon = NSImageBox(image: icon)
+
+            await MainActor.run {
+                if let icon = boxedIcon.image {
+                    self.fileIcons[appPath] = icon
+                }
+                self.pendingAppPaths.remove(appPath)
+                self.resolvedAppPaths.insert(appPath)
+            }
+        }
+    }
+}
+
 // MARK: - Favicon Provider
 
 /// Provides website favicons by fetching directly from the website itself (no third-party APIs).
@@ -718,6 +810,7 @@ public struct FaviconView: View {
 public struct AppIconView: View {
     let bundleID: String
     let size: CGFloat
+    @StateObject private var metadata = AppMetadataCache.shared
 
     public init(bundleID: String, size: CGFloat = 32) {
         self.bundleID = bundleID
@@ -726,7 +819,7 @@ public struct AppIconView: View {
 
     public var body: some View {
         Group {
-            if let nsImage = AppIconProvider.shared.icon(for: bundleID) {
+            if let nsImage = metadata.icon(for: bundleID) {
                 Image(nsImage: nsImage)
                     .resizable()
                     .interpolation(.high)
@@ -737,10 +830,13 @@ public struct AppIconView: View {
             }
         }
         .frame(width: size, height: size)
+        .task(id: bundleID) {
+            metadata.requestMetadata(for: bundleID)
+        }
     }
 
     private var fallbackIcon: some View {
-        let appName = AppNameResolver.shared.displayName(for: bundleID)
+        let appName = metadata.name(for: bundleID) ?? fallbackName(for: bundleID)
         let firstLetter = appName.first.map { String($0).uppercased() } ?? "?"
         let color = Color.segmentColor(for: bundleID)
 
@@ -755,6 +851,10 @@ public struct AppIconView: View {
                 .font(RetraceFont.font(size: size * 0.45, weight: .semibold))
                 .foregroundColor(color)
         }
+    }
+
+    private func fallbackName(for bundleID: String) -> String {
+        bundleID.components(separatedBy: ".").last ?? bundleID
     }
 }
 
@@ -786,6 +886,7 @@ public class AppIconColorCache {
     private let cacheFileURL: URL
     private var diskCache: [String: StoredColor] = [:]
     private var isDirty = false
+    private var pendingExtractions: Set<String> = []
 
     private init() {
         // Store in AppPaths.storageRoot (respects custom location)
@@ -803,10 +904,8 @@ public class AppIconColorCache {
     /// Get the dominant color for an app's icon, with caching
     public func color(for bundleID: String) -> Color {
         lock.lock()
-        defer { lock.unlock() }
-
-        // Return from memory cache if available
         if let cached = cache[bundleID] {
+            lock.unlock()
             return cached
         }
 
@@ -814,17 +913,31 @@ public class AppIconColorCache {
         if let stored = diskCache[bundleID] {
             let color = stored.color
             cache[bundleID] = color
+            lock.unlock()
             return color
         }
 
-        // Extract color from icon
+        // Cache miss: return deterministic fallback immediately and extract asynchronously.
+        if !pendingExtractions.contains(bundleID) {
+            pendingExtractions.insert(bundleID)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                self?.extractAndCacheColor(for: bundleID)
+            }
+        }
+        lock.unlock()
+        return fallbackColor(for: bundleID)
+    }
+
+    private func extractAndCacheColor(for bundleID: String) {
         let color = extractDominantColor(for: bundleID)
+
+        lock.lock()
         cache[bundleID] = color
+        pendingExtractions.remove(bundleID)
+        lock.unlock()
 
-        // Save to disk cache (async to avoid blocking)
+        // Persist asynchronously to keep extraction path non-blocking.
         saveToDiskAsync(bundleID: bundleID, color: color)
-
-        return color
     }
 
     /// Extract the dominant color from an app's icon
@@ -1453,7 +1566,7 @@ public struct TimelineScaleFactor {
     private static let minScale: CGFloat = 0.85
 
     /// Maximum scale factor to prevent UI from becoming too large
-    private static let maxScale: CGFloat = 1.6
+    private static let maxScale: CGFloat = 1.35
 
     /// Thread-safe cached scale factor to prevent size changes during window lifecycle
     private static var _cachedScaleFactor: CGFloat?
@@ -1515,8 +1628,9 @@ public struct TimelineScaleFactor {
 
     // MARK: - Control Positioning (scaled)
 
-    /// Y offset for control buttons above tape
-    public static var controlsYOffset: CGFloat { -55 * current }
+    /// Y offset for control buttons above tape.
+    /// Raised by 10pt from baseline.
+    public static var controlsYOffset: CGFloat { -65 * current }
 
     /// Y offset for floating search panel
     public static var searchPanelYOffset: CGFloat { -195 * current }

@@ -66,7 +66,8 @@ public actor SearchManager: SearchProtocol {
 
         // Build FTS query
         let ftsQuery = parsed.toFTSQuery()
-        Log.debug("[SearchManager] Raw query: '\(query.text)' → FTS query: '\(ftsQuery)' | terms: \(parsed.searchTerms) | phrases: \(parsed.phrases)", category: .search)
+        let textOnlyFTSQuery = scopeToTextColumn(ftsQuery)
+        Log.debug("[SearchManager] Raw query: '\(query.text)' → FTS query: '\(textOnlyFTSQuery)' | terms: \(parsed.searchTerms) | phrases: \(parsed.phrases)", category: .search)
 
         // Build filters
         var filters = query.filters
@@ -98,14 +99,14 @@ public actor SearchManager: SearchProtocol {
 
         // Execute FTS search
         let ftsMatches = try await ftsEngine.search(
-            query: ftsQuery,
+            query: textOnlyFTSQuery,
             filters: filters,
             limit: query.limit,
             offset: query.offset
         )
 
         // Get total count for pagination
-        let totalCount = try await ftsEngine.getMatchCount(query: ftsQuery, filters: filters)
+        let totalCount = try await ftsEngine.getMatchCount(query: textOnlyFTSQuery, filters: filters)
 
         // Convert FTS matches to SearchResults
         var results: [SearchResult] = []
@@ -170,7 +171,7 @@ public actor SearchManager: SearchProtocol {
 
         // Use prefix search to find matching terms
         // Search for "prefix*" to get documents containing words starting with prefix
-        let prefixQuery = "\(prefix)*"
+        let prefixQuery = scopeToTextColumn("\(prefix)*")
 
         do {
             let results = try await ftsEngine.search(
@@ -288,5 +289,11 @@ public actor SearchManager: SearchProtocol {
         // BM25 returns negative values (more negative = better match)
         // Normalize to 0-1 range: higher score for more negative BM25
         return -bm25Rank / (1.0 + abs(bm25Rank))
+    }
+
+    /// Scope FTS query to the OCR text column only.
+    /// This prevents matches from window title/browser URL columns.
+    private func scopeToTextColumn(_ query: String) -> String {
+        "text:(\(query))"
     }
 }

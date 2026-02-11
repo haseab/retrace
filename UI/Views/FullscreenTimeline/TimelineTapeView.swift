@@ -33,6 +33,7 @@ public struct TimelineTapeView: View {
     /// Using @AppStorage so the view automatically updates when the setting changes
     @AppStorage("scrubbingAnimationDuration", store: UserDefaults(suiteName: "io.retrace.app"))
     private var scrubbingAnimationDuration: Double = 0.10
+    @StateObject private var tapeLayoutCache = TapeLayoutCache()
 
     // MARK: - Body
 
@@ -65,13 +66,22 @@ public struct TimelineTapeView: View {
         GeometryReader { geometry in
             let centerX = geometry.size.width / 2
             let blocks = viewModel.appBlocks
+            let layout = tapeLayoutCache.layout(
+                snapshotRevision: viewModel.appBlockSnapshotRevision,
+                blocks: blocks,
+                frameCount: viewModel.frames.count,
+                pixelsPerFrame: pixelsPerFrame,
+                blockSpacing: blockSpacing,
+                gapIndicatorWidth: gapIndicatorWidth,
+                hidingRange: viewModel.hidingSegmentBlockRange
+            )
 
             // Calculate offset to center current frame
-            let currentFrameOffset = offsetForFrame(viewModel.currentIndex, in: blocks)
+            let currentFrameOffset = layout.offsetForFrame(viewModel.currentIndex)
             let unclampedTapeOffset = centerX - currentFrameOffset - viewModel.subFrameOffset
 
             // Calculate total tape width
-            let totalTapeWidth = calculateTotalTapeWidth(blocks: blocks)
+            let totalTapeWidth = layout.totalTapeWidth
 
             // Clamp tape offset to prevent scrolling past content
             // - At the start: tape's left edge shouldn't go past centerX
@@ -92,26 +102,25 @@ public struct TimelineTapeView: View {
             ZStack(alignment: .leading) {
                 // Main tape blocks with gap indicators
                 // Precompute all block positions in O(n), then filter to visible
-                let blockPositions = computeBlockPositions(blocks: blocks)
-                let visibleBlocks = blockPositions.filter { item in
+                let visibleBlocks = layout.blocks.filter { item in
                     item.rightX >= cullingLeftX && item.leftX <= cullingRightX
                 }
 
                 ForEach(visibleBlocks, id: \.block.id) { item in
                     // Gap indicator before block
-                    if item.block.formattedGapBefore != nil {
+                    if item.hasGap, let gapX = item.gapX {
                         gapIndicatorView(block: item.block)
-                            .offset(x: item.gapX)
+                            .offset(x: gapX)
                     }
                     // The block itself
-                    appBlockView(block: item.block, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX, blocks: blocks)
+                    appBlockView(item: item, cullingLeftX: cullingLeftX, cullingRightX: cullingRightX)
                         .offset(x: item.leftX)
                 }
                 .frame(width: totalTapeWidth, alignment: .leading)
 
                 // Video boundary markers overlay (only when enabled)
                 if viewModel.showVideoBoundaries {
-                    videoBoundaryMarkers(blocks: blocks)
+                    videoBoundaryMarkers(layout: layout)
                 }
             }
             .offset(x: tapeOffset)
@@ -124,11 +133,11 @@ public struct TimelineTapeView: View {
 
     /// Red tick marks showing where video segment boundaries are on the timeline
     @ViewBuilder
-    private func videoBoundaryMarkers(blocks: [AppBlock]) -> some View {
-        let boundaries = viewModel.videoBoundaryIndices
+    private func videoBoundaryMarkers(layout: TapeLayoutSnapshot) -> some View {
+        let boundaries = viewModel.orderedVideoBoundaryIndices
 
-        ForEach(Array(boundaries), id: \.self) { frameIndex in
-            let xOffset = offsetForFrame(frameIndex, in: blocks) - pixelsPerFrame / 2
+        ForEach(boundaries, id: \.self) { frameIndex in
+            let xOffset = layout.offsetForFrame(frameIndex) - pixelsPerFrame / 2
 
             // Thick red line that protrudes above and below the tape
             Rectangle()
@@ -177,25 +186,26 @@ public struct TimelineTapeView: View {
 
     // MARK: - App Block View
 
-    private func appBlockView(block: AppBlock, cullingLeftX: CGFloat, cullingRightX: CGFloat, blocks: [AppBlock]) -> some View {
+    private func appBlockView(item: TapeBlockLayout, cullingLeftX: CGFloat, cullingRightX: CGFloat) -> some View {
+        let block = item.block
         let isCurrentBlock = viewModel.currentIndex >= block.startIndex && viewModel.currentIndex <= block.endIndex
         let isSelectedBlock = viewModel.selectedFrameIndex.map { $0 >= block.startIndex && $0 <= block.endIndex } ?? false
         let color = blockColor(for: block)
-        let collapseFactor = collapseFactor(for: block)
+        let collapseFactor = item.collapseFactor
         let isHidingBlock = collapseFactor < 0.999
-        let effectivePixelsPerFrame = pixelsPerFrame * collapseFactor
-        let blockWidth = displayedWidth(for: block)
+        let framePixelWidth = max(item.effectivePixelsPerFrame, 0.001)
+        let blockWidth = item.width
 
         // Calculate this block's position in tape-space for frame culling
-        let blockLeftX = offsetForFrame(block.startIndex, in: blocks) - effectivePixelsPerFrame / 2
-        let blockRightX = blockLeftX + blockWidth
+        let blockLeftX = item.leftX
+        let blockRightX = item.rightX
 
         // Calculate visible frame range within this block
         let relativeLeft = max(0, cullingLeftX - blockLeftX)
         let relativeRight = cullingRightX - blockLeftX
 
-        let firstVisibleFrame = block.startIndex + max(0, Int(floor(relativeLeft / pixelsPerFrame)))
-        let lastVisibleFrame = block.startIndex + min(block.frameCount - 1, Int(ceil(relativeRight / pixelsPerFrame)))
+        let firstVisibleFrame = block.startIndex + max(0, Int(floor(relativeLeft / framePixelWidth)))
+        let lastVisibleFrame = block.startIndex + min(block.frameCount - 1, Int(ceil(relativeRight / framePixelWidth)))
 
         // Clamp to block bounds
         let renderStart = max(block.startIndex, firstVisibleFrame)
@@ -217,7 +227,7 @@ public struct TimelineTapeView: View {
                     // Spacer for frames before visible range
                     if renderStart > block.startIndex {
                         Spacer()
-                            .frame(width: CGFloat(renderStart - block.startIndex) * pixelsPerFrame)
+                            .frame(width: CGFloat(renderStart - block.startIndex) * framePixelWidth)
                     }
 
                     // Only render visible frames
@@ -228,7 +238,7 @@ public struct TimelineTapeView: View {
                     // Spacer for frames after visible range
                     if renderEnd < block.endIndex {
                         Spacer()
-                            .frame(width: CGFloat(block.endIndex - renderEnd) * pixelsPerFrame)
+                            .frame(width: CGFloat(block.endIndex - renderEnd) * framePixelWidth)
                     }
                 }
                 .frame(width: blockWidth, height: tapeHeight)
@@ -272,112 +282,161 @@ public struct TimelineTapeView: View {
     /// Fixed width of gap indicators (doubled from original)
     private var gapIndicatorWidth: CGFloat { 100 * TimelineScaleFactor.current }
 
-    /// Block position info for absolute positioning
-    private struct BlockPosition {
+    /// Cached block geometry for tape rendering.
+    private struct TapeBlockLayout {
         let block: AppBlock
-        let leftX: CGFloat   // Block's left edge
-        let rightX: CGFloat  // Block's right edge
-        let gapX: CGFloat    // Gap indicator's left edge (if present)
+        let leftX: CGFloat
+        let rightX: CGFloat
+        let width: CGFloat
+        let gapX: CGFloat?
+        let hasGap: Bool
+        let collapseFactor: CGFloat
+        let effectivePixelsPerFrame: CGFloat
     }
 
-    /// Compute all block positions in a single O(n) pass
-    private func computeBlockPositions(blocks: [AppBlock]) -> [BlockPosition] {
-        var positions: [BlockPosition] = []
-        positions.reserveCapacity(blocks.count)
-        var x: CGFloat = 0
+    private struct TapeLayoutSnapshot {
+        let blocks: [TapeBlockLayout]
+        let totalTapeWidth: CGFloat
+        let frameCenterOffsets: [CGFloat]
 
-        for block in blocks {
-            var gapX: CGFloat = 0
+        static let empty = TapeLayoutSnapshot(blocks: [], totalTapeWidth: 0, frameCenterOffsets: [])
 
-            // Gap indicator before this block
-            if block.formattedGapBefore != nil {
-                gapX = x
-                x += gapIndicatorWidth + blockSpacing
+        func offsetForFrame(_ frameIndex: Int) -> CGFloat {
+            guard frameIndex >= 0 && frameIndex < frameCenterOffsets.count else { return 0 }
+            return frameCenterOffsets[frameIndex]
+        }
+    }
+
+    private final class TapeLayoutCache: ObservableObject {
+        private struct CacheKey: Equatable {
+            let snapshotRevision: Int
+            let frameCount: Int
+            let pixelsPerFrameMilli: Int
+            let blockSpacingMilli: Int
+            let gapWidthMilli: Int
+            let hidingLower: Int?
+            let hidingUpper: Int?
+        }
+
+        private var key: CacheKey?
+        private var cached: TapeLayoutSnapshot = .empty
+
+        func layout(
+            snapshotRevision: Int,
+            blocks: [AppBlock],
+            frameCount: Int,
+            pixelsPerFrame: CGFloat,
+            blockSpacing: CGFloat,
+            gapIndicatorWidth: CGFloat,
+            hidingRange: ClosedRange<Int>?
+        ) -> TapeLayoutSnapshot {
+            let key = CacheKey(
+                snapshotRevision: snapshotRevision,
+                frameCount: frameCount,
+                pixelsPerFrameMilli: quantized(pixelsPerFrame),
+                blockSpacingMilli: quantized(blockSpacing),
+                gapWidthMilli: quantized(gapIndicatorWidth),
+                hidingLower: hidingRange?.lowerBound,
+                hidingUpper: hidingRange?.upperBound
+            )
+            if self.key == key {
+                return cached
             }
 
-            let blockLeftX = x
-            let blockWidth = displayedWidth(for: block)
-            let blockRightX = x + blockWidth
-
-            positions.append(BlockPosition(
-                block: block,
-                leftX: blockLeftX,
-                rightX: blockRightX,
-                gapX: gapX
-            ))
-
-            x = blockRightX + blockSpacing
+            let layout = Self.buildLayout(
+                blocks: blocks,
+                frameCount: frameCount,
+                pixelsPerFrame: pixelsPerFrame,
+                blockSpacing: blockSpacing,
+                gapIndicatorWidth: gapIndicatorWidth,
+                hidingRange: hidingRange
+            )
+            self.key = key
+            self.cached = layout
+            return layout
         }
 
-        return positions
-    }
-
-    /// Calculate the total width of the timeline tape
-    private func calculateTotalTapeWidth(blocks: [AppBlock]) -> CGFloat {
-        guard !blocks.isEmpty else { return 0 }
-
-        // Sum all block widths plus spacing between blocks
-        let blocksWidth = blocks.reduce(0) { $0 + displayedWidth(for: $1) }
-
-        // Count gap indicators (blocks with formattedGapBefore)
-        let gapCount = blocks.filter { $0.formattedGapBefore != nil }.count
-        let totalGapWidth = CGFloat(gapCount) * (gapIndicatorWidth + blockSpacing)
-
-        // Total spacing: between each item (blocks + gaps)
-        let totalItems = blocks.count + gapCount
-        let totalSpacing = CGFloat(totalItems - 1) * blockSpacing
-
-        return blocksWidth + totalGapWidth + totalSpacing - CGFloat(gapCount) * blockSpacing // Adjust for double-counted spacing
-    }
-
-    /// Calculate the horizontal offset for a given frame index
-    private func offsetForFrame(_ frameIndex: Int, in blocks: [AppBlock]) -> CGFloat {
-        var offset: CGFloat = 0
-        var spacingCount = 0
-
-        for block in blocks {
-            let collapse = collapseFactor(for: block)
-            let effectivePixelsPerFrame = pixelsPerFrame * collapse
-            let effectiveBlockWidth = displayedWidth(for: block)
-
-            // Add gap indicator width if this block has one
-            // Note: Don't add blockSpacing here - spacingBeforeBlock handles all spacing
-            // The HStack applies blockSpacing between [previousBlock, gapIndicator, currentBlock]
-            if block.formattedGapBefore != nil {
-                offset += gapIndicatorWidth
-                spacingCount += 1
+        private static func buildLayout(
+            blocks: [AppBlock],
+            frameCount: Int,
+            pixelsPerFrame: CGFloat,
+            blockSpacing: CGFloat,
+            gapIndicatorWidth: CGFloat,
+            hidingRange: ClosedRange<Int>?
+        ) -> TapeLayoutSnapshot {
+            guard !blocks.isEmpty else {
+                return TapeLayoutSnapshot(
+                    blocks: [],
+                    totalTapeWidth: 0,
+                    frameCenterOffsets: Array(repeating: 0, count: max(0, frameCount))
+                )
             }
 
-            if frameIndex >= block.startIndex && frameIndex <= block.endIndex {
-                // Frame is in this block - calculate exact pixel position within block
-                let framePositionInBlock = frameIndex - block.startIndex
-                // Add spacing for all blocks/gaps before this one
-                let spacingBeforeBlock = CGFloat(spacingCount) * blockSpacing
-                // Add exact pixel position within this block (centered on the frame's pixel)
-                offset += CGFloat(framePositionInBlock) * effectivePixelsPerFrame + effectivePixelsPerFrame / 2 + spacingBeforeBlock
-                break
-            } else {
-                // Add full block width (spacing handled separately)
-                offset += effectiveBlockWidth
-                spacingCount += 1
+            var layoutBlocks: [TapeBlockLayout] = []
+            layoutBlocks.reserveCapacity(blocks.count)
+            var frameCenterOffsets = Array(repeating: CGFloat.zero, count: max(0, frameCount))
+            var x: CGFloat = 0
+
+            for block in blocks {
+                let hasGap = block.gapBeforeSeconds != nil
+                var gapX: CGFloat? = nil
+                if hasGap {
+                    gapX = x
+                    x += gapIndicatorWidth + blockSpacing
+                }
+
+                let collapseFactor: CGFloat
+                if let hidingRange,
+                   hidingRange.lowerBound == block.startIndex,
+                   hidingRange.upperBound == block.endIndex {
+                    collapseFactor = 0.05
+                } else {
+                    collapseFactor = 1.0
+                }
+
+                let effectivePixelsPerFrame = pixelsPerFrame * collapseFactor
+                let blockWidth = max(2, CGFloat(block.frameCount) * effectivePixelsPerFrame)
+                let leftX = x
+                let rightX = leftX + blockWidth
+
+                layoutBlocks.append(TapeBlockLayout(
+                    block: block,
+                    leftX: leftX,
+                    rightX: rightX,
+                    width: blockWidth,
+                    gapX: gapX,
+                    hasGap: hasGap,
+                    collapseFactor: collapseFactor,
+                    effectivePixelsPerFrame: effectivePixelsPerFrame
+                ))
+
+                if !frameCenterOffsets.isEmpty {
+                    let start = max(0, block.startIndex)
+                    let end = min(block.endIndex, frameCenterOffsets.count - 1)
+                    if start <= end {
+                        for frameIndex in start...end {
+                            let framePositionInBlock = frameIndex - block.startIndex
+                            frameCenterOffsets[frameIndex] = leftX
+                                + (CGFloat(framePositionInBlock) * effectivePixelsPerFrame)
+                                + (effectivePixelsPerFrame / 2)
+                        }
+                    }
+                }
+
+                x = rightX + blockSpacing
             }
+
+            let totalTapeWidth = max(0, x - blockSpacing)
+            return TapeLayoutSnapshot(
+                blocks: layoutBlocks,
+                totalTapeWidth: totalTapeWidth,
+                frameCenterOffsets: frameCenterOffsets
+            )
         }
 
-        return offset
-    }
-
-    private func collapseFactor(for block: AppBlock) -> CGFloat {
-        guard let hidingRange = viewModel.hidingSegmentBlockRange else {
-            return 1.0
+        private func quantized(_ value: CGFloat) -> Int {
+            Int((value * 1_000).rounded())
         }
-        if hidingRange.lowerBound == block.startIndex && hidingRange.upperBound == block.endIndex {
-            return 0.05
-        }
-        return 1.0
-    }
-
-    private func displayedWidth(for block: AppBlock) -> CGFloat {
-        max(2, block.width(pixelsPerFrame: pixelsPerFrame) * collapseFactor(for: block))
     }
 
     private func blockColor(for block: AppBlock) -> Color {
@@ -388,19 +447,7 @@ public struct TimelineTapeView: View {
     }
 
     private func appIcon(for bundleID: String) -> some View {
-        Group {
-            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                let appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
-                Image(nsImage: appIcon)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                // Fallback icon
-                Image(systemName: "app.fill")
-                    .resizable()
-                    .foregroundColor(.white.opacity(0.6))
-            }
-        }
+        AppIconView(bundleID: bundleID, size: appIconSize)
     }
 
     // MARK: - Fixed Playhead
@@ -408,6 +455,8 @@ public struct TimelineTapeView: View {
     private var playhead: some View {
         GeometryReader { geometry in
             let centerX = geometry.size.width / 2
+            let middleSideControlsWidth = TimelineScaleFactor.controlButtonSize * 2 + 6 + 8 +
+                (viewModel.showVideoControls ? TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing : 0)
 
             ZStack {
                 // Center controls: Filter + Datetime + GoToNow/Refresh
@@ -415,6 +464,7 @@ public struct TimelineTapeView: View {
                 HStack(spacing: TimelineScaleFactor.controlSpacing) {
                     // Filter button (left of datetime)
                     FilterAndPeekGroup(viewModel: viewModel)
+                        .frame(width: middleSideControlsWidth, alignment: .trailing)
 
                     // Datetime button (center)
                     DatetimeButton(viewModel: viewModel)
@@ -437,7 +487,7 @@ public struct TimelineTapeView: View {
                                 .transition(.opacity.combined(with: .scale(scale: 0.8)))
                         }
                     }
-                    .frame(width: TimelineScaleFactor.controlButtonSize * 2 + 6 + 8 + (viewModel.showVideoControls ? TimelineScaleFactor.controlButtonSize + TimelineScaleFactor.controlSpacing : 0), alignment: .leading)
+                    .frame(width: middleSideControlsWidth, alignment: .leading)
                 }
                 .position(x: centerX, y: TimelineScaleFactor.controlsYOffset)
 
@@ -702,8 +752,8 @@ struct VideoControlsButton: View {
             viewModel.isPlaying ? "Pause" : "Play (\(formattedSpeed(viewModel.playbackSpeed)))",
             isVisible: .constant(isButtonHovering && !showSpeedPicker)
         )
-        // Speed picker floats above via overlay — completely outside the layout flow
-        .overlay(alignment: .top) {
+        // Speed picker floats above the play button.
+        .overlay(alignment: .bottom) {
             if showSpeedPicker {
                 VStack(spacing: 2) {
                     ForEach(availableSpeeds.reversed(), id: \.self) { speed in
@@ -728,10 +778,8 @@ struct VideoControlsButton: View {
                                 .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                         )
                 )
-                // Use layout alignment instead of offset so hit-testing matches the visible menu position.
-                .alignmentGuide(.top) { dimensions in
-                    dimensions[.bottom] + 6
-                }
+                // Position picker so its bottom sits above the button top with a fixed gap.
+                .offset(y: -(TimelineScaleFactor.controlButtonSize + 6))
                 .transition(.opacity.combined(with: .scale(scale: 0.85, anchor: .bottom)).combined(with: .offset(y: 4)))
                 .onHover { hovering in
                     if hovering {
@@ -961,16 +1009,7 @@ struct CurrentAppBadge: View {
 
     @ViewBuilder
     private func appIconView(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            let appIcon = NSWorkspace.shared.icon(forFile: appURL.path)
-            Image(nsImage: appIcon)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-        } else {
-            Image(systemName: "app.fill")
-                .font(.system(size: TimelineScaleFactor.fontCallout, weight: .medium))
-                .foregroundColor(.white.opacity(0.7))
-        }
+        AppIconView(bundleID: bundleID, size: iconSize)
     }
 }
 

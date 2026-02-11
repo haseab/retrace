@@ -4743,64 +4743,40 @@ extension SettingsView {
             panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot)
         }
 
-        if panel.runModal() == .OK, let url = panel.url {
-            let selectedPath = url.path
-            let defaultPath = NSString(string: AppPaths.defaultStorageRoot).expandingTildeInPath
-            let currentPath = customRetraceDBLocation ?? defaultPath
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
 
-            // Check if selecting the same location that's currently active
-            if selectedPath == currentPath {
-                Log.info("Retrace database location unchanged (same as current): \(selectedPath)", category: .ui)
+        let selectedPath = url.path
+        let defaultPath = NSString(string: AppPaths.defaultStorageRoot).expandingTildeInPath
+        let currentPath = customRetraceDBLocation ?? defaultPath
+
+        // Check if selecting the same location that's currently active
+        if selectedPath == currentPath {
+            Log.info("Retrace database location unchanged (same as current): \(selectedPath)", category: .ui)
+            return
+        }
+
+        Task { @MainActor in
+            let validation = await validateRetraceFolderSelection(at: selectedPath)
+
+            switch validation {
+            case .invalid(let title, let message):
+                showDatabaseAlert(type: .error, title: title, message: message)
                 return
-            }
 
-            // Validate the selected folder
-            let fm = FileManager.default
-            let dbPath = "\(selectedPath)/retrace.db"
-            let chunksPath = "\(selectedPath)/chunks"
-            let hasDatabase = fm.fileExists(atPath: dbPath)
-            let hasChunks = fm.fileExists(atPath: chunksPath)
-
-            // If has database, verify it's a valid Retrace database
-            if hasDatabase {
-                let verification = verifyRetraceDatabase(at: dbPath)
-                if !verification.isValid {
-                    showDatabaseAlert(
-                        type: .error,
-                        title: "Invalid Retrace Database",
-                        message: verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database."
-                    )
+            case .missingChunks:
+                let shouldContinue = showDatabaseConfirmation(
+                    title: "Missing Chunks Folder",
+                    message: "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?",
+                    primaryButton: "Continue Anyway"
+                )
+                if !shouldContinue {
                     return
                 }
 
-                // Valid database but no chunks - ask if they want to continue
-                if !hasChunks {
-                    let shouldContinue = showDatabaseConfirmation(
-                        title: "Missing Chunks Folder",
-                        message: "The selected folder has retrace.db but is missing the 'chunks' folder with video files.\n\nRetrace may not be able to load existing video frames.\n\nDo you want to continue anyway?",
-                        primaryButton: "Continue Anyway"
-                    )
-                    if !shouldContinue {
-                        return
-                    }
-                }
-            }
-
-            // If no database, check if directory is empty or has other files
-            if !hasDatabase {
-                let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
-                // Filter out hidden files like .DS_Store
-                let visibleContents = contents.filter { !$0.hasPrefix(".") }
-
-                if !visibleContents.isEmpty {
-                    // Folder has other files - show error dialog
-                    showDatabaseAlert(
-                        type: .error,
-                        title: "Invalid Folder Selection",
-                        message: "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
-                    )
-                    return
-                }
+            case .valid:
+                break
             }
 
             // If selecting the default location, clear custom path
@@ -4830,34 +4806,33 @@ extension SettingsView {
             panel.directoryURL = URL(fileURLWithPath: AppPaths.expandedRewindStorageRoot)
         }
 
-        if panel.runModal() == .OK, let url = panel.url {
-            let selectedPath = url.path
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
 
-            // Check if the selected file exists
-            guard FileManager.default.fileExists(atPath: selectedPath) else {
+        let selectedPath = url.path
+
+        Task { @MainActor in
+            let validationResult = await validateRewindDatabaseSelection(at: selectedPath)
+
+            switch validationResult {
+            case .missingFile:
                 Log.warning("Selected Rewind database file does not exist: \(selectedPath)", category: .ui)
                 return
-            }
 
-            // Verify it's a valid Rewind database using SQLCipher
-            let verificationResult = verifyRewindDatabase(at: selectedPath)
-            guard verificationResult.isValid else {
+            case .invalid(let message):
                 showDatabaseAlert(
                     type: .error,
                     title: "Invalid Rewind Database",
-                    message: verificationResult.error ?? "The selected file is not a valid Rewind database."
+                    message: message
                 )
                 return
-            }
 
-            let parentDir = (selectedPath as NSString).deletingLastPathComponent
-            let chunksPath = "\(parentDir)/chunks"
-
-            // Check if chunks directory exists
-            if FileManager.default.fileExists(atPath: chunksPath) {
+            case .valid(hasChunks: true):
                 // Valid Rewind database structure - apply immediately
                 applyRewindDBLocation(selectedPath)
-            } else {
+
+            case .valid(hasChunks: false):
                 // Database exists but no chunks folder - ask user if they want to continue
                 let shouldContinue = showDatabaseConfirmation(
                     title: "Missing Chunks Folder",
@@ -4871,8 +4846,79 @@ extension SettingsView {
         }
     }
 
+    private enum RetraceFolderValidationOutcome: Sendable {
+        case valid
+        case missingChunks
+        case invalid(title: String, message: String)
+    }
+
+    private enum RewindDatabaseValidationOutcome: Sendable {
+        case valid(hasChunks: Bool)
+        case invalid(message: String)
+        case missingFile
+    }
+
+    private func validateRetraceFolderSelection(at selectedPath: String) async -> RetraceFolderValidationOutcome {
+        await Task.detached(priority: .userInitiated) {
+            Self.validateRetraceFolderSelectionSync(at: selectedPath)
+        }.value
+    }
+
+    nonisolated private static func validateRetraceFolderSelectionSync(at selectedPath: String) -> RetraceFolderValidationOutcome {
+        let fm = FileManager.default
+        let dbPath = "\(selectedPath)/retrace.db"
+        let chunksPath = "\(selectedPath)/chunks"
+        let hasDatabase = fm.fileExists(atPath: dbPath)
+        let hasChunks = fm.fileExists(atPath: chunksPath)
+
+        if hasDatabase {
+            let verification = verifyRetraceDatabase(at: dbPath)
+            guard verification.isValid else {
+                return .invalid(
+                    title: "Invalid Retrace Database",
+                    message: verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database."
+                )
+            }
+
+            return hasChunks ? .valid : .missingChunks
+        }
+
+        let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
+        let visibleContents = contents.filter { !$0.hasPrefix(".") }
+        guard visibleContents.isEmpty else {
+            return .invalid(
+                title: "Invalid Folder Selection",
+                message: "The selected folder contains other files but is not a valid Retrace database folder.\n\nPlease select either:\n• An existing Retrace folder (with retrace.db)\n• An empty folder for a new database"
+            )
+        }
+
+        return .valid
+    }
+
+    private func validateRewindDatabaseSelection(at selectedPath: String) async -> RewindDatabaseValidationOutcome {
+        await Task.detached(priority: .userInitiated) {
+            Self.validateRewindDatabaseSelectionSync(at: selectedPath)
+        }.value
+    }
+
+    nonisolated private static func validateRewindDatabaseSelectionSync(at selectedPath: String) -> RewindDatabaseValidationOutcome {
+        guard FileManager.default.fileExists(atPath: selectedPath) else {
+            return .missingFile
+        }
+
+        let verificationResult = verifyRewindDatabase(at: selectedPath)
+        guard verificationResult.isValid else {
+            return .invalid(message: verificationResult.error ?? "The selected file is not a valid Rewind database.")
+        }
+
+        let parentDir = (selectedPath as NSString).deletingLastPathComponent
+        let chunksPath = "\(parentDir)/chunks"
+        let hasChunks = FileManager.default.fileExists(atPath: chunksPath)
+        return .valid(hasChunks: hasChunks)
+    }
+
     /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)
-    private func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
+    nonisolated private static func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
         var db: OpaquePointer?
 
         // Try to open the database
@@ -4911,7 +4957,7 @@ extension SettingsView {
     }
 
     /// Verifies that a file is a valid Rewind database by attempting to open it with SQLCipher (encrypted)
-    private func verifyRewindDatabase(at path: String) -> (isValid: Bool, error: String?) {
+    nonisolated private static func verifyRewindDatabase(at path: String) -> (isValid: Bool, error: String?) {
         var db: OpaquePointer?
 
         // Try to open the database

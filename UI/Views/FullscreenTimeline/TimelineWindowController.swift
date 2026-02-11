@@ -32,6 +32,7 @@ public class TimelineWindowController: NSObject {
     private var timelineViewModel: SimpleTimelineViewModel?
     private var hostingView: NSView?
     private var tapeShowAnimationTask: Task<Void, Never>?
+    private var liveModeCaptureTask: Task<Void, Never>?
     private var isHiding = false
 
     // MARK: - Emergency Escape (CGEvent tap for when main thread is blocked)
@@ -52,9 +53,6 @@ public class TimelineWindowController: NSObject {
 
     /// When the timeline was last hidden (for cache expiry check)
     private var lastHiddenAt: Date?
-
-    /// Cached live screenshot for instant toggle without re-capture
-    private var cachedLiveScreenshot: NSImage?
 
     /// Timer that periodically refreshes timeline data in the background
     private var backgroundRefreshTimer: Timer?
@@ -393,18 +391,13 @@ public class TimelineWindowController: NSObject {
         guard !isVisible, let coordinator = coordinator else {
             return
         }
+        let showStartTime = CFAbsoluteTimeGetCurrent()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
 
         // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
         let shouldUseLiveMode = timelineViewModel?.isNearMostRecentFrame(within: 2) ?? true
-
-        let liveScreenshot: NSImage?
-        if shouldUseLiveMode {
-            // Always capture fresh screenshot
-            liveScreenshot = captureLiveScreenshot()
-        } else {
-            liveScreenshot = nil
-        }
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -424,14 +417,7 @@ public class TimelineWindowController: NSObject {
 
         // Check if we have a pre-rendered window ready
         if isPrepared, let window = window, let viewModel = timelineViewModel {
-
-            // Set live mode with captured screenshot
-            if let screenshot = liveScreenshot {
-                viewModel.isInLiveMode = true
-                viewModel.liveScreenshot = screenshot
-                // Auto-trigger OCR on the live screenshot
-                viewModel.performLiveOCR()
-            }
+            prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
 
@@ -449,7 +435,12 @@ public class TimelineWindowController: NSObject {
             }
 
             // Show the pre-rendered window
-            showPreparedWindow(coordinator: coordinator)
+            showPreparedWindow(
+                coordinator: coordinator,
+                openPath: "prerendered",
+                showStartTime: showStartTime
+            )
+            startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             return
         }
 
@@ -460,16 +451,9 @@ public class TimelineWindowController: NSObject {
 	        // Create and store the view model so we can forward scroll events
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
+        prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
         viewModel.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
-
-        // Set live mode with captured screenshot
-        if let screenshot = liveScreenshot {
-            viewModel.isInLiveMode = true
-            viewModel.liveScreenshot = screenshot
-            // Auto-trigger OCR on the live screenshot
-            viewModel.performLiveOCR()
-        }
 
         guard let coordinatorWrapper = coordinatorWrapper else {
             Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
@@ -498,7 +482,12 @@ public class TimelineWindowController: NSObject {
         self.isPrepared = true
 
         // Show the window
-        showPreparedWindow(coordinator: coordinator)
+        showPreparedWindow(
+            coordinator: coordinator,
+            openPath: "fallback",
+            showStartTime: showStartTime
+        )
+        startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
 
         // Start async frame loading in background (non-blocking)
         Task {
@@ -507,7 +496,11 @@ public class TimelineWindowController: NSObject {
     }
 
     /// Show the prepared window with animation and setup event monitors
-    private func showPreparedWindow(coordinator: AppCoordinator) {
+    private func showPreparedWindow(
+        coordinator: AppCoordinator,
+        openPath: String,
+        showStartTime: CFAbsoluteTime
+    ) {
         guard let window = window else { return }
 
         // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
@@ -515,10 +508,6 @@ public class TimelineWindowController: NSObject {
             hostingView.frame = window.contentView?.bounds ?? .zero
             window.contentView?.addSubview(hostingView)
             hostingView.layoutSubtreeIfNeeded()
-            // Force SwiftUI to re-read all @Published properties from the view model.
-            // While detached, SwiftUI missed objectWillChange notifications,
-            // so the timeline tape may show stale/empty state.
-            timelineViewModel?.objectWillChange.send()
         }
 
         timelineViewModel?.isTapeHidden = true
@@ -540,7 +529,7 @@ public class TimelineWindowController: NSObject {
             viewModel.currentIndex = original
         }
 
-        let isLive = (timelineViewModel?.isInLiveMode ?? false) && timelineViewModel?.liveScreenshot != nil
+        let isLive = timelineViewModel?.isInLiveMode ?? false
         window.alphaValue = isLive ? 1 : 0
 
         // Re-enable mouse events before showing (was disabled while hidden to prevent blocking clicks)
@@ -555,6 +544,23 @@ public class TimelineWindowController: NSObject {
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        let openElapsedMs = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
+        Log.recordLatency(
+            "timeline.open.window_visible_ms",
+            valueMs: openElapsedMs,
+            category: .ui,
+            summaryEvery: 5,
+            warningThresholdMs: 250,
+            criticalThresholdMs: 600
+        )
+        Log.recordLatency(
+            "timeline.open.\(openPath).window_visible_ms",
+            valueMs: openElapsedMs,
+            category: .ui,
+            summaryEvery: 5,
+            warningThresholdMs: 250,
+            criticalThresholdMs: 600
+        )
 
         isVisible = true
         Self.isTimelineVisible = true  // For emergency escape tap
@@ -600,6 +606,8 @@ public class TimelineWindowController: NSObject {
     public func hide() {
         guard isVisible, let window = window, !isHiding else { return }
         isHiding = true
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
 
         // Record timeline session duration (only if > 3 seconds)
         if let startTime = sessionStartTime, let coordinator = coordinator {
@@ -730,10 +738,8 @@ public class TimelineWindowController: NSObject {
         }
     }
 
-    /// Capture a live screenshot for seamless timeline launch
-    /// Returns NSImage of the current screen, or nil on failure
-    private func captureLiveScreenshot() -> NSImage? {
-        // Get the screen where the mouse cursor is located
+    /// Capture a live screenshot off the main actor to avoid blocking timeline-open path.
+    private func captureLiveScreenshotAsync() async -> NSImage? {
         let mouseLocation = NSEvent.mouseLocation
         guard let targetScreen = NSScreen.screens.first(where: {
             NSMouseInRect(mouseLocation, $0.frame, false)
@@ -741,18 +747,74 @@ public class TimelineWindowController: NSObject {
             return nil
         }
 
-        // Get display ID for this screen
         guard let screenNumber = targetScreen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
             return nil
         }
 
-        // Capture the screen
-        guard let cgImage = CGDisplayCreateImage(screenNumber) else {
+        let screenSize = targetScreen.frame.size
+        let captureStartTime = CFAbsoluteTimeGetCurrent()
+        let cgImage = await Task.detached(priority: .userInitiated) {
+            CGDisplayCreateImage(screenNumber)
+        }.value
+        let captureElapsedMs = (CFAbsoluteTimeGetCurrent() - captureStartTime) * 1000
+        Log.recordLatency(
+            "timeline.live_screenshot.capture_ms",
+            valueMs: captureElapsedMs,
+            category: .ui,
+            summaryEvery: 20,
+            warningThresholdMs: 40,
+            criticalThresholdMs: 120
+        )
+
+        guard let cgImage else {
             Log.warning("[TIMELINE-LIVE] Failed to capture live screenshot", category: .ui)
             return nil
         }
 
-        return NSImage(cgImage: cgImage, size: targetScreen.frame.size)
+        return NSImage(cgImage: cgImage, size: screenSize)
+    }
+
+    /// Starts asynchronous live screenshot capture and then triggers live OCR.
+    /// This keeps timeline open responsive by removing heavy capture from the critical show path.
+    private func prepareLiveModeState(shouldUseLiveMode: Bool, viewModel: SimpleTimelineViewModel) {
+        if shouldUseLiveMode {
+            // Prime live mode before showing the window so open animation/render path
+            // matches previous behavior while screenshot capture finishes in background.
+            viewModel.isInLiveMode = true
+            viewModel.liveScreenshot = nil
+        } else {
+            viewModel.isInLiveMode = false
+            viewModel.liveScreenshot = nil
+        }
+    }
+
+    /// Starts asynchronous live screenshot capture and then triggers live OCR.
+    /// This keeps timeline open responsive by removing heavy capture from the critical show path.
+    private func startLiveModeCaptureIfNeeded(shouldUseLiveMode: Bool, viewModel: SimpleTimelineViewModel) {
+        guard shouldUseLiveMode else {
+            viewModel.isInLiveMode = false
+            viewModel.liveScreenshot = nil
+            return
+        }
+
+        let targetViewModel = viewModel
+        liveModeCaptureTask = Task { @MainActor [weak self, weak targetViewModel] in
+            guard let self, let targetViewModel else { return }
+            let screenshot = await self.captureLiveScreenshotAsync()
+            guard !Task.isCancelled else { return }
+            guard self.isVisible, self.timelineViewModel === targetViewModel else { return }
+            guard targetViewModel.isNearMostRecentFrame(within: 2) else { return }
+            guard let screenshot else {
+                // Fall back to historical frame rendering if live capture fails.
+                targetViewModel.isInLiveMode = false
+                targetViewModel.liveScreenshot = nil
+                return
+            }
+
+            targetViewModel.isInLiveMode = true
+            targetViewModel.liveScreenshot = screenshot
+            targetViewModel.performLiveOCR()
+        }
     }
 
     /// Start a repeating timer that keeps timeline data fresh while hidden
@@ -811,6 +873,8 @@ public class TimelineWindowController: NSObject {
         Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
         // Save state before destroying for cross-session persistence
         timelineViewModel?.saveState()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
 
         window?.orderOut(nil)
         hostingView?.removeFromSuperview()
@@ -1117,7 +1181,6 @@ public class TimelineWindowController: NSObject {
                 hostingView.frame = window.contentView?.bounds ?? .zero
                 window.contentView?.addSubview(hostingView)
                 hostingView.layoutSubtreeIfNeeded()
-                timelineViewModel?.objectWillChange.send()
             }
             // Move window to target screen if needed
             if window.frame != targetScreen.frame {
@@ -1168,7 +1231,6 @@ public class TimelineWindowController: NSObject {
             hostingView.frame = window.contentView?.bounds ?? .zero
             window.contentView?.addSubview(hostingView)
             hostingView.layoutSubtreeIfNeeded()
-            timelineViewModel?.objectWillChange.send()
         }
 
         // Ensure tape starts hidden and cancel any pending animation
@@ -1246,10 +1308,12 @@ public class TimelineWindowController: NSObject {
         // Make it cover the entire screen including menu bar
         window.setFrame(screen.frame, display: true)
 
-        // Create content view with dark background
+        // Create content view with transparent background.
+        // SwiftUI controls the visible backdrop (black during normal mode,
+        // transparent while awaiting live screenshot when requested).
         let contentView = NSView(frame: screen.frame)
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.95).cgColor
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = contentView
 
         return window
@@ -1271,6 +1335,12 @@ public class TimelineWindowController: NSObject {
                 let clickPoint = event.locationInWindow
                 let isInTapeArea = self.isPointInTapeArea(clickPoint)
                 let startedNearPlaybackControls = self.isPointNearPlaybackControls(clickPoint)
+
+                // Playback controls (play/pause + speed menu) should always receive click
+                // completion; don't prime tape drag in this region.
+                if startedNearPlaybackControls {
+                    return event
+                }
 
                 if isInTapeArea {
                     // Don't start drag if overlays are open
@@ -1691,7 +1761,7 @@ public class TimelineWindowController: NSObject {
                 }
                 // If search overlay is showing, close it
                 if viewModel.isSearchOverlayVisible {
-                    viewModel.isSearchOverlayVisible = false
+                    viewModel.searchViewModel.requestOverlayDismiss(clearSearchState: true)
                     return true
                 }
                 // If search highlight is showing, clear it and return to search results if available
@@ -2101,8 +2171,6 @@ public class TimelineWindowController: NSObject {
         // }
         // // Option+3 — Send objectWillChange (should fix stale tape)
         // if event.keyCode == 20 && modifiers == [.option] { // 3
-        //     timelineViewModel?.objectWillChange.send()
-        //     Log.info("[DEV-TEST] ⚡ Sent objectWillChange.send()", category: .ui)
         //     return true
         // }
         // #endif
@@ -2359,6 +2427,7 @@ public class TimelineWindowController: NSObject {
 
     private func copyMomentLink() {
         guard let viewModel = timelineViewModel,
+              !viewModel.isInLiveMode,
               let timestamp = viewModel.currentTimestamp,
               let url = DeeplinkHandler.generateTimelineLink(timestamp: timestamp) else { return }
         let pasteboard = NSPasteboard.general
@@ -2371,6 +2440,11 @@ public class TimelineWindowController: NSObject {
     }
 
     private func getCurrentFrameImage(viewModel: SimpleTimelineViewModel, completion: @escaping (NSImage?) -> Void) {
+        if viewModel.isInLiveMode {
+            completion(viewModel.liveScreenshot)
+            return
+        }
+
         if let image = viewModel.currentImage {
             completion(image)
             return
@@ -2443,26 +2517,45 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Session Metrics
 
-    /// Force record session metrics (called on app termination)
-    public func forceRecordSessionMetrics() {
-        guard let startTime = sessionStartTime, let coordinator = coordinator else { return }
+    /// Force-record active session metrics without blocking the main actor.
+    /// Returns true when metrics were flushed before timeout, false otherwise.
+    public func forceRecordSessionMetrics(timeoutMs: UInt64 = 350) async -> Bool {
+        guard let startTime = sessionStartTime, let coordinator = coordinator else { return true }
 
         let durationMs = Int64(Date().timeIntervalSince(startTime) * 1000)
+        let scrubDistance = sessionScrubDistance > 0 ? Int(sessionScrubDistance) : nil
 
-        // Record synchronously using a blocking task
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            try? await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    try await coordinator.recordMetricEvent(metricType: .timelineSessionDuration, metadata: "\(durationMs)")
+                    if let scrubDistance {
+                        try await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(scrubDistance)")
+                    }
+                }
 
-            if sessionScrubDistance > 0 {
-                try? await coordinator.recordMetricEvent(metricType: .scrubDistance, metadata: "\(Int(sessionScrubDistance))")
+                group.addTask {
+                    try await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+                    throw SessionMetricFlushTimeout()
+                }
+
+                _ = try await group.next()
+                group.cancelAll()
             }
 
-            semaphore.signal()
+            Log.info("[TIMELINE] Session metrics flush completed during termination", category: .ui)
+            return true
+        } catch is SessionMetricFlushTimeout {
+            Log.warning("[TIMELINE] Session metrics flush timed out after \(timeoutMs)ms during termination", category: .ui)
+            return false
+        } catch {
+            Log.warning("[TIMELINE] Session metrics flush failed during termination: \(error)", category: .ui)
+            return false
         }
-        semaphore.wait()
     }
 }
+
+private struct SessionMetricFlushTimeout: Error {}
 
 // MARK: - Notifications
 
