@@ -46,12 +46,13 @@ targets:
       - package: Sparkle
       - package: swift-sqlcipher
         product: SQLCipher
+      - package: SwiftyChrono
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app
         INFOPLIST_FILE: UI/Info.plist
-        MARKETING_VERSION: "0.6.0"
-        CURRENT_PROJECT_VERSION: "5"
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "6"
         CODE_SIGN_ENTITLEMENTS: UI/Retrace.entitlements
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "Developer ID Application"
@@ -219,6 +220,14 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: io.retrace.App
 
+schemes:
+  Retrace:
+    build:
+      targets:
+        Retrace: all
+    archive:
+      config: Release
+
 packages:
   swift-sqlcipher:
     url: https://github.com/skiptools/swift-sqlcipher.git
@@ -226,3 +235,6 @@ packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle.git
     from: "2.6.0"
+  SwiftyChrono:
+    url: https://github.com/batmac/SwiftyChrono.git
+    revision: "e1bf3bde0f09112909157360b6bf39302f10ae5f"
