@@ -60,7 +60,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
             throw StorageError.fileWriteFailed(path: fileURL.path, underlying: "Writer cancelled")
         }
 
-        Log.debug("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
+        Log.verbose("[IncrementalWriter] appendFrame called: segmentID=\(segmentID.value), frameCount=\(frameCount), size=\(frame.width)x\(frame.height)", category: .storage)
 
         // Track I/O latency for storage health monitoring
         let writeStart = CFAbsoluteTimeGetCurrent()

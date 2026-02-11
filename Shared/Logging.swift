@@ -276,14 +276,34 @@ public enum Log {
         message: String,
         category: Category,
         file: String,
-        line: Int
+        line: Int,
+        consoleOnly: Bool = false
     ) {
         let filename = (file as NSString).lastPathComponent
         let formattedLog = "[\(timestamp())] [\(level)] [\(category.rawValue)] \(filename):\(line) - \(message)"
         print(formattedLog)
 
-        // Also write to log file for persistence across crashes
-        LogFile.shared.append(formattedLog)
+        if !consoleOnly {
+            // Also write to log file for persistence across crashes
+            LogFile.shared.append(formattedLog)
+        }
+    }
+
+    /// Console-only debug log — prints to stdout but NOT to retrace.log.
+    /// Use for high-frequency per-frame logs that would spam the log file.
+    public static func verbose(
+        _ message: String,
+        category: Category = .app,
+        file: String = #file,
+        function: String = #function,
+        line: Int = #line
+    ) {
+        let logger = category.logger
+        logger.debug("\(message, privacy: .public)")
+
+        if printToConsole {
+            printFormatted(level: "DEBUG", message: message, category: category, file: file, line: line, consoleOnly: true)
+        }
     }
 }
 

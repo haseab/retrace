@@ -9,9 +9,8 @@ import Shared
 /// Vision framework implementation of OCRProtocol
 public final class VisionOCR: OCRProtocol, @unchecked Sendable {
 
-    /// Reusable text recognition request - configured once, reused per frame
-    /// This avoids recreating the request object for every frame
-    private let textRequest: VNRecognizeTextRequest
+    /// Recognition languages for OCR
+    private let recognitionLanguages: [String]
 
     /// OCR scale settings for adaptive downscaling.
     /// Frames above the target megapixel budget are downscaled to cap OCR cost.
@@ -21,10 +20,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     private static let targetMegapixelsFast: CGFloat = 4.0
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
-        self.textRequest = VNRecognizeTextRequest()
-        textRequest.recognitionLevel = .accurate
-        textRequest.recognitionLanguages = recognitionLanguages
-        textRequest.usesLanguageCorrection = true
+        self.recognitionLanguages = recognitionLanguages
     }
 
     public func recognizeText(
@@ -34,18 +30,18 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         bytesPerRow: Int,
         config: ProcessingConfig
     ) async throws -> [TextRegion] {
-        // Apply recognition mode dynamically so power/quality config is honored.
+        // Create a fresh request per call for thread safety with concurrent workers
+        let textRequest = VNRecognizeTextRequest()
         textRequest.recognitionLevel = Self.recognitionLevel(for: config)
-        textRequest.usesLanguageCorrection = config.ocrAccuracyLevel == .accurate
+        textRequest.recognitionLanguages = recognitionLanguages
+        textRequest.usesLanguageCorrection = false
+        textRequest.preferBackgroundProcessing = config.preferBackgroundProcessing
 
         // Create CGImage from raw pixel data
         guard let cgImage = createCGImage(from: imageData, width: width, height: height, bytesPerRow: bytesPerRow) else {
             throw ProcessingError.imageConversionFailed
         }
 
-        // Downscale image before OCR to reduce energy consumption
-        // OCR cost scales ~linearly with pixel count, so 50% scale = ~50% less ANE work
-        // Screen text remains perfectly readable at lower resolutions
         let ocrImage: CGImage
         let ocrScaleFactor = Self.calculateOCRScaleFactor(
             width: width,
@@ -58,14 +54,14 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             ocrImage = cgImage
         }
 
-        // Perform recognition on downscaled image using reusable request
+        // Perform recognition with per-call request
         let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
 
         return try await withCheckedThrowingContinuation { continuation in
             do {
-                try handler.perform([self.textRequest])
+                try handler.perform([textRequest])
 
-                guard let observations = self.textRequest.results else {
+                guard let observations = textRequest.results else {
                     continuation.resume(returning: [])
                     return
                 }
@@ -123,12 +119,16 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         // No downscaling for live screenshot - it's a one-shot operation
         // and downscaling can introduce subtle bounding box drift from integer rounding
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        let textRequest = VNRecognizeTextRequest()
+        textRequest.recognitionLevel = .accurate
+        textRequest.recognitionLanguages = recognitionLanguages
+        textRequest.usesLanguageCorrection = true
 
         return try await withCheckedThrowingContinuation { continuation in
             do {
-                try handler.perform([self.textRequest])
+                try handler.perform([textRequest])
 
-                guard let observations = self.textRequest.results else {
+                guard let observations = textRequest.results else {
                     continuation.resume(returning: [])
                     return
                 }
@@ -439,7 +439,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             throw ProcessingError.imageConversionFailed
         }
 
-        // Downscale image for OCR
         let ocrImage: CGImage
         let ocrScaleFactor = Self.calculateOCRScaleFactor(
             width: width,
@@ -470,7 +469,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         // Create a fresh request with regionOfInterest
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = Self.recognitionLevel(for: config)
-        request.recognitionLanguages = textRequest.recognitionLanguages
+        request.recognitionLanguages = recognitionLanguages
         request.usesLanguageCorrection = config.ocrAccuracyLevel == .accurate
         request.regionOfInterest = normalizedRegion
 

@@ -168,7 +168,7 @@ public struct SystemMonitorView: View {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         settingsRotation += 90
                     }
-                    NotificationCenter.default.post(name: .openSettings, object: nil)
+                    NotificationCenter.default.post(name: .openSettingsPower, object: nil)
                 }) {
                     Image(systemName: "gearshape")
                         .font(.retraceCalloutMedium)
@@ -241,7 +241,8 @@ public struct SystemMonitorView: View {
                     )
                     .frame(height: 140)
                 }
-                .padding(16)
+                .padding(.vertical, 16)
+                .padding(.horizontal, 20)
 
                 Divider()
                     .background(Color.white.opacity(0.06))
@@ -333,14 +334,41 @@ public struct SystemMonitorView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        NotificationCenter.default.post(name: .openSettingsPower, object: nil)
+                        NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
                     }
                     .padding(12)
                     .background(Color.orange.opacity(0.05))
                 }
+
+                // OCR disabled warning
+                if !viewModel.ocrEnabled {
+                    Divider()
+                        .background(Color.white.opacity(0.06))
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "eye.slash.fill")
+                            .font(.retraceCaption)
+                            .foregroundColor(.gray)
+                        Text("OCR is paused — resume in ")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                        + Text("Power Settings")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceAccent)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
+                    }
+                    .padding(12)
+                    .background(Color.gray.opacity(0.05))
+                }
             }
-            .background(Color.white.opacity(0.02))
-            .cornerRadius(12)
+            .background(
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(Color.white.opacity(0.02))
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.white.opacity(0.06), lineWidth: 1)
@@ -675,11 +703,50 @@ struct ProcessingBarChart: View {
     }
 
     private func backlogTooltipView(pendingCount: Int) -> some View {
-        floatingTooltip {
-            tooltipMetricChip(
-                text: "\(pendingCount)",
-                tint: .orange
-            )
+        VStack(spacing: 0) {
+            Text("\(pendingCount)")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(.orange)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(Color.orange.opacity(0.18))
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+                )
+                .padding(.horizontal, 6)
+                .padding(.top, 5)
+                .padding(.bottom, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.15, green: 0.18, blue: 0.24).opacity(0.98),
+                                    Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .shadow(color: Color.black.opacity(0.34), radius: 10, x: 0, y: 6)
+                )
+
+            TooltipPointer()
+                .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98))
+                .frame(width: 10, height: 6)
+                .overlay(
+                    TooltipPointer()
+                        .stroke(Color.white.opacity(0.14), lineWidth: 0.8)
+                )
+                .offset(y: -1)
         }
     }
 

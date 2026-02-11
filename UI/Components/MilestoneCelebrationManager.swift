@@ -19,7 +19,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     // MARK: - Color Theme
 
     /// Available color themes for the app accent color
-    public enum ColorTheme: String, CaseIterable, Identifiable {
+    public enum ColorTheme: String, CaseIterable, Identifiable, Sendable {
         case blue = "blue"
         case gold = "gold"
         case purple = "purple"
@@ -126,7 +126,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     // MARK: - Configuration
 
     /// UserDefaults suite for app settings
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
     /// Key for storing cumulative screen time (survives database resets)
     private static let cumulativeScreenTimeKey = "retraceCumulativeScreenTimeSeconds"
@@ -148,14 +148,15 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Get the current color theme (respects user's preference)
     /// Marked nonisolated because it only reads from thread-safe UserDefaults
     public nonisolated static func getCurrentTheme() -> ColorTheme {
+        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         #if DEBUG
-        if let rawValue = settingsStore?.string(forKey: debugThemeOverrideKey),
+        if let rawValue = settingsStore.string(forKey: "retraceDebugThemeOverride"),
            let theme = ColorTheme(rawValue: rawValue) {
             return theme
         }
         #endif
 
-        if let rawValue = settingsStore?.string(forKey: colorThemePreferenceKey),
+        if let rawValue = settingsStore.string(forKey: "retraceColorThemePreference"),
            let theme = ColorTheme(rawValue: rawValue) {
             return theme
         }
@@ -164,7 +165,8 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Get the user's color theme preference
     public nonisolated static func getColorThemePreference() -> ColorTheme {
-        if let rawValue = settingsStore?.string(forKey: colorThemePreferenceKey),
+        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        if let rawValue = settingsStore.string(forKey: "retraceColorThemePreference"),
            let theme = ColorTheme(rawValue: rawValue) {
             return theme
         }
@@ -173,7 +175,8 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Set the user's color theme preference
     public nonisolated static func setColorThemePreference(_ theme: ColorTheme) {
-        settingsStore?.set(theme.rawValue, forKey: colorThemePreferenceKey)
+        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        settingsStore.set(theme.rawValue, forKey: "retraceColorThemePreference")
         // Post notification so views can update
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: .colorThemeDidChange, object: theme)
@@ -184,16 +187,18 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Set the debug theme override (shared across all views)
     /// Marked nonisolated because it only writes to thread-safe UserDefaults
     public nonisolated static func setDebugThemeOverride(_ theme: ColorTheme?) {
+        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         if let theme = theme {
-            settingsStore?.set(theme.rawValue, forKey: debugThemeOverrideKey)
+            settingsStore.set(theme.rawValue, forKey: "retraceDebugThemeOverride")
         } else {
-            settingsStore?.removeObject(forKey: debugThemeOverrideKey)
+            settingsStore.removeObject(forKey: "retraceDebugThemeOverride")
         }
     }
 
     /// Get the debug theme override
     public nonisolated static func getDebugThemeOverride() -> ColorTheme? {
-        guard let rawValue = settingsStore?.string(forKey: debugThemeOverrideKey) else {
+        let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard let rawValue = settingsStore.string(forKey: "retraceDebugThemeOverride") else {
             return nil
         }
         return ColorTheme(rawValue: rawValue)
@@ -236,7 +241,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     private func updateCumulativeTime() async {
         do {
             let lastCountedTimestamp = getLastCountedTimestamp()
-            let cumulativeTime = Self.settingsStore?.double(forKey: Self.cumulativeScreenTimeKey) ?? 0
+            let cumulativeTime = Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
 
             // Get duration of segments created after the last checkpoint
             let newDuration: TimeInterval
@@ -250,12 +255,12 @@ public class MilestoneCelebrationManager: ObservableObject {
             // Update cumulative time if there's new time
             if newDuration > 0 {
                 let updatedCumulative = cumulativeTime + newDuration
-                Self.settingsStore?.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
+                Self.settingsStore.set(updatedCumulative, forKey: Self.cumulativeScreenTimeKey)
                 Log.debug("[MilestoneCelebrationManager] Added \(newDuration / 3600)h, cumulative: \(updatedCumulative / 3600)h", category: .ui)
             }
 
             // Update checkpoint to now
-            Self.settingsStore?.set(Date().timeIntervalSince1970, forKey: Self.lastCountedTimestampKey)
+            Self.settingsStore.set(Date().timeIntervalSince1970, forKey: Self.lastCountedTimestampKey)
 
         } catch {
             Log.error("[MilestoneCelebrationManager] Failed to update cumulative time: \(error)", category: .ui)
@@ -264,7 +269,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Get the timestamp of the last counted segment checkpoint
     private func getLastCountedTimestamp() -> Date? {
-        guard let timestamp = Self.settingsStore?.object(forKey: Self.lastCountedTimestampKey) as? TimeInterval,
+        guard let timestamp = Self.settingsStore.object(forKey: Self.lastCountedTimestampKey) as? TimeInterval,
               timestamp > 0 else {
             return nil
         }
@@ -273,7 +278,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Get the total cumulative screen time (persisted across database resets)
     private func getCumulativeScreenTime() -> TimeInterval {
-        Self.settingsStore?.double(forKey: Self.cumulativeScreenTimeKey) ?? 0
+        Self.settingsStore.double(forKey: Self.cumulativeScreenTimeKey)
     }
 
     /// Get the user's current color theme
@@ -308,7 +313,7 @@ public class MilestoneCelebrationManager: ObservableObject {
             // Auto-dismiss all milestones below the highest achieved
             for milestone in Milestone.allCases {
                 if milestone.rawValue < highest.rawValue && !hasBeenDismissed(milestone) {
-                    Self.settingsStore?.set(true, forKey: milestone.dismissedKey)
+                    Self.settingsStore.set(true, forKey: milestone.dismissedKey)
                     Log.debug("[MilestoneCelebrationManager] Auto-dismissed \(milestone.rawValue)h milestone (user already at \(highest.rawValue)h)", category: .ui)
                 }
             }
@@ -325,7 +330,7 @@ public class MilestoneCelebrationManager: ObservableObject {
 
     /// Check if a milestone has been dismissed
     private func hasBeenDismissed(_ milestone: Milestone) -> Bool {
-        Self.settingsStore?.bool(forKey: milestone.dismissedKey) ?? false
+        Self.settingsStore.bool(forKey: milestone.dismissedKey)
     }
 
     // MARK: - User Actions
@@ -333,7 +338,7 @@ public class MilestoneCelebrationManager: ObservableObject {
     /// Dismiss the current milestone celebration
     public func dismissCurrentMilestone() {
         guard let milestone = currentMilestone else { return }
-        Self.settingsStore?.set(true, forKey: milestone.dismissedKey)
+        Self.settingsStore.set(true, forKey: milestone.dismissedKey)
         currentMilestone = nil
         Log.debug("[MilestoneCelebrationManager] User dismissed \(milestone.rawValue)h milestone", category: .ui)
     }

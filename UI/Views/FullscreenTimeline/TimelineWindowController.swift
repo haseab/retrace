@@ -150,8 +150,9 @@ public class TimelineWindowController: NSObject {
                         flags.contains(.maskCommand) &&
                         flags.contains(.maskAlternate)
 
-                    // Cmd+Option+Escape: EMERGENCY - terminate app immediately
+                    // Cmd+Option+Escape: EMERGENCY - capture diagnostics then terminate
                     if isCmdOptEscape {
+                        EmergencyDiagnostics.capture(trigger: "cmd_opt_escape")
                         TimelineWindowController.isTimelineVisible = false
                         exit(0)
                     }
@@ -172,6 +173,7 @@ public class TimelineWindowController: NSObject {
                         // Check for triple-escape (3 presses within 1.5 seconds)
                         if TimelineWindowController.escapeTimestamps.count >= 3 {
                             TimelineWindowController.escapeTimestamps.removeAll()
+                            EmergencyDiagnostics.capture(trigger: "triple_escape")
                             TimelineWindowController.isTimelineVisible = false
                             exit(0)  // Force quit immediately
                         }

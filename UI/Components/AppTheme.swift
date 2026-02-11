@@ -1172,7 +1172,7 @@ extension Color {
 // MARK: - Typography
 
 /// Available font styles for the app
-public enum RetraceFontStyle: String, CaseIterable, Identifiable {
+public enum RetraceFontStyle: String, CaseIterable, Identifiable, Sendable {
     case `default` = "default"
     case rounded = "rounded"
     case serif = "serif"
@@ -1211,19 +1211,19 @@ public enum RetraceFont {
     private static let fontStyleKey = "retraceFontStyle"
 
     /// Shared UserDefaults store (same as Settings uses)
-    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app")
+    private static let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
     /// The current font style (persisted in UserDefaults)
     public static var currentStyle: RetraceFontStyle {
         get {
-            if let rawValue = settingsStore?.string(forKey: fontStyleKey),
+            if let rawValue = settingsStore.string(forKey: fontStyleKey),
                let style = RetraceFontStyle(rawValue: rawValue) {
                 return style
             }
             return .default
         }
         set {
-            settingsStore?.set(newValue.rawValue, forKey: fontStyleKey)
+            settingsStore.set(newValue.rawValue, forKey: fontStyleKey)
             // Post notification so views can update
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .fontStyleDidChange, object: newValue)
@@ -1966,7 +1966,7 @@ public struct RetraceMenuButton: View {
 }
 
 /// Shared UserDefaults store for accessing settings
-private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
 /// Standardized menu container modifier
 /// Applies consistent background, border, and shadow to any menu/popover content
@@ -1975,7 +1975,7 @@ public struct RetraceMenuContainer: ViewModifier {
     var addPadding: Bool = true
 
     private var showColoredBorders: Bool {
-        menuContainerSettingsStore?.bool(forKey: "timelineColoredBorders") ?? true
+        menuContainerSettingsStore.bool(forKey: "timelineColoredBorders")
     }
 
     private var borderColor: Color {

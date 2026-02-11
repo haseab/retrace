@@ -129,10 +129,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize the Sparkle updater for automatic updates
         UpdaterManager.shared.initialize()
 
+        // Start main thread hang detection (writes emergency diagnostics if main thread freezes)
+        MainThreadHangDetector.shared.start()
+
         // Initialize the app coordinator and UI
         Task { @MainActor in
             await initializeApp()
-            
+
             // Record app launch metric
             if let coordinator = coordinatorWrapper?.coordinator {
                 DashboardViewModel.recordAppLaunch(coordinator: coordinator)

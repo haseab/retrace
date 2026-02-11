@@ -60,7 +60,8 @@ enum SettingsDefaults {
     // MARK: OCR Power
     static let ocrEnabled = true
     static let ocrOnlyWhenPluggedIn = false
-    static let ocrMaxFramesPerSecond: Double = 1.0  // Default balanced mode
+    static let ocrMaxFramesPerSecond: Double = 0  // Legacy, unused
+    static let ocrProcessingLevel: Int = 3  // Default: Medium (utility priority)
     static let ocrAppFilterMode: OCRAppFilterMode = .allApps
     static let ocrFilteredApps = ""  // JSON array of bundle IDs
 }
@@ -95,6 +96,8 @@ public struct SettingsView: View {
     @State private var isScrollingToTarget = false
     @State private var isPauseReminderCardHighlighted = false
     @State private var pauseReminderHighlightTask: Task<Void, Never>? = nil
+    @State private var isOCRCardHighlighted = false
+    @State private var ocrCardHighlightTask: Task<Void, Never>? = nil
 
     // Settings search
     @State private var showSettingsSearch = false
@@ -240,6 +243,7 @@ public struct SettingsView: View {
     @AppStorage("ocrEnabled", store: settingsStore) private var ocrEnabled = SettingsDefaults.ocrEnabled
     @AppStorage("ocrOnlyWhenPluggedIn", store: settingsStore) private var ocrOnlyWhenPluggedIn = SettingsDefaults.ocrOnlyWhenPluggedIn
     @AppStorage("ocrMaxFramesPerSecond", store: settingsStore) private var ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+    @AppStorage("ocrProcessingLevel", store: settingsStore) private var ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
     @AppStorage("ocrAppFilterMode", store: settingsStore) private var ocrAppFilterMode: OCRAppFilterMode = SettingsDefaults.ocrAppFilterMode
     @AppStorage("ocrFilteredApps", store: settingsStore) private var ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
     @State private var ocrFilteredAppsPopoverShown = false
@@ -287,6 +291,7 @@ public struct SettingsView: View {
     // Danger zone confirmation states
     @State private var showingResetConfirmation = false
     @State private var showingDeleteConfirmation = false
+    @State private var showingSectionResetConfirmation = false
 
     // Database schema display
     @State private var showingDatabaseSchema = false
@@ -393,12 +398,13 @@ public struct SettingsView: View {
     private let settingsMaxWidth: CGFloat = 1200
     static let pauseReminderIntervalTargetID = "settings.pauseReminderInterval"
     private static let pauseReminderCardAnchorID = "settings.pauseReminderCard"
+    static let powerOCRCardTargetID = "settings.powerOCRCard"
+    private static let powerOCRCardAnchorID = "settings.powerOCRCardAnchor"
 
     public var body: some View {
         GeometryReader { geometry in
             let windowWidth = geometry.size.width
             let detached = windowWidth > settingsMaxWidth
-            let _ = Self.logSettingsLayout(windowWidth: windowWidth)
 
             HStack(spacing: 0) {
                 // Sidebar
@@ -473,10 +479,16 @@ public struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
             requestNavigation(to: Self.pauseReminderIntervalTargetID)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+            requestNavigation(to: Self.powerOCRCardTargetID)
+        }
         .onDisappear {
             pauseReminderHighlightTask?.cancel()
             pauseReminderHighlightTask = nil
             isPauseReminderCardHighlighted = false
+            ocrCardHighlightTask?.cancel()
+            ocrCardHighlightTask = nil
+            isOCRCardHighlighted = false
         }
         .overlay {
             settingsSearchOverlay
@@ -753,6 +765,8 @@ public struct SettingsView: View {
         switch targetID {
         case Self.pauseReminderIntervalTargetID:
             selectedTab = .capture
+        case Self.powerOCRCardTargetID:
+            selectedTab = .power
         default:
             break
         }
@@ -766,6 +780,8 @@ public struct SettingsView: View {
         switch targetID {
         case Self.pauseReminderIntervalTargetID:
             guard selectedTab == .capture else { return }
+        case Self.powerOCRCardTargetID:
+            guard selectedTab == .power else { return }
         default:
             pendingScrollTargetID = nil
             return
@@ -775,6 +791,8 @@ public struct SettingsView: View {
         switch targetID {
         case Self.pauseReminderIntervalTargetID:
             anchorID = Self.pauseReminderCardAnchorID
+        case Self.powerOCRCardTargetID:
+            anchorID = Self.powerOCRCardAnchorID
         default:
             pendingScrollTargetID = nil
             return
@@ -790,6 +808,10 @@ public struct SettingsView: View {
             if targetID == Self.pauseReminderIntervalTargetID {
                 try? await Task.sleep(nanoseconds: 140_000_000)
                 triggerPauseReminderCardHighlight()
+            }
+            if targetID == Self.powerOCRCardTargetID {
+                try? await Task.sleep(nanoseconds: 140_000_000)
+                triggerOCRCardHighlight()
             }
             pendingScrollTargetID = nil
             isScrollingToTarget = false
@@ -814,6 +836,27 @@ public struct SettingsView: View {
                 isPauseReminderCardHighlighted = false
             }
             pauseReminderHighlightTask = nil
+        }
+    }
+
+    private func triggerOCRCardHighlight() {
+        ocrCardHighlightTask?.cancel()
+        ocrCardHighlightTask = nil
+
+        isOCRCardHighlighted = false
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.22)) {
+                isOCRCardHighlighted = true
+            }
+        }
+
+        ocrCardHighlightTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.38)) {
+                isOCRCardHighlighted = false
+            }
+            ocrCardHighlightTask = nil
         }
     }
 
@@ -863,8 +906,8 @@ public struct SettingsView: View {
                 }
 
                 // Reset section button (only for sections with resettable settings)
-                if let resetAction = selectedTab.resetAction(for: self) {
-                    Button(action: resetAction) {
+                if selectedTab.resetAction(for: self) != nil {
+                    Button(action: { showingSectionResetConfirmation = true }) {
                         HStack(spacing: 6) {
                             Image(systemName: "arrow.counterclockwise")
                                 .font(.system(size: 12))
@@ -878,6 +921,14 @@ public struct SettingsView: View {
                         .cornerRadius(8)
                     }
                     .buttonStyle(.plain)
+                    .alert("Reset \(selectedTab.rawValue) Settings?", isPresented: $showingSectionResetConfirmation) {
+                        Button("Cancel", role: .cancel) {}
+                        Button("Reset", role: .destructive) {
+                            selectedTab.resetAction(for: self)?()
+                        }
+                    } message: {
+                        Text("This will reset all \(selectedTab.rawValue.lowercased()) settings to their defaults.")
+                    }
                 }
             }
         }
@@ -2382,6 +2433,9 @@ public struct SettingsView: View {
             // Energy usage banner (informational, not a settings card)
             powerEnergyBanner
 
+            Color.clear
+                .frame(height: 0)
+                .id(Self.powerOCRCardAnchorID)
             ocrProcessingCard
 
             if ocrEnabled {
@@ -2510,58 +2564,96 @@ public struct SettingsView: View {
                     }
                 }
         }
+        .overlay {
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(
+                    Color.retraceAccent.opacity(isOCRCardHighlighted ? 0.92 : 0),
+                    lineWidth: isOCRCardHighlighted ? 2.5 : 0
+                )
+                .shadow(
+                    color: Color.retraceAccent.opacity(isOCRCardHighlighted ? 0.45 : 0),
+                    radius: 12
+                )
+                .animation(.easeInOut(duration: 0.2), value: isOCRCardHighlighted)
+        }
     }
 
     @ViewBuilder
     private var powerEfficiencyCard: some View {
-        ModernSettingsCard(title: "Power Efficiency", icon: "leaf.fill") {
+        ModernSettingsCard(title: "Processing Speed", icon: "gauge.with.dots.needle.33percent") {
                     VStack(alignment: .leading, spacing: 16) {
                         HStack {
-                            Text("Max OCR rate")
+                            Text("OCR Priority")
                                 .font(.retraceCalloutMedium)
                                 .foregroundColor(.retracePrimary)
                             Spacer()
-                            Text(ocrRateDisplayText)
+                            Text(processingLevelDisplayText)
                                 .font(.retraceCalloutBold)
                                 .foregroundColor(.white)
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
-                                .background(Color.retraceAccent.opacity(0.3))
+                                .background(processingLevelColor.opacity(0.3))
                                 .cornerRadius(8)
                         }
 
-                        // Slider: left = slow (0.2 FPS), right = fast (2 FPS/unlimited)
-                        // Storage: 0 = unlimited, 0.2-2 = FPS limit
-                        Slider(value: Binding(
-                            get: { ocrMaxFramesPerSecond == 0 ? 2.0 : ocrMaxFramesPerSecond },
-                            set: { newValue in
-                                if newValue >= 1.9 {
-                                    ocrMaxFramesPerSecond = 0  // Unlimited (treated as 2 FPS)
-                                } else {
-                                    ocrMaxFramesPerSecond = max(0.2, newValue)
-                                }
-                            }
-                        ), in: 0.2...2, step: 0.2)
-                            .tint(.retraceAccent)
-                            .onChange(of: ocrMaxFramesPerSecond) { _ in
+                        // 5-level discrete slider: Efficiency (1) to Max (5)
+                        ModernSlider(
+                            value: Binding(
+                                get: { Double(ocrProcessingLevel) },
+                                set: { ocrProcessingLevel = Int($0) }
+                            ),
+                            range: 1...5,
+                            step: 1
+                        )
+                            .onChange(of: ocrProcessingLevel) { _ in
                                 notifyPowerSettingsChanged()
                             }
 
                         HStack {
-                            Text(ocrRateDescriptionText)
+                            Text(processingLevelLabels)
                                 .font(.retraceCaption2)
                                 .foregroundColor(.retraceSecondary.opacity(0.7))
-
                             Spacer()
+                        }
 
-                            if ocrMaxFramesPerSecond != SettingsDefaults.ocrMaxFramesPerSecond {
+                        // CPU profile visualization
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 0) {
+                                Text("CPU over time")
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                                Spacer()
+                                Text(processingLevelSummary)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                            }
+
+                            cpuProfileGraph
+                                .frame(height: 32)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+
+                            ForEach(processingLevelBullets, id: \.self) { bullet in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text("•")
+                                        .font(.retraceCaption2)
+                                        .foregroundColor(.retraceSecondary.opacity(0.6))
+                                    Text(bullet)
+                                        .font(.retraceCaption2)
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                            }
+                        }
+
+                        if ocrProcessingLevel != SettingsDefaults.ocrProcessingLevel {
+                            HStack {
+                                Spacer()
                                 Button(action: {
-                                    ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+                                    ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
                                 }) {
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.counterclockwise")
                                             .font(.system(size: 10))
-                                        Text("Reset")
+                                        Text("Reset to default")
                                             .font(.retraceCaption2)
                                     }
                                     .foregroundColor(.white.opacity(0.7))
@@ -2697,25 +2789,106 @@ public struct SettingsView: View {
         .cornerRadius(10)
     }
 
-    private var ocrRateDisplayText: String {
-        if ocrMaxFramesPerSecond == 0 {
-            return "Unlimited"
-        } else {
-            return String(format: "%.1f FPS", ocrMaxFramesPerSecond)
+    private var processingLevelDisplayText: String {
+        switch ocrProcessingLevel {
+        case 1: return "Efficiency"
+        case 2: return "Light"
+        case 3: return "Balanced"
+        case 4: return "Performance"
+        case 5: return "Max"
+        default: return "Balanced"
         }
     }
 
-    private var ocrRateDescriptionText: String {
-        if ocrMaxFramesPerSecond == 0 {
-            return "Process frames as fast as possible (may cause fan noise)"
-        } else if ocrMaxFramesPerSecond <= 0.3 {
-            return "Ultra low power - maximum CPU smoothing, higher OCR delay"
-        } else if ocrMaxFramesPerSecond <= 0.5 {
-            return "Quietest mode - minimal CPU and fan activity"
-        } else if ocrMaxFramesPerSecond <= 1.0 {
-            return "Balanced - good performance with low fan noise"
-        } else {
-            return "Higher performance - may increase fan activity"
+    private var processingLevelColor: Color {
+        switch ocrProcessingLevel {
+        case 1: return .green
+        case 2: return .green
+        case 3: return .retraceAccent
+        case 4: return .orange
+        case 5: return .red
+        default: return .retraceAccent
+        }
+    }
+
+    private var processingLevelLabels: String {
+        "Efficiency  ·  Light  ·  Balanced  ·  Performance  ·  Max"
+    }
+
+    private var processingLevelSummary: String {
+        switch ocrProcessingLevel {
+        case 1: return "Low CPU, always running"
+        case 2: return "Low CPU, mostly running"
+        case 3: return "Moderate bursts, some idle"
+        case 4: return "Intense bursts, more idle"
+        case 5: return "Intense spikes, done fast"
+        default: return "Moderate bursts, some idle"
+        }
+    }
+
+    /// CPU usage profile pattern for each level
+    /// Values represent relative CPU intensity (0–1) over time slices
+    private var cpuProfilePattern: [CGFloat] {
+        switch ocrProcessingLevel {
+        case 1: // Constant low hum, never stops
+            return [0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19, 0.18, 0.20, 0.19]
+        case 2: // Low steady with occasional tiny dips
+            return [0.35, 0.38, 0.36, 0.34, 0.37, 0.35, 0.33, 0.36, 0.34, 0.08, 0.35, 0.37, 0.34, 0.36, 0.35, 0.33, 0.37, 0.35, 0.08, 0.34, 0.36, 0.35, 0.37, 0.34]
+        case 3: // Moderate bursts with short idle gaps
+            return [0.65, 0.70, 0.60, 0.55, 0.08, 0.08, 0.08, 0.60, 0.68, 0.65, 0.55, 0.08, 0.08, 0.08, 0.62, 0.70, 0.58, 0.08, 0.08, 0.08, 0.65, 0.68, 0.60, 0.08, 0.08, 0.08, 0.55, 0.62]
+        case 4: // Tall spikes with longer idle periods
+            return [0.85, 0.90, 0.80, 0.08, 0.08, 0.08, 0.08, 0.08, 0.82, 0.88, 0.85, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.86, 0.92, 0.80, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]
+        case 5: // Intense sharp spikes, lots of silence
+            return [1.0, 0.95, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.92, 1.0, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.95, 1.0, 0.08, 0.08, 0.08, 0.08, 0.08]
+        default:
+            return [0.65, 0.70, 0.60, 0.55, 0.08, 0.08, 0.08, 0.60, 0.68, 0.65, 0.55, 0.08, 0.08, 0.08, 0.62, 0.70, 0.58, 0.08, 0.08, 0.08, 0.65, 0.68, 0.60, 0.08, 0.08, 0.08, 0.55, 0.62]
+        }
+    }
+
+    @ViewBuilder
+    private var cpuProfileGraph: some View {
+        let pattern = cpuProfilePattern
+        let color = processingLevelColor
+        GeometryReader { geo in
+            HStack(alignment: .bottom, spacing: 1.5) {
+                ForEach(0..<pattern.count, id: \.self) { i in
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(color.opacity(pattern[i] > 0.1 ? 0.6 : 0.15))
+                        .frame(height: max(2, geo.size.height * pattern[i]))
+                }
+            }
+        }
+    }
+
+    private var processingLevelBullets: [String] {
+        switch ocrProcessingLevel {
+        case 1: return [
+            "~0.5 frames/sec  ·  70–90% CPU",
+            "Low CPU but always running — the queue will grow and never catch up",
+            "Use if you rarely search for recent activity"
+        ]
+        case 2: return [
+            "~1 frame/sec  ·  110–130% CPU",
+            "Low intensity, mostly running — may fall behind during busy sessions but catches up when idle"
+        ]
+        case 3: return [
+            "~1.5 frames/sec  ·  150–200% CPU",
+            "Moderate bursts then idle — keeps up with most workflows",
+            "Recommended for most users"
+        ]
+        case 4: return [
+            "~2 frames/sec  ·  200–300% CPU",
+            "Intense bursts then longer idle periods — stays current even during fast-paced work"
+        ]
+        case 5: return [
+            "~3–4 frames/sec  ·  250–450% CPU  ·  2 workers",
+            "Sharp spikes then done — everything is searchable almost instantly"
+        ]
+        default: return [
+            "~1.5 frames/sec  ·  150–200% CPU",
+            "Moderate bursts then idle — keeps up with most workflows",
+            "Recommended for most users"
+        ]
         }
     }
 
@@ -2815,7 +2988,7 @@ public struct SettingsView: View {
     func resetPowerSettings() {
         ocrEnabled = SettingsDefaults.ocrEnabled
         ocrOnlyWhenPluggedIn = SettingsDefaults.ocrOnlyWhenPluggedIn
-        ocrMaxFramesPerSecond = SettingsDefaults.ocrMaxFramesPerSecond
+        ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
         ocrAppFilterMode = SettingsDefaults.ocrAppFilterMode
         ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
         notifyPowerSettingsChanged()
@@ -4390,18 +4563,6 @@ private struct RetentionTagsChip<PopoverContent: View>: View {
         .popover(isPresented: $isPopoverShown, arrowEdge: .bottom) {
             popoverContent()
         }
-    }
-}
-
-extension SettingsView {
-    private static func logSettingsLayout(windowWidth: CGFloat) {
-        let sidebarWidth: CGFloat = 220
-        let dividerWidth: CGFloat = 1
-        let contentWidth = windowWidth - sidebarWidth - dividerWidth
-        Log.debug(
-            "[SETTINGS-LAYOUT] windowWidth: \(windowWidth), sidebarWidth: \(sidebarWidth), contentWidth: \(contentWidth)",
-            category: .ui
-        )
     }
 }
 

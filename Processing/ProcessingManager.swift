@@ -26,9 +26,6 @@ public actor ProcessingManager: ProcessingProtocol {
     private var previousFrame: CapturedFrame?
     private var useRegionBasedOCR: Bool = true
 
-    // Serialization for region-based OCR (prevents concurrent cache access)
-    private var extractionQueue: [CheckedContinuation<Void, Never>] = []
-    private var isExtractingText: Bool = false
 
     // Region OCR statistics
     private var totalEnergySavings: Double = 0
@@ -55,36 +52,10 @@ public actor ProcessingManager: ProcessingProtocol {
         self.config = config
     }
 
-    /// Helper to resume next queued extraction or clear the flag
-    private func finishExtraction() {
-        if !extractionQueue.isEmpty {
-            let next = extractionQueue.removeFirst()
-            next.resume()
-        } else {
-            isExtractingText = false
-        }
-    }
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
         let startTime = Date()
-
-        // Serialize extraction calls to prevent race conditions with region-based OCR cache
-        if isExtractingText {
-            await withCheckedContinuation { continuation in
-                extractionQueue.append(continuation)
-            }
-        }
-        isExtractingText = true
-
-
-        do {
-            let result = try await extractTextInternal(from: frame, startTime: startTime)
-            finishExtraction()
-            return result
-        } catch {
-            finishExtraction()
-            throw error
-        }
+        return try await extractTextInternal(from: frame, startTime: startTime)
     }
 
     private func extractTextInternal(from frame: CapturedFrame, startTime: Date) async throws -> ExtractedText {

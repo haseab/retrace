@@ -207,6 +207,8 @@ struct DashboardContentView: View {
     @State private var initialSettingsTab: SettingsTab? = nil
     @State private var initialSettingsScrollTargetID: String? = nil
     @State private var hasLoadedDashboard = false
+    /// Forces a SwiftUI refresh when global appearance preferences change.
+    @State private var appearanceRefreshTick = 0
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
@@ -285,6 +287,12 @@ struct DashboardContentView: View {
                 selectedView = .settings
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
+            appearanceRefreshTick &+= 1
+        }
         .onReceive(NotificationCenter.default.publisher(for: .toggleSettings)) { _ in
             // Toggle: if on settings go to dashboard, otherwise go to settings
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -319,6 +327,14 @@ struct DashboardContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
             initialSettingsTab = .capture
             initialSettingsScrollTargetID = SettingsView.pauseReminderIntervalTargetID
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selectedView = .settings
+            }
+            DashboardWindowController.shared.show()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+            initialSettingsTab = .power
+            initialSettingsScrollTargetID = SettingsView.powerOCRCardTargetID
             withAnimation(.easeInOut(duration: 0.2)) {
                 selectedView = .settings
             }

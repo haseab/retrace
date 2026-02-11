@@ -519,7 +519,7 @@ public actor AppCoordinator {
         // Get OCR enabled state (defaults to true if not set)
         let ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
         let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
-        let maxFPS = (defaults.object(forKey: "ocrMaxFramesPerSecond") as? NSNumber)?.doubleValue ?? 1.0
+        let processingLevel = (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3
 
         // Parse app filter mode and filtered apps
         let filterModeRaw = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
@@ -559,6 +559,42 @@ public actor AppCoordinator {
         // Get current power source
         let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
 
+        // Derive priority, FPS limit, and worker count from processing level
+        // Level 1: Very Low  - background, 0.5 FPS, 1 worker
+        // Level 2: Low       - background, no limit, 1 worker
+        // Level 3: Medium    - utility, no limit, 1 worker
+        // Level 4: High      - medium, no limit, 1 worker
+        // Level 5: Very High - high, no limit, 2 workers
+        let taskPriority: TaskPriority
+        let maxFPS: Double
+        let workerCount: Int
+        switch processingLevel {
+        case 1:
+            taskPriority = .background; maxFPS = 0.5; workerCount = 1
+        case 2:
+            taskPriority = .background; maxFPS = 0; workerCount = 1
+        case 4:
+            taskPriority = .medium; maxFPS = 0; workerCount = 1
+        case 5:
+            taskPriority = .high; maxFPS = 0; workerCount = 2
+        default: // 3 = Medium (default)
+            taskPriority = .background; maxFPS = 0; workerCount = 2
+        }
+
+        // Update processing config - always prefer background processing for VNRecognizeTextRequest
+        let currentConfig = await services.processing.getConfig()
+        let preferBackground = true
+        if currentConfig.preferBackgroundProcessing != preferBackground {
+            let updatedConfig = ProcessingConfig(
+                accessibilityEnabled: currentConfig.accessibilityEnabled,
+                ocrAccuracyLevel: currentConfig.ocrAccuracyLevel,
+                recognitionLanguages: currentConfig.recognitionLanguages,
+                minimumConfidence: currentConfig.minimumConfidence,
+                preferBackgroundProcessing: preferBackground
+            )
+            await services.processing.updateConfig(updatedConfig)
+        }
+
         // Apply to processing queue
         if let queue = await services.processingQueue {
             await queue.updatePowerConfig(
@@ -566,6 +602,8 @@ public actor AppCoordinator {
                 pauseOnBattery: pauseOnBattery,
                 currentPowerSource: powerSource,
                 maxFPS: maxFPS,
+                workerCount: workerCount,
+                taskPriority: taskPriority,
                 excludedBundleIDs: excludedBundleIDs,
                 includedBundleIDs: includedBundleIDs
             )
@@ -573,7 +611,7 @@ public actor AppCoordinator {
             Log.warning("[AppCoordinator] processingQueue is nil, cannot apply power config", category: .app)
         }
 
-        Log.info("[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), maxFPS=\(maxFPS), power=\(powerSource), filterMode=\(filterMode), excluded=\(excludedBundleIDs), included=\(includedBundleIDs)", category: .app)
+        Log.info("[AppCoordinator] Applied power settings: ocrEnabled=\(ocrEnabled), level=\(processingLevel), workers=\(workerCount), priority=\(taskPriority), maxFPS=\(maxFPS), preferBgProcessing=\(preferBackground), pauseOnBattery=\(pauseOnBattery), power=\(powerSource)", category: .app)
     }
 
     /// Handle capture stopped unexpectedly (e.g., user clicked "Stop sharing" in macOS)
@@ -729,7 +767,7 @@ public actor AppCoordinator {
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
         for await frame in frameStream {
-            Log.debug("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
+            Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
             if Task.isCancelled {
                 Log.info("Pipeline task cancelled", category: .app)
@@ -831,7 +869,7 @@ public actor AppCoordinator {
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
 
-                Log.debug("[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), app=\(frame.metadata.appName)", category: .app)
+                Log.verbose("[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), app=\(frame.metadata.appName)", category: .app)
 
                 if writerState.frameCount % videoUpdateInterval == 0 {
                     let width = await writerState.writer.frameWidth

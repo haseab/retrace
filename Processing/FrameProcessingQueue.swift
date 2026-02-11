@@ -63,6 +63,9 @@ public actor FrameProcessingQueue {
     /// 0 = no delay (unlimited), otherwise nanoseconds between frames
     private var minDelayBetweenFramesNs: UInt64 = 0
 
+    /// Task priority for worker tasks
+    private var workerPriority: TaskPriority = .utility
+
     /// Bundle IDs to exclude from OCR (when ocrAppFilterMode == .allExceptTheseApps)
     private var ocrExcludedBundleIDs: Set<String> = []
 
@@ -104,6 +107,8 @@ public actor FrameProcessingQueue {
         pauseOnBattery: Bool,
         currentPowerSource: PowerStateMonitor.PowerSource,
         maxFPS: Double,
+        workerCount: Int,
+        taskPriority: TaskPriority,
         excludedBundleIDs: Set<String>,
         includedBundleIDs: Set<String>
     ) {
@@ -120,7 +125,62 @@ public actor FrameProcessingQueue {
             self.minDelayBetweenFramesNs = 0
         }
 
-        Log.info("[Queue] Power config updated: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), power=\(currentPowerSource), maxFPS=\(maxFPS), paused=\(isPausedForBattery), excludedApps=\(ocrExcludedBundleIDs), includedApps=\(ocrIncludedBundleIDs)", category: .processing)
+        // Update priority and restart workers if priority changed
+        let priorityChanged = self.workerPriority != taskPriority
+        self.workerPriority = taskPriority
+
+        // Adjust worker count or restart if priority changed
+        if isRunning {
+            if priorityChanged {
+                // Must restart all workers to apply new priority
+                restartWorkers(count: workerCount)
+            } else if workers.count != workerCount {
+                adjustWorkerCount(to: workerCount)
+            }
+        }
+
+        Log.info("[Queue] Power config updated: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), power=\(currentPowerSource), maxFPS=\(maxFPS), workers=\(workers.count), priority=\(taskPriority), paused=\(isPausedForBattery)", category: .processing)
+    }
+
+    /// Adjust the number of running workers to the desired count
+    private func adjustWorkerCount(to desired: Int) {
+        let current = workers.count
+        if desired > current {
+            // Spawn additional workers
+            for workerID in current..<desired {
+                let priority = workerPriority
+                let task = Task(priority: priority) {
+                    await runWorker(id: workerID)
+                }
+                workers.append(task)
+            }
+            Log.info("[Queue] Scaled up workers: \(current) → \(desired)", category: .processing)
+        } else if desired < current {
+            // Cancel excess workers from the end
+            for _ in desired..<current {
+                workers.removeLast().cancel()
+            }
+            Log.info("[Queue] Scaled down workers: \(current) → \(desired)", category: .processing)
+        }
+    }
+
+    /// Restart all workers with current priority and desired count
+    private func restartWorkers(count: Int) {
+        // Cancel all existing workers
+        for worker in workers {
+            worker.cancel()
+        }
+        workers.removeAll()
+
+        // Spawn new workers with updated priority
+        let priority = workerPriority
+        for workerID in 0..<count {
+            let task = Task(priority: priority) {
+                await runWorker(id: workerID)
+            }
+            workers.append(task)
+        }
+        Log.info("[Queue] Restarted \(count) workers with priority \(priority)", category: .processing)
     }
 
     /// Check if OCR should be processed for a specific bundle ID
@@ -228,8 +288,9 @@ public actor FrameProcessingQueue {
 
         // Log.info("[Queue-DIAG] Starting \(config.workerCount) processing workers, isRunning=\(isRunning)", category: .processing)
 
+        let priority = workerPriority
         for workerID in 0..<config.workerCount {
-            let task = Task(priority: .background) {
+            let task = Task(priority: priority) {
                 await runWorker(id: workerID)
             }
             workers.append(task)
@@ -257,23 +318,24 @@ public actor FrameProcessingQueue {
 
     /// Worker loop - processes frames from queue
     private func runWorker(id: Int) async {
-        // Log.info("[Queue-DIAG] Worker \(id) STARTED and entering run loop", category: .processing)
+        Log.info("[Queue] Worker \(id) STARTED (total workers: \(workers.count))", category: .processing)
 
         // Initial delay to ensure database is fully stable
         // This prevents race conditions on first launch after onboarding
         try? await Task.sleep(nanoseconds: 500_000_000) // 500ms - increased for stability
-        // Log.info("[Queue-DIAG] Worker \(id) finished initial delay, entering main loop", category: .processing)
 
-        while isRunning {
+        while isRunning && !Task.isCancelled {
             // Check if OCR is disabled globally
             guard ocrEnabled else {
                 try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s poll when disabled
+                if Task.isCancelled { break }
                 continue
             }
 
             // Check if paused due to battery power
             guard !isPausedForBattery else {
                 try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s poll when paused for battery
+                if Task.isCancelled { break }
                 continue
             }
 
@@ -281,6 +343,7 @@ public actor FrameProcessingQueue {
             guard await databaseManager.isReady() else {
                 // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
                 try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                if Task.isCancelled { break }
                 continue
             }
 
@@ -338,6 +401,9 @@ public actor FrameProcessingQueue {
                     }
                 }
 
+            } catch is CancellationError {
+                Log.debug("[Queue] Worker \(id) cancelled", category: .processing)
+                break
             } catch {
                 Log.error("[Queue-DIAG] Worker \(id) error: \(error)", category: .processing)
                 try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s backoff
@@ -353,7 +419,7 @@ public actor FrameProcessingQueue {
     /// Returns ProcessFrameResult indicating success, skip, or deferral
     private func processFrame(_ queuedFrame: QueuedFrame) async throws -> ProcessFrameResult {
         let frameID = queuedFrame.frameID
-        // Log.info("[Queue-DIAG] processFrame START for frame \(frameID)", category: .processing)
+        let t0 = CFAbsoluteTimeGetCurrent()
 
         // Get frame with video info (includes isVideoFinalized and bundleID in metadata)
         guard let frameWithInfo = try await databaseManager.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
@@ -383,16 +449,12 @@ public actor FrameProcessingQueue {
 
         // Mark as processing
         try await updateFrameProcessingStatus(frameID, status: .processing)
-        // Log.info("[Queue-DIAG] Frame \(frameID) marked as processing", category: .processing)
-
-        // Log.info("[Queue-DIAG] Frame \(frameID) found, videoID=\(frameRef.videoID.value), segmentID=\(frameRef.segmentID.value)", category: .processing)
 
         // Get video segment for dimensions (needed for node insertion)
         guard let videoSegment = try await databaseManager.getVideoSegment(id: frameRef.videoID) else {
             Log.error("[Queue-DIAG] Video segment \(frameRef.videoID.value) not found!", category: .processing)
             throw DatabaseError.queryFailed(query: "getVideoSegment", underlying: "Video segment \(frameRef.videoID) not found")
         }
-        // Log.info("[Queue-DIAG] Frame \(frameID) videoPath=\(videoSegment.relativePath)", category: .processing)
 
         // CRITICAL: Verify video file exists before attempting any extraction
         // This prevents infinite retry loops when database points to missing files
@@ -407,17 +469,17 @@ public actor FrameProcessingQueue {
             return .success // Return success to not re-queue (it's a permanent failure)
         }
 
+        let tPrep = CFAbsoluteTimeGetCurrent()
+
         // Check if we have cached frame data (avoids B-frame timing issues)
         let capturedFrame: CapturedFrame
         if let cachedFrame = frameDataCache[frameID] {
             // Use cached frame data directly - guaranteed correct
             capturedFrame = cachedFrame
             frameDataCache.removeValue(forKey: frameID)  // Clear from cache after use
-            // Log.info("[Queue-DIAG] Frame \(frameID) using cached frame data, cache size now: \(frameDataCache.count)", category: .processing)
         } else {
             // Fallback: extract from video (used for deferred mode, reprocessOCR, or crash recovery)
             // At this point we've verified the video is finalized, so presentation order is correct
-            // Log.info("[Queue-DIAG] Frame \(frameID) no cached data, extracting from video (fallback path)", category: .processing)
 
             // Extract the actual segment ID from the path (last path component is the timestamp-based ID)
             let pathComponents = videoSegment.relativePath.split(separator: "/")
@@ -428,12 +490,10 @@ public actor FrameProcessingQueue {
             }
 
             // Load frame image from video using the actual segment ID from the filename
-            // Log.info("[Queue-DIAG] Frame \(frameID) loading image from segment \(actualSegmentID), frameIndex=\(frameRef.frameIndexInSegment)", category: .processing)
             let frameData = try await storage.readFrame(
                 segmentID: VideoSegmentID(value: actualSegmentID),
                 frameIndex: frameRef.frameIndexInSegment
             )
-            // Log.info("[Queue-DIAG] Frame \(frameID) loaded \(frameData.count) bytes of image data", category: .processing)
 
             // Convert JPEG data to CapturedFrame for OCR
             guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
@@ -442,24 +502,20 @@ public actor FrameProcessingQueue {
             }
             capturedFrame = convertedFrame
         }
-        // Log.info("[Queue-DIAG] Frame \(frameID) ready for OCR, size=\(capturedFrame.width)x\(capturedFrame.height)", category: .processing)
+
+        let tFrame = CFAbsoluteTimeGetCurrent()
 
         // Run OCR
-        // Log.info("[Queue-DIAG] Frame \(frameID) starting OCR extraction", category: .processing)
         let extractedText = try await processing.extractText(from: capturedFrame)
 
-        // Debug: Log first 100 chars of extracted text to verify we're processing the right frame
-        let textPreview = extractedText.fullText.prefix(100).replacingOccurrences(of: "\n", with: " ")
-        // Log.info("[OCR-TRACE] frameID=\(frameID) OCR found \(extractedText.regions.count) regions, text preview: \"\(textPreview)...\"", category: .processing)
+        let tOCR = CFAbsoluteTimeGetCurrent()
 
         // Index in FTS
-        // Log.info("[Queue-DIAG] Frame \(frameID) indexing in FTS, segmentId=\(frameRef.segmentID.value)", category: .processing)
         let docid = try await search.index(
             text: extractedText,
             segmentId: frameRef.segmentID.value,
             frameId: frameID
         )
-        // Log.info("[Queue-DIAG] Frame \(frameID) FTS indexed with docid=\(docid)", category: .processing)
 
         // Insert OCR nodes
         if docid > 0 && !extractedText.regions.isEmpty {
@@ -488,13 +544,14 @@ public actor FrameProcessingQueue {
                 frameWidth: videoSegment.width,
                 frameHeight: videoSegment.height
             )
-            // Log.info("[Queue-DIAG] Frame \(frameID) inserted \(nodeData.count) OCR nodes", category: .processing)
-        } else {
-            // Log.warning("[Queue-DIAG] Frame \(frameID) skipped node insertion: docid=\(docid), regions=\(extractedText.regions.count)", category: .processing)
         }
 
         // Mark as completed
         try await updateFrameProcessingStatus(frameID, status: .completed)
+
+        let tDone = CFAbsoluteTimeGetCurrent()
+        Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(capturedFrame.width)x\(capturedFrame.height)", category: .processing)
+
         return .success
     }
 
@@ -763,7 +820,7 @@ public actor FrameProcessingQueue {
             processingCount: processing,
             totalProcessed: totalProcessed,
             totalFailed: totalFailed,
-            workerCount: config.workerCount
+            workerCount: workers.count
         )
     }
 }

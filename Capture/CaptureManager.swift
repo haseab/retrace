@@ -349,7 +349,7 @@ public actor CaptureManager: CaptureProtocol {
                         lastFrameTime: frame.timestamp
                     )
 
-                    Log.debug("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
+                    Log.verbose("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
                 } else {
                     // Frame was filtered out
                     stats = CaptureStatistics(

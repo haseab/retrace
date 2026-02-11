@@ -12,6 +12,8 @@ public struct SimpleTimelineView: View {
 
     @ObservedObject private var viewModel: SimpleTimelineViewModel
     @State private var hasInitialized = false
+    /// Forces a SwiftUI refresh when global appearance preferences change.
+    @State private var appearanceRefreshTick = 0
     /// Tracks whether the live screenshot has been displayed, allowing AVPlayer to pre-mount underneath
     @State private var liveScreenshotHasAppeared = false
 
@@ -355,6 +357,12 @@ public struct SimpleTimelineView: View {
                 viewModel.stopPeriodicStatusRefresh()
                 // Stop video playback when timeline is closed
                 viewModel.stopPlayback()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
+                appearanceRefreshTick &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
+                appearanceRefreshTick &+= 1
             }
             // Note: Keyboard shortcuts (Option+F, Cmd+F, Escape) are handled by TimelineWindowController
             // at the window level for more reliable event handling
@@ -4392,7 +4400,7 @@ struct TagSubmenuRow: View {
 
 /// Floating vertical card panel for timeline filtering
 /// Shared UserDefaults store for accessing settings
-private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app")
+private let filterPanelSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
 struct FilterPanel: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel

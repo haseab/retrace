@@ -252,16 +252,21 @@ public struct ProcessingConfig: Codable, Sendable {
     /// Minimum confidence threshold for OCR results (0-1)
     public let minimumConfidence: Float
 
+    /// Hint to Vision to prefer background processing (lower resource usage)
+    public let preferBackgroundProcessing: Bool
+
     public init(
         accessibilityEnabled: Bool = true,
         ocrAccuracyLevel: OCRAccuracyLevel = .accurate,
         recognitionLanguages: [String] = ["en-US"],
-        minimumConfidence: Float = 0.5
+        minimumConfidence: Float = 0.5,
+        preferBackgroundProcessing: Bool = false
     ) {
         self.accessibilityEnabled = accessibilityEnabled
         self.ocrAccuracyLevel = ocrAccuracyLevel
         self.recognitionLanguages = recognitionLanguages
         self.minimumConfidence = minimumConfidence
+        self.preferBackgroundProcessing = preferBackgroundProcessing
     }
 
     public static let `default` = ProcessingConfig()
