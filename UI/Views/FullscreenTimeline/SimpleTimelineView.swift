@@ -296,38 +296,38 @@ public struct SimpleTimelineView: View {
 	                    )
 	                }
 
-                // Toast feedback overlay (e.g. "Copied!")
+                // Toast feedback overlay (centered, larger for errors)
                 if viewModel.toastMessage != nil {
                     VStack {
-                        HStack(spacing: 8) {
+                        Spacer()
+                        HStack(spacing: 12) {
                             if let icon = viewModel.toastIcon {
                                 Image(systemName: icon)
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundColor(.green)
+                                    .font(.system(size: 22, weight: .semibold))
+                                    .foregroundColor(.red)
                             }
                             if let message = viewModel.toastMessage {
                                 Text(message)
-                                    .font(.system(size: 14, weight: .medium))
+                                    .font(.system(size: 17, weight: .semibold))
                                     .foregroundColor(.white)
                             }
                         }
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 18)
                         .background(
                             ZStack {
-                                RoundedRectangle(cornerRadius: 12)
+                                RoundedRectangle(cornerRadius: 16)
                                     .fill(.ultraThinMaterial)
                                     .environment(\.colorScheme, .dark)
-                                RoundedRectangle(cornerRadius: 12)
-                                    .fill(Color.black.opacity(0.4))
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+                                RoundedRectangle(cornerRadius: 16)
+                                    .fill(Color.black.opacity(0.5))
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(Color.red.opacity(0.3), lineWidth: 1)
                             }
                         )
-                        .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
-                        .scaleEffect(viewModel.toastVisible ? 1.0 : 0.8)
+                        .shadow(color: .black.opacity(0.4), radius: 20, y: 8)
+                        .scaleEffect(viewModel.toastVisible ? 1.0 : 0.85)
                         .opacity(viewModel.toastVisible ? 1.0 : 0.0)
-                        .padding(.top, 60)
                         Spacer()
                     }
                     .allowsHitTesting(false)
@@ -1557,6 +1557,8 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // For final state, progress is 1.0
         let progress: CGFloat = (isTransitioning || isExitTransitioning) ? animationProgress : 1.0
 
+        let _ = Log.debug("[ZoomDismiss] ZoomUnifiedOverlay rendered - isTransitioning: \(isTransitioning), isExitTransitioning: \(isExitTransitioning), progress: \(progress)", category: .ui)
+
         // Convert zoomRegion from actualFrameRect-normalized coords to screen coords
         // The normalized Y from screenToNormalizedCoords is already in "top-down" space (0=top, 1=bottom)
         // So we just multiply directly without flipping again
@@ -1626,19 +1628,32 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         // Content and border animate together from start position
         // Dimming stays constant throughout - no fade, just like during drag
         ZStack {
-            // Light blur on the background - fades in as image centers
+            // LAYER 1: Dismiss overlay - full screen, tappable to exit zoom
+            // Bottom layer to catch clicks that pass through all other layers
+            if !isTransitioning && !isExitTransitioning {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        Log.debug("[ZoomDismiss] Dismiss overlay tapped - exiting zoom region", category: .ui)
+                        viewModel.exitZoomRegion()
+                    }
+            }
+
+            // LAYER 2: Light blur on the background - visual only, no interaction
             Rectangle()
                 .fill(.regularMaterial)
                 .opacity(targetBlur * 0.3)
+                .allowsHitTesting(false)
 
-            // Darken outside the rectangle - constant opacity to match drag preview
+            // LAYER 3: Darken outside the rectangle - visual only, no interaction
             InverseRoundedRectCutout(
                 cutoutRect: targetRect,
                 cornerRadius: 12
             )
             .fill(Color.black.opacity(0.6), style: FillStyle(eoFill: true))
+            .allowsHitTesting(false)
 
-            // The zoomed content that animates from original position to center
+            // LAYER 4: The zoomed content - visual only (interaction handled by overlay on top)
             zoomedContentView()
                 .frame(width: containerSize.width, height: containerSize.height)
                 .scaleEffect(targetScale, anchor: .center)
@@ -1649,14 +1664,16 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                         .frame(width: targetRect.width, height: targetRect.height)
                         .position(x: targetRect.midX, y: targetRect.midY)
                 }
+                .allowsHitTesting(false)
 
-            // White border around the rectangle
+            // LAYER 5: White border - visual only, no interaction
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
                 .frame(width: targetRect.width, height: targetRect.height)
                 .position(x: targetRect.midX, y: targetRect.midY)
+                .allowsHitTesting(false)
 
-            // Text selection overlay - only show when NOT transitioning (final state)
+            // LAYER 6: Text selection overlay - interactive within zoomed region only
             if !isTransitioning && !isExitTransitioning && !viewModel.ocrNodes.isEmpty {
                 ZoomedTextSelectionOverlay(
                     viewModel: viewModel,
@@ -1664,9 +1681,10 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                     containerSize: containerSize,
                     zoomedRect: endRect
                 )
+                // This layer handles text selection - allows hit testing only within its bounds
             }
 
-            // Action menu on the right side - animate in with the zoom
+            // LAYER 7: Action menu - interactive, should receive clicks
             ZoomActionMenu(
                 viewModel: viewModel,
                 zoomRegion: zoomRegion
@@ -1674,7 +1692,11 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             .frame(width: menuWidth)
             .position(x: menuX + menuWidth / 2, y: menuY)
             .opacity(progress)
-            .offset(x: lerp(30, 0, progress))  // Slide in from right
+            .offset(x: lerp(30, 0, progress))
+            .onTapGesture {
+                // This catches clicks on the menu background to prevent dismissal
+                Log.debug("[ZoomDismiss] Menu area tapped - ignoring", category: .ui)
+            }
         }
         .allowsHitTesting(!isTransitioning && !isExitTransitioning)
         // Animate all interpolated values together

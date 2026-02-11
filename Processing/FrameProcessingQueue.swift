@@ -229,7 +229,7 @@ public actor FrameProcessingQueue {
         // Log.info("[Queue-DIAG] Starting \(config.workerCount) processing workers, isRunning=\(isRunning)", category: .processing)
 
         for workerID in 0..<config.workerCount {
-            let task = Task {
+            let task = Task(priority: .background) {
                 await runWorker(id: workerID)
             }
             workers.append(task)

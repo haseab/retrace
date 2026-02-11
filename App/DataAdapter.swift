@@ -243,9 +243,6 @@ public actor DataAdapter {
 
     /// Optimized filtered query - tries Retrace first, then Rewind to get full limit
     private func getMostRecentFramesWithFilters(limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
-        let queryStartTime = CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("DA_FILTERS_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
-
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
 
@@ -257,7 +254,6 @@ public actor DataAdapter {
 
         // Step 1: Try Retrace first (unless excluded)
         if !excludeRetrace {
-            logTabClickTiming("DA_RETRACE_QUERY_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             let retraceFrames = try queryMostRecentFramesWithFiltersOptimized(
                 limit: limit,
                 connection: retraceConnection,
@@ -265,7 +261,6 @@ public actor DataAdapter {
                 filters: filters,
                 isRewindDatabase: false
             )
-            logTabClickTiming("DA_RETRACE_QUERY_DONE (count=\(retraceFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             allFrames.append(contentsOf: retraceFrames)
             remaining = limit - retraceFrames.count
             Log.debug("[Filter] Got \(retraceFrames.count) frames from Retrace, need \(remaining) more", category: .database)
@@ -278,7 +273,6 @@ public actor DataAdapter {
                            filters.hiddenFilter == .onlyHidden
         let startDateAfterCutoff = cutoffDate != nil && filters.startDate != nil && filters.startDate! >= cutoffDate!
         if remaining > 0, !excludeRewind, !hasTagFilters, !startDateAfterCutoff, let rewind = rewindConnection, let config = rewindConfig {
-            logTabClickTiming("DA_REWIND_QUERY_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             let rewindFrames = try queryMostRecentFramesWithFiltersOptimized(
                 limit: remaining,
                 connection: rewind,
@@ -286,7 +280,6 @@ public actor DataAdapter {
                 filters: filters,
                 isRewindDatabase: true
             )
-            logTabClickTiming("DA_REWIND_QUERY_DONE (count=\(rewindFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
             allFrames.append(contentsOf: rewindFrames)
             Log.debug("[Filter] Got \(rewindFrames.count) frames from Rewind", category: .database)
         } else if startDateAfterCutoff {
@@ -295,31 +288,7 @@ public actor DataAdapter {
 
         // Sort by timestamp descending (newest first)
         allFrames.sort { $0.frame.timestamp > $1.frame.timestamp }
-        logTabClickTiming("DA_FILTERS_COMPLETE (total=\(allFrames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
         return allFrames
-    }
-
-    // MARK: - Tab Click Timing
-
-    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-    /// Log timing for tab click filter queries
-    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, filter: String?) {
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let filterInfo = filter ?? "no-filter"
-        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.tabClickLogPath)
-            }
-        }
     }
 
     /// Get most recent frames
@@ -853,6 +822,11 @@ public actor DataAdapter {
     // MARK: - Source Information
 
     /// Get registered sources
+    /// Public accessor for Rewind cutoff date (used to determine if data is from Rewind)
+    public var rewindCutoffDate: Date? {
+        cutoffDate
+    }
+
     public var registeredSources: [FrameSource] {
         var sources: [FrameSource] = [.native]
         if rewindConnection != nil {
@@ -1015,10 +989,6 @@ public actor DataAdapter {
         filters: FilterCriteria,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
-        let queryStartTime = CFAbsoluteTimeGetCurrent()
-        let dbName = isRewindDatabase ? "REWIND" : "RETRACE"
-        logTabClickTiming("SQL_\(dbName)_BUILD_START", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
-
         var whereClauses: [String] = []
         var bindIndex = 1
 
@@ -1161,7 +1131,6 @@ public actor DataAdapter {
         Log.debug("[Filter] Window name filter: \(filters.windowNameFilter ?? "nil")", category: .database)
         Log.debug("[Filter] Browser URL filter: \(filters.browserUrlFilter ?? "nil")", category: .database)
         Log.debug("[Filter] Date range: \(String(describing: filters.startDate)) - \(String(describing: filters.endDate))", category: .database)
-        logTabClickTiming("SQL_\(dbName)_QUERY_BUILT", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         let statement: OpaquePointer?
         do {
@@ -1178,7 +1147,6 @@ public actor DataAdapter {
             return []
         }
         defer { connection.finalize(stmt) }
-        logTabClickTiming("SQL_\(dbName)_PREPARED", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         // Bind tag IDs (they appear in the CTE) - ONLY for include mode
         if hasTagFilter && tagFilterMode == .include {
@@ -1247,14 +1215,10 @@ public actor DataAdapter {
         Log.debug("[Filter] Binding limit \(limit) at index \(bindIndex)", category: .database)
         sqlite3_bind_int(stmt, Int32(bindIndex), Int32(limit))
         Log.debug("[Filter] ====== QUERY DEBUG END ======", category: .database)
-        logTabClickTiming("SQL_\(dbName)_BOUND", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         var frames: [FrameWithVideoInfo] = []
         var stepCount = 0
-        let execStartTime = CFAbsoluteTimeGetCurrent()
         var stepResult = sqlite3_step(stmt)
-        let firstStepTime = CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("SQL_\(dbName)_FIRST_STEP (time=\(String(format: "%.1f", (firstStepTime - execStartTime) * 1000))ms)", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         while stepResult == SQLITE_ROW {
             stepCount += 1
@@ -1263,14 +1227,12 @@ public actor DataAdapter {
             }
             stepResult = sqlite3_step(stmt)
         }
-        logTabClickTiming("SQL_\(dbName)_ALL_STEPS (count=\(stepCount))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         if stepResult != SQLITE_DONE {
             Log.error("[Filter] sqlite3_step error code: \(stepResult)", category: .database)
         }
 
         Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
-        logTabClickTiming("SQL_\(dbName)_COMPLETE (frames=\(frames.count))", startTime: queryStartTime, filter: filters.browserUrlFilter ?? filters.selectedApps?.first)
 
         return frames
     }

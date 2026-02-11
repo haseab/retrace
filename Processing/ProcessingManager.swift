@@ -1,22 +1,6 @@
 import Foundation
 import Shared
 
-/// Debug logger that writes to /tmp/retrace_debug.log
-private func debugLog(_ message: String) {
-    let logLine = "[\(Log.timestamp())] [ProcessingManager] \(message)\n"
-    let logPath = "/tmp/retrace_debug.log"
-
-    if let handle = FileHandle(forWritingAtPath: logPath) {
-        handle.seekToEndOfFile()
-        if let data = logLine.data(using: .utf8) {
-            handle.write(data)
-        }
-        handle.closeFile()
-    } else {
-        FileManager.default.createFile(atPath: logPath, contents: logLine.data(using: .utf8))
-    }
-}
-
 // MARK: - ProcessingManager
 
 /// Main actor implementing ProcessingProtocol
@@ -73,7 +57,6 @@ public actor ProcessingManager: ProcessingProtocol {
 
     /// Helper to resume next queued extraction or clear the flag
     private func finishExtraction() {
-        debugLog("finishExtraction, queue size=\(extractionQueue.count)")
         if !extractionQueue.isEmpty {
             let next = extractionQueue.removeFirst()
             next.resume()
@@ -84,19 +67,15 @@ public actor ProcessingManager: ProcessingProtocol {
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
         let startTime = Date()
-        debugLog("extractText START frame=\(frame.width)x\(frame.height), isExtractingText=\(isExtractingText)")
 
         // Serialize extraction calls to prevent race conditions with region-based OCR cache
         if isExtractingText {
-            debugLog("Waiting in queue...")
             await withCheckedContinuation { continuation in
                 extractionQueue.append(continuation)
             }
-            debugLog("Resumed from queue")
         }
         isExtractingText = true
 
-        debugLog("extractText RUNNING frame=\(frame.width)x\(frame.height)")
 
         do {
             let result = try await extractTextInternal(from: frame, startTime: startTime)
@@ -112,7 +91,6 @@ public actor ProcessingManager: ProcessingProtocol {
 
         // Ensure full-frame cache is initialized for region-based OCR
         if fullFrameCache == nil {
-            debugLog("Creating new FullFrameOCRCache")
             fullFrameCache = FullFrameOCRCache()
         }
 
@@ -122,7 +100,6 @@ public actor ProcessingManager: ProcessingProtocol {
         if useRegionBasedOCR, let cache = fullFrameCache {
             // Use region-based OCR for energy efficiency
             // Tiles are used for CHANGE DETECTION only, not for OCR bounding boxes
-            debugLog("Starting region-based OCR, hasPreviousFrame=\(previousFrame != nil)")
             let result = try await ocr.recognizeTextRegionBased(
                 frame: frame,
                 previousFrame: previousFrame,
@@ -130,7 +107,6 @@ public actor ProcessingManager: ProcessingProtocol {
                 config: config
             )
             ocrRegions = result.regions
-            debugLog("Region OCR complete: \(result.stats.tilesOCRed)/\(result.stats.totalTiles) tiles, \(result.regions.count) regions")
 
             // Track energy savings
             regionOCRFrameCount += 1
@@ -142,7 +118,6 @@ public actor ProcessingManager: ProcessingProtocol {
             }
         } else {
             // Fallback to full-frame OCR
-            debugLog("Starting full-frame OCR")
             ocrRegions = try await ocr.recognizeText(
                 imageData: frame.imageData,
                 width: frame.width,
@@ -150,7 +125,6 @@ public actor ProcessingManager: ProcessingProtocol {
                 bytesPerRow: frame.bytesPerRow,
                 config: config
             )
-            debugLog("Full-frame OCR complete: \(ocrRegions.count) regions")
         }
 
         // Store frame for next comparison (region-based OCR)
@@ -250,7 +224,6 @@ public actor ProcessingManager: ProcessingProtocol {
         totalOCRTimeMs += ocrTime
         totalTextLength += extractedText.wordCount
 
-        debugLog("extractTextInternal COMPLETE")
         return extractedText
     }
 

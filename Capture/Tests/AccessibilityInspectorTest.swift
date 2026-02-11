@@ -209,7 +209,7 @@ final class AccessibilityInspectorTest: XCTestCase {
     // MARK: - Safari
 
     private func getSafariURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
-        debugLog("[Safari] Attempting URL extraction...")
+        verboseLog("[Safari] Attempting URL extraction...")
 
         // Method 1: Toolbar → TextField approach
         if let toolbar: AXUIElement = getAttributeValue(window, attribute: "AXToolbar" as CFString),
@@ -219,7 +219,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                    role == kAXTextFieldRole as String,
                    let url: String = getAttributeValue(child, attribute: kAXValueAttribute as CFString),
                    !url.isEmpty {
-                    debugLog("[Safari] ✅ Got URL via toolbar text field")
+                    verboseLog("[Safari] ✅ Got URL via toolbar text field")
                     return (url, "Safari: AXToolbar → AXTextField")
                 }
             }
@@ -227,17 +227,17 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         // Method 2: AXWebArea → AXURL
         if let url = findURLInWebArea(window) {
-            debugLog("[Safari] ✅ Got URL via AXWebArea")
+            verboseLog("[Safari] ✅ Got URL via AXWebArea")
             return (url, "Safari: AXWebArea → AXURL")
         }
 
         // Method 3: Deep search
         if let url = findURLInElement(window, depth: 0, maxDepth: 10) {
-            debugLog("[Safari] ✅ Got URL via deep search")
+            verboseLog("[Safari] ✅ Got URL via deep search")
             return (url, "Safari: Deep UI search")
         }
 
-        debugLog("[Safari] ❌ All methods failed")
+        verboseLog("[Safari] ❌ All methods failed")
         return (nil, nil)
     }
 
@@ -245,42 +245,42 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     private func getChromiumURL(appElement: AXUIElement, window: AXUIElement, bundleID: String) -> (url: String?, method: String?) {
         let browserName = bundleID.components(separatedBy: ".").last ?? "Chromium"
-        debugLog("[\(browserName)] Attempting URL extraction...")
+        verboseLog("[\(browserName)] Attempting URL extraction...")
 
         // Enable accessibility on Chromium/Electron apps
         enableChromiumAccessibility(appElement)
 
         // Method 1: AXDocument on window (most reliable for Chrome)
         if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
-            debugLog("[\(browserName)] ✅ Got URL via AXDocument on window")
+            verboseLog("[\(browserName)] ✅ Got URL via AXDocument on window")
             return (url, "\(browserName): AXDocument on window")
         }
 
         // Method 2: AXWebArea → AXURL
         if let url = findURLInWebArea(window) {
-            debugLog("[\(browserName)] ✅ Got URL via AXWebArea")
+            verboseLog("[\(browserName)] ✅ Got URL via AXWebArea")
             return (url, "\(browserName): AXWebArea → AXURL")
         }
 
         // Method 3: Focused element attributes
         if let focused: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedUIElementAttribute as CFString) {
             if let url: String = getAttributeValue(focused, attribute: kAXURLAttribute as CFString), !url.isEmpty {
-                debugLog("[\(browserName)] ✅ Got URL via focused element AXURL")
+                verboseLog("[\(browserName)] ✅ Got URL via focused element AXURL")
                 return (url, "\(browserName): Focused element AXURL")
             }
             if let url: String = getAttributeValue(focused, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
-                debugLog("[\(browserName)] ✅ Got URL via focused element AXDocument")
+                verboseLog("[\(browserName)] ✅ Got URL via focused element AXDocument")
                 return (url, "\(browserName): Focused element AXDocument")
             }
         }
 
         // Method 4: Deep search for address bar
         if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
-            debugLog("[\(browserName)] ✅ Got URL via deep search")
+            verboseLog("[\(browserName)] ✅ Got URL via deep search")
             return (url, "\(browserName): Deep UI search")
         }
 
-        debugLog("[\(browserName)] ❌ All methods failed")
+        verboseLog("[\(browserName)] ❌ All methods failed")
         inspectAllAttributes(window)
         return (nil, nil)
     }
@@ -295,18 +295,18 @@ final class AccessibilityInspectorTest: XCTestCase {
         )
 
         if result == .success {
-            debugLog("[Chromium] Set AXManualAccessibility = true")
+            verboseLog("[Chromium] Set AXManualAccessibility = true")
         }
     }
 
     // MARK: - Arc Browser
 
     private func getArcURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
-        debugLog("[Arc] Attempting URL extraction...")
+        verboseLog("[Arc] Attempting URL extraction...")
 
         // Method 1: AppleScript (most reliable for Arc)
         if let url = getArcURLViaAppleScript() {
-            debugLog("[Arc] ✅ Got URL via AppleScript")
+            verboseLog("[Arc] ✅ Got URL via AppleScript")
             return (url, "Arc: AppleScript")
         }
 
@@ -314,57 +314,57 @@ final class AccessibilityInspectorTest: XCTestCase {
         enableChromiumAccessibility(appElement)
 
         if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
-            debugLog("[Arc] ✅ Got URL via AXDocument")
+            verboseLog("[Arc] ✅ Got URL via AXDocument")
             return (url, "Arc: AXDocument on window")
         }
 
         if let url = findURLInWebArea(window) {
-            debugLog("[Arc] ✅ Got URL via AXWebArea")
+            verboseLog("[Arc] ✅ Got URL via AXWebArea")
             return (url, "Arc: AXWebArea → AXURL")
         }
 
-        debugLog("[Arc] ❌ All methods failed")
+        verboseLog("[Arc] ❌ All methods failed")
         return (nil, nil)
     }
 
     // MARK: - Firefox
 
     private func getFirefoxURL() -> (url: String?, method: String?) {
-        debugLog("[Firefox] Attempting URL extraction via AppleScript...")
+        verboseLog("[Firefox] Attempting URL extraction via AppleScript...")
 
         if let url = getFirefoxURLViaAppleScript() {
-            debugLog("[Firefox] ✅ Got URL via AppleScript")
+            verboseLog("[Firefox] ✅ Got URL via AppleScript")
             return (url, "Firefox: AppleScript")
         }
 
-        debugLog("[Firefox] ❌ AppleScript failed (check Automation permissions)")
+        verboseLog("[Firefox] ❌ AppleScript failed (check Automation permissions)")
         return (nil, nil)
     }
 
     // MARK: - Generic Browser Fallback
 
     private func getGenericBrowserURL(appElement: AXUIElement, window: AXUIElement) -> (url: String?, method: String?) {
-        debugLog("[Generic] Attempting URL extraction...")
+        verboseLog("[Generic] Attempting URL extraction...")
 
         // Try AXWebArea approach
         if let url = findURLInWebArea(window) {
-            debugLog("[Generic] ✅ Got URL via AXWebArea")
+            verboseLog("[Generic] ✅ Got URL via AXWebArea")
             return (url, "Generic: AXWebArea → AXURL")
         }
 
         // Try AXDocument on window
         if let url: String = getAttributeValue(window, attribute: kAXDocumentAttribute as CFString), !url.isEmpty {
-            debugLog("[Generic] ✅ Got URL via AXDocument")
+            verboseLog("[Generic] ✅ Got URL via AXDocument")
             return (url, "Generic: AXDocument on window")
         }
 
         // Deep search
         if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
-            debugLog("[Generic] ✅ Got URL via deep search")
+            verboseLog("[Generic] ✅ Got URL via deep search")
             return (url, "Generic: Deep UI search")
         }
 
-        debugLog("[Generic] ❌ All methods failed")
+        verboseLog("[Generic] ❌ All methods failed")
         return (nil, nil)
     }
 
@@ -510,11 +510,11 @@ final class AccessibilityInspectorTest: XCTestCase {
         let result = AXUIElementCopyAttributeNames(element, &attributeNames)
 
         guard result == .success, let attributes = attributeNames as? [String] else {
-            debugLog("  Failed to get attribute names")
+            verboseLog("  Failed to get attribute names")
             return
         }
 
-        debugLog("  Available attributes (\(attributes.count)):")
+        verboseLog("  Available attributes (\(attributes.count)):")
         for attr in attributes {
             var value: AnyObject?
             let valueResult = AXUIElementCopyAttributeValue(element, attr as CFString, &value)
@@ -522,12 +522,12 @@ final class AccessibilityInspectorTest: XCTestCase {
             if valueResult == .success, let val = value {
                 let valueStr = String(describing: val)
                 let truncated = valueStr.prefix(100)
-                debugLog("    \(attr) = \(truncated)")
+                verboseLog("    \(attr) = \(truncated)")
             }
         }
     }
 
-    private func debugLog(_ message: String) {
+    private func verboseLog(_ message: String) {
         guard verboseLogging else { return }
         let line = message + "\n"
         logFileHandle?.write(line.data(using: .utf8)!)
@@ -546,7 +546,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         if let title = title { output += " title=\"\(title.prefix(30))\"" }
         if let value = value { output += " value=\"\(value.prefix(50))\"" }
         if let description = description { output += " desc=\"\(description.prefix(30))\"" }
-        debugLog(output)
+        verboseLog(output)
 
         if let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) {
             for child in children.prefix(15).enumerated() {

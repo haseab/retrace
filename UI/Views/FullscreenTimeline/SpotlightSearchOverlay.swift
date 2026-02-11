@@ -5,23 +5,6 @@ import AppKit
 
 private let searchLog = "[SpotlightSearch]"
 
-/// Debug logging to file
-private func debugLog(_ message: String) {
-    let line = "[\(Log.timestamp())] \(message)\n"
-    let path = "/tmp/retrace_debug.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: path, contents: data)
-        }
-    }
-}
-
 /// Spotlight-style search overlay that appears center-screen
 /// Triggered by Cmd+F or search icon click
 public struct SpotlightSearchOverlay: View {
@@ -622,20 +605,6 @@ public struct SpotlightSearchOverlay: View {
                 Log.error("\(searchLog) ❌ THUMBNAIL FAILED after \(Int(duration))ms: \(error)", category: .ui)
                 Log.error("\(searchLog) ❌ Details: videoID=\(result.videoID), frameIndex=\(result.frameIndex), source=\(result.source)", category: .ui)
 
-                // Write to debug log file
-                let logMessage = "[\(Log.timestamp())] ❌ THUMBNAIL FAILED: \(error)\n  videoID=\(result.videoID), frameID=\(result.frameID), frameIndex=\(result.frameIndex), source=\(result.source)\n"
-                if let data = logMessage.data(using: .utf8) {
-                    let logPath = "/tmp/retrace_debug.log"
-                    if !FileManager.default.fileExists(atPath: logPath) {
-                        FileManager.default.createFile(atPath: logPath, contents: nil)
-                    }
-                    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                        handle.seekToEndOfFile()
-                        handle.write(data)
-                        handle.closeFile()
-                    }
-                }
-
                 // Create a placeholder thumbnail so the UI doesn't show infinite loading
                 let placeholder = createPlaceholderThumbnail(size: thumbnailSize)
                 // Only update if still same generation
@@ -1181,7 +1150,6 @@ struct SpotlightSearchField: NSViewRepresentable {
 
         textField.onCancelCallback = onEscape
         textField.onClickCallback = {
-            debugLog("[SpotlightSearchField] mouseDown - text field clicked")
             self.onFocus?()
         }
 
@@ -1197,13 +1165,11 @@ struct SpotlightSearchField: NSViewRepresentable {
         }
         // Update the click callback in case onFocus changed
         textField.onClickCallback = {
-            debugLog("[SpotlightSearchField] mouseDown - text field clicked")
             self.onFocus?()
         }
         // Check if refocus was triggered
         if context.coordinator.lastRefocusTrigger != refocusTrigger {
             context.coordinator.lastRefocusTrigger = refocusTrigger
-            debugLog("[SpotlightSearchField] Refocus triggered by Tab navigation")
             focusTextField(textField, attempt: 1)
         }
     }
@@ -1290,7 +1256,6 @@ struct SpotlightSearchField: NSViewRepresentable {
         }
 
         func controlTextDidBeginEditing(_ notification: Notification) {
-            debugLog("[SpotlightSearchField] controlTextDidBeginEditing - text field became first responder, calling onFocus")
             onFocus?()
         }
 

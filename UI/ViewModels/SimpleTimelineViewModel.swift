@@ -488,7 +488,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var toastDismissTask: Task<Void, Never>?
 
     /// Show a brief toast notification overlay
-    public func showToast(_ message: String, icon: String = "checkmark.circle.fill") {
+    public func showToast(_ message: String, icon: String = "xmark.circle.fill") {
         toastDismissTask?.cancel()
         // Set content first, then animate in
         toastMessage = message
@@ -497,7 +497,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             toastVisible = true
         }
         toastDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_200_000_000) // 1.2s
+            try? await Task.sleep(nanoseconds: 1_500_000_000) // 1.5s (longer for error messages)
             if !Task.isCancelled {
                 withAnimation(.easeIn(duration: 0.3)) {
                     self.toastVisible = false
@@ -1487,6 +1487,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         return frames[index].frame.segmentID
     }
 
+    /// Check if a frame is from Rewind data
+    private func isFrameFromRewind(at index: Int) -> Bool {
+        guard index >= 0 && index < frames.count else { return false }
+        let frame = frames[index]
+
+        // Check if frame source is Rewind
+        return frame.frame.source == .rewind
+    }
+
     /// Hide all segments in the visible block at the current timeline context menu selection
     /// This hides all consecutive frames with the same bundleID as shown in the UI
     public func hideSelectedTimelineSegment() {
@@ -1502,9 +1511,21 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        // Check if this is Rewind data before proceeding
+        if isFrameFromRewind(at: index) {
+            showToast("Cannot hide Rewind data")
+            dismissTimelineContextMenu()
+            return
+        }
+
         // Get all unique segment IDs in this visible block
         let segmentIds = getSegmentIds(inBlock: block)
 
+        performHideSegment(segmentIds: segmentIds, block: block)
+    }
+
+    /// Perform the hide operation (extracted for async flow)
+    private func performHideSegment(segmentIds: Set<SegmentID>, block: AppBlock) {
         // Add all to hidden set immediately (optimistic UI update)
         for segmentId in segmentIds {
             hiddenSegmentIds.insert(segmentId)
@@ -1582,6 +1603,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        // Check if this is Rewind data before proceeding
+        if isFrameFromRewind(at: index) {
+            showToast("Cannot modify Rewind data")
+            dismissTimelineContextMenu()
+            return
+        }
+
         let segmentIds = getSegmentIds(inBlock: block)
         let segmentIdsToUnhide = Set(segmentIds.filter { hiddenSegmentIds.contains($0) })
         guard !segmentIdsToUnhide.isEmpty else {
@@ -1590,6 +1618,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        performUnhideSegment(segmentIdsToUnhide: segmentIdsToUnhide, block: block)
+    }
+
+    /// Perform the unhide operation (extracted for async flow)
+    private func performUnhideSegment(segmentIdsToUnhide: Set<SegmentID>, block: AppBlock) {
         // Remove from hidden set immediately (optimistic UI update)
         for segmentId in segmentIdsToUnhide {
             hiddenSegmentIds.remove(segmentId)
@@ -1670,6 +1703,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        // Check if this is Rewind data before proceeding
+        if isFrameFromRewind(at: index) {
+            showToast("Cannot tag Rewind data")
+            dismissTimelineContextMenu()
+            return
+        }
+
         // Get all unique segment IDs in this visible block
         let segmentIds = getSegmentIds(inBlock: block)
 
@@ -1691,6 +1731,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func toggleTagOnSelectedSegment(tag: Tag) {
         guard let index = timelineContextMenuSegmentIndex,
               let block = getBlock(forFrameAt: index) else {
+            return
+        }
+
+        // Check if this is Rewind data before proceeding
+        if isFrameFromRewind(at: index) {
+            showToast("Cannot tag Rewind data")
             return
         }
 
@@ -1740,6 +1786,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         guard let index = timelineContextMenuSegmentIndex,
               let block = getBlock(forFrameAt: index) else {
+            return
+        }
+
+        // Check if this is Rewind data before proceeding
+        if isFrameFromRewind(at: index) {
+            showToast("Cannot tag Rewind data")
             return
         }
 
@@ -2603,9 +2655,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         isInitialLoadInProgress = true
         defer { isInitialLoadInProgress = false }
-
-        let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("VM_LOAD_START", startTime: startTime)
+        _ = clickStartTime
 
         isLoading = true
         clearError()
@@ -2615,9 +2665,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Uses optimized query that JOINs on video table - no N+1 queries!
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: filterCriteria.selectedApps)), mode: \(filterCriteria.appFilterMode.rawValue)", category: .ui)
-            logTabClickTiming("VM_BEFORE_QUERY", startTime: startTime)
             let framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: filterCriteria)
-            logTabClickTiming("VM_AFTER_QUERY (count=\(framesWithVideoInfo.count))", startTime: startTime)
 
             guard !framesWithVideoInfo.isEmpty else {
                 // No frames found - check if filters are active
@@ -2627,7 +2675,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     showErrorWithAutoDismiss("No frames found in any database")
                 }
                 isLoading = false
-                logTabClickTiming("VM_NO_FRAMES", startTime: startTime)
                 return
             }
 
@@ -2635,7 +2682,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Reverse so oldest is first (index 0), newest is last
             // This matches the timeline UI which displays left-to-right as past-to-future
             frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
-            logTabClickTiming("VM_FRAMES_MAPPED", startTime: startTime)
 
             // Initialize window boundary timestamps for infinite scroll
             updateWindowBoundaries()
@@ -2683,15 +2729,12 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Load image if needed for current frame
             loadImageIfNeeded()
-            logTabClickTiming("VM_IMAGE_LOADED", startTime: startTime)
 
             isLoading = false
-            logTabClickTiming("VM_LOAD_COMPLETE", startTime: startTime)
 
         } catch {
             self.error = "Failed to load frames: \(error.localizedDescription)"
             isLoading = false
-            logTabClickTiming("VM_LOAD_ERROR: \(error.localizedDescription)", startTime: startTime)
         }
     }
 
@@ -2707,9 +2750,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         isInitialLoadInProgress = true
         defer { isInitialLoadInProgress = false }
-
-        let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("VM_LOAD_DIRECT_START", startTime: startTime)
+        _ = clickStartTime
 
         isLoading = true
         clearError()
@@ -2721,13 +2762,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 showErrorWithAutoDismiss("No frames found in any database")
             }
             isLoading = false
-            logTabClickTiming("VM_LOAD_DIRECT_NO_FRAMES", startTime: startTime)
             return
         }
 
         // Convert to TimelineFrame - reverse so oldest is first (index 0), newest is last
         frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
-        logTabClickTiming("VM_LOAD_DIRECT_MAPPED (count=\(frames.count))", startTime: startTime)
 
         // Initialize window boundary timestamps for infinite scroll
         updateWindowBoundaries()
@@ -2748,33 +2787,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load image if needed for current frame
         loadImageIfNeeded()
-        logTabClickTiming("VM_LOAD_DIRECT_IMAGE", startTime: startTime)
 
         isLoading = false
-        logTabClickTiming("VM_LOAD_DIRECT_COMPLETE", startTime: startTime)
-    }
-
-    // MARK: - Tab Click Timing
-
-    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-    /// Log timing for tab click filter queries
-    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime) {
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let filterInfo = filterCriteria.browserUrlFilter ?? filterCriteria.selectedApps?.first ?? "no-filter"
-        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.tabClickLogPath)
-            }
-        }
     }
 
     /// Refresh frame data when showing the pre-rendered timeline
@@ -2908,6 +2922,18 @@ public class SimpleTimelineViewModel: ObservableObject {
             var currentFrameUpdated = false
 
             for (index, frame) in framesToRefresh {
+                // Validate index is still valid (frames array may have changed)
+                guard index < frames.count else {
+                    Log.debug("[TIMELINE-REFRESH] Skipping frame at index \(index) - frames array changed (now \(frames.count) frames)", category: .ui)
+                    continue
+                }
+
+                // Also verify the frame ID still matches (defensive check)
+                guard frames[index].frame.id == frame.frame.id else {
+                    Log.debug("[TIMELINE-REFRESH] Skipping frame - ID mismatch at index \(index)", category: .ui)
+                    continue
+                }
+
                 if let newStatus = updatedStatuses[frame.frame.id.value],
                    newStatus != frame.processingStatus {
                     // Re-fetch the full frame with updated videoInfo
@@ -4185,7 +4211,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Start creating a zoom region (Shift+Drag)
     public func startZoomRegion(at point: CGPoint) {
-        zoomDebugLog("startZoomRegion at \(point)")
         zoomUpdateCount = 0
         isDraggingZoomRegion = true
         zoomRegionDragStart = point
@@ -4197,38 +4222,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Update zoom region drag
     public func updateZoomRegion(to point: CGPoint) {
         zoomUpdateCount += 1
-        if zoomUpdateCount % 10 == 1 {
-            zoomDebugLog("updateZoomRegion #\(zoomUpdateCount) to \(point)")
-        }
         zoomRegionDragEnd = point
     }
 
     /// Finalize zoom region from drag - triggers animation to centered view
-    /// Debug log to /tmp/retrace_debug.log for zoom animation investigation
-    private func zoomDebugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] [ZOOM] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let path = "/tmp/retrace_debug.log"
-            if FileManager.default.fileExists(atPath: path) {
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: path, contents: data)
-            }
-        }
-    }
-
     public func endZoomRegion() {
-        zoomDebugLog("endZoomRegion() called - mouseUp received")
 
         guard let start = zoomRegionDragStart, let end = zoomRegionDragEnd else {
-            zoomDebugLog("endZoomRegion() - no start/end points, aborting")
             isDraggingZoomRegion = false
             return
         }
@@ -4242,11 +4242,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         let width = maxX - minX
         let height = maxY - minY
 
-        zoomDebugLog("endZoomRegion() - calculated rect: width=\(width), height=\(height)")
 
-        // Only create zoom region if it's large enough (at least 5% of screen)
-        guard width > 0.05 && height > 0.05 else {
-            zoomDebugLog("endZoomRegion() - rect too small (<5%), aborting")
+        // Only create zoom region if it's large enough (at least 1% of screen)
+        guard width > 0.01 && height > 0.01 else {
             isDraggingZoomRegion = false
             zoomRegionDragStart = nil
             zoomRegionDragEnd = nil
@@ -4254,11 +4252,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let finalRect = CGRect(x: minX, y: minY, width: width, height: height)
-
-        // DEBUG: Log the zoom region coordinates
-        Log.info("[ZoomRegion] endZoomRegion: start=\(start), end=\(end)", category: .ui)
-        Log.info("[ZoomRegion] endZoomRegion: finalRect=\(finalRect) (normalized coords, Y=0 at top)", category: .ui)
-        zoomDebugLog("endZoomRegion() - finalRect=\(finalRect)")
 
         // Record shift+drag zoom region metric
         if let screenSize = NSScreen.main?.frame.size {
@@ -4274,7 +4267,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Store the starting rect for animation
         zoomTransitionStartRect = finalRect
         zoomRegion = finalRect
-        zoomDebugLog("endZoomRegion() - set zoomRegion and zoomTransitionStartRect")
 
         // Clear drag state
         isDraggingZoomRegion = false
@@ -4285,23 +4277,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         isZoomTransitioning = true
         zoomTransitionProgress = 0
         zoomTransitionBlurOpacity = 0
-        zoomDebugLog("endZoomRegion() - starting transition animation (isZoomTransitioning=true)")
 
         // Animate to final state
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
             zoomTransitionProgress = 1.0
             zoomTransitionBlurOpacity = 1.0
         }
-        zoomDebugLog("endZoomRegion() - withAnimation started (progress -> 1.0)")
 
         // After animation completes, switch to final zoom state
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-            self?.zoomDebugLog("endZoomRegion() - 0.45s timer fired, setting isZoomRegionActive=true")
             self?.isZoomRegionActive = true
             self?.zoomTransitionStartRect = nil
             // Disable transition on next run loop to ensure smooth handoff
             DispatchQueue.main.async {
-                self?.zoomDebugLog("endZoomRegion() - final state: isZoomTransitioning=false")
                 self?.isZoomTransitioning = false
             }
         }
@@ -4315,7 +4303,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        zoomDebugLog("exitZoomRegion() - starting exit animation")
 
         // Clear text selection highlight before starting animation
         clearTextSelection()
@@ -4326,7 +4313,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // After animation completes, clear all zoom state
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.zoomDebugLog("exitZoomRegion() - animation complete, clearing state")
             self?.clearZoomRegionState()
         }
     }

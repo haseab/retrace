@@ -653,31 +653,40 @@ struct RefreshButton: View {
 /// Only visible when "Show video controls" is enabled in Settings > Advanced
 struct VideoControlsButton: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
-    @State private var isHovering = false
+    @State private var isButtonHovering = false
+    @State private var isPickerHovering = false
     @State private var showSpeedPicker = false
 
     private let availableSpeeds: [Double] = [1, 2, 4, 8]
-    /// Height reserved for the speed picker so it doesn't shift the button
-    private let pickerHeight: CGFloat = 4 * 24 + 16
+
+    private var isHoveringControl: Bool {
+        isButtonHovering || isPickerHovering
+    }
 
     var body: some View {
         // Button sized to match other controls; speed picker floats above via overlay
         Button(action: {
             viewModel.dismissContextMenu()
+            let wasPlaying = viewModel.isPlaying
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
                 viewModel.togglePlayback()
             }
+            Log.info(
+                "[PLAY-CLICK] button click handled wasPlaying=\(wasPlaying) nowPlaying=\(viewModel.isPlaying) " +
+                "speed=\(formattedSpeed(viewModel.playbackSpeed)) mouse=\(formattedMouseLocation())",
+                category: .ui
+            )
         }) {
             Image(systemName: viewModel.isPlaying ? "pause.fill" : "play.fill")
                 .font(.system(size: TimelineScaleFactor.fontCaption2, weight: .medium))
-                .foregroundColor(isHovering || viewModel.isPlaying ? .white : .white.opacity(0.7))
+                .foregroundColor(isHoveringControl || viewModel.isPlaying ? .white : .white.opacity(0.7))
                 .frame(width: TimelineScaleFactor.controlButtonSize, height: TimelineScaleFactor.controlButtonSize)
-                .themeAwareCircleStyle(isActive: viewModel.isPlaying, isHovering: isHovering)
+                .themeAwareCircleStyle(isActive: viewModel.isPlaying, isHovering: isHoveringControl)
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             withAnimation(.easeOut(duration: 0.1)) {
-                isHovering = hovering
+                isButtonHovering = hovering
             }
             if hovering {
                 NSCursor.pointingHand.push()
@@ -686,21 +695,15 @@ struct VideoControlsButton: View {
                 }
             } else {
                 NSCursor.pop()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    if !isHovering {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            showSpeedPicker = false
-                        }
-                    }
-                }
+                dismissSpeedPickerIfNeeded(after: 0.2)
             }
         }
         .instantTooltip(
             viewModel.isPlaying ? "Pause" : "Play (\(formattedSpeed(viewModel.playbackSpeed)))",
-            isVisible: .constant(isHovering && !showSpeedPicker)
+            isVisible: .constant(isButtonHovering && !showSpeedPicker)
         )
         // Speed picker floats above via overlay — completely outside the layout flow
-        .overlay(alignment: .bottom) {
+        .overlay(alignment: .top) {
             if showSpeedPicker {
                 VStack(spacing: 2) {
                     ForEach(availableSpeeds.reversed(), id: \.self) { speed in
@@ -725,20 +728,17 @@ struct VideoControlsButton: View {
                                 .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                         )
                 )
-                .offset(y: -(TimelineScaleFactor.controlButtonSize + 6))
+                // Use layout alignment instead of offset so hit-testing matches the visible menu position.
+                .alignmentGuide(.top) { dimensions in
+                    dimensions[.bottom] + 6
+                }
                 .transition(.opacity.combined(with: .scale(scale: 0.85, anchor: .bottom)).combined(with: .offset(y: 4)))
                 .onHover { hovering in
                     if hovering {
-                        isHovering = true
+                        isPickerHovering = true
                     } else {
-                        isHovering = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                            if !isHovering {
-                                withAnimation(.easeOut(duration: 0.15)) {
-                                    showSpeedPicker = false
-                                }
-                            }
-                        }
+                        isPickerHovering = false
+                        dismissSpeedPickerIfNeeded(after: 0.15)
                     }
                 }
             }
@@ -748,6 +748,21 @@ struct VideoControlsButton: View {
     private func formattedSpeed(_ speed: Double) -> String {
         if speed == 1 { return "1x" }
         return "\(Int(speed))x"
+    }
+
+    private func dismissSpeedPickerIfNeeded(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if !isButtonHovering && !isPickerHovering {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showSpeedPicker = false
+                }
+            }
+        }
+    }
+
+    private func formattedMouseLocation() -> String {
+        let mouse = NSEvent.mouseLocation
+        return "(\(Int(mouse.x)),\(Int(mouse.y)))"
     }
 }
 

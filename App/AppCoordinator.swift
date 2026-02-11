@@ -519,7 +519,7 @@ public actor AppCoordinator {
         // Get OCR enabled state (defaults to true if not set)
         let ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
         let pauseOnBattery = defaults.bool(forKey: "ocrOnlyWhenPluggedIn")
-        let maxFPS = defaults.double(forKey: "ocrMaxFramesPerSecond")
+        let maxFPS = (defaults.object(forKey: "ocrMaxFramesPerSecond") as? NSNumber)?.doubleValue ?? 1.0
 
         // Parse app filter mode and filtered apps
         let filterModeRaw = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
@@ -874,17 +874,6 @@ public actor AppCoordinator {
                 while let firstFrame = writerState.pendingFrames.first,
                       firstFrame.frameIndexInSegment < flushedCount {
                     let frameToEnqueue = writerState.pendingFrames.removeFirst()
-                    // DEBUG: Log to file when marking readable
-                    let debugMsg = "[READABLE] frameID=\(frameToEnqueue.frameID) frameIndex=\(frameToEnqueue.frameIndexInSegment) flushedCount=\(flushedCount) videoDBID=\(writerState.videoDBID) writerFrameCount=\(writerState.frameCount)\n"
-                    if let data = debugMsg.data(using: .utf8) {
-                        let fileHandle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") ?? {
-                            FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: nil)
-                            return FileHandle(forWritingAtPath: "/tmp/retrace_debug.log")!
-                        }()
-                        fileHandle.seekToEndOfFile()
-                        fileHandle.write(data)
-                        fileHandle.closeFile()
-                    }
                     // Mark frame as readable now that it's confirmed flushed to video file
                     try await services.database.markFrameReadable(frameID: frameToEnqueue.frameID)
                     // Pass the original captured frame pixels directly to OCR
@@ -1479,28 +1468,79 @@ public actor AppCoordinator {
 
     /// Add a tag to a segment
     public func addTagToSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        // Prevent tagging Rewind data
+        if try await isRewindSegment(segmentId: segmentId) {
+            Log.warning("[AppCoordinator] Cannot add tag to Rewind segment \(segmentId.value)", category: .app)
+            return
+        }
         try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
     }
 
     /// Add a tag to multiple segments
     public func addTagToSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        var addedCount = 0
         for segmentId in segmentIds {
+            // Skip Rewind segments
+            if try await isRewindSegment(segmentId: segmentId) {
+                Log.debug("[AppCoordinator] Skipping tag add for Rewind segment \(segmentId.value)", category: .app)
+                continue
+            }
             try await services.database.addTagToSegment(segmentId: segmentId, tagId: tagId)
+            addedCount += 1
         }
-        Log.info("[AppCoordinator] Added tag \(tagId.value) to \(segmentIds.count) segments", category: .app)
+        Log.info("[AppCoordinator] Added tag \(tagId.value) to \(addedCount) segments (skipped \(segmentIds.count - addedCount) Rewind segments)", category: .app)
     }
 
     /// Remove a tag from a segment
     public func removeTagFromSegment(segmentId: SegmentID, tagId: TagID) async throws {
+        // Prevent removing tags from Rewind data
+        if try await isRewindSegment(segmentId: segmentId) {
+            Log.warning("[AppCoordinator] Cannot remove tag from Rewind segment \(segmentId.value)", category: .app)
+            return
+        }
         try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
     }
 
     /// Remove a tag from multiple segments
     public func removeTagFromSegments(segmentIds: [SegmentID], tagId: TagID) async throws {
+        var removedCount = 0
         for segmentId in segmentIds {
+            // Skip Rewind segments
+            if try await isRewindSegment(segmentId: segmentId) {
+                Log.debug("[AppCoordinator] Skipping tag removal for Rewind segment \(segmentId.value)", category: .app)
+                continue
+            }
             try await services.database.removeTagFromSegment(segmentId: segmentId, tagId: tagId)
+            removedCount += 1
         }
-        Log.info("[AppCoordinator] Removed tag \(tagId.value) from \(segmentIds.count) segments", category: .app)
+        Log.info("[AppCoordinator] Removed tag \(tagId.value) from \(removedCount) segments (skipped \(segmentIds.count - removedCount) Rewind segments)", category: .app)
+    }
+
+    /// Check if a segment is from Rewind data (before the cutoff date)
+    private func isRewindSegment(segmentId: SegmentID) async throws -> Bool {
+        guard let adapter = await services.dataAdapter else {
+            return false // No Rewind source configured
+        }
+
+        guard let cutoffDate = await adapter.rewindCutoffDate else {
+            return false // No cutoff date means no Rewind data
+        }
+
+        // Get segment to check its start date
+        guard let segment = try await services.database.getSegment(id: segmentId.value) else {
+            return false // Segment doesn't exist
+        }
+
+        // If segment starts before cutoff, it's from Rewind
+        return segment.startDate < cutoffDate
+    }
+
+    /// Get the Rewind cutoff date (for UI to check if data is from Rewind)
+    public func getRewindCutoffDate() async -> Date? {
+        guard let adapter = await services.dataAdapter else {
+            return nil
+        }
+        return await adapter.rewindCutoffDate
     }
 
     /// Get all tags for a segment

@@ -3,23 +3,6 @@ import Shared
 import App
 import AppKit
 
-/// Debug logging to file
-private func debugLog(_ message: String) {
-    let line = "[\(Log.timestamp())] \(message)\n"
-    let path = "/tmp/retrace_debug.log"
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path) {
-            if let handle = FileHandle(forWritingAtPath: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            FileManager.default.createFile(atPath: path, contents: data)
-        }
-    }
-}
-
 // MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
 
 /// Modifier that hides the focus ring, with availability check for macOS 14.0+
@@ -54,23 +37,7 @@ public struct SearchFilterBar: View {
 
     // MARK: - Body
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     public var body: some View {
-        let _ = logToFile("[SearchFilterBar] Rendering, showAppsDropdown=\(showAppsDropdown), showDatePopover=\(showDatePopover), showTagsDropdown=\(showTagsDropdown), showVisibilityDropdown=\(showVisibilityDropdown)")
         HStack(spacing: 10) {
             SearchOrderChip(
                 selection: SearchOrderOption.from(
@@ -124,7 +91,6 @@ public struct SearchFilterBar: View {
                 isActive: viewModel.selectedAppFilters != nil && !viewModel.selectedAppFilters!.isEmpty,
                 isOpen: showAppsDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Apps chip CLICKED! showAppsDropdown was \(showAppsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showAppsDropdown.toggle()
                         showDatePopover = false
@@ -132,7 +98,6 @@ public struct SearchFilterBar: View {
                         showVisibilityDropdown = false
                         showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Apps chip after toggle: showAppsDropdown=\(showAppsDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: 56) {
@@ -164,7 +129,6 @@ public struct SearchFilterBar: View {
                 isOpen: showDatePopover,
                 showChevron: true
             ) {
-                logToFile("[SearchFilterBar] Date chip CLICKED! showDatePopover was \(showDatePopover), toggling...")
                 withAnimation(.easeOut(duration: 0.15)) {
                     showDatePopover.toggle()
                     showAppsDropdown = false
@@ -172,7 +136,6 @@ public struct SearchFilterBar: View {
                     showVisibilityDropdown = false
                     showAdvancedDropdown = false
                 }
-                logToFile("[SearchFilterBar] Date chip after toggle: showDatePopover=\(showDatePopover)")
             }
             .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
                 DateRangeFilterPopover(
@@ -209,7 +172,6 @@ public struct SearchFilterBar: View {
                 isActive: viewModel.selectedTags != nil && !viewModel.selectedTags!.isEmpty,
                 isOpen: showTagsDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Tags chip CLICKED! showTagsDropdown was \(showTagsDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showTagsDropdown.toggle()
                         showAppsDropdown = false
@@ -217,7 +179,6 @@ public struct SearchFilterBar: View {
                         showVisibilityDropdown = false
                         showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Tags chip after toggle: showTagsDropdown=\(showTagsDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: 56) {
@@ -246,7 +207,6 @@ public struct SearchFilterBar: View {
                 isActive: viewModel.hiddenFilter != .hide,
                 isOpen: showVisibilityDropdown,
                 action: {
-                    logToFile("[SearchFilterBar] Visibility chip CLICKED! showVisibilityDropdown was \(showVisibilityDropdown), toggling...")
                     withAnimation(.easeOut(duration: 0.15)) {
                         showVisibilityDropdown.toggle()
                         showAppsDropdown = false
@@ -254,7 +214,6 @@ public struct SearchFilterBar: View {
                         showTagsDropdown = false
                         showAdvancedDropdown = false
                     }
-                    logToFile("[SearchFilterBar] Visibility chip after toggle: showVisibilityDropdown=\(showVisibilityDropdown)")
                 }
             )
             .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: 56) {
@@ -344,9 +303,7 @@ public struct SearchFilterBar: View {
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showAppsDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
-            debugLog("[SearchFilterBar] isDropdownOpen now: \(viewModel.isDropdownOpen)")
             // Lazy load apps only when dropdown is opened
             if isOpen {
                 viewModel.openFilterSignal = (2, UUID())
@@ -356,7 +313,6 @@ public struct SearchFilterBar: View {
             }
         }
         .onChange(of: showDatePopover) { isOpen in
-            debugLog("[SearchFilterBar] showDatePopover changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if !isOpen {
                 viewModel.isDatePopoverHandlingKeys = false
@@ -366,32 +322,27 @@ public struct SearchFilterBar: View {
             }
         }
         .onChange(of: showTagsDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showTagsDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (4, UUID())
             }
         }
         .onChange(of: showVisibilityDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showVisibilityDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (5, UUID())
             }
         }
         .onChange(of: showAdvancedDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showAdvancedDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (6, UUID())
             }
         }
         .onChange(of: showSearchOrderDropdown) { isOpen in
-            debugLog("[SearchFilterBar] showSearchOrderDropdown changed to: \(isOpen)")
             viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
-            debugLog("[SearchFilterBar] closeDropdownsSignal received: \(newValue)")
             // Close all dropdowns when signal is received (from Escape key in parent)
             withAnimation(.easeOut(duration: 0.15)) {
                 showAppsDropdown = false
@@ -404,7 +355,6 @@ public struct SearchFilterBar: View {
         }
         .onChange(of: viewModel.openFilterSignal.id) { _ in
             let filterIndex = viewModel.openFilterSignal.index
-            debugLog("[SearchFilterBar] openFilterSignal received: index=\(filterIndex)")
             openFilterAtIndex(filterIndex)
         }
         .onAppear {
@@ -482,7 +432,6 @@ public struct SearchFilterBar: View {
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
-            debugLog("[SearchFilterBar] Tab pressed in dropdown, lastSignal=\(lastSignal), cycling from \(currentIndex), shift=\(isShiftHeld)")
 
             // Calculate next index based on direction
             let nextIndex: Int
@@ -545,24 +494,8 @@ private struct FilterChip: View {
 
     @State private var isHovered = false
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[FilterChip] Button action triggered for: \(label)")
             action()
         }) {
             HStack(spacing: 6) {
@@ -627,24 +560,8 @@ private struct AppsFilterChip: View {
         filterMode == .exclude && isActive
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[AppsFilterChip] Button action triggered!")
             action()
         }) {
             HStack(spacing: 6) {
@@ -820,24 +737,8 @@ private struct TagsFilterChip: View {
         }
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[TagsFilterChip] Button action triggered!")
             action()
         }) {
             HStack(spacing: 6) {
@@ -912,24 +813,8 @@ private struct VisibilityFilterChip: View {
         }
     }
 
-    private func logToFile(_ message: String) {
-        let logMessage = "[\(Log.timestamp())] \(message)\n"
-        if let data = logMessage.data(using: .utf8) {
-            let logPath = "/tmp/retrace_debug.log"
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
-            }
-            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        }
-    }
-
     var body: some View {
         Button(action: {
-            logToFile("[VisibilityFilterChip] Button action triggered!")
             action()
         }) {
             HStack(spacing: 6) {

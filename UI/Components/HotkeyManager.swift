@@ -12,8 +12,11 @@ public class HotkeyManager: NSObject {
 
     // MARK: - Properties
 
+    private let stateLock = NSLock()
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
+    private var eventTapRunLoop: CFRunLoop?
+    private var isSettingUpEventTap = false
 
     /// Registered hotkeys with their callbacks
     /// Uses character-based matching to support non-QWERTY keyboard layouts (DVORAK, Colemak, etc.)
@@ -22,10 +25,24 @@ public class HotkeyManager: NSObject {
     /// Whether hotkeys are pending registration (waiting for permissions)
     private var pendingSetup = false
 
+    /// Cached keyboard layout data. The CFData must be retained while using
+    /// the UCKeyboardLayout pointer derived from its bytes.
+    private var cachedLayoutData: CFData?
+
     // MARK: - Initialization
 
     private override init() {
         super.init()
+
+        // Cache keyboard layout on init (main thread)
+        refreshKeyboardLayoutCache()
+
+        // Listen for keyboard layout changes
+        setupKeyboardLayoutObserver()
+    }
+
+    deinit {
+        DistributedNotificationCenter.default().removeObserver(self)
     }
 
     // MARK: - Permission Check
@@ -65,7 +82,9 @@ public class HotkeyManager: NSObject {
         callback: @escaping () -> Void
     ) {
         Log.info("[HotkeyManager] Registering hotkey: key='\(key)' modifiers=\(modifierDescription(modifiers))", category: .ui)
-        hotkeys.append((key, modifiers, callback))
+        withStateLock {
+            hotkeys.append((key, modifiers, callback))
+        }
 
         // Start monitoring if not already
         startEventTap()
@@ -73,9 +92,12 @@ public class HotkeyManager: NSObject {
 
     /// Unregister all hotkeys
     public func unregisterAll() {
-        Log.info("[HotkeyManager] Unregistering all hotkeys (count: \(hotkeys.count))", category: .ui)
+        let count = withStateLock { hotkeys.count }
+        Log.info("[HotkeyManager] Unregistering all hotkeys (count: \(count))", category: .ui)
         stopEventTap()
-        hotkeys.removeAll()
+        withStateLock {
+            hotkeys.removeAll()
+        }
     }
 
     /// Helper to describe modifiers for logging
@@ -91,8 +113,44 @@ public class HotkeyManager: NSObject {
     /// Retry setting up event tap if permissions are now available
     /// Call this after user grants accessibility permission
     public func retrySetupIfNeeded() {
-        guard pendingSetup, !hotkeys.isEmpty else { return }
+        let shouldRetry = withStateLock {
+            pendingSetup && !hotkeys.isEmpty
+        }
+        guard shouldRetry else { return }
         startEventTap()
+    }
+
+    // MARK: - Keyboard Layout Cache
+
+    /// Refresh the cached keyboard layout (MUST be called on main thread)
+    /// This caches the layout data so we can safely use it from background threads
+    private func refreshKeyboardLayoutCache() {
+        dispatchPrecondition(condition: .onQueue(.main))
+
+        guard let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let layoutDataPtr = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData) else {
+            Log.warning("[HotkeyManager] Failed to get keyboard layout data", category: .ui)
+            return
+        }
+
+        let layoutData = unsafeBitCast(layoutDataPtr, to: CFData.self)
+        withStateLock {
+            cachedLayoutData = layoutData
+        }
+
+        Log.debug("[HotkeyManager] Keyboard layout cache refreshed", category: .ui)
+    }
+
+    /// Set up observer for keyboard layout changes
+    private func setupKeyboardLayoutObserver() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil,
+            queue: .main // Receive on main thread
+        ) { [weak self] _ in
+            Log.debug("[HotkeyManager] Keyboard layout changed, refreshing cache", category: .ui)
+            self?.refreshKeyboardLayoutCache()
+        }
     }
 
     // MARK: - Event Tap
@@ -102,14 +160,39 @@ public class HotkeyManager: NSObject {
         guard hasAccessibilityPermission() else {
             // Silently skip - hotkeys will be set up when permissions are granted
             // and the app restarts or when retrySetupIfNeeded() is called
-            pendingSetup = true
+            withStateLock {
+                pendingSetup = true
+            }
             return
         }
 
-        // Stop existing tap if any
-        stopEventTap()
+        // If tap already exists, just ensure it is enabled.
+        if let tap = withStateLock({ eventTap }) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            withStateLock {
+                pendingSetup = false
+            }
+            return
+        }
 
-        // Create event tap for key down events
+        let shouldSetup = withStateLock { () -> Bool in
+            guard !isSettingUpEventTap else {
+                return false
+            }
+            isSettingUpEventTap = true
+            return true
+        }
+
+        guard shouldSetup else {
+            return
+        }
+
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            self?.setupEventTapOnBackgroundRunLoop()
+        }
+    }
+
+    private func setupEventTapOnBackgroundRunLoop() {
         let eventMask = (1 << CGEventType.keyDown.rawValue)
 
         guard let tap = CGEvent.tapCreate(
@@ -119,7 +202,7 @@ public class HotkeyManager: NSObject {
             eventsOfInterest: CGEventMask(eventMask),
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
                 guard let refcon = refcon else {
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 }
 
                 let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
@@ -127,35 +210,39 @@ public class HotkeyManager: NSObject {
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
+            withStateLock {
+                isSettingUpEventTap = false
+            }
             Log.error("[HotkeyManager] Failed to create event tap. Check accessibility permissions.", category: .ui)
             return
         }
 
-        pendingSetup = false
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        let runLoop = CFRunLoopGetCurrent()
 
-        // Create run loop source
-        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-
-        if let source = runLoopSource {
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        withStateLock {
+            eventTap = tap
+            runLoopSource = source
+            eventTapRunLoop = runLoop
+            pendingSetup = false
+            isSettingUpEventTap = false
         }
 
-        // Enable the tap
+        if let source {
+            CFRunLoopAddSource(runLoop, source, .commonModes)
+        }
+
         CGEvent.tapEnable(tap: tap, enable: true)
-        eventTap = tap
 
         Log.info("[HotkeyManager] Global hotkey monitoring started", category: .ui)
+
+        // Keep this thread alive so the event tap remains active.
+        CFRunLoopRun()
     }
 
     private func stopEventTap() {
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-            runLoopSource = nil
-        }
-
-        if let tap = eventTap {
+        if let tap = withStateLock({ eventTap }) {
             CGEvent.tapEnable(tap: tap, enable: false)
-            eventTap = nil
         }
     }
 
@@ -167,33 +254,43 @@ public class HotkeyManager: NSObject {
         // Handle tap disabled event
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             // Re-enable the tap
-            if let tap = eventTap {
+            if let tap = withStateLock({ eventTap }) {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
-            return Unmanaged.passRetained(event)
+            return Unmanaged.passUnretained(event)
         }
 
         // Only handle key down events
         guard type == .keyDown else {
-            return Unmanaged.passRetained(event)
+            return Unmanaged.passUnretained(event)
+        }
+
+        let hotkeysSnapshot = withStateLock { hotkeys }
+        guard !hotkeysSnapshot.isEmpty else {
+            return Unmanaged.passUnretained(event)
+        }
+
+        let flags = event.flags
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
+
+        // Fast path: if all registered hotkeys require modifiers and this event has
+        // no relevant modifiers, skip expensive keyboard-layout translation work.
+        let hasModifierLessHotkey = hotkeysSnapshot.contains {
+            $0.modifiers.intersection(relevantModifiers).isEmpty
+        }
+        let hasRelevantModifiers = !modifierFlags(from: flags).intersection(relevantModifiers).isEmpty
+        if !hasModifierLessHotkey && !hasRelevantModifiers {
+            return Unmanaged.passUnretained(event)
         }
 
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        let flags = event.flags
-
         // Get the character for this key event, respecting keyboard layout
         let pressedKey = characterForEvent(event, keyCode: keyCode)
 
-        // Convert CGEventFlags to NSEvent.ModifierFlags for comparison
-        var eventModifiers: NSEvent.ModifierFlags = []
-        if flags.contains(.maskCommand) { eventModifiers.insert(.command) }
-        if flags.contains(.maskShift) { eventModifiers.insert(.shift) }
-        if flags.contains(.maskAlternate) { eventModifiers.insert(.option) }
-        if flags.contains(.maskControl) { eventModifiers.insert(.control) }
+        let eventModifiers = modifierFlags(from: flags)
 
         // Check if this matches any registered hotkey using character-based comparison
-        let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
-        for hotkey in hotkeys {
+        for hotkey in hotkeysSnapshot {
             // Compare characters case-insensitively for letter keys
             let keysMatch = pressedKey.lowercased() == hotkey.key.lowercased()
             let modifiersMatch = eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers)
@@ -212,7 +309,23 @@ public class HotkeyManager: NSObject {
             }
         }
 
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
+    }
+
+    private func modifierFlags(from flags: CGEventFlags) -> NSEvent.ModifierFlags {
+        var modifiers: NSEvent.ModifierFlags = []
+        if flags.contains(.maskCommand) { modifiers.insert(.command) }
+        if flags.contains(.maskShift) { modifiers.insert(.shift) }
+        if flags.contains(.maskAlternate) { modifiers.insert(.option) }
+        if flags.contains(.maskControl) { modifiers.insert(.control) }
+        return modifiers
+    }
+
+    @discardableResult
+    private func withStateLock<T>(_ block: () -> T) -> T {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return block()
     }
 
     /// Get the character for a CGEvent, respecting the current keyboard layout
@@ -255,10 +368,14 @@ public class HotkeyManager: NSObject {
         // and setting event.flags doesn't change the cached Unicode string.
         // UCKeyTranslate with modifierKeyState=0 gives us the true base character,
         // respecting Dvorak/Colemak/etc. layouts.
-        if let inputSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-           let layoutDataPtr = TISGetInputSourceProperty(inputSource, kTISPropertyUnicodeKeyLayoutData) {
-            let layoutData = unsafeBitCast(layoutDataPtr, to: CFData.self)
-            let keyboardLayout = unsafeBitCast(CFDataGetBytePtr(layoutData), to: UnsafePointer<UCKeyboardLayout>.self)
+        //
+        // IMPORTANT: Snapshot CFData under lock and derive pointer from the
+        // local snapshot so memory stays valid for the full translate call.
+        if let layoutData = withStateLock({ cachedLayoutData }) {
+            let keyboardLayout = unsafeBitCast(
+                CFDataGetBytePtr(layoutData),
+                to: UnsafePointer<UCKeyboardLayout>.self
+            )
             var deadKeyState: UInt32 = 0
             var length: Int = 0
             var chars = [UniChar](repeating: 0, count: 4)

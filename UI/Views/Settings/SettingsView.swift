@@ -60,7 +60,7 @@ enum SettingsDefaults {
     // MARK: OCR Power
     static let ocrEnabled = true
     static let ocrOnlyWhenPluggedIn = false
-    static let ocrMaxFramesPerSecond: Double = 0  // 0 = unlimited
+    static let ocrMaxFramesPerSecond: Double = 1.0  // Default balanced mode
     static let ocrAppFilterMode: OCRAppFilterMode = .allApps
     static let ocrFilteredApps = ""  // JSON array of bundle IDs
 }
@@ -2441,12 +2441,42 @@ public struct SettingsView: View {
         ModernSettingsCard(title: "OCR Processing", icon: "text.viewfinder") {
                 VStack(spacing: 16) {
                     ModernToggleRow(
-                        title: "Enable OCR",
-                        subtitle: "Extract text from screen captures for search",
-                        isOn: $ocrEnabled
+                        title: "Pause OCR",
+                        subtitle: "Stop OCR for now; captured frames will be processed when resumed",
+                        isOn: Binding(
+                            get: { !ocrEnabled },
+                            set: { shouldPause in
+                                ocrEnabled = !shouldPause
+                            }
+                        )
                     )
                     .onChange(of: ocrEnabled) { _ in
                         notifyPowerSettingsChanged()
+                    }
+
+                    if !ocrEnabled {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "clock.arrow.trianglehead.counterclockwise.rotate.90")
+                                .foregroundColor(.orange)
+                                .font(.system(size: 13))
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("OCR is paused. New frames are still captured and queued, then processed later when you resume.")
+                                    .font(.retraceCaption2)
+                                    .foregroundColor(.retraceSecondary)
+
+                                Button("Open System Monitor") {
+                                    NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+                                }
+                                .font(.retraceCaption2Medium)
+                                .foregroundColor(.retraceAccent)
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.retraceCard)
+                        .cornerRadius(8)
                     }
 
                     if ocrEnabled {
@@ -2500,18 +2530,18 @@ public struct SettingsView: View {
                                 .cornerRadius(8)
                         }
 
-                        // Slider: left = slow (0.5 FPS), right = fast (2 FPS/unlimited)
-                        // Storage: 0 = unlimited, 0.5-2 = FPS limit
+                        // Slider: left = slow (0.2 FPS), right = fast (2 FPS/unlimited)
+                        // Storage: 0 = unlimited, 0.2-2 = FPS limit
                         Slider(value: Binding(
                             get: { ocrMaxFramesPerSecond == 0 ? 2.0 : ocrMaxFramesPerSecond },
                             set: { newValue in
                                 if newValue >= 1.9 {
                                     ocrMaxFramesPerSecond = 0  // Unlimited (treated as 2 FPS)
                                 } else {
-                                    ocrMaxFramesPerSecond = max(0.5, newValue)
+                                    ocrMaxFramesPerSecond = max(0.2, newValue)
                                 }
                             }
-                        ), in: 0.5...2, step: 0.1)
+                        ), in: 0.2...2, step: 0.2)
                             .tint(.retraceAccent)
                             .onChange(of: ocrMaxFramesPerSecond) { _ in
                                 notifyPowerSettingsChanged()
@@ -2670,16 +2700,16 @@ public struct SettingsView: View {
     private var ocrRateDisplayText: String {
         if ocrMaxFramesPerSecond == 0 {
             return "Unlimited"
-        } else if ocrMaxFramesPerSecond < 1 {
-            return String(format: "%.1f FPS", ocrMaxFramesPerSecond)
         } else {
-            return String(format: "%.0f FPS", ocrMaxFramesPerSecond)
+            return String(format: "%.1f FPS", ocrMaxFramesPerSecond)
         }
     }
 
     private var ocrRateDescriptionText: String {
         if ocrMaxFramesPerSecond == 0 {
             return "Process frames as fast as possible (may cause fan noise)"
+        } else if ocrMaxFramesPerSecond <= 0.3 {
+            return "Ultra low power - maximum CPU smoothing, higher OCR delay"
         } else if ocrMaxFramesPerSecond <= 0.5 {
             return "Quietest mode - minimal CPU and fan activity"
         } else if ocrMaxFramesPerSecond <= 1.0 {
@@ -4368,20 +4398,10 @@ extension SettingsView {
         let sidebarWidth: CGFloat = 220
         let dividerWidth: CGFloat = 1
         let contentWidth = windowWidth - sidebarWidth - dividerWidth
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "[\(timestamp)] [SETTINGS-LAYOUT] windowWidth: \(windowWidth), sidebarWidth: \(sidebarWidth), contentWidth: \(contentWidth)\n"
-        let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: path.path) {
-                if let handle = try? FileHandle(forWritingTo: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: path)
-            }
-        }
+        Log.debug(
+            "[SETTINGS-LAYOUT] windowWidth: \(windowWidth), sidebarWidth: \(sidebarWidth), contentWidth: \(contentWidth)",
+            category: .ui
+        )
     }
 }
 

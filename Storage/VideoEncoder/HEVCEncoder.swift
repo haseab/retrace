@@ -247,17 +247,6 @@ public actor HEVCEncoder {
                 // To be safe, only mark frames up to frameCount-2 as flushed
                 // This means indices 0 to frameCount-3 are readable (< frameCount-2)
                 flushedFrameCount = max(0, frameCount - 2)
-                // DEBUG: Log to file
-                let debugMsg = "[FRAGMENT] fragment=\(fragmentCount) frameCount=\(frameCount) flushedFrameCount=\(flushedFrameCount) sizeIncrease=\(sizeIncrease) file=\(url.lastPathComponent)\n"
-                if let data = debugMsg.data(using: .utf8) {
-                    let fileHandle = FileHandle(forWritingAtPath: "/tmp/retrace_debug.log") ?? {
-                        FileManager.default.createFile(atPath: "/tmp/retrace_debug.log", contents: nil)
-                        return FileHandle(forWritingAtPath: "/tmp/retrace_debug.log")!
-                    }()
-                    fileHandle.seekToEndOfFile()
-                    fileHandle.write(data)
-                    fileHandle.closeFile()
-                }
                 Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(flushedFrameCount) frames flushed, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
                 lastLoggedFileSize = currentSize
             } else if lastLoggedFileSize == 0 && currentSize > 0 {

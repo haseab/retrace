@@ -13,9 +13,12 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     /// This avoids recreating the request object for every frame
     private let textRequest: VNRecognizeTextRequest
 
-    /// Scale factor for downscaling images before OCR (0.9 = 90% of original size)
-    /// Lower values = less energy, slightly lower precision on bounding boxes
-    private static let ocrScaleFactor: CGFloat = 1.0
+    /// OCR scale settings for adaptive downscaling.
+    /// Frames above the target megapixel budget are downscaled to cap OCR cost.
+    private static let maxOCRScaleFactor: CGFloat = 1.0
+    private static let minOCRScaleFactor: CGFloat = 0.55
+    private static let targetMegapixelsAccurate: CGFloat = 3.0
+    private static let targetMegapixelsFast: CGFloat = 4.0
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
         self.textRequest = VNRecognizeTextRequest()
@@ -31,6 +34,10 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         bytesPerRow: Int,
         config: ProcessingConfig
     ) async throws -> [TextRegion] {
+        // Apply recognition mode dynamically so power/quality config is honored.
+        textRequest.recognitionLevel = Self.recognitionLevel(for: config)
+        textRequest.usesLanguageCorrection = config.ocrAccuracyLevel == .accurate
+
         // Create CGImage from raw pixel data
         guard let cgImage = createCGImage(from: imageData, width: width, height: height, bytesPerRow: bytesPerRow) else {
             throw ProcessingError.imageConversionFailed
@@ -40,8 +47,13 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         // OCR cost scales ~linearly with pixel count, so 50% scale = ~50% less ANE work
         // Screen text remains perfectly readable at lower resolutions
         let ocrImage: CGImage
-        if Self.ocrScaleFactor < 1.0 {
-            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
+        let ocrScaleFactor = Self.calculateOCRScaleFactor(
+            width: width,
+            height: height,
+            config: config
+        )
+        if ocrScaleFactor < Self.maxOCRScaleFactor {
+            ocrImage = downscaleImage(cgImage, scale: ocrScaleFactor) ?? cgImage
         } else {
             ocrImage = cgImage
         }
@@ -429,8 +441,13 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
 
         // Downscale image for OCR
         let ocrImage: CGImage
-        if Self.ocrScaleFactor < 1.0 {
-            ocrImage = downscaleImage(cgImage, scale: Self.ocrScaleFactor) ?? cgImage
+        let ocrScaleFactor = Self.calculateOCRScaleFactor(
+            width: width,
+            height: height,
+            config: config
+        )
+        if ocrScaleFactor < Self.maxOCRScaleFactor {
+            ocrImage = downscaleImage(cgImage, scale: ocrScaleFactor) ?? cgImage
         } else {
             ocrImage = cgImage
         }
@@ -452,9 +469,9 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
 
         // Create a fresh request with regionOfInterest
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
+        request.recognitionLevel = Self.recognitionLevel(for: config)
         request.recognitionLanguages = textRequest.recognitionLanguages
-        request.usesLanguageCorrection = true
+        request.usesLanguageCorrection = config.ocrAccuracyLevel == .accurate
         request.regionOfInterest = normalizedRegion
 
         let handler = VNImageRequestHandler(cgImage: ocrImage, options: [:])
@@ -508,6 +525,37 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
                 continuation.resume(throwing: ProcessingError.ocrFailed(underlying: error.localizedDescription))
             }
         }
+    }
+
+    /// Map app OCR config to Vision recognition mode.
+    private static func recognitionLevel(for config: ProcessingConfig) -> VNRequestTextRecognitionLevel {
+        switch config.ocrAccuracyLevel {
+        case .fast:
+            return .fast
+        case .accurate:
+            return .accurate
+        }
+    }
+
+    /// Compute an adaptive OCR scale based on frame size.
+    /// This caps OCR pixel workload on large/ultrawide displays to reduce CPU spikes.
+    private static func calculateOCRScaleFactor(
+        width: Int,
+        height: Int,
+        config: ProcessingConfig
+    ) -> CGFloat {
+        guard width > 0, height > 0 else { return maxOCRScaleFactor }
+
+        let frameMegapixels = (CGFloat(width) * CGFloat(height)) / 1_000_000.0
+        let targetMegapixels: CGFloat = (config.ocrAccuracyLevel == .fast) ? targetMegapixelsFast : targetMegapixelsAccurate
+
+        guard frameMegapixels > targetMegapixels else {
+            return maxOCRScaleFactor
+        }
+
+        // Keep OCR near the target megapixel budget: scale^2 * frameMP ~= targetMP.
+        let scale = sqrt(targetMegapixels / frameMegapixels)
+        return min(maxOCRScaleFactor, max(minOCRScaleFactor, scale))
     }
 
     /// Create a CapturedFrame-like structure from a CGImage for change detection

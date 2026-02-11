@@ -48,7 +48,7 @@ retrace/
 ├── Package.swift                # Swift Package Manager configuration
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
-│   ├── Logging.swift            # Log utility + debugFile() for /tmp/retrace_debug.log
+│   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
 │   ├── AppPaths.swift           # Application path configuration
 │   ├── Models/                  # Data types used across modules
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
@@ -326,59 +326,18 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 
 ## Debug Logging
 
-**ALL debug logs MUST go to `/tmp/retrace_debug.log`** — this is the single source of truth for debugging.
+Use `Shared/Logging.swift` (`Log.debug`, `Log.info`, `Log.warning`, `Log.error`) with the correct category.
 
 ### Writing Debug Logs
 
 ```swift
-// Use the static helper in SimpleTimelineViewModel (or copy this pattern)
-private static func logDebugFileStatic(_ message: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
-    let path = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-    if let data = line.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: path.path) {
-            if let handle = try? FileHandle(forWritingTo: path) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            }
-        } else {
-            try? data.write(to: path)
-        }
-    }
-}
+Log.debug("[TIMELINE] Play button tapped", category: .ui)
+Log.info("[TIMELINE] Playback started at \(position)", category: .ui)
 ```
 
-### Reading Debug Logs
+### Best Practice: Scope Logs to User Actions
 
-```bash
-# Watch logs in real-time
-tail -f /tmp/retrace_debug.log
-
-# Search for specific patterns
-cat /tmp/retrace_debug.log | grep "DEBUG-LOAD"
-
-# View last 100 lines
-tail -100 /tmp/retrace_debug.log
-```
-
-### Best Practice: Clear Log Before Each Session
-
-**ALWAYS clear the debug log before starting a new debugging session:**
-
-```bash
-# FASTEST way to clear (instant, shell builtin)
-: > /tmp/retrace_debug.log
-
-# Alternative methods (also fast)
-cat /dev/null > /tmp/retrace_debug.log
-truncate -s 0 /tmp/retrace_debug.log
-
-# Clear and watch in one command
-: > /tmp/retrace_debug.log && tail -f /tmp/retrace_debug.log | grep "TIMELINE"
-```
+Prefer event-scoped logging over high-frequency frame-by-frame logging during normal debugging.
 
 ### Debugging Philosophy: Trace Execution First
 
@@ -386,9 +345,9 @@ truncate -s 0 /tmp/retrace_debug.log
 
 Don't assume you know which code is running. Add logs at each layer to verify:
 ```swift
-debugLog("[VM] → Calling coordinator")
-debugLog("[COORDINATOR] → Calling adapter")
-debugLog("[ADAPTER] → Taking FILTERED path")  // Reveals which path!
+Log.debug("[VM] Calling coordinator", category: .ui)
+Log.debug("[COORDINATOR] Calling adapter", category: .app)
+Log.debug("[ADAPTER] Taking FILTERED path", category: .database)  // Reveals which path
 ```
 
 Then check which path actually executes and fix the right code.

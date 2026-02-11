@@ -15,47 +15,11 @@ public class TimelineWindowController: NSObject {
 
     public static let shared = TimelineWindowController()
 
-    // MARK: - Performance Tracking
-
-    /// Tracks timing from hotkey press to animation complete
-    private var showStartTime: CFAbsoluteTime = 0
-
-    /// Path to the performance log file
-    private static let perfLogPath = URL(fileURLWithPath: "/tmp/retrace_timeline_perf.log")
-
     // MARK: - Session Duration Tracking
 
     /// Tracks when the timeline was opened for duration tracking
     private var sessionStartTime: Date?
     private var sessionScrubDistance: Double = 0
-
-    /// Log detailed timing breakdown for timeline show (writes to temp file)
-    private func logShowTiming(_ checkpoint: String) {
-        guard showStartTime > 0 else { return }
-        let elapsed = (CFAbsoluteTimeGetCurrent() - showStartTime) * 1000
-        let line = "[\(Log.timestamp())] \(checkpoint): \(String(format: "%.1f", elapsed))ms\n"
-
-        // Append to file
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.perfLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.perfLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.perfLogPath)
-            }
-        }
-    }
-
-    /// Start a new performance trace (clears previous entries and logs header)
-    private func startPerfTrace() {
-        showStartTime = CFAbsoluteTimeGetCurrent()
-        let header = "\n--- Timeline Show @ \(Log.timestamp()) ---\n"
-        try? header.data(using: .utf8)?.write(to: Self.perfLogPath)
-        Log.info("[TIMELINE-PERF] ⏱️ Logging to: \(Self.perfLogPath.path)", category: .ui)
-    }
 
     // MARK: - Properties
 
@@ -124,8 +88,14 @@ public class TimelineWindowController: NSObject {
     /// The mouse X position where the tape drag started (for minimum distance threshold)
     private var tapeDragStartX: CGFloat = 0
 
+    /// The full mouse position where the tape drag started (for click diagnostics)
+    private var tapeDragStartPoint: CGPoint = .zero
+
     /// Whether drag has passed the minimum distance threshold to be considered a drag (vs a click)
     private var tapeDragDidExceedThreshold = false
+
+    /// Whether the current drag candidate started near the playback controls area
+    private var tapeDragStartedNearPlaybackControls = false
 
     /// Minimum pixel distance before a mouseDown+mouseDragged is treated as a drag (not a tap)
     private static let tapeDragMinDistance: CGFloat = 3.0
@@ -155,12 +125,23 @@ public class TimelineWindowController: NSObject {
             guard let eventTap = CGEvent.tapCreate(
                 tap: .cgSessionEventTap,
                 place: .headInsertEventTap,
-                options: .defaultTap,
+                options: .listenOnly,
                 eventsOfInterest: CGEventMask(eventMask),
                 callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                        if let tap = TimelineWindowController.emergencyEventTap {
+                            CGEvent.tapEnable(tap: tap, enable: true)
+                        }
+                        return Unmanaged.passUnretained(event)
+                    }
+
+                    guard type == .keyDown else {
+                        return Unmanaged.passUnretained(event)
+                    }
+
                     // Only process if timeline is visible
                     guard TimelineWindowController.isTimelineVisible else {
-                        return Unmanaged.passRetained(event)
+                        return Unmanaged.passUnretained(event)
                     }
 
                     // Check for Escape key (keycode 53) or Cmd+Option+Escape
@@ -198,7 +179,7 @@ public class TimelineWindowController: NSObject {
                         }
                     }
 
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 },
                 userInfo: nil
             ) else {
@@ -396,9 +377,6 @@ public class TimelineWindowController: NSObject {
 
 	    /// Show the timeline overlay on the current screen
 	    public func show() {
-        // Start performance tracking
-        startPerfTrace()
-
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
             isHiding = false
@@ -409,14 +387,12 @@ public class TimelineWindowController: NSObject {
             })
             isVisible = true
             Self.isTimelineVisible = true
-            logShowTiming("cancelled hide, snapping back to visible")
             return
         }
 
         guard !isVisible, let coordinator = coordinator else {
             return
         }
-        logShowTiming("guard passed")
 
         // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
@@ -426,10 +402,8 @@ public class TimelineWindowController: NSObject {
         if shouldUseLiveMode {
             // Always capture fresh screenshot
             liveScreenshot = captureLiveScreenshot()
-            logShowTiming("live screenshot captured")
         } else {
             liveScreenshot = nil
-            logShowTiming("skipped live screenshot - playhead not at latest frame")
         }
 
         // Remember if dashboard was the key window before we take over
@@ -441,7 +415,6 @@ public class TimelineWindowController: NSObject {
         guard let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) }) ?? NSScreen.main else {
             return
         }
-        logShowTiming("screen detected")
 
         // Reset scale factor cache so it recalculates for the current display
         TimelineScaleFactor.resetCache()
@@ -451,13 +424,11 @@ public class TimelineWindowController: NSObject {
 
         // Check if we have a pre-rendered window ready
         if isPrepared, let window = window, let viewModel = timelineViewModel {
-            logShowTiming("using prerendered window")
 
             // Set live mode with captured screenshot
             if let screenshot = liveScreenshot {
                 viewModel.isInLiveMode = true
                 viewModel.liveScreenshot = screenshot
-                logShowTiming("live mode activated")
                 // Auto-trigger OCR on the live screenshot
                 viewModel.performLiveOCR()
             }
@@ -467,7 +438,6 @@ public class TimelineWindowController: NSObject {
             // Move window to target screen if needed (instant, no recreation)
             if window.frame != targetScreen.frame {
                 window.setFrame(targetScreen.frame, display: false)
-                logShowTiming("moved window to target screen")
             }
 
             // Log cache state
@@ -482,7 +452,6 @@ public class TimelineWindowController: NSObject {
             showPreparedWindow(coordinator: coordinator)
             return
         }
-        logShowTiming("no prerendered window, creating new")
 
         // Fallback: Create window from scratch (original behavior)
 	        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
@@ -498,7 +467,6 @@ public class TimelineWindowController: NSObject {
         if let screenshot = liveScreenshot {
             viewModel.isInLiveMode = true
             viewModel.liveScreenshot = screenshot
-            logShowTiming("live mode activated (fallback)")
             // Auto-trigger OCR on the live screenshot
             viewModel.performLiveOCR()
         }
@@ -535,13 +503,11 @@ public class TimelineWindowController: NSObject {
         // Start async frame loading in background (non-blocking)
         Task {
             await viewModel.loadMostRecentFrame()
-            logShowTiming("background frame load complete (fallback)")
         }
     }
 
     /// Show the prepared window with animation and setup event monitors
     private func showPreparedWindow(coordinator: AppCoordinator) {
-        logShowTiming("showPreparedWindow started")
         guard let window = window else { return }
 
         // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
@@ -549,7 +515,6 @@ public class TimelineWindowController: NSObject {
             hostingView.frame = window.contentView?.bounds ?? .zero
             window.contentView?.addSubview(hostingView)
             hostingView.layoutSubtreeIfNeeded()
-            logShowTiming("hosting view reattached")
             // Force SwiftUI to re-read all @Published properties from the view model.
             // While detached, SwiftUI missed objectWillChange notifications,
             // so the timeline tape may show stale/empty state.
@@ -574,7 +539,6 @@ public class TimelineWindowController: NSObject {
             viewModel.currentIndex = max(0, original - 1)
             viewModel.currentIndex = original
         }
-        logShowTiming("video reload triggered")
 
         let isLive = (timelineViewModel?.isInLiveMode ?? false) && timelineViewModel?.liveScreenshot != nil
         window.alphaValue = isLive ? 1 : 0
@@ -591,18 +555,9 @@ public class TimelineWindowController: NSObject {
         Log.info("[TIMELINE-SHOW] 🚀 WINDOW BECOMING VISIBLE NOW (makeKeyAndOrderFront)", category: .ui)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        logShowTiming("makeKeyAndOrderFront")
 
         isVisible = true
         Self.isTimelineVisible = true  // For emergency escape tap
-
-        // Log display/screen info for debugging cross-display zoom issues
-        let mousePos = NSEvent.mouseLocation
-        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-        let windowScreen = window.screen?.frame ?? .zero
-        let scaleFactor = TimelineScaleFactor.current
-        let screenBackingScale = window.screen?.backingScaleFactor ?? -1
-        debugLog("[TIMELINE-LAUNCH] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), windowFrame: \(Int(windowScreen.width))x\(Int(windowScreen.height)), isKeyWindow: \(window.isKeyWindow), zoomScale: \(timelineViewModel?.frameZoomScale ?? -1), timelineScaleFactor: \(String(format: "%.3f", scaleFactor)), backingScale: \(screenBackingScale)")
 
         // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
         if !isLive {
@@ -768,12 +723,10 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        let screenIndex = NSScreen.screens.firstIndex(of: targetScreen) ?? -1
         if window.frame != targetScreen.frame {
             window.setFrame(targetScreen.frame, display: false)
             // Reset scale factor cache so it recalculates for the new display
             TimelineScaleFactor.resetCache()
-            debugLog("[DISPLAY-SWITCH] moved window to display \(screenIndex), screen: \(Int(targetScreen.frame.width))x\(Int(targetScreen.frame.height)) at (\(Int(targetScreen.frame.origin.x)),\(Int(targetScreen.frame.origin.y))), mouse: (\(Int(mouseLocation.x)),\(Int(mouseLocation.y)))")
         }
     }
 
@@ -1102,7 +1055,6 @@ public class TimelineWindowController: NSObject {
     ///   - clickStartTime: Optional start time from when the tab was clicked (for end-to-end timing)
     public func showWithFilter(bundleID: String, windowName: String?, browserUrl: String? = nil, startDate: Date? = nil, endDate: Date? = nil, clickStartTime: CFAbsoluteTime? = nil) {
         let startTime = clickStartTime ?? CFAbsoluteTimeGetCurrent()
-        logTabClickTiming("TIMELINE_SHOW_WITH_FILTER", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
         // Build the filter criteria upfront
         var criteria = FilterCriteria()
@@ -1119,7 +1071,6 @@ public class TimelineWindowController: NSObject {
 
         // Prepare window invisibly first (don't show yet)
         prepareWindowInvisibly()
-        logTabClickTiming("WINDOW_PREPARED_INVISIBLY", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
         // Load data, then fade in once ready
         Task { @MainActor in
@@ -1128,23 +1079,18 @@ public class TimelineWindowController: NSObject {
             // Apply the filter criteria to viewModel
             viewModel.filterCriteria = criteria
             viewModel.pendingFilterCriteria = criteria
-            logTabClickTiming("TIMELINE_FILTER_SET", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
             // Query and load frames
-            logTabClickTiming("QUERY_START", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
             let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: criteria)
-            logTabClickTiming("QUERY_DONE (count=\(frames?.count ?? 0))", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
             // Load frames directly into viewModel
             await viewModel.loadFramesDirectly(frames ?? [], clickStartTime: startTime)
-            logTabClickTiming("FRAMES_LOADED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
             // Small delay to let the view settle before fade-in
             try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
 
             // Now fade in the window with data already loaded
             fadeInPreparedWindow()
-            logTabClickTiming("FADE_IN_STARTED", startTime: startTime, bundleID: bundleID, browserUrl: browserUrl)
 
         }
     }
@@ -1276,29 +1222,6 @@ public class TimelineWindowController: NSObject {
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
     }
 
-    // MARK: - Tab Click Timing
-
-    private static let tabClickLogPath = URL(fileURLWithPath: "/tmp/retrace_debug.log")
-
-    /// Log timing for tab click filter queries
-    private func logTabClickTiming(_ checkpoint: String, startTime: CFAbsoluteTime, bundleID: String, browserUrl: String?) {
-        let elapsed = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
-        let filterInfo = browserUrl ?? bundleID
-        let line = "[\(Log.timestamp())] [TAB_CLICK] \(checkpoint): \(String(format: "%.1f", elapsed))ms (filter: \(filterInfo))\n"
-
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.tabClickLogPath.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.tabClickLogPath) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.tabClickLogPath)
-            }
-        }
-    }
-
     // MARK: - Window Creation
 
     private func createWindow(for screen: NSScreen) -> NSWindow {
@@ -1334,29 +1257,7 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Event Monitoring
 
-    /// Debug log to /tmp/retrace_debug.log for shift-drag investigation
-    private func debugLog(_ message: String) {
-        let timestamp = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss.SSS"
-        let line = "[\(formatter.string(from: timestamp))] [WINDOW] \(message)\n"
-        if let data = line.data(using: .utf8) {
-            let path = "/tmp/retrace_debug.log"
-            if FileManager.default.fileExists(atPath: path) {
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                FileManager.default.createFile(atPath: path, contents: data)
-            }
-        }
-    }
-
     private func setupEventMonitors() {
-        debugLog("setupEventMonitors called - timeline launched")
-
         // Monitor for mouse events to handle click-drag scrubbing on the timeline tape
         mouseEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .flagsChanged]) { [weak self] event in
             guard let self = self, self.isVisible else { return event }
@@ -1367,7 +1268,11 @@ public class TimelineWindowController: NSObject {
                 guard !event.modifierFlags.contains(.shift) else { return event }
 
                 // Check if the click is in the tape area
-                if self.isPointInTapeArea(event.locationInWindow) {
+                let clickPoint = event.locationInWindow
+                let isInTapeArea = self.isPointInTapeArea(clickPoint)
+                let startedNearPlaybackControls = self.isPointNearPlaybackControls(clickPoint)
+
+                if isInTapeArea {
                     // Don't start drag if overlays are open
                     if let viewModel = self.timelineViewModel,
                        !viewModel.isSearchOverlayVisible,
@@ -1378,8 +1283,10 @@ public class TimelineWindowController: NSObject {
                         // Cancel any ongoing momentum from a previous drag
                         viewModel.cancelTapeDragMomentum()
 
-                        self.tapeDragStartX = event.locationInWindow.x
-                        self.tapeDragLastX = event.locationInWindow.x
+                        self.tapeDragStartX = clickPoint.x
+                        self.tapeDragLastX = clickPoint.x
+                        self.tapeDragStartPoint = clickPoint
+                        self.tapeDragStartedNearPlaybackControls = startedNearPlaybackControls
                         self.isTapeDragging = true
                         self.tapeDragDidExceedThreshold = false
                         self.tapeDragVelocitySamples.removeAll()
@@ -1397,6 +1304,14 @@ public class TimelineWindowController: NSObject {
                         // Check if we've moved far enough to be a drag (not a click)
                         if totalDistance >= Self.tapeDragMinDistance {
                             self.tapeDragDidExceedThreshold = true
+                            if self.tapeDragStartedNearPlaybackControls {
+                                Log.info(
+                                    "[PLAY-CLICK] dragThresholdExceeded start=\(self.formattedPoint(self.tapeDragStartPoint)) " +
+                                    "current=\(self.formattedPoint(event.locationInWindow)) distance=\(String(format: "%.2f", totalDistance)) " +
+                                    "=> converting click to tape drag",
+                                    category: .ui
+                                )
+                            }
                             NSCursor.closedHand.push()
                             // Defer heavy operations during drag
                             if let viewModel = self.timelineViewModel {
@@ -1441,6 +1356,13 @@ public class TimelineWindowController: NSObject {
                     self.tapeDragDidExceedThreshold = false
 
                     if wasDragging {
+                        if self.tapeDragStartedNearPlaybackControls {
+                            Log.info(
+                                "[PLAY-CLICK] mouseUp consumed by tape drag at \(self.formattedPoint(event.locationInWindow)); " +
+                                "play button action will not fire",
+                                category: .ui
+                            )
+                        }
                         NSCursor.pop()
 
                         // Calculate release velocity from recent samples
@@ -1465,8 +1387,12 @@ public class TimelineWindowController: NSObject {
                                 viewModel.endTapeDrag(withVelocity: scrollVelocity)
                             }
                         }
+                        self.tapeDragStartedNearPlaybackControls = false
+                        self.tapeDragStartPoint = .zero
                         return nil // Consume the event
                     }
+                    self.tapeDragStartedNearPlaybackControls = false
+                    self.tapeDragStartPoint = .zero
                     // If we never exceeded the threshold, let the event through
                     // so .onTapGesture on FrameSegmentView can handle it
                 }
@@ -2221,6 +2147,33 @@ public class TimelineWindowController: NSObject {
         return pointInWindow.y >= hitBottom && pointInWindow.y <= hitTop
     }
 
+    /// Approximate hit region near playback controls for click diagnostics.
+    /// This is intentionally broad and centered around the right side of the center control group.
+    private func isPointNearPlaybackControls(_ pointInWindow: CGPoint) -> Bool {
+        guard let viewModel = timelineViewModel,
+              viewModel.showVideoControls,
+              !viewModel.areControlsHidden,
+              !viewModel.isTapeHidden,
+              let window = window else {
+            return false
+        }
+
+        let scale = TimelineScaleFactor.current
+        let centerX = window.contentView?.bounds.midX ?? window.frame.width / 2
+
+        // Playback control sits on the center-right controls row near the datetime cluster.
+        let minX = centerX + (45 * scale)
+        let maxX = centerX + (300 * scale)
+        let controlsCenterY = TimelineScaleFactor.tapeBottomPadding + TimelineScaleFactor.tapeHeight + TimelineScaleFactor.controlsYOffset
+        let minY = controlsCenterY - (30 * scale)
+        let maxY = controlsCenterY + (30 * scale)
+
+        return pointInWindow.x >= minX &&
+            pointInWindow.x <= maxX &&
+            pointInWindow.y >= minY &&
+            pointInWindow.y <= maxY
+    }
+
     /// Force-end any in-progress tape drag (e.g., on window focus loss)
     private func forceEndTapeDrag() {
         guard isTapeDragging else { return }
@@ -2228,6 +2181,8 @@ public class TimelineWindowController: NSObject {
         isTapeDragging = false
         tapeDragDidExceedThreshold = false
         tapeDragVelocitySamples.removeAll()
+        tapeDragStartedNearPlaybackControls = false
+        tapeDragStartPoint = .zero
 
         if wasDragging {
             NSCursor.pop()
@@ -2255,9 +2210,6 @@ public class TimelineWindowController: NSObject {
             // Cancel any tape drag momentum on real scroll input
             viewModel.cancelTapeDragMomentum()
 
-            let mousePos = NSEvent.mouseLocation
-            let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-            debugLog("[SCROLL] \(source), display: \(screenIndex), delta: \(String(format: "%.1f", delta)), isKeyWindow: \(window?.isKeyWindow ?? false)")
             onScroll?(delta)
             // Forward scroll to view model
             Task { @MainActor in
@@ -2290,9 +2242,6 @@ public class TimelineWindowController: NSObject {
         let anchor = CGPoint(x: normalizedX, y: normalizedY)
 
         // Apply the magnification with anchor point
-        let mousePos = NSEvent.mouseLocation
-        let screenIndex = NSScreen.screens.firstIndex(where: { NSMouseInRect(mousePos, $0.frame, false) }) ?? -1
-        debugLog("[ZOOM] display: \(screenIndex), mouse: (\(Int(mousePos.x)),\(Int(mousePos.y))), magnification: \(String(format: "%.3f", magnification)), scaleBefore: \(String(format: "%.2f", viewModel.frameZoomScale)), isKeyWindow: \(window.isKeyWindow)")
         viewModel.applyMagnification(scaleFactor, anchor: anchor, frameSize: windowSize)
     }
 
@@ -2486,6 +2435,10 @@ public class TimelineWindowController: NSObject {
         if let coordinator = coordinator {
             DashboardViewModel.recordKeyboardShortcut(coordinator: coordinator, shortcut: shortcut)
         }
+    }
+
+    private func formattedPoint(_ point: CGPoint) -> String {
+        "(\(Int(point.x)),\(Int(point.y)))"
     }
 
     // MARK: - Session Metrics

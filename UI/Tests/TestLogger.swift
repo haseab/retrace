@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import Shared
 import App
 @testable import Retrace
@@ -176,5 +177,31 @@ final class DeeplinkHandlerTests: XCTestCase {
         XCTAssertEqual(queryMap["app"]!, "com.apple.Safari")
         XCTAssertEqual(queryMap["t"]!, "1704067200123")
         XCTAssertFalse(queryMap.keys.contains("timestamp"))
+    }
+}
+
+final class MenuBarManagerClickBehaviorTests: XCTestCase {
+    func testLeftMouseDownOpensStatusMenu() {
+        XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: .leftMouseDown))
+    }
+
+    func testLeftClickOpensStatusMenu() {
+        XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: .leftMouseUp))
+    }
+
+    func testRightMouseDownOpensStatusMenu() {
+        XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: .rightMouseDown))
+    }
+
+    func testRightClickOpensStatusMenu() {
+        XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: .rightMouseUp))
+    }
+
+    func testUnrelatedEventDoesNotOpenStatusMenu() {
+        XCTAssertFalse(MenuBarManager.shouldOpenStatusMenu(for: .keyDown))
+    }
+
+    func testMissingEventDefaultsToOpenStatusMenu() {
+        XCTAssertTrue(MenuBarManager.shouldOpenStatusMenu(for: nil))
     }
 }

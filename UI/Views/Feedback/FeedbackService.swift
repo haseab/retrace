@@ -254,7 +254,8 @@ public final class FeedbackService {
         // Capture + OCR behavior (effective values)
         settings["ocrEnabled"] = boolString(defaults.object(forKey: "ocrEnabled") as? Bool ?? true)
         settings["ocrOnlyWhenPluggedIn"] = boolString(defaults.bool(forKey: "ocrOnlyWhenPluggedIn"))
-        settings["ocrMaxFramesPerSecond"] = String(format: "%.2f", defaults.double(forKey: "ocrMaxFramesPerSecond"))
+        let ocrMaxFPS = (defaults.object(forKey: "ocrMaxFramesPerSecond") as? NSNumber)?.doubleValue ?? 1.0
+        settings["ocrMaxFramesPerSecond"] = String(format: "%.2f", ocrMaxFPS)
         settings["ocrAppFilterMode"] = defaults.string(forKey: "ocrAppFilterMode") ?? "all"
 
         // Include counts, never raw app lists

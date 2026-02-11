@@ -16,6 +16,8 @@ public class MenuBarManager: ObservableObject {
 
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
+    private var lastStatusMenuOpenEventTimestamp: TimeInterval = 0
+    private var localStatusClickMonitor: Any?
     private let coordinator: AppCoordinator
     private let onboardingManager: OnboardingManager
     private var refreshTimer: DispatchSourceTimer?
@@ -52,14 +54,21 @@ public class MenuBarManager: ObservableObject {
 
     public func setup() {
         // Don't create status item if menu bar icon is disabled
-        guard isMenuBarIconEnabled else { return }
+        guard isMenuBarIconEnabled else {
+            Log.debug("[MenuBarLifecycle] setup skipped: menu bar icon disabled", category: .ui)
+            return
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        Log.debug("[MenuBarLifecycle] status item created", category: .ui)
 
         if statusItem?.button != nil {
             // Start with icon showing current recording state
             updateIcon(recording: isRecording)
-            configureStatusItemButton()
+            configureStatusButtonClicks()
+            setupStatusClickMonitors()
+        } else {
+            Log.error("[MenuBarLifecycle] status item button missing after creation", category: .ui)
         }
 
         // Load shortcuts then setup menu and hotkeys
@@ -561,17 +570,6 @@ public class MenuBarManager: ObservableObject {
     private func setupMenu() {
         let menu = NSMenu()
 
-        // Status
-        let statusMenuItem = NSMenuItem(
-            title: isRecording ? "Recording..." : "Paused",
-            action: nil,
-            keyEquivalent: ""
-        )
-        statusMenuItem.isEnabled = false
-        menu.addItem(statusMenuItem)
-
-        menu.addItem(NSMenuItem.separator())
-
         // Open Timeline
         let timelineItem = NSMenuItem(
             title: "Open Timeline",
@@ -655,27 +653,138 @@ public class MenuBarManager: ObservableObject {
         statusMenu = menu
     }
 
-    /// Configure explicit click handling so single and double-click both show the status menu.
-    private func configureStatusItemButton() {
-        guard let button = statusItem?.button else { return }
+    /// Ensure both left-click and right-click open the status menu.
+    private func configureStatusButtonClicks() {
+        guard let button = statusItem?.button else {
+            Log.error("[MenuBarLifecycle] cannot configure clicks: status button missing", category: .ui)
+            return
+        }
         button.target = self
-        button.action = #selector(handleStatusItemClick(_:))
-        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        button.action = #selector(handleStatusButtonClick(_:))
+        button.sendAction(on: [.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp])
+        Log.debug("[MenuBarLifecycle] click handlers configured for left/right/other mouse down+up", category: .ui)
     }
 
-    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
-        guard let statusItem, let menu = statusMenu else { return }
-        guard let event = NSApp.currentEvent else { return }
+    /// Adds a local monitor so right-click is still detected if NSStatusBarButton action dispatch misses it.
+    private func setupStatusClickMonitors() {
+        teardownStatusClickMonitors()
 
-        switch event.type {
-        case .leftMouseUp, .rightMouseUp:
-            // Show menu for both normal click and double-click.
-            statusItem.menu = menu
-            sender.performClick(nil)
-            statusItem.menu = nil
-        default:
-            break
+        localStatusClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp]) { [weak self] event in
+            self?.handleMonitoredStatusClick(event)
+            return event
         }
+
+        Log.debug("[MenuBarLifecycle] installed local secondary-click monitor", category: .ui)
+    }
+
+    private func teardownStatusClickMonitors() {
+        if let localStatusClickMonitor {
+            NSEvent.removeMonitor(localStatusClickMonitor)
+            self.localStatusClickMonitor = nil
+        }
+    }
+
+    /// Handle right/secondary click events from local monitor and open status menu if click lands on the menu bar button.
+    private func handleMonitoredStatusClick(_ event: NSEvent) {
+        guard Self.shouldOpenStatusMenu(for: event.type) else { return }
+        guard let button = statusItem?.button else { return }
+        guard isEventOnStatusButton(event, button: button) else { return }
+        guard shouldOpenMenu(forEventTimestamp: event.timestamp) else { return }
+
+        Log.debug(
+            "[MenuBarLifecycle] local monitor captured secondary click type=\(String(describing: event.type)) button=\(event.buttonNumber) ts=\(event.timestamp)",
+            category: .ui
+        )
+
+        DispatchQueue.main.async { [weak self, weak button] in
+            guard let self, let button else { return }
+            self.showStatusMenu(from: button)
+        }
+    }
+
+    /// Converts a local event location and checks whether it intersects the status bar button.
+    private func isEventOnStatusButton(_ event: NSEvent, button: NSStatusBarButton) -> Bool {
+        guard let window = button.window else { return false }
+
+        let pointInWindow: NSPoint
+        if event.window === window {
+            pointInWindow = event.locationInWindow
+        } else {
+            pointInWindow = window.convertPoint(fromScreen: event.locationInWindow)
+        }
+
+        let pointInButton = button.convert(pointInWindow, from: nil)
+        return button.bounds.contains(pointInButton)
+    }
+
+    /// De-duplicates down/up or monitor/action double-fires.
+    private func shouldOpenMenu(forEventTimestamp eventTimestamp: TimeInterval?) -> Bool {
+        guard let eventTimestamp else { return true }
+
+        let delta = eventTimestamp - lastStatusMenuOpenEventTimestamp
+        if delta >= 0, delta < 0.20 {
+            Log.debug("[MenuBarLifecycle] duplicate click event ignored delta=\(String(format: "%.4f", delta))s", category: .ui)
+            return false
+        }
+
+        lastStatusMenuOpenEventTimestamp = eventTimestamp
+        return true
+    }
+
+    /// Determines whether the current event should trigger opening the menu.
+    static func shouldOpenStatusMenu(for eventType: NSEvent.EventType?) -> Bool {
+        switch eventType {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            return true
+        case nil:
+            // Fallback to open menu when currentEvent is unavailable.
+            return true
+        default:
+            return false
+        }
+    }
+
+    @objc private func handleStatusButtonClick(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let eventType = String(describing: event?.type)
+        let buttonNumber = event.map { String($0.buttonNumber) } ?? "nil"
+        let clickCount = event.map { String($0.clickCount) } ?? "nil"
+        let eventTimestamp = event?.timestamp
+        let isControlClick = event?.modifierFlags.contains(.control) == true
+
+        Log.debug(
+            "[MenuBarLifecycle] status button click received type=\(eventType) button=\(buttonNumber) clicks=\(clickCount) controlClick=\(isControlClick) ts=\(eventTimestamp.map { String($0) } ?? "nil")",
+            category: .ui
+        )
+
+        guard Self.shouldOpenStatusMenu(for: event?.type) else {
+            Log.debug("[MenuBarLifecycle] click ignored by event gate", category: .ui)
+            return
+        }
+
+        guard shouldOpenMenu(forEventTimestamp: eventTimestamp) else { return }
+
+        showStatusMenu(from: sender)
+    }
+
+    private func showStatusMenu(from button: NSStatusBarButton) {
+        setupMenu()
+        guard let menu = statusMenu, let statusItem else {
+            Log.error("[MenuBarLifecycle] popup aborted: status menu is nil", category: .ui)
+            return
+        }
+
+        Log.debug(
+            "[MenuBarLifecycle] opening status menu items=\(menu.items.count) via status-item attachment",
+            category: .ui
+        )
+
+        // Present as a real status-item menu so it stays visually attached to the menu bar.
+        statusItem.menu = menu
+        button.performClick(nil)
+        statusItem.menu = nil
+
+        Log.debug("[MenuBarLifecycle] status menu closed", category: .ui)
     }
 
     // MARK: - Actions
@@ -780,6 +889,7 @@ public class MenuBarManager: ObservableObject {
     public func hide() {
         isMenuBarIconEnabled = false
         DispatchQueue.main.async {
+            self.teardownStatusClickMonitors()
             if let item = self.statusItem {
                 NSStatusBar.system.removeStatusItem(item)
                 self.statusItem = nil
@@ -792,6 +902,7 @@ public class MenuBarManager: ObservableObject {
     deinit {
         refreshTimer?.cancel()
         iconAnimationTimer?.invalidate()
+        teardownStatusClickMonitors()
     }
 }
 
