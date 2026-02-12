@@ -2435,11 +2435,13 @@ public actor DataAdapter {
         }
 
         // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
+        // Note: Skip tag filters for Rewind database (it doesn't have segment_tag table)
         // When no tags selected, tagJoin is empty and no join happens
-        let hasTagIncludeFilter = query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
+        let isRewind = source == .rewind
+        let hasTagIncludeFilter = !isRewind && query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
         var tagJoinBindValues: [Int64] = []
         let tagJoin: String
-        if let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
+        if !isRewind, let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
             let tagPlaceholders = tagIds.map { _ in "?" }.joined(separator: ", ")
             tagJoin = "INNER JOIN segment_tag st_include ON f.segmentId = st_include.segmentId AND st_include.tagId IN (\(tagPlaceholders))"
             tagJoinBindValues = tagIds
@@ -2447,8 +2449,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Tag exclude filter - use NOT EXISTS
-        if let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
+        // Tag exclude filter - use NOT EXISTS (skip for Rewind)
+        if !isRewind, let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
             let tagPlaceholders = excludedTagIds.map { _ in "?" }.joined(separator: ", ")
             outerWhereConditions.append("""
                 NOT EXISTS (
@@ -2460,35 +2462,37 @@ public actor DataAdapter {
             outerBindValues.append(contentsOf: excludedTagIds)
         }
 
-        // Hidden filter
-        switch query.filters.hiddenFilter {
-        case .hide:
-            // Exclude hidden segments
-            if let hiddenTagId = cachedHiddenTagId {
-                outerWhereConditions.append("""
-                    NOT EXISTS (
-                        SELECT 1 FROM segment_tag st_hidden
-                        WHERE st_hidden.segmentId = f.segmentId
-                        AND st_hidden.tagId = ?
-                    )
-                    """)
-                outerBindValues.append(hiddenTagId)
+        // Hidden filter - skip for Rewind database (no segment_tag table)
+        if !isRewind {
+            switch query.filters.hiddenFilter {
+            case .hide:
+                // Exclude hidden segments
+                if let hiddenTagId = cachedHiddenTagId {
+                    outerWhereConditions.append("""
+                        NOT EXISTS (
+                            SELECT 1 FROM segment_tag st_hidden
+                            WHERE st_hidden.segmentId = f.segmentId
+                            AND st_hidden.tagId = ?
+                        )
+                        """)
+                    outerBindValues.append(hiddenTagId)
+                }
+            case .onlyHidden:
+                // Only show hidden segments
+                if let hiddenTagId = cachedHiddenTagId {
+                    outerWhereConditions.append("""
+                        EXISTS (
+                            SELECT 1 FROM segment_tag st_hidden
+                            WHERE st_hidden.segmentId = f.segmentId
+                            AND st_hidden.tagId = ?
+                        )
+                        """)
+                    outerBindValues.append(hiddenTagId)
+                }
+            case .showAll:
+                // No filter needed - show both hidden and visible
+                break
             }
-        case .onlyHidden:
-            // Only show hidden segments
-            if let hiddenTagId = cachedHiddenTagId {
-                outerWhereConditions.append("""
-                    EXISTS (
-                        SELECT 1 FROM segment_tag st_hidden
-                        WHERE st_hidden.segmentId = f.segmentId
-                        AND st_hidden.tagId = ?
-                    )
-                    """)
-                outerBindValues.append(hiddenTagId)
-            }
-        case .showAll:
-            // No filter needed - show both hidden and visible
-            break
         }
 
         let outerWhereClause = outerWhereConditions.isEmpty ? "" : "WHERE " + outerWhereConditions.joined(separator: " AND ")
@@ -2678,11 +2682,13 @@ public actor DataAdapter {
         }
 
         // Tag include filter - use INNER JOIN (more efficient than EXISTS subquery)
+        // Note: Skip tag filters for Rewind database (it doesn't have segment_tag table)
         // When no tags selected, tagJoin is empty and no join happens
-        let hasTagIncludeFilter = query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
+        let isRewind = source == .rewind
+        let hasTagIncludeFilter = !isRewind && query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
         var tagJoinBindValues: [Int64] = []
         let tagJoin: String
-        if let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
+        if !isRewind, let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
             let tagPlaceholders = tagIds.map { _ in "?" }.joined(separator: ", ")
             tagJoin = "INNER JOIN segment_tag st_include ON f.segmentId = st_include.segmentId AND st_include.tagId IN (\(tagPlaceholders))"
             tagJoinBindValues = tagIds
@@ -2690,8 +2696,8 @@ public actor DataAdapter {
             tagJoin = ""
         }
 
-        // Tag exclude filter - use NOT EXISTS
-        if let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
+        // Tag exclude filter - use NOT EXISTS (skip for Rewind)
+        if !isRewind, let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
             let tagPlaceholders = excludedTagIds.map { _ in "?" }.joined(separator: ", ")
             whereConditions.append("""
                 NOT EXISTS (
@@ -2703,41 +2709,43 @@ public actor DataAdapter {
             bindValues.append(contentsOf: excludedTagIds)
         }
 
-        // Hidden filter
-        switch query.filters.hiddenFilter {
-        case .hide:
-            // Exclude hidden segments
-            if let hiddenTagId = cachedHiddenTagId {
-                whereConditions.append("""
-                    NOT EXISTS (
-                        SELECT 1 FROM segment_tag st_hidden
-                        WHERE st_hidden.segmentId = f.segmentId
-                        AND st_hidden.tagId = ?
-                    )
-                    """)
-                bindValues.append(hiddenTagId)
+        // Hidden filter - skip for Rewind database (no segment_tag table)
+        if !isRewind {
+            switch query.filters.hiddenFilter {
+            case .hide:
+                // Exclude hidden segments
+                if let hiddenTagId = cachedHiddenTagId {
+                    whereConditions.append("""
+                        NOT EXISTS (
+                            SELECT 1 FROM segment_tag st_hidden
+                            WHERE st_hidden.segmentId = f.segmentId
+                            AND st_hidden.tagId = ?
+                        )
+                        """)
+                    bindValues.append(hiddenTagId)
+                }
+            case .onlyHidden:
+                // Only show hidden segments
+                if let hiddenTagId = cachedHiddenTagId {
+                    whereConditions.append("""
+                        EXISTS (
+                            SELECT 1 FROM segment_tag st_hidden
+                            WHERE st_hidden.segmentId = f.segmentId
+                            AND st_hidden.tagId = ?
+                        )
+                        """)
+                    bindValues.append(hiddenTagId)
+                }
+            case .showAll:
+                // No filter needed - show both hidden and visible
+                break
             }
-        case .onlyHidden:
-            // Only show hidden segments
-            if let hiddenTagId = cachedHiddenTagId {
-                whereConditions.append("""
-                    EXISTS (
-                        SELECT 1 FROM segment_tag st_hidden
-                        WHERE st_hidden.segmentId = f.segmentId
-                        AND st_hidden.tagId = ?
-                    )
-                    """)
-                bindValues.append(hiddenTagId)
-            }
-        case .showAll:
-            // No filter needed - show both hidden and visible
-            break
         }
 
         // Determine if we need the segment table join (for app filter or tag/hidden filters)
         let hasTagFilters = hasTagIncludeFilter ||
-            (query.filters.excludedTagIds != nil && !query.filters.excludedTagIds!.isEmpty) ||
-            query.filters.hiddenFilter != .showAll
+            (!isRewind && query.filters.excludedTagIds != nil && !query.filters.excludedTagIds!.isEmpty) ||
+            (!isRewind && query.filters.hiddenFilter != .showAll)
         let hasMetadataFilters =
             (query.filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ||
             (query.filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)

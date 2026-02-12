@@ -647,6 +647,11 @@ public class TimelineWindowController: NSObject {
             if viewModel.isFilterPanelVisible {
                 viewModel.dismissFilterPanel()
             }
+            if viewModel.isCalendarPickerVisible {
+                viewModel.isCalendarPickerVisible = false
+                viewModel.hoursWithFrames = []
+                viewModel.selectedCalendarDate = nil
+            }
             if viewModel.isDateSearchActive {
                 viewModel.closeDateSearch()
             }
