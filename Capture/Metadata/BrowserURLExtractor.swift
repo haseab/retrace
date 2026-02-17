@@ -1,6 +1,5 @@
 import Foundation
 import ApplicationServices
-import AppKit
 import Shared
 
 /// Extracts the current URL from supported web browsers
@@ -76,7 +75,7 @@ struct BrowserURLExtractor: Sendable {
         case "company.thebrowser.Browser":  // Arc
             getArcURL(pid: pid)
         case "org.mozilla.firefox":
-            getFirefoxURL()
+            getFirefoxURL(pid: pid)
         default:
             nil
         }
@@ -177,7 +176,7 @@ struct BrowserURLExtractor: Sendable {
         Log.debug("[BrowserURL] Attempting Arc URL extraction via AppleScript", category: .capture)
 
         // Method 1: AppleScript (most reliable)
-        if let url = runAppleScript("""
+        if let url = runAppleScriptViaProcess("""
             tell application "Arc"
                 if (count of windows) > 0 then
                     get URL of active tab of front window
@@ -191,7 +190,7 @@ struct BrowserURLExtractor: Sendable {
         Log.debug("[BrowserURL] Arc AppleScript method 1 failed, trying method 2", category: .capture)
 
         // Method 2: Alternative AppleScript syntax
-        if let url = runAppleScript("""
+        if let url = runAppleScriptViaProcess("""
             tell application "Arc"
                 if (count of windows) > 0 then
                     get URL of current tab of window 1
@@ -220,16 +219,26 @@ struct BrowserURLExtractor: Sendable {
     /// Firefox (Gecko) doesn't expose the URL via standard AX attributes.
     ///
     /// Note: Firefox's AppleScript support is limited. If this doesn't work,
-    /// we fall back to OCR to extract the URL from the address bar.
-    /// We intentionally avoid clipboard hacks as they disrupt user workflow.
-    private static func getFirefoxURL() -> String? {
-        return runAppleScript("""
+    /// we fall back to AX text field search in the focused window.
+    private static func getFirefoxURL(pid: pid_t) -> String? {
+        if let url = runAppleScriptViaProcess("""
             tell application "Firefox"
                 if (count of windows) > 0 then
                     get URL of active tab of front window
                 end if
             end tell
-            """)
+            """) {
+            return url
+        }
+
+        Log.debug("[BrowserURL] Firefox AppleScript failed, trying AX text field fallback", category: .capture)
+
+        let appRef = AXUIElementCreateApplication(pid)
+        guard let window: AXUIElement = getAXAttribute(appRef, kAXFocusedWindowAttribute) else {
+            return nil
+        }
+
+        return findURLInElement(window, depth: 0, maxDepth: 12)
     }
 
     // MARK: - Generic AXWebArea Approach
@@ -362,36 +371,67 @@ struct BrowserURLExtractor: Sendable {
                (trimmed.contains(".") && !trimmed.contains(" ") && trimmed.count > 4)
     }
 
-    /// Run an AppleScript and return the result
-    /// Note: Requires Automation permission for the target app
-    private static func runAppleScript(_ source: String) -> String? {
-        var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else {
-            Log.error("[AppleScript] Failed to create NSAppleScript", category: .capture)
+    /// Run an AppleScript in an isolated subprocess and return trimmed stdout.
+    /// Note: Requires Automation permission for the target app.
+    private static func runAppleScriptViaProcess(_ source: String, timeoutSeconds: TimeInterval = 2.0) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        let terminationSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            terminationSemaphore.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            Log.error("[AppleScript] Failed to launch osascript subprocess", category: .capture, error: error)
             return nil
         }
 
-        let result = script.executeAndReturnError(&error)
+        if terminationSemaphore.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            Log.warning("[AppleScript] osascript timed out after \(timeoutSeconds)s - terminating subprocess", category: .capture)
+            process.terminate()
+            _ = terminationSemaphore.wait(timeout: .now() + 0.2)
+            return nil
+        }
 
-        if let error = error {
-            let errorNum = error[NSAppleScript.errorNumber] as? Int ?? -1
-            let errorMsg = error[NSAppleScript.errorMessage] as? String ?? "Unknown error"
-            Log.error("[AppleScript] Execution failed: \(errorMsg) (code: \(errorNum))", category: .capture)
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stderr = String(data: errorData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-            // Error -1743 = "Not authorized to send Apple events"
-            if errorNum == -1743 {
+        if process.terminationReason == .uncaughtSignal {
+            Log.error("[AppleScript] osascript crashed with signal \(process.terminationStatus)", category: .capture)
+            if !stderr.isEmpty {
+                Log.error("[AppleScript] osascript stderr: \(stderr)", category: .capture)
+            }
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else {
+            Log.error("[AppleScript] osascript failed: \(stderr.isEmpty ? "Unknown error" : stderr) (code: \(process.terminationStatus))", category: .capture)
+            if stderr.contains("-1743") || stderr.localizedCaseInsensitiveContains("not authorized") {
                 Log.error("[AppleScript] ⚠️ Automation permission denied - user needs to grant permission in System Settings → Privacy & Security → Automation", category: .capture)
             }
             return nil
         }
 
-        if let url = result.stringValue {
-            Log.debug("[AppleScript] Successfully got URL: \(url.prefix(50))...", category: .capture)
-            return url
+        guard !output.isEmpty else {
+            Log.warning("[AppleScript] Script executed but returned empty output", category: .capture)
+            return nil
         }
 
-        Log.warning("[AppleScript] Script executed but returned nil/empty result", category: .capture)
-        return nil
+        Log.debug("[AppleScript] Successfully got URL: \(output.prefix(50))...", category: .capture)
+        return output
     }
 
 }
