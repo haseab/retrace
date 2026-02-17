@@ -239,7 +239,7 @@ public class TimelineWindowController: NSObject {
         // Pre-render the window in the background for instant show()
         Task { @MainActor in
             // Small delay to let app finish launching
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 0.5 seconds
             prepareWindow()
         }
 
@@ -913,7 +913,7 @@ public class TimelineWindowController: NSObject {
 
         // Navigate after a brief delay to allow the view to initialize
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(300_000_000)), clock: .continuous) // 0.3 seconds
             await timelineViewModel?.navigateToHour(date)
         }
     }
@@ -939,7 +939,7 @@ public class TimelineWindowController: NSObject {
             // Wait briefly for the pre-rendered view model to be ready on first launch.
             var attempts = 0
             while self.timelineViewModel == nil && attempts < 20 {
-                try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+                try? await Task.sleep(for: .nanoseconds(Int64(50_000_000)), clock: .continuous) // 50ms
                 attempts += 1
             }
 
@@ -1158,7 +1158,7 @@ public class TimelineWindowController: NSObject {
             await viewModel.loadFramesDirectly(frames ?? [], clickStartTime: startTime)
 
             // Small delay to let the view settle before fade-in
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 0.1 seconds
 
             // Now fade in the window with data already loaded
             fadeInPreparedWindow()
@@ -2542,7 +2542,7 @@ public class TimelineWindowController: NSObject {
                 }
 
                 group.addTask {
-                    try await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+                    try await Task.sleep(for: .nanoseconds(Int64(timeoutMs * 1_000_000)), clock: .continuous)
                     throw SessionMetricFlushTimeout()
                 }
 

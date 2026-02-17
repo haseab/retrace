@@ -801,16 +801,16 @@ public struct SettingsView: View {
         isScrollingToTarget = true
         Task { @MainActor in
             // Wait one layout pass so the target row is in the tree.
-            try? await Task.sleep(nanoseconds: 60_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(60_000_000)), clock: .continuous)
             withAnimation(.easeInOut(duration: 0.25)) {
                 proxy.scrollTo(anchorID, anchor: .top)
             }
             if targetID == Self.pauseReminderIntervalTargetID {
-                try? await Task.sleep(nanoseconds: 140_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(140_000_000)), clock: .continuous)
                 triggerPauseReminderCardHighlight()
             }
             if targetID == Self.powerOCRCardTargetID {
-                try? await Task.sleep(nanoseconds: 140_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(140_000_000)), clock: .continuous)
                 triggerOCRCardHighlight()
             }
             pendingScrollTargetID = nil
@@ -830,7 +830,7 @@ public struct SettingsView: View {
         }
 
         pauseReminderHighlightTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(1_800_000_000)), clock: .continuous)
             guard !Task.isCancelled else { return }
             withAnimation(.easeInOut(duration: 0.38)) {
                 isPauseReminderCardHighlighted = false
@@ -851,7 +851,7 @@ public struct SettingsView: View {
         }
 
         ocrCardHighlightTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(1_800_000_000)), clock: .continuous)
             guard !Task.isCancelled else { return }
             withAnimation(.easeInOut(duration: 0.38)) {
                 isOCRCardHighlighted = false
@@ -1335,7 +1335,7 @@ public struct SettingsView: View {
 
                 // Start 10 second timeout
                 recordingTimeoutTask = Task {
-                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(10_000_000_000)), clock: .continuous)
                     if !Task.isCancelled {
                         await MainActor.run {
                             isRecording.wrappedValue = false
@@ -3204,7 +3204,7 @@ public struct SettingsView: View {
             await loadTagsForSettings()
 
             // Clear error after success (with delay)
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(3_000_000_000)), clock: .continuous)
             await MainActor.run {
                 tagCreationError = nil
             }
@@ -5569,7 +5569,7 @@ extension SettingsView {
 
                     // Auto-hide result after 5 seconds
                     Task {
-                        try? await Task.sleep(nanoseconds: 5_000_000_000)
+                        try? await Task.sleep(for: .nanoseconds(Int64(5_000_000_000)), clock: .continuous)
                         await MainActor.run {
                             withAnimation {
                                 deleteResult = nil
@@ -5698,7 +5698,7 @@ extension SettingsView {
 
         // Auto-dismiss after 2 seconds
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
             await MainActor.run {
                 excludedAppsUpdateMessage = nil
             }
@@ -5711,7 +5711,7 @@ extension SettingsView {
 
         // Auto-dismiss after 2 seconds
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
             await MainActor.run {
                 excludedAppsUpdateMessage = nil
             }
@@ -5815,7 +5815,7 @@ extension SettingsView {
         // Poll for permission change
         Task {
             for _ in 0..<30 { // Check for up to 30 seconds
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous)
                 let granted = checkAccessibilityPermission()
                 if granted {
                     await MainActor.run {
@@ -5988,7 +5988,7 @@ extension SettingsView {
 
         // Auto-dismiss after 2 seconds
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
             await MainActor.run {
                 compressionUpdateMessage = nil
             }
@@ -6001,7 +6001,7 @@ extension SettingsView {
 
         // Auto-dismiss after 2 seconds
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
             await MainActor.run {
                 captureUpdateMessage = nil
             }
@@ -6014,7 +6014,7 @@ extension SettingsView {
 
         // Auto-dismiss after 2 seconds
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
             await MainActor.run {
                 scrubbingAnimationUpdateMessage = nil
             }

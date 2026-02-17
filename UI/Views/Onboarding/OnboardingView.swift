@@ -1352,7 +1352,7 @@ public struct OnboardingView: View {
 
                 // Start 10 second timeout
                 recordingTimeoutTask = Task {
-                    try? await Task.sleep(nanoseconds: 10_000_000_000) // 10 seconds
+                    try? await Task.sleep(for: .nanoseconds(Int64(10_000_000_000)), clock: .continuous) // 10 seconds
                     if !Task.isCancelled {
                         await MainActor.run {
                             isRecording.wrappedValue = false
@@ -1900,7 +1900,7 @@ public struct OnboardingView: View {
         // Start polling for permission
         Task {
             for _ in 0..<30 { // Check for up to 30 seconds
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous)
 
                 // Check without prompting during polling
                 let checkOptions: NSDictionary = [

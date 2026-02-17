@@ -211,7 +211,7 @@ public actor HEVCEncoder {
                 try await finalize()
                 throw StorageModuleError.encodingFailed(underlying: "Encoder timeout waiting for input ready - auto-finalized")
             }
-            try await Task.sleep(nanoseconds: 1_000_000) // 1ms
+            try await Task.sleep(for: .nanoseconds(Int64(1_000_000)), clock: .continuous) // 1ms
         }
 
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {

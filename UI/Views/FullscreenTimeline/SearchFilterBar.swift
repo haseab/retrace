@@ -301,7 +301,7 @@ public struct SearchFilterBar: View {
         .padding(.vertical, 12)
         .task {
             // Delay loading until after animation completes to avoid choppy animation
-            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in

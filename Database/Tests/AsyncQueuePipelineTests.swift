@@ -276,7 +276,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
             // Wait for queue to drain AND all frames to be processed
             if queueDepth == 0 && stats.totalProcessed >= allEnqueuedFrameIDs.count {
                 // Give a small grace period for workers to mark frames as completed
-                try await Task.sleep(nanoseconds: 100_000_000)  // 0.1 seconds
+                try await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)  // 0.1 seconds
                 break
             }
 
@@ -285,7 +285,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
                 break
             }
 
-            try await Task.sleep(nanoseconds: 500_000_000)  // Wait 0.5 seconds
+            try await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)  // Wait 0.5 seconds
         }
 
         let elapsedWait = Date().timeIntervalSince(startWait)

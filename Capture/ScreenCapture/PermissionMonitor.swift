@@ -213,7 +213,7 @@ public actor PermissionMonitor {
             let checkInterval: UInt64 = 2_000_000_000
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: checkInterval)
+                try? await Task.sleep(for: .nanoseconds(Int64(checkInterval)), clock: .continuous)
                 guard !Task.isCancelled else { break }
 
                 await self?.checkPermissionChanges()

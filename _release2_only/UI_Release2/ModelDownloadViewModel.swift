@@ -145,7 +145,7 @@ class ModelDownloadViewModel: ObservableObject {
                 percentage: percentage
             )
 
-            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms
+            try? await Task.sleep(for: .nanoseconds(Int64(20_000_000)), clock: .continuous) // 20ms
         }
 
         modelStatuses[model.name] = ModelStatus(

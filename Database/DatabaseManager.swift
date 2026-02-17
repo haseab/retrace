@@ -1331,7 +1331,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
             // Exponential backoff before retry
             if attempt < maxRetries {
-                try await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000) // 500ms, 1s, 1.5s
+                try await Task.sleep(for: .nanoseconds(Int64(UInt64(attempt) * 500_000_000)), clock: .continuous) // 500ms, 1s, 1.5s
             }
         }
 

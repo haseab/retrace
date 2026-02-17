@@ -309,7 +309,7 @@ public actor AppCoordinator {
                 Log.info("[ORPHAN-RECOVERY] Enqueued batch of \(frameIDs.count) frames (total: \(totalEnqueued)/\(orphanedCount))", category: .app)
 
                 // Small delay between batches to avoid overwhelming the queue
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
             }
 
             Log.info("[ORPHAN-RECOVERY] Completed - enqueued \(totalEnqueued) orphaned frames for OCR processing", category: .app)
@@ -698,7 +698,7 @@ public actor AppCoordinator {
             let cleanupInterval: UInt64 = 60_000_000_000 // 60 seconds
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: cleanupInterval)
+                try? await Task.sleep(for: .nanoseconds(Int64(cleanupInterval)), clock: .continuous)
                 guard !Task.isCancelled else { break }
 
                 await self?.cleanupOrphanedVideos()

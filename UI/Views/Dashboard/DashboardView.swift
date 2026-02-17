@@ -1334,28 +1334,28 @@ private struct MonitorButton: View {
                     withAnimation(.easeOut(duration: 0.1)) {
                         heartbeatScale = 1.25
                     }
-                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)
 
                     // Contract back
                     withAnimation(.easeIn(duration: 0.15)) {
                         heartbeatScale = 1.05
                     }
-                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(150_000_000)), clock: .continuous)
 
                     // Beat 2: smaller secondary beat
                     withAnimation(.easeOut(duration: 0.08)) {
                         heartbeatScale = 1.15
                     }
-                    try? await Task.sleep(nanoseconds: 80_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(80_000_000)), clock: .continuous)
 
                     // Contract and rest
                     withAnimation(.easeIn(duration: 0.2)) {
                         heartbeatScale = 1.05
                     }
-                    try? await Task.sleep(nanoseconds: 600_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(600_000_000)), clock: .continuous)
                 } else {
                     heartbeatScale = 1.0
-                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)
                 }
             }
         }

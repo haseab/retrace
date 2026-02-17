@@ -252,7 +252,7 @@ public actor ProcessingManager: ProcessingProtocol {
 
     public func waitForQueueDrain() async {
         while !processingQueue.isEmpty || isProcessing {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous)  // 100ms
         }
     }
 
