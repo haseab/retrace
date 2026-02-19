@@ -104,7 +104,8 @@ public actor HEVCEncoder {
         var compressionProperties: [String: Any] = [
             AVVideoQualityKey: quality,
             AVVideoMaxKeyFrameIntervalKey: 30,  // Keyframe every 30 frames (like Rewind) for better compression
-            AVVideoAllowFrameReorderingKey: true,  // Allow B-frames for bidirectional prediction
+            // Stability: disable frame reordering (B-frames) to reduce encoder callback complexity.
+            AVVideoAllowFrameReorderingKey: false,
             AVVideoExpectedSourceFrameRateKey: 30
         ]
 
@@ -123,7 +124,8 @@ public actor HEVCEncoder {
         ]
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        input.expectsMediaDataInRealTime = false
+        // Live capture source: enable real-time mode to reduce deep internal buffering.
+        input.expectsMediaDataInRealTime = true
 
         // Create pixel buffer adaptor
         let sourcePixelBufferAttributes: [String: Any] = [
