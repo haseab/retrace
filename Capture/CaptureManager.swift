@@ -209,10 +209,8 @@ public actor CaptureManager: CaptureProtocol {
         guard _isCapturing else { return }
         guard currentConfig.captureOnWindowChange else { return }
 
-        // Get current window info
-        let currentInfo = await MainActor.run {
-            appInfoProvider.getFrontmostAppInfo()
-        }
+        // Get current window info (skip expensive browser URL extraction on hot path)
+        let currentInfo = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
         let currentTitle = currentInfo.windowName ?? ""
         let currentBundleID = currentInfo.appBundleID ?? ""
 
@@ -382,10 +380,8 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Enrich frame with app metadata
     private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
-        // Get app info on main actor
-        let metadata = await MainActor.run {
-            appInfoProvider.getFrontmostAppInfo()
-        }
+        // Get app info with browser metadata off-main to avoid blocking UI paths
+        let metadata = await appInfoProvider.getFrontmostAppInfo()
 
         // Create new frame with enriched metadata
         return CapturedFrame(

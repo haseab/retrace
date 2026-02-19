@@ -15,10 +15,12 @@ struct AppInfoProvider: Sendable {
 
     /// Get information about the frontmost application
     /// - Returns: FrameMetadata with app info, or minimal metadata if unavailable
-    @MainActor
-    func getFrontmostAppInfo() -> FrameMetadata {
-        // Get frontmost app from NSWorkspace
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+    /// - Parameter includeBrowserURL: Whether browser URL extraction should run (can be expensive)
+    func getFrontmostAppInfo(includeBrowserURL: Bool = true) async -> FrameMetadata {
+        // Read NSWorkspace state on main actor, then do expensive work off-main.
+        guard let frontApp = await MainActor.run(body: {
+            NSWorkspace.shared.frontmostApplication
+        }) else {
             return FrameMetadata(displayID: CGMainDisplayID())
         }
 
@@ -37,7 +39,9 @@ struct AppInfoProvider: Sendable {
 
         // Get browser URL if applicable
         var browserURL: String? = nil
-        if let bundleID = bundleID, Self.browserBundleIDs.contains(bundleID) {
+        if includeBrowserURL,
+           let bundleID = bundleID,
+           Self.browserBundleIDs.contains(bundleID) {
             browserURL = BrowserURLExtractor.getURL(
                 bundleID: bundleID,
                 pid: frontApp.processIdentifier

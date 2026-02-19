@@ -374,6 +374,12 @@ struct BrowserURLExtractor: Sendable {
     /// Run an AppleScript in an isolated subprocess and return trimmed stdout.
     /// Note: Requires Automation permission for the target app.
     private static func runAppleScriptViaProcess(_ source: String, timeoutSeconds: TimeInterval = 2.0) -> String? {
+        // Never block the main thread on a subprocess wait.
+        if Thread.isMainThread {
+            Log.warning("[AppleScript] Skipping URL extraction on main thread to avoid UI stalls", category: .capture)
+            return nil
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", source]
