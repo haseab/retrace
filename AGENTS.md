@@ -47,6 +47,11 @@ retrace/
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration
+├── scripts/                     # Build/release/validation scripts
+│   ├── release.sh               # End-to-end release automation
+│   ├── create-release.sh        # Release build + packaging helper
+│   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
+│   └── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │
 ├── Shared/                      # CRITICAL: Shared types and protocols
 │   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
@@ -411,4 +416,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-02-11*
+*This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-02-20*

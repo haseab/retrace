@@ -2,6 +2,168 @@ import Foundation
 import ApplicationServices
 import Shared
 
+// MARK: - AppleScript Coordination
+
+struct BrowserURLAppleScriptResult: Sendable {
+    let output: String?
+    let didTimeOut: Bool
+    let permissionDenied: Bool
+    let completedWithoutTimeout: Bool
+    let skippedByCooldown: Bool
+    let returnedFromCache: Bool
+
+    init(
+        output: String? = nil,
+        didTimeOut: Bool = false,
+        permissionDenied: Bool = false,
+        completedWithoutTimeout: Bool = false,
+        skippedByCooldown: Bool = false,
+        returnedFromCache: Bool = false
+    ) {
+        self.output = output
+        self.didTimeOut = didTimeOut
+        self.permissionDenied = permissionDenied
+        self.completedWithoutTimeout = completedWithoutTimeout
+        self.skippedByCooldown = skippedByCooldown
+        self.returnedFromCache = returnedFromCache
+    }
+}
+
+struct BrowserURLAppleScriptKey: Hashable, Sendable {
+    let bundleID: String
+    let pid: pid_t
+}
+
+actor BrowserURLAppleScriptCoordinator {
+    typealias Runner = @Sendable (
+        _ source: String,
+        _ browserBundleID: String,
+        _ pid: pid_t,
+        _ timeoutSeconds: TimeInterval,
+        _ isBootstrapTimeout: Bool
+    ) async -> BrowserURLAppleScriptResult
+
+    private enum PermissionState: Sendable {
+        case unknown
+        case settled
+    }
+
+    private struct CacheEntry: Sendable {
+        let url: String
+        let timestamp: Date
+    }
+
+    private struct BackoffState: Sendable {
+        var timeoutFailures: Int = 0
+        var deniedFailures: Int = 0
+        var nextAllowedAt: Date?
+    }
+
+    private let runner: Runner
+    private let bootstrapTimeoutSeconds: TimeInterval
+    private let normalTimeoutSeconds: TimeInterval
+    private let cacheTTLSeconds: TimeInterval
+    private let timeoutBaseBackoffSeconds: TimeInterval
+    private let deniedBaseBackoffSeconds: TimeInterval
+    private let maxTimeoutBackoffSeconds: TimeInterval
+    private let maxDeniedBackoffSeconds: TimeInterval
+
+    private var permissionStateByBrowser: [String: PermissionState] = [:]
+    private var inFlight: [BrowserURLAppleScriptKey: Task<BrowserURLAppleScriptResult, Never>] = [:]
+    private var cache: [BrowserURLAppleScriptKey: CacheEntry] = [:]
+    private var backoffByKey: [BrowserURLAppleScriptKey: BackoffState] = [:]
+
+    init(
+        bootstrapTimeoutSeconds: TimeInterval = 45.0,
+        normalTimeoutSeconds: TimeInterval = 2.0,
+        cacheTTLSeconds: TimeInterval = 3.0,
+        timeoutBaseBackoffSeconds: TimeInterval = 2.0,
+        deniedBaseBackoffSeconds: TimeInterval = 15.0,
+        maxTimeoutBackoffSeconds: TimeInterval = 30.0,
+        maxDeniedBackoffSeconds: TimeInterval = 120.0,
+        runner: @escaping Runner
+    ) {
+        self.bootstrapTimeoutSeconds = bootstrapTimeoutSeconds
+        self.normalTimeoutSeconds = normalTimeoutSeconds
+        self.cacheTTLSeconds = cacheTTLSeconds
+        self.timeoutBaseBackoffSeconds = timeoutBaseBackoffSeconds
+        self.deniedBaseBackoffSeconds = deniedBaseBackoffSeconds
+        self.maxTimeoutBackoffSeconds = maxTimeoutBackoffSeconds
+        self.maxDeniedBackoffSeconds = maxDeniedBackoffSeconds
+        self.runner = runner
+    }
+
+    func execute(source: String, browserBundleID: String, pid: pid_t) async -> BrowserURLAppleScriptResult {
+        let key = BrowserURLAppleScriptKey(bundleID: browserBundleID, pid: pid)
+        let now = Date()
+
+        if let task = inFlight[key] {
+            return await task.value
+        }
+
+        if let cached = cache[key], now.timeIntervalSince(cached.timestamp) <= cacheTTLSeconds {
+            return BrowserURLAppleScriptResult(
+                output: cached.url,
+                completedWithoutTimeout: true,
+                returnedFromCache: true
+            )
+        }
+
+        if let nextAllowedAt = backoffByKey[key]?.nextAllowedAt, nextAllowedAt > now {
+            return BrowserURLAppleScriptResult(skippedByCooldown: true)
+        }
+
+        let permissionState = permissionStateByBrowser[browserBundleID] ?? .unknown
+        let isBootstrapTimeout = permissionState == .unknown
+        let timeoutSeconds = isBootstrapTimeout ? bootstrapTimeoutSeconds : normalTimeoutSeconds
+
+        let task = Task<BrowserURLAppleScriptResult, Never> {
+            await runner(source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout)
+        }
+        inFlight[key] = task
+        defer {
+            inFlight.removeValue(forKey: key)
+        }
+
+        let result = await task.value
+
+        if result.completedWithoutTimeout {
+            permissionStateByBrowser[browserBundleID] = .settled
+        }
+
+        if let output = result.output, !output.isEmpty {
+            cache[key] = CacheEntry(url: output, timestamp: Date())
+            backoffByKey.removeValue(forKey: key)
+            return result
+        }
+
+        if result.didTimeOut || result.permissionDenied {
+            var backoff = backoffByKey[key] ?? BackoffState()
+
+            if result.didTimeOut {
+                backoff.timeoutFailures += 1
+                backoff.deniedFailures = 0
+                let delay = min(
+                    maxTimeoutBackoffSeconds,
+                    timeoutBaseBackoffSeconds * pow(2.0, Double(max(0, backoff.timeoutFailures - 1)))
+                )
+                backoff.nextAllowedAt = now.addingTimeInterval(delay)
+            } else if result.permissionDenied {
+                backoff.deniedFailures += 1
+                let delay = min(
+                    maxDeniedBackoffSeconds,
+                    deniedBaseBackoffSeconds * pow(2.0, Double(max(0, backoff.deniedFailures - 1)))
+                )
+                backoff.nextAllowedAt = now.addingTimeInterval(delay)
+            }
+
+            backoffByKey[key] = backoff
+        }
+
+        return result
+    }
+}
+
 /// Extracts the current URL from supported web browsers
 /// Requires Accessibility permission
 ///
@@ -46,6 +208,18 @@ struct BrowserURLExtractor: Sendable {
         "com.nicklockwood.Floorp",     // Floorp
     ]
 
+    private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
+        runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout in
+            await runAppleScriptViaProcess(
+                source,
+                browserBundleID: browserBundleID,
+                pid: pid,
+                timeoutSeconds: timeoutSeconds,
+                isBootstrapTimeout: isBootstrapTimeout
+            )
+        }
+    )
+
     /// Check if a bundle ID is a known browser
     static func isBrowser(_ bundleID: String) -> Bool {
         knownBrowsers.contains(bundleID)
@@ -63,21 +237,22 @@ struct BrowserURLExtractor: Sendable {
     /// 1. Browser-specific method (AX attributes or AppleScript)
     /// 2. Generic AXWebArea → AXURL traversal
     /// 3. Address bar text field search
-    static func getURL(bundleID: String, pid: pid_t) -> String? {
+    static func getURL(bundleID: String, pid: pid_t) async -> String? {
         // Try browser-specific method first
-        let url: String? = switch bundleID {
+        let url: String?
+        switch bundleID {
         case "com.apple.Safari":
-            getSafariURL(pid: pid)
+            url = getSafariURL(pid: pid)
         case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi",
              "org.chromium.Chromium", "com.sigmaos.sigmaos", "com.cometbrowser.Comet", "com.aspect.browser",
              "com.openai.chat", "com.nicklockwood.Thorium":
-            getChromiumURL(pid: pid)
+            url = getChromiumURL(pid: pid)
         case "company.thebrowser.Browser":  // Arc
-            getArcURL(pid: pid)
+            url = await getArcURL(pid: pid)
         case "org.mozilla.firefox":
-            getFirefoxURL(pid: pid)
+            url = await getFirefoxURL(pid: pid)
         default:
-            nil
+            url = nil
         }
 
         if let url = url, !url.isEmpty {
@@ -172,33 +347,54 @@ struct BrowserURLExtractor: Sendable {
     /// Extract URL from Arc browser
     /// Arc is Chromium-based but often has an incomplete AX tree.
     /// AppleScript is the most reliable method.
-    private static func getArcURL(pid: pid_t) -> String? {
+    private static func getArcURL(pid: pid_t) async -> String? {
         Log.debug("[BrowserURL] Attempting Arc URL extraction via AppleScript", category: .capture)
 
         // Method 1: AppleScript (most reliable)
-        if let url = runAppleScriptViaProcess("""
+        let arcBundleID = "company.thebrowser.Browser"
+        let method1Result = await appleScriptCoordinator.execute(
+            source:
+            """
             tell application "Arc"
                 if (count of windows) > 0 then
                     get URL of active tab of front window
                 end if
             end tell
-            """) {
-            Log.info("[BrowserURL] ✅ Arc URL extracted via AppleScript method 1", category: .capture)
+            """,
+            browserBundleID: arcBundleID,
+            pid: pid
+        )
+        if let url = method1Result.output {
+            let source = method1Result.returnedFromCache ? "cache" : "AppleScript method 1"
+            Log.info("[BrowserURL] ✅ Arc URL extracted via \(source)", category: .capture)
             return url
         }
 
-        Log.debug("[BrowserURL] Arc AppleScript method 1 failed, trying method 2", category: .capture)
+        if method1Result.skippedByCooldown {
+            Log.debug("[BrowserURL] Arc AppleScript in cooldown; skipping launch in this capture cycle", category: .capture)
+        } else if method1Result.didTimeOut {
+            Log.warning("[BrowserURL] Arc AppleScript method 1 timed out; skipping method 2 for this capture cycle", category: .capture)
+        } else {
+            Log.debug("[BrowserURL] Arc AppleScript method 1 failed, trying method 2", category: .capture)
 
-        // Method 2: Alternative AppleScript syntax
-        if let url = runAppleScriptViaProcess("""
-            tell application "Arc"
-                if (count of windows) > 0 then
-                    get URL of current tab of window 1
-                end if
-            end tell
-            """) {
-            Log.info("[BrowserURL] ✅ Arc URL extracted via AppleScript method 2", category: .capture)
-            return url
+            // Method 2: Alternative AppleScript syntax
+            let method2Result = await appleScriptCoordinator.execute(
+                source:
+                """
+                tell application "Arc"
+                    if (count of windows) > 0 then
+                        get URL of current tab of window 1
+                    end if
+                end tell
+                """,
+                browserBundleID: arcBundleID,
+                pid: pid
+            )
+            if let url = method2Result.output {
+                let source = method2Result.returnedFromCache ? "cache" : "AppleScript method 2"
+                Log.info("[BrowserURL] ✅ Arc URL extracted via \(source)", category: .capture)
+                return url
+            }
         }
 
         Log.debug("[BrowserURL] Arc AppleScript methods failed, falling back to Chromium AX approach", category: .capture)
@@ -220,15 +416,28 @@ struct BrowserURLExtractor: Sendable {
     ///
     /// Note: Firefox's AppleScript support is limited. If this doesn't work,
     /// we fall back to AX text field search in the focused window.
-    private static func getFirefoxURL(pid: pid_t) -> String? {
-        if let url = runAppleScriptViaProcess("""
+    private static func getFirefoxURL(pid: pid_t) async -> String? {
+        let firefoxBundleID = "org.mozilla.firefox"
+        let appleScriptResult = await appleScriptCoordinator.execute(
+            source:
+            """
             tell application "Firefox"
                 if (count of windows) > 0 then
                     get URL of active tab of front window
                 end if
             end tell
-            """) {
+            """,
+            browserBundleID: firefoxBundleID,
+            pid: pid
+        )
+        if let url = appleScriptResult.output {
             return url
+        }
+
+        if appleScriptResult.skippedByCooldown {
+            Log.debug("[BrowserURL] Firefox AppleScript in cooldown; skipping launch in this capture cycle", category: .capture)
+        } else if appleScriptResult.didTimeOut {
+            Log.warning("[BrowserURL] Firefox AppleScript timed out; retry will use bootstrap timeout until permission settles", category: .capture)
         }
 
         Log.debug("[BrowserURL] Firefox AppleScript failed, trying AX text field fallback", category: .capture)
@@ -371,15 +580,15 @@ struct BrowserURLExtractor: Sendable {
                (trimmed.contains(".") && !trimmed.contains(" ") && trimmed.count > 4)
     }
 
-    /// Run an AppleScript in an isolated subprocess and return trimmed stdout.
-    /// Note: Requires Automation permission for the target app.
-    private static func runAppleScriptViaProcess(_ source: String, timeoutSeconds: TimeInterval = 2.0) -> String? {
-        // Never block the main thread on a subprocess wait.
-        if Thread.isMainThread {
-            Log.warning("[AppleScript] Skipping URL extraction on main thread to avoid UI stalls", category: .capture)
-            return nil
-        }
-
+    /// Run AppleScript in an isolated subprocess and return trimmed stdout.
+    /// This path is fully async and avoids blocking with semaphore waits.
+    private static func runAppleScriptViaProcess(
+        _ source: String,
+        browserBundleID: String,
+        pid: pid_t,
+        timeoutSeconds: TimeInterval,
+        isBootstrapTimeout: Bool
+    ) async -> BrowserURLAppleScriptResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", source]
@@ -389,23 +598,23 @@ struct BrowserURLExtractor: Sendable {
         process.standardOutput = outputPipe
         process.standardError = errorPipe
 
-        let terminationSemaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            terminationSemaphore.signal()
-        }
-
         do {
             try process.run()
         } catch {
-            Log.error("[AppleScript] Failed to launch osascript subprocess", category: .capture, error: error)
-            return nil
+            Log.error("[AppleScript] [\(browserBundleID)] Failed to launch osascript subprocess", category: .capture, error: error)
+            return BrowserURLAppleScriptResult()
         }
 
-        if terminationSemaphore.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            Log.warning("[AppleScript] osascript timed out after \(timeoutSeconds)s - terminating subprocess", category: .capture)
+        let didTimeout = await waitForProcessExitOrTimeout(
+            process: process,
+            timeoutSeconds: timeoutSeconds
+        )
+        if didTimeout {
+            let mode = isBootstrapTimeout ? "bootstrap timeout" : "normal timeout"
+            Log.warning("[AppleScript] [\(browserBundleID):\(pid)] osascript timed out after \(timeoutSeconds)s (\(mode)) - terminating subprocess", category: .capture)
             process.terminate()
-            _ = terminationSemaphore.wait(timeout: .now() + 0.2)
-            return nil
+            await waitForProcessExit(process)
+            return BrowserURLAppleScriptResult(didTimeOut: true)
         }
 
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
@@ -416,28 +625,77 @@ struct BrowserURLExtractor: Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
         if process.terminationReason == .uncaughtSignal {
-            Log.error("[AppleScript] osascript crashed with signal \(process.terminationStatus)", category: .capture)
+            Log.error("[AppleScript] [\(browserBundleID)] osascript crashed with signal \(process.terminationStatus)", category: .capture)
             if !stderr.isEmpty {
-                Log.error("[AppleScript] osascript stderr: \(stderr)", category: .capture)
+                Log.error("[AppleScript] [\(browserBundleID)] osascript stderr: \(stderr)", category: .capture)
             }
-            return nil
+            return BrowserURLAppleScriptResult(completedWithoutTimeout: true)
         }
 
         guard process.terminationStatus == 0 else {
-            Log.error("[AppleScript] osascript failed: \(stderr.isEmpty ? "Unknown error" : stderr) (code: \(process.terminationStatus))", category: .capture)
-            if stderr.contains("-1743") || stderr.localizedCaseInsensitiveContains("not authorized") {
+            Log.error("[AppleScript] [\(browserBundleID)] osascript failed: \(stderr.isEmpty ? "Unknown error" : stderr) (code: \(process.terminationStatus))", category: .capture)
+            let permissionDenied = stderr.contains("-1743") || stderr.localizedCaseInsensitiveContains("not authorized")
+            if permissionDenied {
                 Log.error("[AppleScript] ⚠️ Automation permission denied - user needs to grant permission in System Settings → Privacy & Security → Automation", category: .capture)
             }
-            return nil
+            return BrowserURLAppleScriptResult(
+                permissionDenied: permissionDenied,
+                completedWithoutTimeout: true
+            )
         }
 
         guard !output.isEmpty else {
-            Log.warning("[AppleScript] Script executed but returned empty output", category: .capture)
-            return nil
+            Log.warning("[AppleScript] [\(browserBundleID)] Script executed but returned empty output", category: .capture)
+            return BrowserURLAppleScriptResult(completedWithoutTimeout: true)
         }
 
-        Log.debug("[AppleScript] Successfully got URL: \(output.prefix(50))...", category: .capture)
-        return output
+        Log.debug("[AppleScript] [\(browserBundleID)] Successfully got URL: \(output.prefix(50))...", category: .capture)
+        return BrowserURLAppleScriptResult(
+            output: output,
+            completedWithoutTimeout: true
+        )
+    }
+
+    private static func waitForProcessExit(_ process: Process) async {
+        while process.isRunning {
+            try? await Task.sleep(for: .milliseconds(10), clock: .continuous)
+        }
+    }
+
+    private static func waitForProcessExitOrTimeout(
+        process: Process,
+        timeoutSeconds: TimeInterval
+    ) async -> Bool {
+        final class ResumeState {
+            private var hasResumed = false
+            private let lock = NSLock()
+
+            func resumeOnce(_ continuation: CheckedContinuation<Bool, Never>, value: Bool) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                continuation.resume(returning: value)
+            }
+        }
+
+        let state = ResumeState()
+
+        return await withCheckedContinuation { continuation in
+            process.terminationHandler = { _ in
+                state.resumeOnce(continuation, value: false)
+            }
+
+            if !process.isRunning {
+                state.resumeOnce(continuation, value: false)
+                return
+            }
+
+            Task {
+                try? await Task.sleep(for: .seconds(timeoutSeconds), clock: .continuous)
+                state.resumeOnce(continuation, value: true)
+            }
+        }
     }
 
 }

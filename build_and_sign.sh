@@ -11,6 +11,7 @@ BUILD_DIR=".build/release"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 
 echo "🔨 Building Retrace..."
+./scripts/check_no_nanoseconds_sleep.sh
 swift build -c release
 
 echo "📦 Creating app bundle..."

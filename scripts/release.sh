@@ -50,6 +50,10 @@ echo -e "${BLUE}  Retrace Release Script v${VERSION}${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
+echo -e "${YELLOW}[preflight] Running sleep API guard...${NC}"
+"${PROJECT_DIR}/scripts/check_no_nanoseconds_sleep.sh"
+echo -e "${GREEN}✓ Sleep API guard passed${NC}"
+
 # Check for wrangler
 if ! command -v wrangler &> /dev/null; then
     echo -e "${YELLOW}Warning: wrangler not installed. R2 upload will be skipped.${NC}"

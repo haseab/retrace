@@ -52,6 +52,10 @@ echo ""
 echo -e "${GREEN}Building version: ${VERSION}${NC}"
 echo ""
 
+echo -e "${YELLOW}Preflight: Running sleep API guard...${NC}"
+./scripts/check_no_nanoseconds_sleep.sh
+echo -e "${GREEN}  Sleep API guard passed${NC}"
+
 # Create releases directory
 mkdir -p "$RELEASES_DIR"
 

@@ -39,6 +39,10 @@ public actor CaptureManager: CaptureProtocol {
     private var lastWindowChangeCaptureTime: Date?
     private var lastNormalizedTitle: String?
     private var lastBundleID: String?
+    private var windowChangeCaptureTask: Task<Void, Never>?
+    private var deferredDisplaySyncTask: Task<Void, Never>?
+    private var currentCaptureDisplayID: UInt32?
+    private var isDisplaySwitchInFlight = false
 
     /// Callback for accessibility permission warnings
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
@@ -88,6 +92,7 @@ public actor CaptureManager: CaptureProtocol {
 
         // Get the active display (the one containing the focused window)
         let activeDisplayID = await displayMonitor.getActiveDisplayID()
+        currentCaptureDisplayID = activeDisplayID
 
         // Start CGWindowList capture on the active display
         try await cgWindowListCapture.startCapture(
@@ -129,8 +134,14 @@ public actor CaptureManager: CaptureProtocol {
         dedupedFrameContinuation?.finish()
         rawFrameContinuation = nil
         dedupedFrameContinuation = nil
+        windowChangeCaptureTask?.cancel()
+        windowChangeCaptureTask = nil
+        deferredDisplaySyncTask?.cancel()
+        deferredDisplaySyncTask = nil
         lastKeptFrame = nil
         hasShownAccessibilityWarning = false
+        currentCaptureDisplayID = nil
+        isDisplaySwitchInFlight = false
     }
 
     public var isCapturing: Bool {
@@ -198,10 +209,29 @@ public actor CaptureManager: CaptureProtocol {
 
         // Set up window change callback for immediate capture
         displaySwitchMonitor.onWindowChange = { [weak self] in
-            await self?.handleWindowChange()
+            await self?.handleWindowChangeCoalesced()
         }
 
         await displaySwitchMonitor.startMonitoring(initialDisplayID: initialDisplayID)
+    }
+
+    /// Coalesce duplicate window-change events while a capture refresh is in flight.
+    private func handleWindowChangeCoalesced() async {
+        guard _isCapturing else { return }
+        guard currentConfig.captureOnWindowChange else { return }
+
+        if let task = windowChangeCaptureTask {
+            await task.value
+            return
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.handleWindowChange()
+        }
+        windowChangeCaptureTask = task
+        await task.value
+        windowChangeCaptureTask = nil
     }
 
     /// Handle window change - capture immediately and reset timer if enabled
@@ -209,10 +239,14 @@ public actor CaptureManager: CaptureProtocol {
         guard _isCapturing else { return }
         guard currentConfig.captureOnWindowChange else { return }
 
-        // Get current window info (skip expensive browser URL extraction on hot path)
-        let currentInfo = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
-        let currentTitle = currentInfo.windowName ?? ""
-        let currentBundleID = currentInfo.appBundleID ?? ""
+        // Keyboard-driven monitor moves can race with display-change notifications.
+        // Reconcile active display before capture so we don't keep polling a stale display.
+        await syncCaptureDisplayIfNeeded()
+
+        // Get lightweight context (no browser URL extraction on this path)
+        let currentContext = await appInfoProvider.getFrontmostWindowContext()
+        let currentTitle = currentContext.windowName ?? ""
+        let currentBundleID = currentContext.appBundleID ?? ""
 
         // Check if this is a meaningful title change
         // Skip if titles are related (one contains the other) - handles "Messenger" vs "Messenger (1)"
@@ -240,8 +274,8 @@ public actor CaptureManager: CaptureProtocol {
 
         // Trigger immediate capture and reset timer
         await cgWindowListCapture.captureImmediateAndResetTimer()
-
-        Log.debug("[CaptureManager] Window changed - captured frame and reset timer (title: '\(currentTitle)')", category: .capture)
+        await syncCaptureDisplayIfNeeded()
+        scheduleDisplaySyncCheck()
     }
 
     /// Handle display switch by restarting capture on the new display
@@ -256,6 +290,14 @@ public actor CaptureManager: CaptureProtocol {
         }
 
         guard _isCapturing else { return }
+        guard oldDisplayID != newDisplayID else {
+            currentCaptureDisplayID = newDisplayID
+            return
+        }
+        guard !isDisplaySwitchInFlight else { return }
+
+        isDisplaySwitchInFlight = true
+        defer { isDisplaySwitchInFlight = false }
 
         do {
             // Recreate raw frame continuation with same stream
@@ -270,6 +312,7 @@ public actor CaptureManager: CaptureProtocol {
                 frameContinuation: continuation,
                 displayID: newDisplayID
             )
+            currentCaptureDisplayID = newDisplayID
         } catch {
             Log.error("Failed to switch displays: \(error.localizedDescription)", category: .capture)
         }
@@ -299,8 +342,12 @@ public actor CaptureManager: CaptureProtocol {
         dedupedFrameContinuation?.finish()
         rawFrameContinuation = nil
         dedupedFrameContinuation = nil
+        deferredDisplaySyncTask?.cancel()
+        deferredDisplaySyncTask = nil
         lastKeptFrame = nil
         hasShownAccessibilityWarning = false
+        currentCaptureDisplayID = nil
+        isDisplaySwitchInFlight = false
 
         // Stop display switch monitoring
         await displaySwitchMonitor.stopMonitoring()
@@ -380,8 +427,9 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Enrich frame with app metadata
     private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
-        // Get app info with browser metadata off-main to avoid blocking UI paths
-        let metadata = await appInfoProvider.getFrontmostAppInfo()
+        // Get app info with two-stage metadata attachment:
+        // window title aligned to frame + deferred browser URL cache attachment.
+        let metadata = await appInfoProvider.getFrontmostAppInfo(frameTimestamp: frame.timestamp)
 
         // Create new frame with enriched metadata
         return CapturedFrame(
@@ -392,6 +440,33 @@ public actor CaptureManager: CaptureProtocol {
             bytesPerRow: frame.bytesPerRow,
             metadata: metadata
         )
+    }
+
+    /// Compare active display vs capture display and force a switch when they drift apart.
+    private func syncCaptureDisplayIfNeeded() async {
+        guard _isCapturing else { return }
+        guard !isDisplaySwitchInFlight else { return }
+
+        let (activeDisplayID, hasAXPermission) = await displayMonitor.getActiveDisplayIDWithPermissionStatus()
+        guard hasAXPermission else { return }
+
+        guard let captureDisplayID = currentCaptureDisplayID else {
+            currentCaptureDisplayID = activeDisplayID
+            return
+        }
+
+        guard activeDisplayID != captureDisplayID else { return }
+        await handleDisplaySwitch(from: captureDisplayID, to: activeDisplayID)
+    }
+
+    /// Schedule one delayed drift check to catch async display updates after keyboard window moves.
+    private func scheduleDisplaySyncCheck(delayMilliseconds: UInt64 = 300) {
+        deferredDisplaySyncTask?.cancel()
+        deferredDisplaySyncTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(delayMilliseconds)), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self?.syncCaptureDisplayIfNeeded()
+        }
     }
 }
 

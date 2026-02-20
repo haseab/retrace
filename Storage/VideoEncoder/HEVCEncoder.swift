@@ -104,8 +104,8 @@ public actor HEVCEncoder {
         var compressionProperties: [String: Any] = [
             AVVideoQualityKey: quality,
             AVVideoMaxKeyFrameIntervalKey: 30,  // Keyframe every 30 frames (like Rewind) for better compression
-            // Stability: disable frame reordering (B-frames) to reduce encoder callback complexity.
-            AVVideoAllowFrameReorderingKey: false,
+            // Enable frame reordering (B-frames) for better compression efficiency.
+            AVVideoAllowFrameReorderingKey: true,
             AVVideoExpectedSourceFrameRateKey: 30
         ]
 
