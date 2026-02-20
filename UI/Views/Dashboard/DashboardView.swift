@@ -1159,6 +1159,14 @@ public struct DashboardView: View {
                     }
                 }
 
+                Circle()
+                    .fill(Color.retraceSecondary.opacity(0.5))
+                    .frame(width: 3, height: 3)
+
+                Text(BuildInfo.displayVersion)
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary.opacity(0.5))
+
                 #if DEBUG
                 Circle()
                     .fill(Color.retraceSecondary.opacity(0.5))

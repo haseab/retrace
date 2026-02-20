@@ -636,6 +636,17 @@ public class MenuBarManager: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Version (informational, non-clickable)
+        let versionItem = NSMenuItem(
+            title: "Retrace \(BuildInfo.displayVersion)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         // Quit
         let quitItem = NSMenuItem(
             title: "Quit Retrace",

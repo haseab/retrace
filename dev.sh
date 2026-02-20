@@ -5,7 +5,46 @@
 
 set -e
 
-echo "🔨 Building Retrace (DEBUG mode)..."
+BUILDINFO_FILE="UI/BuildInfo.swift"
+BUILD_CONFIG="debug"
+
+# ---------------------------------------------------------------------------
+# Parse version from project.yml
+# ---------------------------------------------------------------------------
+MARKETING_VERSION=$(grep 'MARKETING_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+: "${MARKETING_VERSION:=0.0.0}"
+: "${BUILD_NUMBER:=0}"
+
+# ---------------------------------------------------------------------------
+# Inject build metadata into BuildInfo.swift
+# ---------------------------------------------------------------------------
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+cp "$BUILDINFO_FILE" "$BUILDINFO_FILE.bak"
+
+sed -i '' \
+    -e "s|static let version = \".*\"|static let version = \"$MARKETING_VERSION\"|" \
+    -e "s|static let buildNumber = \".*\"|static let buildNumber = \"$BUILD_NUMBER\"|" \
+    -e "s|static let gitCommit = \".*\"|static let gitCommit = \"$GIT_COMMIT\"|" \
+    -e "s|static let gitCommitFull = \".*\"|static let gitCommitFull = \"$GIT_COMMIT_FULL\"|" \
+    -e "s|static let gitBranch = \".*\"|static let gitBranch = \"$GIT_BRANCH\"|" \
+    -e "s|static let buildDate = \".*\"|static let buildDate = \"$BUILD_DATE\"|" \
+    -e "s|static let buildConfig = \".*\"|static let buildConfig = \"$BUILD_CONFIG\"|" \
+    "$BUILDINFO_FILE"
+
+restore_buildinfo() {
+    if [ -f "$BUILDINFO_FILE.bak" ]; then
+        mv "$BUILDINFO_FILE.bak" "$BUILDINFO_FILE"
+    fi
+}
+trap restore_buildinfo EXIT
+
+echo "🔨 Building Retrace v${MARKETING_VERSION} (DEBUG)..."
+echo "   commit: ${GIT_COMMIT} (${GIT_BRANCH})"
 swift build -c debug
 
 echo ""
