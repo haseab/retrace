@@ -19,7 +19,7 @@ BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"
 # ---------------------------------------------------------------------------
 # Require a clean working tree so the embedded commit hash is accurate
 # ---------------------------------------------------------------------------
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+if [ -n "$(git diff --name-only HEAD 2>/dev/null)" ]; then
     echo "⚠️  Working tree is dirty.  The build will embed the HEAD commit hash,"
     echo "   but your uncommitted changes won't be reflected in that hash."
     echo ""
