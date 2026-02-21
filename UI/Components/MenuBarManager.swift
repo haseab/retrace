@@ -937,14 +937,26 @@ public class MenuBarManager: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Version (informational, non-clickable)
+        // Version — clickable to open commit on GitHub (if available)
         let versionItem = NSMenuItem(
             title: "Retrace \(BuildInfo.displayVersion)",
-            action: nil,
+            action: BuildInfo.commitURL != nil ? #selector(openCommitURL) : nil,
             keyEquivalent: ""
         )
-        versionItem.isEnabled = false
+        versionItem.isEnabled = BuildInfo.commitURL != nil
         menu.addItem(versionItem)
+
+        // Branch on its own line for dev builds (keeps menu width reasonable)
+        if let branch = BuildInfo.displayBranch {
+            let branchItem = NSMenuItem()
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            branchItem.attributedTitle = NSAttributedString(string: "  \(branch)", attributes: attrs)
+            branchItem.isEnabled = false
+            menu.addItem(branchItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1250,6 +1262,12 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func checkForUpdatesFromMenu() {
         UpdaterManager.shared.checkForUpdates()
+    }
+
+    @objc private func openCommitURL() {
+        if let url = BuildInfo.commitURL {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func quit() {

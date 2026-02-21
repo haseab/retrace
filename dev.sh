@@ -23,6 +23,7 @@ GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+FORK_NAME=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github.com/||; s|\.git$||' || echo "")
 
 cp "$BUILDINFO_FILE" "$BUILDINFO_FILE.bak"
 
@@ -34,6 +35,8 @@ sed -i '' \
     -e "s|static let gitBranch = \".*\"|static let gitBranch = \"$GIT_BRANCH\"|" \
     -e "s|static let buildDate = \".*\"|static let buildDate = \"$BUILD_DATE\"|" \
     -e "s|static let buildConfig = \".*\"|static let buildConfig = \"$BUILD_CONFIG\"|" \
+    -e "s|static let isDevBuild = .*|static let isDevBuild = true|" \
+    -e "s|static let forkName = \".*\"|static let forkName = \"$FORK_NAME\"|" \
     "$BUILDINFO_FILE"
 
 restore_buildinfo() {
