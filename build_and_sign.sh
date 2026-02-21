@@ -27,6 +27,23 @@ if [ -z "$BUILD_NUMBER" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Require a clean working tree so the embedded commit hash is accurate
+# ---------------------------------------------------------------------------
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "⚠️  Working tree is dirty.  The build will embed the HEAD commit hash,"
+    echo "   but your uncommitted changes won't be reflected in that hash."
+    echo ""
+    echo "   Uncommitted changes:"
+    git diff --stat
+    echo ""
+    read -p "   Continue anyway? [y/N] " answer
+    case "$answer" in
+        [yY]*) echo "   Proceeding with dirty tree..." ;;
+        *)     echo "   Aborting. Commit your changes first, then rebuild."; exit 1 ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
 # Inject build metadata into BuildInfo.swift
 # ---------------------------------------------------------------------------
 GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
