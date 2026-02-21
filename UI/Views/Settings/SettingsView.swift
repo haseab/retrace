@@ -1071,6 +1071,11 @@ public struct SettingsView: View {
                     }
                     .font(.retraceCalloutMedium)
                     .foregroundColor(.retracePrimary)
+                    if BuildInfo.isDevBuild && BuildInfo.buildDate != "unknown" {
+                        Text("Built \(BuildInfo.buildDate)")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    }
                 }
                 Spacer()
             }
