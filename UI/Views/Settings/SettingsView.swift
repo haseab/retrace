@@ -652,18 +652,35 @@ public struct SettingsView: View {
             Spacer()
 
             // Version info
-            VStack(spacing: 4) {
+            VStack(spacing: 2) {
                 Text("Retrace")
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
+
+                Group {
+                    if let url = BuildInfo.commitURL {
+                        Text(BuildInfo.displayVersion)
+                            .onTapGesture { NSWorkspace.shared.open(url) }
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+                    } else {
+                        Text(BuildInfo.displayVersion)
+                    }
+                }
+                .font(.retraceCaption2Medium)
+                .foregroundColor(.retraceSecondary.opacity(0.6))
+
+                if let branch = BuildInfo.displayBranch {
+                    Text(branch)
+                        .font(.system(size: 9))
+                        .foregroundColor(.retraceSecondary.opacity(0.4))
+                }
+
                 #if DEBUG
-                Text("Dev Version")
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.retraceSecondary.opacity(0.6))
-                #else
-                Text("v\(UpdaterManager.shared.currentVersion)")
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.retraceSecondary.opacity(0.6))
+                Text("Debug Build")
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange.opacity(0.7))
                 #endif
             }
             .frame(maxWidth: .infinity)
@@ -1035,6 +1052,37 @@ public struct SettingsView: View {
     @ViewBuilder
     private var updatesCard: some View {
         ModernSettingsCard(title: "Updates", icon: "arrow.down.circle") {
+            // Current version display
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Current Version")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                    Group {
+                        if let url = BuildInfo.commitURL {
+                            Text(BuildInfo.fullVersion)
+                                .onTapGesture { NSWorkspace.shared.open(url) }
+                                .onHover { hovering in
+                                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                }
+                        } else {
+                            Text(BuildInfo.fullVersion)
+                        }
+                    }
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
+                    if BuildInfo.isDevBuild && BuildInfo.buildDate != "unknown" {
+                        Text("Built \(BuildInfo.buildDate)")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    }
+                }
+                Spacer()
+            }
+
+            Divider()
+                .padding(.vertical, 4)
+
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Check for Updates")
@@ -3371,6 +3419,26 @@ public struct SettingsView: View {
     @ViewBuilder
     private var developerCard: some View {
         ModernSettingsCard(title: "Developer", icon: "hammer") {
+            // Build info section
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Build Info")
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.retraceSecondary)
+
+                buildInfoRow(label: "Version", value: BuildInfo.fullVersion)
+                buildInfoRow(label: "Build Type", value: BuildInfo.isDevBuild ? "Dev Build" : "Official Release")
+                if BuildInfo.isDevBuild && !BuildInfo.forkName.isEmpty {
+                    buildInfoRow(label: "Fork", value: BuildInfo.forkName)
+                }
+                buildInfoRow(label: "Git Commit", value: BuildInfo.gitCommit, fullValue: BuildInfo.gitCommitFull, url: BuildInfo.commitURL)
+                buildInfoRow(label: "Branch", value: BuildInfo.gitBranch)
+                buildInfoRow(label: "Build Date", value: BuildInfo.buildDate)
+                buildInfoRow(label: "Config", value: BuildInfo.buildConfig)
+            }
+
+            Divider()
+                .padding(.vertical, 8)
+
             ModernToggleRow(
                 title: "Show frame IDs in UI",
                 subtitle: "Display frame IDs in the timeline for debugging",
@@ -3398,6 +3466,33 @@ public struct SettingsView: View {
             }
             .sheet(isPresented: $showingDatabaseSchema) {
                 DatabaseSchemaView(schemaText: databaseSchemaText, isPresented: $showingDatabaseSchema)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func buildInfoRow(label: String, value: String, fullValue: String? = nil, url: URL? = nil) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary)
+                .frame(width: 80, alignment: .trailing)
+            if let url {
+                Text(value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.blue.opacity(0.8))
+                    .textSelection(.enabled)
+                    .help(fullValue ?? value)
+                    .onTapGesture { NSWorkspace.shared.open(url) }
+                    .onHover { hovering in
+                        if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                    }
+            } else {
+                Text(value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.retracePrimary)
+                    .textSelection(.enabled)
+                    .help(fullValue ?? value)
             }
         }
     }

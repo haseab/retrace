@@ -110,13 +110,20 @@ public final class UpdaterManager: ObservableObject {
         }
     }
 
-    /// Get the current app version
+    /// Get the current app version.
+    /// Falls back to BuildInfo when the bundle value contains unresolved
+    /// Xcode build-variable placeholders (e.g. `$(MARKETING_VERSION)`).
     public var currentVersion: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Unknown"
+        let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        if let raw, !raw.contains("$(") { return raw }
+        return BuildInfo.version
     }
 
-    /// Get the current build number
+    /// Get the current build number.
+    /// Same fallback logic as `currentVersion`.
     public var currentBuild: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "Unknown"
+        let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        if let raw, !raw.contains("$(") { return raw }
+        return BuildInfo.buildNumber
     }
 }
