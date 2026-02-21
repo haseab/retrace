@@ -1163,9 +1163,19 @@ public struct DashboardView: View {
                     .fill(Color.retraceSecondary.opacity(0.5))
                     .frame(width: 3, height: 3)
 
-                Text(BuildInfo.displayVersion)
-                    .font(.retraceCaption2)
-                    .foregroundColor(.retraceSecondary.opacity(0.5))
+                Group {
+                    if let url = BuildInfo.commitURL {
+                        Text(BuildInfo.displayVersion)
+                            .onTapGesture { NSWorkspace.shared.open(url) }
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+                    } else {
+                        Text(BuildInfo.displayVersion)
+                    }
+                }
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary.opacity(0.5))
 
                 #if DEBUG
                 Circle()

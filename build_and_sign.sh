@@ -34,9 +34,14 @@ GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
+# Detect fork name from the origin remote (e.g. "aculich/retrace")
+FORK_NAME=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github.com/||; s|\.git$||' || echo "")
+
 # Back up the defaults so we can restore after build
 cp "$BUILDINFO_FILE" "$BUILDINFO_FILE.bak"
 
+# SPM builds via this script are always dev builds (official releases use
+# create-release.sh which goes through xcodebuild archive).
 sed -i '' \
     -e "s|static let version = \".*\"|static let version = \"$MARKETING_VERSION\"|" \
     -e "s|static let buildNumber = \".*\"|static let buildNumber = \"$BUILD_NUMBER\"|" \
@@ -45,6 +50,8 @@ sed -i '' \
     -e "s|static let gitBranch = \".*\"|static let gitBranch = \"$GIT_BRANCH\"|" \
     -e "s|static let buildDate = \".*\"|static let buildDate = \"$BUILD_DATE\"|" \
     -e "s|static let buildConfig = \".*\"|static let buildConfig = \"$BUILD_CONFIG\"|" \
+    -e "s|static let isDevBuild = .*|static let isDevBuild = true|" \
+    -e "s|static let forkName = \".*\"|static let forkName = \"$FORK_NAME\"|" \
     "$BUILDINFO_FILE"
 
 # Ensure defaults are restored even if the build fails

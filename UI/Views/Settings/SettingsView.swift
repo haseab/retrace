@@ -652,13 +652,31 @@ public struct SettingsView: View {
             Spacer()
 
             // Version info
-            VStack(spacing: 4) {
+            VStack(spacing: 2) {
                 Text("Retrace")
                     .font(.retraceCaption2Medium)
                     .foregroundColor(.retraceSecondary)
-                Text(BuildInfo.displayVersion)
-                    .font(.retraceCaption2Medium)
-                    .foregroundColor(.retraceSecondary.opacity(0.6))
+
+                Group {
+                    if let url = BuildInfo.commitURL {
+                        Text(BuildInfo.displayVersion)
+                            .onTapGesture { NSWorkspace.shared.open(url) }
+                            .onHover { hovering in
+                                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                            }
+                    } else {
+                        Text(BuildInfo.displayVersion)
+                    }
+                }
+                .font(.retraceCaption2Medium)
+                .foregroundColor(.retraceSecondary.opacity(0.6))
+
+                if let branch = BuildInfo.displayBranch {
+                    Text(branch)
+                        .font(.system(size: 9))
+                        .foregroundColor(.retraceSecondary.opacity(0.4))
+                }
+
                 #if DEBUG
                 Text("Debug Build")
                     .font(.system(size: 9))
@@ -1040,9 +1058,19 @@ public struct SettingsView: View {
                     Text("Current Version")
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary)
-                    Text(BuildInfo.fullVersion)
-                        .font(.retraceCalloutMedium)
-                        .foregroundColor(.retracePrimary)
+                    Group {
+                        if let url = BuildInfo.commitURL {
+                            Text(BuildInfo.fullVersion)
+                                .onTapGesture { NSWorkspace.shared.open(url) }
+                                .onHover { hovering in
+                                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                                }
+                        } else {
+                            Text(BuildInfo.fullVersion)
+                        }
+                    }
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
                 }
                 Spacer()
             }
@@ -3393,13 +3421,14 @@ public struct SettingsView: View {
                     .foregroundColor(.retraceSecondary)
 
                 buildInfoRow(label: "Version", value: BuildInfo.fullVersion)
-                buildInfoRow(label: "Git Commit", value: BuildInfo.gitCommit, fullValue: BuildInfo.gitCommitFull)
+                buildInfoRow(label: "Build Type", value: BuildInfo.isDevBuild ? "Dev Build" : "Official Release")
+                if BuildInfo.isDevBuild && !BuildInfo.forkName.isEmpty {
+                    buildInfoRow(label: "Fork", value: BuildInfo.forkName)
+                }
+                buildInfoRow(label: "Git Commit", value: BuildInfo.gitCommit, fullValue: BuildInfo.gitCommitFull, url: BuildInfo.commitURL)
                 buildInfoRow(label: "Branch", value: BuildInfo.gitBranch)
                 buildInfoRow(label: "Build Date", value: BuildInfo.buildDate)
                 buildInfoRow(label: "Config", value: BuildInfo.buildConfig)
-                if BuildInfo.isDevBuild {
-                    buildInfoRow(label: "Dev Build", value: "Yes (\(BuildInfo.forkName))")
-                }
             }
 
             Divider()
@@ -3437,17 +3466,29 @@ public struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func buildInfoRow(label: String, value: String, fullValue: String? = nil) -> some View {
+    private func buildInfoRow(label: String, value: String, fullValue: String? = nil, url: URL? = nil) -> some View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.retraceCaption2)
                 .foregroundColor(.retraceSecondary)
                 .frame(width: 80, alignment: .trailing)
-            Text(value)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundColor(.retracePrimary)
-                .textSelection(.enabled)
-                .help(fullValue ?? value)
+            if let url {
+                Text(value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.blue.opacity(0.8))
+                    .textSelection(.enabled)
+                    .help(fullValue ?? value)
+                    .onTapGesture { NSWorkspace.shared.open(url) }
+                    .onHover { hovering in
+                        if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                    }
+            } else {
+                Text(value)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.retracePrimary)
+                    .textSelection(.enabled)
+                    .help(fullValue ?? value)
+            }
         }
     }
 
