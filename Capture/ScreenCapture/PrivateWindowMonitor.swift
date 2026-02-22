@@ -43,7 +43,7 @@ actor PrivateWindowMonitor {
                 await checkForPrivateWindows()
 
                 // Wait before next check
-                try? await Task.sleep(for: .seconds(checkIntervalSeconds))
+                try? await Task.sleep(for: .seconds(checkIntervalSeconds), clock: .continuous)
             }
         }
     }

@@ -66,7 +66,7 @@ final class AccessibilityInspectorTest: XCTestCase {
             }
 
             log("   Waiting for permission grant...")
-            try await Task.sleep(nanoseconds: 2_000_000_000)
+            try await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
         }
 
         log("✅ Accessibility permission granted\n")
@@ -105,7 +105,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                 }
             }
 
-            try await Task.sleep(nanoseconds: 500_000_000) // Check every 0.5s
+            try await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // Check every 0.5s
         }
 
         // Note: This code won't be reached, but kept for completeness

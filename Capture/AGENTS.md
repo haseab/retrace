@@ -22,7 +22,8 @@ Capture/
 │   ├── AppInfoProvider.swift      # Get active app info via NSWorkspace
 │   └── BrowserURLExtractor.swift  # Extract URL from browsers (AX API)
 └── Tests/
-    ├── CaptureManagerTests.swift
+    ├── AccessibilityInspectorTest.swift
+    ├── BrowserURLAppleScriptCoordinatorTests.swift
     └── DeduplicationTests.swift
 ```
 

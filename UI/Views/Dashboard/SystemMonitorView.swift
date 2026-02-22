@@ -1001,7 +1001,7 @@ class SystemMonitorViewModel: ObservableObject {
         monitoringTask = Task {
             while !Task.isCancelled {
                 await updateStats()
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1 second
             }
         }
     }
@@ -1018,7 +1018,7 @@ class SystemMonitorViewModel: ObservableObject {
                     pulseScale = 1.6
                     pulseOpacity = 0
                 }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous)
                 pulseScale = 1.0
                 pulseOpacity = 1.0
             }

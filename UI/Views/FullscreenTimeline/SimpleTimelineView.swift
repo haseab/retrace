@@ -4320,7 +4320,7 @@ struct TagSubmenu: View {
                 // Small delay before closing to allow mouse to move back to main menu or Add Tag button
                 closeTask?.cancel()
                 closeTask = Task {
-                    try? await Task.sleep(nanoseconds: 150_000_000) // 150ms delay
+                    try? await Task.sleep(for: .nanoseconds(Int64(150_000_000)), clock: .continuous) // 150ms delay
                     if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
                         await MainActor.run {
                             withAnimation(.easeOut(duration: 0.15)) {

@@ -104,7 +104,8 @@ public actor HEVCEncoder {
         var compressionProperties: [String: Any] = [
             AVVideoQualityKey: quality,
             AVVideoMaxKeyFrameIntervalKey: 30,  // Keyframe every 30 frames (like Rewind) for better compression
-            AVVideoAllowFrameReorderingKey: true,  // Allow B-frames for bidirectional prediction
+            // Enable frame reordering (B-frames) for better compression efficiency.
+            AVVideoAllowFrameReorderingKey: true,
             AVVideoExpectedSourceFrameRateKey: 30
         ]
 
@@ -123,7 +124,8 @@ public actor HEVCEncoder {
         ]
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        input.expectsMediaDataInRealTime = false
+        // Live capture source: enable real-time mode to reduce deep internal buffering.
+        input.expectsMediaDataInRealTime = true
 
         // Create pixel buffer adaptor
         let sourcePixelBufferAttributes: [String: Any] = [
@@ -211,7 +213,7 @@ public actor HEVCEncoder {
                 try await finalize()
                 throw StorageModuleError.encodingFailed(underlying: "Encoder timeout waiting for input ready - auto-finalized")
             }
-            try await Task.sleep(nanoseconds: 1_000_000) // 1ms
+            try await Task.sleep(for: .nanoseconds(Int64(1_000_000)), clock: .continuous) // 1ms
         }
 
         guard adaptor.append(pixelBuffer, withPresentationTime: timestamp) else {

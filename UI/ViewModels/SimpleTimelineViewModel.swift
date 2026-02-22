@@ -507,13 +507,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             toastVisible = true
         }
         toastDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000) // 1.5s (longer for error messages)
+            try? await Task.sleep(for: .nanoseconds(Int64(1_500_000_000)), clock: .continuous) // 1.5s (longer for error messages)
             if !Task.isCancelled {
                 withAnimation(.easeIn(duration: 0.3)) {
                     self.toastVisible = false
                 }
                 // Clear content after fade-out completes
-                try? await Task.sleep(nanoseconds: 350_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(350_000_000)), clock: .continuous)
                 if !Task.isCancelled {
                     self.toastMessage = nil
                     self.toastIcon = nil
@@ -1605,7 +1605,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 160_000_000)
+            try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
             let previousCurrentFrameID = currentTimelineFrame?.frame.id
             let beforeCount = frames.count
@@ -1704,7 +1704,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 160_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(160_000_000)), clock: .continuous)
 
                 let previousCurrentFrameID = currentTimelineFrame?.frame.id
                 let beforeCount = frames.count
@@ -2393,7 +2393,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Auto-dismiss after specified seconds
         errorDismissTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            try? await Task.sleep(for: .seconds(Double(seconds)), clock: .continuous)
             if !Task.isCancelled {
                 error = nil
             }
@@ -2460,7 +2460,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load data asynchronously - delay slightly to let animation complete first
         Task {
             // Small delay to let the panel animation complete before loading data
-            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
             await loadFilterPanelDataBatched()
         }
     }
@@ -3578,7 +3578,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         liveOCRDebounceTask?.cancel()
         liveOCRDebounceTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 350_000_000) // 350ms
+                try await Task.sleep(for: .nanoseconds(Int64(350_000_000)), clock: .continuous) // 350ms
             } catch {
                 return // Cancelled
             }
@@ -4095,7 +4095,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             while !Task.isCancelled {
                 // Wait 2000ms between polls (coalesces with other 2s timers for power efficiency)
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
 
                 guard !Task.isCancelled else { return }
 
@@ -5315,7 +5315,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Debounce: settle tape to frame center and load OCR/URL after 100ms of no scroll
         scrollDebounceTask = Task {
-            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
             if !Task.isCancelled {
                 await MainActor.run {
                     self.isActivelyScrolling = false
@@ -5360,7 +5360,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     // Apply friction
                     currentVelocity *= friction
 
-                    try? await Task.sleep(nanoseconds: tickInterval)
+                    try? await Task.sleep(for: .nanoseconds(Int64(tickInterval)), clock: .continuous)
                 }
 
                 if !Task.isCancelled {

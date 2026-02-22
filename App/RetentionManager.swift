@@ -57,14 +57,14 @@ public actor RetentionManager {
         // Start periodic cleanup task (runs in background, doesn't block startup)
         cleanupTask = Task {
             // Run initial cleanup after a short delay to not block app startup
-            try? await Task.sleep(nanoseconds: 5_000_000_000) // 5 second delay
+            try? await Task.sleep(for: .nanoseconds(Int64(5_000_000_000)), clock: .continuous) // 5 second delay
 
             if Task.isCancelled { return }
             await runCleanupIfNeeded()
 
             while !Task.isCancelled {
                 // Wait for cleanup interval
-                try? await Task.sleep(nanoseconds: UInt64(cleanupInterval * 1_000_000_000))
+                try? await Task.sleep(for: .seconds(cleanupInterval), clock: .continuous)
 
                 if Task.isCancelled { break }
 

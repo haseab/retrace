@@ -959,7 +959,7 @@ struct CurrentAppBadge: View {
                 // Expand after a short delay when scrolling stops on a browser frame
                 expandTask?.cancel()
                 expandTask = Task {
-                    try? await Task.sleep(nanoseconds: 650_000_000) // 650ms delay
+                    try? await Task.sleep(for: .nanoseconds(Int64(650_000_000)), clock: .continuous) // 650ms delay
                     if !Task.isCancelled && !viewModel.isActivelyScrolling && hasOpenableURL {
                         await MainActor.run {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
@@ -979,7 +979,7 @@ struct CurrentAppBadge: View {
                 // Schedule expand when landing on a browser frame
                 expandTask?.cancel()
                 expandTask = Task {
-                    try? await Task.sleep(nanoseconds: 650_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(650_000_000)), clock: .continuous)
                     if !Task.isCancelled && !viewModel.isActivelyScrolling && hasOpenableURL {
                         await MainActor.run {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
@@ -994,7 +994,7 @@ struct CurrentAppBadge: View {
             // If we appear on a browser frame (not scrolling), expand after delay
             if hasOpenableURL && !viewModel.isActivelyScrolling {
                 expandTask = Task {
-                    try? await Task.sleep(nanoseconds: 650_000_000)
+                    try? await Task.sleep(for: .nanoseconds(Int64(650_000_000)), clock: .continuous)
                     if !Task.isCancelled {
                         await MainActor.run {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {

@@ -301,7 +301,7 @@ public actor RewindImporter: MigrationProtocol {
             delegate?.migrationDidUpdateProgress(currentProgress)
 
             // Small delay to avoid hogging CPU
-            try await Task.sleep(nanoseconds: batchDelayMs * 1_000_000)
+            try await Task.sleep(for: .nanoseconds(Int64(batchDelayMs * 1_000_000)), clock: .continuous)
         }
 
         // Complete!
@@ -467,7 +467,7 @@ public actor RewindImporter: MigrationProtocol {
                     try await stateStore.saveState(state)
 
                     // Yield to other tasks
-                    try await Task.sleep(nanoseconds: batchDelayMs * 1_000_000)
+                    try await Task.sleep(for: .nanoseconds(Int64(batchDelayMs * 1_000_000)), clock: .continuous)
                 }
 
             } catch {

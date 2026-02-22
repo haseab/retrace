@@ -322,19 +322,19 @@ public actor FrameProcessingQueue {
 
         // Initial delay to ensure database is fully stable
         // This prevents race conditions on first launch after onboarding
-        try? await Task.sleep(nanoseconds: 500_000_000) // 500ms - increased for stability
+        try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms - increased for stability
 
         while isRunning && !Task.isCancelled {
             // Check if OCR is disabled globally
             guard ocrEnabled else {
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s poll when disabled
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1s poll when disabled
                 if Task.isCancelled { break }
                 continue
             }
 
             // Check if paused due to battery power
             guard !isPausedForBattery else {
-                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2s poll when paused for battery
+                try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous) // 2s poll when paused for battery
                 if Task.isCancelled { break }
                 continue
             }
@@ -342,7 +342,7 @@ public actor FrameProcessingQueue {
             // Wait for database to be ready before attempting any operations
             guard await databaseManager.isReady() else {
                 // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
-                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms
                 if Task.isCancelled { break }
                 continue
             }
@@ -351,7 +351,7 @@ public actor FrameProcessingQueue {
                 // Try to dequeue a frame
                 guard let queuedFrame = try await dequeue() else {
                     // Queue empty - wait before polling again
-                    try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    try await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
                     continue
                 }
 
@@ -367,7 +367,7 @@ public actor FrameProcessingQueue {
                         // Frame's video not finalized yet - re-enqueue for later
                         try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
                         currentQueueDepth += 1
-                        try? await Task.sleep(nanoseconds: 500_000_000) // 500ms before next attempt
+                        try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms before next attempt
                         continue
                     }
 
@@ -378,7 +378,7 @@ public actor FrameProcessingQueue {
 
                     // Apply rate limiting delay after successful processing
                     if minDelayBetweenFramesNs > 0 {
-                        try? await Task.sleep(nanoseconds: minDelayBetweenFramesNs)
+                        try? await Task.sleep(for: .nanoseconds(Int64(minDelayBetweenFramesNs)), clock: .continuous)
                     }
 
                 } catch {
@@ -406,7 +406,7 @@ public actor FrameProcessingQueue {
                 break
             } catch {
                 Log.error("[Queue-DIAG] Worker \(id) error: \(error)", category: .processing)
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s backoff
+                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1s backoff
             }
         }
 

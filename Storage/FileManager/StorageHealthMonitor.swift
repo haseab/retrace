@@ -310,7 +310,7 @@ public final class StorageHealthMonitor: @unchecked Sendable {
     private func startHealthCheckTask() {
         monitorTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(Config.healthCheckInterval * 1_000_000_000))
+                try? await Task.sleep(for: .seconds(Config.healthCheckInterval), clock: .continuous)
                 guard !Task.isCancelled else { break }
 
                 await self?.performHealthCheck()
