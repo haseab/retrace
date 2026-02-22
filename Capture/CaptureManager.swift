@@ -244,9 +244,9 @@ public actor CaptureManager: CaptureProtocol {
         await syncCaptureDisplayIfNeeded()
 
         // Get lightweight context (no browser URL extraction on this path)
-        let currentContext = await appInfoProvider.getFrontmostWindowContext()
-        let currentTitle = currentContext.windowName ?? ""
-        let currentBundleID = currentContext.appBundleID ?? ""
+        let currentMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
+        let currentTitle = currentMetadata.windowName ?? ""
+        let currentBundleID = currentMetadata.appBundleID ?? ""
 
         // Check if this is a meaningful title change
         // Skip if titles are related (one contains the other) - handles "Messenger" vs "Messenger (1)"
@@ -427,9 +427,8 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Enrich frame with app metadata
     private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
-        // Get app info with two-stage metadata attachment:
-        // window title aligned to frame + deferred browser URL cache attachment.
-        let metadata = await appInfoProvider.getFrontmostAppInfo(frameTimestamp: frame.timestamp)
+        // Get app info in a single metadata fetch.
+        let metadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: true)
 
         // Create new frame with enriched metadata
         return CapturedFrame(
