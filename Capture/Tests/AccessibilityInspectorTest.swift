@@ -110,7 +110,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
         while true {
-            if let data = captureActiveWindowData() {
+            if let data = await captureActiveWindowData() {
                 // Only print when something changes
                 let currentURL = data.browserURL ?? ""
                 if data.appBundleID != lastAppBundleID || data.windowTitle != lastWindowTitle || currentURL != lastBrowserURL {
@@ -118,7 +118,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
                     log("🪟 Window Title:   \(data.windowTitle ?? "(none)")")
-                    log("🌐 Browser URL:    \(data.browserURL ?? "(not a browser / URL not found)")")
+                    log("🌐 URL:            \(data.browserURL ?? "(URL not found)")")
                     if let method = data.urlExtractionMethod {
                         log("   └─ Method:      \(method)")
                     }
@@ -144,9 +144,11 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     // MARK: - Accessibility Data Capture
 
-    private func captureActiveWindowData() -> AccessibilityData? {
+    private func captureActiveWindowData() async -> AccessibilityData? {
         // Get the frontmost application
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+        guard let frontApp = await MainActor.run(body: {
+            NSWorkspace.shared.frontmostApplication
+        }) else {
             return nil
         }
 
@@ -166,15 +168,16 @@ final class AccessibilityInspectorTest: XCTestCase {
             // Get window title
             windowTitle = getAttributeValue(focusedWindow, attribute: kAXTitleAttribute as CFString)
 
-            // Try to get browser URL
-            if isBrowserApp(appBundleID) {
-                let result = getBrowserURL(appElement: appElement, window: focusedWindow, bundleID: appBundleID)
-                browserURL = result.url
-                urlMethod = result.method
-            }
+            // Try to get URL context for any app (browser-specific + generic fallback)
+            let result = getBrowserURL(appElement: appElement, window: focusedWindow, bundleID: appBundleID)
+            browserURL = result.url
+            urlMethod = result.method
 
-            // Try to get status bar / menu bar text (chrome text)
-            chromeText = getChromeText(windowElement: focusedWindow)
+            // Chrome text is only meaningful for browser chrome areas
+            if isBrowserApp(appBundleID) {
+                // Try to get status bar / menu bar text (chrome text)
+                chromeText = getChromeText(windowElement: focusedWindow)
+            }
         }
 
         return AccessibilityData(

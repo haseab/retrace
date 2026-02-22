@@ -32,13 +32,13 @@ struct AppInfoProvider: Sendable {
         // Get window title via Accessibility API
         let windowName = getWindowTitle(for: frontApp.processIdentifier)
 
-        // Get browser URL if applicable
+        // Get URL metadata from the active app window if available.
+        // This is attempted for all apps (not just known browsers) because
+        // many Electron/webview apps expose meaningful AX URL context.
         var browserURL: String? = nil
-        if includeBrowserURL,
-           let bundleID = bundleID,
-           BrowserURLExtractor.isBrowser(bundleID) {
+        if includeBrowserURL {
             browserURL = await BrowserURLExtractor.getURL(
-                bundleID: bundleID,
+                bundleID: bundleID ?? "",
                 pid: frontApp.processIdentifier
             )
         }

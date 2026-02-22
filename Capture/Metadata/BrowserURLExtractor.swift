@@ -303,7 +303,7 @@ struct BrowserURLExtractor: Sendable {
             return url
         }
 
-        // Fallback: Try generic AXWebArea approach for any browser
+        // Fallback: Try generic AX-based URL extraction for any app
         return getURLViaWebArea(pid: pid)
     }
 
@@ -496,17 +496,34 @@ struct BrowserURLExtractor: Sendable {
 
     // MARK: - Generic AXWebArea Approach
 
-    /// Find URL by locating AXWebArea element and reading its AXURL attribute
-    /// This is the generic approach documented by Apple for web content.
-    /// Works when the browser properly exposes its accessibility tree.
+    /// Find URL using generic AX traversal.
+    /// This path is intentionally app-agnostic and can return URL context from
+    /// non-browser apps that embed webviews (e.g. Electron apps).
     private static func getURLViaWebArea(pid: pid_t) -> String? {
         let appRef = AXUIElementCreateApplication(pid)
+        enableAccessibilityIfNeeded(appRef)
 
         guard let window: AXUIElement = getAXAttribute(appRef, kAXFocusedWindowAttribute) else {
             return nil
         }
 
-        return findURLInWebArea(window)
+        // Method 1: AXWebArea traversal
+        if let url = findURLInWebArea(window) {
+            return url
+        }
+
+        // Method 2: Focused element direct URL/document attributes
+        if let focused: AXUIElement = getAXAttribute(appRef, kAXFocusedUIElementAttribute) {
+            if let url: String = getAXAttribute(focused, kAXURLAttribute), !url.isEmpty {
+                return url
+            }
+            if let url: String = getAXAttribute(focused, kAXDocumentAttribute), !url.isEmpty {
+                return url
+            }
+        }
+
+        // Method 3: Lightweight deep search for URL-like fields
+        return findURLInElement(window, depth: 0, maxDepth: 6)
     }
 
     /// Recursively search for AXWebArea element and extract its AXURL
