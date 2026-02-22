@@ -6,11 +6,6 @@ import Shared
 /// Provides information about the currently active application
 struct AppInfoProvider: Sendable {
 
-    // MARK: - Constants
-
-    /// Known browser bundle identifiers for URL extraction (references shared list)
-    static var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
-
     // MARK: - App Info Retrieval
 
     /// Get information about the frontmost application
@@ -41,7 +36,7 @@ struct AppInfoProvider: Sendable {
         var browserURL: String? = nil
         if includeBrowserURL,
            let bundleID = bundleID,
-           Self.browserBundleIDs.contains(bundleID) {
+           BrowserURLExtractor.isBrowser(bundleID) {
             browserURL = await BrowserURLExtractor.getURL(
                 bundleID: bundleID,
                 pid: frontApp.processIdentifier

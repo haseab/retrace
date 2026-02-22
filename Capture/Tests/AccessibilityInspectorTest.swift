@@ -17,8 +17,38 @@ final class AccessibilityInspectorTest: XCTestCase {
     // File handle for logging - make it an instance variable so other methods can access it
     private var logFileHandle: FileHandle?
 
-    // Set to true to see detailed extraction attempts (noisy)
-    private var verboseLogging = false
+    // Set AX_VERBOSE=1 to see detailed extraction attempts (noisy)
+    private let verboseLogging = ProcessInfo.processInfo.environment["AX_VERBOSE"] == "1"
+
+    private let chromiumBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "org.chromium.Chromium",
+        "com.sigmaos.sigmaos",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.openai.chat",
+        "com.nicklockwood.Thorium",
+    ]
+
+    private let chromiumAppShimPrefixes: [String] = [
+        "com.google.Chrome.app.",
+        "com.google.Chrome.canary.app.",
+        "com.microsoft.edgemac.app.",
+        "com.brave.Browser.app.",
+        "com.vivaldi.Vivaldi.app.",
+        "com.operasoftware.Opera.app.",
+        "org.chromium.Chromium.app.",
+        "com.cometbrowser.Comet.app.",
+        "com.aspect.browser.app.",
+        "com.sigmaos.sigmaos.app.",
+        "com.openai.chat.app.",
+        "com.nicklockwood.Thorium.app.",
+    ]
 
     /// Run this test and switch between different apps/windows to see what data is captured
     func testShowAccessibilityDataDialog() async throws {
@@ -179,7 +209,19 @@ final class AccessibilityInspectorTest: XCTestCase {
             "com.operasoftware.Opera",
             "company.thebrowser.Browser"  // Arc
         ]
-        return browsers.contains(bundleID)
+        if browsers.contains(bundleID) {
+            return true
+        }
+
+        return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
+    }
+
+    private func isChromiumBundleID(_ bundleID: String) -> Bool {
+        if chromiumBundleIDs.contains(bundleID) {
+            return true
+        }
+
+        return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
     }
 
     // MARK: - Browser URL Extraction
@@ -187,23 +229,24 @@ final class AccessibilityInspectorTest: XCTestCase {
     private func getBrowserURL(appElement: AXUIElement, window: AXUIElement, bundleID: String) -> (url: String?, method: String?) {
         // Strategy varies by browser type
 
-        switch bundleID {
-        case "com.apple.Safari":
+        if bundleID == "com.apple.Safari" {
             return getSafariURL(appElement: appElement, window: window)
-
-        case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi":
-            return getChromiumURL(appElement: appElement, window: window, bundleID: bundleID)
-
-        case "company.thebrowser.Browser":  // Arc
-            return getArcURL(appElement: appElement, window: window)
-
-        case "org.mozilla.firefox":
-            return getFirefoxURL()
-
-        default:
-            // Generic fallback for unknown browsers
-            return getGenericBrowserURL(appElement: appElement, window: window)
         }
+
+        if isChromiumBundleID(bundleID) {
+            return getChromiumURL(appElement: appElement, window: window, bundleID: bundleID)
+        }
+
+        if bundleID == "company.thebrowser.Browser" { // Arc
+            return getArcURL(appElement: appElement, window: window)
+        }
+
+        if bundleID == "org.mozilla.firefox" {
+            return getFirefoxURL()
+        }
+
+        // Generic fallback for unknown browsers
+        return getGenericBrowserURL(appElement: appElement, window: window)
     }
 
     // MARK: - Safari

@@ -177,4 +177,16 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         let snapshot = await probe.snapshot()
         XCTAssertEqual(snapshot.callCount, 1)
     }
+
+    func testIsBrowserRecognizesChromiumAppShims() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.google.Chrome.app.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.microsoft.edgemac.app.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.brave.Browser.app.cccccccccccccccccccccccccccccccc"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.chromium.Chromium.app.dddddddddddddddddddddddddddddddd"))
+    }
+
+    func testIsBrowserRejectsNonBrowserBundleID() {
+        XCTAssertFalse(BrowserURLExtractor.isBrowser("com.example.notabrowser"))
+        XCTAssertFalse(BrowserURLExtractor.isBrowser("com.google.Chromeapp.fake"))
+    }
 }

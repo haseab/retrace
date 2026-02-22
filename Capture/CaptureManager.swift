@@ -40,6 +40,9 @@ public actor CaptureManager: CaptureProtocol {
     private var lastNormalizedTitle: String?
     private var lastBundleID: String?
     private var windowChangeCaptureTask: Task<Void, Never>?
+    private let windowChangeSettleDelayMilliseconds = 120
+    private let windowChangeSettlePollMilliseconds = 40
+    private let windowChangeSettleTimeoutSeconds: TimeInterval = 0.45
     private var deferredDisplaySyncTask: Task<Void, Never>?
     private var currentCaptureDisplayID: UInt32?
     private var isDisplaySwitchInFlight = false
@@ -243,8 +246,10 @@ public actor CaptureManager: CaptureProtocol {
         // Reconcile active display before capture so we don't keep polling a stale display.
         await syncCaptureDisplayIfNeeded()
 
-        // Get lightweight context (no browser URL extraction on this path)
-        let currentMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
+        // Wait briefly for app/window activation to settle so we capture the new window,
+        // not a compositor transition frame.
+        let initialMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
+        let currentMetadata = await waitForSettledWindowMetadata(initialMetadata: initialMetadata)
         let currentTitle = currentMetadata.windowName ?? ""
         let currentBundleID = currentMetadata.appBundleID ?? ""
 
@@ -466,6 +471,36 @@ public actor CaptureManager: CaptureProtocol {
             guard !Task.isCancelled else { return }
             await self?.syncCaptureDisplayIfNeeded()
         }
+    }
+
+    /// Sample frontmost app/window until it stabilizes or timeout is reached.
+    private func waitForSettledWindowMetadata(initialMetadata: FrameMetadata) async -> FrameMetadata {
+        var latestMetadata = initialMetadata
+        var lastIdentity = windowIdentity(from: initialMetadata)
+        let deadline = Date().addingTimeInterval(windowChangeSettleTimeoutSeconds)
+
+        try? await Task.sleep(for: .milliseconds(windowChangeSettleDelayMilliseconds), clock: .continuous)
+
+        while Date() < deadline {
+            guard !Task.isCancelled else { return latestMetadata }
+
+            let nextMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: false)
+            let nextIdentity = windowIdentity(from: nextMetadata)
+
+            latestMetadata = nextMetadata
+            if nextIdentity == lastIdentity {
+                break
+            }
+            lastIdentity = nextIdentity
+
+            try? await Task.sleep(for: .milliseconds(windowChangeSettlePollMilliseconds), clock: .continuous)
+        }
+
+        return latestMetadata
+    }
+
+    private func windowIdentity(from metadata: FrameMetadata) -> (bundleID: String, windowName: String) {
+        (metadata.appBundleID ?? "", metadata.windowName ?? "")
     }
 }
 

@@ -177,6 +177,7 @@ struct BrowserURLExtractor: Sendable {
 
     // MARK: - Known Browser Bundle IDs
 
+    /// Browser bundle IDs matched exactly.
     private static let knownBrowsers: Set<String> = [
         "com.apple.Safari",
         "com.google.Chrome",
@@ -208,6 +209,39 @@ struct BrowserURLExtractor: Sendable {
         "com.nicklockwood.Floorp",     // Floorp
     ]
 
+    /// Chromium app-shim bundle IDs (PWAs/installed web apps).
+    /// Examples: com.google.Chrome.app.<id>, com.brave.Browser.app.<id>
+    private static let chromiumAppShimPrefixes: [String] = [
+        "com.google.Chrome.app.",
+        "com.google.Chrome.canary.app.",
+        "com.microsoft.edgemac.app.",
+        "com.brave.Browser.app.",
+        "com.vivaldi.Vivaldi.app.",
+        "com.operasoftware.Opera.app.",
+        "org.chromium.Chromium.app.",
+        "com.cometbrowser.Comet.app.",
+        "com.aspect.browser.app.",
+        "com.sigmaos.sigmaos.app.",
+        "com.openai.chat.app.",
+        "com.nicklockwood.Thorium.app.",
+    ]
+
+    /// Exact IDs that should use the Chromium extraction path.
+    private static let chromiumExactBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "org.chromium.Chromium",
+        "com.sigmaos.sigmaos",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.openai.chat",
+        "com.nicklockwood.Thorium",
+    ]
+
     private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
         runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout in
             await runAppleScriptViaProcess(
@@ -222,7 +256,20 @@ struct BrowserURLExtractor: Sendable {
 
     /// Check if a bundle ID is a known browser
     static func isBrowser(_ bundleID: String) -> Bool {
-        knownBrowsers.contains(bundleID)
+        if knownBrowsers.contains(bundleID) {
+            return true
+        }
+
+        return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
+    }
+
+    /// Check whether a bundle ID should use Chromium-specific URL extraction.
+    private static func isChromiumBrowser(_ bundleID: String) -> Bool {
+        if chromiumExactBundleIDs.contains(bundleID) {
+            return true
+        }
+
+        return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
     }
 
     // MARK: - URL Extraction
@@ -240,18 +287,15 @@ struct BrowserURLExtractor: Sendable {
     static func getURL(bundleID: String, pid: pid_t) async -> String? {
         // Try browser-specific method first
         let url: String?
-        switch bundleID {
-        case "com.apple.Safari":
+        if bundleID == "com.apple.Safari" {
             url = getSafariURL(pid: pid)
-        case "com.google.Chrome", "com.microsoft.edgemac", "com.brave.Browser", "com.vivaldi.Vivaldi",
-             "org.chromium.Chromium", "com.sigmaos.sigmaos", "com.cometbrowser.Comet", "com.aspect.browser",
-             "com.openai.chat", "com.nicklockwood.Thorium":
+        } else if isChromiumBrowser(bundleID) {
             url = getChromiumURL(pid: pid)
-        case "company.thebrowser.Browser":  // Arc
+        } else if bundleID == "company.thebrowser.Browser" { // Arc
             url = await getArcURL(pid: pid)
-        case "org.mozilla.firefox":
+        } else if bundleID == "org.mozilla.firefox" {
             url = await getFirefoxURL(pid: pid)
-        default:
+        } else {
             url = nil
         }
 
