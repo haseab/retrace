@@ -17,6 +17,9 @@ final class AccessibilityInspectorTest: XCTestCase {
     // File handle for logging - make it an instance variable so other methods can access it
     private var logFileHandle: FileHandle?
 
+    // Interactive inspector should only run when explicitly opted in.
+    private let interactiveInspectorEnabled = ProcessInfo.processInfo.environment["RUN_INTERACTIVE_ACCESSIBILITY_INSPECTOR"] == "1"
+
     // Set AX_VERBOSE=1 to see detailed extraction attempts (noisy)
     private let verboseLogging = ProcessInfo.processInfo.environment["AX_VERBOSE"] == "1"
 
@@ -52,10 +55,18 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     /// Run this test and switch between different apps/windows to see what data is captured
     func testShowAccessibilityDataDialog() async throws {
+        guard interactiveInspectorEnabled else {
+            throw XCTSkip("Interactive-only test. Set RUN_INTERACTIVE_ACCESSIBILITY_INSPECTOR=1 to run manually.")
+        }
+
         // Write to a file in /tmp so you can tail it
         let outputPath = "/tmp/accessibility_test_output.txt"
         FileManager.default.createFile(atPath: outputPath, contents: nil)
         logFileHandle = FileHandle(forWritingAtPath: outputPath)!
+        defer {
+            logFileHandle?.closeFile()
+            logFileHandle = nil
+        }
 
         func log(_ message: String) {
             let line = message + "\n"
@@ -110,7 +121,7 @@ final class AccessibilityInspectorTest: XCTestCase {
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
-        while true {
+        while !Task.isCancelled {
             if let data = await captureActiveWindowData() {
                 // Only print when something changes
                 let currentURL = data.browserURL ?? ""
