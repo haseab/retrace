@@ -850,7 +850,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         powerSettingsApplyTask?.cancel()
         powerSettingsApplyTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 250_000_000)
+                try await Task.sleep(for: .nanoseconds(Int64(250_000_000)), clock: .continuous)
             } catch {
                 return
             }

@@ -4434,7 +4434,7 @@ struct TimelineSegmentContextMenu: View {
     private let menuHeight: CGFloat = 172
     private let tagSubmenuWidth: CGFloat = 188
     private let edgePadding: CGFloat = 16
-    
+
     private var selectedTagsForContextMenu: [Tag] {
         viewModel.availableTags
             .filter { !($0.isHidden) && viewModel.selectedSegmentTags.contains($0.id) }
