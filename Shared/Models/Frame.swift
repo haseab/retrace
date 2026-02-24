@@ -39,6 +39,9 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// URL if the active app is a browser
     public let browserURL: String?
 
+    /// Why the frame was redacted (if redacted during capture)
+    public let redactionReason: String?
+
     /// Display ID that was captured
     public let displayID: UInt32
 
@@ -47,12 +50,14 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         appName: String? = nil,
         windowName: String? = nil,
         browserURL: String? = nil,
+        redactionReason: String? = nil,
         displayID: UInt32 = 0
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
         self.windowName = windowName
         self.browserURL = browserURL
+        self.redactionReason = redactionReason
         self.displayID = displayID
     }
 
@@ -345,4 +350,3 @@ public struct UnfinalisedVideo: Sendable, Equatable {
         self.height = height
     }
 }
-

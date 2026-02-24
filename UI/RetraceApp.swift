@@ -88,6 +88,7 @@ struct RetraceApp: App {
 
 // MARK: - App Delegate
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     var menuBarManager: MenuBarManager?
@@ -104,8 +105,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isActivationRevealInFlight = false
     private var isInitialized = false
     private var isTerminationFlushInProgress = false
+    private var isTerminationDecisionInProgress = false
+    private var bypassQuitConfirmationPromptOnce = false
+    private var quitConfirmationHostWindow: NSWindow?
+    private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
+    private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
+
+    private enum QuitTerminationPreference: String {
+        case ask
+        case quit
+        case runInBackground
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prompt user to move app to Applications folder if not already there
@@ -128,7 +140,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else if isAnotherInstanceRunning() {
             Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
             activateExistingInstance()
-            NSApp.terminate(nil)
+            requestImmediateTermination(skipQuitConfirmation: true)
             return
         }
 
@@ -231,14 +243,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureWatchdogAutoQuit() {
-        MainThreadWatchdog.shared.setAutoQuitHandler { blockedSeconds in
+        MainThreadWatchdog.shared.setAutoQuitHandler { [weak self] blockedSeconds in
             let blockedFor = String(format: "%.1f", blockedSeconds)
             Log.critical("[Watchdog] Auto-quit threshold reached (\(blockedFor)s). Capturing diagnostics and attempting graceful termination.", category: .ui)
             EmergencyDiagnostics.capture(trigger: "watchdog_auto_quit")
 
             // If main is still responsive enough, request normal app termination first.
             DispatchQueue.main.async {
-                NSApp.terminate(nil)
+                self?.requestImmediateTermination(skipQuitConfirmation: true)
             }
 
             // Fallback: if graceful termination cannot run (main frozen), force-exit.
@@ -280,6 +292,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateNow
         }
 
+        if isTerminationDecisionInProgress {
+            return .terminateLater
+        }
+
+        switch terminationPreferenceForCurrentRequest() {
+        case .quit:
+            beginTerminationFlush()
+            return .terminateLater
+        case .runInBackground:
+            runInBackgroundInsteadOfQuitting()
+            return .terminateCancel
+        case .ask:
+            break
+        }
+
+        isTerminationDecisionInProgress = true
+        presentQuitConfirmationAlert()
+
+        return .terminateLater
+    }
+
+    private func requestImmediateTermination(skipQuitConfirmation: Bool) {
+        if skipQuitConfirmation {
+            bypassQuitConfirmationPromptOnce = true
+        }
+        NSApp.terminate(nil)
+    }
+
+    private func terminationPreferenceForCurrentRequest() -> QuitTerminationPreference {
+        if bypassQuitConfirmationPromptOnce {
+            bypassQuitConfirmationPromptOnce = false
+            return .quit
+        }
+
+        guard let rawValue = settingsStore.string(forKey: Self.quitConfirmationPreferenceKey),
+              let storedPreference = QuitTerminationPreference(rawValue: rawValue) else {
+            return .ask
+        }
+
+        return storedPreference
+    }
+
+    private func beginTerminationFlush() {
+        guard !isTerminationFlushInProgress else { return }
+
         isTerminationFlushInProgress = true
 
         // Save timeline state (filters, search) for cross-session persistence.
@@ -292,8 +349,155 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.isTerminationFlushInProgress = false
             NSApp.reply(toApplicationShouldTerminate: true)
         }
+    }
 
-        return .terminateLater
+    private func presentQuitConfirmationAlert() {
+        Log.info("[AppDelegate] Presenting standard quit confirmation alert", category: .app)
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "Are you sure you want to quit Retrace?"
+        alert.informativeText = "Quitting Retrace will stop any active capture and end ongoing recording. You can keep Retrace running in the background without interruption."
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Don't ask again"
+        alert.addButton(withTitle: "Quit Retrace")
+        alert.addButton(withTitle: "Run Retrace in Background")
+        alert.addButton(withTitle: "Cancel")
+        styleQuitAlertPrimaryButton(alert, context: "initial")
+
+        let anchorWindow = currentTerminationAnchorWindow() ?? makeQuitConfirmationHostWindow()
+        scheduleQuitButtonStyleEnforcement(for: alert, context: "sheet")
+        alert.beginSheetModal(for: anchorWindow) { [weak self] response in
+            Task { @MainActor in
+                guard let self else { return }
+                self.handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+                self.dismissQuitConfirmationHostWindowIfNeeded(anchorWindow)
+            }
+        }
+    }
+
+    private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse, dontAskAgain: Bool) {
+        let result: QuitConfirmationResult
+        switch response {
+        case .alertFirstButtonReturn:
+            result = QuitConfirmationResult(action: .quit, dontAskAgain: dontAskAgain)
+        case .alertSecondButtonReturn:
+            result = QuitConfirmationResult(action: .runInBackground, dontAskAgain: dontAskAgain)
+        default:
+            result = QuitConfirmationResult(action: .cancel, dontAskAgain: dontAskAgain)
+        }
+        handleQuitConfirmationResult(result)
+    }
+
+    private func currentTerminationAnchorWindow() -> NSWindow? {
+        if let keyWindow = NSApp.keyWindow {
+            return keyWindow
+        }
+        return NSApp.mainWindow
+    }
+
+    private func makeQuitConfirmationHostWindow() -> NSWindow {
+        if let window = quitConfirmationHostWindow {
+            return window
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 220),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Retrace"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovable = false
+        window.isReleasedWhenClosed = false
+        window.center()
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        quitConfirmationHostWindow = window
+        return window
+    }
+
+    private func dismissQuitConfirmationHostWindowIfNeeded(_ window: NSWindow) {
+        guard quitConfirmationHostWindow === window else { return }
+        window.orderOut(nil)
+        window.close()
+        quitConfirmationHostWindow = nil
+    }
+
+    private func scheduleQuitButtonStyleEnforcement(for alert: NSAlert, context: String) {
+        // AppKit may restyle alert buttons after presentation; re-apply a few times.
+        let delays: [TimeInterval] = [0.0, 0.04, 0.10, 0.20]
+        for delay in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.styleQuitAlertPrimaryButton(alert, context: "\(context)-t+\(String(format: "%.2f", delay))")
+            }
+        }
+    }
+
+    private func styleQuitAlertPrimaryButton(_ alert: NSAlert, context: String) {
+        guard let quitButton = alert.buttons.first else { return }
+
+        let retraceQuitBlue = NSColor(
+            calibratedRed: 11.0 / 255.0,
+            green: 51.0 / 255.0,
+            blue: 108.0 / 255.0,
+            alpha: 1.0
+        )
+
+        quitButton.appearance = NSAppearance(named: .darkAqua)
+        quitButton.bezelColor = retraceQuitBlue
+        quitButton.contentTintColor = .white
+        quitButton.attributedTitle = NSAttributedString(
+            string: quitButton.title,
+            attributes: [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.systemFont(ofSize: quitButton.font?.pointSize ?? 15, weight: .semibold)
+            ]
+        )
+        quitButton.needsDisplay = true
+
+        if let appliedColor = quitButton.attributedTitle.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor {
+            Log.debug("[QUIT_ALERT] Applied style context=\(context) fg=\(appliedColor) bezel=\(retraceQuitBlue)", category: .ui)
+        } else {
+            Log.warning("[QUIT_ALERT] Failed to read attributed foreground color context=\(context)", category: .ui)
+        }
+    }
+
+    private func handleQuitConfirmationResult(_ result: QuitConfirmationResult) {
+        isTerminationDecisionInProgress = false
+
+        if result.dontAskAgain {
+            switch result.action {
+            case .quit:
+                settingsStore.set(QuitTerminationPreference.quit.rawValue, forKey: Self.quitConfirmationPreferenceKey)
+            case .runInBackground:
+                settingsStore.set(QuitTerminationPreference.runInBackground.rawValue, forKey: Self.quitConfirmationPreferenceKey)
+            case .cancel:
+                break
+            }
+        }
+
+        switch result.action {
+        case .quit:
+            Log.info("[AppDelegate] User confirmed quit", category: .app)
+            beginTerminationFlush()
+        case .runInBackground:
+            Log.info("[AppDelegate] User chose to keep Retrace running in background", category: .app)
+            runInBackgroundInsteadOfQuitting()
+            NSApp.reply(toApplicationShouldTerminate: false)
+        case .cancel:
+            Log.info("[AppDelegate] User cancelled quit", category: .app)
+            NSApp.reply(toApplicationShouldTerminate: false)
+        }
+    }
+
+    private func runInBackgroundInsteadOfQuitting() {
+        TimelineWindowController.shared.hide()
+        DashboardWindowController.shared.hide()
+        NSApp.hide(nil)
     }
 
     // MARK: - Storage Path Validation
@@ -377,7 +581,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             // Quit
             Log.info("[AppDelegate] User chose to quit", category: .app)
-            NSApp.terminate(nil)
+            requestImmediateTermination(skipQuitConfirmation: true)
             return false
         }
     }
@@ -461,7 +665,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }.value
     }
 
-    private static func validateRetraceFolderSelectionSync(at selectedPath: String) -> RetraceFolderValidationResult {
+    nonisolated private static func validateRetraceFolderSelectionSync(at selectedPath: String) -> RetraceFolderValidationResult {
         let fm = FileManager.default
         let dbPath = "\(selectedPath)/retrace.db"
         let chunksPath = "\(selectedPath)/chunks"
@@ -482,7 +686,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)
-    private static func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
+    nonisolated private static func verifyRetraceDatabase(at path: String) -> (isValid: Bool, error: String?) {
         var db: OpaquePointer?
 
         // Try to open the database
@@ -779,8 +983,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func shouldRevealDashboardForActivation() -> Bool {
         guard isInitialized else { return false }
+        guard !isTerminationDecisionInProgress else { return false }
+        guard !isTerminationFlushInProgress else { return false }
         guard !TimelineWindowController.shared.isVisible else { return false }
         guard !DashboardWindowController.shared.isVisible else { return false }
+        guard !PauseReminderWindowController.shared.isVisible else { return false }
 
         let hasVisibleForegroundWindow = NSApp.windows.contains { window in
             window.level.rawValue == 0 && window.isVisible
@@ -889,6 +1096,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Force dark mode - the app UI is designed for dark theme
         NSApp.appearance = NSAppearance(named: .darkAqua)
     }
+}
+
+private enum QuitConfirmationAction {
+    case quit
+    case runInBackground
+    case cancel
+}
+
+private struct QuitConfirmationResult {
+    let action: QuitConfirmationAction
+    let dontAskAgain: Bool
 }
 
 // MARK: - URL Handling

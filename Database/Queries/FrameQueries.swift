@@ -14,8 +14,8 @@ enum FrameQueries {
     static func insert(db: OpaquePointer, frame: FrameReference) throws -> Int64 {
         let sql = """
             INSERT INTO frame (
-                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, processingStatus
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 4);
+                createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus, redactionReason, processingStatus
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4);
             """
 
         var statement: OpaquePointer?
@@ -58,6 +58,9 @@ enum FrameQueries {
 
         // encodingStatus: "pending", "success", "failed"
         sqlite3_bind_text(statement, 7, frame.encodingStatus.rawValue, -1, SQLITE_TRANSIENT)
+
+        // redactionReason: nullable, set when frame pixels were intentionally redacted
+        bindTextOrNull(statement, 8, frame.metadata.redactionReason)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -107,7 +110,7 @@ enum FrameQueries {
     static func getByID(db: OpaquePointer, id: FrameID) throws -> FrameReference? {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.id = ?;
@@ -144,7 +147,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -186,7 +189,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt < ?
@@ -227,7 +230,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.createdAt >= ?
@@ -264,7 +267,7 @@ enum FrameQueries {
     static func getMostRecent(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             ORDER BY f.createdAt DESC
@@ -304,7 +307,7 @@ enum FrameQueries {
     ) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
             WHERE s.bundleID = ?
@@ -343,7 +346,7 @@ enum FrameQueries {
     static func getFramesPendingVideoEncoding(db: OpaquePointer, limit: Int) throws -> [FrameReference] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.isStarred, f.encodingStatus,
-                   s.bundleID, s.windowName, s.browserUrl
+                   f.redactionReason, s.bundleID, s.windowName, s.browserUrl
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             WHERE f.videoId IS NULL
@@ -547,7 +550,7 @@ enum FrameQueries {
 
     /// Parse a frame row from Rewind-compatible schema
     /// Expected columns: id, createdAt, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus,
-    ///                   bundleID, windowName, browserUrl (from JOIN)
+    ///                   redactionReason, bundleID, windowName, browserUrl (from JOIN)
     private static func parseFrameRow(statement: OpaquePointer) throws -> FrameReference {
         // Column 0: id (INTEGER)
         let frameIDValue = sqlite3_column_int64(statement, 0)
@@ -575,16 +578,18 @@ enum FrameQueries {
         let statusString = getTextOrNil(statement, 6) ?? "pending"
         let encodingStatus = EncodingStatus(rawValue: statusString) ?? .pending
 
-        // Columns 7-9: metadata from segment JOIN (nullable)
-        let appBundleID = getTextOrNil(statement, 7)
-        let windowName = getTextOrNil(statement, 8)
-        let browserURL = getTextOrNil(statement, 9)
+        // Columns 7-10: Window redaction + metadata from segment JOIN (nullable)
+        let redactionReason = getTextOrNil(statement, 7)
+        let appBundleID = getTextOrNil(statement, 8)
+        let windowName = getTextOrNil(statement, 9)
+        let browserURL = getTextOrNil(statement, 10)
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,
             appName: nil, // Not stored in Rewind schema
             windowName: windowName,
-            browserURL: browserURL
+            browserURL: browserURL,
+            redactionReason: redactionReason
         )
 
         return FrameReference(
@@ -629,6 +634,7 @@ enum FrameQueries {
                 f.videoFrameIndex,
                 f.encodingStatus,
                 f.processingStatus,
+                f.redactionReason,
                 s.bundleID,
                 s.windowName,
                 v.path,
@@ -680,11 +686,11 @@ enum FrameQueries {
         Log.debug("[FrameQueries] getMostRecentWithVideoInfo: limit=\(limit)", category: .database)
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason
                 FROM frame
                 WHERE processingStatus != 4
                 ORDER BY createdAt DESC
@@ -724,11 +730,11 @@ enum FrameQueries {
     /// Get frames before timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
     static func getBeforeWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason
                 FROM frame
                 WHERE createdAt < ? AND processingStatus != 4
                 ORDER BY createdAt DESC
@@ -764,11 +770,11 @@ enum FrameQueries {
     /// Get frames after timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
     static func getAfterWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason
                 FROM frame
                 WHERE createdAt >= ? AND processingStatus != 4
                 ORDER BY createdAt ASC
@@ -804,7 +810,7 @@ enum FrameQueries {
     /// Get a single frame by ID with video info (optimized - single query with JOINs)
     static func getByIDWithVideoInfo(db: OpaquePointer, id: FrameID) throws -> FrameWithVideoInfo? {
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
                    v.path, v.frameRate, v.width, v.height, v.processingState
             FROM frame f
@@ -834,7 +840,7 @@ enum FrameQueries {
 
     /// Parse a row from a query that JOINs frame with segment and video tables
     /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
-    ///          s.bundleID, s.windowName, v.path, v.frameRate, v.width, v.height, v.processingState
+    ///          f.redactionReason, s.bundleID, s.windowName, v.path, v.frameRate, v.width, v.height, v.processingState
     private static func parseFrameWithVideoInfoRow(statement: OpaquePointer) throws -> FrameWithVideoInfo {
         // Parse frame data
         let id = FrameID(value: sqlite3_column_int64(statement, 0))
@@ -848,11 +854,12 @@ enum FrameQueries {
         let encodingStatusText = getTextOrNil(statement, 5) ?? "pending"
         let encodingStatus = EncodingStatus(rawValue: encodingStatusText) ?? .pending
         let processingStatus = Int(sqlite3_column_int(statement, 6))
+        let redactionReason = getTextOrNil(statement, 7)
         Log.debug("[FrameQueries]   encodingStatus=\(encodingStatus), processingStatus=\(processingStatus)", category: .database)
 
-        // Parse metadata from segment (columns 7-8: s.bundleID, s.windowName)
-        let appBundleID = getTextOrNil(statement, 7)
-        let windowName = getTextOrNil(statement, 8)
+        // Parse metadata from segment (columns 8-9: s.bundleID, s.windowName)
+        let appBundleID = getTextOrNil(statement, 8)
+        let windowName = getTextOrNil(statement, 9)
         Log.debug("[FrameQueries]   metadata: bundleID=\(appBundleID ?? "nil"), windowName=\(windowName ?? "nil")", category: .database)
 
         let metadata = FrameMetadata(
@@ -860,6 +867,7 @@ enum FrameQueries {
             appName: nil,  // App name not stored in segment table
             windowName: windowName,
             browserURL: nil,  // Browser URL not stored in simple segment table
+            redactionReason: redactionReason,
             displayID: 0  // Display ID not stored in segment table
         )
 
@@ -874,22 +882,22 @@ enum FrameQueries {
             source: .native
         )
 
-        // Parse video info (columns 9-12: v.path, v.frameRate, v.width, v.height)
+        // Parse video info (columns 10-13: v.path, v.frameRate, v.width, v.height)
         var videoInfo: FrameVideoInfo? = nil
-        let videoPath = getTextOrNil(statement, 9)
+        let videoPath = getTextOrNil(statement, 10)
         Log.debug("[FrameQueries]   videoPath=\(videoPath ?? "nil"), videoID.value=\(videoID.value)", category: .database)
 
         if let videoPath = videoPath,
            videoID.value > 0 {
-            let frameRate = sqlite3_column_double(statement, 10)
-            let width = sqlite3_column_type(statement, 11) != SQLITE_NULL
-                ? Int(sqlite3_column_int(statement, 11))
-                : nil
-            let height = sqlite3_column_type(statement, 12) != SQLITE_NULL
+            let frameRate = sqlite3_column_double(statement, 11)
+            let width = sqlite3_column_type(statement, 12) != SQLITE_NULL
                 ? Int(sqlite3_column_int(statement, 12))
                 : nil
+            let height = sqlite3_column_type(statement, 13) != SQLITE_NULL
+                ? Int(sqlite3_column_int(statement, 13))
+                : nil
             // v.processingState: 0 = finalized/complete, 1 = still being written
-            let videoProcessingState = Int(sqlite3_column_int(statement, 13))
+            let videoProcessingState = Int(sqlite3_column_int(statement, 14))
             let isVideoFinalized = videoProcessingState == 0
 
             // Convert relative path to full path (must use expandedStorageRoot to resolve ~)

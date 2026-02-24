@@ -25,6 +25,30 @@ public actor CGWindowListCapture {
     /// Callback when frame is captured
     nonisolated(unsafe) var onFrameCaptured: (@Sendable (CapturedFrame) -> Void)?
 
+    private struct RedactionWindowContext: Sendable {
+        let reason: String
+        let appBundleID: String?
+        let appName: String?
+    }
+
+    private struct RedactionSummary: Sendable {
+        let reason: String
+        let appBundleID: String?
+        let appName: String?
+    }
+
+    private struct ExclusionComputationResult: Sendable {
+        let excludedWindowIDs: Set<CGWindowID>
+        let redactedWindowIDs: Set<CGWindowID>
+        let redactionContextByWindowID: [CGWindowID: RedactionWindowContext]
+        let redactionWindowOrder: [CGWindowID]
+    }
+
+    private struct FilteredCaptureResult {
+        let image: CGImage
+        let visibleExcludedWindowIDs: Set<CGWindowID>
+    }
+
     // MARK: - Lifecycle
 
     /// Start capturing frames with the given configuration
@@ -136,13 +160,19 @@ public actor CGWindowListCapture {
         guard isActive, let config = currentConfig else { return }
 
         // Compute excluded window IDs for THIS capture (real-time filtering)
-        let excludedIDs = computeExcludedWindowIDs(config: config)
+        let exclusionResult = await computeExcludedWindowIDs(config: config, displayID: displayID)
+        let excludedIDs = exclusionResult.excludedWindowIDs
 
         // Capture the frame using CGWindowList with filtering
-        guard let cgImage = captureWithFiltering(displayID: displayID, excludedWindowIDs: excludedIDs) else {
+        guard let captureResult = captureWithFiltering(
+            displayID: displayID,
+            excludedWindowIDs: excludedIDs,
+            forceMasking: !exclusionResult.redactedWindowIDs.isEmpty
+        ) else {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
             return
         }
+        let cgImage = captureResult.image
 
         // Convert CGImage to BGRA data format (matching ScreenCaptureKit output)
         guard let frameData = convertCGImageToBGRAData(cgImage) else {
@@ -157,6 +187,15 @@ public actor CGWindowListCapture {
 
         Log.verbose("[CGWindowListCapture] Frame captured: \(width)x\(height), excluded \(excludedIDs.count) windows", category: .capture)
 
+        let visibleRedactedWindowIDs = captureResult
+            .visibleExcludedWindowIDs
+            .intersection(exclusionResult.redactedWindowIDs)
+        let redactionSummary = summarizeRedaction(
+            for: visibleRedactedWindowIDs,
+            contextByWindowID: exclusionResult.redactionContextByWindowID,
+            redactionOrder: exclusionResult.redactionWindowOrder
+        )
+
         // Create captured frame
         let frame = CapturedFrame(
             timestamp: Date(),
@@ -164,7 +203,12 @@ public actor CGWindowListCapture {
             width: width,
             height: height,
             bytesPerRow: bytesPerRow,
-            metadata: FrameMetadata(displayID: UInt32(displayID))
+            metadata: FrameMetadata(
+                appBundleID: redactionSummary?.appBundleID,
+                appName: redactionSummary?.appName,
+                redactionReason: redactionSummary?.reason,
+                displayID: UInt32(displayID)
+            )
         )
 
         // Yield frame
@@ -173,33 +217,166 @@ public actor CGWindowListCapture {
 
     /// Compute which window IDs should be excluded based on current config
     /// Called on EVERY capture to ensure real-time filtering
-    private func computeExcludedWindowIDs(config: CaptureConfig) -> Set<CGWindowID> {
+    private func computeExcludedWindowIDs(
+        config: CaptureConfig,
+        displayID: CGWindowID
+    ) async -> ExclusionComputationResult {
         var excludedIDs = Set<CGWindowID>()
+        var redactedWindowIDs = Set<CGWindowID>()
+        var redactionContextByWindowID: [CGWindowID: RedactionWindowContext] = [:]
+        var redactionWindowOrder: [CGWindowID] = []
+
+        enum BrowserURLLookupResult {
+            case found(String)
+            case unavailable
+        }
 
         // Get all on-screen windows
         guard let windowList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return excludedIDs
+            return ExclusionComputationResult(
+                excludedWindowIDs: excludedIDs,
+                redactedWindowIDs: redactedWindowIDs,
+                redactionContextByWindowID: redactionContextByWindowID,
+                redactionWindowOrder: redactionWindowOrder
+            )
         }
 
+        let windowTitlePatterns = normalizedPatterns(config.redactWindowTitlePatterns)
+        let browserURLPatterns = normalizedPatterns(config.redactBrowserURLPatterns)
+
+        let hasWindowTitlePatterns = !windowTitlePatterns.isEmpty
+        let hasBrowserURLPatterns = !browserURLPatterns.isEmpty
+
+        var bundleIDCache: [pid_t: String] = [:]
+        var pidsWithoutBundleID = Set<pid_t>()
+        var browserURLCache: [String: BrowserURLLookupResult] = [:]
+        let displayBounds = CGDisplayBounds(displayID)
 
         for windowInfo in windowList {
             guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
+            guard shouldConsiderWindowForCapture(windowInfo, displayBounds: displayBounds) else { continue }
 
             let ownerName = windowInfo[kCGWindowOwnerName as String] as? String ?? "unknown"
             let windowName = windowInfo[kCGWindowName as String] as? String ?? ""
 
-            // Check 1: Excluded app bundle IDs (check by bundle ID from PID)
-            if let ownerPID = windowInfo[kCGWindowOwnerPID as String] as? pid_t,
-               let bundleID = bundleIDForPID(ownerPID) {
-                if config.excludedAppBundleIDs.contains(bundleID) {
-                    Log.info("[Exclusion] EXCLUDING app window: '\(windowName)' from \(ownerName) (bundleID: \(bundleID))", category: .capture)
-                    excludedIDs.insert(windowID)
-                    continue
+            var ownerPID: pid_t?
+            var bundleID: String?
+            if let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t {
+                ownerPID = pid
+                if let cachedBundleID = bundleIDCache[pid] {
+                    bundleID = cachedBundleID
+                } else if !pidsWithoutBundleID.contains(pid), let resolvedBundleID = bundleIDForPID(pid) {
+                    bundleID = resolvedBundleID
+                    bundleIDCache[pid] = resolvedBundleID
+                } else {
+                    pidsWithoutBundleID.insert(pid)
                 }
             }
+
+            // Check 1: Excluded app bundle IDs (check by bundle ID from PID)
+            if let bundleID, config.excludedAppBundleIDs.contains(bundleID) {
+                Log.info("[Exclusion] EXCLUDING app window: '\(windowName)' from \(ownerName) (bundleID: \(bundleID))", category: .capture)
+                excludedIDs.insert(windowID)
+                redactedWindowIDs.insert(windowID)
+                if redactionContextByWindowID[windowID] == nil {
+                    redactionWindowOrder.append(windowID)
+                    let displayName = appDisplayName(ownerName: ownerName, bundleID: bundleID)
+                    redactionContextByWindowID[windowID] = RedactionWindowContext(
+                        reason: "Excluded app: \(displayName)",
+                        appBundleID: bundleID,
+                        appName: displayName
+                    )
+                }
+                continue
+            }
+
+            // Check 2: Explicit window title redaction rules (case-insensitive substring)
+            if hasWindowTitlePatterns,
+               let matchedPattern = firstMatchingPattern(in: windowName, patterns: windowTitlePatterns) {
+                excludedIDs.insert(windowID)
+                redactedWindowIDs.insert(windowID)
+                if redactionContextByWindowID[windowID] == nil {
+                    redactionWindowOrder.append(windowID)
+                    redactionContextByWindowID[windowID] = RedactionWindowContext(
+                        reason: "Window title matches '\(matchedPattern)'",
+                        appBundleID: bundleID,
+                        appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
+                    )
+                }
+                Log.info("[Redaction] Redacting window \(windowID) by title rule '\(matchedPattern)'", category: .capture)
+                continue
+            }
+
+            guard hasBrowserURLPatterns else {
+                continue
+            }
+
+            // Fast path: if URL rule text appears in the visible window title, redact immediately.
+            if let matchedPattern = firstMatchingPattern(in: windowName, patterns: browserURLPatterns) {
+                excludedIDs.insert(windowID)
+                redactedWindowIDs.insert(windowID)
+                if redactionContextByWindowID[windowID] == nil {
+                    redactionWindowOrder.append(windowID)
+                    redactionContextByWindowID[windowID] = RedactionWindowContext(
+                        reason: "Browser URL matches '\(matchedPattern)'",
+                        appBundleID: bundleID,
+                        appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
+                    )
+                }
+                Log.info("[Redaction] Redacting window \(windowID) by URL rule text in title '\(matchedPattern)'", category: .capture)
+                continue
+            }
+
+            // Slow path: query browser URL for this visible browser window.
+            guard let ownerPID, let bundleID, BrowserURLExtractor.isBrowser(bundleID) else {
+                continue
+            }
+
+            let windowCacheKey = normalizedWindowCacheKey(windowName: windowName, ownerName: ownerName)
+            let browserURLCacheKey = "\(ownerPID)|\(windowCacheKey.lowercased())"
+
+            let browserURL: String?
+            if let cachedResult = browserURLCache[browserURLCacheKey] {
+                switch cachedResult {
+                case let .found(cachedURL):
+                    browserURL = cachedURL
+                case .unavailable:
+                    browserURL = nil
+                }
+            } else {
+                let fetchedURL = await BrowserURLExtractor.getURL(
+                    bundleID: bundleID,
+                    pid: ownerPID,
+                    windowCacheKey: windowCacheKey
+                )
+                if let fetchedURL, !fetchedURL.isEmpty {
+                    browserURLCache[browserURLCacheKey] = .found(fetchedURL)
+                    browserURL = fetchedURL
+                } else {
+                    browserURLCache[browserURLCacheKey] = .unavailable
+                    browserURL = nil
+                }
+            }
+
+            guard let browserURL,
+                  let matchedPattern = firstMatchingPattern(in: browserURL, patterns: browserURLPatterns) else {
+                continue
+            }
+
+            excludedIDs.insert(windowID)
+            redactedWindowIDs.insert(windowID)
+            if redactionContextByWindowID[windowID] == nil {
+                redactionWindowOrder.append(windowID)
+                redactionContextByWindowID[windowID] = RedactionWindowContext(
+                    reason: "Browser URL matches '\(matchedPattern)'",
+                    appBundleID: bundleID,
+                    appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
+                )
+            }
+            Log.info("[Redaction] Redacting window \(windowID) by URL rule '\(matchedPattern)'", category: .capture)
 
             // Check 2: Private/incognito windows
             // TODO: Re-enable once private window detection is more reliable
@@ -217,7 +394,12 @@ public actor CGWindowListCapture {
             // }
         }
 
-        return excludedIDs
+        return ExclusionComputationResult(
+            excludedWindowIDs: excludedIDs,
+            redactedWindowIDs: redactedWindowIDs,
+            redactionContextByWindowID: redactionContextByWindowID,
+            redactionWindowOrder: redactionWindowOrder
+        )
     }
 
     /// Get bundle ID for a process ID
@@ -226,11 +408,134 @@ public actor CGWindowListCapture {
         return app.bundleIdentifier
     }
 
+    private func shouldConsiderWindowForCapture(
+        _ windowInfo: [String: Any],
+        displayBounds: CGRect
+    ) -> Bool {
+        let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+        guard layer == 0 else { return false }
+
+        let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
+        guard alpha > 0 else { return false }
+
+        let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
+        guard isOnScreen else { return false }
+
+        guard let windowBounds = windowBounds(from: windowInfo), windowBounds.intersects(displayBounds) else {
+            return false
+        }
+
+        return true
+    }
+
+    private func windowBounds(from windowInfo: [String: Any]) -> CGRect? {
+        guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: Any],
+              let x = boundsDict["X"] as? CGFloat,
+              let y = boundsDict["Y"] as? CGFloat,
+              let width = boundsDict["Width"] as? CGFloat,
+              let height = boundsDict["Height"] as? CGFloat,
+              width > 1,
+              height > 1 else {
+            return nil
+        }
+
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func normalizedPatterns(_ patterns: [String]) -> [String] {
+        patterns
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { patternHasContent($0) }
+    }
+
+    private func firstMatchingPattern(in value: String, patterns: [String]) -> String? {
+        guard !value.isEmpty else { return nil }
+        for rawPattern in patterns {
+            let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard patternHasContent(pattern) else { continue }
+
+            if value.range(of: pattern, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                return pattern
+            }
+        }
+        return nil
+    }
+
+    private func patternHasContent(_ pattern: String) -> Bool {
+        pattern.contains(where: { !$0.isWhitespace })
+    }
+
+    private func normalizedWindowCacheKey(windowName: String, ownerName: String) -> String {
+        let trimmedWindowName = windowName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedWindowName.isEmpty {
+            return trimmedWindowName
+        }
+        return ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func appDisplayName(ownerName: String, bundleID: String?) -> String {
+        let normalizedOwnerName = ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedOwnerName.isEmpty, normalizedOwnerName.lowercased() != "unknown" {
+            return normalizedOwnerName
+        }
+
+        if let bundleID {
+            let fallbackName = bundleID
+                .split(separator: ".")
+                .last
+                .map(String.init)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let fallbackName, !fallbackName.isEmpty {
+                return fallbackName
+            }
+        }
+
+        return "this app"
+    }
+
+    private func summarizeRedaction(
+        for visibleRedactedWindowIDs: Set<CGWindowID>,
+        contextByWindowID: [CGWindowID: RedactionWindowContext],
+        redactionOrder: [CGWindowID]
+    ) -> RedactionSummary? {
+        let orderedVisibleWindowIDs = redactionOrder.filter { visibleRedactedWindowIDs.contains($0) }
+        guard let firstWindowID = orderedVisibleWindowIDs.first else { return nil }
+
+        let firstContext = contextByWindowID[firstWindowID] ?? RedactionWindowContext(
+            reason: "Redaction rule matched",
+            appBundleID: nil,
+            appName: nil
+        )
+
+        let firstReason = firstContext.reason
+        let additionalCount = max(0, orderedVisibleWindowIDs.count - 1)
+        guard additionalCount > 0 else {
+            return RedactionSummary(
+                reason: firstReason,
+                appBundleID: firstContext.appBundleID,
+                appName: firstContext.appName
+            )
+        }
+
+        let windowLabel = additionalCount == 1 ? "window" : "windows"
+        return RedactionSummary(
+            reason: "\(firstReason) (+\(additionalCount) more \(windowLabel))",
+            appBundleID: firstContext.appBundleID,
+            appName: firstContext.appName
+        )
+    }
+
     /// Capture with window filtering using CGWindowListCreateImageFromArray
-    private func captureWithFiltering(displayID: CGWindowID, excludedWindowIDs: Set<CGWindowID>) -> CGImage? {
+    private func captureWithFiltering(
+        displayID: CGWindowID,
+        excludedWindowIDs: Set<CGWindowID>,
+        forceMasking: Bool
+    ) -> FilteredCaptureResult? {
         // If no exclusions, use simple display capture
         if excludedWindowIDs.isEmpty {
-            return CGDisplayCreateImage(displayID)
+            guard let image = CGDisplayCreateImage(displayID) else { return nil }
+            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
         }
 
         // Get all on-screen windows
@@ -238,7 +543,12 @@ public actor CGWindowListCapture {
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
         ) as? [[String: Any]] else {
-            return CGDisplayCreateImage(displayID)
+            guard let image = CGDisplayCreateImage(displayID) else { return nil }
+            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
+        }
+
+        if forceMasking {
+            return captureWithMasking(displayID: displayID, excludedWindowIDs: excludedWindowIDs, windowList: windowList)
         }
 
         // Build list of window IDs to include (everything except excluded)
@@ -273,7 +583,8 @@ public actor CGWindowListCapture {
 
         // If we filtered everything, capture just desktop
         if includedWindowIDs.isEmpty {
-            return CGDisplayCreateImage(displayID)
+            guard let image = CGDisplayCreateImage(displayID) else { return nil }
+            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
         }
 
         let displayBounds = CGDisplayBounds(displayID)
@@ -315,7 +626,7 @@ public actor CGWindowListCapture {
             imageOption: [.bestResolution]
         ) {
             Log.info("[Filtering] SUCCESS with array capture: \(image.width)x\(image.height)", category: .capture)
-            return image
+            return FilteredCaptureResult(image: image, visibleExcludedWindowIDs: [])
         }
 
         // Array capture failed - run diagnostic ONCE to log which windows fail
@@ -349,7 +660,7 @@ public actor CGWindowListCapture {
         displayID: CGWindowID,
         excludedWindowIDs: Set<CGWindowID>,
         windowList: [[String: Any]]
-    ) -> CGImage? {
+    ) -> FilteredCaptureResult? {
         // Capture the full screen first
         guard let fullScreenImage = CGDisplayCreateImage(displayID) else {
             Log.error("[Masking] Failed to capture full screen", category: .capture)
@@ -358,7 +669,7 @@ public actor CGWindowListCapture {
 
         // If nothing to exclude, return the full screen capture
         if excludedWindowIDs.isEmpty {
-            return fullScreenImage
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
         let displayBounds = CGDisplayBounds(displayID)
@@ -395,7 +706,7 @@ public actor CGWindowListCapture {
 
         // Calculate visible regions for each excluded window
         // For each excluded window, subtract all windows that are in front of it
-        var visibleExcludedRects: [CGRect] = []
+        var visibleExcludedRegions: [(windowID: CGWindowID, rect: CGRect)] = []
 
         for (index, window) in windowBoundsInOrder.enumerated() {
             guard window.isExcluded else { continue }
@@ -411,15 +722,15 @@ public actor CGWindowListCapture {
 
             // Add remaining visible regions to mask list
             for region in visibleRegions where region.width > 1 && region.height > 1 {
-                visibleExcludedRects.append(region)
+                visibleExcludedRegions.append((window.windowID, region))
                 Log.debug("[Masking] Visible region for window \(window.windowID): \(region)", category: .capture)
             }
         }
 
         // If no visible regions to mask, return the full capture
-        if visibleExcludedRects.isEmpty {
+        if visibleExcludedRegions.isEmpty {
             Log.info("[Masking] Excluded windows are fully occluded, no masking needed", category: .capture)
-            return fullScreenImage
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
         // Create a new image with visible excluded regions blacked out
@@ -437,7 +748,7 @@ public actor CGWindowListCapture {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
             Log.error("[Masking] Failed to create graphics context", category: .capture)
-            return fullScreenImage
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
         // Draw the full screen image
@@ -445,7 +756,7 @@ public actor CGWindowListCapture {
 
         // Black out visible excluded regions
         context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
-        for rect in visibleExcludedRects {
+        for (_, rect) in visibleExcludedRegions {
             // Flip Y coordinate for CGContext (origin is bottom-left)
             let flippedRect = CGRect(
                 x: rect.origin.x,
@@ -458,11 +769,12 @@ public actor CGWindowListCapture {
 
         guard let maskedImage = context.makeImage() else {
             Log.error("[Masking] Failed to create masked image", category: .capture)
-            return fullScreenImage
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
-        Log.info("[Masking] Successfully masked \(visibleExcludedRects.count) visible regions", category: .capture)
-        return maskedImage
+        let visibleExcludedWindowIDs = Set(visibleExcludedRegions.map { $0.windowID })
+        Log.info("[Masking] Successfully masked \(visibleExcludedRegions.count) visible regions", category: .capture)
+        return FilteredCaptureResult(image: maskedImage, visibleExcludedWindowIDs: visibleExcludedWindowIDs)
     }
 
     /// Subtract a rectangle from a list of rectangles, returning the remaining visible regions

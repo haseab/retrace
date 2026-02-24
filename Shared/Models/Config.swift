@@ -134,6 +134,14 @@ public struct CaptureConfig: Codable, Sendable {
     /// Whether to show the mouse cursor in captures (default: true)
     public let showCursor: Bool
 
+    /// Case-insensitive substring patterns for window titles that should be redacted.
+    /// Matching frames are kept but replaced with black placeholder pixels.
+    public let redactWindowTitlePatterns: [String]
+
+    /// Case-insensitive substring patterns for browser URLs that should be redacted.
+    /// Matching frames are kept but replaced with black placeholder pixels.
+    public let redactBrowserURLPatterns: [String]
+
     /// Idle threshold in seconds - if no frames are captured for this duration,
     /// the current segment is closed and a new one is created on the next frame.
     /// This handles cases like screen sleep, lock screen, or extended AFK periods.
@@ -154,6 +162,8 @@ public struct CaptureConfig: Codable, Sendable {
         excludePrivateWindows: Bool = true,
         customPrivateWindowPatterns: [String] = [],
         showCursor: Bool = true,
+        redactWindowTitlePatterns: [String] = [],
+        redactBrowserURLPatterns: [String] = [],
         idleThresholdSeconds: Double = 120.0,
         captureOnWindowChange: Bool = true
     ) {
@@ -165,6 +175,8 @@ public struct CaptureConfig: Codable, Sendable {
         self.excludePrivateWindows = excludePrivateWindows
         self.customPrivateWindowPatterns = customPrivateWindowPatterns
         self.showCursor = showCursor
+        self.redactWindowTitlePatterns = redactWindowTitlePatterns
+        self.redactBrowserURLPatterns = redactBrowserURLPatterns
         self.idleThresholdSeconds = idleThresholdSeconds
         self.captureOnWindowChange = captureOnWindowChange
     }

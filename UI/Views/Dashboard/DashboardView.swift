@@ -41,6 +41,14 @@ private enum LayoutSize {
 /// Maximum width for the dashboard content area before it centers
 private let dashboardMaxWidth: CGFloat = 1100
 
+private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
 /// Main dashboard view - analytics and statistics
 /// Default landing screen
 public struct DashboardView: View {
@@ -74,6 +82,7 @@ public struct DashboardView: View {
     }
 
     private static let viewModeDefaultsKey = "dashboardAppUsageViewMode"
+    private static let pauseMenuWidth: CGFloat = 100
 
     private static func loadSavedViewMode() -> AppUsageViewMode {
         guard let raw = UserDefaults.standard.string(forKey: viewModeDefaultsKey),
@@ -258,6 +267,39 @@ public struct DashboardView: View {
             if let newTheme = notification.object as? MilestoneCelebrationManager.ColorTheme {
                 currentTheme = newTheme
             }
+        }
+        .overlayPreferenceValue(RecordingIndicatorAnchorPreferenceKey.self) { anchor in
+            GeometryReader { proxy in
+                if showPauseOptionsPopover, let anchor {
+                    let anchorRect = proxy[anchor]
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .ignoresSafeArea()
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.12)) {
+                                    showPauseOptionsPopover = false
+                                }
+                            }
+
+                        pauseRecordingMenu
+                            .frame(width: Self.pauseMenuWidth)
+                            .offset(
+                                x: pauseMenuOriginX(
+                                    anchorRect: anchorRect,
+                                    containerWidth: proxy.size.width,
+                                    menuWidth: Self.pauseMenuWidth
+                                ),
+                                y: anchorRect.maxY + 6
+                            )
+                            .transition(
+                                .opacity.combined(with: .scale(scale: 0.96, anchor: .top))
+                            )
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+            .zIndex(showPauseOptionsPopover ? 20 : 0)
         }
         .overlay {
             // Sessions detail overlay (replaces .sheet for faster presentation)
@@ -558,11 +600,18 @@ public struct DashboardView: View {
     // MARK: - Recording Indicator
 
     @State private var isHoveringRecordingIndicator = false
+    @State private var showPauseOptionsPopover = false
 
     private var recordingIndicator: some View {
         Button(action: {
-            Task {
-                await viewModel.toggleRecording(to: !viewModel.isRecording)
+            if viewModel.isRecording {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    showPauseOptionsPopover.toggle()
+                }
+            } else {
+                Task {
+                    await viewModel.toggleRecording(to: true)
+                }
             }
         }) {
             HStack(spacing: 6) {
@@ -571,6 +620,18 @@ public struct DashboardView: View {
                         .font(.system(size: 8))
                         .foregroundColor(.retraceSecondary)
                         .frame(width: 6)
+                        .transition(.opacity)
+                } else if viewModel.recordingPauseRemainingSeconds != nil {
+                    Image(systemName: "timer")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 8)
+                        .transition(.opacity)
+                } else if viewModel.isRecordingPaused {
+                    Image(systemName: "pause.circle")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 8)
                         .transition(.opacity)
                 } else {
                     Circle()
@@ -583,7 +644,7 @@ public struct DashboardView: View {
                     .font(.retraceCaptionMedium)
                     .foregroundColor(.retraceSecondary)
                     .contentTransition(.interpolate)
-                    .frame(width: 65, alignment: .center)
+                    .frame(width: 74, alignment: .center)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -597,6 +658,7 @@ public struct DashboardView: View {
         .buttonStyle(.plain)
         .animation(.easeInOut(duration: 0.15), value: isHoveringRecordingIndicator)
         .animation(.easeInOut(duration: 0.15), value: viewModel.isRecording)
+        .anchorPreference(key: RecordingIndicatorAnchorPreferenceKey.self, value: .bounds) { $0 }
         // .instantTooltip("Toggle Recording  ⌘⇧R", isVisible: $isHoveringRecordingIndicator)
         .onHover { hovering in
             isHoveringRecordingIndicator = hovering
@@ -611,8 +673,99 @@ public struct DashboardView: View {
     private var recordingIndicatorLabel: String {
         if viewModel.isRecording {
             return isHoveringRecordingIndicator ? "Pause" : "Recording"
+        } else if let seconds = viewModel.recordingPauseRemainingSeconds {
+            return isHoveringRecordingIndicator ? "Start Rec." : formatPauseCountdown(seconds)
+        } else if viewModel.isRecordingPaused {
+            return isHoveringRecordingIndicator ? "Start Rec." : "Paused"
         } else {
             return isHoveringRecordingIndicator ? "Start Rec." : "Off"
+        }
+    }
+
+    private func formatPauseCountdown(_ seconds: Int) -> String {
+        let clamped = max(0, seconds)
+        let hours = clamped / 3600
+        let minutes = (clamped % 3600) / 60
+        let remainingSeconds = clamped % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+        }
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private var pauseRecordingMenu: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            PauseMenuOptionRow(title: "5 min") {
+                handlePauseSelection(duration: 5 * 60)
+            }
+            PauseMenuOptionRow(title: "30 min") {
+                handlePauseSelection(duration: 30 * 60)
+            }
+            PauseMenuOptionRow(title: "60 min") {
+                handlePauseSelection(duration: 60 * 60)
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.1))
+                .padding(.vertical, 1)
+
+            PauseMenuOptionRow(title: "Turn Off") {
+                handlePauseSelection(duration: nil)
+            }
+        }
+        .padding(4)
+        .retraceMenuContainer(addPadding: false)
+    }
+
+    private func handlePauseSelection(duration: TimeInterval?) {
+        withAnimation(.easeOut(duration: 0.12)) {
+            showPauseOptionsPopover = false
+        }
+        Task {
+            await viewModel.pauseRecording(for: duration)
+        }
+    }
+
+    private func pauseMenuOriginX(anchorRect: CGRect, containerWidth: CGFloat, menuWidth: CGFloat) -> CGFloat {
+        let horizontalPadding: CGFloat = 16
+        let desiredX = anchorRect.minX
+        return min(
+            max(horizontalPadding, desiredX),
+            max(horizontalPadding, containerWidth - menuWidth - horizontalPadding)
+        )
+    }
+
+    private struct PauseMenuOptionRow: View {
+        let title: String
+        let action: () -> Void
+
+        @State private var isHovering = false
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: 0) {
+                    Text(title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundColor(isHovering ? .white : .white.opacity(0.78))
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 24)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(isHovering ? Color.white.opacity(0.12) : Color.clear)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    isHovering = hovering
+                }
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
+            }
         }
     }
 

@@ -188,6 +188,26 @@ public struct SimpleTimelineView: View {
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.isPeeking)
                 }
 
+                // Persistent redaction reason banner (top center)
+                if let redactionContext = currentRedactionContext {
+                    VStack {
+                        RedactionReasonBanner(
+                            reason: redactionContext.reason,
+                            appBundleID: redactionContext.appBundleID
+                        )
+                            .padding(.top, redactionBannerTopPadding(topSafeAreaInset: geometry.safeAreaInsets.top))
+                            .padding(.horizontal, .spacingL)
+                        Spacer()
+                            .allowsHitTesting(false)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .top).combined(with: .opacity),
+                        removal: .opacity
+                    ))
+                    .animation(.spring(response: 0.28, dampingFraction: 0.82), value: redactionContext.reason)
+                }
+
                 // Close button (top-right) - always visible
                 VStack {
                     HStack {
@@ -373,6 +393,104 @@ public struct SimpleTimelineView: View {
 
     private var isAwaitingLiveScreenshot: Bool {
         viewModel.isInLiveMode && viewModel.liveScreenshot == nil
+    }
+
+    private struct RedactionBannerContext {
+        let reason: String
+        let appBundleID: String?
+    }
+
+    private var currentRedactionContext: RedactionBannerContext? {
+        guard let reason = viewModel.currentFrame?.metadata.redactionReason?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !reason.isEmpty else {
+            return nil
+        }
+
+        let fallbackBundleID = viewModel.currentFrame?.metadata.appBundleID
+        let (baseReason, suffix) = splitRedactionReasonSuffix(reason)
+
+        if let excludedBundleID = extractQuotedValue(
+            from: baseReason,
+            prefix: "excludedApp contains '"
+        ) {
+            let appName = appDisplayName(forBundleID: excludedBundleID)
+            return RedactionBannerContext(
+                reason: "Excluded app: \(appName)\(suffix)",
+                appBundleID: excludedBundleID
+            )
+        }
+
+        if let pattern = extractQuotedValue(
+            from: baseReason,
+            prefix: "windowTitle contains '"
+        ) {
+            return RedactionBannerContext(
+                reason: "Window title matches '\(pattern)'\(suffix)",
+                appBundleID: fallbackBundleID
+            )
+        }
+
+        if let pattern = extractQuotedValue(
+            from: baseReason,
+            prefix: "browserURL contains '"
+        ) {
+            return RedactionBannerContext(
+                reason: "Browser URL matches '\(pattern)'\(suffix)",
+                appBundleID: fallbackBundleID
+            )
+        }
+
+        return RedactionBannerContext(
+            reason: reason,
+            appBundleID: fallbackBundleID
+        )
+    }
+
+    private func splitRedactionReasonSuffix(_ reason: String) -> (base: String, suffix: String) {
+        guard let suffixStart = reason.range(of: " (+", options: .backwards),
+              reason.hasSuffix(")") else {
+            return (reason, "")
+        }
+
+        return (
+            String(reason[..<suffixStart.lowerBound]),
+            String(reason[suffixStart.lowerBound...])
+        )
+    }
+
+    private func extractQuotedValue(from text: String, prefix: String) -> String? {
+        guard text.hasPrefix(prefix), text.hasSuffix("'") else { return nil }
+        let valueStart = text.index(text.startIndex, offsetBy: prefix.count)
+        let valueEnd = text.index(before: text.endIndex)
+        guard valueStart <= valueEnd else { return nil }
+        let value = text[valueStart..<valueEnd].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func appDisplayName(forBundleID bundleID: String) -> String {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            let appName = appURL.deletingPathExtension().lastPathComponent
+            if !appName.isEmpty {
+                return appName
+            }
+        }
+
+        if let fallbackName = bundleID.split(separator: ".").last, !fallbackName.isEmpty {
+            return String(fallbackName)
+        }
+
+        return "this app"
+    }
+
+    private func redactionBannerTopPadding(topSafeAreaInset: CGFloat) -> CGFloat {
+        // Keep redaction UI below the notch/menu bar even when we ignore safe areas.
+        let baseTopPadding = max(44, topSafeAreaInset + 12)
+
+        if viewModel.isPeeking {
+            return viewModel.isFrameZoomed ? baseTopPadding + 94 : baseTopPadding + 46
+        }
+        return viewModel.isFrameZoomed ? baseTopPadding + 48 : baseTopPadding
     }
 
     private var frameCanvasBackgroundColor: Color {
@@ -3985,6 +4103,53 @@ struct TextSelectionHintBanner: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.white.opacity(0.15), lineWidth: 1)
         )
+    }
+}
+
+/// Persistent banner that explains why the current frame is redacted.
+private struct RedactionReasonBanner: View {
+    let reason: String
+    let appBundleID: String?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let appBundleID, !appBundleID.isEmpty {
+                AppIconView(bundleID: appBundleID, size: 18)
+                    .frame(width: 18, height: 18)
+            } else {
+                Image(systemName: "eye.slash.fill")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(Color.orange.opacity(0.95))
+            }
+
+            Text("Redacted")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.95))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.22))
+                .frame(width: 1, height: 14)
+
+            Text(reason)
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.8))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: 680)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(white: 0.13).opacity(0.94))
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .allowsHitTesting(false)
+        .help("Current frame is redacted")
     }
 }
 

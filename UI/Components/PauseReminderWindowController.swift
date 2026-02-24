@@ -159,4 +159,9 @@ public class PauseReminderWindowController: NSObject, ObservableObject {
     public var manager: PauseReminderManager? {
         pauseReminderManager
     }
+
+    /// Whether the pause reminder window is currently visible.
+    public var isVisible: Bool {
+        window?.isVisible == true
+    }
 }

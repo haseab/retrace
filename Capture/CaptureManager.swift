@@ -43,6 +43,7 @@ public actor CaptureManager: CaptureProtocol {
     private var deferredDisplaySyncTask: Task<Void, Never>?
     private var currentCaptureDisplayID: UInt32?
     private var isDisplaySwitchInFlight = false
+    private static let windowChangeCaptureDelayMilliseconds = 100
 
     /// Callback for accessibility permission warnings
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
@@ -272,6 +273,10 @@ public actor CaptureManager: CaptureProtocol {
         lastNormalizedTitle = currentTitle
         lastBundleID = currentBundleID
 
+        // Allow a brief settle period after window change before taking the frame.
+        try? await Task.sleep(for: .milliseconds(Self.windowChangeCaptureDelayMilliseconds), clock: .continuous)
+        guard !Task.isCancelled else { return }
+
         // Trigger immediate capture and reset timer
         await cgWindowListCapture.captureImmediateAndResetTimer()
         await syncCaptureDisplayIfNeeded()
@@ -427,7 +432,20 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Enrich frame with app metadata
     private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
-        let metadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: true)
+        let frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: true)
+        let redactionReason = frame.metadata.redactionReason
+        let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
+        let redactedAppBundleID = frame.metadata.appBundleID
+        let redactedAppName = frame.metadata.appName
+
+        let enrichedMetadata = FrameMetadata(
+            appBundleID: redactionReason == nil ? frontmostMetadata.appBundleID : (redactedAppBundleID ?? frontmostMetadata.appBundleID),
+            appName: redactionReason == nil ? frontmostMetadata.appName : (redactedAppName ?? frontmostMetadata.appName),
+            windowName: redactionReason == nil ? frontmostMetadata.windowName : nil,
+            browserURL: redactionReason == nil ? frontmostMetadata.browserURL : nil,
+            redactionReason: redactionReason,
+            displayID: preservedDisplayID
+        )
 
         // Create new frame with enriched metadata
         return CapturedFrame(
@@ -436,7 +454,7 @@ public actor CaptureManager: CaptureProtocol {
             width: frame.width,
             height: frame.height,
             bytesPerRow: frame.bytesPerRow,
-            metadata: metadata
+            metadata: enrichedMetadata
         )
     }
 

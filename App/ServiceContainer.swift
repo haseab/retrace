@@ -613,6 +613,9 @@ extension CaptureConfig {
             }
         }
 
+        let redactWindowTitlePatterns = parseRedactionPatterns(defaults.string(forKey: "redactWindowTitlePatterns"))
+        let redactBrowserURLPatterns = parseRedactionPatterns(defaults.string(forKey: "redactBrowserURLPatterns"))
+
         // Capture on window change - instantly capture when switching apps/windows
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
 
@@ -624,8 +627,18 @@ extension CaptureConfig {
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,
             showCursor: showCursor,
+            redactWindowTitlePatterns: redactWindowTitlePatterns,
+            redactBrowserURLPatterns: redactBrowserURLPatterns,
             captureOnWindowChange: captureOnWindowChange
         )
+    }
+
+    private static func parseRedactionPatterns(_ raw: String?) -> [String] {
+        guard let raw, !raw.isEmpty else { return [] }
+        return raw
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 }
 

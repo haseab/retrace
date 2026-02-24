@@ -21,6 +21,8 @@ public class MenuBarManager: ObservableObject {
     private let coordinator: AppCoordinator
     private let onboardingManager: OnboardingManager
     private var refreshTimer: DispatchSourceTimer?
+    private var autoResumeCountdownTimer: Timer?
+    private weak var autoResumeStatusItem: NSMenuItem?
 
     @Published public var isRecording = false
 
@@ -41,6 +43,30 @@ public class MenuBarManager: ObservableObject {
     private var iconAnimationTimer: Timer?
     /// Current fill progress for icon animation (0.0 to 1.0)
     private var iconFillProgress: CGFloat = 0.0
+    /// References used to keep the recording toggle pinned to the row's trailing edge.
+    private weak var recordingToggleContainerView: NSView?
+    private weak var recordingToggleControl: RecordingToggleSwitch?
+    /// True when capture was paused via pause controls (not plain keyboard toggle off).
+    private var isPausedByUser = false
+    /// Pending task that resumes capture after a timed pause.
+    private var scheduledResumeTask: Task<Void, Never>?
+    /// Target wall clock time for timed resume (nil means paused indefinitely / no timed pause active).
+    private var scheduledResumeDate: Date?
+
+    private enum RecordingStatusIconStyle {
+        case off
+        case recording
+        case paused
+    }
+
+    public var isPausedState: Bool {
+        !isRecording && isPausedByUser
+    }
+
+    public var timedPauseRemainingSeconds: Int? {
+        guard isPausedState, let scheduledResumeDate else { return nil }
+        return max(0, Int(ceil(scheduledResumeDate.timeIntervalSinceNow)))
+    }
 
     // MARK: - Initialization
 
@@ -64,7 +90,7 @@ public class MenuBarManager: ObservableObject {
 
         if statusItem?.button != nil {
             // Start with icon showing current recording state
-            updateIcon(recording: isRecording)
+            updateIconForCurrentState()
             configureStatusButtonClicks()
             setupStatusClickMonitors()
         } else {
@@ -254,8 +280,12 @@ public class MenuBarManager: ObservableObject {
     private func toggleRecording() {
         Task { @MainActor in
             do {
-                let currentlyRecording = await coordinator.getStatus().isRunning
+                let currentlyRecording = coordinator.statusHolder.status.isRunning
                 let shouldRecord = !currentlyRecording
+
+                // Keyboard shortcut remains a plain toggle and clears any timed pause intent.
+                clearScheduledResume()
+                isPausedByUser = false
 
                 // Update state and animate icon
                 isRecording = shouldRecord
@@ -271,7 +301,7 @@ public class MenuBarManager: ObservableObject {
             } catch {
                 Log.error("[MenuBar] Failed to toggle recording via hotkey: \(error)", category: .ui)
                 // Revert on error
-                let actualState = await coordinator.getStatus().isRunning
+                let actualState = coordinator.statusHolder.status.isRunning
                 isRecording = actualState
                 updateIcon(recording: actualState)
             }
@@ -287,16 +317,34 @@ public class MenuBarManager: ObservableObject {
     /// Restore recording indicator (called when timeline closes)
     private func restoreRecordingIndicator() {
         shouldHideRecordingIndicator = false
-        updateIcon(recording: isRecording)
+        updateIconForCurrentState()
+    }
+
+    private func currentIconStyle() -> RecordingStatusIconStyle {
+        if shouldHideRecordingIndicator {
+            return .off
+        }
+        if isRecording {
+            return .recording
+        }
+        return isPausedByUser ? .paused : .off
+    }
+
+    private func updateIconForCurrentState() {
+        updateIcon(style: currentIconStyle())
+    }
+
+    /// Update the menu bar icon to show recording status (no animation)
+    private func updateIcon(style: RecordingStatusIconStyle) {
+        guard let button = statusItem?.button else { return }
+        let image = createStatusIcon(style: style)
+        button.image = image
+        button.image?.isTemplate = true
     }
 
     /// Update the menu bar icon to show recording status (no animation)
     private func updateIcon(recording: Bool) {
-        guard let button = statusItem?.button else { return }
-
-        let image = createStatusIcon(filled: recording)
-        button.image = image
-        button.image?.isTemplate = true
+        updateIcon(style: recording ? .recording : .off)
     }
 
     /// Animate the menu bar icon with a "press" effect when recording state changes
@@ -332,7 +380,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = 1.0 - ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    let image = self.createStatusIcon(style: startFilled ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -350,7 +398,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = minScale + ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    let image = self.createStatusIcon(style: toRecording ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -365,9 +413,9 @@ public class MenuBarManager: ObservableObject {
     }
 
     /// Create a custom status icon with two triangles (Retrace logo)
-    /// Left triangle: Points left, filled or outlined based on state, with optional scale
+    /// Left triangle: Points left, supports recording/off/paused visual states, with optional scale
     /// Right triangle: Points right, always outlined
-    private func createStatusIcon(filled: Bool, scale: CGFloat = 1.0) -> NSImage {
+    private func createStatusIcon(style: RecordingStatusIconStyle, scale: CGFloat = 1.0) -> NSImage {
         let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size)
 
@@ -395,12 +443,13 @@ public class MenuBarManager: ObservableObject {
         leftTriangle.line(to: NSPoint(x: leftBase, y: verticalCenter + triangleHeight / 2))
         leftTriangle.close()
 
-        if filled {
+        switch style {
+        case .recording:
             // Filled when recording (no border)
             NSColor.white.setFill()
             leftTriangle.fill()
-        } else {
-            // Outlined when not recording
+        case .paused, .off:
+            // Outlined when paused or fully off.
             NSColor.white.setStroke()
             leftTriangle.lineWidth = 1.2
             leftTriangle.stroke()
@@ -468,7 +517,28 @@ public class MenuBarManager: ObservableObject {
         toggleView.action = #selector(recordingToggleChanged(_:))
         containerView.addSubview(toggleView)
 
+        recordingToggleContainerView = containerView
+        recordingToggleControl = toggleView
+
         return containerView
+    }
+
+    /// Expands the custom recording row to match menu width and pins the toggle to the trailing edge.
+    private func alignRecordingToggleToTrailingEdge(in menu: NSMenu) {
+        guard let container = recordingToggleContainerView,
+              let toggle = recordingToggleControl else { return }
+
+        let targetWidth = max(container.frame.width, menu.size.width - 8)
+        guard targetWidth > 0 else { return }
+
+        var containerFrame = container.frame
+        containerFrame.size.width = targetWidth
+        container.frame = containerFrame
+
+        var toggleFrame = toggle.frame
+        let trailingPadding: CGFloat = 2
+        toggleFrame.origin.x = targetWidth - toggleFrame.width - trailingPadding
+        toggle.frame = toggleFrame
     }
 
     /// Handle recording toggle switch change
@@ -476,9 +546,13 @@ public class MenuBarManager: ObservableObject {
         guard let toggle = sender as? RecordingToggleSwitch else { return }
         let shouldRecord = toggle.state == .on
 
+        clearScheduledResume()
+        isPausedByUser = false
+
         // Update state and animate icon (using common run loop mode to work while menu is open)
         isRecording = shouldRecord
         animateIconFillWithCommonMode(toRecording: shouldRecord)
+        refreshOpenRecordingControlsIfNeeded()
 
         // Then perform the actual operation in the background
         Task { @MainActor in
@@ -493,10 +567,11 @@ public class MenuBarManager: ObservableObject {
             } catch {
                 Log.error("[MenuBar] Failed to toggle recording: \(error)", category: .ui)
                 // Revert on error
-                let actualState = await coordinator.getStatus().isRunning
+                let actualState = coordinator.statusHolder.status.isRunning
                 toggle.isOn = actualState
                 isRecording = actualState
                 updateIcon(recording: actualState)
+                refreshOpenRecordingControlsIfNeeded()
             }
         }
     }
@@ -533,7 +608,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = 1.0 - ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: startFilled, scale: scale)
+                    let image = self.createStatusIcon(style: startFilled ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -550,7 +625,7 @@ public class MenuBarManager: ObservableObject {
                 let scale = minScale + ((1.0 - minScale) * easedProgress)
 
                 if let button = self.statusItem?.button {
-                    let image = self.createStatusIcon(filled: toRecording, scale: scale)
+                    let image = self.createStatusIcon(style: toRecording ? .recording : .off, scale: scale)
                     button.image = image
                     button.image?.isTemplate = true
                 }
@@ -565,6 +640,177 @@ public class MenuBarManager: ObservableObject {
         // Add to common run loop mode so it runs while menu is tracking
         RunLoop.main.add(timer, forMode: .common)
         iconAnimationTimer = timer
+    }
+
+    public func pauseRecording(for duration: TimeInterval?) async {
+        clearScheduledResume()
+        let wasRecording = coordinator.statusHolder.status.isRunning
+        let isTimedPause = (duration ?? 0) > 0
+        if wasRecording {
+            // Timed pauses are treated as paused state; "Turn Off" is normal off state.
+            isPausedByUser = isTimedPause
+        }
+
+        do {
+            if wasRecording {
+                Log.debug("[MenuBar] Pausing capture pipeline...", category: .ui)
+                // Timed pause should come back ON after app relaunch; explicit "Turn Off" should persist OFF.
+                try await coordinator.stopPipeline(persistState: !isTimedPause)
+            }
+
+            if wasRecording, isTimedPause, let duration {
+                scheduleTimedResume(after: duration)
+            }
+        } catch {
+            Log.error("[MenuBar] Failed to pause recording: \(error)", category: .ui)
+        }
+
+        syncWithCoordinator()
+        updateIconForCurrentState()
+    }
+
+    private func startRecordingNow() async {
+        clearScheduledResume()
+        isPausedByUser = false
+        do {
+            try await coordinator.startPipeline()
+        } catch {
+            Log.error("[MenuBar] Failed to start recording: \(error)", category: .ui)
+        }
+        syncWithCoordinator()
+    }
+
+    private func clearScheduledResume(refreshMenu: Bool = true) {
+        scheduledResumeTask?.cancel()
+        scheduledResumeTask = nil
+
+        if scheduledResumeDate != nil {
+            scheduledResumeDate = nil
+            if refreshMenu {
+                setupMenu()
+            }
+        }
+    }
+
+    public func cancelScheduledResume() {
+        clearScheduledResume()
+    }
+
+    private func scheduleTimedResume(after duration: TimeInterval) {
+        guard duration > 0 else { return }
+
+        let targetDate = Date().addingTimeInterval(duration)
+        scheduledResumeDate = targetDate
+        setupMenu()
+
+        scheduledResumeTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(duration), clock: .continuous)
+            } catch {
+                return
+            }
+
+            guard let self else { return }
+            guard self.scheduledResumeDate == targetDate else { return }
+
+            self.scheduledResumeDate = nil
+            self.scheduledResumeTask = nil
+
+            do {
+                Log.info("[MenuBar] Timed pause ended - resuming capture", category: .ui)
+                try await self.coordinator.startPipeline()
+            } catch {
+                Log.error("[MenuBar] Failed to auto-resume after timed pause: \(error)", category: .ui)
+            }
+
+            self.syncWithCoordinator()
+            self.setupMenu()
+        }
+    }
+
+    private func autoResumeSubtitle() -> String? {
+        guard let remainingSeconds = timedPauseRemainingSeconds else { return nil }
+        let hours = remainingSeconds / 3600
+        let minutes = (remainingSeconds % 3600) / 60
+        let seconds = remainingSeconds % 60
+
+        if hours > 0 {
+            return String(format: "Resumes in %d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "Resumes in %02d:%02d", minutes, seconds)
+    }
+
+    private func makeRecordingControlItems() -> [NSMenuItem] {
+        autoResumeStatusItem = nil
+
+        let recordingToggleItem = NSMenuItem()
+        recordingToggleItem.view = createRecordingToggleView()
+        var items: [NSMenuItem] = [recordingToggleItem]
+
+        if isRecording {
+            let pauseFor5Item = NSMenuItem(title: "Pause for 5 Minutes", action: #selector(pauseFor5Minutes), keyEquivalent: "")
+            pauseFor5Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor5Item.target = self
+            items.append(pauseFor5Item)
+
+            let pauseFor30Item = NSMenuItem(title: "Pause for 30 Minutes", action: #selector(pauseFor30Minutes), keyEquivalent: "")
+            pauseFor30Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor30Item.target = self
+            items.append(pauseFor30Item)
+
+            let pauseFor60Item = NSMenuItem(title: "Pause for 60 Minutes", action: #selector(pauseFor60Minutes), keyEquivalent: "")
+            pauseFor60Item.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            pauseFor60Item.target = self
+            items.append(pauseFor60Item)
+        } else if let subtitle = autoResumeSubtitle() {
+            let resumeStatusItem = NSMenuItem(title: subtitle, action: nil, keyEquivalent: "")
+            resumeStatusItem.isEnabled = false
+            resumeStatusItem.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            autoResumeStatusItem = resumeStatusItem
+            items.append(resumeStatusItem)
+        }
+
+        return items
+    }
+
+    private func addRecordingControls(to menu: NSMenu) {
+        for item in makeRecordingControlItems() {
+            menu.addItem(item)
+        }
+    }
+
+    /// Refresh only the recording-controls section while status menu is open.
+    /// This keeps the menu visible and updates pause rows immediately after toggle changes.
+    private func refreshOpenRecordingControlsIfNeeded() {
+        guard let menu = statusItem?.menu else { return }
+
+        let separatorIndices = menu.items.enumerated().compactMap { idx, item in
+            item.isSeparatorItem ? idx : nil
+        }
+        guard separatorIndices.count >= 2 else { return }
+
+        let firstSeparator = separatorIndices[0]
+        let secondSeparator = separatorIndices[1]
+        let insertionIndex = firstSeparator + 1
+
+        if secondSeparator > insertionIndex {
+            for _ in insertionIndex..<secondSeparator {
+                menu.removeItem(at: insertionIndex)
+            }
+        }
+
+        let refreshedItems = makeRecordingControlItems()
+        for (offset, item) in refreshedItems.enumerated() {
+            menu.insertItem(item, at: insertionIndex + offset)
+        }
+
+        alignRecordingToggleToTrailingEdge(in: menu)
+
+        if autoResumeStatusItem != nil {
+            startAutoResumeCountdownUpdates()
+        } else {
+            stopAutoResumeCountdownUpdates()
+        }
     }
 
     private func setupMenu() {
@@ -604,11 +850,8 @@ public class MenuBarManager: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Recording toggle with switch
-        let recordingItem = NSMenuItem()
-        let recordingView = createRecordingToggleView()
-        recordingItem.view = recordingView
-        menu.addItem(recordingItem)
+        // Recording controls
+        addRecordingControls(to: menu)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -621,6 +864,16 @@ public class MenuBarManager: ObservableObject {
         settingsItem.keyEquivalentModifierMask = .command
         settingsItem.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
         menu.addItem(settingsItem)
+
+        // Check for updates
+        let checkForUpdatesItem = NSMenuItem(
+            title: UpdaterManager.shared.isCheckingForUpdates ? "Checking..." : "Check for Updates...",
+            action: #selector(checkForUpdatesFromMenu),
+            keyEquivalent: ""
+        )
+        checkForUpdatesItem.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+        checkForUpdatesItem.isEnabled = !UpdaterManager.shared.isCheckingForUpdates && UpdaterManager.shared.canCheckForUpdates
+        menu.addItem(checkForUpdatesItem)
 
         // Get Help
         let feedbackItem = NSMenuItem(
@@ -773,6 +1026,8 @@ public class MenuBarManager: ObservableObject {
             Log.error("[MenuBarLifecycle] popup aborted: status menu is nil", category: .ui)
             return
         }
+        alignRecordingToggleToTrailingEdge(in: menu)
+        startAutoResumeCountdownUpdates()
 
         Log.debug(
             "[MenuBarLifecycle] opening status menu items=\(menu.items.count) via status-item attachment",
@@ -783,8 +1038,40 @@ public class MenuBarManager: ObservableObject {
         statusItem.menu = menu
         button.performClick(nil)
         statusItem.menu = nil
+        stopAutoResumeCountdownUpdates()
 
         Log.debug("[MenuBarLifecycle] status menu closed", category: .ui)
+    }
+
+    private func startAutoResumeCountdownUpdates() {
+        autoResumeCountdownTimer?.invalidate()
+        autoResumeCountdownTimer = nil
+        guard autoResumeStatusItem != nil else { return }
+
+        autoResumeCountdownTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+
+            guard let item = self.autoResumeStatusItem else {
+                self.stopAutoResumeCountdownUpdates()
+                return
+            }
+
+            if let subtitle = self.autoResumeSubtitle() {
+                item.title = subtitle
+            } else {
+                self.stopAutoResumeCountdownUpdates()
+            }
+        }
+
+        if let timer = autoResumeCountdownTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopAutoResumeCountdownUpdates() {
+        autoResumeCountdownTimer?.invalidate()
+        autoResumeCountdownTimer = nil
+        autoResumeStatusItem = nil
     }
 
     // MARK: - Actions
@@ -808,6 +1095,28 @@ public class MenuBarManager: ObservableObject {
 
     @objc private func openSystemMonitor() {
         NotificationCenter.default.post(name: .openSystemMonitor, object: nil)
+    }
+
+    @objc private func startRecordingFromMenu() {
+        Task { @MainActor in
+            await startRecordingNow()
+        }
+    }
+
+    @objc private func pauseFor5Minutes() {
+        applyPauseSelection(duration: 5 * 60)
+    }
+
+    @objc private func pauseFor30Minutes() {
+        applyPauseSelection(duration: 30 * 60)
+    }
+
+    @objc private func pauseFor60Minutes() {
+        applyPauseSelection(duration: 60 * 60)
+    }
+
+    @objc private func turnOffRecording() {
+        applyPauseSelection(duration: nil)
     }
 
     /// Toggle system monitor from global hotkey - hides timeline if open, then toggles monitor view
@@ -843,8 +1152,16 @@ public class MenuBarManager: ObservableObject {
     public func syncWithCoordinator() {
         // Read status directly from thread-safe holder - no actor hop needed
         let status = coordinator.statusHolder.status
+        if status.isRunning {
+            isPausedByUser = false
+            if scheduledResumeDate != nil {
+                clearScheduledResume(refreshMenu: false)
+            }
+        }
         if isRecording != status.isRunning {
             updateRecordingStatus(status.isRunning)
+        } else {
+            updateIconForCurrentState()
         }
     }
 
@@ -856,8 +1173,18 @@ public class MenuBarManager: ObservableObject {
         NotificationCenter.default.post(name: .openFeedback, object: nil)
     }
 
+    @objc private func checkForUpdatesFromMenu() {
+        UpdaterManager.shared.checkForUpdates()
+    }
+
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    private func applyPauseSelection(duration: TimeInterval?) {
+        Task { @MainActor in
+            await pauseRecording(for: duration)
+        }
     }
 
     // MARK: - Update
@@ -865,13 +1192,16 @@ public class MenuBarManager: ObservableObject {
     public func updateRecordingStatus(_ recording: Bool) {
         let wasRecording = isRecording
         isRecording = recording
+        if recording {
+            isPausedByUser = false
+        }
         setupMenu()
 
-        // Animate the icon fill if the state actually changed
-        if wasRecording != recording {
+        // Animate only for true start/stop transitions; paused uses hatched static icon.
+        if wasRecording != recording && !(wasRecording && !recording && isPausedByUser) {
             animateIconFill(toRecording: recording)
         } else {
-            updateIcon(recording: recording)
+            updateIconForCurrentState()
         }
     }
 
@@ -902,6 +1232,8 @@ public class MenuBarManager: ObservableObject {
     deinit {
         refreshTimer?.cancel()
         iconAnimationTimer?.invalidate()
+        autoResumeCountdownTimer?.invalidate()
+        scheduledResumeTask?.cancel()
         teardownStatusClickMonitors()
     }
 }
@@ -1036,7 +1368,8 @@ private class RecordingToggleSwitch: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        isOn.toggle()
+        let nextState = !isOn
+        isOn = nextState
 
         // Send action
         if let target = target, let action = action {

@@ -158,6 +158,7 @@ public actor ProcessingManager: ProcessingProtocol {
                 appName: axResult.appInfo.name,
                 windowName: axResult.appInfo.windowName,
                 browserURL: axResult.appInfo.browserURL ?? frame.metadata.browserURL,
+                redactionReason: frame.metadata.redactionReason,
                 displayID: frame.metadata.displayID
             )
         }
@@ -172,6 +173,7 @@ public actor ProcessingManager: ProcessingProtocol {
                     appName: metadata.appName,
                     windowName: metadata.windowName,
                     browserURL: extractedURL,
+                    redactionReason: metadata.redactionReason,
                     displayID: metadata.displayID
                 )
             }

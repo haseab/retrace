@@ -875,9 +875,26 @@ struct CurrentAppBadge: View {
         return URL(string: urlString) != nil
     }
 
+    /// Why the current frame was redacted (if applicable)
+    private var currentRedactionReason: String? {
+        guard let reason = viewModel.currentFrame?.metadata.redactionReason,
+              !reason.isEmpty else {
+            return nil
+        }
+        return reason
+    }
+
+    private var isCurrentFrameRedacted: Bool {
+        currentRedactionReason != nil
+    }
+
     /// Whether to show the expanded "Open" state
     private var shouldShowExpanded: Bool {
-        (isExpanded || isHovering) && hasOpenableURL && !viewModel.isActivelyScrolling
+        (isExpanded || isHovering) && !viewModel.isActivelyScrolling && (hasOpenableURL || isCurrentFrameRedacted)
+    }
+
+    private var expandedLabel: String {
+        isCurrentFrameRedacted ? "Redacted" : "Open"
     }
 
     private var expandedWidth: CGFloat {
@@ -886,8 +903,7 @@ struct CurrentAppBadge: View {
 
     var body: some View {
         Group {
-            // Only show the badge for browsers with an openable URL
-            if let bundleID = currentBundleID, hasOpenableURL {
+            if let bundleID = currentBundleID, hasOpenableURL || isCurrentFrameRedacted {
                 Button(action: {
                     if hasOpenableURL, viewModel.openCurrentBrowserURL() {
                         TimelineWindowController.shared.hide()
@@ -902,7 +918,7 @@ struct CurrentAppBadge: View {
                         // Animated button content pinned to right edge (expands left)
                         HStack(spacing: 8) {
                             if shouldShowExpanded {
-                                Text("Open")
+                                Text(expandedLabel)
                                     .font(.system(size: 14, weight: .medium))
                                     .foregroundColor(.white)
                                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
@@ -930,6 +946,7 @@ struct CurrentAppBadge: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+                .help(currentRedactionReason.map { "Redacted: \($0)" } ?? "Open current URL")
                 .onHover { hovering in
                     withAnimation(.easeOut(duration: 0.15)) {
                         isHovering = hovering

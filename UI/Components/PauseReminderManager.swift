@@ -43,6 +43,7 @@ public class PauseReminderManager: ObservableObject {
     private var statusCheckTimer: DispatchSourceTimer?
     private var wasCapturing = false
     private var hasCheckedInitialState = false
+    private var wasSuppressedForPausedState = false
 
     // MARK: - Initialization
 
@@ -70,6 +71,19 @@ public class PauseReminderManager: ObservableObject {
     /// Check the current capture state and manage the reminder timer
     private func checkCaptureState() async {
         let isCapturing = await coordinator.isCapturing()
+        let isPausedState = MenuBarManager.shared?.isPausedState == true
+
+        // "Paused" (timed pause) should not show the off reminder.
+        if isPausedState {
+            if pauseStartTime != nil || reminderTimer != nil || remindLaterTimer != nil || shouldShowReminder {
+                onCaptureResumed()
+                Log.debug("[PauseReminderManager] Suppressing off reminder while recording is paused", category: .ui)
+            }
+            hasCheckedInitialState = true
+            wasCapturing = isCapturing
+            wasSuppressedForPausedState = true
+            return
+        }
 
         // Handle initial state: if app starts while not capturing, treat it as paused
         if !hasCheckedInitialState {
@@ -81,6 +95,12 @@ public class PauseReminderManager: ObservableObject {
             wasCapturing = isCapturing
             return
         }
+
+        // Transitioned from paused state -> off (still not capturing): start off reminder timer now.
+        if wasSuppressedForPausedState && !isCapturing {
+            onCapturePaused()
+        }
+        wasSuppressedForPausedState = false
 
         if wasCapturing && !isCapturing {
             // Capture just stopped - start the reminder timer

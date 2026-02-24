@@ -48,6 +48,8 @@ enum SettingsDefaults {
     // MARK: Privacy
     static let excludedApps = ""
     static let excludePrivateWindows = false
+    static let redactWindowTitlePatterns = ""
+    static let redactBrowserURLPatterns = ""
     static let excludeSafariPrivate = true
     static let excludeChromeIncognito = true
     static let encryptionEnabled = true
@@ -189,6 +191,8 @@ public struct SettingsView: View {
     // MARK: Privacy Settings
     @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = SettingsDefaults.excludedApps
     @AppStorage("excludePrivateWindows", store: settingsStore) private var excludePrivateWindows = SettingsDefaults.excludePrivateWindows
+    @AppStorage("redactWindowTitlePatterns", store: settingsStore) private var redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
+    @AppStorage("redactBrowserURLPatterns", store: settingsStore) private var redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
 
     // Computed property to manage excluded apps as array
     private var excludedApps: [ExcludedAppInfo] {
@@ -313,6 +317,7 @@ public struct SettingsView: View {
 
     // Excluded apps feedback
     @State private var excludedAppsUpdateMessage: String? = nil
+    @State private var redactionRulesUpdateMessage: String? = nil
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
@@ -356,6 +361,8 @@ public struct SettingsView: View {
         // Privacy
         SettingsSearchEntry(id: "privacy.excludedApps", tab: .privacy, cardTitle: "Excluded Apps", cardIcon: "app.badge.checkmark",
             searchableText: ["excluded apps", "block app", "privacy", "apps not recorded", "app exclusion"]),
+        SettingsSearchEntry(id: "privacy.frameRedaction", tab: .privacy, cardTitle: "Window Redaction", cardIcon: "eye.slash",
+            searchableText: ["redaction", "window title", "browser url", "black frames", "privacy rules"]),
         SettingsSearchEntry(id: "privacy.quickDelete", tab: .privacy, cardTitle: "Quick Delete", cardIcon: "clock.arrow.circlepath",
             searchableText: ["quick delete", "delete recent", "last 5 minutes", "last hour", "last 24 hours", "erase"]),
         SettingsSearchEntry(id: "privacy.permissions", tab: .privacy, cardTitle: "Permissions", cardIcon: "hand.raised",
@@ -2351,6 +2358,7 @@ public struct SettingsView: View {
     private var privacySettings: some View {
         VStack(alignment: .leading, spacing: 20) {
             excludedAppsCard
+            redactionRulesCard
             quickDeleteCard
             permissionsCard
         }
@@ -2408,65 +2416,144 @@ public struct SettingsView: View {
     @ViewBuilder
     private var quickDeleteCard: some View {
         ModernSettingsCard(title: "Quick Delete", icon: "clock.arrow.circlepath") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Permanently delete recent recordings")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Permanently delete recent recordings")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
 
-                    HStack(spacing: 12) {
-                        QuickDeleteButton(
-                            title: "Last 5 min",
-                            option: .fiveMinutes,
-                            isDeleting: isDeleting,
-                            currentOption: deletingOption
-                        ) {
-                            quickDeleteConfirmation = .fiveMinutes
-                        }
-
-                        QuickDeleteButton(
-                            title: "Last hour",
-                            option: .oneHour,
-                            isDeleting: isDeleting,
-                            currentOption: deletingOption
-                        ) {
-                            quickDeleteConfirmation = .oneHour
-                        }
-
-                        QuickDeleteButton(
-                            title: "Last 24h",
-                            option: .oneDay,
-                            isDeleting: isDeleting,
-                            currentOption: deletingOption
-                        ) {
-                            quickDeleteConfirmation = .oneDay
-                        }
+                HStack(spacing: 12) {
+                    QuickDeleteButton(
+                        title: "Last 5 min",
+                        option: .fiveMinutes,
+                        isDeleting: isDeleting,
+                        currentOption: deletingOption
+                    ) {
+                        quickDeleteConfirmation = .fiveMinutes
                     }
 
-                    // Show result message after deletion
-                    if let result = deleteResult {
-                        HStack(spacing: 8) {
-                            Image(systemName: result.success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .font(.retraceCaption2)
-                                .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
-                            Text(result.message)
-                                .font(.retraceCaption2Medium)
-                                .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
-                        }
-                        .padding(.top, 4)
-                        .transition(.opacity)
+                    QuickDeleteButton(
+                        title: "Last hour",
+                        option: .oneHour,
+                        isDeleting: isDeleting,
+                        currentOption: deletingOption
+                    ) {
+                        quickDeleteConfirmation = .oneHour
+                    }
+
+                    QuickDeleteButton(
+                        title: "Last 24h",
+                        option: .oneDay,
+                        isDeleting: isDeleting,
+                        currentOption: deletingOption
+                    ) {
+                        quickDeleteConfirmation = .oneDay
                     }
                 }
+
+                // Show result message after deletion
+                if let result = deleteResult {
+                    HStack(spacing: 6) {
+                        Image(systemName: result.success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .font(.retraceCaption2)
+                            .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
+                        Text(result.message)
+                            .font(.retraceCaption2Medium)
+                            .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
+                    }
+                    .padding(.top, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
-            .alert(item: $quickDeleteConfirmation) { option in
-                Alert(
-                    title: Text("Delete \(option.displayName)?"),
-                    message: Text("This will permanently delete all recordings from the \(option.displayName.lowercased()). This action cannot be undone."),
-                    primaryButton: .destructive(Text("Delete")) {
-                        performQuickDelete(option: option)
-                    },
-                    secondaryButton: .cancel()
-                )
         }
+        .alert(item: $quickDeleteConfirmation) { option in
+            Alert(
+                title: Text("Delete \(option.displayName)?"),
+                message: Text("This will permanently delete all recordings from the \(option.displayName.lowercased()). This action cannot be undone."),
+                primaryButton: .destructive(Text("Delete")) {
+                    performQuickDelete(option: option)
+                },
+                secondaryButton: .cancel()
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var redactionRulesCard: some View {
+        ModernSettingsCard(title: "Window Redaction", icon: "eye.slash") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Mask matching window regions in captured frames (case-insensitive substring).")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Window title patterns (one per line)")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                    redactionRuleEditor(
+                        text: $redactWindowTitlePatternsRaw,
+                        placeholder: "Examples:\nWells Fargo Bank - Home\nPassword Manager\nGusto - Payroll"
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Browser URL patterns (one per line)")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                    redactionRuleEditor(
+                        text: $redactBrowserURLPatternsRaw,
+                        placeholder: "Examples:\nx.com/home\nbankofamerica.com\ninstagram.com/profile"
+                    )
+                }
+
+                if let message = redactionRulesUpdateMessage {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 12))
+                        Text(message)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .onChange(of: redactWindowTitlePatternsRaw) { _ in
+                updateRedactionRulesConfig()
+            }
+            .onChange(of: redactBrowserURLPatternsRaw) { _ in
+                updateRedactionRulesConfig()
+            }
+            .animation(.easeInOut(duration: 0.2), value: redactionRulesUpdateMessage)
+        }
+    }
+
+    @ViewBuilder
+    private func redactionRuleEditor(text: Binding<String>, placeholder: String) -> some View {
+        ZStack(alignment: .topLeading) {
+            if text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(placeholder)
+                    .font(.retraceCaption)
+                    .foregroundColor(.white.opacity(0.32))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .allowsHitTesting(false)
+            }
+
+            TextEditor(text: text)
+                .font(.retraceCaption)
+                .scrollContentBackground(.hidden)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+        }
+        .frame(minHeight: 90)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.09), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -3515,6 +3602,7 @@ public struct SettingsView: View {
         case "storage.retentionPolicy": retentionPolicyCard
         case "exportData.comingSoon": comingSoonCard
         case "privacy.excludedApps": excludedAppsCard
+        case "privacy.frameRedaction": redactionRulesCard
         case "privacy.quickDelete": quickDeleteCard
         case "privacy.permissions": permissionsCard
         case "power.ocrProcessing": ocrProcessingCard
@@ -5774,6 +5862,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
                 captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
@@ -5782,6 +5872,58 @@ extension SettingsView {
                 Log.info("[SettingsView] Excluded apps updated: \(excludedBundleIDs.count - 1) apps excluded", category: .ui)
             } catch {
                 Log.error("[SettingsView] Failed to update excluded apps config: \(error)", category: .ui)
+            }
+        }
+    }
+
+    private func parseRedactionPatterns(_ raw: String) -> [String] {
+        raw
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func updateRedactionRulesConfig() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let windowPatterns = parseRedactionPatterns(redactWindowTitlePatternsRaw)
+            let urlPatterns = parseRedactionPatterns(redactBrowserURLPatternsRaw)
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: windowPatterns,
+                redactBrowserURLPatterns: urlPatterns,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                showRedactionRulesUpdateFeedback()
+                Log.info(
+                    "[SettingsView] Updated redaction rules: windowPatterns=\(windowPatterns.count), urlPatterns=\(urlPatterns.count)",
+                    category: .ui
+                )
+            } catch {
+                Log.error("[SettingsView] Failed to update redaction rules: \(error)", category: .ui)
+            }
+        }
+    }
+
+    private func showRedactionRulesUpdateFeedback() {
+        redactionRulesUpdateMessage = "Updated"
+        Task {
+            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
+            await MainActor.run {
+                redactionRulesUpdateMessage = nil
             }
         }
     }
@@ -6000,6 +6142,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
                 captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
@@ -6031,6 +6175,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
                 captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 
@@ -6063,6 +6209,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
                 captureOnWindowChange: captureOnWindowChange
             )
 
@@ -6171,6 +6319,8 @@ extension SettingsView {
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
                 captureOnWindowChange: SettingsDefaults.captureOnWindowChange
             )
 
@@ -6197,6 +6347,8 @@ extension SettingsView {
     func resetPrivacySettings() {
         excludedAppsString = SettingsDefaults.excludedApps
         excludePrivateWindows = SettingsDefaults.excludePrivateWindows
+        redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
+        redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
         excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
         excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
 
@@ -6214,6 +6366,8 @@ extension SettingsView {
                 excludePrivateWindows: SettingsDefaults.excludePrivateWindows,
                 customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
                 showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: [],
+                redactBrowserURLPatterns: [],
                 captureOnWindowChange: currentConfig.captureOnWindowChange
             )
 

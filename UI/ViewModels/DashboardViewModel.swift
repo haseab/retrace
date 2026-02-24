@@ -15,6 +15,8 @@ public class DashboardViewModel: ObservableObject {
 
     // Recording status
     @Published public var isRecording = false
+    @Published public var isRecordingPaused = false
+    @Published public var recordingPauseRemainingSeconds: Int?
 
     // Weekly app usage
     @Published public var weeklyAppUsage: [AppUsageData] = []
@@ -66,6 +68,8 @@ public class DashboardViewModel: ObservableObject {
     private let coordinator: AppCoordinator
     private var cancellables = Set<AnyCancellable>()
     private var refreshTimer: DispatchSourceTimer?
+    /// Prevents the 2s poll from clobbering optimistic toggle UI while start/stop is in flight.
+    private var isRecordingToggleInFlight = false
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -96,15 +100,16 @@ public class DashboardViewModel: ObservableObject {
     }
 
     private func setupAutoRefresh() {
-        // Refresh recording status and permissions every 2 seconds with leeway for power efficiency
+        // Refresh recording status and permissions every 1 second with leeway for power efficiency
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now(), repeating: 2.0, leeway: .milliseconds(500))
+        timer.schedule(deadline: .now(), repeating: 1.0, leeway: .milliseconds(250))
         timer.setEventHandler { [weak self] in
             Task { @MainActor in
                 guard let self = self else { return }
                 // Skip UI updates when window is hidden to avoid SwiftUI diffing
                 guard self.isWindowVisible else { return }
-                await self.updateRecordingStatus()
+                self.updateRecordingStatus()
+                self.updatePauseStatus()
                 await self.updateQueueStatus()
                 self.checkPermissions()
             }
@@ -113,8 +118,20 @@ public class DashboardViewModel: ObservableObject {
         refreshTimer = timer
     }
 
-    private func updateRecordingStatus() async {
-        isRecording = await coordinator.isCapturing()
+    private func updateRecordingStatus(force: Bool = false) {
+        guard force || !isRecordingToggleInFlight else { return }
+        // Read from thread-safe holder to avoid actor hops and keep UI updates responsive.
+        isRecording = coordinator.statusHolder.status.isRunning
+    }
+
+    private func updatePauseStatus() {
+        guard let menuBarManager = MenuBarManager.shared else {
+            isRecordingPaused = false
+            recordingPauseRemainingSeconds = nil
+            return
+        }
+        isRecordingPaused = menuBarManager.isPausedState
+        recordingPauseRemainingSeconds = menuBarManager.timedPauseRemainingSeconds
     }
 
     private func updateQueueStatus() async {
@@ -179,6 +196,13 @@ public class DashboardViewModel: ObservableObject {
     }
 
     public func toggleRecording(to newValue: Bool) async {
+        guard !isRecordingToggleInFlight else { return }
+        isRecordingToggleInFlight = true
+
+        if newValue {
+            MenuBarManager.shared?.cancelScheduledResume()
+        }
+
         // Update UI immediately for instant feedback
         isRecording = newValue
         MenuBarManager.shared?.updateRecordingStatus(newValue)
@@ -189,11 +213,42 @@ public class DashboardViewModel: ObservableObject {
             } else {
                 try await coordinator.stopPipeline()
             }
+            updateRecordingStatus(force: true)
         } catch {
             Log.error("[DashboardViewModel] Failed to toggle recording: \(error)", category: .ui)
             // Revert to actual state on error
-            await updateRecordingStatus()
+            updateRecordingStatus(force: true)
         }
+        MenuBarManager.shared?.updateRecordingStatus(isRecording)
+        updatePauseStatus()
+        isRecordingToggleInFlight = false
+    }
+
+    public func pauseRecording(for duration: TimeInterval?) async {
+        guard !isRecordingToggleInFlight else { return }
+        isRecordingToggleInFlight = true
+
+        // Update UI immediately for instant feedback
+        isRecording = false
+        MenuBarManager.shared?.updateRecordingStatus(false)
+
+        if let menuBarManager = MenuBarManager.shared {
+            await menuBarManager.pauseRecording(for: duration)
+            updateRecordingStatus(force: true)
+        } else {
+            // Fallback path (menu bar manager should normally always be configured)
+            do {
+                let isTimedPause = (duration ?? 0) > 0
+                try await coordinator.stopPipeline(persistState: !isTimedPause)
+            } catch {
+                Log.error("[DashboardViewModel] Failed to pause recording: \(error)", category: .ui)
+            }
+            updateRecordingStatus(force: true)
+        }
+
+        MenuBarManager.shared?.updateRecordingStatus(isRecording)
+        updatePauseStatus()
+        isRecordingToggleInFlight = false
     }
 
     public func dismissAccessibilityWarning() {
@@ -213,7 +268,8 @@ public class DashboardViewModel: ObservableObject {
         error = nil
 
         // Update recording status
-        await updateRecordingStatus()
+        updateRecordingStatus()
+        updatePauseStatus()
 
         do {
             // Calculate last 7 days date range

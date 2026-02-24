@@ -961,6 +961,7 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         let sql = """
             SELECT
@@ -971,6 +972,7 @@ public actor DataAdapter {
                 f.videoFrameIndex,
                 f.encodingStatus,
                 \(processingStatusColumn),
+                \(redactionReasonColumn),
                 s.bundleID,
                 s.windowName,
                 s.browserUrl,
@@ -1030,14 +1032,16 @@ public actor DataAdapter {
     ) throws -> [FrameWithVideoInfo] {
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
@@ -1188,11 +1192,12 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1452,11 +1457,12 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1673,11 +1679,12 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -1883,11 +1890,12 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         // CTE filters tags first (small set), then joins with frames using segmentId index
         let sql = """
             \(combinedCTE)
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2004,14 +2012,16 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2090,14 +2100,16 @@ public actor DataAdapter {
 
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
+        let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2151,9 +2163,10 @@ public actor DataAdapter {
     ) throws -> FrameWithVideoInfo? {
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
         let sql = """
-            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn),
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl,
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
@@ -2471,6 +2484,7 @@ public actor DataAdapter {
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let relevanceLimit = 50
+        let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
 
         Log.info("[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? []), windowNameFilter=\(query.filters.windowNameFilter ?? "nil"), browserUrlFilter=\(query.filters.browserUrlFilter ?? "nil")", category: .app)
 
@@ -2595,6 +2609,7 @@ public actor DataAdapter {
                 s.bundleID as app_bundle_id,
                 s.windowName as window_title,
                 s.browserUrl as browser_url,
+                \(redactionReasonColumn),
                 f.videoId as video_id,
                 f.videoFrameIndex as frame_index,
                 fts.rank
@@ -2664,9 +2679,10 @@ public actor DataAdapter {
             let appBundleID = sqlite3_column_text(statement, 4).map { String(cString: $0) }
             let windowName = sqlite3_column_text(statement, 5).map { String(cString: $0) }
             let browserUrl = sqlite3_column_text(statement, 6).map { String(cString: $0) }
-            let videoId = sqlite3_column_int64(statement, 7)
-            let frameIndex = Int(sqlite3_column_int(statement, 8))
-            let rank = sqlite3_column_double(statement, 9)
+            let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
+            let videoId = sqlite3_column_int64(statement, 8)
+            let frameIndex = Int(sqlite3_column_int(statement, 9))
+            let rank = sqlite3_column_double(statement, 10)
 
             let appName = appBundleID?.components(separatedBy: ".").last
             let timestamp = config.parseDate(from: statement, column: 2) ?? Date()
@@ -2682,6 +2698,7 @@ public actor DataAdapter {
                     appName: appName,
                     windowName: windowName,
                     browserURL: browserUrl,
+                    redactionReason: redactionReason,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: segmentId),
@@ -2708,6 +2725,7 @@ public actor DataAdapter {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
 
         // Build WHERE conditions for outer query
         var whereConditions: [String] = []
@@ -2860,7 +2878,8 @@ public actor DataAdapter {
                     f.createdAt as timestamp,
                     f.segmentId as segment_id,
                     f.videoId as video_id,
-                    f.videoFrameIndex as frame_index
+                    f.videoFrameIndex as frame_index,
+                    \(redactionReasonColumn)
                 FROM fts_matches fts
                 JOIN doc_segment ds ON fts.docid = ds.docid
                 JOIN frame f ON ds.frameId = f.id
@@ -2880,7 +2899,8 @@ public actor DataAdapter {
                     f.createdAt as timestamp,
                     f.segmentId as segment_id,
                     f.videoId as video_id,
-                    f.videoFrameIndex as frame_index
+                    f.videoFrameIndex as frame_index,
+                    \(redactionReasonColumn)
                 FROM doc_segment ds
                 JOIN frame f ON ds.frameId = f.id
                 WHERE ds.docid IN (
@@ -2927,7 +2947,7 @@ public actor DataAdapter {
         bindIndex += 1
         sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
 
-        var frameResults: [(frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int)] = []
+        var frameResults: [(frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int, redactionReason: String?)] = []
 
         let stepStartTime = Date()
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -2936,7 +2956,15 @@ public actor DataAdapter {
             let segmentId = sqlite3_column_int64(statement, 2)
             let videoId = sqlite3_column_int64(statement, 3)
             let frameIndex = Int(sqlite3_column_int(statement, 4))
-            frameResults.append((frameId: frameId, timestamp: timestamp, segmentId: segmentId, videoId: videoId, frameIndex: frameIndex))
+            let redactionReason = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+            frameResults.append((
+                frameId: frameId,
+                timestamp: timestamp,
+                segmentId: segmentId,
+                videoId: videoId,
+                frameIndex: frameIndex,
+                redactionReason: redactionReason
+            ))
         }
         let queryElapsed = Int(Date().timeIntervalSince(stepStartTime) * 1000)
         Log.info("[DataAdapter.searchAll] SQL executed in \(queryElapsed)ms, found \(frameResults.count) frames, source: \(source)", category: .app)
@@ -2970,6 +2998,7 @@ public actor DataAdapter {
                     appName: appName,
                     windowName: windowName,
                     browserURL: browserUrl,
+                    redactionReason: frame.redactionReason,
                     displayID: 0
                 ),
                 segmentID: AppSegmentID(value: frame.segmentId),
@@ -3170,20 +3199,22 @@ public actor DataAdapter {
         let encodingStatus = EncodingStatus(rawValue: encodingStatusString) ?? .pending
         let processingStatus = Int(sqlite3_column_int(statement, 6))
 
-        let bundleID = getTextOrNil(statement, 7) ?? ""
-        let windowName = getTextOrNil(statement, 8)
-        let browserUrl = getTextOrNil(statement, 9)
+        let redactionReason = getTextOrNil(statement, 7)
+        let bundleID = getTextOrNil(statement, 8) ?? ""
+        let windowName = getTextOrNil(statement, 9)
+        let browserUrl = getTextOrNil(statement, 10)
 
-        let videoPath = getTextOrNil(statement, 10)
-        let frameRate = sqlite3_column_type(statement, 11) != SQLITE_NULL ? sqlite3_column_double(statement, 11) : nil
-        let width = sqlite3_column_type(statement, 12) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 12)) : nil
-        let height = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
+        let videoPath = getTextOrNil(statement, 11)
+        let frameRate = sqlite3_column_type(statement, 12) != SQLITE_NULL ? sqlite3_column_double(statement, 12) : nil
+        let width = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
+        let height = sqlite3_column_type(statement, 14) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 14)) : nil
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
             appName: bundleID.components(separatedBy: ".").last,
             windowName: windowName,
             browserURL: browserUrl,
+            redactionReason: redactionReason,
             displayID: 0
         )
 

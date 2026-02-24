@@ -13,7 +13,13 @@ Database/
 ├── Schema.swift               # Table definitions
 ├── Migrations/
 │   ├── MigrationRunner.swift  # Run migrations in order
-│   └── V1_InitialSchema.swift # Initial schema migration
+│   ├── V1_InitialSchema.swift # Initial schema migration
+│   ├── V2_UnfinalisedVideoTracking.swift
+│   ├── V3_TagSystem.swift
+│   ├── V4_DailyMetrics.swift
+│   ├── V5_FTSUnicode61.swift
+│   ├── V6_FrameProcessedAt.swift
+│   └── V7_FrameRedactionReason.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
