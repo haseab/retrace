@@ -46,6 +46,7 @@ UI/
 │   └── SettingsViewModel.swift
 └── Tests/
     ├── TestLogger.swift                  # UI behavior + deeplink parsing tests
+    ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     └── ManualShowSearchSimulationTests.swift # Manual dev harness for showSearch deeplink simulation
 ```
 

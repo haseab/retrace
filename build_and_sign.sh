@@ -10,7 +10,6 @@ BUNDLE_ID="io.retrace.app"
 BUILD_DIR=".build/release"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 BUILD_CONFIG="release"
-BUILDINFO_FILE="UI/BuildInfo.swift"
 
 # ---------------------------------------------------------------------------
 # Parse version from project.yml (single source of truth)
@@ -30,21 +29,14 @@ fi
 # Require a clean working tree so the embedded commit hash is accurate
 # ---------------------------------------------------------------------------
 if [ -n "$(git diff --name-only HEAD 2>/dev/null)" ]; then
-    echo "⚠️  Working tree is dirty.  The build will embed the HEAD commit hash,"
-    echo "   but your uncommitted changes won't be reflected in that hash."
-    echo ""
-    echo "   Uncommitted changes:"
+    echo "INFO: Building with local uncommitted changes."
+    echo "      Build metadata will use HEAD commit (local diff is not encoded)."
+    echo "      Local changes:"
     git diff --stat
-    echo ""
-    read -p "   Continue anyway? [y/N] " answer
-    case "$answer" in
-        [yY]*) echo "   Proceeding with dirty tree..." ;;
-        *)     echo "   Aborting. Commit your changes first, then rebuild."; exit 1 ;;
-    esac
 fi
 
 # ---------------------------------------------------------------------------
-# Inject build metadata into BuildInfo.swift
+# Collect build metadata (embedded into generated Info.plist)
 # ---------------------------------------------------------------------------
 GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
@@ -52,37 +44,14 @@ GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
 # Detect fork name from the origin remote (e.g. "aculich/retrace")
-FORK_NAME=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github.com/||; s|\.git$||' || echo "")
-
-# Back up the defaults so we can restore after build
-cp "$BUILDINFO_FILE" "$BUILDINFO_FILE.bak"
-
-# SPM builds via this script are always dev builds (official releases use
-# create-release.sh which goes through xcodebuild archive).
-sed -i '' \
-    -e "s|static let version = \".*\"|static let version = \"$MARKETING_VERSION\"|" \
-    -e "s|static let buildNumber = \".*\"|static let buildNumber = \"$BUILD_NUMBER\"|" \
-    -e "s|static let gitCommit = \".*\"|static let gitCommit = \"$GIT_COMMIT\"|" \
-    -e "s|static let gitCommitFull = \".*\"|static let gitCommitFull = \"$GIT_COMMIT_FULL\"|" \
-    -e "s|static let gitBranch = \".*\"|static let gitBranch = \"$GIT_BRANCH\"|" \
-    -e "s|static let buildDate = \".*\"|static let buildDate = \"$BUILD_DATE\"|" \
-    -e "s|static let buildConfig = \".*\"|static let buildConfig = \"$BUILD_CONFIG\"|" \
-    -e "s|static let isDevBuild = .*|static let isDevBuild = true|" \
-    -e "s|static let forkName = \".*\"|static let forkName = \"$FORK_NAME\"|" \
-    "$BUILDINFO_FILE"
-
-# Ensure defaults are restored even if the build fails
-restore_buildinfo() {
-    if [ -f "$BUILDINFO_FILE.bak" ]; then
-        mv "$BUILDINFO_FILE.bak" "$BUILDINFO_FILE"
-    fi
-}
-trap restore_buildinfo EXIT
+REMOTE_URL=$(git remote get-url origin 2>/dev/null || true)
+FORK_NAME=$(printf "%s" "$REMOTE_URL" | sed -E 's#^(git@github\.com:|ssh://git@github\.com/|https://github\.com/)##; s#\.git$##')
 
 echo "🔨 Building Retrace..."
 ./scripts/check_no_nanoseconds_sleep.sh
 echo "🔨 Building Retrace v${MARKETING_VERSION} (${BUILD_CONFIG})..."
 echo "   commit: ${GIT_COMMIT} (${GIT_BRANCH})"
+./scripts/check_no_nanoseconds_sleep.sh
 swift build -c release
 
 echo "📦 Creating app bundle..."
@@ -110,6 +79,30 @@ done
 sed -e "s/\$(MARKETING_VERSION)/$MARKETING_VERSION/g" \
     -e "s/\$(CURRENT_PROJECT_VERSION)/$BUILD_NUMBER/g" \
     "UI/Info.plist" > "$APP_BUNDLE/Contents/Info.plist"
+
+set_plist_string() {
+    local key="$1"
+    local value="$2"
+    /usr/libexec/PlistBuddy -c "Set :$key \"$value\"" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :$key string \"$value\"" "$APP_BUNDLE/Contents/Info.plist"
+}
+
+set_plist_bool() {
+    local key="$1"
+    local value="$2"
+    /usr/libexec/PlistBuddy -c "Set :$key $value" "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :$key bool $value" "$APP_BUNDLE/Contents/Info.plist"
+}
+
+set_plist_string "RetraceVersion" "$MARKETING_VERSION"
+set_plist_string "RetraceBuildNumber" "$BUILD_NUMBER"
+set_plist_string "RetraceGitCommit" "$GIT_COMMIT"
+set_plist_string "RetraceGitCommitFull" "$GIT_COMMIT_FULL"
+set_plist_string "RetraceGitBranch" "$GIT_BRANCH"
+set_plist_string "RetraceBuildDate" "$BUILD_DATE"
+set_plist_string "RetraceBuildConfig" "$BUILD_CONFIG"
+set_plist_bool "RetraceIsDevBuild" "true"
+set_plist_string "RetraceForkName" "$FORK_NAME"
 
 # Create PkgInfo
 echo -n "APPL????" > "$APP_BUNDLE/Contents/PkgInfo"

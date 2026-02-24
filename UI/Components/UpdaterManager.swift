@@ -298,16 +298,19 @@ public final class UpdaterManager: NSObject, ObservableObject {
     /// Xcode build-variable placeholders (e.g. `$(MARKETING_VERSION)`).
     public var currentVersion: String {
         let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        if let raw, !raw.contains("$(") { return raw }
-        return BuildInfo.version
+        return Self.resolveBundleVersionValue(raw, fallback: BuildInfo.version)
     }
 
     /// Get the current build number.
     /// Same fallback logic as `currentVersion`.
     public var currentBuild: String {
         let raw = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        if let raw, !raw.contains("$(") { return raw }
-        return BuildInfo.buildNumber
+        return Self.resolveBundleVersionValue(raw, fallback: BuildInfo.buildNumber)
+    }
+
+    static func resolveBundleVersionValue(_ raw: String?, fallback: String) -> String {
+        guard let raw, !raw.isEmpty, !raw.contains("$(") else { return fallback }
+        return raw
     }
 
     /// Whether the dashboard "What's New" shortcut should be visible.
