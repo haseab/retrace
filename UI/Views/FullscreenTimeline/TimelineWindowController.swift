@@ -72,6 +72,14 @@ public class TimelineWindowController: NSObject {
     /// Whether the timeline is hiding to show dashboard/settings (don't auto-hide dashboard in this case)
     private var isHidingToShowDashboard = false
 
+    struct FocusRestoreTarget: Equatable {
+        let processIdentifier: pid_t
+        let bundleIdentifier: String?
+    }
+
+    /// The app that was frontmost before the timeline was shown.
+    private var focusRestoreTarget: FocusRestoreTarget?
+
     /// Callback when timeline closes
     public var onClose: (() -> Void)?
 
@@ -113,6 +121,64 @@ public class TimelineWindowController: NSObject {
     private enum TimelineScrollOrientation: String {
         case horizontal
         case vertical
+    }
+
+    nonisolated static func shouldCaptureFocusRestoreTarget(frontmostProcessID: pid_t?, currentProcessID: pid_t) -> Bool {
+        guard let frontmostProcessID else { return false }
+        return frontmostProcessID != currentProcessID
+    }
+
+    nonisolated static func shouldRestoreFocus(
+        requestedRestore: Bool,
+        isHidingToShowDashboard: Bool,
+        targetProcessID: pid_t?,
+        currentProcessID: pid_t
+    ) -> Bool {
+        guard requestedRestore, !isHidingToShowDashboard, let targetProcessID else { return false }
+        return targetProcessID != currentProcessID
+    }
+
+    private func captureFocusRestoreTarget() {
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        guard let frontmost = NSWorkspace.shared.frontmostApplication,
+              Self.shouldCaptureFocusRestoreTarget(
+                  frontmostProcessID: frontmost.processIdentifier,
+                  currentProcessID: currentProcessID
+              ) else {
+            focusRestoreTarget = nil
+            return
+        }
+
+        focusRestoreTarget = FocusRestoreTarget(
+            processIdentifier: frontmost.processIdentifier,
+            bundleIdentifier: frontmost.bundleIdentifier
+        )
+    }
+
+    private func restoreFocusIfNeeded(requestedRestore: Bool, wasHidingToShowDashboard: Bool) {
+        defer {
+            focusRestoreTarget = nil
+        }
+
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        guard Self.shouldRestoreFocus(
+            requestedRestore: requestedRestore,
+            isHidingToShowDashboard: wasHidingToShowDashboard,
+            targetProcessID: focusRestoreTarget?.processIdentifier,
+            currentProcessID: currentProcessID
+        ), let target = focusRestoreTarget else {
+            return
+        }
+
+        guard let app = NSRunningApplication(processIdentifier: target.processIdentifier),
+              !app.isTerminated else {
+            Log.debug("[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier)", category: .ui)
+            return
+        }
+
+        if !app.activate(options: [.activateIgnoringOtherApps]) {
+            Log.warning("[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")", category: .ui)
+        }
     }
 
     // MARK: - Initialization
@@ -413,6 +479,7 @@ public class TimelineWindowController: NSObject {
         let showStartTime = CFAbsoluteTimeGetCurrent()
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
+        captureFocusRestoreTarget()
 
         // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
@@ -632,7 +699,7 @@ public class TimelineWindowController: NSObject {
     }
 
     /// Hide the timeline overlay
-    public func hide() {
+    public func hide(restorePreviousFocus: Bool = true) {
         guard isVisible, let window = window, !isHiding else { return }
         isHiding = true
         liveModeCaptureTask?.cancel()
@@ -696,13 +763,14 @@ public class TimelineWindowController: NSObject {
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             Task { @MainActor in
+                let wasHidingToShowDashboard = self?.isHidingToShowDashboard == true
                 self?.isHiding = false
                 // Only hide dashboard if it wasn't the active window before timeline opened
                 // AND we're not hiding specifically to show the dashboard/settings
                 // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
                 // Also don't hide if a modal sheet (feedback form, etc.) is attached
                 if self?.dashboardWasKeyWindow != true,
-                   self?.isHidingToShowDashboard != true,
+                   !wasHidingToShowDashboard,
                    DashboardWindowController.shared.window?.attachedSheet == nil {
                     DashboardWindowController.shared.hide()
                 }
@@ -753,6 +821,10 @@ public class TimelineWindowController: NSObject {
 
                 // Post notification so menu bar can restore recording indicator
                 NotificationCenter.default.post(name: .timelineDidClose, object: nil)
+                self?.restoreFocusIfNeeded(
+                    requestedRestore: restorePreviousFocus,
+                    wasHidingToShowDashboard: wasHidingToShowDashboard
+                )
             }
         })
     }
@@ -962,7 +1034,7 @@ public class TimelineWindowController: NSObject {
     /// This prevents the dashboard from being auto-hidden when the timeline closes
     public func hideToShowDashboard() {
         isHidingToShowDashboard = true
-        hide()
+        hide(restorePreviousFocus: false)
     }
 
     /// Show the timeline and navigate to a specific date
@@ -1273,6 +1345,7 @@ public class TimelineWindowController: NSObject {
     /// Used by showWithFilter to load data before revealing
     private func prepareWindowInvisibly() {
         guard !isVisible, let coordinator = coordinator else { return }
+        captureFocusRestoreTarget()
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -2075,12 +2148,14 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        // Cmd+C to copy selected text, or copy image if no selection
+        // Cmd+C to copy selected text, otherwise copy the active image context.
         if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
             recordShortcut("cmd+c")
             if let viewModel = timelineViewModel {
                 if viewModel.hasSelection {
                     viewModel.copySelectedText()
+                } else if viewModel.isZoomRegionActive {
+                    viewModel.copyZoomedRegionImage()
                 } else {
                     copyCurrentFrameImage()
                 }
@@ -2099,7 +2174,7 @@ public class TimelineWindowController: NSObject {
         if event.charactersIgnoringModifiers == "l" && modifiers == [.command] {
             recordShortcut("cmd+l")
             if let viewModel = timelineViewModel, viewModel.openCurrentBrowserURL() {
-                hide()
+                hide(restorePreviousFocus: false)
                 return true
             }
             return false

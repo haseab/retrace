@@ -6460,35 +6460,76 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Copy the zoomed region as an image to clipboard
     public func copyZoomedRegionImage() {
-        guard let region = zoomRegion, isZoomRegionActive else { return }
+        guard let region = zoomRegion, isZoomRegionActive else {
+            Log.warning("[ZoomCopy] Ignored copy: no active zoom region", category: .ui)
+            return
+        }
 
         // Get the current frame image (either from cache or from video)
         getCurrentFrameImage { image in
-            guard let image = image else { return }
+            guard let image = image else {
+                Log.warning("[ZoomCopy] Failed: current frame image unavailable", category: .ui)
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
 
-            let imageSize = image.size
+            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                Log.warning("[ZoomCopy] Failed: could not get CGImage from frame image", category: .ui)
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
 
-            // Calculate crop rect based on zoom region (normalized 0-1 coordinates)
-            // Both zoom region and CGImage use Y=0 at top, so no flip needed
-            let cropRect = CGRect(
-                x: region.origin.x * imageSize.width,
-                y: region.origin.y * imageSize.height,
-                width: region.width * imageSize.width,
-                height: region.height * imageSize.height
+            let pixelBounds = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+
+            // Calculate crop rect based on zoom region (normalized 0-1 coordinates).
+            // Both zoom region and CGImage crop coordinates are treated in the same orientation here.
+            let rawCropRect = CGRect(
+                x: region.origin.x * CGFloat(cgImage.width),
+                y: region.origin.y * CGFloat(cgImage.height),
+                width: region.width * CGFloat(cgImage.width),
+                height: region.height * CGFloat(cgImage.height)
+            )
+            let cropRect = rawCropRect.intersection(pixelBounds).integral
+
+            guard !cropRect.isEmpty, let croppedCGImage = cgImage.cropping(to: cropRect) else {
+                Log.warning("[ZoomCopy] Failed: crop rect invalid raw=\(rawCropRect), clipped=\(cropRect), image=\(cgImage.width)x\(cgImage.height)", category: .ui)
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
+
+            let croppedImage = NSImage(
+                cgImage: croppedCGImage,
+                size: NSSize(width: croppedCGImage.width, height: croppedCGImage.height)
             )
 
-            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-                  let croppedCGImage = cgImage.cropping(to: cropRect) else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            let didWrite = pasteboard.writeObjects([croppedImage])
 
-            let croppedImage = NSImage(cgImage: croppedCGImage, size: NSSize(width: croppedCGImage.width, height: croppedCGImage.height))
+            guard didWrite else {
+                Log.warning("[ZoomCopy] Failed: pasteboard.writeObjects returned false", category: .ui)
+                self.showToast("Failed to copy image", icon: "exclamationmark.triangle.fill")
+                return
+            }
 
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([croppedImage])
+            self.showToast("Image copied")
+            DashboardViewModel.recordImageCopy(coordinator: self.coordinator, frameID: self.currentFrame?.id.value)
         }
     }
 
     /// Get the current frame as an image (handles both static images and video frames)
     private func getCurrentFrameImage(completion: @escaping (NSImage?) -> Void) {
+        // Live mode uses the latest screenshot buffer, not timeline video/currentImage.
+        if isInLiveMode {
+            if let liveScreenshot {
+                completion(liveScreenshot)
+            } else {
+                Log.warning("[ZoomCopy] Live mode active but liveScreenshot is nil", category: .ui)
+                completion(nil)
+            }
+            return
+        }
+
         // Try static image first
         if let image = currentImage {
             completion(image)
@@ -6497,6 +6538,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Fall back to extracting from video
         guard let videoInfo = currentVideoInfo else {
+            Log.warning("[ZoomCopy] No currentImage and no currentVideoInfo", category: .ui)
             completion(nil)
             return
         }
@@ -6508,6 +6550,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             if FileManager.default.fileExists(atPath: pathWithExtension) {
                 actualVideoPath = pathWithExtension
             } else {
+                Log.warning("[ZoomCopy] Video file missing at both paths: \(actualVideoPath) and \(pathWithExtension)", category: .ui)
                 completion(nil)
                 return
             }
@@ -6526,6 +6569,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 do {
                     try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
                 } catch {
+                    Log.warning("[ZoomCopy] Failed to create symlink at \(symlinkPath): \(error)", category: .ui)
                     completion(nil)
                     return
                 }
@@ -6547,6 +6591,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)
                 } else {
+                    Log.warning("[ZoomCopy] AVAssetImageGenerator returned nil image for url=\(url.path), frameIndex=\(videoInfo.frameIndex)", category: .ui)
                     completion(nil)
                 }
             }

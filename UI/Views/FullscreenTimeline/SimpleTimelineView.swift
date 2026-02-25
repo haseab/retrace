@@ -2680,6 +2680,8 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
             )
         }
 
+        // Keep cursor state in sync when node geometry changes while hovering.
+        nsView.refreshCursorForCurrentMouseLocation()
         nsView.needsDisplay = true
     }
 }
@@ -2716,8 +2718,16 @@ class ZoomedSelectionView: NSView {
     private var hasMoved = false
     private var mouseDownPoint: CGPoint = .zero
     private var trackingArea: NSTrackingArea?
+    private var isShowingIBeamCursor = false
+    private let boundingBoxPadding: CGFloat = 8.0
 
     override var acceptsFirstResponder: Bool { true }
+
+    deinit {
+        if isShowingIBeamCursor {
+            NSCursor.pop()
+        }
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -2727,6 +2737,43 @@ class ZoomedSelectionView: NSView {
         let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited]
         trackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
         addTrackingArea(trackingArea!)
+        refreshCursorForCurrentMouseLocation()
+    }
+
+    func refreshCursorForCurrentMouseLocation() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        updateCursorForLocation(location)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        updateCursorForLocation(location)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if isShowingIBeamCursor {
+            NSCursor.pop()
+            isShowingIBeamCursor = false
+        }
+    }
+
+    private func isNearAnyNode(screenPoint: CGPoint) -> Bool {
+        nodeData.contains { node in
+            node.rect.insetBy(dx: -boundingBoxPadding, dy: -boundingBoxPadding).contains(screenPoint)
+        }
+    }
+
+    private func updateCursorForLocation(_ location: CGPoint) {
+        let isNearNode = isNearAnyNode(screenPoint: location)
+
+        if isNearNode && !isShowingIBeamCursor {
+            NSCursor.iBeam.push()
+            isShowingIBeamCursor = true
+        } else if !isNearNode && isShowingIBeamCursor {
+            NSCursor.pop()
+            isShowingIBeamCursor = false
+        }
     }
 
     override func mouseDown(with event: NSEvent) {

@@ -1026,7 +1026,7 @@ struct CurrentAppBadge: View {
             if let bundleID = currentBundleID, hasOpenableURL || isCurrentFrameRedacted {
                 Button(action: {
                     if hasOpenableURL, viewModel.openCurrentBrowserURL() {
-                        TimelineWindowController.shared.hide()
+                        TimelineWindowController.shared.hide(restorePreviousFocus: false)
                     }
                 }) {
                     // Fixed-size container with trailing alignment - pill expands leftward
