@@ -150,6 +150,7 @@ public struct OnboardingView: View {
     @State private var observedSystemSettingsForeground = false
     @State private var isHoveringAppURLContinueButton = false
     @State private var automationPermissionDecisionMonitorTasksByBundleID: [String: Task<Void, Never>] = [:]
+    @State private var creatorProfileImage: NSImage? = nil
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
@@ -1526,16 +1527,15 @@ public struct OnboardingView: View {
     private var creatorHeader: some View {
         VStack(spacing: .spacingM) {
             // Profile picture centered - bundled locally (no network request needed)
-            Image("CreatorProfile")
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 80, height: 80)
-                .clipShape(Circle())
+            creatorProfileImageView(size: 80)
 
             Text("Hey, thanks for trying Retrace!")
                 .font(.retraceTitle)
                 .foregroundColor(.retracePrimary)
                 .multilineTextAlignment(.center)
+        }
+        .onAppear {
+            ensureCreatorProfileImageLoaded(reason: "creator-header-onAppear")
         }
     }
 
@@ -1550,7 +1550,7 @@ public struct OnboardingView: View {
     }
 
     private func prefetchCreatorImage() async {
-        // No-op: creator image is now bundled locally in Assets.xcassets
+        ensureCreatorProfileImageLoaded(reason: "prefetch")
     }
 
     // MARK: - Step 2: Creator Features
@@ -2034,19 +2034,18 @@ public struct OnboardingView: View {
             // Creator section
             VStack(spacing: .spacingM) {
                 // Profile picture - bundled locally
-                Image("CreatorProfile")
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 70, height: 70)
-                    .clipShape(Circle())
-                    .overlay(
-                        Circle()
-                            .stroke(Color.retraceAccent.opacity(0.3), lineWidth: 2)
-                    )
+                creatorProfileImageView(
+                    size: 70,
+                    ringColor: Color.retraceAccent.opacity(0.3),
+                    ringWidth: 2
+                )
 
                 Text("Thanks for being an early user!")
                     .font(.retraceHeadline)
                     .foregroundColor(.retracePrimary)
+            }
+            .onAppear {
+                ensureCreatorProfileImageLoaded(reason: "safety-step-onAppear")
             }
 
             // Info card
@@ -2153,6 +2152,108 @@ public struct OnboardingView: View {
 
             Spacer()
         }
+    }
+
+    @ViewBuilder
+    private func creatorProfileImageView(
+        size: CGFloat,
+        ringColor: Color = .clear,
+        ringWidth: CGFloat = 0
+    ) -> some View {
+        if let creatorProfileImage {
+            Image(nsImage: creatorProfileImage)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+                .overlay(
+                    Circle()
+                        .stroke(ringColor, lineWidth: ringWidth)
+                )
+        } else {
+            creatorPlaceholder
+                .frame(width: size, height: size)
+                .overlay(
+                    Circle()
+                        .stroke(ringColor, lineWidth: ringWidth)
+                )
+        }
+    }
+
+    private func ensureCreatorProfileImageLoaded(reason: String) {
+        guard creatorProfileImage == nil else { return }
+        creatorProfileImage = resolveCreatorProfileImage(logContext: "[OnboardingView] \(reason)")
+    }
+
+    private func resolveCreatorProfileImage(logContext: String) -> NSImage? {
+        let imageName = NSImage.Name("CreatorProfile")
+
+        if let image = NSImage(named: imageName) {
+            Log.info("\(logContext) Loaded CreatorProfile via NSImage(named:)", category: .ui)
+            return image
+        }
+
+        if let image = Bundle.main.image(forResource: imageName) {
+            Log.info("\(logContext) Loaded CreatorProfile via Bundle.main.image(forResource:)", category: .ui)
+            return image
+        }
+
+#if SWIFT_PACKAGE
+        if let image = Bundle.module.image(forResource: imageName) {
+            Log.info("\(logContext) Loaded CreatorProfile via Bundle.module.image(forResource:)", category: .ui)
+            return image
+        }
+#endif
+
+        let fileManager = FileManager.default
+        let resourcePath = Bundle.main.resourcePath ?? ""
+        let bundleCandidates: [(label: String, path: String)] = [
+            ("bundle/CreatorProfile.png", "\(resourcePath)/CreatorProfile.png"),
+            ("bundle/haseab.png", "\(resourcePath)/haseab.png"),
+            ("bundle/Assets.xcassets/CreatorProfile.imageset/haseab.png", "\(resourcePath)/Assets.xcassets/CreatorProfile.imageset/haseab.png")
+        ]
+
+        for candidate in bundleCandidates where fileManager.fileExists(atPath: candidate.path) {
+            if let image = NSImage(contentsOfFile: candidate.path) {
+                Log.warning("\(logContext) Loaded creator profile via file fallback \(candidate.label)", category: .ui)
+                return image
+            }
+        }
+
+#if SWIFT_PACKAGE
+        let moduleResourcePath = Bundle.module.resourcePath ?? ""
+        let moduleCandidates: [(label: String, path: String)] = [
+            ("module/CreatorProfile.png", "\(moduleResourcePath)/CreatorProfile.png"),
+            ("module/haseab.png", "\(moduleResourcePath)/haseab.png"),
+            ("module/Assets.xcassets/CreatorProfile.imageset/haseab.png", "\(moduleResourcePath)/Assets.xcassets/CreatorProfile.imageset/haseab.png")
+        ]
+        for candidate in moduleCandidates where fileManager.fileExists(atPath: candidate.path) {
+            if let image = NSImage(contentsOfFile: candidate.path) {
+                Log.warning("\(logContext) Loaded creator profile via SwiftPM module file fallback \(candidate.label)", category: .ui)
+                return image
+            }
+        }
+#endif
+
+        let debugWorkingTreePath = "\(fileManager.currentDirectoryPath)/UI/Assets.xcassets/CreatorProfile.imageset/haseab.png"
+        if fileManager.fileExists(atPath: debugWorkingTreePath),
+           let image = NSImage(contentsOfFile: debugWorkingTreePath) {
+            Log.warning("\(logContext) Loaded creator profile via working-tree fallback path", category: .ui)
+            return image
+        }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "nil"
+        let bundlePath = Bundle.main.bundlePath
+        let hasAssetsCar = fileManager.fileExists(atPath: "\(resourcePath)/Assets.car")
+        let candidateSummary = bundleCandidates
+            .map { "\($0.label)=\(fileManager.fileExists(atPath: $0.path) ? "exists" : "missing")" }
+            .joined(separator: ",")
+
+        Log.error(
+            "\(logContext) CreatorProfile missing. bundleID=\(bundleID), bundlePath=\(bundlePath), hasAssetsCar=\(hasAssetsCar), fileCandidates=\(candidateSummary)",
+            category: .ui
+        )
+        return nil
     }
 
     // MARK: - Screen Recording Indicator

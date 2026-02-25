@@ -66,6 +66,7 @@ public struct DashboardView: View {
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
     @State private var showSystemMonitor = false
+    @State private var showDiscordFollowup = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
     @Binding var hasLoadedInitialData: Bool
 
@@ -370,30 +371,66 @@ public struct DashboardView: View {
             }
         }
         .overlay {
-            // Milestone celebration dialog
-            if let milestone = milestoneCelebrationManager.currentMilestone {
-                ZStack {
-                    // Dimmed background
-                    Color.black.opacity(0.6)
-                        .ignoresSafeArea()
-                        .onTapGesture {
-                            // Dismiss on background tap
-                            milestoneCelebrationManager.dismissCurrentMilestone()
-                        }
+            ZStack {
+                // Milestone celebration dialog
+                if let milestone = milestoneCelebrationManager.currentMilestone {
+                    ZStack {
+                        // Dimmed background
+                        Color.black.opacity(0.6)
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                // Dismiss on background tap
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                            }
 
-                    // Celebration dialog
-                    MilestoneCelebrationView(
-                        milestone: milestone,
-                        onDismiss: {
-                            milestoneCelebrationManager.dismissCurrentMilestone()
-                        },
-                        onSupport: {
-                            milestoneCelebrationManager.openSupportLink()
-                        }
-                    )
-                    .transition(.scale.combined(with: .opacity))
+                        // Celebration dialog
+                        MilestoneCelebrationView(
+                            milestone: milestone,
+                            onDismiss: {
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                            },
+                            onMaybeLater: {
+                                milestoneCelebrationManager.dismissCurrentMilestone()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = true
+                                }
+                            },
+                            onSupport: {
+                                milestoneCelebrationManager.openSupportLink()
+                            }
+                        )
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: milestone)
                 }
-                .animation(.spring(response: 0.3, dampingFraction: 0.8), value: milestone)
+
+                if showDiscordFollowup {
+                    ZStack {
+                        Color.black.opacity(0.65)
+                            .ignoresSafeArea()
+                            .onTapGesture {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            }
+
+                        DiscordFollowupView(
+                            onJoin: {
+                                milestoneCelebrationManager.openDiscordLink()
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            },
+                            onMaybeLater: {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showDiscordFollowup = false
+                                }
+                            }
+                        )
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showDiscordFollowup)
+                }
             }
         }
     }

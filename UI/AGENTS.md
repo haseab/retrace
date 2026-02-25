@@ -8,6 +8,9 @@ You are the **UI** agent responsible for building the SwiftUI interface for Retr
 
 ```
 UI/
+├── Assets.xcassets/
+│   ├── AppIcon.appiconset/             # App icon assets
+│   └── CreatorProfile.imageset/        # Creator profile image shown in onboarding/milestones
 ├── Views/
 │   ├── Timeline/
 │   │   ├── TimelineView.swift           # Main timeline scrubber

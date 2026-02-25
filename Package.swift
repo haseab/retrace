@@ -230,7 +230,12 @@ let package = Package(
             exclude: [
                 "Tests",
                 "README.md",
-                "AGENTS.md"
+                "AGENTS.md",
+                "Info.plist",
+                "Retrace.entitlements"
+            ],
+            resources: [
+                .process("Assets.xcassets")
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),

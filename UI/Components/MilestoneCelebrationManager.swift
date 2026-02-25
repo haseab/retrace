@@ -97,7 +97,7 @@ public class MilestoneCelebrationManager: ObservableObject {
                 return """
                 100 hours of screen time captured! I'm happy that you've made Retrace part of your daily workflow.
 
-                Your continued use motivates me to keep improving Retrace and adding new features.
+                I really tried to make this product as useful as possible, and it's great it being put to use.
 
                 I'd be grateful for even a small contribution to help keep this project alive and growing!
                 """
@@ -106,16 +106,16 @@ public class MilestoneCelebrationManager: ObservableObject {
                 return """
                 ONE THOUSAND HOURS. You're officially a power user. The fact that Retrace has been running alongside you for this long is honestly really cool.
 
-                Building this has been a labor of love, and every user who sticks around this long means a lot.
+                I know how important it was for me to have something like this, so I'm glad it's been useful for you.
 
-                If Retrace has earned a place in your toolkit, I'd be incredibly grateful for any support ❤️
+                If Retrace has been an active part of your workflow, I'd be incredibly grateful for any support ❤️
                 """
 
             case .tenThousandHours:
                 return """
                 I don't even know what to say. TEN THOUSAND HOURS. That means you've used this product for about 3 years or more. You've achieved screen mastery 👑
 
-                Now that we've been acquainted for 3 years, please dm me on twitter. I wanna know your name. I wanna chat about what got into you to want to use this product for 3+ years.
+                Now that we've been acquainted for 3 years, please dm me. I wanna know your name. I wanna chat about what got into you to want to use this product for 3+ years.
 
                 You dropped your crown, king 🫴👑
                 """
@@ -361,6 +361,12 @@ public class MilestoneCelebrationManager: ObservableObject {
         if let url = URL(string: urlString) {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Open the Discord community invite link
+    public func openDiscordLink() {
+        guard let url = URL(string: "https://dub.sh/retrace-discord") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Cleanup
