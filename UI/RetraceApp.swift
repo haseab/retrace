@@ -210,6 +210,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Setup power settings change observer
             setupPowerSettingsObserver()
+            ProcessCPUMonitor.shared.start()
 
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
 
@@ -1072,6 +1073,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.lowPowerModeObserver = nil
         }
         DistributedNotificationCenter.default().removeObserver(self)
+        ProcessCPUMonitor.shared.stop()
 
         Log.info("[AppDelegate] Application terminating", category: .app)
     }

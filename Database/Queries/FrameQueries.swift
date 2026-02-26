@@ -860,7 +860,10 @@ enum FrameQueries {
         // Parse metadata from segment (columns 8-9: s.bundleID, s.windowName)
         let appBundleID = getTextOrNil(statement, 8)
         let windowName = getTextOrNil(statement, 9)
-        Log.debug("[FrameQueries]   metadata: bundleID=\(appBundleID ?? "nil"), windowName=\(windowName ?? "nil")", category: .database)
+        Log.debug(
+            "[FrameQueries]   metadata present: bundleID=\(appBundleID != nil), windowName=\(windowName != nil)",
+            category: .database
+        )
 
         let metadata = FrameMetadata(
             appBundleID: appBundleID,

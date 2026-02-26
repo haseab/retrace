@@ -6,6 +6,7 @@ import Carbon.HIToolbox
 import ScreenCaptureKit
 import SQLCipher
 import ServiceManagement
+import Darwin
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -262,6 +263,8 @@ public struct SettingsView: View {
     @State private var currentPowerSource: PowerStateMonitor.PowerSource = .unknown
     @State private var isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
     @State private var pendingOCRFrameCount: Int = 0
+    @ObservedObject private var processCPUMonitor = ProcessCPUMonitor.shared
+    @StateObject private var appMetadataCache = AppMetadataCache.shared
 
     // MARK: Tag Management
     @State private var tagsForSettings: [Tag] = []
@@ -2566,6 +2569,10 @@ public struct SettingsView: View {
                     }
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
+
+                Text("Note: Window redaction does not currently work in Firefox.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary.opacity(0.85))
             }
             .onChange(of: redactWindowTitlePatternsRaw) { _ in
                 updateRedactionRulesConfig()
@@ -2640,13 +2647,12 @@ public struct SettingsView: View {
                 .id(Self.powerOCRCardAnchorID)
             ocrProcessingCard
 
-            if ocrEnabled {
-                Color.clear
-                    .frame(height: 0)
-                    .id(Self.powerOCRPriorityAnchorID)
-                powerEfficiencyCard
-                appFilterCard
-            }
+            appFilterCard
+
+            Color.clear
+                .frame(height: 0)
+                .id(Self.powerOCRPriorityAnchorID)
+            powerEfficiencyCard
 
             // Tips card (informational)
             powerTipsCard
@@ -2654,12 +2660,16 @@ public struct SettingsView: View {
         .onAppear {
             updatePowerSourceStatus()
             loadOCRFilteredApps()
+            processCPUMonitor.setPowerSettingsVisible(true)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PowerSourceDidChange"))) { _ in
             updatePowerSourceStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name.NSProcessInfoPowerStateDidChange)) { _ in
             updatePowerSourceStatus()
+        }
+        .onDisappear {
+            processCPUMonitor.setPowerSettingsVisible(false)
         }
     }
 
@@ -2909,6 +2919,11 @@ public struct SettingsView: View {
                                 .buttonStyle(.plain)
                             }
                         }
+
+                        Divider()
+                            .background(Color.white.opacity(0.08))
+
+                        liveCPUComparisonSection
                     }
         }
     }
@@ -3035,6 +3050,286 @@ public struct SettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.yellow.opacity(0.08))
         .cornerRadius(10)
+    }
+
+    @ViewBuilder
+    private var liveCPUComparisonSection: some View {
+        let snapshot = processCPUMonitor.snapshot
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Text("Cumulative CPU (from log, last 24h)")
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+
+                Button("Restart") {
+                    processCPUMonitor.resetSampler()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(0.9))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.06))
+                .cornerRadius(6)
+                .help("Clear CPU sampler history and restart baseline collection")
+            }
+
+            Text("Activity Monitor %CPU is one-core scale. Total Share = %CPU ÷ \(max(snapshot.logicalCoreCount, 1)) cores. Running Share is relative to tracked processes.")
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary.opacity(0.85))
+
+            if snapshot.hasEnoughData {
+                Text("Sampled duration: \(formatWindowDuration(snapshot.sampleDurationSeconds)) • Total tracked CPU work: \(formatCPUSec(snapshot.totalTrackedCPUSeconds)) CPU Seconds")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.65))
+
+                VStack(spacing: 0) {
+                    HStack {
+                        Text("Top processes")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text("CPU")
+                            Text("Seconds")
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                        .frame(width: 68, alignment: .trailing)
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text("Running")
+                            Text("Share %")
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                        .frame(width: 58, alignment: .trailing)
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text("Avg CPU")
+                            Text("Usage %")
+                        }
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.retraceAccent.opacity(0.95))
+                        .frame(width: 68, alignment: .trailing)
+                        VStack(alignment: .trailing, spacing: 0) {
+                            Text("Peak CPU")
+                            Text("Usage %")
+                        }
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                        .frame(width: 100, alignment: .trailing)
+                    }
+                    .padding(.bottom, 6)
+
+                    ForEach(Array(snapshot.topProcesses.prefix(10).enumerated()), id: \.element.id) { index, row in
+                        let peakTotalSharePercent = snapshot.logicalCoreCount > 0
+                            ? ((snapshot.peakPercentByGroup[row.id] ?? 0) / Double(snapshot.logicalCoreCount))
+                            : 0
+
+                        HStack(spacing: 8) {
+                            Text("\(index + 1).")
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.retraceSecondary.opacity(0.75))
+                                .lineLimit(1)
+                                .frame(width: 26, alignment: .leading)
+
+                            processIconView(for: row)
+                                .frame(width: 16, height: 16)
+
+                            Text(row.name)
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundColor(.retracePrimary)
+                                .lineLimit(1)
+
+                            Spacer(minLength: 4)
+
+                            Text(formatCPUSec(row.cpuSeconds))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.retracePrimary)
+                                .frame(width: 68, alignment: .trailing)
+
+                            Text(formatCPUPercent(row.shareOfTrackedPercent))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.retraceSecondary.opacity(0.95))
+                                .frame(width: 58, alignment: .trailing)
+
+                            Text(formatCPUPercent(row.capacityPercent))
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.retraceAccent.opacity(0.95))
+                                .frame(width: 68, alignment: .trailing)
+
+                            Text(formatCPUPercent(peakTotalSharePercent))
+                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                .foregroundColor(.retraceSecondary.opacity(0.95))
+                                .frame(width: 100, alignment: .trailing)
+                        }
+                        .padding(.vertical, 3)
+
+                        if index < min(snapshot.topProcesses.count, 10) - 1 {
+                            Divider()
+                                .background(Color.white.opacity(0.06))
+                        }
+                    }
+                }
+                .padding(10)
+                .background(Color.black.opacity(0.18))
+                .cornerRadius(8)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Legend")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.75))
+                    Text("CPU Seconds: Total CPU work accumulated by the process during sampled time.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.8))
+                    Text("Running Share %: Process share of total tracked CPU work in this table.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.8))
+                    Text("Avg CPU Usage %: Process share of total machine CPU capacity (all cores), averaged over sampled time.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.8))
+                    Text("Peak CPU Usage %: Highest sampled instant share of total machine CPU capacity (all cores).")
+                        .font(.system(size: 10))
+                        .foregroundColor(.retraceSecondary.opacity(0.8))
+                }
+                .padding(.top, 2)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Collecting process CPU baseline...")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(10)
+    }
+
+    private func retraceRankComparisonText(for snapshot: ProcessCPUSnapshot) -> String? {
+        guard let retraceGroupKey = snapshot.retraceGroupKey else { return nil }
+        guard let retraceIndex = snapshot.topProcesses.firstIndex(where: { $0.id == retraceGroupKey }) else { return nil }
+
+        let retraceRow = snapshot.topProcesses[retraceIndex]
+        guard retraceRow.cpuSeconds > 0.001 else { return nil }
+
+        if retraceIndex == 0 {
+            guard snapshot.topProcesses.count > 1 else { return nil }
+            let secondRow = snapshot.topProcesses[1]
+            guard secondRow.cpuSeconds > 0.001 else { return nil }
+
+            let ratio = retraceRow.cpuSeconds / secondRow.cpuSeconds
+            return "Retrace used \(formatCPUSec(retraceRow.cpuSeconds)) CPU Seconds vs #2 \(secondRow.name) \(formatCPUSec(secondRow.cpuSeconds)) CPU Seconds (\(String(format: "%.1fx", ratio)) higher for Retrace)."
+        }
+
+        let topRow = snapshot.topProcesses[0]
+        guard topRow.cpuSeconds > 0.001 else { return nil }
+
+        let ratio = topRow.cpuSeconds / retraceRow.cpuSeconds
+        return "Retrace used \(formatCPUSec(retraceRow.cpuSeconds)) CPU Seconds vs #1 \(topRow.name) \(formatCPUSec(topRow.cpuSeconds)) CPU Seconds (\(String(format: "%.1fx", ratio)) lower for Retrace)."
+    }
+
+    private func formatCPUSec(_ seconds: Double) -> String {
+        if seconds >= 100 {
+            return String(format: "%.0f", seconds)
+        }
+        return String(format: "%.1f", seconds)
+    }
+
+    private func formatCPUPercent(_ percent: Double) -> String {
+        String(format: "%.1f%%", percent)
+    }
+
+    @ViewBuilder
+    private func processIconView(for row: ProcessCPURow) -> some View {
+        Group {
+            if let icon = cachedProcessIcon(for: row) {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+            } else {
+                Image(systemName: "app.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.retraceSecondary.opacity(0.75))
+            }
+        }
+        .onAppear {
+            requestProcessIconIfNeeded(for: row)
+        }
+    }
+
+    private func cachedProcessIcon(for row: ProcessCPURow) -> NSImage? {
+        if row.id == "app:retrace" {
+            return appMetadataCache.icon(forAppPath: preferredRetraceIconAppPath())
+        }
+
+        if let appPath = processAppPath(from: row.id),
+           let icon = appMetadataCache.icon(forAppPath: appPath) {
+            return icon
+        }
+
+        if let bundleID = processBundleID(for: row),
+           let icon = appMetadataCache.icon(for: bundleID) {
+            return icon
+        }
+
+        return nil
+    }
+
+    private func requestProcessIconIfNeeded(for row: ProcessCPURow) {
+        if row.id == "app:retrace" {
+            appMetadataCache.requestIcon(forAppPath: preferredRetraceIconAppPath())
+            return
+        }
+
+        if let appPath = processAppPath(from: row.id) {
+            appMetadataCache.requestIcon(forAppPath: appPath)
+            return
+        }
+
+        if let bundleID = processBundleID(for: row) {
+            appMetadataCache.requestMetadata(for: bundleID)
+        }
+    }
+
+    private func processBundleID(for row: ProcessCPURow) -> String? {
+        if row.id == "app:google-chrome" || row.name == "Google Chrome" {
+            return "com.google.Chrome"
+        }
+        return nil
+    }
+
+    private func processAppPath(from processGroupID: String) -> String? {
+        guard processGroupID.hasPrefix("app:") else { return nil }
+        let rawValue = String(processGroupID.dropFirst(4))
+        guard rawValue.contains("/"), rawValue.hasSuffix(".app") else { return nil }
+        return rawValue
+    }
+
+    private func preferredRetraceIconAppPath() -> String {
+        let installedPath = "/Applications/Retrace.app"
+        if FileManager.default.fileExists(atPath: installedPath) {
+            return installedPath
+        }
+        return Bundle.main.bundlePath
+    }
+
+    private func formatWindowDuration(_ seconds: TimeInterval) -> String {
+        let clamped = max(0, Int(seconds.rounded()))
+        let minutes = clamped / 60
+        let remainingSeconds = clamped % 60
+        if minutes == 0 {
+            return "\(remainingSeconds)s"
+        }
+        if remainingSeconds == 0 {
+            return "\(minutes)m"
+        }
+        return "\(minutes)m \(remainingSeconds)s"
     }
 
     private var processingLevelDisplayText: String {
@@ -6813,6 +7108,619 @@ private struct DatabaseSchemaView: View {
         .frame(width: 600, height: 500)
         .background(Color.retraceBackground)
         .cornerRadius(12)
+    }
+}
+
+struct ProcessCPURow: Identifiable {
+    let id: String
+    let name: String
+    let cpuSeconds: Double
+    let shareOfTrackedPercent: Double
+    let capacityPercent: Double
+    let averagePercent: Double
+}
+
+struct ProcessCPUSnapshot {
+    static let empty = ProcessCPUSnapshot(
+        sampleDurationSeconds: 0,
+        peakInstantPercent: 0,
+        peakCapacityPercent: 0,
+        averagePercent: 0,
+        capacityPercent: 0,
+        trackedSharePercent: 0,
+        logicalCoreCount: 0,
+        retraceCPUSeconds: 0,
+        chromeCPUSeconds: 0,
+        totalTrackedCPUSeconds: 0,
+        retraceRank: nil,
+        retraceGroupKey: nil,
+        chromeGroupKeys: [],
+        peakPercentByGroup: [:],
+        topProcesses: []
+    )
+
+    let sampleDurationSeconds: TimeInterval
+    let peakInstantPercent: Double
+    let peakCapacityPercent: Double
+    let averagePercent: Double
+    let capacityPercent: Double
+    let trackedSharePercent: Double
+    let logicalCoreCount: Int
+    let retraceCPUSeconds: Double
+    let chromeCPUSeconds: Double
+    let totalTrackedCPUSeconds: Double
+    let retraceRank: Int?
+    let retraceGroupKey: String?
+    let chromeGroupKeys: Set<String>
+    let peakPercentByGroup: [String: Double]
+    let topProcesses: [ProcessCPURow]
+
+    var hasEnoughData: Bool {
+        sampleDurationSeconds >= 5 && !topProcesses.isEmpty
+    }
+}
+
+final class ProcessCPUMonitor: ObservableObject {
+    static let shared = ProcessCPUMonitor()
+
+    @Published private(set) var snapshot = ProcessCPUSnapshot.empty
+
+    private var samplingTask: Task<Void, Never>?
+    private let sampler = ProcessCPULogSampler()
+    private var sampleIntervalSeconds: TimeInterval = 5
+    private var isPowerSettingsVisible = false
+
+    private static let fastPollingInterval: TimeInterval = 1
+    private static let slowPollingInterval: TimeInterval = 5
+    private static let batteryPollingInterval: TimeInterval = 10
+    private static let snapshotWindowDuration: TimeInterval = 24 * 60 * 60
+
+    private init() {}
+
+    func start() {
+        guard samplingTask == nil else { return }
+        restartSamplingLoop()
+    }
+
+    func setPowerSettingsVisible(_ isVisible: Bool) {
+        isPowerSettingsVisible = isVisible
+        let desiredInterval = preferredSamplingInterval()
+        if samplingTask == nil {
+            sampleIntervalSeconds = desiredInterval
+            restartSamplingLoop()
+            return
+        }
+
+        guard sampleIntervalSeconds != desiredInterval else { return }
+        sampleIntervalSeconds = desiredInterval
+        restartSamplingLoop()
+    }
+
+    private func preferredSamplingInterval() -> TimeInterval {
+        if isPowerSettingsVisible {
+            return Self.fastPollingInterval
+        }
+
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return Self.batteryPollingInterval
+        }
+
+        let powerSource = PowerStateMonitor.shared.getCurrentPowerSource()
+        if powerSource == .battery {
+            return Self.batteryPollingInterval
+        }
+
+        return Self.slowPollingInterval
+    }
+
+    private func restartSamplingLoop() {
+        samplingTask?.cancel()
+        let initialInterval = max(1, sampleIntervalSeconds)
+
+        samplingTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await runSamplingLoop(initialIntervalSeconds: initialInterval)
+        }
+    }
+
+    func stop() {
+        samplingTask?.cancel()
+        samplingTask = nil
+    }
+
+    deinit {
+        samplingTask?.cancel()
+    }
+
+    private func runSamplingLoop(initialIntervalSeconds: TimeInterval) async {
+        var intervalSeconds = max(1, initialIntervalSeconds)
+
+        while !Task.isCancelled {
+            let nextSnapshot = await sampler.sampleAndLoadSnapshot(
+                windowDuration: Self.snapshotWindowDuration,
+                expectedIntervalSeconds: intervalSeconds
+            )
+            intervalSeconds = await MainActor.run {
+                self.snapshot = nextSnapshot
+                self.sampleIntervalSeconds = self.preferredSamplingInterval()
+                return max(1, self.sampleIntervalSeconds)
+            }
+
+            let sleepNanoseconds = Int64(intervalSeconds * 1_000_000_000)
+            do {
+                try await Task.sleep(for: .nanoseconds(sleepNanoseconds), clock: .continuous)
+            } catch {
+                break
+            }
+        }
+    }
+
+    func resetSampler() {
+        Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let intervalSeconds = max(1, self.sampleIntervalSeconds)
+            let refreshedSnapshot = await self.sampler.resetAndLoadSnapshot(
+                windowDuration: Self.snapshotWindowDuration,
+                expectedIntervalSeconds: intervalSeconds
+            )
+            await MainActor.run {
+                self.snapshot = refreshedSnapshot
+            }
+        }
+    }
+}
+
+private actor ProcessCPULogSampler {
+    private struct ProcessIdentity {
+        let key: String
+        let name: String
+        let isChrome: Bool
+    }
+
+    private struct CPULogEntry: Codable {
+        let timestamp: TimeInterval
+        let durationSeconds: TimeInterval
+        let retraceGroupKey: String?
+        let chromeGroupKeys: [String]
+        let groupDeltaNanoseconds: [String: UInt64]
+        let groupDeltaUnit: String?
+        let groupDisplayNames: [String: String]
+    }
+
+    private static let logRetentionDuration: TimeInterval = 7 * 24 * 60 * 60
+    private static let logCompactionInterval: TimeInterval = 12 * 60 * 60
+    private static let nanosecondUnit = "ns"
+    private static let machTimebaseInfo: mach_timebase_info_data_t = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        if info.denom == 0 {
+            info.denom = 1
+        }
+        return info
+    }()
+
+    private let retracePID: pid_t = getpid()
+    private var lastSampleDate: Date?
+    private var lastCPUByPID: [pid_t: UInt64] = [:]
+    private var identityByPID: [pid_t: ProcessIdentity] = [:]
+    private var groupDisplayNameByKey: [String: String] = [:]
+    private var chromeGroupKeys: Set<String> = []
+    private var retraceGroupKey: String?
+    private var lastCompactionDate: Date?
+    private let logFileURL: URL
+    private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
+
+    init() {
+        logFileURL = Self.makeLogFileURL()
+        Self.ensureLogFileExists(at: logFileURL)
+    }
+
+    func sampleAndLoadSnapshot(
+        windowDuration: TimeInterval,
+        expectedIntervalSeconds: TimeInterval
+    ) -> ProcessCPUSnapshot {
+        let now = Date()
+        captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        maybeCompactLog(at: now)
+        return snapshotFromLog(windowDuration: windowDuration, now: now)
+    }
+
+    func resetAndLoadSnapshot(
+        windowDuration: TimeInterval,
+        expectedIntervalSeconds: TimeInterval
+    ) -> ProcessCPUSnapshot {
+        clearLogAndState()
+        let now = Date()
+        captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        return snapshotFromLog(windowDuration: windowDuration, now: now)
+    }
+
+    private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) {
+        let allPIDs = Self.listAllProcessIDs()
+
+        var currentCPUByPID: [pid_t: UInt64] = [:]
+        var currentIdentityByPID: [pid_t: ProcessIdentity] = [:]
+
+        for pid in allPIDs {
+            guard let cpuTime = Self.processCPUTimeAbsoluteUnits(for: pid) else { continue }
+            guard let identity = identityByPID[pid] ?? Self.resolveIdentity(for: pid, retracePID: retracePID) else { continue }
+
+            currentCPUByPID[pid] = cpuTime
+            currentIdentityByPID[pid] = identity
+            groupDisplayNameByKey[identity.key] = identity.name
+            if identity.isChrome {
+                chromeGroupKeys.insert(identity.key)
+            }
+            if pid == retracePID {
+                retraceGroupKey = identity.key
+            }
+        }
+
+        if let lastSampleDate {
+            let duration = now.timeIntervalSince(lastSampleDate)
+            let maxAcceptedSampleGap = max(1, expectedIntervalSeconds) * 2.0
+            if duration > 0, duration <= maxAcceptedSampleGap {
+                var groupDeltaNanoseconds: [String: UInt64] = [:]
+
+                for (pid, currentCPU) in currentCPUByPID {
+                    guard let previousCPU = lastCPUByPID[pid], currentCPU >= previousCPU else { continue }
+                    guard let identity = currentIdentityByPID[pid] else { continue }
+
+                    let deltaAbsoluteUnits = currentCPU - previousCPU
+                    if deltaAbsoluteUnits > 0 {
+                        let deltaNanoseconds = Self.absoluteTimeToNanoseconds(deltaAbsoluteUnits)
+                        groupDeltaNanoseconds[identity.key, default: 0] += deltaNanoseconds
+                    }
+                }
+
+                if !groupDeltaNanoseconds.isEmpty {
+                    var groupNamesForEntry: [String: String] = [:]
+                    for key in groupDeltaNanoseconds.keys {
+                        groupNamesForEntry[key] = groupDisplayNameByKey[key] ?? key
+                    }
+
+                    let currentChromeKeys = Set(currentIdentityByPID.values.filter(\.isChrome).map(\.key))
+                    let entry = CPULogEntry(
+                        timestamp: now.timeIntervalSince1970,
+                        durationSeconds: duration,
+                        retraceGroupKey: retraceGroupKey,
+                        chromeGroupKeys: Array(currentChromeKeys),
+                        groupDeltaNanoseconds: groupDeltaNanoseconds,
+                        groupDeltaUnit: Self.nanosecondUnit,
+                        groupDisplayNames: groupNamesForEntry
+                    )
+                    appendLogEntry(entry)
+                }
+            }
+        }
+
+        lastSampleDate = now
+        lastCPUByPID = currentCPUByPID
+        identityByPID = currentIdentityByPID
+    }
+
+    private func snapshotFromLog(windowDuration: TimeInterval, now: Date) -> ProcessCPUSnapshot {
+        let entries = readLogEntries()
+        let cutoffTimestamp = now.addingTimeInterval(-windowDuration).timeIntervalSince1970
+
+        var totalDuration: TimeInterval = 0
+        var cumulativeByGroup: [String: UInt64] = [:]
+        var peakPercentByGroup: [String: Double] = [:]
+        var displayNamesByKey = groupDisplayNameByKey
+        var effectiveChromeGroupKeys = chromeGroupKeys
+        var effectiveRetraceGroupKey = retraceGroupKey
+
+        for entry in entries where entry.timestamp >= cutoffTimestamp {
+            totalDuration += entry.durationSeconds
+
+            for (key, rawDelta) in entry.groupDeltaNanoseconds {
+                let delta = Self.normalizedDeltaNanoseconds(rawDelta: rawDelta, unit: entry.groupDeltaUnit)
+                cumulativeByGroup[key, default: 0] += delta
+            }
+
+            for (key, name) in entry.groupDisplayNames where displayNamesByKey[key] == nil {
+                displayNamesByKey[key] = name
+            }
+
+            effectiveChromeGroupKeys.formUnion(entry.chromeGroupKeys)
+            if effectiveRetraceGroupKey == nil {
+                effectiveRetraceGroupKey = entry.retraceGroupKey
+            }
+
+            guard entry.durationSeconds > 0 else { continue }
+            for (key, rawDelta) in entry.groupDeltaNanoseconds {
+                let delta = Self.normalizedDeltaNanoseconds(rawDelta: rawDelta, unit: entry.groupDeltaUnit)
+                let instantPercent = (Double(delta) / 1_000_000_000.0) / entry.durationSeconds * 100.0
+                if instantPercent > (peakPercentByGroup[key] ?? 0) {
+                    peakPercentByGroup[key] = instantPercent
+                }
+            }
+        }
+
+        let retraceNanoseconds = effectiveRetraceGroupKey.flatMap { cumulativeByGroup[$0] } ?? 0
+        let retraceCPUSeconds = Double(retraceNanoseconds) / 1_000_000_000.0
+        let totalTrackedNanoseconds = cumulativeByGroup.values.reduce(UInt64(0), +)
+        let totalTrackedCPUSeconds = Double(totalTrackedNanoseconds) / 1_000_000_000.0
+        let logicalCoreCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        let capacityDenominatorSeconds = totalDuration * Double(logicalCoreCount)
+
+        let retracePeakCorePercent = effectiveRetraceGroupKey.flatMap { peakPercentByGroup[$0] } ?? 0
+        let retracePeakCapacityPercent = retracePeakCorePercent / Double(logicalCoreCount)
+        let averageRetracePercent = totalDuration > 0
+            ? (retraceCPUSeconds / totalDuration) * 100.0
+            : 0
+        let retraceCapacityPercent = capacityDenominatorSeconds > 0
+            ? (retraceCPUSeconds / capacityDenominatorSeconds) * 100.0
+            : 0
+        let retraceTrackedSharePercent = totalTrackedCPUSeconds > 0
+            ? (retraceCPUSeconds / totalTrackedCPUSeconds) * 100.0
+            : 0
+
+        let chromeNanoseconds = effectiveChromeGroupKeys.reduce(UInt64(0)) { partialResult, key in
+            partialResult + (cumulativeByGroup[key] ?? 0)
+        }
+        let chromeCPUSeconds = Double(chromeNanoseconds) / 1_000_000_000.0
+
+        let rankedProcesses = cumulativeByGroup.map { key, nanoseconds -> ProcessCPURow in
+            let seconds = Double(nanoseconds) / 1_000_000_000.0
+            let shareOfTrackedPercent = totalTrackedCPUSeconds > 0
+                ? (seconds / totalTrackedCPUSeconds) * 100.0
+                : 0
+            let capacityPercent = capacityDenominatorSeconds > 0
+                ? (seconds / capacityDenominatorSeconds) * 100.0
+                : 0
+            let averagePercent = totalDuration > 0 ? (seconds / totalDuration) * 100.0 : 0
+            let name = displayNamesByKey[key] ?? key
+            return ProcessCPURow(
+                id: key,
+                name: name,
+                cpuSeconds: seconds,
+                shareOfTrackedPercent: shareOfTrackedPercent,
+                capacityPercent: capacityPercent,
+                averagePercent: averagePercent
+            )
+        }
+        .sorted { $0.cpuSeconds > $1.cpuSeconds }
+
+        let retraceRank = effectiveRetraceGroupKey.flatMap { key in
+            rankedProcesses.firstIndex(where: { $0.id == key }).map { $0 + 1 }
+        }
+
+        return ProcessCPUSnapshot(
+            sampleDurationSeconds: totalDuration,
+            peakInstantPercent: retracePeakCorePercent,
+            peakCapacityPercent: retracePeakCapacityPercent,
+            averagePercent: averageRetracePercent,
+            capacityPercent: retraceCapacityPercent,
+            trackedSharePercent: retraceTrackedSharePercent,
+            logicalCoreCount: logicalCoreCount,
+            retraceCPUSeconds: retraceCPUSeconds,
+            chromeCPUSeconds: chromeCPUSeconds,
+            totalTrackedCPUSeconds: totalTrackedCPUSeconds,
+            retraceRank: retraceRank,
+            retraceGroupKey: effectiveRetraceGroupKey,
+            chromeGroupKeys: effectiveChromeGroupKeys,
+            peakPercentByGroup: peakPercentByGroup,
+            topProcesses: rankedProcesses
+        )
+    }
+
+    private func maybeCompactLog(at now: Date) {
+        if let lastCompactionDate, now.timeIntervalSince(lastCompactionDate) < Self.logCompactionInterval {
+            return
+        }
+
+        let retentionCutoff = now.addingTimeInterval(-Self.logRetentionDuration).timeIntervalSince1970
+        let retainedEntries = readLogEntries().filter { $0.timestamp >= retentionCutoff }
+        rewriteLog(with: retainedEntries)
+        lastCompactionDate = now
+    }
+
+    private func appendLogEntry(_ entry: CPULogEntry) {
+        do {
+            Self.ensureLogFileExists(at: logFileURL)
+            let encodedEntry = try encoder.encode(entry)
+            let handle = try FileHandle(forWritingTo: logFileURL)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: encodedEntry)
+            try handle.write(contentsOf: Data([0x0A]))
+        } catch {
+            Log.warning("[SettingsView] Failed to append CPU usage log entry: \(error)", category: .ui)
+        }
+    }
+
+    private func readLogEntries() -> [CPULogEntry] {
+        guard FileManager.default.fileExists(atPath: logFileURL.path) else { return [] }
+
+        do {
+            let data = try Data(contentsOf: logFileURL)
+            guard !data.isEmpty else { return [] }
+            guard let content = String(data: data, encoding: .utf8) else { return [] }
+
+            var entries: [CPULogEntry] = []
+            for line in content.split(whereSeparator: \.isNewline) {
+                let lineData = Data(line.utf8)
+                if let entry = try? decoder.decode(CPULogEntry.self, from: lineData) {
+                    entries.append(entry)
+                }
+            }
+            return entries
+        } catch {
+            Log.warning("[SettingsView] Failed to read CPU usage log file: \(error)", category: .ui)
+            return []
+        }
+    }
+
+    private func rewriteLog(with entries: [CPULogEntry]) {
+        do {
+            Self.ensureLogFileExists(at: logFileURL)
+            var output = Data()
+            for entry in entries {
+                let encoded = try encoder.encode(entry)
+                output.append(encoded)
+                output.append(0x0A)
+            }
+            try output.write(to: logFileURL, options: .atomic)
+        } catch {
+            Log.warning("[SettingsView] Failed to compact CPU usage log file: \(error)", category: .ui)
+        }
+    }
+
+    private func clearLogAndState() {
+        rewriteLog(with: [])
+        lastSampleDate = nil
+        lastCPUByPID = [:]
+        identityByPID = [:]
+        groupDisplayNameByKey = [:]
+        chromeGroupKeys = []
+        retraceGroupKey = nil
+        lastCompactionDate = nil
+    }
+
+    private static func ensureLogFileExists(at fileURL: URL) {
+        let directoryURL = fileURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: fileURL.path) {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil)
+            }
+        } catch {
+            Log.warning("[SettingsView] Failed to create CPU usage log directory: \(error)", category: .ui)
+        }
+    }
+
+    private static func makeLogFileURL() -> URL {
+        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        return rootURL
+            .appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("cpu_process_usage.jsonl", isDirectory: false)
+    }
+
+    private static func listAllProcessIDs() -> [pid_t] {
+        let maxProcessCount = 8192
+        var pids = [pid_t](repeating: 0, count: maxProcessCount)
+        let byteCount = Int32(maxProcessCount * MemoryLayout<pid_t>.size)
+        let processCount = Int(proc_listallpids(&pids, byteCount))
+        guard processCount > 0 else { return [] }
+
+        return pids.prefix(processCount).filter { $0 > 0 }
+    }
+
+    private static func processCPUTimeAbsoluteUnits(for pid: pid_t) -> UInt64? {
+        var info = proc_taskinfo()
+        let size = Int32(MemoryLayout<proc_taskinfo>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            proc_pidinfo(pid, PROC_PIDTASKINFO, 0, pointer, size)
+        }
+
+        guard result == size else { return nil }
+        return info.pti_total_user + info.pti_total_system
+    }
+
+    private static func absoluteTimeToNanoseconds(_ absoluteUnits: UInt64) -> UInt64 {
+        let timebase = Self.machTimebaseInfo
+        if timebase.numer == timebase.denom {
+            return absoluteUnits
+        }
+
+        return UInt64((Double(absoluteUnits) * Double(timebase.numer)) / Double(timebase.denom))
+    }
+
+    private static func normalizedDeltaNanoseconds(rawDelta: UInt64, unit: String?) -> UInt64 {
+        if unit == Self.nanosecondUnit {
+            return rawDelta
+        }
+        // Legacy entries were stored in mach absolute-time units.
+        return absoluteTimeToNanoseconds(rawDelta)
+    }
+
+    private static func resolveIdentity(for pid: pid_t, retracePID: pid_t) -> ProcessIdentity? {
+        if pid == retracePID {
+            return ProcessIdentity(
+                key: "app:retrace",
+                name: "Retrace",
+                isChrome: false
+            )
+        }
+
+        let path = processPath(for: pid)
+        if let path, let appPath = appBundlePath(from: path) {
+            let appName = URL(fileURLWithPath: appPath).deletingPathExtension().lastPathComponent
+            if isChromeProcessName(appName) {
+                return ProcessIdentity(
+                    key: "app:google-chrome",
+                    name: "Google Chrome",
+                    isChrome: true
+                )
+            }
+
+            return ProcessIdentity(
+                key: "app:\(appPath.lowercased())",
+                name: appName,
+                isChrome: false
+            )
+        }
+
+        let executableName = processName(for: pid)
+            ?? path.map { URL(fileURLWithPath: $0).lastPathComponent }
+            ?? "pid\(pid)"
+
+        if isChromeProcessName(executableName) {
+            return ProcessIdentity(
+                key: "app:google-chrome",
+                name: "Google Chrome",
+                isChrome: true
+            )
+        }
+
+        let normalizedName = normalizedKeyComponent(executableName)
+        return ProcessIdentity(
+            key: "proc:\(normalizedName)",
+            name: executableName,
+            isChrome: executableName.localizedCaseInsensitiveContains("chrome")
+        )
+    }
+
+    private static func processPath(for pid: pid_t) -> String? {
+        let maxPathSize = Int(MAXPATHLEN * 4)
+        var buffer = [CChar](repeating: 0, count: maxPathSize)
+        let pathLength = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard pathLength > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func processName(for pid: pid_t) -> String? {
+        var nameBuffer = [CChar](repeating: 0, count: 1024)
+        let nameLength = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+        guard nameLength > 0 else { return nil }
+        return String(cString: nameBuffer)
+    }
+
+    private static func appBundlePath(from executablePath: String) -> String? {
+        guard let appMarker = executablePath.range(of: ".app/", options: .caseInsensitive) else {
+            return nil
+        }
+
+        let appEnd = executablePath.index(appMarker.lowerBound, offsetBy: 4)
+        return String(executablePath[..<appEnd])
+    }
+
+    private static func isChromeProcessName(_ name: String) -> Bool {
+        let lowercased = name.lowercased()
+        return lowercased.contains("google chrome")
+            || lowercased.contains("chrome helper")
+            || lowercased == "chrome"
+    }
+
+    private static func normalizedKeyComponent(_ value: String) -> String {
+        let pieces = value
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+
+        let normalized = pieces.joined(separator: "-")
+        return normalized.isEmpty ? "unknown" : normalized
     }
 }
 

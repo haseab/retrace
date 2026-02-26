@@ -370,12 +370,9 @@ public actor CaptureManager: CaptureProtocol {
         var totalBytes: Int64 = 0
         var totalFrames = 0
 
-        for await var frame in rawStream {
+        for await frame in rawStream {
             totalFrames += 1
             totalBytes += Int64(frame.imageData.count)
-
-            // Enrich with app metadata (if we can get it on main actor)
-            frame = await enrichFrameMetadata(frame)
 
             // Apply deduplication if enabled
             if currentConfig.adaptiveCaptureEnabled {
@@ -387,8 +384,10 @@ public actor CaptureManager: CaptureProtocol {
                 )
 
                 if shouldKeep {
+                    // Keep raw frame for future similarity checks. Metadata is not needed for dedup.
                     lastKeptFrame = frame
-                    dedupedFrameContinuation?.yield(frame)
+                    let enrichedFrame = await enrichFrameMetadata(frame)
+                    dedupedFrameContinuation?.yield(enrichedFrame)
 
                     // Update stats
                     stats = CaptureStatistics(
@@ -396,7 +395,7 @@ public actor CaptureManager: CaptureProtocol {
                         framesDeduped: stats.framesDeduped,
                         averageFrameSizeBytes: Int(totalBytes / Int64(totalFrames)),
                         captureStartTime: stats.captureStartTime,
-                        lastFrameTime: frame.timestamp
+                        lastFrameTime: enrichedFrame.timestamp
                     )
 
                     Log.verbose("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
@@ -414,14 +413,15 @@ public actor CaptureManager: CaptureProtocol {
                 }
             } else {
                 // No deduplication - pass through all frames
-                dedupedFrameContinuation?.yield(frame)
+                let enrichedFrame = await enrichFrameMetadata(frame)
+                dedupedFrameContinuation?.yield(enrichedFrame)
 
                 stats = CaptureStatistics(
                     totalFramesCaptured: totalFrames,
                     framesDeduped: 0,
                     averageFrameSizeBytes: Int(totalBytes / Int64(totalFrames)),
                     captureStartTime: stats.captureStartTime,
-                    lastFrameTime: frame.timestamp
+                    lastFrameTime: enrichedFrame.timestamp
                 )
             }
         }
