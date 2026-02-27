@@ -212,6 +212,7 @@ public actor AppCoordinator {
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
+    private static let pipelineMemoryLogInterval: TimeInterval = 5.0
 
     // MARK: - Initialization
 
@@ -849,8 +850,17 @@ public actor AppCoordinator {
 
         let frameStream = await services.capture.frameStream
         var writersByResolution: [String: VideoWriterState] = [:]
+        var lastPipelineMemoryLogAt = Date.distantPast
         let maxFramesPerSegment = 150
         let videoUpdateInterval = 5
+
+        func maybeLogPipelineMemory(reason: String) {
+            let now = Date()
+            guard now.timeIntervalSince(lastPipelineMemoryLogAt) >= Self.pipelineMemoryLogInterval else { return }
+            lastPipelineMemoryLogAt = now
+            logPipelineMemorySnapshot(writersByResolution: writersByResolution, reason: reason)
+        }
+
         for await frame in frameStream {
             Log.verbose("[Pipeline] Received frame from stream: \(frame.width)x\(frame.height), app=\(frame.metadata.appName)", category: .app)
 
@@ -1004,6 +1014,7 @@ public actor AppCoordinator {
                 }
 
                 writersByResolution[resolutionKey] = writerState
+                maybeLogPipelineMemory(reason: "steady-state")
                 totalFramesProcessed += 1
                 statusHolder.incrementFrames()
 
@@ -1034,6 +1045,8 @@ public actor AppCoordinator {
             }
         }
 
+        logPipelineMemorySnapshot(writersByResolution: writersByResolution, reason: "pipeline-ending")
+
         // Save and finalize all remaining writers
         for (resolutionKey, var writerState) in writersByResolution {
             do {
@@ -1052,6 +1065,40 @@ public actor AppCoordinator {
         }
 
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
+    }
+
+    private func logPipelineMemorySnapshot(writersByResolution: [String: VideoWriterState], reason: String) {
+        var totalPendingFrames = 0
+        var totalPendingBytes: Int64 = 0
+        var perResolutionParts: [String] = []
+
+        for (resolutionKey, writerState) in writersByResolution {
+            let pendingFrames = writerState.pendingFrames.count
+            guard pendingFrames > 0 else { continue }
+
+            let pendingBytes = writerState.pendingFrames.reduce(into: Int64(0)) { partialResult, bufferedFrame in
+                partialResult += Int64(bufferedFrame.capturedFrame.imageData.count)
+            }
+            totalPendingFrames += pendingFrames
+            totalPendingBytes += pendingBytes
+            perResolutionParts.append("\(resolutionKey):\(pendingFrames)f/\(Self.formatBytes(pendingBytes))")
+        }
+
+        let perResolutionSummary = perResolutionParts.isEmpty ? "none" : perResolutionParts.sorted().joined(separator: ", ")
+
+        Log.info(
+            "[Pipeline-Memory] reason=\(reason) pendingRawFrames=\(totalPendingFrames) pendingRawBytes=\(Self.formatBytes(totalPendingBytes)) activeWriters=\(writersByResolution.count) byResolution=[\(perResolutionSummary)]",
+            category: .app
+        )
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
     }
 
     private func createNewWriterState(width: Int, height: Int) async throws -> VideoWriterState {

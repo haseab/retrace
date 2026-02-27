@@ -35,7 +35,9 @@ UI/
 ├── Components/
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
 │   ├── SessionTimeline.swift            # App session visualization
-│   └── DeeplinkHandler.swift            # URL scheme routing
+│   ├── DeeplinkHandler.swift            # URL scheme routing
+│   ├── ProcessCPUMonitor.swift          # Shared process CPU sampler + 24h aggregation service
+│   └── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
 ├── ViewModels/
 │   ├── TimelineViewModel.swift
 │   ├── SearchViewModel.swift

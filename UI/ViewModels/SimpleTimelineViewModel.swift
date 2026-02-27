@@ -1235,6 +1235,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     deinit {
+        imageCacheMemoryLogTask?.cancel()
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
     }
@@ -1265,22 +1266,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         didSet {
             let oldCount = oldValue.count
             let newCount = imageCache.count
+            imageCacheBytes = Self.estimatedImageCacheBytes(imageCache)
             if oldCount != newCount {
                 if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug("[Memory] imageCache changed: \(oldCount) → \(newCount) images", category: .ui)
+                    Log.debug(
+                        "[Memory] imageCache changed: \(oldCount) → \(newCount) images (\(Self.formatBytes(imageCacheBytes)))",
+                        category: .ui
+                    )
                 }
             }
         }
     }
+    private var imageCacheBytes: Int64 = 0
 
     /// Maximum images to keep in cache (prevents unbounded memory growth)
     private static let maxImageCacheSize = 50
 
     /// Number of frames to preload ahead and behind current position
     private static let preloadRadius = 5
+    private static let imageCacheMemoryLogIntervalNs: UInt64 = 5_000_000_000
 
     /// Task for preloading nearby frames (cancelled when index changes rapidly)
     private var preloadTask: Task<Void, Never>?
+    private var imageCacheMemoryLogTask: Task<Void, Never>?
 
     /// Track frames currently being decoded to prevent duplicate decode operations
     private var inFlightDecodes: Set<FrameID> = []
@@ -1428,6 +1436,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Persist search overlay visibility preference
         setupSearchOverlayPersistence()
+        startImageCacheMemoryReporting()
     }
 
     /// Set up Combine observer to track when any dialog/overlay is open
@@ -1455,6 +1464,52 @@ public class SimpleTimelineViewModel: ObservableObject {
                 UserDefaults.standard.set(isVisible, forKey: "searchOverlayVisible")
             }
             .store(in: &cancellables)
+    }
+
+    private func startImageCacheMemoryReporting() {
+        imageCacheMemoryLogTask?.cancel()
+        imageCacheMemoryLogTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .nanoseconds(Int64(Self.imageCacheMemoryLogIntervalNs)), clock: .continuous)
+                guard !Task.isCancelled, let self else { break }
+                self.logImageCacheMemorySnapshot()
+            }
+        }
+    }
+
+    private func logImageCacheMemorySnapshot() {
+        Log.info(
+            "[Timeline-Memory] imageCacheCount=\(imageCache.count) imageCacheBytes=\(Self.formatBytes(imageCacheBytes)) frameWindowCount=\(frames.count)",
+            category: .ui
+        )
+    }
+
+    private static func estimatedImageCacheBytes(_ cache: [FrameID: NSImage]) -> Int64 {
+        cache.values.reduce(into: Int64(0)) { total, image in
+            total += estimatedMemoryBytes(for: image)
+        }
+    }
+
+    private static func estimatedMemoryBytes(for image: NSImage) -> Int64 {
+        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return Int64(cgImage.bytesPerRow * cgImage.height)
+        }
+        if let bitmapRep = image.representations.first(where: { $0 is NSBitmapImageRep }) as? NSBitmapImageRep {
+            return Int64(bitmapRep.bytesPerRow * bitmapRep.pixelsHigh)
+        }
+
+        let width = max(Int(image.size.width), 1)
+        let height = max(Int(image.size.height), 1)
+        return Int64(width * height * 4)
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
     }
 
     private func summarizeFiltersForLog(_ filters: FilterCriteria) -> String {

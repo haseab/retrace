@@ -67,9 +67,17 @@ public class SearchViewModel: ObservableObject {
     public var savedScrollPosition: CGFloat = 0
 
     // Thumbnail cache - persists across overlay open/close, cleared on new search
-    @Published public var thumbnailCache: [String: NSImage] = [:]
+    @Published public var thumbnailCache: [String: NSImage] = [:] {
+        didSet {
+            thumbnailCacheBytes = Self.estimatedImageBytes(thumbnailCache)
+        }
+    }
     @Published public var loadingThumbnails: Set<String> = []
-    @Published public var appIconCache: [String: NSImage] = [:]
+    @Published public var appIconCache: [String: NSImage] = [:] {
+        didSet {
+            appIconCacheBytes = Self.estimatedImageBytes(appIconCache)
+        }
+    }
 
     // Search generation counter - incremented on each new search to invalidate in-flight loads
     @Published public var searchGeneration: Int = 0
@@ -124,12 +132,16 @@ public class SearchViewModel: ObservableObject {
     // Active search tasks that can be cancelled
     private var currentSearchTask: Task<Void, Never>?
     private var currentLoadMoreTask: Task<Void, Never>?
+    private var memoryReportTask: Task<Void, Never>?
+    private var thumbnailCacheBytes: Int64 = 0
+    private var appIconCacheBytes: Int64 = 0
 
     // MARK: - Constants
 
     private let debounceDelay: TimeInterval = 0.3
     private let defaultResultLimit = 50
     private let maxSearchWords = 15  // Limit search queries to prevent performance issues
+    private let memoryReportIntervalNs: UInt64 = 5_000_000_000
 
     // MARK: - Search Results Cache (for restoring on app reopen)
 
@@ -186,6 +198,7 @@ public class SearchViewModel: ObservableObject {
     public init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
         setupBindings()
+        startMemoryReporting()
     }
 
     // MARK: - Setup
@@ -248,6 +261,54 @@ public class SearchViewModel: ObservableObject {
             }
         }
         .store(in: &cancellables)
+    }
+
+    private func startMemoryReporting() {
+        memoryReportTask?.cancel()
+        let intervalNs = Int64(memoryReportIntervalNs)
+        memoryReportTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .nanoseconds(intervalNs), clock: .continuous)
+                guard !Task.isCancelled, let self else { break }
+                self.logMemorySnapshot()
+            }
+        }
+    }
+
+    private func logMemorySnapshot() {
+        let resultCount = results?.results.count ?? 0
+        Log.info(
+            "[Search-Memory] results=\(resultCount) visibleResults=\(visibleResults.count) thumbnails=\(thumbnailCache.count)/\(Self.formatBytes(thumbnailCacheBytes)) appIcons=\(appIconCache.count)/\(Self.formatBytes(appIconCacheBytes))",
+            category: .ui
+        )
+    }
+
+    private static func estimatedImageBytes(_ images: [String: NSImage]) -> Int64 {
+        images.values.reduce(into: Int64(0)) { total, image in
+            total += estimatedMemoryBytes(for: image)
+        }
+    }
+
+    private static func estimatedMemoryBytes(for image: NSImage) -> Int64 {
+        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return Int64(cgImage.bytesPerRow * cgImage.height)
+        }
+        if let bitmapRep = image.representations.first(where: { $0 is NSBitmapImageRep }) as? NSBitmapImageRep {
+            return Int64(bitmapRep.bytesPerRow * bitmapRep.pixelsHigh)
+        }
+
+        let width = max(Int(image.size.width), 1)
+        let height = max(Int(image.size.height), 1)
+        return Int64(width * height * 4)
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
     }
 
     private func updateVisibleResults() {
@@ -1152,6 +1213,7 @@ public class SearchViewModel: ObservableObject {
         // Cancel tasks directly - deinit is not actor-isolated so we can't call cancelSearch()
         currentSearchTask?.cancel()
         currentLoadMoreTask?.cancel()
+        memoryReportTask?.cancel()
         cancellables.removeAll()
     }
 }

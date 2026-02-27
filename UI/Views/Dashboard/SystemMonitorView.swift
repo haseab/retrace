@@ -35,6 +35,7 @@ public struct SystemMonitorView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         // OCR Processing Section
                         ocrProcessingSection
+                        processCPUSummarySection
 
                         // Future sections placeholder
                         // - Data Transfers
@@ -50,7 +51,11 @@ public struct SystemMonitorView: View {
         .task {
             await viewModel.startMonitoring()
         }
+        .onAppear {
+            ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: true)
+        }
         .onDisappear {
+            ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
             viewModel.stopMonitoring()
         }
         .background(
@@ -201,23 +206,24 @@ public struct SystemMonitorView: View {
 
     private var ocrProcessingSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Section header
-            HStack {
-                Image(systemName: "text.viewfinder")
-                    .font(.retraceCallout)
-                    .foregroundColor(.retraceSecondary)
-                Text("OCR Processing")
-                    .font(.retraceCalloutBold)
-                    .foregroundColor(.retracePrimary)
-
-                Spacer()
-
-                // Status badge
-                statusBadge
-            }
-
-            // Content card
             VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "text.viewfinder")
+                        .font(.retraceCallout)
+                        .foregroundColor(.retraceSecondary)
+                    Text("OCR Processing")
+                        .font(.retraceCalloutBold)
+                        .foregroundColor(.retracePrimary)
+
+                    Spacer()
+                    statusBadge
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 14)
+
+                Divider()
+                    .background(Color.white.opacity(0.06))
+
                 // Chart area
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 6) {
@@ -484,6 +490,10 @@ public struct SystemMonitorView: View {
                     .stroke(Color.white.opacity(0.06), lineWidth: 1)
             )
         }
+    }
+
+    private var processCPUSummarySection: some View {
+        ProcessCPUSummaryCard()
     }
 
     private var statusBadge: some View {

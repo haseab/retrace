@@ -24,6 +24,7 @@ public actor FrameProcessingQueue {
     private let config: ProcessingQueueConfig
     private var workers: [Task<Void, Never>] = []
     private var isRunning = false
+    private var memoryReportTask: Task<Void, Never>?
 
     // Statistics
     private var totalProcessed: Int = 0
@@ -37,11 +38,13 @@ public actor FrameProcessingQueue {
     // Workers use cached data directly instead of extracting from video.
     // This bypasses B-frame reordering issues in fragmented MP4s.
     private var frameDataCache: [Int64: CapturedFrame] = [:]
+    private var frameDataCacheBytes: Int64 = 0
 
     // Maximum number of frames to keep in cache to prevent unbounded memory growth
     // Each CapturedFrame is ~10-30MB, so 50 frames = 500MB-1.5GB max
     // If processing falls behind, oldest frames will be evicted
     private let maxFrameDataCacheSize = 50
+    private let memoryReportIntervalNs: UInt64 = 5_000_000_000
 
     // MARK: - Power-Aware Processing Control
 
@@ -245,14 +248,20 @@ public actor FrameProcessingQueue {
                 let sortedKeys = frameDataCache.keys.sorted()
                 let keysToRemove = sortedKeys.prefix(frameDataCache.count - effectiveCacheSize + 1)
                 for key in keysToRemove {
-                    frameDataCache.removeValue(forKey: key)
+                    if let removedFrame = frameDataCache.removeValue(forKey: key) {
+                        frameDataCacheBytes -= Int64(removedFrame.imageData.count)
+                    }
                 }
                 if !isDeferredMode {
                     Log.warning("[Queue-DIAG] Frame data cache at capacity (\(effectiveCacheSize)), evicted \(keysToRemove.count) oldest frames", category: .processing)
                 }
             }
 
+            if let existingFrame = frameDataCache[frameID] {
+                frameDataCacheBytes -= Int64(existingFrame.imageData.count)
+            }
             frameDataCache[frameID] = frame
+            frameDataCacheBytes += Int64(frame.imageData.count)
             // Log.debug("[Queue-DIAG] Cached frame data for frameID \(frameID), cache size: \(frameDataCache.count)", category: .processing)
         }
 
@@ -308,6 +317,8 @@ public actor FrameProcessingQueue {
             workers.append(task)
         }
 
+        startMemoryReporting()
+
         Log.info("[Queue] Started \(workers.count) workers (priority=\(priority))", category: .processing)
     }
 
@@ -324,6 +335,8 @@ public actor FrameProcessingQueue {
         }
 
         workers.removeAll()
+        memoryReportTask?.cancel()
+        memoryReportTask = nil
 
         Log.info("[Queue] Workers stopped", category: .processing)
     }
@@ -488,7 +501,9 @@ public actor FrameProcessingQueue {
         if let cachedFrame = frameDataCache[frameID] {
             // Use cached frame data directly - guaranteed correct
             capturedFrame = cachedFrame
-            frameDataCache.removeValue(forKey: frameID)  // Clear from cache after use
+            if let removedFrame = frameDataCache.removeValue(forKey: frameID) {
+                frameDataCacheBytes -= Int64(removedFrame.imageData.count)
+            }
         } else {
             // Fallback: extract from video (used for deferred mode, reprocessOCR, or crash recovery)
             // At this point we've verified the video is finalized, so presentation order is correct
@@ -834,6 +849,40 @@ public actor FrameProcessingQueue {
             totalFailed: totalFailed,
             workerCount: workers.count
         )
+    }
+
+    // MARK: - Memory Reporting
+
+    private func startMemoryReporting() {
+        memoryReportTask?.cancel()
+        let intervalNs = Int64(memoryReportIntervalNs)
+        memoryReportTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .nanoseconds(intervalNs), clock: .continuous)
+                guard !Task.isCancelled else { break }
+                await self?.logMemorySnapshot()
+            }
+        }
+    }
+
+    private func logMemorySnapshot() {
+        let cacheFrames = frameDataCache.count
+        let cacheBytes = frameDataCacheBytes
+        let queueDepth = pendingCount + processingCount
+
+        Log.info(
+            "[Queue-Memory] rawCacheFrames=\(cacheFrames) rawCacheBytes=\(Self.formatBytes(cacheBytes)) queueDepth=\(queueDepth) pending=\(pendingCount) processing=\(processingCount) workers=\(workers.count)",
+            category: .processing
+        )
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: max(0, bytes))
     }
 }
 
