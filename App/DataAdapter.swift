@@ -1115,6 +1115,21 @@ public actor DataAdapter {
 
         // Window name filter - uses direct LIKE on segment.windowName (faster than FTS)
         let hasWindowNameFilter = filters.windowNameFilter != nil && !filters.windowNameFilter!.isEmpty
+        let hasSelectedTagFilters = filters.selectedTags != nil && !filters.selectedTags!.isEmpty
+        let hasBrowserUrlFilter = filters.browserUrlFilter != nil && !filters.browserUrlFilter!.isEmpty
+        let hasSegmentMetadataFilter = hasBrowserUrlFilter || hasWindowNameFilter
+
+        // Sparse metadata filters are often selective; use a segment-first query shape so SQLite doesn't
+        // scan the full frame table just to satisfy ORDER BY createdAt LIMIT N.
+        if hasSegmentMetadataFilter && !hasSelectedTagFilters && filters.hiddenFilter != .onlyHidden {
+            return try queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
+                limit: limit,
+                connection: connection,
+                config: config,
+                filters: filters,
+                isRewindDatabase: isRewindDatabase
+            )
+        }
 
         // Build CTE for tag filtering (filter tags first in subquery, then join to frames)
         let tagCTE: String
@@ -1331,6 +1346,138 @@ public actor DataAdapter {
         }
 
         Log.debug("[Filter] Query returned \(frames.count) frames (stepped \(stepCount) times)", category: .database)
+
+        return frames
+    }
+
+    /// Specialized most-recent query for window name/browser URL filters.
+    /// Uses a segment-first subquery to avoid scanning frame.createdAt across the full table.
+    private func queryMostRecentFramesWithSegmentMetadataFilterSegmentFirst(
+        limit: Int,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        filters: FilterCriteria,
+        isRewindDatabase: Bool
+    ) throws -> [FrameWithVideoInfo] {
+        let browserUrlPattern = filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let windowNamePattern = filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasBrowserUrlFilter = browserUrlPattern != nil && !(browserUrlPattern?.isEmpty ?? true)
+        let hasWindowNameFilter = windowNamePattern != nil && !(windowNamePattern?.isEmpty ?? true)
+        guard hasBrowserUrlFilter || hasWindowNameFilter else {
+            return []
+        }
+
+        var segmentWhereClauses: [String] = []
+        var whereClauses: [String] = []
+
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            segmentWhereClauses.append(buildAppFilterClause(apps: apps, mode: filters.appFilterMode, tableAlias: "s2"))
+        }
+
+        let urlFilter = hasBrowserUrlFilter
+            ? buildBrowserUrlFilterClause(urlPattern: browserUrlPattern!, tableAlias: "s2")
+            : nil
+        if let urlFilter {
+            segmentWhereClauses.append(urlFilter.clause)
+        }
+
+        if hasWindowNameFilter {
+            segmentWhereClauses.append("s2.windowName LIKE ?")
+        }
+
+        let segmentWhereClause = segmentWhereClauses.joined(separator: " AND ")
+        whereClauses.append("""
+            f.segmentId IN (
+                SELECT s2.id
+                FROM segment s2
+                WHERE \(segmentWhereClause)
+            )
+            """)
+
+        if filters.startDate != nil {
+            whereClauses.append("f.createdAt >= ?")
+        }
+        if filters.endDate != nil {
+            whereClauses.append("f.createdAt <= ?")
+        }
+
+        // Rewind database doesn't have segment_tag; hidden filter only applies on Retrace.
+        if !isRewindDatabase, filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
+            whereClauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_hidden
+                    WHERE st_hidden.segmentId = f.segmentId
+                    AND st_hidden.tagId = ?
+                )
+                """)
+        }
+
+        if config.source != .rewind {
+            whereClauses.append("f.processingStatus != 4")
+        }
+
+        let whereClause = whereClauses.joined(separator: " AND ")
+
+        let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
+        let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
+
+        let sql = """
+            SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
+                   s.bundleID, s.windowName, s.browserUrl,
+                   v.path, v.frameRate, v.width, v.height
+            FROM frame f
+            INNER JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON f.videoId = v.id
+            WHERE \(whereClause)
+            ORDER BY f.createdAt DESC
+            LIMIT ?
+            """
+
+        guard let statement = try? connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+
+        var bindIndex = 1
+
+        if let apps = filters.selectedApps, !apps.isEmpty {
+            for (index, app) in apps.enumerated() {
+                sqlite3_bind_text(statement, Int32(bindIndex + index), (app as NSString).utf8String, -1, nil)
+            }
+            bindIndex += apps.count
+        }
+
+        if let urlFilter {
+            sqlite3_bind_text(statement, Int32(bindIndex), (urlFilter.pattern as NSString).utf8String, -1, nil)
+            bindIndex += 1
+        }
+
+        if hasWindowNameFilter, let windowName = windowNamePattern {
+            let pattern = "%\(windowName)%"
+            sqlite3_bind_text(statement, Int32(bindIndex), (pattern as NSString).utf8String, -1, nil)
+            bindIndex += 1
+        }
+
+        if let startDate = filters.startDate {
+            config.bindDate(startDate, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+        if let endDate = filters.endDate {
+            config.bindDate(endDate, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
+        if !isRewindDatabase, filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
+            sqlite3_bind_int64(statement, Int32(bindIndex), hiddenTagId)
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
+
+        var frames: [FrameWithVideoInfo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let frameWithVideo = try? parseFrameWithVideoInfo(statement: statement, config: config) {
+                frames.append(frameWithVideo)
+            }
+        }
 
         return frames
     }

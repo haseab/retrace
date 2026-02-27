@@ -8834,26 +8834,48 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Use a bounded window to avoid expensive full-history scans.
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             let rangeEnd = oneMillisecondBefore(oldestTimestamp)
-            let rangeStart = rangeEnd.addingTimeInterval(-WindowConfig.loadWindowSpanSeconds)
-            guard let boundedFilters = makeBoundedBoundaryFilters(rangeStart: rangeStart, rangeEnd: rangeEnd) else {
+            let hasMetadataFilter = filterCriteria.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || filterCriteria.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+
+            let queryFilters: FilterCriteria
+            if hasMetadataFilter {
+                // Metadata filters can be very sparse; avoid a narrow one-day probe so we can jump large gaps.
+                var metadataFilters = filterCriteria
+                if let explicitEnd = metadataFilters.endDate {
+                    metadataFilters.endDate = min(explicitEnd, rangeEnd)
+                } else {
+                    metadataFilters.endDate = rangeEnd
+                }
+                queryFilters = metadataFilters
+                let effectiveStart = queryFilters.startDate.map { Log.timestamp(from: $0) } ?? "unbounded"
+                let effectiveEnd = queryFilters.endDate.map { Log.timestamp(from: $0) } ?? Log.timestamp(from: rangeEnd)
                 Log.info(
-                    "[BoundaryOlder] SKIP reason=\(reason) window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) no-overlap-with-filters",
+                    "[BoundaryOlder] START reason=\(reason) strategy=metadata-unbounded effectiveWindow=\(effectiveStart)->\(effectiveEnd) currentOldest=\(Log.timestamp(from: oldestTimestamp))",
                     category: .ui
                 )
-                hasMoreOlder = false
-                hasReachedAbsoluteStart = true
-                isLoadingOlder = false
-                return
+            } else {
+                let rangeStart = rangeEnd.addingTimeInterval(-WindowConfig.loadWindowSpanSeconds)
+                guard let boundedFilters = makeBoundedBoundaryFilters(rangeStart: rangeStart, rangeEnd: rangeEnd) else {
+                    Log.info(
+                        "[BoundaryOlder] SKIP reason=\(reason) window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) no-overlap-with-filters",
+                        category: .ui
+                    )
+                    hasMoreOlder = false
+                    hasReachedAbsoluteStart = true
+                    isLoadingOlder = false
+                    return
+                }
+                queryFilters = boundedFilters
+                Log.info(
+                    "[BoundaryOlder] START reason=\(reason) strategy=windowed window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) effectiveWindow=\(Log.timestamp(from: boundedFilters.startDate ?? rangeStart))->\(Log.timestamp(from: boundedFilters.endDate ?? rangeEnd)) currentOldest=\(Log.timestamp(from: oldestTimestamp))",
+                    category: .ui
+                )
             }
-            Log.info(
-                "[BoundaryOlder] START reason=\(reason) window=\(Log.timestamp(from: rangeStart))->\(Log.timestamp(from: rangeEnd)) effectiveWindow=\(Log.timestamp(from: boundedFilters.startDate ?? rangeStart))->\(Log.timestamp(from: boundedFilters.endDate ?? rangeEnd)) currentOldest=\(Log.timestamp(from: oldestTimestamp))",
-                category: .ui
-            )
             let queryStart = CFAbsoluteTimeGetCurrent()
             let framesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
                 timestamp: oldestTimestamp,
                 limit: WindowConfig.loadBatchSize,
-                filters: boundedFilters,
+                filters: queryFilters,
                 reason: "loadOlderFrames.reason=\(reason)"
             )
             let queryElapsedMs = (CFAbsoluteTimeGetCurrent() - queryStart) * 1000
@@ -8907,17 +8929,44 @@ public class SimpleTimelineViewModel: ObservableObject {
                 TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus)
             }
 
+            // If timeline state changed while the query was in-flight (filter/apply/reload), drop stale results.
+            guard let currentOldest = frames.first?.frame.timestamp else {
+                Log.warning(
+                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=frameBufferClearedWhileLoading",
+                    category: .ui
+                )
+                isLoadingOlder = false
+                return
+            }
+            let oldestDriftMs = abs(currentOldest.timeIntervalSince(oldestTimestamp) * 1000)
+            if oldestDriftMs > 1 {
+                Log.info(
+                    "[BoundaryOlder] ABORT reason=\(reason) staleResult=oldestChanged old=\(Log.timestamp(from: oldestTimestamp)) current=\(Log.timestamp(from: currentOldest)) driftMs=\(String(format: "%.1f", oldestDriftMs))",
+                    category: .ui
+                )
+                isLoadingOlder = false
+                return
+            }
+
             // Prepend to existing frames
             // Use insert(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
+            let clampedCurrentIndex = min(max(currentIndex, 0), max(0, beforeCount - 1))
+            if clampedCurrentIndex != currentIndex {
+                Log.warning(
+                    "[BoundaryOlder] Clamping invalid currentIndex reason=\(reason) oldIndex=\(currentIndex) frameCount=\(beforeCount) clamped=\(clampedCurrentIndex)",
+                    category: .ui
+                )
+                currentIndex = clampedCurrentIndex
+            }
             let oldCurrentIndex = currentIndex
-            let oldTimestamp = frames[currentIndex].frame.timestamp
-            let oldFirstTimestamp = frames.first?.frame.timestamp
+            let oldTimestamp = frames[oldCurrentIndex].frame.timestamp
+            let oldFirstTimestamp = currentOldest
 
             frames.insert(contentsOf: newTimelineFrames, at: 0)
 
             // Adjust currentIndex to maintain position
-            currentIndex += newTimelineFrames.count
+            currentIndex = oldCurrentIndex + newTimelineFrames.count
             logCmdFPlayheadState(
                 "boundary.older.indexAdjusted",
                 trace: cmdFTrace,
@@ -8926,7 +8975,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             Log.info("[Memory] LOADED OLDER: +\(newTimelineFrames.count) frames (\(beforeCount)→\(frames.count)), index adjusted from \(oldCurrentIndex) to \(currentIndex), maintaining timestamp=\(oldTimestamp)", category: .ui)
             Log.info("[INFINITE-SCROLL] After load older: new first frame=\(frames.first?.frame.timestamp.description ?? "nil"), new last frame=\(frames.last?.frame.timestamp.description ?? "nil")", category: .ui)
-            if let oldFirstTimestamp, let bridge = newTimelineFrames.last?.frame.timestamp {
+            if let bridge = newTimelineFrames.last?.frame.timestamp {
                 let bridgeGap = max(0, oldFirstTimestamp.timeIntervalSince(bridge))
                 Log.info(
                     "[BoundaryOlder] MERGE reason=\(reason) bridgeGap=\(String(format: "%.1fs", bridgeGap)) oldFirst=\(Log.timestamp(from: oldFirstTimestamp)) insertedLast=\(Log.timestamp(from: bridge))",

@@ -1645,6 +1645,8 @@ struct FrameWithURLOverlay<Content: View>: View {
 
             }
             .onRightClick { location in
+                // Keep right-clicks on the floating filter card from opening the frame menu behind it.
+                guard !viewModel.isFilterPanelVisible else { return }
                 viewModel.contextMenuLocation = location
                 withAnimation(.easeOut(duration: 0.16)) {
                     viewModel.showContextMenu = true

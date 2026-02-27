@@ -1781,6 +1781,10 @@ public class TimelineWindowController: NSObject {
 
                 // Cmd+C to copy (handle before system can intercept)
                 if event.charactersIgnoringModifiers == "c" && modifiers == [.command] {
+                    // When editing text (e.g., filter fields), let AppKit handle Cmd+C.
+                    if isTextFieldActive {
+                        return event
+                    }
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume the event to prevent propagation
                 }
