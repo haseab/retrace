@@ -5,6 +5,39 @@ import SQLCipher
 import Darwin
 import IOKit.ps
 
+private enum WatchdogRelaunchGuard {
+    private static let lock = NSLock()
+    private static let relaunchTimestampsKey = "watchdogAutoRelaunchTimestamps"
+    private static let relaunchWindowSeconds: TimeInterval = 5 * 60
+    private static let maxRelaunchesPerWindow = 2
+
+    struct Decision {
+        let shouldRelaunch: Bool
+        let recentCount: Int
+    }
+
+    static func evaluateAndRecord(now: Date = Date()) -> Decision {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let defaults = UserDefaults.standard
+        let cutoff = now.timeIntervalSince1970 - relaunchWindowSeconds
+        var timestamps = (defaults.array(forKey: relaunchTimestampsKey) as? [TimeInterval] ?? [])
+            .filter { $0 >= cutoff }
+
+        if timestamps.count >= maxRelaunchesPerWindow {
+            defaults.set(timestamps, forKey: relaunchTimestampsKey)
+            defaults.synchronize()
+            return Decision(shouldRelaunch: false, recentCount: timestamps.count)
+        }
+
+        timestamps.append(now.timeIntervalSince1970)
+        defaults.set(timestamps, forKey: relaunchTimestampsKey)
+        defaults.synchronize()
+        return Decision(shouldRelaunch: true, recentCount: timestamps.count)
+    }
+}
+
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -248,21 +281,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureWatchdogAutoQuit() {
-        MainThreadWatchdog.shared.setAutoQuitHandler { [weak self] blockedSeconds in
+        MainThreadWatchdog.shared.setAutoQuitHandler { blockedSeconds in
             let blockedFor = String(format: "%.1f", blockedSeconds)
-            Log.critical("[Watchdog] Auto-quit threshold reached (\(blockedFor)s). Capturing diagnostics and attempting graceful termination.", category: .ui)
+            Log.critical("[Watchdog] Auto-quit threshold reached (\(blockedFor)s). Capturing diagnostics and attempting automatic relaunch.", category: .ui)
             EmergencyDiagnostics.capture(trigger: "watchdog_auto_quit")
 
-            // If main is still responsive enough, request normal app termination first.
-            DispatchQueue.main.async {
-                self?.requestImmediateTermination(skipQuitConfirmation: true)
-            }
-
-            // Fallback: if graceful termination cannot run (main frozen), force-exit.
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2.0) {
-                Log.critical("[Watchdog] Graceful termination did not complete after auto-quit trigger. Force exiting.", category: .ui)
+            let relaunchDecision = WatchdogRelaunchGuard.evaluateAndRecord()
+            guard relaunchDecision.shouldRelaunch else {
+                Log.critical(
+                    "[Watchdog] Auto-relaunch suppressed to prevent restart loop (\(relaunchDecision.recentCount) relaunches in last 5 minutes). Exiting without relaunch.",
+                    category: .ui
+                )
                 Darwin.exit(0)
             }
+
+            // Ensure we still terminate if relaunch scheduling fails unexpectedly.
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 3.0) {
+                Log.critical("[Watchdog] Relaunch did not complete after auto-quit trigger. Force exiting.", category: .ui)
+                Darwin.exit(0)
+            }
+
+            // Reuse the same restart path as Settings so watchdog quits auto-recover.
+            AppRelaunch.relaunch()
         }
     }
 

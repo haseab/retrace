@@ -4718,11 +4718,11 @@ private struct FontStylePicker: View {
 
                         VStack(spacing: 2) {
                             Text(style.displayName)
-                                .font(.retraceCaptionBold)
+                                .font(.system(size: 11, weight: .semibold, design: style.design))
                                 .foregroundColor(selection == style ? .retracePrimary : .retraceSecondary)
 
                             Text(style.description)
-                                .font(.retraceTiny)
+                                .font(.system(size: 10, weight: .regular, design: style.design))
                                 .foregroundColor(.retraceSecondary)
                                 .lineLimit(1)
                         }

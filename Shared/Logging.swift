@@ -499,8 +499,9 @@ public final class MainThreadWatchdog: @unchecked Sendable {
     private var isRunning = false
     private let lock = NSLock()
 
-    /// Timestamp of last main thread heartbeat
-    private var lastHeartbeat: Date = Date()
+    /// Monotonic timestamp of last main-thread heartbeat.
+    /// Uses uptime nanoseconds to avoid counting time spent in system sleep.
+    private var lastHeartbeatUptimeNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
 
     /// Threshold for warning (in seconds)
     private let warningThreshold: TimeInterval = 0.5
@@ -576,7 +577,7 @@ public final class MainThreadWatchdog: @unchecked Sendable {
     private func recordHeartbeat() {
         lock.lock()
         defer { lock.unlock() }
-        lastHeartbeat = Date()
+        lastHeartbeatUptimeNanos = DispatchTime.now().uptimeNanoseconds
         autoQuitTriggered = false
     }
 
@@ -584,7 +585,7 @@ public final class MainThreadWatchdog: @unchecked Sendable {
         guard isRunningSnapshot() else { return }
 
         lock.lock()
-        let elapsed = Date().timeIntervalSince(lastHeartbeat)
+        let elapsed = elapsedSecondsSinceLastHeartbeatLocked()
         lock.unlock()
 
         var didBlock = false
@@ -608,6 +609,14 @@ public final class MainThreadWatchdog: @unchecked Sendable {
         }
 
         guard elapsed >= autoQuitThreshold else { return }
+        guard !mainThreadRespondedToProbe(timeout: 0.25) else {
+            Log.warning(
+                "[Watchdog] Skipping auto-quit: main thread responded to probe after \(String(format: "%.1f", elapsed))s elapsed (likely sleep/wake timing).",
+                category: .ui
+            )
+            recordHeartbeat()
+            return
+        }
 
         let handler: (@Sendable (_ blockedSeconds: TimeInterval) -> Void)?
         lock.lock()
@@ -626,7 +635,25 @@ public final class MainThreadWatchdog: @unchecked Sendable {
     public var statistics: (blockingCount: Int, isHealthy: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        let elapsed = Date().timeIntervalSince(lastHeartbeat)
+        let elapsed = elapsedSecondsSinceLastHeartbeatLocked()
         return (blockingCount, elapsed < warningThreshold)
+    }
+
+    private func elapsedSecondsSinceLastHeartbeatLocked() -> TimeInterval {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= lastHeartbeatUptimeNanos else {
+            return 0
+        }
+
+        return TimeInterval(now - lastHeartbeatUptimeNanos) / 1_000_000_000
+    }
+
+    private func mainThreadRespondedToProbe(timeout: TimeInterval) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            semaphore.signal()
+        }
+
+        return semaphore.wait(timeout: .now() + timeout) == .success
     }
 }
