@@ -955,12 +955,10 @@ public class TimelineWindowController: NSObject {
     private func startBackgroundRefreshTimer() {
         // Don't restart if already running
         guard backgroundRefreshTimer == nil else {
-            Log.debug("[TIMELINE-CACHE] Timer already running, not restarting", category: .ui)
             return
         }
 
         let refreshInterval: TimeInterval = 10
-        Log.info("[TIMELINE-CACHE] ⏱️ Starting background refresh timer (every \(Int(refreshInterval))s)", category: .ui)
 
         backgroundRefreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -971,7 +969,6 @@ public class TimelineWindowController: NSObject {
 
                 // Only refresh if capture is active (no point refreshing if not recording)
                 guard await coordinator.isCapturing() else {
-                    Log.debug("[TIMELINE-CACHE] ⏸️ Skipping background refresh (not capturing)", category: .ui)
                     return
                 }
 
@@ -988,23 +985,19 @@ public class TimelineWindowController: NSObject {
                 // Expire hidden-state caches together so reopen returns to fresh timeline/search state.
                 if cacheExpired {
                     if viewModel.filterCriteria.hasActiveFilters {
-                        Log.info("[TIMELINE-CACHE] ⏳ Filtered view expired after \(Int(cacheExpirationSeconds))s hidden, clearing filters", category: .ui)
                         viewModel.clearFiltersWithoutReload()
                     }
 
                     let searchViewModel = viewModel.searchViewModel
                     if searchViewModel.hasResults || !searchViewModel.searchQuery.isEmpty {
-                        Log.info("[TIMELINE-CACHE] ⏳ Search state expired after \(Int(cacheExpirationSeconds))s hidden, clearing search cache", category: .ui)
                         searchViewModel.clearSearchResults()
                     }
                 }
 
-                Log.info("[TIMELINE-CACHE] 🔄 Background refresh triggered (cacheExpired: \(cacheExpired))", category: .ui)
                 // Only preserve position if cache hasn't expired; after 1 minute, navigate to newest
                 await viewModel.refreshFrameData(navigateToNewest: cacheExpired)
                 // Force video reload so AVPlayer picks up new frames appended to the video file
                 viewModel.forceVideoReload = true
-                Log.info("[TIMELINE-CACHE] ✅ Background refresh complete", category: .ui)
             }
         }
     }

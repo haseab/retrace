@@ -977,7 +977,8 @@ struct CurrentAppBadge: View {
     @State private var expandTask: Task<Void, Never>?
 
     private let buttonSize = TimelineScaleFactor.controlButtonSize * 1.125
-    private let iconSize = TimelineScaleFactor.controlButtonSize * 0.88
+    private let baseIconSize = TimelineScaleFactor.controlButtonSize * 0.95
+    private let expandedIconSize = TimelineScaleFactor.controlButtonSize * 0.88
 
     /// Get the bundle ID of the current frame's app
     private var currentBundleID: String? {
@@ -1019,6 +1020,10 @@ struct CurrentAppBadge: View {
 
     private var expandedWidth: CGFloat {
         TimelineScaleFactor.controlButtonSize * 3.0
+    }
+
+    private var iconSize: CGFloat {
+        shouldShowExpanded ? expandedIconSize : baseIconSize
     }
 
     var body: some View {

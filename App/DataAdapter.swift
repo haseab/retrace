@@ -2280,26 +2280,6 @@ public actor DataAdapter {
     }
 
     private func getAllOCRNodes(frameID: FrameID, connection: DatabaseConnection) throws -> [OCRNodeWithText] {
-        // DEBUG: First check what docid is linked to this frame
-        let debugSQL = """
-            SELECT ds.docid, ds.frameId, LENGTH(COALESCE(sc.c0, '')) as textLen
-            FROM doc_segment ds
-            JOIN searchRanking_content sc ON ds.docid = sc.id
-            WHERE ds.frameId = ?;
-            """
-        if let debugStmt = try? connection.prepare(sql: debugSQL) {
-            sqlite3_bind_int64(debugStmt, 1, frameID.value)
-            if sqlite3_step(debugStmt) == SQLITE_ROW {
-                let docid = sqlite3_column_int64(debugStmt, 0)
-                let dsFrameId = sqlite3_column_int64(debugStmt, 1)
-                let textLen = sqlite3_column_int(debugStmt, 2)
-                Log.debug("[DB-DEBUG] For frameID=\(frameID.value): doc_segment has docid=\(docid), frameId=\(dsFrameId), textLen=\(textLen)", category: .database)
-            } else {
-                Log.debug("[DB-DEBUG] For frameID=\(frameID.value): NO doc_segment found!", category: .database)
-            }
-            connection.finalize(debugStmt)
-        }
-
         let sql = """
             SELECT
                 n.id,
@@ -2324,26 +2304,13 @@ public actor DataAdapter {
 
         sqlite3_bind_int64(statement, 1, frameID.value)
 
-        // Reset parse debug counter for new frame
-        DataAdapter.parseDebugCounter = 0
-
         var nodes: [OCRNodeWithText] = []
-        var isFirstNode = true
         while sqlite3_step(statement) == SQLITE_ROW {
-            // DEBUG: Log first row's fullText to see what we're getting
-            if isFirstNode {
-                if let fullTextPtr = sqlite3_column_text(statement, 8) {
-                    let fullText = String(cString: fullTextPtr)
-                    Log.debug("[DB-DEBUG] frameID=\(frameID.value) fullText preview: '\(fullText.prefix(100))...'", category: .database)
-                }
-                isFirstNode = false
-            }
             if let node = parseOCRNodeFromRow(statement: statement) {
                 nodes.append(node)
             }
         }
 
-        Log.debug("[DB-DEBUG] frameID=\(frameID.value) returned \(nodes.count) nodes", category: .database)
         return nodes
     }
 
@@ -3304,8 +3271,6 @@ public actor DataAdapter {
         )
     }
 
-    private static var parseDebugCounter = 0
-
     private func parseOCRNodeFromRow(statement: OpaquePointer) -> OCRNodeWithText? {
         let id = Int(sqlite3_column_int64(statement, 0))
         let textOffset = Int(sqlite3_column_int(statement, 2))
@@ -3334,15 +3299,6 @@ public actor DataAdapter {
         ) ?? fullText.endIndex
 
         let text = String(fullText[startIndex..<endIndex])
-
-        // DEBUG: Log first 5 nodes to see offset/length details (commented out to reduce log noise)
-        // DataAdapter.parseDebugCounter += 1
-        // if DataAdapter.parseDebugCounter <= 5 {
-        //     Log.debug("[PARSE-DEBUG] Node \(DataAdapter.parseDebugCounter): id=\(id), offset=\(textOffset), length=\(textLength), fullTextLen=\(fullText.count), extracted='\(text.prefix(30))'", category: .database)
-        // } else if DataAdapter.parseDebugCounter == 6 {
-        //     Log.debug("[PARSE-DEBUG] (suppressing further logs...)", category: .database)
-        //     DataAdapter.parseDebugCounter = 100 // prevent re-printing "suppressing" message
-        // }
 
         return OCRNodeWithText(
             id: id,

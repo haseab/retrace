@@ -393,6 +393,7 @@ public struct SimpleTimelineView: View {
                         await viewModel.loadMostRecentFrame()
                     }
                 }
+                viewModel.handleTimelineOpened()
                 // Start periodic refresh of processing statuses
                 viewModel.startPeriodicStatusRefresh()
             }
@@ -401,6 +402,7 @@ public struct SimpleTimelineView: View {
                 viewModel.stopPeriodicStatusRefresh()
                 // Stop video playback when timeline is closed
                 viewModel.stopPlayback()
+                viewModel.handleTimelineClosed()
             }
             .onReceive(NotificationCenter.default.publisher(for: .colorThemeDidChange)) { _ in
                 appearanceRefreshTick &+= 1
@@ -1502,8 +1504,6 @@ class DoubleBufferedVideoView: NSView {
 
         // Swap roles
         isPlayerAActive.toggle()
-
-        Log.debug("[VideoView] Players swapped, now active: \(isPlayerAActive ? "A" : "B")", category: .ui)
     }
 
     deinit {
