@@ -609,7 +609,7 @@ enum AppSegmentQueries {
     }
 
     /// Get window usage aggregated by windowName for a specific app
-    /// For browsers, aggregates by domain extracted from browserUrl instead
+    /// For browsers, aggregates by domain extracted from browserUrl and includes tab counts per domain
     /// Uses frame-based calculation with 2-minute idle cap (same as getAppUsageStats)
     /// Returns windows sorted by duration descending
     static func getWindowUsageForApp(
@@ -617,7 +617,7 @@ enum AppSegmentQueries {
         bundleID: String,
         from startDate: Date,
         to endDate: Date
-    ) throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
+    ) throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
         let isBrowser = browserBundleIDs.contains(bundleID)
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
@@ -630,7 +630,7 @@ enum AppSegmentQueries {
         let sql: String
         if isBrowser {
             // For browsers: show websites (from browserUrl) first, then windowName fallback entries
-            // Uses UNION to combine website entries and window-only entries, sorted by type then duration
+            // Includes tab count per website (count of tab rows under each domain)
             sql = """
                 WITH all_frames AS (
                     SELECT
@@ -638,6 +638,7 @@ enum AppSegmentQueries {
                         s.bundleID,
                         s.id as segmentId,
                         s.windowName,
+                        s.browserUrl,
                         CASE
                             WHEN s.browserUrl IS NOT NULL AND s.browserUrl != '' THEN
                                 CASE
@@ -665,6 +666,7 @@ enum AppSegmentQueries {
                         LAG(bundleID) OVER (ORDER BY createdAt) as prev_bundleID,
                         LAG(segmentId) OVER (ORDER BY createdAt) as prev_segmentId,
                         LAG(windowName) OVER (ORDER BY createdAt) as prev_windowName,
+                        LAG(browserUrl) OVER (ORDER BY createdAt) as prev_browserUrl,
                         LAG(domain) OVER (ORDER BY createdAt) as prev_domain,
                         createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                     FROM all_frames
@@ -711,13 +713,51 @@ enum AppSegmentQueries {
                         )
                     GROUP BY prev_windowName
                     HAVING duration_ms >= 1000
+                ),
+                -- Domain + tab aggregates to derive tab counts per website
+                domain_tab_usage AS (
+                    SELECT
+                        prev_domain as domain,
+                        prev_windowName as tab_name,
+                        prev_browserUrl as tab_url,
+                        SUM(CASE
+                            WHEN gap_ms IS NULL THEN 0
+                            WHEN gap_ms > ? THEN ?
+                            ELSE gap_ms
+                        END) as duration_ms
+                    FROM frame_gaps
+                    WHERE prev_bundleID = ?
+                        AND prev_domain IS NOT NULL
+                        AND prev_windowName IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM segment_tag st
+                            JOIN tag t ON st.tagId = t.id
+                            WHERE st.segmentId = prev_segmentId AND t.name = 'hidden'
+                        )
+                    GROUP BY prev_domain, prev_windowName, prev_browserUrl
+                    HAVING duration_ms >= 1000
+                ),
+                website_tab_counts AS (
+                    SELECT
+                        domain,
+                        COUNT(*) as tab_count
+                    FROM domain_tab_usage
+                    GROUP BY domain
                 )
-                SELECT item_name, is_website, duration_ms
-                FROM (
-                    SELECT * FROM website_usage
-                    UNION ALL
-                    SELECT * FROM window_usage
-                )
+                SELECT
+                    wu.item_name,
+                    wu.is_website,
+                    wu.duration_ms,
+                    COALESCE(wtc.tab_count, 0) as tab_count
+                FROM website_usage wu
+                LEFT JOIN website_tab_counts wtc ON wtc.domain = wu.item_name
+                UNION ALL
+                SELECT
+                    item_name,
+                    is_website,
+                    duration_ms,
+                    NULL as tab_count
+                FROM window_usage
                 ORDER BY is_website DESC, duration_ms DESC
                 """
         } else {
@@ -748,7 +788,8 @@ enum AppSegmentQueries {
                         WHEN gap_ms IS NULL THEN 0
                         WHEN gap_ms > ? THEN ?
                         ELSE gap_ms
-                    END) as duration_ms
+                    END) as duration_ms,
+                    NULL as tab_count
                 FROM frame_gaps
                 WHERE prev_bundleID = ?
                     AND prev_item IS NOT NULL
@@ -779,14 +820,17 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 4, maxGapMs)
         sqlite3_bind_text(statement, 5, (bundleID as NSString).utf8String, -1, nil)
 
-        // For browser query, we have additional parameters for the window fallback subquery
+        // For browser query, we have additional parameters for window fallback and tab-count CTEs.
         if isBrowser {
             sqlite3_bind_int64(statement, 6, maxGapMs)
             sqlite3_bind_int64(statement, 7, maxGapMs)
             sqlite3_bind_text(statement, 8, (bundleID as NSString).utf8String, -1, nil)
+            sqlite3_bind_int64(statement, 9, maxGapMs)
+            sqlite3_bind_int64(statement, 10, maxGapMs)
+            sqlite3_bind_text(statement, 11, (bundleID as NSString).utf8String, -1, nil)
         }
 
-        var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] = []
+        var results: [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let windowName: String?
             if sqlite3_column_type(statement, 0) == SQLITE_NULL {
@@ -796,11 +840,18 @@ enum AppSegmentQueries {
             }
             let isWebsite = sqlite3_column_int(statement, 1) == 1
             let durationMs = sqlite3_column_int64(statement, 2)
+            let tabCount: Int?
+            if sqlite3_column_type(statement, 3) == SQLITE_NULL {
+                tabCount = nil
+            } else {
+                tabCount = Int(sqlite3_column_int(statement, 3))
+            }
 
             results.append((
                 windowName: windowName,
                 isWebsite: isWebsite,
-                duration: TimeInterval(durationMs) / 1000.0
+                duration: TimeInterval(durationMs) / 1000.0,
+                tabCount: tabCount
             ))
         }
         return results

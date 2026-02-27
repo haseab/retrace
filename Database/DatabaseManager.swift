@@ -696,7 +696,7 @@ public actor DatabaseManager: DatabaseProtocol {
         bundleID: String,
         from startDate: Date,
         to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }

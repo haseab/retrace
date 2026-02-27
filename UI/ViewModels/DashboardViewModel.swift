@@ -469,7 +469,7 @@ public class DashboardViewModel: ObservableObject {
     }
 
     /// Fetch window usage data for a specific app (aggregated by windowName or domain for browsers)
-    /// For browsers: returns websites (from browserUrl) first, then windowName fallbacks with isWebsite=false
+    /// For browsers: includes pre-aggregated tab counts for website rows.
     /// - Parameter bundleID: The app's bundle identifier
     /// - Returns: Array of window usage sorted by type (websites first) then duration descending
     public func getWindowUsageForApp(bundleID: String) async -> [WindowUsageData] {
@@ -493,7 +493,8 @@ public class DashboardViewModel: ObservableObject {
                     windowName: stat.windowName,
                     isWebsite: stat.isWebsite,
                     duration: stat.duration,
-                    percentage: totalDuration > 0 ? stat.duration / totalDuration : 0
+                    percentage: totalDuration > 0 ? stat.duration / totalDuration : 0,
+                    tabCount: stat.tabCount
                 )
             }
         } catch {
@@ -525,7 +526,7 @@ public class DashboardViewModel: ObservableObject {
                 WindowUsageData(
                     windowName: stat.windowName,
                     browserUrl: stat.browserUrl,
-                    isWebsite: true,  // These are nested tabs within a domain, always websites
+                    isWebsite: true,
                     duration: stat.duration,
                     percentage: totalDuration > 0 ? stat.duration / totalDuration : 0
                 )
@@ -557,7 +558,7 @@ public class DashboardViewModel: ObservableObject {
                 WindowUsageData(
                     windowName: stat.windowName,
                     browserUrl: stat.browserUrl,
-                    isWebsite: true,  // These are nested tabs within a domain, always websites
+                    isWebsite: true,
                     duration: stat.duration,
                     percentage: totalDuration > 0 ? stat.duration / totalDuration : 0
                 )
@@ -785,7 +786,7 @@ public class DashboardViewModel: ObservableObject {
 
 // MARK: - Supporting Types
 
-/// Browser bundle IDs that show "websites" instead of "windows" (references shared list)
+/// Browser bundle IDs used for browser-specific breakdown behavior (references shared list)
 private var browserBundleIDs: Set<String> { AppInfo.browserBundleIDs }
 
 public struct AppUsageData: Identifiable {
@@ -831,13 +832,15 @@ public struct WindowUsageData: Identifiable {
     public let isWebsite: Bool      // True for website entries (with browserUrl), false for windowName fallbacks
     public let duration: TimeInterval
     public let percentage: Double
+    public let tabCount: Int?
 
-    public init(windowName: String?, browserUrl: String? = nil, isWebsite: Bool = true, duration: TimeInterval, percentage: Double) {
+    public init(windowName: String?, browserUrl: String? = nil, isWebsite: Bool = true, duration: TimeInterval, percentage: Double, tabCount: Int? = nil) {
         self.windowName = windowName
         self.browserUrl = browserUrl
         self.isWebsite = isWebsite
         self.duration = duration
         self.percentage = percentage
+        self.tabCount = tabCount
     }
 
     /// Display name for the window (handles nil/empty cases)

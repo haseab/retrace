@@ -1640,14 +1640,14 @@ public actor AppCoordinator {
     }
 
     /// Get window usage aggregated by windowName or domain for a specific app
-    /// For browsers: returns websites (from browserUrl) first, then windowName fallbacks
+    /// For browsers: returns websites (from browserUrl) first, then windowName fallbacks, with tab counts per website
     /// For non-browsers: returns windows by windowName
     /// Returns items sorted by type (websites first) then duration descending
     public func getWindowUsageForApp(
         bundleID: String,
         from startDate: Date,
         to endDate: Date
-    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval)] {
+    ) async throws -> [(windowName: String?, isWebsite: Bool, duration: TimeInterval, tabCount: Int?)] {
         try await services.database.getWindowUsageForApp(bundleID: bundleID, from: startDate, to: endDate)
     }
 

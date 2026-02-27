@@ -7257,6 +7257,7 @@ struct ProcessCPUSnapshot {
     }
 }
 
+@MainActor
 final class ProcessCPUMonitor: ObservableObject {
     static let shared = ProcessCPUMonitor()
 
@@ -7334,7 +7335,7 @@ final class ProcessCPUMonitor: ObservableObject {
         var intervalSeconds = max(1, initialIntervalSeconds)
 
         while !Task.isCancelled {
-            let shouldRebuildSnapshot = await MainActor.run { self.isPowerSettingsVisible }
+            let shouldRebuildSnapshot = isPowerSettingsVisible
             let intervalForRequest = intervalSeconds
             let nextSnapshot = await samplerRequestGate.runIfIdle { [sampler] in
                 await sampler.sampleAndMaybeLoadSnapshot(
@@ -7343,13 +7344,11 @@ final class ProcessCPUMonitor: ObservableObject {
                     shouldBuildSnapshot: shouldRebuildSnapshot
                 )
             }
-            intervalSeconds = await MainActor.run {
-                if let nextSnapshot {
-                    self.snapshot = nextSnapshot
-                }
-                self.sampleIntervalSeconds = self.preferredSamplingInterval()
-                return max(1, self.sampleIntervalSeconds)
+            if let nextSnapshot {
+                snapshot = nextSnapshot
             }
+            sampleIntervalSeconds = preferredSamplingInterval()
+            intervalSeconds = max(1, sampleIntervalSeconds)
 
             let sleepNanoseconds = Int64(intervalSeconds * 1_000_000_000)
             do {

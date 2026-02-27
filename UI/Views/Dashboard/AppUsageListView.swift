@@ -459,12 +459,22 @@ struct AppUsageListView: View {
                 }
             }
 
-            // Domain name or window name
-            Text(displayTitle)
-                .font(layoutSize.windowNameFont)
-                .foregroundColor(.retracePrimary.opacity(0.85))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            // Domain name or window name with tab count metadata for websites
+            VStack(alignment: .leading, spacing: 2) {
+                Text(displayTitle)
+                    .font(layoutSize.windowNameFont)
+                    .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if window.isWebsite {
+                    if let tabCount = window.tabCount {
+                        Text(tabCountLabel(tabCount))
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.retraceSecondary.opacity(0.65))
+                    }
+                }
+            }
 
             Spacer()
 
@@ -690,6 +700,10 @@ struct AppUsageListView: View {
                 loadingDomainTabs.remove(domainKey)
             }
         }
+    }
+
+    private func tabCountLabel(_ count: Int) -> String {
+        "\(count) tab\(count == 1 ? "" : "s")"
     }
 
     private var loadMoreButton: some View {
