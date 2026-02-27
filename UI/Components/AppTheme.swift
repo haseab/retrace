@@ -346,11 +346,14 @@ public final class AppMetadataCache: ObservableObject {
     @Published private var appIcons: [String: NSImage] = [:]
     @Published private var appNames: [String: String] = [:]
     @Published private var fileIcons: [String: NSImage] = [:]
+    @Published private var processNameIcons: [String: NSImage] = [:]
 
     private var pendingBundleIDs: Set<String> = []
     private var pendingAppPaths: Set<String> = []
+    private var pendingProcessNames: Set<String> = []
     private var resolvedBundleIDs: Set<String> = []
     private var resolvedAppPaths: Set<String> = []
+    private var resolvedProcessNames: Set<String> = []
 
     private init() {}
 
@@ -364,6 +367,12 @@ public final class AppMetadataCache: ObservableObject {
 
     public func icon(forAppPath appPath: String) -> NSImage? {
         fileIcons[appPath]
+    }
+
+    public func icon(forProcessName processName: String) -> NSImage? {
+        let normalizedName = Self.normalizedProcessName(processName)
+        guard !normalizedName.isEmpty else { return nil }
+        return processNameIcons[normalizedName]
     }
 
     public func prefetch(bundleIDs: [String]) {
@@ -420,6 +429,54 @@ public final class AppMetadataCache: ObservableObject {
                 self.resolvedAppPaths.insert(appPath)
             }
         }
+    }
+
+    public func requestIcon(forProcessName processName: String) {
+        let normalizedName = Self.normalizedProcessName(processName)
+        guard !normalizedName.isEmpty else { return }
+
+        if resolvedProcessNames.contains(normalizedName) || pendingProcessNames.contains(normalizedName) {
+            return
+        }
+
+        pendingProcessNames.insert(normalizedName)
+        let lookupName = processName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        Task.detached(priority: .utility) {
+            let iconPath = Self.resolveAppPath(forProcessName: lookupName)
+            let icon = iconPath.map { NSWorkspace.shared.icon(forFile: $0) }
+            let boxedIcon = NSImageBox(image: icon)
+
+            await MainActor.run {
+                if let icon = boxedIcon.image {
+                    self.processNameIcons[normalizedName] = icon
+                }
+                self.pendingProcessNames.remove(normalizedName)
+                self.resolvedProcessNames.insert(normalizedName)
+            }
+        }
+    }
+
+    nonisolated private static func normalizedProcessName(_ processName: String) -> String {
+        processName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    nonisolated private static func resolveAppPath(forProcessName processName: String) -> String? {
+        guard !processName.isEmpty else { return nil }
+
+        for app in NSWorkspace.shared.runningApplications {
+            guard let localizedName = app.localizedName,
+                  localizedName.compare(
+                    processName,
+                    options: [.caseInsensitive, .diacriticInsensitive]
+                  ) == .orderedSame,
+                  let bundlePath = app.bundleURL?.path else {
+                continue
+            }
+            return bundlePath
+        }
+
+        return nil
     }
 }
 

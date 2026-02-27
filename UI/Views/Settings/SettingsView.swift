@@ -264,6 +264,8 @@ public struct SettingsView: View {
     @State private var currentPowerSource: PowerStateMonitor.PowerSource = .unknown
     @State private var isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
     @State private var pendingOCRFrameCount: Int = 0
+    @State private var cpuProcessRowsVisible = 10
+    @State private var cpuProcessScrollTargetID: String?
     @ObservedObject private var processCPUMonitor = ProcessCPUMonitor.shared
     @StateObject private var appMetadataCache = AppMetadataCache.shared
 
@@ -422,6 +424,8 @@ public struct SettingsView: View {
     private static let powerOCRCardAnchorID = "settings.powerOCRCardAnchor"
     static let powerOCRPriorityTargetID = "settings.powerOCRPriority"
     private static let powerOCRPriorityAnchorID = "settings.powerOCRPriorityAnchor"
+    private static let cpuRowsPageSize = 10
+    private static let cpuRowsContainerHeight: CGFloat = 236
 
     public var body: some View {
         GeometryReader { geometry in
@@ -2667,6 +2671,8 @@ public struct SettingsView: View {
         .onAppear {
             updatePowerSourceStatus()
             loadOCRFilteredApps()
+            cpuProcessRowsVisible = Self.cpuRowsPageSize
+            cpuProcessScrollTargetID = nil
             processCPUMonitor.setPowerSettingsVisible(true)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("PowerSourceDidChange"))) { _ in
@@ -3089,6 +3095,10 @@ public struct SettingsView: View {
                 .foregroundColor(.retraceSecondary.opacity(0.85))
 
             if snapshot.hasEnoughData {
+                let totalRows = snapshot.topProcesses.count
+                let visibleRows = min(max(Self.cpuRowsPageSize, cpuProcessRowsVisible), totalRows)
+                let hasMoreRows = visibleRows < totalRows
+
                 Text("Sampled duration: \(formatWindowDuration(snapshot.sampleDurationSeconds)) • Total tracked CPU work: \(formatCPUSec(snapshot.totalTrackedCPUSeconds)) CPU Seconds")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.65))
@@ -3130,54 +3140,94 @@ public struct SettingsView: View {
                     }
                     .padding(.bottom, 6)
 
-                    ForEach(Array(snapshot.topProcesses.prefix(10).enumerated()), id: \.element.id) { index, row in
-                        let peakTotalSharePercent = snapshot.logicalCoreCount > 0
-                            ? ((snapshot.peakPercentByGroup[row.id] ?? 0) / Double(snapshot.logicalCoreCount))
-                            : 0
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(Array(snapshot.topProcesses.prefix(visibleRows).enumerated()), id: \.element.id) { index, row in
+                                    let rowNumber = index + 1
+                                    let peakTotalSharePercent = snapshot.logicalCoreCount > 0
+                                        ? ((snapshot.peakPercentByGroup[row.id] ?? 0) / Double(snapshot.logicalCoreCount))
+                                        : 0
 
-                        HStack(spacing: 8) {
-                            Text("\(index + 1).")
-                                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    HStack(spacing: 8) {
+                                        Text("\(rowNumber).")
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.retraceSecondary.opacity(0.75))
+                                            .lineLimit(1)
+                                            .frame(width: 26, alignment: .leading)
+
+                                        processIconView(for: row)
+                                            .frame(width: 16, height: 16)
+
+                                        Text(row.name)
+                                            .font(.system(size: 11, weight: .regular))
+                                            .foregroundColor(.retracePrimary)
+                                            .lineLimit(1)
+
+                                        Spacer(minLength: 4)
+
+                                        Text(formatCPUSec(row.cpuSeconds))
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.retracePrimary)
+                                            .frame(width: 68, alignment: .trailing)
+
+                                        Text(formatCPUPercent(row.shareOfTrackedPercent))
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.retraceSecondary.opacity(0.95))
+                                            .frame(width: 58, alignment: .trailing)
+
+                                        Text(formatCPUPercent(row.capacityPercent))
+                                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                            .foregroundColor(.retraceAccent.opacity(0.95))
+                                            .frame(width: 68, alignment: .trailing)
+
+                                        Text(formatCPUPercent(peakTotalSharePercent))
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.retraceSecondary.opacity(0.95))
+                                            .frame(width: 100, alignment: .trailing)
+                                    }
+                                    .padding(.vertical, 3)
+                                    .id(cpuProcessRowAnchorID(rowNumber))
+
+                                    if index < visibleRows - 1 {
+                                        Divider()
+                                            .background(Color.white.opacity(0.06))
+                                    }
+                                }
+                            }
+                        }
+                        .frame(height: Self.cpuRowsContainerHeight)
+                        .clipped()
+                        .onChange(of: cpuProcessScrollTargetID) { targetID in
+                            guard let targetID else { return }
+                            DispatchQueue.main.async {
+                                withAnimation(.easeInOut(duration: 0.22)) {
+                                    proxy.scrollTo(targetID, anchor: .top)
+                                }
+                                cpuProcessScrollTargetID = nil
+                            }
+                        }
+                    }
+
+                    if hasMoreRows {
+                        HStack {
+                            Spacer()
+                            Button("Load 10 more") {
+                                let nextStartRow = visibleRows + 1
+                                guard nextStartRow <= totalRows else { return }
+                                cpuProcessRowsVisible = min(totalRows, visibleRows + Self.cpuRowsPageSize)
+                                cpuProcessScrollTargetID = cpuProcessRowAnchorID(nextStartRow)
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.retraceAccent.opacity(0.95))
+
+                            Text("(\(visibleRows) / \(totalRows))")
+                                .font(.system(size: 10, weight: .medium))
                                 .foregroundColor(.retraceSecondary.opacity(0.75))
-                                .lineLimit(1)
-                                .frame(width: 26, alignment: .leading)
-
-                            processIconView(for: row)
-                                .frame(width: 16, height: 16)
-
-                            Text(row.name)
-                                .font(.system(size: 11, weight: .regular))
-                                .foregroundColor(.retracePrimary)
-                                .lineLimit(1)
-
-                            Spacer(minLength: 4)
-
-                            Text(formatCPUSec(row.cpuSeconds))
-                                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                .foregroundColor(.retracePrimary)
-                                .frame(width: 68, alignment: .trailing)
-
-                            Text(formatCPUPercent(row.shareOfTrackedPercent))
-                                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                .foregroundColor(.retraceSecondary.opacity(0.95))
-                                .frame(width: 58, alignment: .trailing)
-
-                            Text(formatCPUPercent(row.capacityPercent))
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(.retraceAccent.opacity(0.95))
-                                .frame(width: 68, alignment: .trailing)
-
-                            Text(formatCPUPercent(peakTotalSharePercent))
-                                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                .foregroundColor(.retraceSecondary.opacity(0.95))
-                                .frame(width: 100, alignment: .trailing)
+                            Spacer()
                         }
-                        .padding(.vertical, 3)
-
-                        if index < min(snapshot.topProcesses.count, 10) - 1 {
-                            Divider()
-                                .background(Color.white.opacity(0.06))
-                        }
+                        .padding(.top, 4)
                     }
                 }
                 .padding(10)
@@ -3248,7 +3298,11 @@ public struct SettingsView: View {
     }
 
     private func formatCPUPercent(_ percent: Double) -> String {
-        String(format: "%.1f%%", percent)
+        String(format: "%.2f%%", percent)
+    }
+
+    private func cpuProcessRowAnchorID(_ rowNumber: Int) -> String {
+        "settings.cpuProcessRow.\(rowNumber)"
     }
 
     @ViewBuilder
@@ -3271,6 +3325,16 @@ public struct SettingsView: View {
     }
 
     private func cachedProcessIcon(for row: ProcessCPURow) -> NSImage? {
+        if let bundleID = processBundleID(for: row),
+           let icon = appMetadataCache.icon(for: bundleID) {
+            return icon
+        }
+
+        if isRetraceProcess(row),
+           let icon = appMetadataCache.icon(forAppPath: preferredRetraceIconAppPath()) {
+            return icon
+        }
+
         if row.id == "app:retrace" {
             return appMetadataCache.icon(forAppPath: preferredRetraceIconAppPath())
         }
@@ -3280,8 +3344,7 @@ public struct SettingsView: View {
             return icon
         }
 
-        if let bundleID = processBundleID(for: row),
-           let icon = appMetadataCache.icon(for: bundleID) {
+        if let icon = appMetadataCache.icon(forProcessName: row.name) {
             return icon
         }
 
@@ -3289,6 +3352,15 @@ public struct SettingsView: View {
     }
 
     private func requestProcessIconIfNeeded(for row: ProcessCPURow) {
+        if let bundleID = processBundleID(for: row) {
+            appMetadataCache.requestMetadata(for: bundleID)
+            if isRetraceProcess(row) {
+                appMetadataCache.requestIcon(forAppPath: preferredRetraceIconAppPath())
+            }
+            appMetadataCache.requestIcon(forProcessName: row.name)
+            return
+        }
+
         if row.id == "app:retrace" {
             appMetadataCache.requestIcon(forAppPath: preferredRetraceIconAppPath())
             return
@@ -3299,14 +3371,27 @@ public struct SettingsView: View {
             return
         }
 
-        if let bundleID = processBundleID(for: row) {
-            appMetadataCache.requestMetadata(for: bundleID)
+        appMetadataCache.requestIcon(forProcessName: row.name)
+    }
+
+    private func isRetraceProcess(_ row: ProcessCPURow) -> Bool {
+        if row.id == "app:retrace" {
+            return true
         }
+
+        guard let retraceBundleID = Bundle.main.bundleIdentifier?.lowercased(),
+              let bundleID = processBundleID(for: row)?.lowercased() else {
+            return false
+        }
+        return retraceBundleID == bundleID
     }
 
     private func processBundleID(for row: ProcessCPURow) -> String? {
-        if row.id == "app:google-chrome" || row.name == "Google Chrome" {
-            return "com.google.Chrome"
+        if row.id.hasPrefix("bundle:") {
+            return String(row.id.dropFirst("bundle:".count))
+        }
+        if row.id == "app:retrace" {
+            return Bundle.main.bundleIdentifier
         }
         return nil
     }
@@ -3328,8 +3413,16 @@ public struct SettingsView: View {
 
     private func formatWindowDuration(_ seconds: TimeInterval) -> String {
         let clamped = max(0, Int(seconds.rounded()))
+        let hours = clamped / 3600
         let minutes = clamped / 60
+        let remainingMinutes = (clamped % 3600) / 60
         let remainingSeconds = clamped % 60
+        if hours > 0 {
+            if remainingMinutes == 0 {
+                return "\(hours)h"
+            }
+            return "\(hours)h \(remainingMinutes)m"
+        }
         if minutes == 0 {
             return "\(remainingSeconds)s"
         }
@@ -7138,11 +7231,9 @@ struct ProcessCPUSnapshot {
         trackedSharePercent: 0,
         logicalCoreCount: 0,
         retraceCPUSeconds: 0,
-        chromeCPUSeconds: 0,
         totalTrackedCPUSeconds: 0,
         retraceRank: nil,
         retraceGroupKey: nil,
-        chromeGroupKeys: [],
         peakPercentByGroup: [:],
         topProcesses: []
     )
@@ -7155,11 +7246,9 @@ struct ProcessCPUSnapshot {
     let trackedSharePercent: Double
     let logicalCoreCount: Int
     let retraceCPUSeconds: Double
-    let chromeCPUSeconds: Double
     let totalTrackedCPUSeconds: Double
     let retraceRank: Int?
     let retraceGroupKey: String?
-    let chromeGroupKeys: Set<String>
     let peakPercentByGroup: [String: Double]
     let topProcesses: [ProcessCPURow]
 
@@ -7175,12 +7264,13 @@ final class ProcessCPUMonitor: ObservableObject {
 
     private var samplingTask: Task<Void, Never>?
     private let sampler = ProcessCPULogSampler()
+    private let samplerRequestGate = SamplerRequestGate()
     private var sampleIntervalSeconds: TimeInterval = 5
     private var isPowerSettingsVisible = false
 
     private static let fastPollingInterval: TimeInterval = 1
-    private static let slowPollingInterval: TimeInterval = 5
-    private static let batteryPollingInterval: TimeInterval = 10
+    private static let slowPollingInterval: TimeInterval = 15
+    private static let batteryPollingInterval: TimeInterval = 30
     private static let snapshotWindowDuration: TimeInterval = 24 * 60 * 60
 
     private init() {}
@@ -7244,12 +7334,19 @@ final class ProcessCPUMonitor: ObservableObject {
         var intervalSeconds = max(1, initialIntervalSeconds)
 
         while !Task.isCancelled {
-            let nextSnapshot = await sampler.sampleAndLoadSnapshot(
-                windowDuration: Self.snapshotWindowDuration,
-                expectedIntervalSeconds: intervalSeconds
-            )
+            let shouldRebuildSnapshot = await MainActor.run { self.isPowerSettingsVisible }
+            let intervalForRequest = intervalSeconds
+            let nextSnapshot = await samplerRequestGate.runIfIdle { [sampler] in
+                await sampler.sampleAndMaybeLoadSnapshot(
+                    windowDuration: Self.snapshotWindowDuration,
+                    expectedIntervalSeconds: intervalForRequest,
+                    shouldBuildSnapshot: shouldRebuildSnapshot
+                )
+            }
             intervalSeconds = await MainActor.run {
-                self.snapshot = nextSnapshot
+                if let nextSnapshot {
+                    self.snapshot = nextSnapshot
+                }
                 self.sampleIntervalSeconds = self.preferredSamplingInterval()
                 return max(1, self.sampleIntervalSeconds)
             }
@@ -7267,10 +7364,16 @@ final class ProcessCPUMonitor: ObservableObject {
         Task(priority: .utility) { [weak self] in
             guard let self else { return }
             let intervalSeconds = max(1, self.sampleIntervalSeconds)
-            let refreshedSnapshot = await self.sampler.resetAndLoadSnapshot(
-                windowDuration: Self.snapshotWindowDuration,
-                expectedIntervalSeconds: intervalSeconds
-            )
+            let refreshedSnapshot = await self.samplerRequestGate.runIfIdle { [sampler = self.sampler] in
+                await sampler.resetAndLoadSnapshot(
+                    windowDuration: Self.snapshotWindowDuration,
+                    expectedIntervalSeconds: intervalSeconds
+                )
+            }
+            guard let refreshedSnapshot else {
+                Log.debug("[SettingsView] Skipping CPU sampler reset; request already in flight", category: .ui)
+                return
+            }
             await MainActor.run {
                 self.snapshot = refreshedSnapshot
             }
@@ -7278,25 +7381,42 @@ final class ProcessCPUMonitor: ObservableObject {
     }
 }
 
+private actor SamplerRequestGate {
+    private var isRunning = false
+
+    func runIfIdle<T: Sendable>(_ operation: @Sendable () async -> T?) async -> T? {
+        guard !isRunning else { return nil }
+        isRunning = true
+        defer { isRunning = false }
+        return await operation()
+    }
+}
+
 private actor ProcessCPULogSampler {
     private struct ProcessIdentity {
         let key: String
         let name: String
-        let isChrome: Bool
+    }
+
+    private struct BundleMetadata {
+        let bundleID: String?
+        let displayName: String
+        let canonicalAppPath: String
     }
 
     private struct CPULogEntry: Codable {
         let timestamp: TimeInterval
         let durationSeconds: TimeInterval
         let retraceGroupKey: String?
-        let chromeGroupKeys: [String]
         let groupDeltaNanoseconds: [String: UInt64]
         let groupDeltaUnit: String?
-        let groupDisplayNames: [String: String]
+        let groupDisplayNames: [String: String]?
     }
 
     private static let logRetentionDuration: TimeInterval = 7 * 24 * 60 * 60
     private static let logCompactionInterval: TimeInterval = 12 * 60 * 60
+    private static let displayNamePersistInterval: TimeInterval = 30
+    private static let logReadChunkSize = 64 * 1024
     private static let nanosecondUnit = "ns"
     private static let machTimebaseInfo: mach_timebase_info_data_t = {
         var info = mach_timebase_info_data_t()
@@ -7312,26 +7432,65 @@ private actor ProcessCPULogSampler {
     private var lastCPUByPID: [pid_t: UInt64] = [:]
     private var identityByPID: [pid_t: ProcessIdentity] = [:]
     private var groupDisplayNameByKey: [String: String] = [:]
-    private var chromeGroupKeys: Set<String> = []
+    private var displayNameMapDirty = false
+    private var lastDisplayNamePersistDate: Date?
     private var retraceGroupKey: String?
     private var lastCompactionDate: Date?
+    private let retraceBundleID: String
+    private let retraceDisplayName: String
+    private var bundleMetadataByCanonicalPath: [String: BundleMetadata] = [:]
+    private var loadedWindowDuration: TimeInterval?
+    private var windowStateNeedsReload = true
+    private var windowEntries: [CPULogEntry] = []
+    private var windowTotalDuration: TimeInterval = 0
+    private var windowCumulativeByGroup: [String: UInt64] = [:]
+    private var windowPeakPercentByGroup: [String: Double] = [:]
     private let logFileURL: URL
+    private let displayNamesFileURL: URL
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
     init() {
+        retraceBundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
+        retraceDisplayName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
+            ?? "Retrace"
         logFileURL = Self.makeLogFileURL()
+        displayNamesFileURL = Self.makeDisplayNamesFileURL()
         Self.ensureLogFileExists(at: logFileURL)
+        groupDisplayNameByKey = Self.readGroupDisplayNameMap(from: displayNamesFileURL)
+        let retraceGroup = "bundle:\(retraceBundleID)"
+        if groupDisplayNameByKey[retraceGroup] != retraceDisplayName {
+            groupDisplayNameByKey[retraceGroup] = retraceDisplayName
+            displayNameMapDirty = true
+        }
     }
 
-    func sampleAndLoadSnapshot(
+    func sampleAndMaybeLoadSnapshot(
         windowDuration: TimeInterval,
-        expectedIntervalSeconds: TimeInterval
-    ) -> ProcessCPUSnapshot {
+        expectedIntervalSeconds: TimeInterval,
+        shouldBuildSnapshot: Bool
+    ) -> ProcessCPUSnapshot? {
         let now = Date()
-        captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        let appendedEntry = captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        maybePersistDisplayNameMap(at: now)
         maybeCompactLog(at: now)
-        return snapshotFromLog(windowDuration: windowDuration, now: now)
+
+        guard shouldBuildSnapshot else {
+            windowStateNeedsReload = true
+            return nil
+        }
+
+        if loadedWindowDuration != windowDuration || windowStateNeedsReload {
+            rebuildWindowStateFromLog(windowDuration: windowDuration, now: now)
+        } else if let appendedEntry {
+            appendEntryToWindowState(appendedEntry)
+            pruneWindowState(cutoffTimestamp: now.addingTimeInterval(-windowDuration).timeIntervalSince1970)
+        } else {
+            pruneWindowState(cutoffTimestamp: now.addingTimeInterval(-windowDuration).timeIntervalSince1970)
+        }
+
+        return snapshotFromWindowState()
     }
 
     func resetAndLoadSnapshot(
@@ -7340,11 +7499,13 @@ private actor ProcessCPULogSampler {
     ) -> ProcessCPUSnapshot {
         clearLogAndState()
         let now = Date()
-        captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
-        return snapshotFromLog(windowDuration: windowDuration, now: now)
+        _ = captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        maybePersistDisplayNameMap(at: now, force: true)
+        rebuildWindowStateFromLog(windowDuration: windowDuration, now: now)
+        return snapshotFromWindowState()
     }
 
-    private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) {
+    private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) -> CPULogEntry? {
         let allPIDs = Self.listAllProcessIDs()
 
         var currentCPUByPID: [pid_t: UInt64] = [:]
@@ -7352,18 +7513,17 @@ private actor ProcessCPULogSampler {
 
         for pid in allPIDs {
             guard let cpuTime = Self.processCPUTimeAbsoluteUnits(for: pid) else { continue }
-            guard let identity = identityByPID[pid] ?? Self.resolveIdentity(for: pid, retracePID: retracePID) else { continue }
+            guard let identity = identityByPID[pid] ?? resolveIdentity(for: pid) else { continue }
 
             currentCPUByPID[pid] = cpuTime
             currentIdentityByPID[pid] = identity
-            groupDisplayNameByKey[identity.key] = identity.name
-            if identity.isChrome {
-                chromeGroupKeys.insert(identity.key)
-            }
+            updateGroupDisplayNameIfNeeded(forKey: identity.key, name: identity.name)
             if pid == retracePID {
                 retraceGroupKey = identity.key
             }
         }
+
+        var appendedEntry: CPULogEntry?
 
         if let lastSampleDate {
             let duration = now.timeIntervalSince(lastSampleDate)
@@ -7383,22 +7543,16 @@ private actor ProcessCPULogSampler {
                 }
 
                 if !groupDeltaNanoseconds.isEmpty {
-                    var groupNamesForEntry: [String: String] = [:]
-                    for key in groupDeltaNanoseconds.keys {
-                        groupNamesForEntry[key] = groupDisplayNameByKey[key] ?? key
-                    }
-
-                    let currentChromeKeys = Set(currentIdentityByPID.values.filter(\.isChrome).map(\.key))
                     let entry = CPULogEntry(
                         timestamp: now.timeIntervalSince1970,
                         durationSeconds: duration,
                         retraceGroupKey: retraceGroupKey,
-                        chromeGroupKeys: Array(currentChromeKeys),
                         groupDeltaNanoseconds: groupDeltaNanoseconds,
                         groupDeltaUnit: Self.nanosecondUnit,
-                        groupDisplayNames: groupNamesForEntry
+                        groupDisplayNames: nil
                     )
                     appendLogEntry(entry)
+                    appendedEntry = entry
                 }
             }
         }
@@ -7406,43 +7560,292 @@ private actor ProcessCPULogSampler {
         lastSampleDate = now
         lastCPUByPID = currentCPUByPID
         identityByPID = currentIdentityByPID
+        return appendedEntry
     }
 
-    private func snapshotFromLog(windowDuration: TimeInterval, now: Date) -> ProcessCPUSnapshot {
-        let entries = readLogEntries()
-        let cutoffTimestamp = now.addingTimeInterval(-windowDuration).timeIntervalSince1970
+    private func resolveIdentity(for pid: pid_t) -> ProcessIdentity? {
+        if pid == retracePID {
+            return ProcessIdentity(
+                key: "bundle:\(retraceBundleID)",
+                name: retraceDisplayName
+            )
+        }
 
-        var totalDuration: TimeInterval = 0
-        var cumulativeByGroup: [String: UInt64] = [:]
-        var peakPercentByGroup: [String: Double] = [:]
-        var displayNamesByKey = groupDisplayNameByKey
-        var effectiveChromeGroupKeys = chromeGroupKeys
-        var effectiveRetraceGroupKey = retraceGroupKey
+        if let identity = resolveBundleBackedIdentity(for: pid) {
+            return identity
+        }
 
-        for entry in entries where entry.timestamp >= cutoffTimestamp {
-            totalDuration += entry.durationSeconds
+        if let identity = resolveBundleIdentityFromParentChain(for: pid) {
+            return identity
+        }
 
+        let executableName = Self.processName(for: pid)
+            ?? Self.processPath(for: pid).map { URL(fileURLWithPath: $0).lastPathComponent }
+            ?? "pid\(pid)"
+
+        let normalizedName = Self.normalizedKeyComponent(executableName)
+        return ProcessIdentity(
+            key: "proc:\(normalizedName)",
+            name: executableName
+        )
+    }
+
+    private func resolveBundleBackedIdentity(for pid: pid_t) -> ProcessIdentity? {
+        guard let path = Self.processPath(for: pid),
+              let appPath = Self.appBundlePath(from: path) else {
+            return nil
+        }
+
+        let metadata = bundleMetadata(forAppPath: appPath)
+        if let bundleID = metadata.bundleID, !bundleID.isEmpty {
+            return ProcessIdentity(
+                key: "bundle:\(bundleID)",
+                name: metadata.displayName
+            )
+        }
+
+        return ProcessIdentity(
+            key: "app:\(metadata.canonicalAppPath)",
+            name: metadata.displayName
+        )
+    }
+
+    private func resolveBundleIdentityFromParentChain(for pid: pid_t) -> ProcessIdentity? {
+        var currentPID = pid
+        var visited: Set<pid_t> = [pid]
+        let maxDepth = 8
+
+        for _ in 0..<maxDepth {
+            guard let parentPID = Self.parentPID(for: currentPID),
+                  parentPID > 1,
+                  !visited.contains(parentPID) else {
+                return nil
+            }
+
+            visited.insert(parentPID)
+            if parentPID == retracePID {
+                return ProcessIdentity(
+                    key: "bundle:\(retraceBundleID)",
+                    name: retraceDisplayName
+                )
+            }
+
+            if let identity = resolveBundleBackedIdentity(for: parentPID) {
+                return identity
+            }
+
+            currentPID = parentPID
+        }
+
+        return nil
+    }
+
+    private func bundleMetadata(forAppPath appPath: String) -> BundleMetadata {
+        let canonicalPath = appPath.lowercased()
+        if let cached = bundleMetadataByCanonicalPath[canonicalPath] {
+            return cached
+        }
+
+        let appURL = URL(fileURLWithPath: appPath)
+        let fallbackName = appURL.deletingPathExtension().lastPathComponent
+        var bundleID: String?
+        var displayName = fallbackName
+
+        if let bundle = Bundle(url: appURL) {
+            bundleID = bundle.bundleIdentifier
+
+            if let bundleDisplayName = normalizedBundleString(
+                bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ) {
+                displayName = bundleDisplayName
+            } else if let bundleName = normalizedBundleString(
+                bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+            ) {
+                displayName = bundleName
+            }
+        }
+
+        let metadata = BundleMetadata(
+            bundleID: bundleID,
+            displayName: displayName,
+            canonicalAppPath: canonicalPath
+        )
+        bundleMetadataByCanonicalPath[canonicalPath] = metadata
+        return metadata
+    }
+
+    private func normalizedBundleString(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func updateGroupDisplayNameIfNeeded(forKey key: String, name: String) {
+        guard !key.isEmpty else { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        if groupDisplayNameByKey[key] == trimmedName {
+            return
+        }
+        groupDisplayNameByKey[key] = trimmedName
+        displayNameMapDirty = true
+    }
+
+    private func maybePersistDisplayNameMap(at now: Date, force: Bool = false) {
+        guard displayNameMapDirty else { return }
+        if !force, let lastDisplayNamePersistDate,
+           now.timeIntervalSince(lastDisplayNamePersistDate) < Self.displayNamePersistInterval {
+            return
+        }
+
+        do {
+            Self.ensureLogFileExists(at: displayNamesFileURL)
+            let data = try encoder.encode(groupDisplayNameByKey)
+            try data.write(to: displayNamesFileURL, options: .atomic)
+            displayNameMapDirty = false
+            lastDisplayNamePersistDate = now
+        } catch {
+            Log.warning("[SettingsView] Failed to persist CPU group display names: \(error)", category: .ui)
+        }
+    }
+
+    private static func readGroupDisplayNameMap(from fileURL: URL) -> [String: String] {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return [:] }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            guard !data.isEmpty else { return [:] }
+            let decoded = try JSONDecoder().decode([String: String].self, from: data)
+            var sanitized: [String: String] = [:]
+            sanitized.reserveCapacity(decoded.count)
+            for (key, value) in decoded {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty, !trimmed.isEmpty else { continue }
+                sanitized[key] = trimmed
+            }
+            return sanitized
+        } catch {
+            Log.warning("[SettingsView] Failed to read CPU group display names: \(error)", category: .ui)
+            return [:]
+        }
+    }
+
+    private func applyLegacyDisplayNamesIfPresent(from entry: CPULogEntry) {
+        guard let groupDisplayNames = entry.groupDisplayNames, !groupDisplayNames.isEmpty else {
+            return
+        }
+        for (key, name) in groupDisplayNames {
+            updateGroupDisplayNameIfNeeded(forKey: key, name: name)
+        }
+    }
+
+    private func appendEntryToWindowState(_ entry: CPULogEntry) {
+        applyLegacyDisplayNamesIfPresent(from: entry)
+        windowEntries.append(entry)
+        windowTotalDuration += entry.durationSeconds
+        for (key, rawDelta) in entry.groupDeltaNanoseconds {
+            let delta = Self.normalizedDeltaNanoseconds(rawDelta: rawDelta, unit: entry.groupDeltaUnit)
+            windowCumulativeByGroup[key, default: 0] += delta
+            guard entry.durationSeconds > 0 else { continue }
+            let instantPercent = (Double(delta) / 1_000_000_000.0) / entry.durationSeconds * 100.0
+            if instantPercent > (windowPeakPercentByGroup[key] ?? 0) {
+                windowPeakPercentByGroup[key] = instantPercent
+            }
+        }
+    }
+
+    private func pruneWindowState(cutoffTimestamp: TimeInterval) {
+        guard !windowEntries.isEmpty else { return }
+
+        var peakKeysToRebuild: Set<String> = []
+        var removeCount = 0
+        while removeCount < windowEntries.count, windowEntries[removeCount].timestamp < cutoffTimestamp {
+            let entry = windowEntries[removeCount]
+            windowTotalDuration -= entry.durationSeconds
             for (key, rawDelta) in entry.groupDeltaNanoseconds {
                 let delta = Self.normalizedDeltaNanoseconds(rawDelta: rawDelta, unit: entry.groupDeltaUnit)
-                cumulativeByGroup[key, default: 0] += delta
-            }
+                guard let current = windowCumulativeByGroup[key] else { continue }
+                if current <= delta {
+                    windowCumulativeByGroup.removeValue(forKey: key)
+                } else {
+                    windowCumulativeByGroup[key] = current - delta
+                }
 
-            for (key, name) in entry.groupDisplayNames where displayNamesByKey[key] == nil {
-                displayNamesByKey[key] = name
+                guard entry.durationSeconds > 0,
+                      let currentPeak = windowPeakPercentByGroup[key] else { continue }
+                let instantPercent = (Double(delta) / 1_000_000_000.0) / entry.durationSeconds * 100.0
+                if instantPercent >= (currentPeak - 0.000_001) {
+                    peakKeysToRebuild.insert(key)
+                }
             }
+            removeCount += 1
+        }
 
-            effectiveChromeGroupKeys.formUnion(entry.chromeGroupKeys)
-            if effectiveRetraceGroupKey == nil {
-                effectiveRetraceGroupKey = entry.retraceGroupKey
-            }
+        if removeCount > 0 {
+            windowEntries.removeFirst(removeCount)
+            recomputePeakPercentages(for: peakKeysToRebuild)
+        }
 
-            guard entry.durationSeconds > 0 else { continue }
+        if windowTotalDuration < 0 {
+            windowTotalDuration = 0
+        }
+    }
+
+    private func rebuildWindowStateFromLog(windowDuration: TimeInterval, now: Date) {
+        loadedWindowDuration = windowDuration
+        windowEntries.removeAll(keepingCapacity: true)
+        windowTotalDuration = 0
+        windowCumulativeByGroup.removeAll(keepingCapacity: true)
+        windowPeakPercentByGroup.removeAll(keepingCapacity: true)
+
+        let cutoffTimestamp = now.addingTimeInterval(-windowDuration).timeIntervalSince1970
+        streamLogEntries { entry in
+            guard entry.timestamp >= cutoffTimestamp else { return }
+            appendEntryToWindowState(entry)
+        }
+
+        windowStateNeedsReload = false
+        maybePersistDisplayNameMap(at: now)
+    }
+
+    private func recomputePeakPercentages(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+
+        var recomputed: [String: Double] = [:]
+        for entry in windowEntries where entry.durationSeconds > 0 {
             for (key, rawDelta) in entry.groupDeltaNanoseconds {
+                guard keys.contains(key) else { continue }
                 let delta = Self.normalizedDeltaNanoseconds(rawDelta: rawDelta, unit: entry.groupDeltaUnit)
                 let instantPercent = (Double(delta) / 1_000_000_000.0) / entry.durationSeconds * 100.0
-                if instantPercent > (peakPercentByGroup[key] ?? 0) {
-                    peakPercentByGroup[key] = instantPercent
+                if instantPercent > (recomputed[key] ?? 0) {
+                    recomputed[key] = instantPercent
                 }
+            }
+        }
+
+        for key in keys {
+            if windowCumulativeByGroup[key] == nil {
+                windowPeakPercentByGroup.removeValue(forKey: key)
+            } else if let peak = recomputed[key] {
+                windowPeakPercentByGroup[key] = peak
+            } else {
+                windowPeakPercentByGroup.removeValue(forKey: key)
+            }
+        }
+    }
+
+    private func snapshotFromWindowState() -> ProcessCPUSnapshot {
+        let totalDuration = max(windowTotalDuration, 0)
+        let cumulativeByGroup = windowCumulativeByGroup
+        let peakPercentByGroup = windowPeakPercentByGroup
+        let displayNamesByKey = groupDisplayNameByKey
+        var effectiveRetraceGroupKey = retraceGroupKey
+
+        for entry in windowEntries {
+            if effectiveRetraceGroupKey == nil {
+                effectiveRetraceGroupKey = entry.retraceGroupKey
             }
         }
 
@@ -7464,11 +7867,6 @@ private actor ProcessCPULogSampler {
         let retraceTrackedSharePercent = totalTrackedCPUSeconds > 0
             ? (retraceCPUSeconds / totalTrackedCPUSeconds) * 100.0
             : 0
-
-        let chromeNanoseconds = effectiveChromeGroupKeys.reduce(UInt64(0)) { partialResult, key in
-            partialResult + (cumulativeByGroup[key] ?? 0)
-        }
-        let chromeCPUSeconds = Double(chromeNanoseconds) / 1_000_000_000.0
 
         let rankedProcesses = cumulativeByGroup.map { key, nanoseconds -> ProcessCPURow in
             let seconds = Double(nanoseconds) / 1_000_000_000.0
@@ -7504,11 +7902,9 @@ private actor ProcessCPULogSampler {
             trackedSharePercent: retraceTrackedSharePercent,
             logicalCoreCount: logicalCoreCount,
             retraceCPUSeconds: retraceCPUSeconds,
-            chromeCPUSeconds: chromeCPUSeconds,
             totalTrackedCPUSeconds: totalTrackedCPUSeconds,
             retraceRank: retraceRank,
             retraceGroupKey: effectiveRetraceGroupKey,
-            chromeGroupKeys: effectiveChromeGroupKeys,
             peakPercentByGroup: peakPercentByGroup,
             topProcesses: rankedProcesses
         )
@@ -7520,7 +7916,12 @@ private actor ProcessCPULogSampler {
         }
 
         let retentionCutoff = now.addingTimeInterval(-Self.logRetentionDuration).timeIntervalSince1970
-        let retainedEntries = readLogEntries().filter { $0.timestamp >= retentionCutoff }
+        var retainedEntries: [CPULogEntry] = []
+        streamLogEntries { entry in
+            if entry.timestamp >= retentionCutoff {
+                retainedEntries.append(entry)
+            }
+        }
         rewriteLog(with: retainedEntries)
         lastCompactionDate = now
     }
@@ -7539,25 +7940,36 @@ private actor ProcessCPULogSampler {
         }
     }
 
-    private func readLogEntries() -> [CPULogEntry] {
-        guard FileManager.default.fileExists(atPath: logFileURL.path) else { return [] }
+    private func streamLogEntries(_ consume: (CPULogEntry) -> Void) {
+        guard FileManager.default.fileExists(atPath: logFileURL.path) else { return }
 
         do {
-            let data = try Data(contentsOf: logFileURL)
-            guard !data.isEmpty else { return [] }
-            guard let content = String(data: data, encoding: .utf8) else { return [] }
+            let handle = try FileHandle(forReadingFrom: logFileURL)
+            defer { try? handle.close() }
 
-            var entries: [CPULogEntry] = []
-            for line in content.split(whereSeparator: \.isNewline) {
-                let lineData = Data(line.utf8)
-                if let entry = try? decoder.decode(CPULogEntry.self, from: lineData) {
-                    entries.append(entry)
+            var pending = Data()
+            while let chunk = try handle.read(upToCount: Self.logReadChunkSize), !chunk.isEmpty {
+                pending.append(chunk)
+
+                var scanIndex = pending.startIndex
+                while let newlineIndex = pending[scanIndex...].firstIndex(of: 0x0A) {
+                    let lineData = Data(pending[scanIndex..<newlineIndex])
+                    if !lineData.isEmpty, let entry = try? decoder.decode(CPULogEntry.self, from: lineData) {
+                        consume(entry)
+                    }
+                    scanIndex = pending.index(after: newlineIndex)
+                }
+
+                if scanIndex > pending.startIndex {
+                    pending.removeSubrange(..<scanIndex)
                 }
             }
-            return entries
+
+            if !pending.isEmpty, let entry = try? decoder.decode(CPULogEntry.self, from: pending) {
+                consume(entry)
+            }
         } catch {
-            Log.warning("[SettingsView] Failed to read CPU usage log file: \(error)", category: .ui)
-            return []
+            Log.warning("[SettingsView] Failed to stream CPU usage log file: \(error)", category: .ui)
         }
     }
 
@@ -7581,8 +7993,17 @@ private actor ProcessCPULogSampler {
         lastSampleDate = nil
         lastCPUByPID = [:]
         identityByPID = [:]
-        groupDisplayNameByKey = [:]
-        chromeGroupKeys = []
+        groupDisplayNameByKey = Self.readGroupDisplayNameMap(from: displayNamesFileURL)
+        updateGroupDisplayNameIfNeeded(forKey: "bundle:\(retraceBundleID)", name: retraceDisplayName)
+        displayNameMapDirty = false
+        lastDisplayNamePersistDate = nil
+        bundleMetadataByCanonicalPath = [:]
+        loadedWindowDuration = nil
+        windowStateNeedsReload = true
+        windowEntries = []
+        windowTotalDuration = 0
+        windowCumulativeByGroup = [:]
+        windowPeakPercentByGroup = [:]
         retraceGroupKey = nil
         lastCompactionDate = nil
     }
@@ -7604,6 +8025,13 @@ private actor ProcessCPULogSampler {
         return rootURL
             .appendingPathComponent("logs", isDirectory: true)
             .appendingPathComponent("cpu_process_usage.jsonl", isDirectory: false)
+    }
+
+    private static func makeDisplayNamesFileURL() -> URL {
+        let rootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        return rootURL
+            .appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("cpu_process_groups.json", isDirectory: false)
     }
 
     private static func listAllProcessIDs() -> [pid_t] {
@@ -7644,53 +8072,6 @@ private actor ProcessCPULogSampler {
         return absoluteTimeToNanoseconds(rawDelta)
     }
 
-    private static func resolveIdentity(for pid: pid_t, retracePID: pid_t) -> ProcessIdentity? {
-        if pid == retracePID {
-            return ProcessIdentity(
-                key: "app:retrace",
-                name: "Retrace",
-                isChrome: false
-            )
-        }
-
-        let path = processPath(for: pid)
-        if let path, let appPath = appBundlePath(from: path) {
-            let appName = URL(fileURLWithPath: appPath).deletingPathExtension().lastPathComponent
-            if isChromeProcessName(appName) {
-                return ProcessIdentity(
-                    key: "app:google-chrome",
-                    name: "Google Chrome",
-                    isChrome: true
-                )
-            }
-
-            return ProcessIdentity(
-                key: "app:\(appPath.lowercased())",
-                name: appName,
-                isChrome: false
-            )
-        }
-
-        let executableName = processName(for: pid)
-            ?? path.map { URL(fileURLWithPath: $0).lastPathComponent }
-            ?? "pid\(pid)"
-
-        if isChromeProcessName(executableName) {
-            return ProcessIdentity(
-                key: "app:google-chrome",
-                name: "Google Chrome",
-                isChrome: true
-            )
-        }
-
-        let normalizedName = normalizedKeyComponent(executableName)
-        return ProcessIdentity(
-            key: "proc:\(normalizedName)",
-            name: executableName,
-            isChrome: executableName.localizedCaseInsensitiveContains("chrome")
-        )
-    }
-
     private static func processPath(for pid: pid_t) -> String? {
         let maxPathSize = Int(MAXPATHLEN * 4)
         var buffer = [CChar](repeating: 0, count: maxPathSize)
@@ -7706,6 +8087,18 @@ private actor ProcessCPULogSampler {
         return String(cString: nameBuffer)
     }
 
+    private static func parentPID(for pid: pid_t) -> pid_t? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, pointer, size)
+        }
+        guard result == size,
+              info.pbi_ppid > 0,
+              info.pbi_ppid <= UInt32(Int32.max) else { return nil }
+        return pid_t(info.pbi_ppid)
+    }
+
     private static func appBundlePath(from executablePath: String) -> String? {
         guard let appMarker = executablePath.range(of: ".app/", options: .caseInsensitive) else {
             return nil
@@ -7713,13 +8106,6 @@ private actor ProcessCPULogSampler {
 
         let appEnd = executablePath.index(appMarker.lowerBound, offsetBy: 4)
         return String(executablePath[..<appEnd])
-    }
-
-    private static func isChromeProcessName(_ name: String) -> Bool {
-        let lowercased = name.lowercased()
-        return lowercased.contains("google chrome")
-            || lowercased.contains("chrome helper")
-            || lowercased == "chrome"
     }
 
     private static func normalizedKeyComponent(_ value: String) -> String {

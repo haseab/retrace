@@ -154,10 +154,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminationDecisionInProgress = false
     private var bypassQuitConfirmationPromptOnce = false
     private var quitConfirmationHostWindow: NSWindow?
+    private var singleInstanceLockFileDescriptor: CInt = -1
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
+    private static let canonicalBundleIdentifier = "io.retrace.app"
+    private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
 
     private enum QuitTerminationPreference: String {
         case ask
@@ -183,11 +186,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isRelaunch {
             Log.info("[AppDelegate] App relaunched successfully", category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
-        } else if isAnotherInstanceRunning() {
-            Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
-            activateExistingInstance()
-            requestImmediateTermination(skipQuitConfirmation: true)
-            return
+        } else {
+            let hasSingleInstanceLock = acquireSingleInstanceLock()
+            if !hasSingleInstanceLock || isAnotherInstanceRunning() {
+                Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
+                activateExistingInstance()
+                requestImmediateTermination(skipQuitConfirmation: true)
+                return
+            }
         }
 
         // Configure app appearance
@@ -998,35 +1004,125 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Single Instance Check
 
+    private func singleInstanceBundleIdentifier() -> String {
+        if let bundleID = Bundle.main.bundleIdentifier, !bundleID.isEmpty {
+            return bundleID
+        }
+
+        if let infoBundleID = Bundle.main.object(forInfoDictionaryKey: "CFBundleIdentifier") as? String,
+           !infoBundleID.isEmpty {
+            return infoBundleID
+        }
+
+        Log.warning(
+            "[AppDelegate] Missing runtime bundle identifier; using canonical identifier \(Self.canonicalBundleIdentifier) for single-instance coordination",
+            category: .app
+        )
+        return Self.canonicalBundleIdentifier
+    }
+
+    private func acquireSingleInstanceLock() -> Bool {
+        if singleInstanceLockFileDescriptor >= 0 {
+            return true
+        }
+
+        let lockPath = Self.singleInstanceLockPath
+        let fd = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        if fd == -1 {
+            let openError = errno
+            Log.error(
+                "[AppDelegate] Failed to open single-instance lock file at \(lockPath): \(String(cString: strerror(openError)))",
+                category: .app
+            )
+            return true
+        }
+
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockError = errno
+            close(fd)
+
+            if lockError == EWOULDBLOCK {
+                return false
+            }
+
+            Log.error(
+                "[AppDelegate] Failed to acquire single-instance lock at \(lockPath): \(String(cString: strerror(lockError)))",
+                category: .app
+            )
+            return true
+        }
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        _ = ftruncate(fd, 0)
+        _ = lseek(fd, 0, SEEK_SET)
+        let pidString = "\(currentPID)\n"
+        pidString.withCString { pidCString in
+            _ = write(fd, pidCString, strlen(pidCString))
+        }
+
+        singleInstanceLockFileDescriptor = fd
+        return true
+    }
+
+    private func releaseSingleInstanceLock() {
+        guard singleInstanceLockFileDescriptor >= 0 else { return }
+
+        _ = flock(singleInstanceLockFileDescriptor, LOCK_UN)
+        close(singleInstanceLockFileDescriptor)
+        singleInstanceLockFileDescriptor = -1
+    }
+
+    private func lockFileInstancePID() -> pid_t? {
+        guard let data = FileManager.default.contents(atPath: Self.singleInstanceLockPath),
+              let lockContents = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let lockPID = Int32(lockContents) else {
+            return nil
+        }
+        return pid_t(lockPID)
+    }
+
+    private func postExternalDashboardRevealNotification() {
+        DistributedNotificationCenter.default().postNotificationName(
+            Self.externalDashboardRevealNotification,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        Log.info("[LaunchSurface] Posted external dashboard reveal notification", category: .app)
+    }
+
     private func isAnotherInstanceRunning() -> Bool {
+        let retraceBundleID = singleInstanceBundleIdentifier()
         let runningApps = NSWorkspace.shared.runningApplications
         let myPID = ProcessInfo.processInfo.processIdentifier
 
-        let retraceApps = runningApps.filter { app in
-            let isRetrace = app.bundleIdentifier?.contains("retrace") == true ||
-                           app.localizedName?.contains("Retrace") == true
-            return isRetrace && app.processIdentifier != myPID
+        return runningApps.contains { app in
+            app.processIdentifier != myPID && app.bundleIdentifier == retraceBundleID
         }
-
-        return !retraceApps.isEmpty
     }
 
     private func activateExistingInstance() {
+        let retraceBundleID = singleInstanceBundleIdentifier()
+        let myPID = ProcessInfo.processInfo.processIdentifier
         let runningApps = NSWorkspace.shared.runningApplications
+
         if let existingApp = runningApps.first(where: { app in
-            (app.bundleIdentifier?.contains("retrace") == true ||
-             app.localizedName?.contains("Retrace") == true) &&
-            app.processIdentifier != ProcessInfo.processInfo.processIdentifier
+            app.bundleIdentifier == retraceBundleID &&
+                app.processIdentifier != myPID
         }) {
             Log.info("[LaunchSurface] Forwarding duplicate launch to existing instance pid=\(existingApp.processIdentifier) hidden=\(existingApp.isHidden) active=\(existingApp.isActive)", category: .app)
             existingApp.activate(options: .activateIgnoringOtherApps)
-            DistributedNotificationCenter.default().postNotificationName(
-                Self.externalDashboardRevealNotification,
-                object: nil,
-                userInfo: nil,
-                deliverImmediately: true
-            )
-            Log.info("[LaunchSurface] Posted external dashboard reveal notification", category: .app)
+            postExternalDashboardRevealNotification()
+            return
+        }
+
+        if let lockPID = lockFileInstancePID(),
+           lockPID != myPID,
+           let lockedApp = NSRunningApplication(processIdentifier: lockPID) {
+            Log.info("[LaunchSurface] Forwarding duplicate launch to locked instance pid=\(lockPID) hidden=\(lockedApp.isHidden) active=\(lockedApp.isActive)", category: .app)
+            lockedApp.activate(options: .activateIgnoringOtherApps)
+            postExternalDashboardRevealNotification()
         } else {
             Log.warning("[LaunchSurface] Duplicate launch detected but no existing instance was found", category: .app)
         }
@@ -1102,6 +1198,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        releaseSingleInstanceLock()
+
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         for observer in sleepWakeObservers {
             workspaceCenter.removeObserver(observer)

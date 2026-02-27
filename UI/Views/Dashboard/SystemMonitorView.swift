@@ -522,8 +522,9 @@ struct ProcessingBarChart: View {
     // Backlog hover state
     @State private var isHoveringBacklog = false
 
-    // Cap for each backlog bar
+    // Cap for each backlog bar and maximum number of visible backlog bars.
     private let backlogBarCap = 100
+    private let maxVisibleBacklogBars = 10
     private let tooltipEstimatedHeight: CGFloat = 56
     private let tooltipGapAboveBar: CGFloat = 8
     private let tooltipTopOverflowAllowance: CGFloat = 14
@@ -539,11 +540,13 @@ struct ProcessingBarChart: View {
 
             // Reserve space for backlog section if there's pending work
             let hasBacklog = pendingCount > 0
-            // Calculate number of backlog bars needed (each bar shows up to backlogBarCap)
-            let backlogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
+            // Total backlog bars represented by pending count (each bar shows up to backlogBarCap)
+            let totalBacklogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
+            // Render only the most recent backlog bars to avoid overflow in the chart UI.
+            let visibleBacklogBarCount = min(totalBacklogBarCount, maxVisibleBacklogBars)
             let singleBarWidth: CGFloat = 28
             let backlogSpacing: CGFloat = 2
-            let backlogWidth: CGFloat = hasBacklog ? CGFloat(backlogBarCount) * singleBarWidth + CGFloat(max(0, backlogBarCount - 1)) * backlogSpacing + 12 : 0
+            let backlogWidth: CGFloat = hasBacklog ? CGFloat(visibleBacklogBarCount) * singleBarWidth + CGFloat(max(0, visibleBacklogBarCount - 1)) * backlogSpacing + 12 : 0
             let separatorWidth: CGFloat = hasBacklog ? 12 : 0
             let chartWidth = totalWidth - backlogWidth - separatorWidth
 
@@ -643,7 +646,8 @@ struct ProcessingBarChart: View {
                         backlogBarsView(
                             pendingCount: pendingCount,
                             maxValue: maxValue,
-                            barCount: backlogBarCount,
+                            visibleBarCount: visibleBacklogBarCount,
+                            totalBarCount: totalBacklogBarCount,
                             singleBarWidth: singleBarWidth,
                             spacing: backlogSpacing,
                             totalWidth: backlogWidth,
@@ -740,19 +744,21 @@ struct ProcessingBarChart: View {
     private func backlogBarsView(
         pendingCount: Int,
         maxValue: Int,
-        barCount: Int,
+        visibleBarCount: Int,
+        totalBarCount: Int,
         singleBarWidth: CGFloat,
         spacing: CGFloat,
         totalWidth: CGFloat,
         height: CGFloat
     ) -> some View {
-        HStack(alignment: .bottom, spacing: spacing) {
-            ForEach(0..<barCount, id: \.self) { barIndex in
-                // FIFO: rightmost bars drain first, so we fill from right to left
-                // barIndex 0 = leftmost bar (last to drain), barIndex N-1 = rightmost bar (first to drain)
-                // Reverse the index for calculation: rightmost bar shows remainder, leftmost bars are full
-                let reverseIndex = barCount - 1 - barIndex
-                let previousBarsTotal = reverseIndex * backlogBarCap
+        let newestBarIndex = totalBarCount - 1
+
+        return HStack(alignment: .bottom, spacing: spacing) {
+            ForEach(0..<visibleBarCount, id: \.self) { visibleBarIndex in
+                // Show only the most recent N backlog bars when total bar count exceeds UI cap.
+                // Bars are rendered left -> right, with newest chunk first so leftmost drains first.
+                let actualBarIndex = newestBarIndex - visibleBarIndex
+                let previousBarsTotal = actualBarIndex * backlogBarCap
                 let remainingForThisBar = pendingCount - previousBarsTotal
                 let thisBarCount = min(max(remainingForThisBar, 0), backlogBarCap)
 
@@ -998,6 +1004,14 @@ struct ProcessingDataPoint: Identifiable {
 
 @MainActor
 class SystemMonitorViewModel: ObservableObject {
+    #if DEBUG
+    private enum DebugDefaultsKey {
+        static let pendingCount = "debugSystemMonitorPendingCount"
+        static let processingCount = "debugSystemMonitorProcessingCount"
+        static let queueDepth = "debugSystemMonitorQueueDepth"
+    }
+    #endif
+
     // Queue stats
     @Published var queueDepth: Int = 0
     @Published var pendingCount: Int = 0       // Frames waiting (status 0)
@@ -1193,6 +1207,8 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func updateStats() async {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
         // Get queue statistics
         if let stats = await coordinator.getQueueStatistics() {
             queueDepth = stats.queueDepth
@@ -1212,13 +1228,16 @@ class SystemMonitorViewModel: ObservableObject {
             updateProcessingHistory()
         }
 
+        #if DEBUG
+        applyDebugQueueOverrides(defaults: defaults)
+        #endif
+
         // Get power state
         let powerState = coordinator.getCurrentPowerState()
         powerSource = powerState.source
         isPausedForBattery = powerState.isPaused
 
         // Get OCR enabled state
-        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
         isRecordingActive = coordinator.statusHolder.status.isRunning
         let processingLevel = (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3
@@ -1229,6 +1248,28 @@ class SystemMonitorViewModel: ObservableObject {
             captureIntervalSeconds = 2.0
         }
     }
+
+    #if DEBUG
+    private func applyDebugQueueOverrides(defaults: UserDefaults) {
+        let pendingOverride = (defaults.object(forKey: DebugDefaultsKey.pendingCount) as? NSNumber)?.intValue
+        let processingOverride = (defaults.object(forKey: DebugDefaultsKey.processingCount) as? NSNumber)?.intValue
+        let queueDepthOverride = (defaults.object(forKey: DebugDefaultsKey.queueDepth) as? NSNumber)?.intValue
+
+        if let pendingOverride {
+            pendingCount = max(pendingOverride, 0)
+        }
+
+        if let processingOverride {
+            processingCount = max(processingOverride, 0)
+        }
+
+        if let queueDepthOverride {
+            queueDepth = max(queueDepthOverride, 0)
+        } else if pendingOverride != nil || processingOverride != nil {
+            queueDepth = max(pendingCount + processingCount, 0)
+        }
+    }
+    #endif
 
     private func updateProcessingHistory() {
         let nowKey = minuteKey(for: Date())
