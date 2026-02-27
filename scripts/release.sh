@@ -144,7 +144,7 @@ echo -e "${GREEN}✓ DMG copied to Desktop${NC}"
 # Step 9: Upload to R2
 echo -e "${YELLOW}[9/10] Uploading to R2...${NC}"
 if [ "$WRANGLER_AVAILABLE" = true ]; then
-    wrangler r2 object put "${R2_BUCKET}/${DMG_NAME}" --file="${DMG_PATH}"
+    wrangler r2 object put "${R2_BUCKET}/${DMG_NAME}" --file="${DMG_PATH}" --remote
     echo -e "${GREEN}✓ Uploaded to https://cdn.retrace.to/${DMG_NAME}${NC}"
 else
     echo -e "${YELLOW}⚠ Skipped (wrangler not installed)${NC}"
@@ -155,7 +155,9 @@ fi
 echo -e "${YELLOW}[10/10] Updating frontend...${NC}"
 sed -i '' "s|https://cdn.retrace.to/Retrace-v[^\"]*\.dmg|https://cdn.retrace.to/${DMG_NAME}|g" "${FRONTEND_DIR}/src/lib/track-download.ts"
 sed -i '' "s/version: \"[^\"]*\"/version: \"${VERSION}\"/" "${FRONTEND_DIR}/src/lib/track-download.ts"
-echo -e "${GREEN}✓ Frontend download URL updated${NC}"
+sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/ui/download-button.tsx"
+sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/sections/hero-base.tsx"
+echo -e "${GREEN}✓ Frontend download URL/text updated${NC}"
 
 # Generate appcast entry
 PUBDATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
