@@ -483,6 +483,37 @@ final class DateJumpPlayheadRelativeParsingTests: XCTestCase {
 
 @MainActor
 final class SearchHighlightQueryParsingTests: XCTestCase {
+    func testSingleLetterTermHighlightsWholeWordOnly() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.ocrNodes = [
+            makeNode(id: 1, text: "Status page"),
+            makeNode(id: 2, text: "Create a feature quickly"),
+            makeNode(id: 3, text: "Planning board")
+        ]
+        viewModel.searchHighlightQuery = "a"
+        viewModel.isShowingSearchHighlight = true
+
+        let matches = viewModel.searchHighlightNodes
+
+        XCTAssertEqual(matches.map(\.node.id), [2])
+        XCTAssertEqual(matches.first?.ranges.count, 1)
+    }
+
+    func testMixedQueryDoesNotHighlightEmbeddedSingleLetterMatches() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.ocrNodes = [
+            makeNode(id: 1, text: "Status planning board"),
+            makeNode(id: 2, text: "Create a feature quickly"),
+            makeNode(id: 3, text: "Feature rollout")
+        ]
+        viewModel.searchHighlightQuery = "create a feature"
+        viewModel.isShowingSearchHighlight = true
+
+        let matches = viewModel.searchHighlightNodes
+
+        XCTAssertEqual(matches.map(\.node.id), [2, 3])
+    }
+
     func testQuotedPhraseSearchOnlyHighlightsPhraseMatches() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.ocrNodes = [

@@ -804,42 +804,86 @@ public actor DataAdapter {
         Log.info("[DataAdapter] Search started: query='\(query.text)', mode=\(query.mode), limit=\(query.limit), appFilter=\(query.filters.appBundleIDs ?? []), startDate=\(String(describing: query.filters.startDate)), endDate=\(String(describing: query.filters.endDate))", category: .app)
 
         let startTime = Date()
-        var allResults: [SearchResult] = []
-        var totalCount = 0
-
-        // Search Retrace
-        let retraceStart = Date()
-        do {
-            let retraceResults = try searchConnection(query: query, connection: retraceConnection, config: retraceConfig, source: .native)
-            let retraceElapsed = Int(Date().timeIntervalSince(retraceStart) * 1000)
-            Log.info("[DataAdapter] Retrace search completed in \(retraceElapsed)ms, found \(retraceResults.results.count) results", category: .app)
-            allResults.append(contentsOf: retraceResults.results)
-            totalCount += retraceResults.totalCount
-        } catch {
-            Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
-        }
-
+        let hiddenTagId = cachedHiddenTagId
         let retraceOnlySearchFilters = requiresRetraceOnly(query.filters)
 
-        // Search Rewind
+        let retraceStart = Date()
+        let retraceTask = Task.detached(priority: .userInitiated) { [query, retraceConnection, retraceConfig, hiddenTagId] in
+            try Self.searchConnection(
+                query: query,
+                connection: retraceConnection,
+                config: retraceConfig,
+                source: .native,
+                hiddenTagId: hiddenTagId
+            )
+        }
+
+        var rewindTask: Task<SearchResults, Error>?
+        var rewindStart: Date?
         if !retraceOnlySearchFilters, let rewind = rewindConnection, let config = rewindConfig {
-            let rewindStart = Date()
-            do {
-                var rewindResults = try searchConnection(query: query, connection: rewind, config: config, source: .rewind)
-                let rewindElapsed = Int(Date().timeIntervalSince(rewindStart) * 1000)
-                Log.info("[DataAdapter] Rewind search completed in \(rewindElapsed)ms, found \(rewindResults.results.count) results", category: .app)
-                rewindResults.results = rewindResults.results.map { result in
-                    var modified = result
-                    modified.source = .rewind
-                    return modified
-                }
-                allResults.append(contentsOf: rewindResults.results)
-                totalCount += rewindResults.totalCount
-            } catch {
-                Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
+            rewindStart = Date()
+            rewindTask = Task.detached(priority: .userInitiated) { [query, rewind, config, hiddenTagId] in
+                try Self.searchConnection(
+                    query: query,
+                    connection: rewind,
+                    config: config,
+                    source: .rewind,
+                    hiddenTagId: hiddenTagId
+                )
             }
         } else if retraceOnlySearchFilters {
             Log.debug("[DataAdapter] Skipping Rewind search due to Retrace-only filters", category: .app)
+        }
+
+        let retraceResults: SearchResults
+        do {
+            retraceResults = try await retraceTask.value
+            let retraceElapsed = Int(Date().timeIntervalSince(retraceStart) * 1000)
+            Log.info("[DataAdapter] Retrace search completed in \(retraceElapsed)ms, found \(retraceResults.results.count) results", category: .app)
+        } catch {
+            Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
+            retraceResults = SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        }
+
+        let shouldShortCircuitNewestFirstPage =
+            query.mode == .all &&
+            query.sortOrder == .newestFirst &&
+            query.offset == 0 &&
+            retraceResults.results.count >= query.limit
+
+        if shouldShortCircuitNewestFirstPage {
+            rewindTask?.cancel()
+            Log.debug("[DataAdapter] Returning newest-first first page from Retrace without waiting for Rewind", category: .app)
+
+            let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            return SearchResults(
+                query: query,
+                results: Array(retraceResults.results.prefix(query.limit)),
+                totalCount: retraceResults.totalCount,
+                searchTimeMs: searchTimeMs
+            )
+        }
+
+        var rewindResults: SearchResults?
+        if let rewindTask {
+            do {
+                rewindResults = try await rewindTask.value
+                if let rewindStart {
+                    let rewindElapsed = Int(Date().timeIntervalSince(rewindStart) * 1000)
+                    Log.info("[DataAdapter] Rewind search completed in \(rewindElapsed)ms, found \(rewindResults?.results.count ?? 0) results", category: .app)
+                }
+            } catch is CancellationError {
+                Log.debug("[DataAdapter] Rewind search task cancelled", category: .app)
+            } catch {
+                Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
+            }
+        }
+
+        var allResults: [SearchResult] = retraceResults.results
+        var totalCount = retraceResults.totalCount
+        if let rewindResults {
+            allResults.append(contentsOf: rewindResults.results)
+            totalCount += rewindResults.totalCount
         }
 
         // Sort by search mode
@@ -1225,7 +1269,7 @@ public actor DataAdapter {
                 """)
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             filters.commentFilter,
             isRewindDatabase: isRewindDatabase,
             segmentIDExpression: "f.segmentId"
@@ -1435,7 +1479,7 @@ public actor DataAdapter {
                 """)
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             filters.commentFilter,
             isRewindDatabase: isRewindDatabase,
             segmentIDExpression: "f.segmentId"
@@ -1638,7 +1682,7 @@ public actor DataAdapter {
                 """)
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             filters.commentFilter,
             isRewindDatabase: isRewindDatabase,
             segmentIDExpression: "f.segmentId"
@@ -1868,7 +1912,7 @@ public actor DataAdapter {
                 """)
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             filters.commentFilter,
             isRewindDatabase: isRewindDatabase,
             segmentIDExpression: "f.segmentId"
@@ -2092,7 +2136,7 @@ public actor DataAdapter {
                 """)
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             filters.commentFilter,
             isRewindDatabase: isRewindDatabase,
             segmentIDExpression: "f.segmentId"
@@ -2646,25 +2690,27 @@ public actor DataAdapter {
         )
     }
 
-    private func searchConnection(
+    private static func searchConnection(
         query: SearchQuery,
         connection: DatabaseConnection,
         config: DatabaseConfig,
-        source: FrameSource
+        source: FrameSource,
+        hiddenTagId: Int64?
     ) throws -> SearchResults {
         switch query.mode {
         case .relevant:
-            return try searchRelevant(query: query, connection: connection, config: config, source: source)
+            return try searchRelevant(query: query, connection: connection, config: config, source: source, hiddenTagId: hiddenTagId)
         case .all:
-            return try searchAll(query: query, connection: connection, config: config, source: source)
+            return try searchAll(query: query, connection: connection, config: config, source: source, hiddenTagId: hiddenTagId)
         }
     }
 
-    private func searchRelevant(
+    private static func searchRelevant(
         query: SearchQuery,
         connection: DatabaseConnection,
         config: DatabaseConfig,
-        source: FrameSource
+        source: FrameSource,
+        hiddenTagId: Int64?
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
@@ -2753,7 +2799,7 @@ public actor DataAdapter {
             switch query.filters.hiddenFilter {
             case .hide:
                 // Exclude hidden segments
-                if let hiddenTagId = cachedHiddenTagId {
+                if let hiddenTagId {
                     outerWhereConditions.append("""
                         NOT EXISTS (
                             SELECT 1 FROM segment_tag st_hidden
@@ -2765,7 +2811,7 @@ public actor DataAdapter {
                 }
             case .onlyHidden:
                 // Only show hidden segments
-                if let hiddenTagId = cachedHiddenTagId {
+                if let hiddenTagId {
                     outerWhereConditions.append("""
                         EXISTS (
                             SELECT 1 FROM segment_tag st_hidden
@@ -2781,7 +2827,7 @@ public actor DataAdapter {
             }
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             query.filters.commentFilter,
             isRewindDatabase: isRewind,
             segmentIDExpression: "f.segmentId"
@@ -2910,11 +2956,12 @@ public actor DataAdapter {
         return SearchResults(query: query, results: results, totalCount: results.count, searchTimeMs: totalElapsed)
     }
 
-    private func searchAll(
+    private static func searchAll(
         query: SearchQuery,
         connection: DatabaseConnection,
         config: DatabaseConfig,
-        source: FrameSource
+        source: FrameSource,
+        hiddenTagId: Int64?
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
@@ -3012,7 +3059,7 @@ public actor DataAdapter {
             switch query.filters.hiddenFilter {
             case .hide:
                 // Exclude hidden segments
-                if let hiddenTagId = cachedHiddenTagId {
+                if let hiddenTagId {
                     whereConditions.append("""
                         NOT EXISTS (
                             SELECT 1 FROM segment_tag st_hidden
@@ -3024,7 +3071,7 @@ public actor DataAdapter {
                 }
             case .onlyHidden:
                 // Only show hidden segments
-                if let hiddenTagId = cachedHiddenTagId {
+                if let hiddenTagId {
                     whereConditions.append("""
                         EXISTS (
                             SELECT 1 FROM segment_tag st_hidden
@@ -3040,7 +3087,7 @@ public actor DataAdapter {
             }
         }
 
-        if let commentClause = buildCommentFilterClause(
+        if let commentClause = Self.buildCommentFilterClause(
             query.filters.commentFilter,
             isRewindDatabase: isRewind,
             segmentIDExpression: "f.segmentId"
@@ -3218,7 +3265,7 @@ public actor DataAdapter {
         return SearchResults(query: query, results: results, totalCount: totalCount, searchTimeMs: elapsed)
     }
 
-    private func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] {
+    private static func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] {
         guard !segmentIds.isEmpty else { return [:] }
 
         let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")
@@ -3244,7 +3291,7 @@ public actor DataAdapter {
         return metadata
     }
 
-    private func buildFTSQuery(_ text: String) -> String {
+    private static func buildFTSQuery(_ text: String) -> String {
         var parts: [String] = []
         var current = ""
         var inQuotes = false
@@ -3306,7 +3353,7 @@ public actor DataAdapter {
     }
 
     /// Remove characters that have special meaning in FTS query syntax.
-    private func sanitizeFTSTerm(_ text: String) -> String {
+    private static func sanitizeFTSTerm(_ text: String) -> String {
         text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\"", with: "")
@@ -3316,14 +3363,14 @@ public actor DataAdapter {
 
     /// For unquoted terms, avoid prefix expansion on stopwords and very short tokens.
     /// This keeps terms like "a" as exact-token matches instead of broad "a*" prefix matches.
-    private func formatUnquotedTerm(_ term: String) -> String {
+    private static func formatUnquotedTerm(_ term: String) -> String {
         if shouldUseExactMatch(term) {
             return "\"\(term)\""
         }
         return "\"\(term)\"*"
     }
 
-    private func shouldUseExactMatch(_ term: String) -> Bool {
+    private static func shouldUseExactMatch(_ term: String) -> Bool {
         if term.count <= 2 {
             return true
         }
@@ -3348,7 +3395,7 @@ public actor DataAdapter {
 
     /// Build SQL clause for comment-presence filtering.
     /// Returns nil when no filtering is required.
-    private func buildCommentFilterClause(
+    private static func buildCommentFilterClause(
         _ filter: CommentFilter,
         isRewindDatabase: Bool,
         segmentIDExpression: String
@@ -3381,7 +3428,7 @@ public actor DataAdapter {
         }
     }
 
-    private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
+    private static func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
         let countSQL = """
             SELECT COUNT(*)
             FROM searchRanking

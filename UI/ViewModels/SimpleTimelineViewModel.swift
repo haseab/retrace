@@ -6073,14 +6073,34 @@ public class SimpleTimelineViewModel: ObservableObject {
         return matchingNodes
     }
 
+    private static let searchHighlightExactMatchStopwords: Set<String> = [
+        "a", "an", "and", "as", "at",
+        "be", "but", "by",
+        "for", "from",
+        "if", "in", "into", "is", "it",
+        "of", "on", "or",
+        "the", "to",
+        "with"
+    ]
+
+    private enum SearchHighlightTermMatchMode {
+        case exactWord
+        case wordPrefix
+    }
+
     private enum SearchHighlightToken {
-        case term(String)
+        case term(String, mode: SearchHighlightTermMatchMode)
         case phrase(String)
 
         var debugDescription: String {
             switch self {
-            case .term(let term):
-                return "term(\(term))"
+            case .term(let term, let mode):
+                switch mode {
+                case .exactWord:
+                    return "termExact(\(term))"
+                case .wordPrefix:
+                    return "termPrefix(\(term))"
+                }
             case .phrase(let phrase):
                 return "phrase(\(phrase))"
             }
@@ -6109,7 +6129,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             } else {
                 let terms = value.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
                 for term in terms {
-                    tokens.append(.term(term))
+                    tokens.append(.term(term, mode: searchHighlightMatchMode(for: term)))
                 }
             }
             current = ""
@@ -6133,10 +6153,81 @@ public class SimpleTimelineViewModel: ObservableObject {
         in text: String
     ) -> [Range<String.Index>] {
         switch token {
-        case .term(let term):
-            return allRanges(of: term, in: text)
+        case .term(let term, let mode):
+            switch mode {
+            case .exactWord:
+                return wordRanges(exactlyMatching: term, in: text)
+            case .wordPrefix:
+                return wordRanges(withPrefix: term, in: text)
+            }
         case .phrase(let phrase):
             return allRanges(of: phrase, in: text)
+        }
+    }
+
+    private func searchHighlightMatchMode(for term: String) -> SearchHighlightTermMatchMode {
+        if term.count <= 2 {
+            return .exactWord
+        }
+        if Self.searchHighlightExactMatchStopwords.contains(term) {
+            return .exactWord
+        }
+        return .wordPrefix
+    }
+
+    private func wordRanges(
+        exactlyMatching needle: String,
+        in haystack: String
+    ) -> [Range<String.Index>] {
+        guard !needle.isEmpty else { return [] }
+        return wordTokenRanges(in: haystack)
+            .filter { $0.token == needle }
+            .map(\.range)
+    }
+
+    private func wordRanges(
+        withPrefix needle: String,
+        in haystack: String
+    ) -> [Range<String.Index>] {
+        guard !needle.isEmpty else { return [] }
+        return wordTokenRanges(in: haystack)
+            .filter { $0.token.hasPrefix(needle) }
+            .map(\.range)
+    }
+
+    private func wordTokenRanges(in text: String) -> [(token: String, range: Range<String.Index>)] {
+        guard !text.isEmpty else { return [] }
+
+        var tokens: [(token: String, range: Range<String.Index>)] = []
+        var tokenStart: String.Index?
+        var index = text.startIndex
+
+        while index < text.endIndex {
+            let nextIndex = text.index(after: index)
+            let character = text[index]
+
+            if isSearchHighlightTokenCharacter(character) {
+                if tokenStart == nil {
+                    tokenStart = index
+                }
+            } else if let start = tokenStart {
+                tokens.append((token: String(text[start..<index]), range: start..<index))
+                tokenStart = nil
+            }
+
+            index = nextIndex
+        }
+
+        if let start = tokenStart {
+            tokens.append((token: String(text[start..<text.endIndex]), range: start..<text.endIndex))
+        }
+
+        return tokens
+    }
+
+    private func isSearchHighlightTokenCharacter(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || scalar.value == 95 // underscore
         }
     }
 

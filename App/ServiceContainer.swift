@@ -414,9 +414,10 @@ public actor ServiceContainer {
             return
         }
 
-        // Open encrypted database
+        // Open encrypted database in serialized mode for safe concurrent reads.
         var db: OpaquePointer?
-        guard sqlite3_open(rewindDBPath, &db) == SQLITE_OK else {
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(rewindDBPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             Log.error("[ServiceContainer] Failed to open Rewind database: \(errorMsg)", category: .app)
             return
