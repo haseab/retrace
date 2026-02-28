@@ -1936,6 +1936,7 @@ public actor AppCoordinator {
         body: String,
         segmentIds: [SegmentID],
         attachments: [SegmentCommentAttachment] = [],
+        frameID: FrameID? = nil,
         author: String? = nil
     ) async throws -> SegmentCommentCreateResult {
         let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1947,7 +1948,8 @@ public actor AppCoordinator {
         let comment = try await services.database.createSegmentComment(
             body: trimmedBody,
             author: resolvedAuthor,
-            attachments: attachments
+            attachments: attachments,
+            frameID: frameID
         )
 
         var linkedSegmentIDs: [SegmentID] = []
@@ -2027,6 +2029,39 @@ public actor AppCoordinator {
         try await services.database.getCommentsForSegment(segmentId: segmentId)
     }
 
+    /// Get all linked comments with representative segment context (Retrace DB only).
+    public func getAllCommentTimelineEntries() async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        try await services.database.getAllCommentTimelineEntries()
+    }
+
+    /// Search comments by body text (server-side, capped result set).
+    public func searchSegmentComments(query: String, limit: Int = 10, offset: Int = 0) async throws -> [SegmentComment] {
+        try await services.database.searchSegmentComments(query: query, limit: limit, offset: offset)
+    }
+
+    /// Search comments with representative segment context (All Comments view).
+    public func searchCommentTimelineEntries(
+        query: String,
+        limit: Int = 10,
+        offset: Int = 0
+    ) async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        try await services.database.searchCommentTimelineEntries(query: query, limit: limit, offset: offset)
+    }
+
     /// Update an existing comment
     public func updateSegmentComment(
         commentId: SegmentCommentID,
@@ -2055,6 +2090,16 @@ public actor AppCoordinator {
     /// Get the number of linked segments for a comment
     public func getSegmentCountForComment(commentId: SegmentCommentID) async throws -> Int {
         try await services.database.getSegmentCountForComment(commentId: commentId)
+    }
+
+    /// Resolve the oldest linked segment for a comment.
+    public func getFirstLinkedSegmentForComment(commentId: SegmentCommentID) async throws -> SegmentID? {
+        try await services.database.getFirstLinkedSegmentForComment(commentId: commentId)
+    }
+
+    /// Resolve the oldest frame in a segment.
+    public func getFirstFrameForSegment(segmentId: SegmentID) async throws -> FrameID? {
+        try await services.database.getFirstFrameForSegment(segmentId: segmentId)
     }
 
     private nonisolated func resolvedCommentAuthor(_ proposedAuthor: String?) -> String {

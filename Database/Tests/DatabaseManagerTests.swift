@@ -632,6 +632,208 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(linkedSegmentCount, 2)
     }
 
+    func testSegmentComment_PersistsFrameAnchor() async throws {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(60),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/comment-anchor.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let videoID = try await database.insertVideoSegment(videoSegment)
+
+        let segmentID = try await database.insertSegment(
+            bundleID: "com.test.anchor",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Anchor Window",
+            browserUrl: nil,
+            type: 0
+        )
+        let segment = SegmentID(value: segmentID)
+
+        let insertedFrameID = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp,
+                segmentID: AppSegmentID(value: segmentID),
+                videoID: VideoSegmentID(value: videoID),
+                frameIndexInSegment: 0,
+                encodingStatus: .success,
+                metadata: .empty,
+                source: .native
+            )
+        )
+        let frameID = FrameID(value: insertedFrameID)
+
+        let comment = try await database.createSegmentComment(
+            body: "Anchored to frame",
+            author: "Test User",
+            attachments: [],
+            frameID: frameID
+        )
+        try await database.addCommentToSegment(segmentId: segment, commentId: comment.id)
+
+        let comments = try await database.getCommentsForSegment(segmentId: segment)
+        XCTAssertEqual(comments.count, 1)
+        XCTAssertEqual(comments.first?.frameID?.value, insertedFrameID)
+    }
+
+    func testSegmentComment_FallbackNavigationResolvers() async throws {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 4,
+            fileSizeBytes: 2048,
+            relativePath: "segments/comment-fallback.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let videoID = try await database.insertVideoSegment(videoSegment)
+
+        let segmentAID = try await database.insertSegment(
+            bundleID: "com.test.fallback.a",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(30),
+            windowName: "Fallback A",
+            browserUrl: nil,
+            type: 0
+        )
+        let segmentBID = try await database.insertSegment(
+            bundleID: "com.test.fallback.b",
+            startDate: timestamp.addingTimeInterval(31),
+            endDate: timestamp.addingTimeInterval(60),
+            windowName: "Fallback B",
+            browserUrl: nil,
+            type: 0
+        )
+        let segmentA = SegmentID(value: segmentAID)
+        let segmentB = SegmentID(value: segmentBID)
+
+        let firstFrameInA = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp.addingTimeInterval(1),
+                segmentID: AppSegmentID(value: segmentAID),
+                videoID: VideoSegmentID(value: videoID),
+                frameIndexInSegment: 0,
+                encodingStatus: .success,
+                metadata: .empty,
+                source: .native
+            )
+        )
+        _ = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp.addingTimeInterval(2),
+                segmentID: AppSegmentID(value: segmentAID),
+                videoID: VideoSegmentID(value: videoID),
+                frameIndexInSegment: 1,
+                encodingStatus: .success,
+                metadata: .empty,
+                source: .native
+            )
+        )
+        _ = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp.addingTimeInterval(35),
+                segmentID: AppSegmentID(value: segmentBID),
+                videoID: VideoSegmentID(value: videoID),
+                frameIndexInSegment: 0,
+                encodingStatus: .success,
+                metadata: .empty,
+                source: .native
+            )
+        )
+
+        let comment = try await database.createSegmentComment(
+            body: "No frame anchor; fallback should use first frame in linked segment",
+            author: "Test User",
+            attachments: [],
+            frameID: nil
+        )
+        try await database.addCommentToSegment(segmentId: segmentA, commentId: comment.id)
+        try await database.addCommentToSegment(segmentId: segmentB, commentId: comment.id)
+
+        let resolvedSegment = try await database.getFirstLinkedSegmentForComment(commentId: comment.id)
+        XCTAssertEqual(resolvedSegment, segmentA)
+
+        let resolvedFrame = try await database.getFirstFrameForSegment(segmentId: segmentA)
+        XCTAssertEqual(resolvedFrame?.value, firstFrameInA)
+    }
+
+    func testSegmentComment_SearchReturnsMatches() async throws {
+        let matching = try await database.createSegmentComment(
+            body: "Investigate crash in sidebar panel",
+            author: "Test User",
+            attachments: []
+        )
+        _ = try await database.createSegmentComment(
+            body: "Misc unrelated note",
+            author: "Test User",
+            attachments: []
+        )
+
+        let results = try await database.searchSegmentComments(
+            query: "crash side",
+            limit: 20
+        )
+
+        XCTAssertTrue(results.contains(where: { $0.id == matching.id }))
+        XCTAssertFalse(results.contains(where: { $0.body == "Misc unrelated note" }))
+    }
+
+    func testSegmentComment_SearchHonorsLimitCap() async throws {
+        for index in 0..<15 {
+            _ = try await database.createSegmentComment(
+                body: "Cap limit phrase \(index)",
+                author: "Test User",
+                attachments: []
+            )
+        }
+
+        let results = try await database.searchSegmentComments(
+            query: "cap limit",
+            limit: 5
+        )
+
+        XCTAssertEqual(results.count, 5)
+    }
+
+    func testSegmentComment_SearchSupportsOffsetPagination() async throws {
+        for index in 0..<15 {
+            _ = try await database.createSegmentComment(
+                body: "Paged phrase \(index)",
+                author: "Test User",
+                attachments: []
+            )
+        }
+
+        let firstPage = try await database.searchSegmentComments(
+            query: "paged phrase",
+            limit: 10,
+            offset: 0
+        )
+        let secondPage = try await database.searchSegmentComments(
+            query: "paged phrase",
+            limit: 10,
+            offset: 10
+        )
+
+        XCTAssertEqual(firstPage.count, 10)
+        XCTAssertEqual(secondPage.count, 5)
+        XCTAssertTrue(Set(firstPage.map(\.id)).isDisjoint(with: Set(secondPage.map(\.id))))
+    }
+
     func testSegmentComment_DuplicateLinkIsIgnored() async throws {
         let segment = try await insertTestAppSegment(bundleID: "com.test.duplicate")
         let comment = try await database.createSegmentComment(

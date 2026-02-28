@@ -140,6 +140,48 @@ public struct CommentAttachmentDraft: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Segment metadata shown in the "All Comments" timeline rows.
+public struct CommentTimelineSegmentContext: Sendable, Equatable {
+    public let segmentID: SegmentID
+    public let appBundleID: String?
+    public let appName: String?
+    public let browserURL: String?
+    public let referenceTimestamp: Date
+
+    public init(
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    ) {
+        self.segmentID = segmentID
+        self.appBundleID = appBundleID
+        self.appName = appName
+        self.browserURL = browserURL
+        self.referenceTimestamp = referenceTimestamp
+    }
+}
+
+/// Flattened row model for browsing comments around an anchor comment.
+public struct CommentTimelineRow: Identifiable, Sendable, Equatable {
+    public let comment: SegmentComment
+    public let context: CommentTimelineSegmentContext?
+    public let primaryTagName: String?
+
+    public var id: SegmentCommentID { comment.id }
+
+    public init(
+        comment: SegmentComment,
+        context: CommentTimelineSegmentContext?,
+        primaryTagName: String?
+    ) {
+        self.comment = comment
+        self.context = context
+        self.primaryTagName = primaryTagName
+    }
+}
+
 /// Simple ViewModel for the redesigned fullscreen timeline view
 /// All state derives from currentIndex - this is the SINGLE source of truth
 @MainActor
@@ -814,6 +856,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the comment submenu is visible
     @Published public var showCommentSubmenu: Bool = false
 
+    /// Whether the comment link insert popover is currently visible.
+    /// Used so Escape can dismiss the popover before dismissing the full comment submenu.
+    @Published public var isCommentLinkPopoverPresented: Bool = false
+
+    /// Signal to request that the comment link popover close.
+    @Published public var closeCommentLinkPopoverSignal: Int = 0
+
     /// Whether the "create new tag" input is visible
     @Published public var showNewTagInput: Bool = false
 
@@ -829,11 +878,60 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Existing comments linked to the selected timeline block (deduplicated by comment ID)
     @Published public var selectedBlockComments: [SegmentComment] = []
 
+    /// Preferred fallback segment context for each selected-block comment.
+    private var selectedBlockCommentPreferredSegmentByID: [Int64: SegmentID] = [:]
+
     /// Whether existing comments are loading for the selected timeline block
     @Published public var isLoadingBlockComments: Bool = false
 
     /// Optional error surfaced when loading selected block comments fails
     @Published public var blockCommentsLoadError: String? = nil
+
+    /// Flattened timeline rows for "All Comments" browsing.
+    @Published public var commentTimelineRows: [CommentTimelineRow] = []
+
+    /// Anchor comment for the all-comments timeline view.
+    @Published public var commentTimelineAnchorCommentID: SegmentCommentID?
+
+    /// Whether the all-comments timeline is currently loading its initial data.
+    @Published public var isLoadingCommentTimeline: Bool = false
+
+    /// Whether older all-comments pages are currently being fetched.
+    @Published public var isLoadingOlderCommentTimeline: Bool = false
+
+    /// Whether newer all-comments pages are currently being fetched.
+    @Published public var isLoadingNewerCommentTimeline: Bool = false
+
+    /// Optional error surfaced when loading all-comments timeline fails.
+    @Published public var commentTimelineLoadError: String? = nil
+
+    /// Whether older comment pages are still available.
+    @Published public var commentTimelineHasOlder: Bool = false
+
+    /// Whether newer comment pages are still available.
+    @Published public var commentTimelineHasNewer: Bool = false
+
+    /// Raw query text for comment search in the all-comments panel.
+    @Published public var commentSearchText: String = ""
+
+    /// Server-side search results (capped).
+    @Published public var commentSearchResults: [CommentTimelineRow] = []
+
+    /// Whether there are additional server-side comment search results to page in.
+    @Published public var commentSearchHasMoreResults: Bool = false
+
+    /// Whether a server-side comment search request is in flight.
+    @Published public var isSearchingComments: Bool = false
+
+    /// Optional error surfaced when searching comments fails.
+    @Published public var commentSearchError: String? = nil
+
+    /// Whether the comment submenu is currently showing the all-comments browser.
+    /// Used by window-level keyboard handling (Escape/Cmd+[) to route back to thread mode.
+    @Published public var isAllCommentsBrowserActive: Bool = false
+
+    /// Signal to request return from all-comments browser back to local thread comments.
+    @Published public var returnToThreadCommentsSignal: Int = 0
 
     /// Whether the mouse is hovering over the "Add Tag" button
     @Published public var isHoveringAddTagButton: Bool = false
@@ -869,17 +967,24 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.showTimelineContextMenu = false
             self.showTagSubmenu = false
             self.showCommentSubmenu = false
+            self.isCommentLinkPopoverPresented = false
+            self.closeCommentLinkPopoverSignal = 0
             self.showNewTagInput = false
             self.newTagName = ""
             self.newCommentText = ""
             self.newCommentAttachmentDrafts = []
             self.selectedBlockComments = []
+            self.selectedBlockCommentPreferredSegmentByID = [:]
             self.isLoadingBlockComments = false
             self.blockCommentsLoadError = nil
             self.isHoveringAddTagButton = false
             self.isHoveringAddCommentButton = false
             self.isAddingComment = false
+            self.isAllCommentsBrowserActive = false
+            self.returnToThreadCommentsSignal = 0
             self.selectedSegmentTags = []
+            self.resetCommentTimelineState()
+            self.resetCommentSearchState()
         }
 
         let shouldAnimate = showTimelineContextMenu || showTagSubmenu || showCommentSubmenu || showNewTagInput
@@ -890,6 +995,50 @@ public class SimpleTimelineViewModel: ObservableObject {
         } else {
             resetMenuState()
         }
+    }
+
+    /// Dismiss only the comment submenu with an explicit fade-out phase.
+    /// This avoids tearing down comment state in the same frame as the transition.
+    public func dismissCommentSubmenu() {
+        guard showCommentSubmenu else { return }
+
+        withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
+            self.showCommentSubmenu = false
+            self.isCommentLinkPopoverPresented = false
+            self.showTagSubmenu = false
+            self.showTimelineContextMenu = false
+            self.showContextMenu = false
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.timelineMenuDismissAnimationDuration) { [weak self] in
+            guard let self else { return }
+            // If reopened during the fade-out window, preserve the new session state.
+            guard !self.showCommentSubmenu else { return }
+
+            self.closeCommentLinkPopoverSignal = 0
+            self.newCommentText = ""
+            self.newCommentAttachmentDrafts = []
+            self.selectedBlockComments = []
+            self.selectedBlockCommentPreferredSegmentByID = [:]
+            self.isLoadingBlockComments = false
+            self.blockCommentsLoadError = nil
+            self.isHoveringAddCommentButton = false
+            self.isAddingComment = false
+            self.isAllCommentsBrowserActive = false
+            self.returnToThreadCommentsSignal = 0
+            self.resetCommentTimelineState()
+            self.resetCommentSearchState()
+        }
+    }
+
+    /// Request that the inline comment "Insert Link" popover close.
+    public func requestCloseCommentLinkPopover() {
+        closeCommentLinkPopoverSignal += 1
+    }
+
+    /// Request that the comment browser return to the local thread-comments view.
+    public func requestReturnToThreadComments() {
+        returnToThreadCommentsSignal += 1
     }
 
     // MARK: - Filter State
@@ -920,6 +1069,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         case apps
         case tags
         case visibility
+        case comments
         case dateRange
         case advanced
     }
@@ -995,6 +1145,27 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var hasLoadedSegmentTagsMap = false
     /// Prevents repeatedly refetching empty comment-count maps.
     private var hasLoadedSegmentCommentCountsMap = false
+
+    /// Cached comments keyed by comment ID for all-comments timeline browsing.
+    private var commentTimelineCommentsByID: [Int64: SegmentComment] = [:]
+    /// Best-known segment metadata for each comment ID.
+    private var commentTimelineContextByCommentID: [Int64: CommentTimelineSegmentContext] = [:]
+    /// Segment IDs already queried for comments while building the timeline.
+    private var commentTimelineLoadedSegmentIDs: Set<Int64> = []
+    /// Oldest frame timestamp seen in the all-comments data source.
+    private var commentTimelineOldestFrameTimestamp: Date?
+    /// Newest frame timestamp seen in the all-comments data source.
+    private var commentTimelineNewestFrameTimestamp: Date?
+    /// In-flight debounced comment search task.
+    private var commentSearchTask: Task<Void, Never>?
+    /// Current normalized query backing paginated comment search.
+    private var activeCommentSearchQuery: String = ""
+    /// Next pagination offset for server-side comment search.
+    private var commentSearchNextOffset: Int = 0
+    /// Page size for server-side comment search.
+    private static let commentSearchPageSize = 10
+    /// Debounce delay for comment search input.
+    private static let commentSearchDebounceNanoseconds: UInt64 = 250_000_000
 
     /// Number of active filters (for badge display)
     public var activeFilterCount: Int {
@@ -1282,6 +1453,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     deinit {
+        commentSearchTask?.cancel()
         diskFrameBufferMemoryLogTask?.cancel()
         diskFrameBufferInactivityCleanupTask?.cancel()
         foregroundFrameLoadTask?.cancel()
@@ -1871,7 +2043,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let hasURLFilter = !(filters.browserUrlFilter?.isEmpty ?? true)
         let hasDateRange = filters.startDate != nil || filters.endDate != nil
 
-        return "active=\(filters.hasActiveFilters) count=\(filters.activeFilterCount) apps=\(appCount) tags=\(tagCount) appMode=\(filters.appFilterMode.rawValue) hidden=\(filters.hiddenFilter.rawValue) window=\(hasWindowFilter) url=\(hasURLFilter) date=\(hasDateRange)"
+        return "active=\(filters.hasActiveFilters) count=\(filters.activeFilterCount) apps=\(appCount) tags=\(tagCount) appMode=\(filters.appFilterMode.rawValue) hidden=\(filters.hiddenFilter.rawValue) comments=\(filters.commentFilter.rawValue) window=\(hasWindowFilter) url=\(hasURLFilter) date=\(hasDateRange)"
     }
 
     private func logCmdFPlayheadState(
@@ -2521,7 +2693,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         newCommentText = ""
         newCommentAttachmentDrafts = []
         selectedBlockComments = []
+        selectedBlockCommentPreferredSegmentByID = [:]
         blockCommentsLoadError = nil
+        resetCommentTimelineState()
         showTagSubmenu = true
         showCommentSubmenu = false
         isHoveringAddTagButton = false
@@ -2545,7 +2719,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         newCommentText = ""
         newCommentAttachmentDrafts = []
         selectedBlockComments = []
+        selectedBlockCommentPreferredSegmentByID = [:]
         blockCommentsLoadError = nil
+        resetCommentTimelineState()
         showTagSubmenu = false
         showCommentSubmenu = true
         isHoveringAddTagButton = false
@@ -2567,6 +2743,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let index = timelineContextMenuSegmentIndex,
               let block = getBlock(forFrameAt: index) else {
             selectedBlockComments = []
+            selectedBlockCommentPreferredSegmentByID = [:]
             blockCommentsLoadError = nil
             isLoadingBlockComments = false
             return
@@ -2575,6 +2752,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let segmentIDs = getSegmentIds(inBlock: block).sorted { $0.value < $1.value }
         guard !segmentIDs.isEmpty else {
             selectedBlockComments = []
+            selectedBlockCommentPreferredSegmentByID = [:]
             blockCommentsLoadError = nil
             isLoadingBlockComments = false
             return
@@ -2585,9 +2763,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             var commentsByID: [Int64: SegmentComment] = [:]
+            var preferredSegmentByCommentID: [Int64: SegmentID] = [:]
             for segmentID in segmentIDs {
                 let comments = try await coordinator.getCommentsForSegment(segmentId: segmentID)
                 for comment in comments {
+                    if preferredSegmentByCommentID[comment.id.value] == nil {
+                        preferredSegmentByCommentID[comment.id.value] = segmentID
+                    }
                     commentsByID[comment.id.value] = comment
                 }
             }
@@ -2598,13 +2780,20 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
                 return $0.createdAt < $1.createdAt
             }
+            selectedBlockCommentPreferredSegmentByID = preferredSegmentByCommentID
             isLoadingBlockComments = false
         } catch {
             isLoadingBlockComments = false
             selectedBlockComments = []
+            selectedBlockCommentPreferredSegmentByID = [:]
             blockCommentsLoadError = "Could not load comments."
             Log.error("[Comments] Failed to load block comments: \(error)", category: .ui)
         }
+    }
+
+    /// Preferred segment context for a comment shown in the selected block thread.
+    public func preferredSegmentIDForSelectedBlockComment(_ commentID: SegmentCommentID) -> SegmentID? {
+        selectedBlockCommentPreferredSegmentByID[commentID.value]
     }
 
     private func currentMouseLocationInContentCoordinates() -> CGPoint? {
@@ -3220,6 +3409,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if linkedSegmentIDs.isEmpty {
                 selectedBlockComments.removeAll { $0.id == comment.id }
+                selectedBlockCommentPreferredSegmentByID.removeValue(forKey: comment.id.value)
+                if commentTimelineCommentsByID.removeValue(forKey: comment.id.value) != nil {
+                    commentTimelineContextByCommentID.removeValue(forKey: comment.id.value)
+                    rebuildCommentTimelineRows()
+                }
                 return true
             }
 
@@ -3229,6 +3423,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             selectedBlockComments.removeAll { $0.id == comment.id }
+            selectedBlockCommentPreferredSegmentByID.removeValue(forKey: comment.id.value)
+            if commentTimelineCommentsByID.removeValue(forKey: comment.id.value) != nil {
+                commentTimelineContextByCommentID.removeValue(forKey: comment.id.value)
+                rebuildCommentTimelineRows()
+            }
             decrementCommentCountsForSegments(linkedSegmentIDs)
             showToast("Comment deleted", icon: "trash.fill")
             return true
@@ -3264,6 +3463,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             showToast("No segments selected", icon: "exclamationmark.circle.fill")
             return
         }
+        let selectedFrameID = (index >= 0 && index < frames.count) ? frames[index].frame.id : nil
 
         isAddingComment = true
         let attachmentDrafts = newCommentAttachmentDrafts
@@ -3279,6 +3479,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                     body: commentBody,
                     segmentIds: Array(segmentIds),
                     attachments: persistedAttachments,
+                    frameID: selectedFrameID,
                     author: nil
                 )
 
@@ -3309,6 +3510,538 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Navigate to the frame linked on a saved comment card.
+    /// Returns true if navigation succeeded.
+    @discardableResult
+    public func navigateToCommentFrame(frameID: FrameID) async -> Bool {
+        setLoadingState(true, reason: "navigateToCommentFrame")
+        clearError()
+
+        let didNavigate = await searchForFrameID(frameID.value)
+        if didNavigate {
+            showToast("Opened linked frame", icon: "checkmark.circle.fill")
+            return true
+        }
+
+        setLoadingState(false, reason: "navigateToCommentFrame.notFound")
+        showToast("Linked frame could not be found", icon: "exclamationmark.triangle.fill")
+        return false
+    }
+
+    /// Navigate to a comment's anchor frame, falling back to the first frame in a linked segment.
+    /// Returns true if navigation succeeded.
+    @discardableResult
+    public func navigateToComment(
+        comment: SegmentComment,
+        preferredSegmentID: SegmentID? = nil
+    ) async -> Bool {
+        if let frameID = comment.frameID {
+            let didNavigate = await navigateToCommentFrame(frameID: frameID)
+            if didNavigate {
+                return true
+            }
+        }
+
+        do {
+            let fallbackSegmentID: SegmentID?
+            if let preferredSegmentID {
+                fallbackSegmentID = preferredSegmentID
+            } else {
+                fallbackSegmentID = try await coordinator.getFirstLinkedSegmentForComment(commentId: comment.id)
+            }
+            guard let fallbackSegmentID,
+                  let fallbackFrameID = try await coordinator.getFirstFrameForSegment(segmentId: fallbackSegmentID) else {
+                showToast("Linked frame could not be found", icon: "exclamationmark.triangle.fill")
+                return false
+            }
+
+            let didNavigate = await navigateToCommentFrame(frameID: fallbackFrameID)
+            if !didNavigate {
+                showToast("Linked frame could not be found", icon: "exclamationmark.triangle.fill")
+            }
+            return didNavigate
+        } catch {
+            Log.error("[Comments] Failed to resolve fallback frame for comment \(comment.id.value): \(error)", category: .ui)
+            showToast("Linked frame could not be found", icon: "exclamationmark.triangle.fill")
+            return false
+        }
+    }
+
+    /// Update the all-comments search query and trigger a debounced server-side search.
+    public func updateCommentSearchQuery(_ rawQuery: String) {
+        commentSearchText = rawQuery
+        scheduleCommentSearch()
+    }
+
+    /// Retry comment search immediately using the current query.
+    public func retryCommentSearch() {
+        scheduleCommentSearch(immediate: true)
+    }
+
+    /// Request the next search page when the user scrolls to the current tail item.
+    public func loadMoreCommentSearchResultsIfNeeded(currentCommentID: SegmentCommentID?) {
+        guard let currentCommentID,
+              currentCommentID == commentSearchResults.last?.id,
+              !activeCommentSearchQuery.isEmpty,
+              commentSearchHasMoreResults,
+              !isSearchingComments else {
+            return
+        }
+
+        runCommentSearchPage(
+            query: activeCommentSearchQuery,
+            offset: commentSearchNextOffset,
+            append: true,
+            immediate: true
+        )
+    }
+
+    /// Clear all in-memory comment search state and cancel in-flight requests.
+    public func resetCommentSearchState() {
+        commentSearchTask?.cancel()
+        commentSearchTask = nil
+        activeCommentSearchQuery = ""
+        commentSearchNextOffset = 0
+        commentSearchText = ""
+        commentSearchResults = []
+        commentSearchHasMoreResults = false
+        commentSearchError = nil
+        isSearchingComments = false
+    }
+
+    private func scheduleCommentSearch(immediate: Bool = false) {
+        commentSearchTask?.cancel()
+        commentSearchTask = nil
+
+        let trimmed = commentSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            activeCommentSearchQuery = ""
+            commentSearchNextOffset = 0
+            commentSearchResults = []
+            commentSearchHasMoreResults = false
+            commentSearchError = nil
+            isSearchingComments = false
+            return
+        }
+
+        activeCommentSearchQuery = trimmed
+        commentSearchNextOffset = 0
+        commentSearchResults = []
+        commentSearchHasMoreResults = false
+        runCommentSearchPage(
+            query: trimmed,
+            offset: 0,
+            append: false,
+            immediate: immediate
+        )
+    }
+
+    private func runCommentSearchPage(
+        query: String,
+        offset: Int,
+        append: Bool,
+        immediate: Bool
+    ) {
+        commentSearchTask?.cancel()
+        commentSearchTask = nil
+        isSearchingComments = true
+        commentSearchError = nil
+
+        commentSearchTask = Task { [weak self] in
+            guard let self else { return }
+
+            if !immediate {
+                try? await Task.sleep(for: .nanoseconds(Int64(Self.commentSearchDebounceNanoseconds)), clock: .continuous)
+            }
+
+            guard !Task.isCancelled else { return }
+
+            do {
+                let entries = try await coordinator.searchCommentTimelineEntries(
+                    query: query,
+                    limit: Self.commentSearchPageSize,
+                    offset: offset
+                )
+                let results = entries.map { entry in
+                    commentTimelineRow(
+                        comment: entry.comment,
+                        context: CommentTimelineSegmentContext(
+                            segmentID: entry.segmentID,
+                            appBundleID: normalizedMetadataString(entry.appBundleID),
+                            appName: normalizedMetadataString(entry.appName),
+                            browserURL: normalizedMetadataString(entry.browserURL),
+                            referenceTimestamp: entry.referenceTimestamp
+                        )
+                    )
+                }
+
+                guard !Task.isCancelled else { return }
+                guard query == activeCommentSearchQuery else { return }
+                if append {
+                    commentSearchResults.append(contentsOf: results)
+                } else {
+                    commentSearchResults = results
+                }
+                commentSearchNextOffset = offset + results.count
+                commentSearchHasMoreResults = results.count == Self.commentSearchPageSize
+                commentSearchError = nil
+                isSearchingComments = false
+            } catch {
+                guard !Task.isCancelled else { return }
+                if !append {
+                    commentSearchResults = []
+                    commentSearchHasMoreResults = false
+                }
+                commentSearchError = append ? "Could not load more comments." : "Could not search comments."
+                isSearchingComments = false
+                Log.error("[Comments] Failed to search comments: \(error)", category: .ui)
+            }
+        }
+    }
+
+    // MARK: - All Comments Timeline
+
+    private enum CommentTimelineDirection {
+        case older
+        case newer
+    }
+
+    /// Build the "All Comments" timeline, optionally anchored on a specific comment.
+    public func loadCommentTimeline(anchoredAt anchorComment: SegmentComment?) async {
+        guard !isLoadingCommentTimeline else { return }
+
+        resetCommentTimelineState()
+        isLoadingCommentTimeline = true
+        commentTimelineAnchorCommentID = anchorComment?.id
+        commentTimelineHasOlder = false
+        commentTimelineHasNewer = false
+
+        do {
+            async let metadataLoad: Void = ensureCommentTimelineMetadataLoaded()
+            async let entriesTask = coordinator.getAllCommentTimelineEntries()
+
+            let entries = try await entriesTask
+            await metadataLoad
+
+            for entry in entries {
+                let commentIDValue = entry.comment.id.value
+                commentTimelineCommentsByID[commentIDValue] = entry.comment
+                commentTimelineContextByCommentID[commentIDValue] = CommentTimelineSegmentContext(
+                    segmentID: entry.segmentID,
+                    appBundleID: normalizedMetadataString(entry.appBundleID),
+                    appName: normalizedMetadataString(entry.appName),
+                    browserURL: normalizedMetadataString(entry.browserURL),
+                    referenceTimestamp: entry.referenceTimestamp
+                )
+            }
+
+            if let anchorComment,
+               commentTimelineCommentsByID[anchorComment.id.value] == nil {
+                commentTimelineCommentsByID[anchorComment.id.value] = anchorComment
+            }
+
+            rebuildCommentTimelineRows()
+        } catch {
+            commentTimelineLoadError = "Could not load all comments."
+            Log.error("[Comments] Failed to load all-comments timeline: \(error)", category: .ui)
+        }
+
+        isLoadingCommentTimeline = false
+    }
+
+    /// Load additional older comments for the all-comments timeline.
+    public func loadOlderCommentTimelinePage() async {
+        guard !isLoadingCommentTimeline,
+              !isLoadingOlderCommentTimeline,
+              commentTimelineHasOlder else {
+            return
+        }
+
+        isLoadingOlderCommentTimeline = true
+        defer { isLoadingOlderCommentTimeline = false }
+
+        do {
+            _ = try await fetchAndIngestCommentTimeline(direction: .older, maxBatches: 4)
+        } catch {
+            commentTimelineLoadError = "Could not load older comments."
+            Log.error("[Comments] Failed loading older all-comments page: \(error)", category: .ui)
+        }
+    }
+
+    /// Load additional newer comments for the all-comments timeline.
+    public func loadNewerCommentTimelinePage() async {
+        guard !isLoadingCommentTimeline,
+              !isLoadingNewerCommentTimeline,
+              commentTimelineHasNewer else {
+            return
+        }
+
+        isLoadingNewerCommentTimeline = true
+        defer { isLoadingNewerCommentTimeline = false }
+
+        do {
+            _ = try await fetchAndIngestCommentTimeline(direction: .newer, maxBatches: 4)
+        } catch {
+            commentTimelineLoadError = "Could not load newer comments."
+            Log.error("[Comments] Failed loading newer all-comments page: \(error)", category: .ui)
+        }
+    }
+
+    /// Reset all in-memory state for all-comments timeline browsing.
+    public func resetCommentTimelineState() {
+        commentSearchTask?.cancel()
+        commentSearchTask = nil
+        commentTimelineRows = []
+        commentTimelineAnchorCommentID = nil
+        isLoadingCommentTimeline = false
+        isLoadingOlderCommentTimeline = false
+        isLoadingNewerCommentTimeline = false
+        commentTimelineLoadError = nil
+        commentTimelineHasOlder = false
+        commentTimelineHasNewer = false
+        activeCommentSearchQuery = ""
+        commentSearchNextOffset = 0
+        commentSearchText = ""
+        commentSearchResults = []
+        commentSearchHasMoreResults = false
+        commentSearchError = nil
+        isSearchingComments = false
+
+        commentTimelineCommentsByID.removeAll()
+        commentTimelineContextByCommentID.removeAll()
+        commentTimelineLoadedSegmentIDs.removeAll()
+        commentTimelineOldestFrameTimestamp = nil
+        commentTimelineNewestFrameTimestamp = nil
+    }
+
+    private func ensureCommentTimelineMetadataLoaded() async {
+        if availableTags.isEmpty {
+            do {
+                availableTags = try await coordinator.getAllTags()
+            } catch {
+                Log.error("[Comments] Failed to load tags for all-comments timeline: \(error)", category: .ui)
+            }
+        }
+
+        if segmentTagsMap.isEmpty {
+            do {
+                segmentTagsMap = try await coordinator.getSegmentTagsMap()
+            } catch {
+                Log.error("[Comments] Failed to load segment-tag map for all-comments timeline: \(error)", category: .ui)
+            }
+        }
+    }
+
+    private func fetchAndIngestCommentTimeline(
+        direction: CommentTimelineDirection,
+        maxBatches: Int
+    ) async throws -> Int {
+        var totalAdded = 0
+        var completedBatches = 0
+        var filters = filterCriteria
+        filters.commentFilter = .commentsOnly
+
+        while completedBatches < maxBatches {
+            completedBatches += 1
+
+            let batch: [FrameReference]
+            switch direction {
+            case .older:
+                guard let oldest = commentTimelineOldestFrameTimestamp else {
+                    commentTimelineHasOlder = false
+                    return totalAdded
+                }
+                batch = try await coordinator.getFramesBefore(
+                    timestamp: oldest,
+                    limit: 240,
+                    filters: filters
+                )
+            case .newer:
+                guard let newest = commentTimelineNewestFrameTimestamp else {
+                    commentTimelineHasNewer = false
+                    return totalAdded
+                }
+                batch = try await coordinator.getFramesAfter(
+                    timestamp: oneMillisecondAfter(newest),
+                    limit: 240,
+                    filters: filters
+                )
+            }
+
+            if batch.isEmpty {
+                switch direction {
+                case .older:
+                    commentTimelineHasOlder = false
+                case .newer:
+                    commentTimelineHasNewer = false
+                }
+                return totalAdded
+            }
+
+            let addedInBatch = try await ingestCommentTimelineFrames(batch)
+            totalAdded += addedInBatch
+
+            if addedInBatch > 0 {
+                return totalAdded
+            }
+        }
+
+        return totalAdded
+    }
+
+    private func ingestCommentTimelineFrames(_ frameRefs: [FrameReference]) async throws -> Int {
+        guard !frameRefs.isEmpty else { return 0 }
+
+        if let oldest = frameRefs.map(\.timestamp).min() {
+            if let existing = commentTimelineOldestFrameTimestamp {
+                commentTimelineOldestFrameTimestamp = min(existing, oldest)
+            } else {
+                commentTimelineOldestFrameTimestamp = oldest
+            }
+        }
+
+        if let newest = frameRefs.map(\.timestamp).max() {
+            if let existing = commentTimelineNewestFrameTimestamp {
+                commentTimelineNewestFrameTimestamp = max(existing, newest)
+            } else {
+                commentTimelineNewestFrameTimestamp = newest
+            }
+        }
+
+        var contextBySegmentID: [Int64: CommentTimelineSegmentContext] = [:]
+        for frame in frameRefs {
+            let segmentIDValue = frame.segmentID.value
+            let candidate = CommentTimelineSegmentContext(
+                segmentID: SegmentID(value: segmentIDValue),
+                appBundleID: normalizedMetadataString(frame.metadata.appBundleID),
+                appName: normalizedMetadataString(frame.metadata.appName),
+                browserURL: normalizedMetadataString(frame.metadata.browserURL),
+                referenceTimestamp: frame.timestamp
+            )
+
+            if let existing = contextBySegmentID[segmentIDValue] {
+                contextBySegmentID[segmentIDValue] = preferredSegmentContext(existing, candidate)
+            } else {
+                contextBySegmentID[segmentIDValue] = candidate
+            }
+        }
+
+        var newlyAddedComments = 0
+
+        for (segmentIDValue, context) in contextBySegmentID.sorted(by: { $0.key < $1.key }) {
+            guard !commentTimelineLoadedSegmentIDs.contains(segmentIDValue) else { continue }
+            commentTimelineLoadedSegmentIDs.insert(segmentIDValue)
+
+            let segmentComments = try await coordinator.getCommentsForSegment(
+                segmentId: SegmentID(value: segmentIDValue)
+            )
+
+            guard !segmentComments.isEmpty else { continue }
+
+            for comment in segmentComments {
+                if commentTimelineCommentsByID[comment.id.value] == nil {
+                    newlyAddedComments += 1
+                }
+                commentTimelineCommentsByID[comment.id.value] = comment
+
+                let existingContext = commentTimelineContextByCommentID[comment.id.value]
+                if shouldUseCommentTimelineContext(candidate: context, existing: existingContext, for: comment) {
+                    commentTimelineContextByCommentID[comment.id.value] = context
+                }
+            }
+        }
+
+        if newlyAddedComments > 0 {
+            rebuildCommentTimelineRows()
+        }
+
+        return newlyAddedComments
+    }
+
+    private func rebuildCommentTimelineRows() {
+        let hiddenTagID = hiddenTagIDValue
+        let tagsByID = availableTagsByID
+
+        commentTimelineRows = commentTimelineCommentsByID.values
+            .sorted {
+                if $0.createdAt == $1.createdAt {
+                    return $0.id.value < $1.id.value
+                }
+                return $0.createdAt < $1.createdAt
+            }
+            .map { comment in
+                let context = commentTimelineContextByCommentID[comment.id.value]
+                return commentTimelineRow(comment: comment, context: context, hiddenTagID: hiddenTagID, tagsByID: tagsByID)
+            }
+    }
+
+    private func commentTimelineRow(
+        comment: SegmentComment,
+        context: CommentTimelineSegmentContext?,
+        hiddenTagID: Int64? = nil,
+        tagsByID: [Int64: Tag]? = nil
+    ) -> CommentTimelineRow {
+        let effectiveHiddenTagID = hiddenTagID ?? hiddenTagIDValue
+        let effectiveTagsByID = tagsByID ?? availableTagsByID
+        let primaryTagName: String? = context.flatMap { context in
+            let segmentTagIDs = segmentTagsMap[context.segmentID.value] ?? []
+            let visibleTagNames = segmentTagIDs
+                .filter { tagID in
+                    guard let effectiveHiddenTagID else { return true }
+                    return tagID != effectiveHiddenTagID
+                }
+                .compactMap { effectiveTagsByID[$0]?.name }
+                .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            return visibleTagNames.first
+        }
+
+        return CommentTimelineRow(
+            comment: comment,
+            context: context,
+            primaryTagName: primaryTagName
+        )
+    }
+
+    private func preferredSegmentContext(
+        _ lhs: CommentTimelineSegmentContext,
+        _ rhs: CommentTimelineSegmentContext
+    ) -> CommentTimelineSegmentContext {
+        let lhsHasBrowserURL = lhs.browserURL?.isEmpty == false
+        let rhsHasBrowserURL = rhs.browserURL?.isEmpty == false
+        if lhsHasBrowserURL != rhsHasBrowserURL {
+            return lhsHasBrowserURL ? lhs : rhs
+        }
+        return lhs.referenceTimestamp <= rhs.referenceTimestamp ? lhs : rhs
+    }
+
+    private func shouldUseCommentTimelineContext(
+        candidate: CommentTimelineSegmentContext,
+        existing: CommentTimelineSegmentContext?,
+        for comment: SegmentComment
+    ) -> Bool {
+        guard let existing else { return true }
+
+        let candidateDistance = abs(candidate.referenceTimestamp.timeIntervalSince(comment.createdAt))
+        let existingDistance = abs(existing.referenceTimestamp.timeIntervalSince(comment.createdAt))
+
+        if candidateDistance == existingDistance {
+            let candidateHasBundle = candidate.appBundleID?.isEmpty == false
+            let existingHasBundle = existing.appBundleID?.isEmpty == false
+            if candidateHasBundle != existingHasBundle {
+                return candidateHasBundle
+            }
+            return candidate.segmentID.value < existing.segmentID.value
+        }
+
+        return candidateDistance < existingDistance
+    }
+
+    private func normalizedMetadataString(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func appendCommentSnippet(_ snippet: String) {
@@ -3496,6 +4229,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         return hasNoSources &&
             criteria.hiddenFilter == .hide &&
+            criteria.commentFilter == .allFrames &&
             hasNoTags &&
             criteria.tagFilterMode == .include &&
             hasNoWindowFilter &&
@@ -3699,6 +4433,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    /// Source selection is no longer user-configurable in timeline filters.
+    /// Always normalize to query across all available sources.
+    private func normalizedTimelineFilterCriteria(_ criteria: FilterCriteria) -> FilterCriteria {
+        var normalized = criteria
+        normalized.selectedSources = nil
+        return normalized
+    }
+
     /// Toggle app filter selection (updates pending, not applied)
     public func toggleAppFilter(_ bundleID: String) {
         var apps = pendingFilterCriteria.selectedApps ?? []
@@ -3709,28 +4451,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
         pendingFilterCriteria.selectedApps = apps.isEmpty ? nil : apps
         Log.debug("[Filter] Toggled app filter for \(bundleID), now \(apps.count) apps selected (pending)", category: .ui)
-    }
-
-    /// Toggle source filter selection (updates pending, not applied)
-    /// Toggle source filter - nil means only Retrace (native)
-    /// Clicking Rewind toggles it on/off while keeping Retrace always on
-    /// Clicking Retrace when only Retrace is selected does nothing (must have at least one)
-    public func toggleSourceFilter(_ source: FrameSource) {
-        // nil means only native (Retrace) selected
-        var sources = pendingFilterCriteria.selectedSources ?? Set([.native])
-
-        if sources.contains(source) {
-            // Don't allow removing the last source
-            if sources.count > 1 {
-                sources.remove(source)
-                pendingFilterCriteria.selectedSources = sources
-            }
-        } else {
-            // Add the source
-            sources.insert(source)
-            pendingFilterCriteria.selectedSources = sources
-        }
-        Log.debug("[Filter] Toggled source filter for \(source.rawValue), now: \(pendingFilterCriteria.selectedSources?.map { $0.rawValue } ?? ["native only"])", category: .ui)
     }
 
     /// Toggle tag filter selection (updates pending, not applied)
@@ -3749,6 +4469,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func setHiddenFilter(_ mode: HiddenFilter) {
         pendingFilterCriteria.hiddenFilter = mode
         Log.debug("[Filter] Set hidden filter to \(mode.rawValue) (pending)", category: .ui)
+    }
+
+    /// Set comment presence filter mode (updates pending, not applied)
+    public func setCommentFilter(_ mode: CommentFilter) {
+        pendingFilterCriteria.commentFilter = mode
+        Log.debug("[Filter] Set comment filter to \(mode.rawValue) (pending)", category: .ui)
     }
 
     /// Set app filter mode (include/exclude) (updates pending, not applied)
@@ -3785,9 +4511,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingCmdFQuickFilterLatencyTrace = nil
     }
 
-    /// Apply pending filters
-    public func applyFilters() {
+    /// Apply pending filters.
+    /// - Parameter dismissPanel: Whether to close the filter panel after applying.
+    public func applyFilters(dismissPanel: Bool = true) {
         Log.debug("[Filter] applyFilters() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), current.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
+
+        let normalizedCurrentCriteria = normalizedTimelineFilterCriteria(filterCriteria)
+        let normalizedPendingCriteria = normalizedTimelineFilterCriteria(pendingFilterCriteria)
+        if normalizedCurrentCriteria != filterCriteria {
+            filterCriteria = normalizedCurrentCriteria
+        }
+        if normalizedPendingCriteria != pendingFilterCriteria {
+            pendingFilterCriteria = normalizedPendingCriteria
+        }
+
+        if normalizedPendingCriteria == normalizedCurrentCriteria {
+            if dismissPanel {
+                dismissFilterPanel()
+            }
+            return
+        }
 
         // Invalidate peek cache since filters are changing
         invalidatePeekCache()
@@ -3800,10 +4543,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             "applyFilters.capture",
             trace: cmdFTrace,
             targetTimestamp: timestampToPreserve,
-            extra: "pending={\(summarizeFiltersForLog(pendingFilterCriteria))} current={\(summarizeFiltersForLog(filterCriteria))}"
+            extra: "pending={\(summarizeFiltersForLog(normalizedPendingCriteria))} current={\(summarizeFiltersForLog(normalizedCurrentCriteria))}"
         )
 
-        filterCriteria = pendingFilterCriteria
+        filterCriteria = normalizedPendingCriteria
+        pendingFilterCriteria = normalizedPendingCriteria
         Log.debug("[Filter] Applied filters - filterCriteria.selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
         logCmdFPlayheadState(
             "applyFilters.applied",
@@ -3816,7 +4560,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         let filterJson = buildTimelineFilterJson()
         DashboardViewModel.recordTimelineFilter(coordinator: coordinator, filterJson: filterJson)
 
-        dismissFilterPanel()
+        if dismissPanel {
+            dismissFilterPanel()
+        }
 
         // Save filter criteria to cache immediately
         saveFilterCriteria()
@@ -4046,8 +4792,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Restore timeline state from a snapshot
     private func restoreTimelineState(_ snapshot: TimelineStateSnapshot) {
-        filterCriteria = snapshot.filterCriteria
-        pendingFilterCriteria = snapshot.filterCriteria
+        let normalized = normalizedTimelineFilterCriteria(snapshot.filterCriteria)
+        filterCriteria = normalized
+        pendingFilterCriteria = normalized
         frames = snapshot.frames
         currentIndex = snapshot.currentIndex
         hasMoreOlder = snapshot.hasMoreOlder
@@ -4160,7 +4907,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func dismissOtherDialogs(except: DialogType? = nil) {
         // Dismiss filter panel
         if except != .filter && isFilterPanelVisible {
-            pendingFilterCriteria = filterCriteria
+            let normalized = normalizedTimelineFilterCriteria(filterCriteria)
+            if normalized != filterCriteria {
+                filterCriteria = normalized
+            }
+            pendingFilterCriteria = normalized
             dismissFilterDropdown()
             isFilterPanelVisible = false
         }
@@ -4191,7 +4942,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Dismiss filter panel (resets pending to match applied)
     public func dismissFilterPanel() {
         // Reset pending first - animation is handled by the View
-        pendingFilterCriteria = filterCriteria
+        let normalized = normalizedTimelineFilterCriteria(filterCriteria)
+        if normalized != filterCriteria {
+            filterCriteria = normalized
+        }
+        pendingFilterCriteria = normalized
         dismissFilterDropdown()
         isFilterPanelVisible = false
     }
@@ -4209,7 +4964,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
         // Initialize pending with current applied filters
-        pendingFilterCriteria = filterCriteria
+        let normalized = normalizedTimelineFilterCriteria(filterCriteria)
+        if normalized != filterCriteria {
+            filterCriteria = normalized
+        }
+        pendingFilterCriteria = normalized
         // Set visible immediately - animation is handled by the View
         isFilterPanelVisible = true
         // Load data asynchronously - delay slightly to let animation complete first
@@ -4437,19 +5196,24 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Save filter criteria to cache
     /// Saves pendingFilterCriteria so that in-progress filter changes are preserved
     private func saveFilterCriteria() {
-        Log.debug("[FilterCache] saveFilterCriteria() called - pending.selectedApps=\(String(describing: pendingFilterCriteria.selectedApps)), pending.hasActiveFilters=\(pendingFilterCriteria.hasActiveFilters)", category: .ui)
+        let normalizedPendingCriteria = normalizedTimelineFilterCriteria(pendingFilterCriteria)
+        if normalizedPendingCriteria != pendingFilterCriteria {
+            pendingFilterCriteria = normalizedPendingCriteria
+        }
+
+        Log.debug("[FilterCache] saveFilterCriteria() called - pending.selectedApps=\(String(describing: normalizedPendingCriteria.selectedApps)), pending.hasActiveFilters=\(normalizedPendingCriteria.hasActiveFilters)", category: .ui)
         // If no filters are active in pending, clear any cached filters to avoid restoring stale state
-        guard pendingFilterCriteria.hasActiveFilters else {
+        guard normalizedPendingCriteria.hasActiveFilters else {
             Log.debug("[FilterCache] No active pending filters, clearing cache", category: .ui)
             clearCachedFilterCriteria()
             return
         }
 
         do {
-            let data = try JSONEncoder().encode(pendingFilterCriteria)
+            let data = try JSONEncoder().encode(normalizedPendingCriteria)
             UserDefaults.standard.set(data, forKey: Self.cachedFilterCriteriaKey)
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.cachedFilterSavedAtKey)
-            Log.debug("[FilterCache] Saved pending filter criteria with selectedApps=\(String(describing: pendingFilterCriteria.selectedApps))", category: .ui)
+            Log.debug("[FilterCache] Saved pending filter criteria with selectedApps=\(String(describing: normalizedPendingCriteria.selectedApps))", category: .ui)
         } catch {
             Log.warning("[FilterCache] Failed to save filter criteria: \(error)", category: .ui)
         }
@@ -4478,8 +5242,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             let restored = try JSONDecoder().decode(FilterCriteria.self, from: data)
-            filterCriteria = restored
-            pendingFilterCriteria = restored
+            let normalized = normalizedTimelineFilterCriteria(restored)
+            filterCriteria = normalized
+            pendingFilterCriteria = normalized
             Log.debug("[FilterCache] Restored filter criteria (saved \(Int(elapsed))s ago) - selectedApps=\(String(describing: filterCriteria.selectedApps))", category: .ui)
         } catch {
             Log.warning("[FilterCache] Failed to restore filter criteria: \(error)", category: .ui)
@@ -7992,13 +8757,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             let startDate = calendar.date(byAdding: .minute, value: -10, to: targetDate) ?? targetDate
             let endDate = calendar.date(byAdding: .minute, value: 10, to: targetDate) ?? targetDate
 
-            // Fetch all frames in the window
-            // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
+            // Fetch all frames in the window.
+            // Linked-comment jumps intentionally ignore hidden filtering so anchored frames remain reachable.
+            var jumpFilters = FilterCriteria.none
+            jumpFilters.hiddenFilter = .showAll
             let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
                 from: startDate,
                 to: endDate,
                 limit: 1000,
-                filters: filterCriteria,
+                filters: jumpFilters,
                 reason: "searchForFrameID"
             )
             Log.debug("[FrameIDSearch] Got \(framesWithVideoInfo.count) frames in window", category: .ui)
@@ -8033,6 +8800,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 currentIndex = closestIndex
                 Log.debug("[FrameIDSearch] Frame not in window, using closest at index \(closestIndex)", category: .ui)
             }
+
+            // Keep comment/tag context anchored to the jumped-to frame.
+            // Without this, reopening the comment panel can resolve against a stale block index
+            // from the pre-jump frame window.
+            timelineContextMenuSegmentIndex = currentIndex
+            selectedFrameIndex = currentIndex
 
             // Load image if needed
             loadImageIfNeeded()

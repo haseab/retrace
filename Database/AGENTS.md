@@ -20,7 +20,10 @@ Database/
 │   ├── V5_FTSUnicode61.swift
 │   ├── V6_FrameProcessedAt.swift
 │   ├── V7_FrameRedactionReason.swift
-│   └── V8_SegmentComments.swift
+│   ├── V8_SegmentComments.swift
+│   ├── V9_SegmentCommentFrameAnchor.swift
+│   ├── V10_SegmentCommentSearchIndex.swift
+│   └── V11_SegmentCommentLinkCompositeIndex.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations

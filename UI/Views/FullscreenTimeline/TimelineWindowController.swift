@@ -1104,6 +1104,7 @@ public class TimelineWindowController: NSObject {
 
         return hasNoSources &&
             criteria.hiddenFilter == .hide &&
+            criteria.commentFilter == .allFrames &&
             hasNoTags &&
             criteria.tagFilterMode == .include &&
             hasNoWindowFilter &&
@@ -1926,6 +1927,22 @@ public class TimelineWindowController: NSObject {
                     }
                     return true
                 }
+                // If the comment link popover is open, close it first.
+                if viewModel.showCommentSubmenu && viewModel.isCommentLinkPopoverPresented {
+                    viewModel.requestCloseCommentLinkPopover()
+                    return true
+                }
+                // In all-comments browser mode, Escape should return to local thread comments
+                // before dismissing the full comment submenu.
+                if viewModel.showCommentSubmenu && viewModel.isAllCommentsBrowserActive {
+                    viewModel.requestReturnToThreadComments()
+                    return true
+                }
+                // Close comment submenu with its dedicated fade-out path.
+                if viewModel.showCommentSubmenu {
+                    viewModel.dismissCommentSubmenu()
+                    return true
+                }
                 // Right-click menus should dismiss before any higher-level escape behavior.
                 if viewModel.showTimelineContextMenu || viewModel.showContextMenu || viewModel.showCommentSubmenu {
                     withAnimation(.easeOut(duration: 0.12)) {
@@ -2285,6 +2302,15 @@ public class TimelineWindowController: NSObject {
             if event.keyCode == 36 || event.keyCode == 76 { // Return or Enter
                 return viewModel.handleCalendarPickerEnterKey()
             }
+        }
+
+        // While the filter panel is open, let the panel own arrow-key navigation.
+        // This prevents left/right from scrubbing the timeline behind the panel.
+        if let viewModel = timelineViewModel,
+           viewModel.isFilterPanelVisible,
+           modifiers.isEmpty,
+           (event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 125 || event.keyCode == 126) {
+            return false
         }
 
         // Left arrow key or J - navigate to previous frame (Option = 3x speed)

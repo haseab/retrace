@@ -87,9 +87,9 @@ public struct SpotlightSearchOverlay: View {
 
                         // Filter bar placeholder + results
                         VStack(spacing: 0) {
-                            // Spacer for the filter bar height (chips ~40px + vertical padding 24px = ~64px)
+                            // Reserve vertical space for the filter bar so results don't jump when it appears.
                             Color.clear
-                                .frame(height: 56)
+                                .frame(height: 48)
                                 .allowsHitTesting(false)
 
                             if hasResults {
@@ -298,7 +298,8 @@ public struct SpotlightSearchOverlay: View {
             // Loading spinner (shown while searching)
             if viewModel.isSearching {
                 SpinnerView(size: 20, lineWidth: 2, color: .white)
-                    .frame(width: 32, height: 32)
+                    // Keep search row height stable while loading so filter bar offset does not shift.
+                    .frame(width: 24, height: 24)
             }
 
             // Filter button (expands to show filters)

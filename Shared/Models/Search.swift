@@ -49,6 +49,7 @@ public struct SearchFilters: Codable, Sendable {
     public let selectedTagIds: [Int64]?  // nil means all tags
     public let excludedTagIds: [Int64]?  // Tags to exclude
     public let hiddenFilter: HiddenFilter  // How to handle hidden segments
+    public let commentFilter: CommentFilter  // How to handle comment presence
     public let windowNameFilter: String?  // Partial match on segment.windowName
     public let browserUrlFilter: String?  // Partial match on segment.browserUrl
 
@@ -60,6 +61,7 @@ public struct SearchFilters: Codable, Sendable {
         selectedTagIds: [Int64]? = nil,
         excludedTagIds: [Int64]? = nil,
         hiddenFilter: HiddenFilter = .hide,
+        commentFilter: CommentFilter = .allFrames,
         windowNameFilter: String? = nil,
         browserUrlFilter: String? = nil
     ) {
@@ -70,6 +72,7 @@ public struct SearchFilters: Codable, Sendable {
         self.selectedTagIds = selectedTagIds
         self.excludedTagIds = excludedTagIds
         self.hiddenFilter = hiddenFilter
+        self.commentFilter = commentFilter
         self.windowNameFilter = windowNameFilter
         self.browserUrlFilter = browserUrlFilter
     }
@@ -81,8 +84,50 @@ public struct SearchFilters: Codable, Sendable {
         appBundleIDs != nil || excludedAppBundleIDs != nil ||
         selectedTagIds != nil || excludedTagIds != nil ||
         hiddenFilter != .hide ||
+        commentFilter != .allFrames ||
         (windowNameFilter?.isEmpty == false) ||
         (browserUrlFilter?.isEmpty == false)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case startDate
+        case endDate
+        case appBundleIDs
+        case excludedAppBundleIDs
+        case selectedTagIds
+        case excludedTagIds
+        case hiddenFilter
+        case commentFilter
+        case windowNameFilter
+        case browserUrlFilter
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        startDate = try container.decodeIfPresent(Date.self, forKey: .startDate)
+        endDate = try container.decodeIfPresent(Date.self, forKey: .endDate)
+        appBundleIDs = try container.decodeIfPresent([String].self, forKey: .appBundleIDs)
+        excludedAppBundleIDs = try container.decodeIfPresent([String].self, forKey: .excludedAppBundleIDs)
+        selectedTagIds = try container.decodeIfPresent([Int64].self, forKey: .selectedTagIds)
+        excludedTagIds = try container.decodeIfPresent([Int64].self, forKey: .excludedTagIds)
+        hiddenFilter = try container.decodeIfPresent(HiddenFilter.self, forKey: .hiddenFilter) ?? .hide
+        commentFilter = try container.decodeIfPresent(CommentFilter.self, forKey: .commentFilter) ?? .allFrames
+        windowNameFilter = try container.decodeIfPresent(String.self, forKey: .windowNameFilter)
+        browserUrlFilter = try container.decodeIfPresent(String.self, forKey: .browserUrlFilter)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(startDate, forKey: .startDate)
+        try container.encodeIfPresent(endDate, forKey: .endDate)
+        try container.encodeIfPresent(appBundleIDs, forKey: .appBundleIDs)
+        try container.encodeIfPresent(excludedAppBundleIDs, forKey: .excludedAppBundleIDs)
+        try container.encodeIfPresent(selectedTagIds, forKey: .selectedTagIds)
+        try container.encodeIfPresent(excludedTagIds, forKey: .excludedTagIds)
+        try container.encode(hiddenFilter, forKey: .hiddenFilter)
+        try container.encode(commentFilter, forKey: .commentFilter)
+        try container.encodeIfPresent(windowNameFilter, forKey: .windowNameFilter)
+        try container.encodeIfPresent(browserUrlFilter, forKey: .browserUrlFilter)
     }
 }
 

@@ -130,6 +130,21 @@ public actor DataAdapter {
         return (retraceConnection, retraceConfig)
     }
 
+    /// Filters that require Retrace-only semantics because Rewind lacks supporting tables/data.
+    private func requiresRetraceOnly(_ filters: FilterCriteria) -> Bool {
+        (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
+        filters.hiddenFilter == .onlyHidden ||
+        filters.commentFilter == .commentsOnly
+    }
+
+    /// Search filters that require Retrace-only semantics.
+    private func requiresRetraceOnly(_ filters: SearchFilters) -> Bool {
+        (filters.selectedTagIds != nil && !filters.selectedTagIds!.isEmpty) ||
+        (filters.excludedTagIds != nil && !filters.excludedTagIds!.isEmpty) ||
+        filters.hiddenFilter == .onlyHidden ||
+        filters.commentFilter == .commentsOnly
+    }
+
     // MARK: - Frame Retrieval
 
     /// Get frames with video info in a time range (optimized - single query with JOINs)
@@ -181,8 +196,7 @@ public actor DataAdapter {
                            filters.selectedSources?.contains(.rewind) == false
         // Rewind database doesn't have segment_tag table.
         // For tag-driven filters, only query Retrace so semantics remain correct.
-        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
-                           filters.hiddenFilter == .onlyHidden
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
 
         let shouldPreferRewindFirst: Bool = {
             guard let cutoff = cutoffDate else { return false }
@@ -213,7 +227,7 @@ public actor DataAdapter {
         func queryRewindIfNeeded() throws {
             guard remaining > 0,
                   !excludeRewind,
-                  !hasTagFilters,
+                  !hasRetraceOnlyFilters,
                   let cutoff = cutoffDate,
                   let rewind = rewindConnection,
                   let config = rewindConfig,
@@ -313,10 +327,9 @@ public actor DataAdapter {
         // Step 2: If we don't have enough frames, query Rewind (unless excluded)
         // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
         // Also skip if the filter's startDate is after the cutoff date (no Rewind data exists after cutoff)
-        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
-                           filters.hiddenFilter == .onlyHidden
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
         let startDateAfterCutoff = cutoffDate != nil && filters.startDate != nil && filters.startDate! >= cutoffDate!
-        if remaining > 0, !excludeRewind, !hasTagFilters, !startDateAfterCutoff, let rewind = rewindConnection, let config = rewindConfig {
+        if remaining > 0, !excludeRewind, !hasRetraceOnlyFilters, !startDateAfterCutoff, let rewind = rewindConnection, let config = rewindConfig {
             let rewindFrames = try queryMostRecentFramesWithFiltersOptimized(
                 limit: remaining,
                 connection: rewind,
@@ -384,8 +397,7 @@ public actor DataAdapter {
                            filters.selectedSources?.contains(.rewind) == false
 
         // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
-        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
-                           filters.hiddenFilter == .onlyHidden
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
         let shouldPreferRewindFirst: Bool = {
             guard let cutoff = cutoffDate else { return false }
             return timestamp < cutoff
@@ -408,7 +420,7 @@ public actor DataAdapter {
         func queryRewindIfNeeded() throws {
             guard remaining > 0,
                   !excludeRewind,
-                  !hasTagFilters,
+                  !hasRetraceOnlyFilters,
                   let rewind = rewindConnection,
                   let config = rewindConfig else {
                 return
@@ -487,8 +499,7 @@ public actor DataAdapter {
                            filters.selectedSources?.contains(.rewind) == false
 
         // Note: Skip Rewind if tag filters are active (Rewind doesn't have segment_tag table)
-        let hasTagFilters = (filters.selectedTags != nil && !filters.selectedTags!.isEmpty) ||
-                           filters.hiddenFilter == .onlyHidden
+        let hasRetraceOnlyFilters = requiresRetraceOnly(filters)
         let shouldPreferRewindFirst: Bool = {
             guard let cutoff = cutoffDate else { return false }
             return timestamp < cutoff
@@ -511,7 +522,7 @@ public actor DataAdapter {
         func queryRewindIfNeeded() throws {
             guard remaining > 0,
                   !excludeRewind,
-                  !hasTagFilters,
+                  !hasRetraceOnlyFilters,
                   let cutoff = cutoffDate,
                   let rewind = rewindConnection,
                   let config = rewindConfig,
@@ -808,8 +819,10 @@ public actor DataAdapter {
             Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
         }
 
+        let retraceOnlySearchFilters = requiresRetraceOnly(query.filters)
+
         // Search Rewind
-        if let rewind = rewindConnection, let config = rewindConfig {
+        if !retraceOnlySearchFilters, let rewind = rewindConnection, let config = rewindConfig {
             let rewindStart = Date()
             do {
                 var rewindResults = try searchConnection(query: query, connection: rewind, config: config, source: .rewind)
@@ -825,6 +838,8 @@ public actor DataAdapter {
             } catch {
                 Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
             }
+        } else if retraceOnlySearchFilters {
+            Log.debug("[DataAdapter] Skipping Rewind search due to Retrace-only filters", category: .app)
         }
 
         // Sort by search mode
@@ -1210,6 +1225,14 @@ public actor DataAdapter {
                 """)
         }
 
+        if let commentClause = buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
+        }
+
         // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
         if config.source != .rewind {
             whereClauses.append("f.processingStatus != 4")
@@ -1412,6 +1435,14 @@ public actor DataAdapter {
                 """)
         }
 
+        if let commentClause = buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
+        }
+
         if config.source != .rewind {
             whereClauses.append("f.processingStatus != 4")
         }
@@ -1605,6 +1636,14 @@ public actor DataAdapter {
                     AND st_hidden.tagId = ?
                 )
                 """)
+        }
+
+        if let commentClause = buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
         }
 
         // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
@@ -1829,6 +1868,14 @@ public actor DataAdapter {
                 """)
         }
 
+        if let commentClause = buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
+        }
+
         // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
         if config.source != .rewind {
             whereClauses.append("f.processingStatus != 4")
@@ -2043,6 +2090,19 @@ public actor DataAdapter {
                     AND st_hidden.tagId = ?
                 )
                 """)
+        }
+
+        if let commentClause = buildCommentFilterClause(
+            filters.commentFilter,
+            isRewindDatabase: isRewindDatabase,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereClauses.append(commentClause)
+        }
+
+        // Always exclude p=4 frames (not yet readable) - only for Retrace, Rewind doesn't have this column
+        if config.source != .rewind {
+            whereClauses.append("f.processingStatus != 4")
         }
 
         let whereClause = whereClauses.joined(separator: " AND ")
@@ -2721,6 +2781,14 @@ public actor DataAdapter {
             }
         }
 
+        if let commentClause = buildCommentFilterClause(
+            query.filters.commentFilter,
+            isRewindDatabase: isRewind,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            outerWhereConditions.append(commentClause)
+        }
+
         let outerWhereClause = outerWhereConditions.isEmpty ? "" : "WHERE " + outerWhereConditions.joined(separator: " AND ")
 
         // Subquery approach: FTS with bm25 FIRST (limited), then join and filter
@@ -2970,6 +3038,14 @@ public actor DataAdapter {
                 // No filter needed - show both hidden and visible
                 break
             }
+        }
+
+        if let commentClause = buildCommentFilterClause(
+            query.filters.commentFilter,
+            isRewindDatabase: isRewind,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereConditions.append(commentClause)
         }
 
         // Determine if we need the segment table join (for app filter or tag/hidden filters)
@@ -3268,6 +3344,41 @@ public actor DataAdapter {
         // Use LIKE with wildcards for partial matching
         let pattern = "%\(urlPattern)%"
         return (clause: "\(tableAlias).browserUrl LIKE ?", pattern: pattern)
+    }
+
+    /// Build SQL clause for comment-presence filtering.
+    /// Returns nil when no filtering is required.
+    private func buildCommentFilterClause(
+        _ filter: CommentFilter,
+        isRewindDatabase: Bool,
+        segmentIDExpression: String
+    ) -> String? {
+        switch filter {
+        case .allFrames:
+            return nil
+        case .commentsOnly:
+            if isRewindDatabase {
+                // Rewind does not have comment-link data.
+                return "1 = 0"
+            }
+            return """
+                EXISTS (
+                    SELECT 1 FROM segment_comment_link scl
+                    WHERE scl.segmentId = \(segmentIDExpression)
+                )
+                """
+        case .noComments:
+            if isRewindDatabase {
+                // Rewind has no comments, so all rows are "no comments".
+                return nil
+            }
+            return """
+                NOT EXISTS (
+                    SELECT 1 FROM segment_comment_link scl
+                    WHERE scl.segmentId = \(segmentIDExpression)
+                )
+                """
+        }
     }
 
     private func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {

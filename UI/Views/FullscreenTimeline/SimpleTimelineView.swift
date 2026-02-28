@@ -16,6 +16,9 @@ public struct SimpleTimelineView: View {
     @State private var appearanceRefreshTick = 0
     /// Tracks whether the live screenshot has been displayed, allowing AVPlayer to pre-mount underneath
     @State private var liveScreenshotHasAppeared = false
+    /// Keep comment submenu mounted during fade-out so dismissal is visibly animated.
+    @State private var isCommentSubmenuMounted = false
+    @State private var commentSubmenuVisibility: Double = 0
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -320,26 +323,25 @@ public struct SimpleTimelineView: View {
                     )
                 }
 
-                if viewModel.showCommentSubmenu {
+                if isCommentSubmenuMounted {
                     Color.black.opacity(0.35)
+                        .opacity(commentSubmenuVisibility)
                         .ignoresSafeArea()
-                        .transition(.opacity)
+                        .allowsHitTesting(viewModel.showCommentSubmenu)
                         .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.12)) {
-                                viewModel.dismissTimelineContextMenu()
-                            }
+                            viewModel.dismissCommentSubmenu()
                         }
 
                     VStack {
                         CommentSubmenu(viewModel: viewModel) {
-                            withAnimation(.easeOut(duration: 0.12)) {
-                                viewModel.dismissTimelineContextMenu()
-                            }
+                            viewModel.dismissCommentSubmenu()
                         }
                         .frame(maxWidth: min(geometry.size.width - 40, 560))
                     }
                     .padding(.horizontal, 20)
-                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                    .opacity(commentSubmenuVisibility)
+                    .scaleEffect(0.98 + (0.02 * commentSubmenuVisibility))
+                    .allowsHitTesting(viewModel.showCommentSubmenu)
                 }
 
                 // Toast feedback overlay (centered, larger for errors)
@@ -393,6 +395,10 @@ public struct SimpleTimelineView: View {
                         await viewModel.loadMostRecentFrame()
                     }
                 }
+                if viewModel.showCommentSubmenu {
+                    isCommentSubmenuMounted = true
+                    commentSubmenuVisibility = 1
+                }
                 viewModel.handleTimelineOpened()
                 // Start periodic refresh of processing statuses
                 viewModel.startPeriodicStatusRefresh()
@@ -409,6 +415,26 @@ public struct SimpleTimelineView: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .fontStyleDidChange)) { _ in
                 appearanceRefreshTick &+= 1
+            }
+            .onChange(of: viewModel.showCommentSubmenu) { isVisible in
+                let animationDuration = 0.16
+                if isVisible {
+                    if !isCommentSubmenuMounted {
+                        isCommentSubmenuMounted = true
+                        commentSubmenuVisibility = 0
+                    }
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        commentSubmenuVisibility = 1
+                    }
+                } else if isCommentSubmenuMounted {
+                    withAnimation(.easeOut(duration: animationDuration)) {
+                        commentSubmenuVisibility = 0
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration) {
+                        guard !viewModel.showCommentSubmenu else { return }
+                        isCommentSubmenuMounted = false
+                    }
+                }
             }
             .animation(.easeOut(duration: 0.16), value: viewModel.showCommentSubmenu)
             // Note: Keyboard shortcuts (Option+F, Cmd+F, Escape) are handled by TimelineWindowController
@@ -4807,6 +4833,7 @@ struct TagSubmenu: View {
     @State private var isHoveringSubmenu = false
     @State private var closeTask: Task<Void, Never>?
     @State private var searchText = ""
+    @State private var highlightedTagID: Int64?
     @State private var isHoveringSettingsButton = false
     @FocusState private var isSearchFocused: Bool
 
@@ -4839,6 +4866,10 @@ struct TagSubmenu: View {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !exactTagMatch
     }
 
+    private var visibleTagIDs: [Int64] {
+        visibleTags.map { $0.id.value }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Search/Create input field - always visible
@@ -4855,9 +4886,9 @@ struct TagSubmenu: View {
                     .onSubmit {
                         if showCreateOption {
                             createTagFromSearch()
-                        } else if visibleTags.count == 1 {
-                            // If only one result, toggle it
-                            viewModel.toggleTagOnSelectedSegment(tag: visibleTags[0])
+                        } else if let highlightedTagID,
+                           let highlightedTag = visibleTags.first(where: { $0.id.value == highlightedTagID }) {
+                            viewModel.toggleTagOnSelectedSegment(tag: highlightedTag)
                         }
                     }
             }
@@ -4889,7 +4920,13 @@ struct TagSubmenu: View {
                         ForEach(visibleTags) { tag in
                             TagSubmenuRow(
                                 tag: tag,
-                                isSelected: viewModel.selectedSegmentTags.contains(tag.id)
+                                isSelected: viewModel.selectedSegmentTags.contains(tag.id),
+                                isKeyboardHighlighted: highlightedTagID == tag.id.value,
+                                onHoverChanged: { hovering in
+                                    if hovering {
+                                        highlightedTagID = tag.id.value
+                                    }
+                                }
                             ) {
                                 viewModel.toggleTagOnSelectedSegment(tag: tag)
                             }
@@ -4970,6 +5007,13 @@ struct TagSubmenu: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isSearchFocused = true
             }
+            syncHighlightedTagToFirstVisibleResult()
+        }
+        .onChange(of: searchText) { _ in
+            syncHighlightedTagToFirstVisibleResult()
+        }
+        .onChange(of: visibleTagIDs) { _ in
+            syncHighlightedTagToFirstVisibleResult()
         }
         .onHover { hovering in
             isHoveringSubmenu = hovering
@@ -4992,6 +5036,13 @@ struct TagSubmenu: View {
                 closeTask?.cancel()
             }
         }
+    }
+
+    private func syncHighlightedTagToFirstVisibleResult() {
+        if let highlightedTagID, visibleTagIDs.contains(highlightedTagID) {
+            return
+        }
+        highlightedTagID = visibleTagIDs.first
     }
 
     private func createTagFromSearch() {
@@ -5025,18 +5076,37 @@ struct TagSubmenu: View {
 struct CommentSubmenu: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let onClose: () -> Void
+    @State private var commentKeyboardMonitor: Any?
     @State private var isCommentFocused = false
     @State private var editorCommand: CommentEditorCommand = .bold
     @State private var editorCommandNonce: Int = 0
     @State private var isLinkPopoverPresented = false
     @State private var pendingLinkURL = "https://"
     @State private var hoveredCommentID: SegmentCommentID?
+    @State private var hoveredAllCommentsRowID: SegmentCommentID?
+    @State private var highlightedCommentSearchResultID: SegmentCommentID?
     @State private var pendingDeleteComment: SegmentComment?
     @State private var isDeletingComment: Bool = false
+    @State private var commentBrowserMode: CommentBrowserMode = .thread
+    @State private var allCommentsAnchorID: SegmentCommentID?
+    @State private var allCommentsVisibleBeforeCount: Int = 0
+    @State private var allCommentsVisibleAfterCount: Int = 0
+    @State private var hasPerformedAllCommentsInitialScroll = false
+    @State private var isRequestingOlderCommentPage = false
+    @State private var isRequestingNewerCommentPage = false
+    @State private var pendingAnchorPinnedCommentID: SegmentCommentID?
+    @State private var isNavigatingLinkedCommentFrame = false
+    @FocusState private var isAllCommentsSearchFieldFocused: Bool
     @FocusState private var isLinkFieldFocused: Bool
     private let submenuWidth: CGFloat = 420
     private let submenuHeight: CGFloat = 560
     private let sectionCornerRadius: CGFloat = 14
+    private let allCommentsPageSize: Int = 10
+
+    private enum CommentBrowserMode {
+        case thread
+        case allComments
+    }
 
     private static let threadDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -5052,6 +5122,17 @@ struct CommentSubmenu: View {
 
     private var canSubmit: Bool {
         !trimmedComment.isEmpty && !viewModel.isAddingComment
+    }
+
+    private var hasActiveCommentSearch: Bool {
+        !viewModel.commentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var commentSearchBinding: Binding<String> {
+        Binding(
+            get: { viewModel.commentSearchText },
+            set: { viewModel.updateCommentSearchQuery($0) }
+        )
     }
 
     private var normalizedPendingLinkURL: URL? {
@@ -5073,11 +5154,17 @@ struct CommentSubmenu: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             commentHeader
-            commentThreadSection
-                .frame(maxHeight: .infinity)
-                .layoutPriority(1)
-            commentComposerSection
-                .fixedSize(horizontal: false, vertical: true)
+            if commentBrowserMode == .thread {
+                commentThreadSection
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
+                commentComposerSection
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                allCommentsSection
+                    .frame(maxHeight: .infinity)
+                    .layoutPriority(1)
+            }
         }
         .frame(width: submenuWidth)
         .frame(height: submenuHeight, alignment: .top)
@@ -5085,12 +5172,63 @@ struct CommentSubmenu: View {
         .padding(.vertical, 15)
         .retraceMenuContainer(addPadding: false)
         .onAppear {
+            installCommentKeyboardMonitor()
+            commentBrowserMode = .thread
+            allCommentsAnchorID = nil
+            allCommentsVisibleBeforeCount = 0
+            allCommentsVisibleAfterCount = 0
+            hasPerformedAllCommentsInitialScroll = false
+            isRequestingOlderCommentPage = false
+            isRequestingNewerCommentPage = false
+            pendingAnchorPinnedCommentID = nil
+            highlightedCommentSearchResultID = nil
+            isAllCommentsSearchFieldFocused = false
+            viewModel.isAllCommentsBrowserActive = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isCommentFocused = true
             }
             if viewModel.selectedBlockComments.isEmpty && !viewModel.isLoadingBlockComments {
                 Task { await viewModel.loadCommentsForSelectedTimelineBlock() }
             }
+        }
+        .onChange(of: commentBrowserMode) { mode in
+            viewModel.isAllCommentsBrowserActive = (mode == .allComments)
+            if mode == .allComments {
+                syncHighlightedCommentSearchSelection()
+                DispatchQueue.main.async {
+                    isAllCommentsSearchFieldFocused = true
+                }
+            } else {
+                highlightedCommentSearchResultID = nil
+                isAllCommentsSearchFieldFocused = false
+            }
+        }
+        .onChange(of: viewModel.returnToThreadCommentsSignal) { _ in
+            guard commentBrowserMode == .allComments else { return }
+            withAnimation(.easeOut(duration: 0.14)) {
+                exitAllCommentsView()
+            }
+        }
+        .onChange(of: viewModel.commentSearchText) { _ in
+            syncHighlightedCommentSearchSelection()
+        }
+        .onChange(of: viewModel.commentSearchResults.map { $0.id.value }) { _ in
+            syncHighlightedCommentSearchSelection()
+        }
+        .onChange(of: isLinkPopoverPresented) { isPresented in
+            viewModel.isCommentLinkPopoverPresented = isPresented
+        }
+        .onChange(of: viewModel.closeCommentLinkPopoverSignal) { _ in
+            guard isLinkPopoverPresented else { return }
+            isLinkPopoverPresented = false
+            isCommentFocused = true
+        }
+        .onDisappear {
+            removeCommentKeyboardMonitor()
+            viewModel.isCommentLinkPopoverPresented = false
+            viewModel.isAllCommentsBrowserActive = false
+            isAllCommentsSearchFieldFocused = false
+            viewModel.resetCommentTimelineState()
         }
         .alert(
             "Delete comment?",
@@ -5111,6 +5249,24 @@ struct CommentSubmenu: View {
 
     private var commentHeader: some View {
         HStack(spacing: 12) {
+            if commentBrowserMode == .allComments {
+                Button(action: exitAllCommentsView) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.9))
+                        .frame(width: 24, height: 24)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.08))
+                        )
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
+
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.white.opacity(0.08))
                 .frame(width: 34, height: 34)
@@ -5121,12 +5277,44 @@ struct CommentSubmenu: View {
                 )
 
             VStack(alignment: .leading, spacing: 0) {
-                Text("Comments")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundColor(.retracePrimary)
+                Text(commentBrowserMode == .allComments ? "All Comments" : "Comments")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.retracePrimary)
             }
 
             Spacer()
+
+            if commentBrowserMode == .thread {
+                Button(action: { openAllComments(anchoredAt: allCommentsLaunchAnchorComment) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "list.bullet")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("All Comments")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text("⌥A")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.85))
+                            .padding(.leading, 2)
+                    }
+                    .foregroundColor(.retracePrimary.opacity(0.9))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(0.08))
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Open All Comments (Option+A)")
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -5148,9 +5336,11 @@ struct CommentSubmenu: View {
 
     private var commentThreadSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(threadCountLabel)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.retraceSecondary)
+            HStack(spacing: 8) {
+                Text(threadCountLabel)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.retraceSecondary)
+            }
 
             if viewModel.isLoadingBlockComments {
                 HStack(spacing: 8) {
@@ -5198,6 +5388,272 @@ struct CommentSubmenu: View {
             RoundedRectangle(cornerRadius: sectionCornerRadius)
                 .stroke(Color.white.opacity(0.06), lineWidth: 1)
         )
+    }
+
+    private var allCommentsAnchorIndex: Int? {
+        let rows = viewModel.commentTimelineRows
+        guard !rows.isEmpty else { return nil }
+
+        if let explicitAnchor = allCommentsAnchorID,
+           let index = rows.firstIndex(where: { $0.id == explicitAnchor }) {
+            return index
+        }
+
+        if let vmAnchor = viewModel.commentTimelineAnchorCommentID,
+           let index = rows.firstIndex(where: { $0.id == vmAnchor }) {
+            return index
+        }
+
+        return rows.count / 2
+    }
+
+    private var allCommentsAvailableBeforeCount: Int {
+        allCommentsAnchorIndex ?? 0
+    }
+
+    private var allCommentsAvailableAfterCount: Int {
+        guard let anchorIndex = allCommentsAnchorIndex else { return 0 }
+        return max(0, viewModel.commentTimelineRows.count - anchorIndex - 1)
+    }
+
+    private var allCommentsVisibleRows: [CommentTimelineRow] {
+        let rows = viewModel.commentTimelineRows
+        guard let anchorIndex = allCommentsAnchorIndex, !rows.isEmpty else { return [] }
+
+        let clampedBefore = min(allCommentsVisibleBeforeCount, allCommentsAvailableBeforeCount)
+        let clampedAfter = min(allCommentsVisibleAfterCount, allCommentsAvailableAfterCount)
+        let startIndex = max(0, anchorIndex - clampedBefore)
+        let endIndex = min(rows.count - 1, anchorIndex + clampedAfter)
+        guard startIndex <= endIndex else { return [] }
+        return Array(rows[startIndex...endIndex])
+    }
+
+    private var allCommentsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(hasActiveCommentSearch ? "Search Results (\(viewModel.commentSearchResults.count))" : allCommentsCountLabel)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.retraceSecondary)
+
+            allCommentsSearchField
+
+            if hasActiveCommentSearch {
+                allCommentsSearchResultsSection
+            } else if viewModel.isLoadingCommentTimeline {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading all comments...")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else if let loadError = viewModel.commentTimelineLoadError,
+                      viewModel.commentTimelineRows.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retraceDanger.opacity(0.9))
+                    Text(loadError)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else if viewModel.commentTimelineRows.isEmpty {
+                Text("No related comments found.")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.retraceSecondary)
+                    .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            if viewModel.isLoadingOlderCommentTimeline {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading older...")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 2)
+                            }
+
+                            ForEach(allCommentsVisibleRows) { row in
+                                allCommentsTimelineCard(row)
+                                    .id(row.id)
+                                    .onAppear {
+                                        handleAllCommentsRowAppear(row)
+                                    }
+                            }
+
+                            if viewModel.isLoadingNewerCommentTimeline {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading newer...")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.vertical, 2)
+                            }
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .onAppear {
+                        syncAllCommentsVisibleWindow(forceReset: true)
+                        scrollToAllCommentsAnchorIfNeeded(proxy: proxy)
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: viewModel.commentTimelineRows.count) { _ in
+                        syncAllCommentsVisibleWindow(forceReset: false)
+                        if viewModel.isLoadingCommentTimeline
+                            || viewModel.isLoadingOlderCommentTimeline
+                            || viewModel.isLoadingNewerCommentTimeline {
+                            pinAllCommentsAnchorForNextViewportUpdate()
+                        }
+                        scrollToAllCommentsAnchorIfNeeded(proxy: proxy)
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: allCommentsVisibleBeforeCount) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: allCommentsVisibleAfterCount) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                    .onChange(of: pendingAnchorPinnedCommentID) { _ in
+                        restorePinnedAllCommentsAnchorIfNeeded(proxy: proxy)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: sectionCornerRadius)
+                .fill(Color.white.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: sectionCornerRadius)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private var allCommentsSearchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(0.85))
+
+            TextField("Search comments", text: commentSearchBinding)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retracePrimary)
+                .focused($isAllCommentsSearchFieldFocused)
+                .onSubmit {
+                    _ = openHighlightedCommentSearchResultIfPossible()
+                }
+
+            if !viewModel.commentSearchText.isEmpty {
+                Button(action: { viewModel.updateCommentSearchQuery("") }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.retraceSecondary.opacity(0.85))
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering in
+                    if hovering { NSCursor.pointingHand.push() }
+                    else { NSCursor.pop() }
+                }
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var allCommentsSearchResultsSection: some View {
+        if viewModel.isSearchingComments && viewModel.commentSearchResults.isEmpty {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Searching comments...")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.retraceSecondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else if let searchError = viewModel.commentSearchError,
+                  viewModel.commentSearchResults.isEmpty {
+            VStack(alignment: .center, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.retraceDanger.opacity(0.9))
+                    Text(searchError)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.retraceSecondary)
+                }
+
+                Button("Retry") {
+                    viewModel.retryCommentSearch()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.9))
+            }
+            .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else if viewModel.commentSearchResults.isEmpty {
+            Text("No matching comments.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retraceSecondary)
+                .frame(maxWidth: .infinity, minHeight: 80, alignment: .center)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(viewModel.commentSearchResults) { row in
+                            allCommentsTimelineCard(row)
+                                .id(row.id)
+                                .onAppear {
+                                    viewModel.loadMoreCommentSearchResultsIfNeeded(currentCommentID: row.id)
+                                }
+                        }
+
+                        if viewModel.isSearchingComments && !viewModel.commentSearchResults.isEmpty {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Loading more...")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+                .onChange(of: highlightedCommentSearchResultID) { selectedID in
+                    guard let selectedID else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.14)) {
+                            proxy.scrollTo(selectedID, anchor: .center)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+        }
     }
 
     private var commentComposerSection: some View {
@@ -5325,6 +5781,337 @@ struct CommentSubmenu: View {
 
     private var threadCountLabel: String {
         "Thread (\(viewModel.selectedBlockComments.count))"
+    }
+
+    private var allCommentsCountLabel: String {
+        "All Comments (\(viewModel.commentTimelineRows.count))"
+    }
+
+    private var allCommentsLaunchAnchorComment: SegmentComment? {
+        let sorted = viewModel.selectedBlockComments.sorted {
+            if $0.createdAt == $1.createdAt {
+                return $0.id.value < $1.id.value
+            }
+            return $0.createdAt < $1.createdAt
+        }
+        guard !sorted.isEmpty else { return nil }
+        return sorted[sorted.count / 2]
+    }
+
+    private func openAllComments(anchoredAt comment: SegmentComment?) {
+        pendingDeleteComment = nil
+        isDeletingComment = false
+        viewModel.resetCommentSearchState()
+        highlightedCommentSearchResultID = nil
+        isAllCommentsSearchFieldFocused = false
+        allCommentsAnchorID = comment?.id
+        allCommentsVisibleBeforeCount = 0
+        allCommentsVisibleAfterCount = 0
+        hasPerformedAllCommentsInitialScroll = false
+        isRequestingOlderCommentPage = false
+        isRequestingNewerCommentPage = false
+        pendingAnchorPinnedCommentID = nil
+        withAnimation(.easeOut(duration: 0.14)) {
+            commentBrowserMode = .allComments
+        }
+
+        Task { @MainActor in
+            await viewModel.loadCommentTimeline(anchoredAt: comment)
+            syncAllCommentsVisibleWindow(forceReset: true)
+        }
+    }
+
+    private func exitAllCommentsView() {
+        commentBrowserMode = .thread
+        highlightedCommentSearchResultID = nil
+        isAllCommentsSearchFieldFocused = false
+        allCommentsAnchorID = nil
+        allCommentsVisibleBeforeCount = 0
+        allCommentsVisibleAfterCount = 0
+        hasPerformedAllCommentsInitialScroll = false
+        isRequestingOlderCommentPage = false
+        isRequestingNewerCommentPage = false
+        pendingAnchorPinnedCommentID = nil
+        viewModel.resetCommentTimelineState()
+    }
+
+    private func syncAllCommentsVisibleWindow(forceReset: Bool) {
+        guard commentBrowserMode == .allComments,
+              let anchorIndex = allCommentsAnchorIndex else {
+            return
+        }
+
+        let availableBefore = anchorIndex
+        let availableAfter = max(0, viewModel.commentTimelineRows.count - anchorIndex - 1)
+
+        if forceReset || (allCommentsVisibleBeforeCount == 0 && allCommentsVisibleAfterCount == 0) {
+            var before = min(allCommentsPageSize / 2, availableBefore)
+            var after = min(max(0, allCommentsPageSize - before - 1), availableAfter)
+
+            let selectedCommentIDs = Set(viewModel.selectedBlockComments.map(\.id))
+            if !selectedCommentIDs.isEmpty {
+                let selectedIndexes = viewModel.commentTimelineRows.enumerated().compactMap { index, row in
+                    selectedCommentIDs.contains(row.id) ? index : nil
+                }
+                if let minSelectedIndex = selectedIndexes.min(),
+                   let maxSelectedIndex = selectedIndexes.max() {
+                    before = max(before, anchorIndex - minSelectedIndex)
+                    after = max(after, maxSelectedIndex - anchorIndex)
+                }
+            }
+
+            before = min(before, availableBefore)
+            after = min(after, availableAfter)
+
+            let visibleCount = before + after + 1
+            if visibleCount < allCommentsPageSize {
+                let remaining = allCommentsPageSize - visibleCount
+                let extraBefore = min(remaining, max(0, availableBefore - before))
+                before += extraBefore
+                let extraAfter = min(
+                    allCommentsPageSize - (before + after + 1),
+                    max(0, availableAfter - after)
+                )
+                after += extraAfter
+            }
+            allCommentsVisibleBeforeCount = before
+            allCommentsVisibleAfterCount = after
+            return
+        }
+
+        allCommentsVisibleBeforeCount = min(allCommentsVisibleBeforeCount, availableBefore)
+        allCommentsVisibleAfterCount = min(allCommentsVisibleAfterCount, availableAfter)
+    }
+
+    private func scrollToAllCommentsAnchorIfNeeded(proxy: ScrollViewProxy) {
+        guard commentBrowserMode == .allComments,
+              !hasPerformedAllCommentsInitialScroll else {
+            return
+        }
+
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        guard let anchorID else { return }
+        guard allCommentsVisibleRows.contains(where: { $0.id == anchorID }) else { return }
+
+        hasPerformedAllCommentsInitialScroll = true
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(anchorID, anchor: .center)
+            }
+        }
+    }
+
+    private func restorePinnedAllCommentsAnchorIfNeeded(proxy: ScrollViewProxy) {
+        guard commentBrowserMode == .allComments,
+              let pinnedID = pendingAnchorPinnedCommentID,
+              allCommentsVisibleRows.contains(where: { $0.id == pinnedID }) else {
+            return
+        }
+
+        pendingAnchorPinnedCommentID = nil
+        DispatchQueue.main.async {
+            proxy.scrollTo(pinnedID, anchor: .center)
+        }
+    }
+
+    private func pinAllCommentsAnchorForNextViewportUpdate() {
+        guard commentBrowserMode == .allComments else { return }
+        if let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID {
+            pendingAnchorPinnedCommentID = anchorID
+        }
+    }
+
+    private func handleAllCommentsRowAppear(_ row: CommentTimelineRow) {
+        guard commentBrowserMode == .allComments else { return }
+        guard !allCommentsVisibleRows.isEmpty else { return }
+
+        if let firstID = allCommentsVisibleRows.first?.id, row.id == firstID {
+            requestOlderCommentRowsIfNeeded()
+        }
+
+        if let lastID = allCommentsVisibleRows.last?.id, row.id == lastID {
+            requestNewerCommentRowsIfNeeded()
+        }
+    }
+
+    private func requestOlderCommentRowsIfNeeded() {
+        let availableBefore = allCommentsAvailableBeforeCount
+        if allCommentsVisibleBeforeCount < availableBefore {
+            pinAllCommentsAnchorForNextViewportUpdate()
+            allCommentsVisibleBeforeCount = min(
+                availableBefore,
+                allCommentsVisibleBeforeCount + allCommentsPageSize
+            )
+            return
+        }
+
+        guard viewModel.commentTimelineHasOlder,
+              !viewModel.isLoadingOlderCommentTimeline,
+              !isRequestingOlderCommentPage else {
+            return
+        }
+
+        isRequestingOlderCommentPage = true
+        Task { @MainActor in
+            defer { isRequestingOlderCommentPage = false }
+            pinAllCommentsAnchorForNextViewportUpdate()
+            await viewModel.loadOlderCommentTimelinePage()
+            syncAllCommentsVisibleWindow(forceReset: false)
+            let refreshedBefore = allCommentsAvailableBeforeCount
+            if allCommentsVisibleBeforeCount < refreshedBefore {
+                pinAllCommentsAnchorForNextViewportUpdate()
+                allCommentsVisibleBeforeCount = min(
+                    refreshedBefore,
+                    allCommentsVisibleBeforeCount + allCommentsPageSize
+                )
+            }
+        }
+    }
+
+    private func requestNewerCommentRowsIfNeeded() {
+        let availableAfter = allCommentsAvailableAfterCount
+        if allCommentsVisibleAfterCount < availableAfter {
+            pinAllCommentsAnchorForNextViewportUpdate()
+            allCommentsVisibleAfterCount = min(
+                availableAfter,
+                allCommentsVisibleAfterCount + allCommentsPageSize
+            )
+            return
+        }
+
+        guard viewModel.commentTimelineHasNewer,
+              !viewModel.isLoadingNewerCommentTimeline,
+              !isRequestingNewerCommentPage else {
+            return
+        }
+
+        isRequestingNewerCommentPage = true
+        Task { @MainActor in
+            defer { isRequestingNewerCommentPage = false }
+            pinAllCommentsAnchorForNextViewportUpdate()
+            await viewModel.loadNewerCommentTimelinePage()
+            syncAllCommentsVisibleWindow(forceReset: false)
+            let refreshedAfter = allCommentsAvailableAfterCount
+            if allCommentsVisibleAfterCount < refreshedAfter {
+                pinAllCommentsAnchorForNextViewportUpdate()
+                allCommentsVisibleAfterCount = min(
+                    refreshedAfter,
+                    allCommentsVisibleAfterCount + allCommentsPageSize
+                )
+            }
+        }
+    }
+
+    private func allCommentsTimelineCard(_ row: CommentTimelineRow) -> some View {
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        let isAnchor = row.id == anchorID &&
+            (highlightedCommentSearchResultID == nil || highlightedCommentSearchResultID == anchorID)
+        let isNavigable = true
+        let isSearchHighlighted = row.id == highlightedCommentSearchResultID
+        let isHoveringInteractiveRow = isNavigable && hoveredAllCommentsRowID == row.id
+        let rowHeaderLabel = row.context?.appBundleID ?? row.comment.author
+
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(rowHeaderLabel)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(.retracePrimary.opacity(0.9))
+                    .lineLimit(1)
+
+                if let tagName = row.primaryTagName {
+                    Text(tagName)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.88))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule()
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            Capsule()
+                                .stroke(Color.white.opacity(0.13), lineWidth: 1)
+                        )
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Text(Self.threadDateFormatter.string(from: row.comment.createdAt))
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.85))
+                    .lineLimit(1)
+            }
+
+            Text(commentPreviewText(from: row.comment.body))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retracePrimary.opacity(0.95))
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if let browserURL = row.context?.browserURL {
+                Text(browserURL)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.88))
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(
+                    isAnchor
+                    ? Color.retraceSubmitAccent.opacity(0.16)
+                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.12) : Color.white.opacity(0.05))
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(
+                    isAnchor
+                    ? Color.retraceSubmitAccent.opacity(0.42)
+                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.34) : Color.white.opacity(0.1)),
+                    lineWidth: 1
+                )
+        )
+        .scaleEffect(isHoveringInteractiveRow ? 1.01 : 1.0)
+        .animation(.easeOut(duration: 0.12), value: isHoveringInteractiveRow)
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onTapGesture {
+            guard isNavigable else { return }
+            openLinkedComment(row.comment, preferredSegmentID: row.context?.segmentID)
+        }
+        .onHover { hovering in
+            if hovering {
+                hoveredAllCommentsRowID = row.id
+                highlightedCommentSearchResultID = row.id
+                if isNavigable {
+                    NSCursor.pointingHand.push()
+                }
+            } else if hoveredAllCommentsRowID == row.id {
+                hoveredAllCommentsRowID = nil
+                if isNavigable {
+                    NSCursor.pop()
+                }
+            }
+        }
+    }
+
+    private func commentPreviewText(from body: String) -> String {
+        let normalized = body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let candidate = normalized
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? "No preview"
+
+        if candidate.count <= 180 {
+            return candidate
+        }
+        let index = candidate.index(candidate.startIndex, offsetBy: 180)
+        return "\(candidate[..<index])..."
     }
 
     private var linkFormattingButton: some View {
@@ -5505,6 +6292,8 @@ struct CommentSubmenu: View {
 
     private func commentThreadCard(_ comment: SegmentComment) -> some View {
         let isHoveringCard = hoveredCommentID == comment.id
+        let isNavigable = true
+        let isHoveringInteractiveCard = isNavigable && isHoveringCard
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -5548,7 +6337,6 @@ struct CommentSubmenu: View {
             VStack(alignment: .leading, spacing: 8) {
                 renderedMarkdownView(from: comment.body)
                     .foregroundColor(.retracePrimary.opacity(0.95))
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .environment(\.openURL, OpenURLAction { url in
                         NSWorkspace.shared.open(url)
@@ -5600,16 +6388,203 @@ struct CommentSubmenu: View {
                 RoundedRectangle(cornerRadius: 12)
                     .stroke(Color.white.opacity(0.1), lineWidth: 1)
             )
+            .scaleEffect(isHoveringInteractiveCard ? 1.01 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: isHoveringInteractiveCard)
         }
         .padding(.trailing, 26)
         .contentShape(Rectangle())
+        .onTapGesture {
+            guard isNavigable else { return }
+            openLinkedComment(
+                comment,
+                preferredSegmentID: viewModel.preferredSegmentIDForSelectedBlockComment(comment.id)
+            )
+        }
         .onHover { hovering in
             if hovering {
                 hoveredCommentID = comment.id
+                if isNavigable {
+                    NSCursor.pointingHand.push()
+                }
             } else if hoveredCommentID == comment.id {
                 hoveredCommentID = nil
+                if isNavigable {
+                    NSCursor.pop()
+                }
             }
         }
+    }
+
+    private func openLinkedComment(_ comment: SegmentComment, preferredSegmentID: SegmentID? = nil) {
+        guard !isNavigatingLinkedCommentFrame else { return }
+        isNavigatingLinkedCommentFrame = true
+        Task { @MainActor in
+            defer { isNavigatingLinkedCommentFrame = false }
+            let didNavigate = await viewModel.navigateToComment(
+                comment: comment,
+                preferredSegmentID: preferredSegmentID
+            )
+            if didNavigate {
+                onClose()
+            }
+        }
+    }
+
+    private func installCommentKeyboardMonitor() {
+        guard commentKeyboardMonitor == nil else { return }
+        commentKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if handleCommentSubmenuKeyEvent(event) {
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeCommentKeyboardMonitor() {
+        if let monitor = commentKeyboardMonitor {
+            NSEvent.removeMonitor(monitor)
+            commentKeyboardMonitor = nil
+        }
+    }
+
+    private func handleCommentSubmenuKeyEvent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+        // Option+A opens all-comments when currently in thread mode.
+        if modifiers == [.option], event.keyCode == 0, commentBrowserMode == .thread {
+            openAllComments(anchoredAt: allCommentsLaunchAnchorComment)
+            return true
+        }
+
+        guard commentBrowserMode == .allComments else { return false }
+
+        // Cmd+[ and Escape should return to the local thread comments when browsing all comments.
+        let isCommandBack = modifiers == [.command] &&
+            (event.keyCode == 33 || event.charactersIgnoringModifiers == "[")
+        if isCommandBack || (modifiers.isEmpty && event.keyCode == 53) {
+            withAnimation(.easeOut(duration: 0.14)) {
+                exitAllCommentsView()
+            }
+            return true
+        }
+
+        guard pendingDeleteComment == nil else { return false }
+        guard !isLinkPopoverPresented else { return false }
+
+        // Tab focuses the all-comments search bar. If already focused, seed
+        // keyboard highlight to the first eligible result.
+        if modifiers.isEmpty, event.keyCode == 48 {
+            if isAllCommentsSearchFieldFocused {
+                seedHighlightedCommentSearchSelectionIfNeeded()
+            } else {
+                isAllCommentsSearchFieldFocused = true
+            }
+            return true
+        }
+
+        guard modifiers.isEmpty else { return false }
+
+        switch event.keyCode {
+        case 125: // Down arrow
+            moveCommentSearchHighlight(by: 1)
+            return true
+        case 126: // Up arrow
+            moveCommentSearchHighlight(by: -1)
+            return true
+        case 36, 76: // Return / Enter
+            return openHighlightedCommentSearchResultIfPossible()
+        default:
+            return false
+        }
+    }
+
+    private var keyboardNavigableCommentRows: [CommentTimelineRow] {
+        hasActiveCommentSearch ? viewModel.commentSearchResults : allCommentsVisibleRows
+    }
+
+    private func syncHighlightedCommentSearchSelection() {
+        guard commentBrowserMode == .allComments else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        if let current = highlightedCommentSearchResultID,
+           results.contains(where: { $0.id == current }) {
+            return
+        }
+
+        if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            highlightedCommentSearchResultID = results[preferredIndex].id
+        } else {
+            highlightedCommentSearchResultID = results.first?.id
+        }
+    }
+
+    private func moveCommentSearchHighlight(by delta: Int) {
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else {
+            highlightedCommentSearchResultID = nil
+            return
+        }
+
+        let nextIndex: Int
+        if let highlightedID = highlightedCommentSearchResultID,
+           let index = results.firstIndex(where: { $0.id == highlightedID }) {
+            nextIndex = min(max(index + delta, 0), results.count - 1)
+        } else if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            // When opened from a thread anchor, arrow navigation should move relative to that anchor.
+            nextIndex = min(max(preferredIndex + delta, 0), results.count - 1)
+        } else {
+            // No anchor context (e.g. opened without a thread): start at first result.
+            nextIndex = 0
+        }
+
+        highlightedCommentSearchResultID = results[nextIndex].id
+    }
+
+    private func seedHighlightedCommentSearchSelectionIfNeeded() {
+        guard commentBrowserMode == .allComments else { return }
+        guard highlightedCommentSearchResultID == nil else { return }
+        let results = keyboardNavigableCommentRows
+        guard !results.isEmpty else { return }
+
+        if let preferredIndex = preferredCommentKeyboardStartIndex(in: results) {
+            highlightedCommentSearchResultID = results[preferredIndex].id
+        } else {
+            highlightedCommentSearchResultID = results.first?.id
+        }
+    }
+
+    private func preferredCommentKeyboardStartIndex(in results: [CommentTimelineRow]) -> Int? {
+        let anchorID = allCommentsAnchorID ?? viewModel.commentTimelineAnchorCommentID
+        guard let anchorID else { return nil }
+        return results.firstIndex(where: { $0.id == anchorID })
+    }
+
+    private func openHighlightedCommentSearchResultIfPossible() -> Bool {
+        guard commentBrowserMode == .allComments else { return false }
+        let rows = keyboardNavigableCommentRows
+        guard !rows.isEmpty else { return false }
+
+        let targetRow: CommentTimelineRow
+        if let highlightedID = highlightedCommentSearchResultID,
+           let row = rows.first(where: { $0.id == highlightedID }) {
+            targetRow = row
+        } else if let first = rows.first {
+            targetRow = first
+            highlightedCommentSearchResultID = first.id
+        } else {
+            return false
+        }
+
+        openLinkedComment(targetRow.comment, preferredSegmentID: targetRow.context?.segmentID)
+        return true
     }
 
     @ViewBuilder
@@ -6445,6 +7420,8 @@ private final class CommentMarkdownTextView: NSTextView {
 struct TagSubmenuRow: View {
     let tag: Tag
     let isSelected: Bool
+    let isKeyboardHighlighted: Bool
+    var onHoverChanged: ((Bool) -> Void)? = nil
     let action: () -> Void
 
     @State private var isHovering = false
@@ -6476,7 +7453,7 @@ struct TagSubmenuRow: View {
             .padding(.vertical, 8)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovering ? Color.white.opacity(0.1) : Color.clear)
+                    .fill((isHovering || isKeyboardHighlighted) ? Color.white.opacity(0.1) : Color.clear)
             )
             .contentShape(Rectangle())
         }
@@ -6487,6 +7464,7 @@ struct TagSubmenuRow: View {
             }
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
+            onHoverChanged?(hovering)
         }
     }
 }
@@ -6514,8 +7492,8 @@ struct FilterPanel: View {
     }
 
     /// Filter order for Tab navigation:
-    /// Apps(1) → Tags(2) → Visibility(3) → Date(4) → Advanced(5) → Action buttons → back to Apps
-    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .dateRange, .advanced]
+    /// Apps(1) → Tags(2) → Visibility(3) → Comments(4) → Date(5) → Advanced(6) → Action buttons → back to Apps
+    private let filterOrder: [SimpleTimelineViewModel.FilterDropdownType] = [.apps, .tags, .visibility, .comments, .dateRange, .advanced]
 
     /// Border color for filter panel
     private var themeBorderColor: Color {
@@ -6568,6 +7546,18 @@ struct FilterPanel: View {
         }
     }
 
+    /// Label for comment filter dropdown
+    private var commentFilterLabel: String {
+        switch viewModel.pendingFilterCriteria.commentFilter {
+        case .allFrames:
+            return "All Frames"
+        case .commentsOnly:
+            return "Comments Only"
+        case .noComments:
+            return "No Comments"
+        }
+    }
+
     /// Label for date range filter
     private var dateRangeLabel: String {
         let startDate = viewModel.pendingFilterCriteria.startDate
@@ -6585,9 +7575,33 @@ struct FilterPanel: View {
         return "Any Time"
     }
 
-    /// Clear button is only visible when there are active pending filters
+    /// Auto-apply mode starts after at least one filter is applied.
+    private var isAutoApplyMode: Bool {
+        viewModel.filterCriteria.hasActiveFilters
+    }
+
+    /// Clear button is visible when pending OR applied filters are active.
     private var hasClearButton: Bool {
-        viewModel.pendingFilterCriteria.hasActiveFilters
+        viewModel.pendingFilterCriteria.hasActiveFilters || viewModel.filterCriteria.hasActiveFilters
+    }
+
+    /// Apply button is shown only before the first filter is applied.
+    private var hasApplyButton: Bool {
+        !isAutoApplyMode
+    }
+
+    /// First action button in keyboard order.
+    private var leadingActionButtonFocus: ActionButtonFocus? {
+        if hasClearButton { return .clear }
+        if hasApplyButton { return .apply }
+        return nil
+    }
+
+    /// Last action button in keyboard order.
+    private var trailingActionButtonFocus: ActionButtonFocus? {
+        if hasApplyButton { return .apply }
+        if hasClearButton { return .clear }
+        return nil
     }
 
     var body: some View {
@@ -6645,137 +7659,127 @@ struct FilterPanel: View {
                 else { NSCursor.pop() }
             }
 
-            // Source section (compact)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("SOURCE")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.4))
-                    .tracking(0.5)
-
-                HStack(spacing: 8) {
-                    let sources = viewModel.pendingFilterCriteria.selectedSources
-                    // Default to only Retrace selected (nil means only native)
-                    let retraceSelected = sources == nil || sources!.contains(.native)
-                    let rewindSelected = sources != nil && sources!.contains(.rewind)
-
-                    SourceFilterChip(
-                        label: "Retrace",
-                        isRetrace: true,
-                        isSelected: retraceSelected
-                    ) {
-                        viewModel.toggleSourceFilter(.native)
-                    }
-
-                    SourceFilterChip(
-                        label: "Rewind",
-                        isRetrace: false,
-                        isSelected: rewindSelected
-                    ) {
-                        viewModel.toggleSourceFilter(.rewind)
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 12)
-
             // Divider
             Rectangle()
                 .fill(Color.white.opacity(0.08))
                 .frame(height: 1)
                 .padding(.horizontal, 16)
 
-            // Two-column grid for Apps, Tags, Visibility, Date Range
-            HStack(alignment: .top, spacing: 12) {
-                // Left column: Apps and Visibility
-                VStack(alignment: .leading, spacing: 12) {
-                    // Apps
-                    CompactAppsFilterDropdown(
-                        label: "APPS",
-                        selectedApps: viewModel.pendingFilterCriteria.selectedApps,
-                        isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
-                        isOpen: viewModel.activeFilterDropdown == .apps,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .apps {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+            // Two-column grid plus dedicated comments row
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    // Left column: Apps and Visibility
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Apps
+                        CompactAppsFilterDropdown(
+                            label: "APPS",
+                            selectedApps: viewModel.pendingFilterCriteria.selectedApps,
+                            isExcludeMode: viewModel.pendingFilterCriteria.appFilterMode == .exclude,
+                            isOpen: viewModel.activeFilterDropdown == .apps,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .apps {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.apps, anchorFrame: frame)
+                                    }
                                 }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.apps] = frame
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.apps] = frame
-                        }
-                    )
+                        )
 
-                    // Visibility
-                    CompactFilterDropdown(
-                        label: "VISIBILITY",
-                        value: hiddenFilterLabel,
-                        icon: "eye",
-                        isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
-                        isOpen: viewModel.activeFilterDropdown == .visibility,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .visibility {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                        // Visibility
+                        CompactFilterDropdown(
+                            label: "VISIBILITY",
+                            value: hiddenFilterLabel,
+                            icon: "eye",
+                            isActive: viewModel.pendingFilterCriteria.hiddenFilter != .hide,
+                            isOpen: viewModel.activeFilterDropdown == .visibility,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .visibility {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.visibility, anchorFrame: frame)
+                                    }
                                 }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.visibility] = frame
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.visibility] = frame
-                        }
-                    )
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    // Right column: Tags and Date Range
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Tags
+                        CompactFilterDropdown(
+                            label: "TAGS",
+                            value: tagsLabel,
+                            icon: "tag",
+                            isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
+                            isOpen: viewModel.activeFilterDropdown == .tags,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .tags {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.tags, anchorFrame: frame)
+                                    }
+                                }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.tags] = frame
+                            }
+                        )
+
+                        // Date Range
+                        CompactFilterDropdown(
+                            label: "DATE",
+                            value: dateRangeLabel,
+                            icon: "calendar",
+                            isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
+                            isOpen: viewModel.activeFilterDropdown == .dateRange,
+                            onTap: { frame in
+                                withAnimation(.easeOut(duration: 0.15)) {
+                                    if viewModel.activeFilterDropdown == .dateRange {
+                                        viewModel.dismissFilterDropdown()
+                                    } else {
+                                        viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
+                                    }
+                                }
+                            },
+                            onFrameAvailable: { frame in
+                                viewModel.filterAnchorFrames[.dateRange] = frame
+                            }
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity)
 
-                // Right column: Tags and Date Range
-                VStack(alignment: .leading, spacing: 12) {
-                    // Tags
-                    CompactFilterDropdown(
-                        label: "TAGS",
-                        value: tagsLabel,
-                        icon: "tag",
-                        isActive: viewModel.pendingFilterCriteria.selectedTags != nil && !viewModel.pendingFilterCriteria.selectedTags!.isEmpty,
-                        isOpen: viewModel.activeFilterDropdown == .tags,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .tags {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.tags, anchorFrame: frame)
-                                }
+                // Comments row
+                CompactFilterDropdown(
+                    label: "COMMENTS",
+                    value: commentFilterLabel,
+                    icon: "text.bubble",
+                    isActive: viewModel.pendingFilterCriteria.commentFilter != .allFrames,
+                    isOpen: viewModel.activeFilterDropdown == .comments,
+                    onTap: { frame in
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            if viewModel.activeFilterDropdown == .comments {
+                                viewModel.dismissFilterDropdown()
+                            } else {
+                                viewModel.showFilterDropdown(.comments, anchorFrame: frame)
                             }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.tags] = frame
                         }
-                    )
-
-                    // Date Range
-                    CompactFilterDropdown(
-                        label: "DATE",
-                        value: dateRangeLabel,
-                        icon: "calendar",
-                        isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
-                        isOpen: viewModel.activeFilterDropdown == .dateRange,
-                        onTap: { frame in
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                if viewModel.activeFilterDropdown == .dateRange {
-                                    viewModel.dismissFilterDropdown()
-                                } else {
-                                    viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
-                                }
-                            }
-                        },
-                        onFrameAvailable: { frame in
-                            viewModel.filterAnchorFrames[.dateRange] = frame
-                        }
-                    )
-                }
-                .frame(maxWidth: .infinity)
+                    },
+                    onFrameAvailable: { frame in
+                        viewModel.filterAnchorFrames[.comments] = frame
+                    }
+                )
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
@@ -6798,13 +7802,13 @@ struct FilterPanel: View {
 
             // Action buttons
             HStack(spacing: 10) {
-                // Clear button (only when pending filters are active)
+                // Clear button
                 if hasClearButton {
                     Button(action: {
                         focusedActionButton = nil
                         viewModel.clearPendingFilters()
                         withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters()
+                            viewModel.applyFilters(dismissPanel: false)
                         }
                     }) {
                         Text("Clear")
@@ -6837,44 +7841,46 @@ struct FilterPanel: View {
                 }
 
                 // Apply button
-                Button(action: {
-                    focusedActionButton = nil
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        viewModel.applyFilters()
+                if hasApplyButton {
+                    Button(action: {
+                        focusedActionButton = nil
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.applyFilters()
+                        }
+                    }) {
+                        Text("Apply Filters")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(
+                                        (focusedActionButton == .apply || isApplyHovered)
+                                            ? RetraceMenuStyle.actionBlue
+                                            : RetraceMenuStyle.actionBlue.opacity(0.8)
+                                    )
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(
+                                        (focusedActionButton == .apply || isApplyHovered)
+                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            : Color.clear,
+                                        lineWidth: 2.25
+                                    )
+                            )
+                            .shadow(
+                                color: (focusedActionButton == .apply || isApplyHovered)
+                                    ? RetraceMenuStyle.actionBlue.opacity(0.65)
+                                    : .clear,
+                                radius: 8
+                            )
                     }
-                }) {
-                    Text("Apply Filters")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(
-                                    (focusedActionButton == .apply || isApplyHovered)
-                                        ? RetraceMenuStyle.actionBlue
-                                        : RetraceMenuStyle.actionBlue.opacity(0.8)
-                                )
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(
-                                    (focusedActionButton == .apply || isApplyHovered)
-                                        ? RetraceMenuStyle.filterStrokeStrong
-                                        : Color.clear,
-                                    lineWidth: 2.25
-                                )
-                        )
-                        .shadow(
-                            color: (focusedActionButton == .apply || isApplyHovered)
-                                ? RetraceMenuStyle.actionBlue.opacity(0.65)
-                                : .clear,
-                            radius: 8
-                        )
-                }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    isApplyHovered = hovering
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        isApplyHovered = hovering
+                    }
                 }
             }
             .padding(.horizontal, 16)
@@ -6924,8 +7930,24 @@ struct FilterPanel: View {
                 return event
             }
 
-            // Set up Tab key monitor for cycling through filters
+            // Set up keyboard monitor for cycling through filters
             tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Let comment submenu own keyboard navigation while it's open.
+                if viewModel.showCommentSubmenu {
+                    return event
+                }
+
+                let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+                // Cmd+Enter applies filters from anywhere in the filter panel.
+                if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command] {
+                    focusedActionButton = nil
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.applyFilters(dismissPanel: hasApplyButton)
+                    }
+                    return nil
+                }
+
                 // Handle Enter on Advanced highlight (expand and focus Window Name)
                 if (event.keyCode == 36 || event.keyCode == 76) &&
                     viewModel.activeFilterDropdown == .advanced &&
@@ -6941,7 +7963,7 @@ struct FilterPanel: View {
                         focusedActionButton = nil
                         viewModel.clearPendingFilters()
                         withAnimation(.easeOut(duration: 0.15)) {
-                            viewModel.applyFilters()
+                            viewModel.applyFilters(dismissPanel: false)
                         }
                     } else {
                         focusedActionButton = nil
@@ -6952,11 +7974,102 @@ struct FilterPanel: View {
                     return nil
                 }
 
+                // Left/Right arrows navigate between filter fields while panel is open.
+                // Keep native caret movement when an advanced text field is focused.
+                if modifiers.isEmpty && (event.keyCode == 123 || event.keyCode == 124) {
+                    let isAdvancedTextFieldFocused =
+                        viewModel.activeFilterDropdown == .advanced &&
+                        (viewModel.advancedFocusedFieldIndex == 1 || viewModel.advancedFocusedFieldIndex == 2)
+                    if isAdvancedTextFieldFocused {
+                        return event
+                    }
+
+                    // Date-range calendar uses arrow keys for day navigation.
+                    if viewModel.activeFilterDropdown == .dateRange && viewModel.isDateRangeCalendarEditing {
+                        return event
+                    }
+
+                    // If action buttons are focused, Left/Right toggles within those buttons.
+                    if focusedActionButton != nil {
+                        if hasClearButton && hasApplyButton {
+                            focusedActionButton = event.keyCode == 123 ? .clear : .apply
+                        } else if hasClearButton {
+                            focusedActionButton = .clear
+                        } else if hasApplyButton {
+                            focusedActionButton = .apply
+                        } else {
+                            focusedActionButton = nil
+                        }
+                        return nil
+                    }
+
+                    let moveBackward = event.keyCode == 123
+                    let currentDropdown = viewModel.activeFilterDropdown
+                    let nextDropdown: SimpleTimelineViewModel.FilterDropdownType
+
+                    if currentDropdown == .none {
+                        nextDropdown = moveBackward ? filterOrder[filterOrder.count - 1] : filterOrder[0]
+                    } else {
+                        guard let currentIndex = filterOrder.firstIndex(of: currentDropdown) else { return event }
+                        let delta = moveBackward ? -1 : 1
+                        let nextIndex = (currentIndex + delta + filterOrder.count) % filterOrder.count
+                        nextDropdown = filterOrder[nextIndex]
+                    }
+
+                    if nextDropdown == .advanced {
+                        // Keep keyboard highlight on Advanced header when entering via arrows.
+                        viewModel.advancedFocusedFieldIndex = 0
+                    }
+
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[nextDropdown] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(nextDropdown, anchorFrame: nextAnchorFrame)
+                    }
+                    return nil
+                }
+
+                // Up/Down arrows switch between Advanced text fields.
+                // Window Name (1) <-> Browser URL (2)
+                if modifiers.isEmpty && (event.keyCode == 125 || event.keyCode == 126) {
+                    if focusedActionButton != nil,
+                       event.keyCode == 126,
+                       viewModel.activeFilterDropdown == .advanced {
+                        // Up from action buttons returns to Browser URL.
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
+                    }
+
+                    let fieldIndex = viewModel.advancedFocusedFieldIndex
+                    if event.keyCode == 125, fieldIndex == 1 { // Down from Window Name
+                        viewModel.advancedFocusedFieldIndex = 2
+                        return nil
+                    }
+                    if event.keyCode == 125, fieldIndex == 2 { // Down from Browser URL -> Apply
+                        viewModel.advancedFocusedFieldIndex = 0
+                        focusedActionButton = hasApplyButton ? .apply : .clear
+                        return nil
+                    }
+                    if event.keyCode == 126, fieldIndex == 2 { // Up from Browser URL
+                        viewModel.advancedFocusedFieldIndex = 1
+                        return nil
+                    }
+                    if event.keyCode == 126, fieldIndex == 1 { // Up from Window Name -> Date
+                        focusedActionButton = nil
+                        viewModel.advancedFocusedFieldIndex = 0
+                        let nextAnchorFrame = viewModel.filterAnchorFrames[.dateRange] ?? .zero
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showFilterDropdown(.dateRange, anchorFrame: nextAnchorFrame)
+                        }
+                        return nil
+                    }
+                }
+
                 // Only handle Tab key (keycode 48)
                 guard event.keyCode == 48 else { return event }
 
                 // Check if Shift is held for reverse direction
-                let isShiftHeld = event.modifierFlags.contains(.shift)
+                let isShiftHeld = modifiers.contains(.shift)
 
                 // Handle Tab while action buttons are focused
                 if let focusedButton = focusedActionButton {
@@ -6974,7 +8087,17 @@ struct FilterPanel: View {
                         }
                     } else {
                         if focusedButton == .clear {
-                            focusedActionButton = .apply
+                            if hasApplyButton {
+                                focusedActionButton = .apply
+                                return nil
+                            }
+                            // Tab on Clear (only action button) -> cycle to Apps dropdown
+                            focusedActionButton = nil
+                            viewModel.advancedFocusedFieldIndex = 0
+                            let nextAnchorFrame = viewModel.filterAnchorFrames[.apps] ?? .zero
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                viewModel.showFilterDropdown(.apps, anchorFrame: nextAnchorFrame)
+                            }
                             return nil
                         }
                         // Tab on Apply -> cycle to Apps dropdown
@@ -6994,7 +8117,7 @@ struct FilterPanel: View {
                     if fieldIndex == 0 {
                         // Advanced header is highlighted: Tab goes to action buttons first.
                         if !isShiftHeld {
-                            focusedActionButton = hasClearButton ? .clear : .apply
+                            focusedActionButton = leadingActionButtonFocus
                             return nil
                         }
                     } else if !isShiftHeld && fieldIndex == 1 {
@@ -7003,7 +8126,7 @@ struct FilterPanel: View {
                     } else if !isShiftHeld && fieldIndex == 2 {
                         // Tab on Browser URL -> action buttons first (Clear, then Apply).
                         viewModel.advancedFocusedFieldIndex = 0
-                        focusedActionButton = hasClearButton ? .clear : .apply
+                        focusedActionButton = leadingActionButtonFocus
                         return nil
                     } else if isShiftHeld && fieldIndex == 2 {
                         // Shift+Tab on Browser URL -> explicitly focus Window Name.
@@ -7024,7 +8147,7 @@ struct FilterPanel: View {
                     withAnimation(.easeOut(duration: 0.15)) {
                         viewModel.dismissFilterDropdown()
                     }
-                    focusedActionButton = .apply
+                    focusedActionButton = trailingActionButtonFocus
                     return nil
                 }
 
@@ -7066,10 +8189,27 @@ struct FilterPanel: View {
                 return nil // Consume the event
             }
         }
-        .onChange(of: viewModel.pendingFilterCriteria.hasActiveFilters) { hasActive in
-            // If Clear disappears while focused, move focus to Apply.
-            if !hasActive && focusedActionButton == .clear {
-                focusedActionButton = .apply
+        .onChange(of: viewModel.pendingFilterCriteria) { newCriteria in
+            // Once filters are active, additional panel changes apply immediately.
+            guard isAutoApplyMode else { return }
+            guard newCriteria != viewModel.filterCriteria else { return }
+            focusedActionButton = nil
+            withAnimation(.easeOut(duration: 0.15)) {
+                viewModel.applyFilters(dismissPanel: false)
+            }
+        }
+        .onChange(of: viewModel.pendingFilterCriteria.hasActiveFilters) { _ in
+            if focusedActionButton == .clear && !hasClearButton {
+                focusedActionButton = hasApplyButton ? .apply : nil
+            } else if focusedActionButton == .apply && !hasApplyButton {
+                focusedActionButton = hasClearButton ? .clear : nil
+            }
+        }
+        .onChange(of: viewModel.filterCriteria.hasActiveFilters) { _ in
+            if focusedActionButton == .apply && !hasApplyButton {
+                focusedActionButton = hasClearButton ? .clear : nil
+            } else if focusedActionButton == .clear && !hasClearButton {
+                focusedActionButton = hasApplyButton ? .apply : nil
             }
         }
         .onDisappear {
@@ -7095,8 +8235,6 @@ struct AdvancedFiltersSection: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @State private var isExpanded: Bool = false
     @State private var isHeaderHovered = false
-    @State private var isWindowFieldHovered = false
-    @State private var isBrowserFieldHovered = false
 
     private enum AdvancedField: Hashable {
         case windowName
@@ -7133,7 +8271,6 @@ struct AdvancedFiltersSection: View {
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(isAdvancedActive ? .white.opacity(0.8) : .white.opacity(0.4))
                         .tracking(0.5)
-                        .padding(.leading, 4)
 
                     if hasActiveAdvancedFilters {
                         Circle()
@@ -7147,6 +8284,7 @@ struct AdvancedFiltersSection: View {
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(isAdvancedActive ? .white.opacity(0.6) : .white.opacity(0.4))
                 }
+                .padding(.horizontal, 12)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -7165,6 +8303,8 @@ struct AdvancedFiltersSection: View {
             )
             .onHover { hovering in
                 isHeaderHovered = hovering
+                if hovering { NSCursor.pointingHand.push() }
+                else { NSCursor.pop() }
             }
 
             if isExpanded {
@@ -7194,17 +8334,12 @@ struct AdvancedFiltersSection: View {
                                 .stroke(
                                     focusedField == .windowName
                                         ? RetraceMenuStyle.filterStrokeStrong
-                                        : (isWindowFieldHovered
-                                            ? RetraceMenuStyle.filterStrokeStrong
-                                            : (viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
-                                                ? RetraceMenuStyle.filterStrokeMedium
-                                                : RetraceMenuStyle.filterStrokeSubtle)),
+                                        : (viewModel.pendingFilterCriteria.windowNameFilter != nil && !viewModel.pendingFilterCriteria.windowNameFilter!.isEmpty
+                                            ? RetraceMenuStyle.filterStrokeMedium
+                                            : RetraceMenuStyle.filterStrokeSubtle),
                                     lineWidth: 1
                                 )
                         )
-                        .onHover { hovering in
-                            isWindowFieldHovered = hovering
-                        }
                         .onSubmit {
                             viewModel.applyFilters()
                         }
@@ -7235,17 +8370,12 @@ struct AdvancedFiltersSection: View {
                                 .stroke(
                                     focusedField == .browserUrl
                                         ? RetraceMenuStyle.filterStrokeStrong
-                                        : (isBrowserFieldHovered
-                                            ? RetraceMenuStyle.filterStrokeStrong
-                                            : (viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
-                                                ? RetraceMenuStyle.filterStrokeMedium
-                                                : RetraceMenuStyle.filterStrokeSubtle)),
+                                        : (viewModel.pendingFilterCriteria.browserUrlFilter != nil && !viewModel.pendingFilterCriteria.browserUrlFilter!.isEmpty
+                                            ? RetraceMenuStyle.filterStrokeMedium
+                                            : RetraceMenuStyle.filterStrokeSubtle),
                                     lineWidth: 1
                                 )
                         )
-                        .onHover { hovering in
-                            isBrowserFieldHovered = hovering
-                        }
                         .onSubmit {
                             viewModel.applyFilters()
                         }
@@ -7273,7 +8403,11 @@ struct AdvancedFiltersSection: View {
             }
         }
         .onChange(of: viewModel.advancedFocusedFieldIndex) { newValue in
-            if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
+            if newValue == 1 {
+                focusedField = .windowName
+            } else if newValue == 2 {
+                focusedField = .browserUrl
+            } else if newValue == -1 && viewModel.activeFilterDropdown == .advanced {
                 // Enter was pressed on the Advanced header — expand and focus Window Name
                 withAnimation(.easeInOut(duration: 0.2)) {
                     isExpanded = true
@@ -7568,70 +8702,6 @@ struct FilterToggleChipCompact: View {
     }
 }
 
-/// Source filter chip with app logo (Retrace or Rewind)
-struct SourceFilterChip: View {
-    let label: String
-    let isRetrace: Bool
-    let isSelected: Bool
-    let action: () -> Void
-    @StateObject private var appMetadata = AppMetadataCache.shared
-    @State private var isHovered = false
-
-    private let retraceAppPath = "/Applications/Retrace.app"
-    private let rewindAppPath = "/Applications/Rewind.app"
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                if isRetrace {
-                    sourceAppIcon(for: retraceAppPath, fallbackSystemName: "app.fill")
-                } else {
-                    sourceAppIcon(for: rewindAppPath, fallbackSystemName: "arrow.counterclockwise")
-                }
-                Text(label)
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .foregroundColor(isSelected ? .white : .white.opacity(0.5))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(isSelected ? Color.white.opacity(0.15) : Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(
-                        isHovered
-                            ? RetraceMenuStyle.filterStrokeStrong
-                            : (isSelected ? RetraceMenuStyle.filterStrokeMedium : RetraceMenuStyle.filterStrokeSubtle),
-                        lineWidth: isHovered ? 1.2 : 1
-                    )
-            )
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering in
-            isHovered = hovering
-        }
-        .onAppear {
-            let path = isRetrace ? retraceAppPath : rewindAppPath
-            appMetadata.requestIcon(forAppPath: path)
-        }
-    }
-
-    @ViewBuilder
-    private func sourceAppIcon(for appPath: String, fallbackSystemName: String) -> some View {
-        if let icon = appMetadata.icon(forAppPath: appPath) {
-            Image(nsImage: icon)
-                .resizable()
-                .frame(width: 16, height: 16)
-        } else {
-            Image(systemName: fallbackSystemName)
-                .font(.system(size: 11))
-                .frame(width: 16, height: 16)
-        }
-    }
-}
-
 // MARK: - Filter Dropdown Overlay
 
 /// Renders filter dropdowns at the top level of SimpleTimelineView to avoid clipping issues
@@ -7748,6 +8818,8 @@ struct FilterDropdownOverlay: View {
             return CGSize(width: 220, height: 320)
         case .visibility:
             return CGSize(width: 240, height: 180)
+        case .comments:
+            return CGSize(width: 240, height: 160)
         case .dateRange:
             let height: CGFloat = viewModel.isDateRangeCalendarEditing ? 430 : 250
             return CGSize(width: 300, height: height)
@@ -7846,6 +8918,24 @@ struct FilterDropdownOverlay: View {
                 currentFilter: viewModel.pendingFilterCriteria.hiddenFilter,
                 onSelect: { filter in
                     viewModel.setHiddenFilter(filter)
+                },
+                onDismiss: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.dismissFilterDropdown()
+                    }
+                },
+                onKeyboardSelect: {
+                    let nextAnchorFrame = viewModel.filterAnchorFrames[.comments] ?? .zero
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        viewModel.showFilterDropdown(.comments, anchorFrame: nextAnchorFrame)
+                    }
+                }
+            )
+        case .comments:
+            CommentFilterPopover(
+                currentFilter: viewModel.pendingFilterCriteria.commentFilter,
+                onSelect: { filter in
+                    viewModel.setCommentFilter(filter)
                 },
                 onDismiss: {
                     withAnimation(.easeOut(duration: 0.15)) {

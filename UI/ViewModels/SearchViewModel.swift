@@ -39,6 +39,7 @@ public class SearchViewModel: ObservableObject {
     @Published public var selectedTags: Set<Int64>?  // nil = all tags
     @Published public var tagFilterMode: TagFilterMode = .include  // include or exclude selected tags
     @Published public var hiddenFilter: HiddenFilter = .hide  // How to handle hidden segments
+    @Published public var commentFilter: CommentFilter = .allFrames  // How to handle comment presence
     @Published public var windowNameFilter: String?  // Optional window title metadata filter
     @Published public var browserUrlFilter: String?  // Optional browser URL metadata filter
     @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
@@ -106,7 +107,7 @@ public class SearchViewModel: ObservableObject {
     @Published public var closeDropdownsSignal: Int = 0
 
     // Signal to open a specific filter dropdown via Tab key navigation
-    // Values: 0 = search field, 1 = apps, 2 = date, 3 = tags, 4 = visibility, 5 = advanced
+    // Values: 0 = search field, 1 = order, 2 = apps, 3 = date, 4 = tags, 5 = visibility, 6 = comments, 7 = advanced
     @Published public var openFilterSignal: (index: Int, id: UUID) = (0, UUID())
 
     // Signal to dismiss the search overlay from parent-level handlers (e.g. global Escape).
@@ -163,6 +164,8 @@ public class SearchViewModel: ObservableObject {
     private static let cachedWindowNameFilterKey = "search.cachedWindowNameFilter"
     /// Key for storing the cached browser URL filter
     private static let cachedBrowserUrlFilterKey = "search.cachedBrowserUrlFilter"
+    /// Key for storing the cached comment filter
+    private static let cachedCommentFilterKey = "search.cachedCommentFilter"
     /// Key for storing the cached search mode
     private static let cachedSearchModeKey = "search.cachedSearchMode"
     /// Key for storing the cached sort order
@@ -229,8 +232,8 @@ public class SearchViewModel: ObservableObject {
             $endDate,
             $contentType
         )
-        .combineLatest($selectedTags, $hiddenFilter, $windowNameFilter)
-        .combineLatest($browserUrlFilter)
+        .combineLatest($selectedTags, $hiddenFilter, $commentFilter)
+        .combineLatest($windowNameFilter, $browserUrlFilter)
         .dropFirst()  // Skip initial values
         .debounce(for: .seconds(debounceDelay), scheduler: DispatchQueue.main)
         .sink { [weak self] _ in
@@ -394,6 +397,10 @@ public class SearchViewModel: ObservableObject {
             components.append("\"hiddenFilter\":\"\(hiddenFilter.rawValue)\"")
         }
 
+        if commentFilter != .allFrames {
+            components.append("\"commentFilter\":\"\(commentFilter.rawValue)\"")
+        }
+
         if let windowName = windowNameFilter, !windowName.isEmpty {
             let escaped = windowName.replacingOccurrences(of: "\"", with: "\\\"")
             components.append("\"windowName\":\"\(escaped)\"")
@@ -517,6 +524,7 @@ public class SearchViewModel: ObservableObject {
             selectedTagIds: selectedTagIdsArray,
             excludedTagIds: excludedTagIdsArray,
             hiddenFilter: hiddenFilter,
+            commentFilter: commentFilter,
             windowNameFilter: windowNameFilter,
             browserUrlFilter: browserUrlFilter
         )
@@ -823,6 +831,7 @@ public class SearchViewModel: ObservableObject {
         selectedTags = nil
         tagFilterMode = .include
         hiddenFilter = .hide
+        commentFilter = .allFrames
         windowNameFilter = nil
         browserUrlFilter = nil
     }
@@ -882,12 +891,18 @@ public class SearchViewModel: ObservableObject {
         hiddenFilter = filter
     }
 
+    /// Set comment presence filter mode
+    public func setCommentFilter(_ filter: CommentFilter) {
+        commentFilter = filter
+    }
+
     /// Check if any filters are active
     public var hasActiveFilters: Bool {
         (selectedAppFilters != nil && !selectedAppFilters!.isEmpty) ||
         startDate != nil || endDate != nil ||
         (selectedTags != nil && !selectedTags!.isEmpty) ||
         hiddenFilter != .hide ||
+        commentFilter != .allFrames ||
         (windowNameFilter?.isEmpty == false) ||
         (browserUrlFilter?.isEmpty == false)
     }
@@ -899,6 +914,7 @@ public class SearchViewModel: ObservableObject {
         if startDate != nil || endDate != nil { count += 1 }
         if let tags = selectedTags, !tags.isEmpty { count += 1 }
         if hiddenFilter != .hide { count += 1 }
+        if commentFilter != .allFrames { count += 1 }
         if windowNameFilter?.isEmpty == false { count += 1 }
         if browserUrlFilter?.isEmpty == false { count += 1 }
         return count
@@ -1023,6 +1039,11 @@ public class SearchViewModel: ObservableObject {
         } else {
             UserDefaults.standard.removeObject(forKey: Self.cachedBrowserUrlFilterKey)
         }
+        if commentFilter != .allFrames {
+            UserDefaults.standard.set(commentFilter.rawValue, forKey: Self.cachedCommentFilterKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedCommentFilterKey)
+        }
         UserDefaults.standard.set(contentType.rawValue, forKey: Self.cachedContentTypeKey)
         UserDefaults.standard.set(searchMode.rawValue, forKey: Self.cachedSearchModeKey)
         UserDefaults.standard.set(sortOrder.rawValue, forKey: Self.cachedSearchSortOrderKey)
@@ -1091,6 +1112,7 @@ public class SearchViewModel: ObservableObject {
         let cachedEndDateValue = UserDefaults.standard.double(forKey: Self.cachedEndDateKey)
         let cachedWindowNameFilter = UserDefaults.standard.string(forKey: Self.cachedWindowNameFilterKey)
         let cachedBrowserUrlFilter = UserDefaults.standard.string(forKey: Self.cachedBrowserUrlFilterKey)
+        let cachedCommentFilterRaw = UserDefaults.standard.string(forKey: Self.cachedCommentFilterKey)
         let cachedContentTypeRaw = UserDefaults.standard.string(forKey: Self.cachedContentTypeKey)
         let cachedSearchModeRaw = UserDefaults.standard.string(forKey: Self.cachedSearchModeKey)
         let cachedSearchSortOrderRaw = UserDefaults.standard.string(forKey: Self.cachedSearchSortOrderKey)
@@ -1120,6 +1142,11 @@ public class SearchViewModel: ObservableObject {
             endDate = cachedEndDateValue > 0 ? Date(timeIntervalSince1970: cachedEndDateValue) : nil
             windowNameFilter = cachedWindowNameFilter?.isEmpty == false ? cachedWindowNameFilter : nil
             browserUrlFilter = cachedBrowserUrlFilter?.isEmpty == false ? cachedBrowserUrlFilter : nil
+            if let rawValue = cachedCommentFilterRaw, let filter = CommentFilter(rawValue: rawValue) {
+                commentFilter = filter
+            } else {
+                commentFilter = .allFrames
+            }
             if let rawValue = cachedContentTypeRaw, let type = ContentType(rawValue: rawValue) {
                 contentType = type
             }
@@ -1164,6 +1191,7 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: cachedEndDateKey)
         UserDefaults.standard.removeObject(forKey: cachedWindowNameFilterKey)
         UserDefaults.standard.removeObject(forKey: cachedBrowserUrlFilterKey)
+        UserDefaults.standard.removeObject(forKey: cachedCommentFilterKey)
         UserDefaults.standard.removeObject(forKey: cachedContentTypeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchModeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchSortOrderKey)

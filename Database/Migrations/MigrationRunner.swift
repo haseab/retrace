@@ -95,7 +95,10 @@ actor MigrationRunner {
             V5_FTSUnicode61(),
             V6_FrameProcessedAt(),
             V7_FrameRedactionReason(),
-            V8_SegmentComments()
+            V8_SegmentComments(),
+            V9_SegmentCommentFrameAnchor(),
+            V10_SegmentCommentSearchIndex(),
+            V11_SegmentCommentLinkCompositeIndex()
         ]
     }
 

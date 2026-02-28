@@ -80,6 +80,7 @@ public actor SearchManager: SearchProtocol {
                 selectedTagIds: filters.selectedTagIds,
                 excludedTagIds: filters.excludedTagIds,
                 hiddenFilter: filters.hiddenFilter,
+                commentFilter: filters.commentFilter,
                 windowNameFilter: filters.windowNameFilter,
                 browserUrlFilter: filters.browserUrlFilter
             )
@@ -92,6 +93,7 @@ public actor SearchManager: SearchProtocol {
                 selectedTagIds: filters.selectedTagIds,
                 excludedTagIds: filters.excludedTagIds,
                 hiddenFilter: filters.hiddenFilter,
+                commentFilter: filters.commentFilter,
                 windowNameFilter: filters.windowNameFilter,
                 browserUrlFilter: filters.browserUrlFilter
             )

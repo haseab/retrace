@@ -67,6 +67,9 @@ public struct SegmentComment: Codable, Sendable, Equatable, Identifiable {
     /// Optional attachment metadata (stored as JSON in DB)
     public let attachments: [SegmentCommentAttachment]
 
+    /// Optional frame anchor for where this comment was created.
+    public let frameID: FrameID?
+
     /// Creation timestamp
     public let createdAt: Date
 
@@ -78,6 +81,7 @@ public struct SegmentComment: Codable, Sendable, Equatable, Identifiable {
         body: String,
         author: String,
         attachments: [SegmentCommentAttachment] = [],
+        frameID: FrameID? = nil,
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -85,6 +89,7 @@ public struct SegmentComment: Codable, Sendable, Equatable, Identifiable {
         self.body = body
         self.author = author
         self.attachments = attachments
+        self.frameID = frameID
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }

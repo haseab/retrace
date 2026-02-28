@@ -3,17 +3,8 @@ import Shared
 import App
 import AppKit
 
-// MARK: - Focus Effect Disabled Modifier (macOS 13.0+ compatible)
-
-/// Modifier that hides the focus ring, with availability check for macOS 14.0+
-private struct FocusEffectDisabledModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 14.0, *) {
-            content.focusEffectDisabled()
-        } else {
-            content
-        }
-    }
+private enum SpotlightFilterChipMetrics {
+    static let dropdownYOffset: CGFloat = 44
 }
 
 /// Filter bar for search overlay - displays filter chips below the search field
@@ -27,18 +18,19 @@ public struct SearchFilterBar: View {
     @State private var showDatePopover = false
     @State private var showTagsDropdown = false
     @State private var showVisibilityDropdown = false
+    @State private var showCommentDropdown = false
     @State private var showAdvancedDropdown = false
     @State private var showSearchOrderDropdown = false
     @State private var isClearFiltersHovered = false
     @State private var tabKeyMonitor: Any?
 
-    /// Filter indices for Tab navigation: 1=Relevance/Newest/Oldest, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Advanced, 0=back to search
-    private let filterCount = 6
+    /// Filter indices for Tab navigation: 1=Order, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Comments, 7=Advanced, 0=back to search
+    private let filterCount = 7
 
     // MARK: - Body
 
     public var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             SearchOrderChip(
                 selection: SearchOrderOption.from(
                     mode: viewModel.searchMode,
@@ -52,11 +44,12 @@ public struct SearchFilterBar: View {
                         showDatePopover = false
                         showTagsDropdown = false
                         showVisibilityDropdown = false
+                        showCommentDropdown = false
                         showAdvancedDropdown = false
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showSearchOrderDropdown, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showSearchOrderDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 SearchOrderPopover(
                     selection: SearchOrderOption.from(
                         mode: viewModel.searchMode,
@@ -81,7 +74,7 @@ public struct SearchFilterBar: View {
             }
 
             Divider()
-                .frame(height: 28)
+                .frame(height: 21)
                 .background(Color.white.opacity(0.2))
 
             // Apps filter (multi-select) - shows app icons when selected
@@ -96,11 +89,12 @@ public struct SearchFilterBar: View {
                         showDatePopover = false
                         showTagsDropdown = false
                         showVisibilityDropdown = false
+                        showCommentDropdown = false
                         showAdvancedDropdown = false
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showAppsDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 AppsFilterPopover(
                     apps: viewModel.installedApps.map { ($0.bundleID, $0.name) },
                     otherApps: viewModel.otherApps.map { ($0.bundleID, $0.name) },
@@ -134,10 +128,11 @@ public struct SearchFilterBar: View {
                     showAppsDropdown = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
+                    showCommentDropdown = false
                     showAdvancedDropdown = false
                 }
             }
-            .dropdownOverlay(isPresented: $showDatePopover, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showDatePopover, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 DateRangeFilterPopover(
                     startDate: viewModel.startDate,
                     endDate: viewModel.endDate,
@@ -150,7 +145,7 @@ public struct SearchFilterBar: View {
                     width: 300,
                     enableKeyboardNavigation: true,
                     onMoveToNextFilter: {
-                        // Tab order: Relevance -> Apps -> Date -> Tags -> Visibility -> Advanced.
+                        // Tab order: Order -> Apps -> Date -> Tags -> Visibility -> Comments -> Advanced.
                         // Enter from Date input should advance to Tags, matching Tab behavior.
                         viewModel.openFilterSignal = (4, UUID())
                     },
@@ -179,11 +174,12 @@ public struct SearchFilterBar: View {
                         showAppsDropdown = false
                         showDatePopover = false
                         showVisibilityDropdown = false
+                        showCommentDropdown = false
                         showAdvancedDropdown = false
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showTagsDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 TagsFilterPopover(
                     tags: viewModel.availableTags,
                     selectedTags: viewModel.selectedTags,
@@ -214,11 +210,12 @@ public struct SearchFilterBar: View {
                         showAppsDropdown = false
                         showDatePopover = false
                         showTagsDropdown = false
+                        showCommentDropdown = false
                         showAdvancedDropdown = false
                     }
                 }
             )
-            .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showVisibilityDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 VisibilityFilterPopover(
                     currentFilter: viewModel.hiddenFilter,
                     onSelect: { filter in
@@ -227,6 +224,36 @@ public struct SearchFilterBar: View {
                     onDismiss: {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showVisibilityDropdown = false
+                        }
+                    }
+                )
+            }
+
+            // Comment presence filter
+            CommentFilterChip(
+                currentFilter: viewModel.commentFilter,
+                isActive: viewModel.commentFilter != .allFrames,
+                isOpen: showCommentDropdown,
+                action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showCommentDropdown.toggle()
+                        showAppsDropdown = false
+                        showDatePopover = false
+                        showTagsDropdown = false
+                        showVisibilityDropdown = false
+                        showAdvancedDropdown = false
+                    }
+                }
+            )
+            .dropdownOverlay(isPresented: $showCommentDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
+                CommentFilterPopover(
+                    currentFilter: viewModel.commentFilter,
+                    onSelect: { filter in
+                        viewModel.setCommentFilter(filter)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            showCommentDropdown = false
                         }
                     }
                 )
@@ -246,9 +273,10 @@ public struct SearchFilterBar: View {
                     showDatePopover = false
                     showTagsDropdown = false
                     showVisibilityDropdown = false
+                    showCommentDropdown = false
                 }
             }
-            .dropdownOverlay(isPresented: $showAdvancedDropdown, yOffset: 56) {
+            .dropdownOverlay(isPresented: $showAdvancedDropdown, yOffset: SpotlightFilterChipMetrics.dropdownYOffset) {
                 AdvancedSearchFilterPopover(
                     windowNameFilter: $viewModel.windowNameFilter,
                     browserUrlFilter: $viewModel.browserUrlFilter
@@ -268,23 +296,23 @@ public struct SearchFilterBar: View {
                         viewModel.submitSearch()
                     }
                 }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: "xmark")
-                            .font(.retraceTinyBold)
+                            .font(.system(size: 9, weight: .semibold))
                         Text("Clear")
-                            .font(.retraceCaption2Medium)
+                            .font(.system(size: 9, weight: .semibold))
                     }
                     .foregroundColor(.white.opacity(0.6))
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
                 .background(
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 5)
                         .fill(Color.white.opacity(0.1))
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 5)
                         .stroke(
                             isClearFiltersHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear,
                             lineWidth: 1.2
@@ -297,15 +325,17 @@ public struct SearchFilterBar: View {
                 }
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 15)
+        // Shift chips slightly upward: more top inset, less bottom inset.
+        .padding(.top, 10)
+        .padding(.bottom, 4)
         .task {
             // Delay loading until after animation completes to avoid choppy animation
             try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous) // 200ms
             await viewModel.loadAvailableTags()
         }
         .onChange(of: showAppsDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             // Lazy load apps only when dropdown is opened
             if isOpen {
                 viewModel.openFilterSignal = (2, UUID())
@@ -315,7 +345,7 @@ public struct SearchFilterBar: View {
             }
         }
         .onChange(of: showDatePopover) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if !isOpen {
                 viewModel.isDatePopoverHandlingKeys = false
             }
@@ -324,25 +354,31 @@ public struct SearchFilterBar: View {
             }
         }
         .onChange(of: showTagsDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (4, UUID())
             }
         }
         .onChange(of: showVisibilityDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (5, UUID())
             }
         }
-        .onChange(of: showAdvancedDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+        .onChange(of: showCommentDropdown) { isOpen in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
             if isOpen {
                 viewModel.openFilterSignal = (6, UUID())
             }
         }
+        .onChange(of: showAdvancedDropdown) { isOpen in
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            if isOpen {
+                viewModel.openFilterSignal = (7, UUID())
+            }
+        }
         .onChange(of: showSearchOrderDropdown) { isOpen in
-            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showAdvancedDropdown || showSearchOrderDropdown
+            viewModel.isDropdownOpen = showAppsDropdown || showDatePopover || showTagsDropdown || showVisibilityDropdown || showCommentDropdown || showAdvancedDropdown || showSearchOrderDropdown
         }
         .onChange(of: viewModel.closeDropdownsSignal) { newValue in
             // Close all dropdowns when signal is received (from Escape key in parent)
@@ -351,6 +387,7 @@ public struct SearchFilterBar: View {
                 showDatePopover = false
                 showTagsDropdown = false
                 showVisibilityDropdown = false
+                showCommentDropdown = false
                 showAdvancedDropdown = false
                 showSearchOrderDropdown = false
             }
@@ -377,6 +414,7 @@ public struct SearchFilterBar: View {
             showDatePopover = false
             showTagsDropdown = false
             showVisibilityDropdown = false
+            showCommentDropdown = false
             showAdvancedDropdown = false
             showSearchOrderDropdown = false
 
@@ -397,6 +435,8 @@ public struct SearchFilterBar: View {
             case 5:
                 showVisibilityDropdown = true
             case 6:
+                showCommentDropdown = true
+            case 7:
                 showAdvancedDropdown = true
             default:
                 // Index 0 means focus search field - parent will handle via onChange
@@ -407,11 +447,13 @@ public struct SearchFilterBar: View {
 
     /// Get the current open filter index (0 if none open)
     private func currentOpenFilterIndex() -> Int {
-        if showAppsDropdown { return 1 }
-        if showDatePopover { return 2 }
-        if showTagsDropdown { return 3 }
-        if showVisibilityDropdown { return 4 }
-        if showAdvancedDropdown { return 5 }
+        if showSearchOrderDropdown { return 1 }
+        if showAppsDropdown { return 2 }
+        if showDatePopover { return 3 }
+        if showTagsDropdown { return 4 }
+        if showVisibilityDropdown { return 5 }
+        if showCommentDropdown { return 6 }
+        if showAdvancedDropdown { return 7 }
         return 0
     }
 
@@ -430,7 +472,7 @@ public struct SearchFilterBar: View {
             let isShiftHeld = event.modifierFlags.contains(.shift)
 
             // Determine current filter by checking the signal's last index
-            // Filter indices: 0=Search, 1=Relevance/Newest/Oldest, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Advanced
+            // Filter indices: 0=Search, 1=Order, 2=Apps, 3=Date, 4=Tags, 5=Visibility, 6=Comments, 7=Advanced
             let lastSignal = vm.openFilterSignal.index
             let currentIndex = lastSignal > 0 ? lastSignal : 1  // Start from 1 if coming from search
 
@@ -438,10 +480,10 @@ public struct SearchFilterBar: View {
             // Calculate next index based on direction
             let nextIndex: Int
             if isShiftHeld {
-                // Shift+Tab: go backward (cycle: 0 -> 6 -> 5 -> 4 -> 3 -> 2 -> 1 -> 0)
+                // Shift+Tab: go backward (cycle: 0 -> 7 -> ... -> 1 -> 0)
                 nextIndex = currentIndex <= 0 ? filterCount : currentIndex - 1
             } else {
-                // Tab: go forward (cycle: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 0 -> 1)
+                // Tab: go forward (cycle: 1 -> 2 -> ... -> 7 -> 0 -> 1)
                 nextIndex = currentIndex >= filterCount ? 0 : currentIndex + 1
             }
 
@@ -500,33 +542,35 @@ private struct FilterChip: View {
         Button(action: {
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 Image(systemName: icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 if showChevron {
                     Image(systemName: "chevron.down")
-                        .font(.retraceCaption2)
+                        .font(.system(size: 9, weight: .semibold))
                 }
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        (isHovered || isOpen)
+                        isOpen
                             ? RetraceMenuStyle.filterStrokeStrong
-                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
-                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
                     )
             )
         }
@@ -552,7 +596,7 @@ private struct AppsFilterChip: View {
     @State private var isHovered = false
 
     private let maxVisibleIcons = 5
-    private let iconSize: CGFloat = 20
+    private let iconSize: CGFloat = 15
 
     private var sortedApps: [String] {
         guard let apps = selectedApps else { return [] }
@@ -567,11 +611,11 @@ private struct AppsFilterChip: View {
         Button(action: {
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 // Show exclude indicator
                 if isExcludeMode {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 12))
+                        .font(.system(size: 9))
                         .foregroundColor(.orange)
                         .transition(.scale.combined(with: .opacity))
                 }
@@ -585,13 +629,13 @@ private struct AppsFilterChip: View {
                         .transition(.scale.combined(with: .opacity))
 
                     Text(appName(for: bundleID))
-                        .font(.retraceCaptionMedium)
+                        .font(.system(size: 10.5, weight: .medium))
                         .lineLimit(1)
                         .strikethrough(isExcludeMode, color: .orange)
                         .transition(.opacity)
                 } else if sortedApps.count > 1 {
                     // Multiple apps: show icons
-                    HStack(spacing: -4) {
+                    HStack(spacing: -3) {
                         ForEach(Array(sortedApps.prefix(maxVisibleIcons)), id: \.self) { bundleID in
                             appIcon(for: bundleID)
                                 .frame(width: iconSize, height: iconSize)
@@ -611,31 +655,33 @@ private struct AppsFilterChip: View {
                 } else {
                     // Default state - no apps selected
                     Image(systemName: "square.grid.2x2.fill")
-                        .font(.system(size: 14))
+                        .font(.system(size: 11))
                         .transition(.scale.combined(with: .opacity))
                     Text("Apps")
-                        .font(.retraceCalloutMedium)
+                        .font(.system(size: 11, weight: .medium))
                         .transition(.opacity)
                 }
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: sortedApps)
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        (isHovered || isOpen)
+                        isOpen
                             ? RetraceMenuStyle.filterStrokeStrong
-                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
-                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
                     )
             )
         }
@@ -740,40 +786,42 @@ private struct TagsFilterChip: View {
         Button(action: {
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 // Show exclude indicator
                 if isExcludeMode {
                     Image(systemName: "minus.circle.fill")
-                        .font(.system(size: 12))
+                        .font(.system(size: 9))
                         .foregroundColor(.orange)
                         .transition(.scale.combined(with: .opacity))
                 }
 
                 Image(systemName: isActive ? "tag.fill" : "tag")
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
                     .strikethrough(isExcludeMode, color: .orange)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        (isHovered || isOpen)
+                        isOpen
                             ? RetraceMenuStyle.filterStrokeStrong
-                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
-                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
                     )
             )
         }
@@ -816,31 +864,102 @@ private struct VisibilityFilterChip: View {
         Button(action: {
             action()
         }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 Image(systemName: icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(label)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .foregroundColor(isActive ? .white : .white.opacity(0.7))
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        (isHovered || isOpen)
+                        isOpen
                             ? RetraceMenuStyle.filterStrokeStrong
-                            : (isActive ? RetraceMenuStyle.filterStrokeMedium : Color.clear),
-                        lineWidth: (isHovered || isOpen) ? 1.2 : 1
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.1)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+// MARK: - Comment Filter Chip
+
+private struct CommentFilterChip: View {
+    let currentFilter: CommentFilter
+    let isActive: Bool
+    let isOpen: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    private var icon: String {
+        switch currentFilter {
+        case .allFrames: return "text.bubble"
+        case .commentsOnly: return "text.bubble.fill"
+        case .noComments: return "text.bubble.slash"
+        }
+    }
+
+    private var label: String {
+        switch currentFilter {
+        case .allFrames: return "All"
+        case .commentsOnly: return "Comments"
+        case .noComments: return "No Comments"
+        }
+    }
+
+    var body: some View {
+        Button(action: {
+            action()
+        }) {
+            HStack(spacing: 4.5) {
+                Image(systemName: icon)
+                    .font(.system(size: 11))
+
+                Text(label)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundColor(isActive ? .white : .white.opacity(0.7))
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? Color.white.opacity(0.2) : Color.white.opacity((isHovered || isOpen) ? 0.15 : 0.1))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isActive
+                                ? RetraceMenuStyle.filterStrokeMedium
+                                : (isHovered ? Color.white.opacity(0.65) : Color.clear)),
+                        lineWidth: (isOpen || isHovered) ? 1.2 : 1
                     )
             )
         }
@@ -864,29 +983,31 @@ private struct SearchOrderChip: View {
         let isHighlighted = isHovered || isOpen
 
         Button(action: action) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4.5) {
                 Image(systemName: selection.icon)
-                    .font(.system(size: 14))
+                    .font(.system(size: 11))
 
                 Text(selection.title)
-                    .font(.retraceCalloutMedium)
+                    .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
 
                 Image(systemName: "chevron.down")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 9, weight: .semibold))
             }
             .foregroundColor(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10.5)
+            .padding(.vertical, 7.5)
             .background(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(isHighlighted ? 0.22 : 0.2))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: 6)
                     .stroke(
-                        isHighlighted ? RetraceMenuStyle.filterStrokeStrong : RetraceMenuStyle.filterStrokeMedium,
-                        lineWidth: isHighlighted ? 1.2 : 1
+                        isOpen
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : (isHovered ? Color.white.opacity(0.65) : RetraceMenuStyle.filterStrokeMedium),
+                        lineWidth: 1.2
                     )
             )
         }

@@ -75,6 +75,7 @@ extension View {
 /// Used in apps, tags, and visibility filter popovers
 public struct FilterRow: View {
     let icon: Image?
+    let iconColorOverride: Color?
     let title: String
     let subtitle: String?
     let isSelected: Bool
@@ -85,6 +86,7 @@ public struct FilterRow: View {
 
     public init(
         icon: Image? = nil,
+        iconColorOverride: Color? = nil,
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
@@ -92,6 +94,7 @@ public struct FilterRow: View {
         action: @escaping () -> Void
     ) {
         self.icon = icon
+        self.iconColorOverride = iconColorOverride
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
@@ -102,6 +105,7 @@ public struct FilterRow: View {
     /// Convenience initializer for SF Symbol icons
     public init(
         systemIcon: String,
+        iconColorOverride: Color? = nil,
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
@@ -109,6 +113,7 @@ public struct FilterRow: View {
         action: @escaping () -> Void
     ) {
         self.icon = Image(systemName: systemIcon)
+        self.iconColorOverride = iconColorOverride
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
@@ -119,6 +124,7 @@ public struct FilterRow: View {
     /// Convenience initializer for NSImage icons (app icons)
     public init(
         nsImage: NSImage?,
+        iconColorOverride: Color? = nil,
         title: String,
         subtitle: String? = nil,
         isSelected: Bool,
@@ -130,6 +136,7 @@ public struct FilterRow: View {
         } else {
             self.icon = Image(systemName: "app.fill")
         }
+        self.iconColorOverride = iconColorOverride
         self.title = title
         self.subtitle = subtitle
         self.isSelected = isSelected
@@ -150,7 +157,7 @@ public struct FilterRow: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(width: RetraceMenuStyle.iconFrameWidth)
-                        .foregroundColor(shouldHighlight ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted)
+                        .foregroundColor(iconColorOverride ?? (shouldHighlight ? RetraceMenuStyle.textColor : RetraceMenuStyle.textColorMuted))
                 }
 
                 // Title and optional subtitle
@@ -891,6 +898,7 @@ public struct TagsFilterPopover: View {
                             ForEach(filteredTags) { tag in
                                 FilterRow(
                                     systemIcon: "tag.fill",
+                                    iconColorOverride: TagColorStore.color(for: tag),
                                     title: tag.name,
                                     isSelected: selectedTags?.contains(tag.id.value) ?? false,
                                     isKeyboardHighlighted: isTagHighlighted(tag.id.value)
@@ -1094,7 +1102,7 @@ public struct AdvancedSearchFilterPopover: View {
                                     focusedField == .windowName
                                         ? RetraceMenuStyle.filterStrokeStrong
                                         : (isWindowHovered
-                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            ? Color.white.opacity(0.65)
                                             : RetraceMenuStyle.filterStrokeSubtle),
                                     lineWidth: 1
                                 )
@@ -1126,7 +1134,7 @@ public struct AdvancedSearchFilterPopover: View {
                                     focusedField == .browserUrl
                                         ? RetraceMenuStyle.filterStrokeStrong
                                         : (isBrowserHovered
-                                            ? RetraceMenuStyle.filterStrokeStrong
+                                            ? Color.white.opacity(0.65)
                                             : RetraceMenuStyle.filterStrokeSubtle),
                                     lineWidth: 1
                                 )
@@ -1257,6 +1265,115 @@ public struct VisibilityFilterPopover: View {
         }
         .onChange(of: isFocused) { focused in
             // Dismiss when focus is lost (e.g., clicking on main search field)
+            if !focused {
+                onDismiss?()
+            }
+        }
+        .keyboardNavigation(
+            onUpArrow: { moveHighlight(by: -1) },
+            onDownArrow: { moveHighlight(by: 1) },
+            onReturn: { selectHighlightedItem() }
+        )
+    }
+}
+
+/// Popover for selecting comment-presence filter
+public struct CommentFilterPopover: View {
+    let currentFilter: CommentFilter
+    let onSelect: (CommentFilter) -> Void
+    var onDismiss: (() -> Void)?
+    var onKeyboardSelect: (() -> Void)?
+
+    @FocusState private var isFocused: Bool
+    @State private var highlightedIndex: Int = 0
+
+    private let options: [CommentFilter] = [.allFrames, .commentsOnly, .noComments]
+
+    public init(
+        currentFilter: CommentFilter,
+        onSelect: @escaping (CommentFilter) -> Void,
+        onDismiss: (() -> Void)? = nil,
+        onKeyboardSelect: (() -> Void)? = nil
+    ) {
+        self.currentFilter = currentFilter
+        self.onSelect = onSelect
+        self.onDismiss = onDismiss
+        self.onKeyboardSelect = onKeyboardSelect
+    }
+
+    private func selectHighlightedItem() {
+        guard highlightedIndex >= 0, highlightedIndex < options.count else { return }
+        onSelect(options[highlightedIndex])
+        if let onKeyboardSelect {
+            onKeyboardSelect()
+        } else {
+            onDismiss?()
+        }
+    }
+
+    private func moveHighlight(by offset: Int) {
+        highlightedIndex = max(0, min(options.count - 1, highlightedIndex + offset))
+    }
+
+    public var body: some View {
+        FilterPopoverContainer(width: 240) {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    FilterRow(
+                        systemIcon: "text.bubble",
+                        title: "All Frames",
+                        subtitle: "Show frames regardless of comments",
+                        isSelected: currentFilter == .allFrames,
+                        isKeyboardHighlighted: highlightedIndex == 0
+                    ) {
+                        onSelect(.allFrames)
+                        onDismiss?()
+                    }
+                    .id(0)
+
+                    Divider()
+                        .padding(.vertical, 4)
+
+                    FilterRow(
+                        systemIcon: "text.bubble.fill",
+                        title: "Comments Only",
+                        subtitle: "Show frames from commented segments",
+                        isSelected: currentFilter == .commentsOnly,
+                        isKeyboardHighlighted: highlightedIndex == 1
+                    ) {
+                        onSelect(.commentsOnly)
+                        onDismiss?()
+                    }
+                    .id(1)
+
+                    FilterRow(
+                        systemIcon: "text.bubble.slash",
+                        title: "No Comments",
+                        subtitle: "Show frames from segments without comments",
+                        isSelected: currentFilter == .noComments,
+                        isKeyboardHighlighted: highlightedIndex == 2
+                    ) {
+                        onSelect(.noComments)
+                        onDismiss?()
+                    }
+                    .id(2)
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 160)
+        }
+        .focusable()
+        .focused($isFocused)
+        .modifier(FocusEffectDisabledModifier())
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isFocused = true
+            }
+            if let index = options.firstIndex(of: currentFilter) {
+                highlightedIndex = index
+            }
+        }
+        .onChange(of: isFocused) { focused in
             if !focused {
                 onDismiss?()
             }

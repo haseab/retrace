@@ -1099,7 +1099,8 @@ public actor DatabaseManager: DatabaseProtocol {
     public func createSegmentComment(
         body: String,
         author: String,
-        attachments: [SegmentCommentAttachment] = []
+        attachments: [SegmentCommentAttachment] = [],
+        frameID: FrameID? = nil
     ) async throws -> SegmentComment {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
@@ -1108,8 +1109,8 @@ public actor DatabaseManager: DatabaseProtocol {
         let timestamp = Schema.currentTimestamp()
         let attachmentsJSON = try encodeCommentAttachments(attachments)
         let sql = """
-            INSERT INTO segment_comment (body, author, attachmentsJson, createdAt, updatedAt)
-            VALUES (?, ?, ?, ?, ?);
+            INSERT INTO segment_comment (body, author, attachmentsJson, frameId, createdAt, updatedAt)
+            VALUES (?, ?, ?, ?, ?, ?);
             """
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
@@ -1124,8 +1125,13 @@ public actor DatabaseManager: DatabaseProtocol {
         sqlite3_bind_text(statement, 1, body, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 2, author, -1, SQLITE_TRANSIENT)
         sqlite3_bind_text(statement, 3, attachmentsJSON, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int64(statement, 4, timestamp)
+        if let frameID {
+            sqlite3_bind_int64(statement, 4, frameID.value)
+        } else {
+            sqlite3_bind_null(statement, 4)
+        }
         sqlite3_bind_int64(statement, 5, timestamp)
+        sqlite3_bind_int64(statement, 6, timestamp)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -1260,7 +1266,7 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         let sql = """
-            SELECT c.id, c.body, c.author, c.attachmentsJson, c.createdAt, c.updatedAt
+            SELECT c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt
             FROM segment_comment c
             JOIN segment_comment_link scl ON c.id = scl.commentId
             WHERE scl.segmentId = ?
@@ -1286,6 +1292,222 @@ public actor DatabaseManager: DatabaseProtocol {
         return comments
     }
 
+    /// Get all linked comments with a representative segment context per comment.
+    /// This powers the "All Comments" timeline without frame-first fan-out queries.
+    public func getAllCommentTimelineEntries() async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            WITH chosen_segment AS (
+                SELECT scl.commentId, MIN(scl.segmentId) AS segmentId
+                FROM segment_comment_link scl
+                GROUP BY scl.commentId
+            )
+            SELECT
+                c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt,
+                cs.segmentId, s.bundleID, s.browserUrl, s.startDate
+            FROM segment_comment c
+            JOIN chosen_segment cs ON cs.commentId = c.id
+            LEFT JOIN segment s ON s.id = cs.segmentId
+            ORDER BY c.createdAt ASC, c.id ASC;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var entries: [(
+            comment: SegmentComment,
+            segmentID: SegmentID,
+            appBundleID: String?,
+            appName: String?,
+            browserURL: String?,
+            referenceTimestamp: Date
+        )] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let comment = parseSegmentComment(statement: statement!)
+            let segmentIDValue = sqlite3_column_int64(statement, 7)
+            let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+            let browserURL = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let referenceTimestamp: Date
+            if sqlite3_column_type(statement, 10) == SQLITE_NULL {
+                referenceTimestamp = comment.createdAt
+            } else {
+                referenceTimestamp = Schema.timestampToDate(sqlite3_column_int64(statement, 10))
+            }
+
+            entries.append((
+                comment: comment,
+                segmentID: SegmentID(value: segmentIDValue),
+                appBundleID: appBundleID,
+                appName: nil,
+                browserURL: browserURL,
+                referenceTimestamp: referenceTimestamp
+            ))
+        }
+
+        return entries
+    }
+
+    /// Full-text search comments by body text.
+    /// Uses FTS5 index and always enforces capped pagination inputs.
+    public func searchSegmentComments(query: String, limit: Int = 10, offset: Int = 0) async throws -> [SegmentComment] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let cappedLimit = min(max(limit, 1), 200)
+        let cappedOffset = max(offset, 0)
+        let ftsQuery = buildSegmentCommentFTSQuery(from: trimmed)
+        guard !ftsQuery.isEmpty else { return [] }
+
+        let sql = """
+            SELECT c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt
+            FROM segment_comment_fts fts
+            JOIN segment_comment c ON c.id = fts.rowid
+            WHERE segment_comment_fts MATCH ?
+            ORDER BY bm25(segment_comment_fts), c.createdAt DESC, c.id DESC
+            LIMIT ? OFFSET ?;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, Int64(cappedLimit))
+        sqlite3_bind_int64(statement, 3, Int64(cappedOffset))
+
+        var comments: [SegmentComment] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            comments.append(parseSegmentComment(statement: statement!))
+        }
+
+        return comments
+    }
+
+    /// Full-text search comments with representative segment context for each comment.
+    /// This is used by the All Comments search UI to avoid follow-up context queries.
+    public func searchCommentTimelineEntries(
+        query: String,
+        limit: Int = 10,
+        offset: Int = 0
+    ) async throws -> [(
+        comment: SegmentComment,
+        segmentID: SegmentID,
+        appBundleID: String?,
+        appName: String?,
+        browserURL: String?,
+        referenceTimestamp: Date
+    )] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let cappedLimit = min(max(limit, 1), 200)
+        let cappedOffset = max(offset, 0)
+        let ftsQuery = buildSegmentCommentFTSQuery(from: trimmed)
+        guard !ftsQuery.isEmpty else { return [] }
+
+        let sql = """
+            WITH matched_comments AS (
+                SELECT
+                    rowid AS commentId,
+                    bm25(segment_comment_fts) AS rank
+                FROM segment_comment_fts
+                WHERE segment_comment_fts MATCH ?
+                ORDER BY bm25(segment_comment_fts), rowid DESC
+                LIMIT ? OFFSET ?
+            ),
+            chosen_segment AS (
+                SELECT scl.commentId, MIN(scl.segmentId) AS segmentId
+                FROM segment_comment_link scl
+                JOIN matched_comments mc ON mc.commentId = scl.commentId
+                GROUP BY scl.commentId
+            )
+            SELECT
+                c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt,
+                cs.segmentId, s.bundleID, s.browserUrl, s.startDate
+            FROM matched_comments mc
+            JOIN segment_comment c ON c.id = mc.commentId
+            JOIN chosen_segment cs ON cs.commentId = c.id
+            LEFT JOIN segment s ON s.id = cs.segmentId
+            ORDER BY mc.rank, c.createdAt DESC, c.id DESC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, Int64(cappedLimit))
+        sqlite3_bind_int64(statement, 3, Int64(cappedOffset))
+
+        var entries: [(
+            comment: SegmentComment,
+            segmentID: SegmentID,
+            appBundleID: String?,
+            appName: String?,
+            browserURL: String?,
+            referenceTimestamp: Date
+        )] = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let comment = parseSegmentComment(statement: statement!)
+            let segmentIDValue = sqlite3_column_int64(statement, 7)
+            let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+            let browserURL = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let referenceTimestamp: Date
+            if sqlite3_column_type(statement, 10) == SQLITE_NULL {
+                referenceTimestamp = comment.createdAt
+            } else {
+                referenceTimestamp = Schema.timestampToDate(sqlite3_column_int64(statement, 10))
+            }
+
+            entries.append((
+                comment: comment,
+                segmentID: SegmentID(value: segmentIDValue),
+                appBundleID: appBundleID,
+                appName: nil,
+                browserURL: browserURL,
+                referenceTimestamp: referenceTimestamp
+            ))
+        }
+
+        return entries
+    }
+
     /// Get how many segments a comment is currently linked to
     public func getSegmentCountForComment(commentId: SegmentCommentID) async throws -> Int {
         guard let db = db else {
@@ -1294,11 +1516,73 @@ public actor DatabaseManager: DatabaseProtocol {
         return try getSegmentCountForComment(db: db, commentId: commentId.value)
     }
 
+    /// Get the first linked segment for a comment (deterministic by link creation).
+    public func getFirstLinkedSegmentForComment(commentId: SegmentCommentID) async throws -> SegmentID? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT segmentId
+            FROM segment_comment_link
+            WHERE commentId = ?
+            ORDER BY createdAt ASC, segmentId ASC
+            LIMIT 1;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, commentId.value)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return SegmentID(value: sqlite3_column_int64(statement, 0))
+    }
+
+    /// Get the first frame in a segment (oldest by timestamp).
+    public func getFirstFrameForSegment(segmentId: SegmentID) async throws -> FrameID? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT id
+            FROM frame
+            WHERE segmentId = ?
+            ORDER BY createdAt ASC, id ASC
+            LIMIT 1;
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, segmentId.value)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return FrameID(value: sqlite3_column_int64(statement, 0))
+    }
+
     // MARK: - Segment Comment Helpers
 
     private func getSegmentCommentByID(db: OpaquePointer, commentID: Int64) throws -> SegmentComment? {
         let sql = """
-            SELECT id, body, author, attachmentsJson, createdAt, updatedAt
+            SELECT id, body, author, attachmentsJson, frameId, createdAt, updatedAt
             FROM segment_comment
             WHERE id = ?;
             """
@@ -1325,14 +1609,21 @@ public actor DatabaseManager: DatabaseProtocol {
         let body = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
         let author = sqlite3_column_text(statement, 2).map { String(cString: $0) } ?? ""
         let attachmentsJSON = sqlite3_column_text(statement, 3).map { String(cString: $0) } ?? "[]"
-        let createdAt = Schema.timestampToDate(sqlite3_column_int64(statement, 4))
-        let updatedAt = Schema.timestampToDate(sqlite3_column_int64(statement, 5))
+        let frameID: FrameID?
+        if sqlite3_column_type(statement, 4) == SQLITE_NULL {
+            frameID = nil
+        } else {
+            frameID = FrameID(value: sqlite3_column_int64(statement, 4))
+        }
+        let createdAt = Schema.timestampToDate(sqlite3_column_int64(statement, 5))
+        let updatedAt = Schema.timestampToDate(sqlite3_column_int64(statement, 6))
 
         return SegmentComment(
             id: SegmentCommentID(value: id),
             body: body,
             author: author,
             attachments: decodeCommentAttachments(attachmentsJSON),
+            frameID: frameID,
             createdAt: createdAt,
             updatedAt: updatedAt
         )
@@ -1433,6 +1724,17 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func buildSegmentCommentFTSQuery(from rawQuery: String) -> String {
+        rawQuery
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .map { token in
+                let escaped = token.replacingOccurrences(of: "\"", with: "\"\"")
+                return "\"\(escaped)\"*"
+            }
+            .joined(separator: " ")
     }
 
     private func cleanupOrphanedCommentIfNeeded(db: OpaquePointer, commentId: Int64) throws {
