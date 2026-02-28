@@ -13,6 +13,9 @@ public protocol ImageExtractor: Sendable {
     ///   - frameRate: Frame rate of the video (optional, used for time calculation)
     /// - Returns: JPEG image data
     func extractFrame(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> Data
+
+    /// Extract a single frame as a CGImage without JPEG encoding/decoding round-trips.
+    func extractFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> CGImage
 }
 
 // MARK: - Frame Generator Actor
@@ -100,7 +103,7 @@ public final class HEVCStorageExtractor: ImageExtractor {
     private let generatorCache: GeneratorCache
 
     public init(storageManager: StorageManager) {
-        self.storageRoot = StorageConfig.default.expandedStorageRootPath
+        self.storageRoot = AppPaths.expandedStorageRoot
         imageCache.countLimit = 100
         imageCache.totalCostLimit = 5 * 1024 * 1024
         generatorCache = GeneratorCache(countLimit: 10)
@@ -120,31 +123,56 @@ public final class HEVCStorageExtractor: ImageExtractor {
             return cached as Data
         }
 
-        // Construct full path
-        let fullVideoPath: String
+        let fullVideoPath = resolveFullVideoPath(videoPath)
+        let cgImage = try await extractFrameCGImageInternal(
+            fullVideoPath: fullVideoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+
+        // Convert to JPEG
+        let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
+
+        // Cache the result
+        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
+        return jpegData
+    }
+
+    public func extractFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> CGImage {
+        let fullVideoPath = resolveFullVideoPath(videoPath)
+        return try await extractFrameCGImageInternal(
+            fullVideoPath: fullVideoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+    }
+
+    private func resolveFullVideoPath(_ videoPath: String) -> String {
         if videoPath.hasPrefix("/") {
-            fullVideoPath = videoPath
-        } else {
-            fullVideoPath = "\(storageRoot)/\(videoPath)"
+            return videoPath
         }
+        return "\(storageRoot)/\(videoPath)"
+    }
 
-        // Get or create frame generator for this video
-        let generator = try await getOrCreateGenerator(for: fullVideoPath)
-
-        // Calculate CMTime from frame index
+    private func frameTime(frameIndex: Int, frameRate: Double?) -> CMTime {
         let effectiveFrameRate = frameRate ?? 30.0
-        let time: CMTime
         if effectiveFrameRate == 30.0 {
-            time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
-        } else {
-            let timeInSeconds = Double(frameIndex) / effectiveFrameRate
-            time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+            return CMTime(value: Int64(frameIndex) * 20, timescale: 600)
         }
+        let timeInSeconds = Double(frameIndex) / effectiveFrameRate
+        return CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+    }
 
-        // Extract frame using serialized actor
-        let cgImage: CGImage
+    private func extractFrameCGImageInternal(
+        fullVideoPath: String,
+        frameIndex: Int,
+        frameRate: Double?
+    ) async throws -> CGImage {
+        let generator = try await getOrCreateGenerator(for: fullVideoPath)
+        let time = frameTime(frameIndex: frameIndex, frameRate: frameRate)
+
         do {
-            cgImage = try await generator.cgImage(at: time)
+            return try await generator.cgImage(at: time)
         } catch {
             // On failure, invalidate cache (file may have changed)
             generatorCache.remove(fullVideoPath)
@@ -154,13 +182,6 @@ public final class HEVCStorageExtractor: ImageExtractor {
                 error: error
             )
         }
-
-        // Convert to JPEG
-        let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
-
-        // Cache the result
-        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
-        return jpegData
     }
 
     private func getOrCreateGenerator(for fullVideoPath: String) async throws -> FrameGenerator {
@@ -257,7 +278,31 @@ public final class AVAssetExtractor: ImageExtractor {
             return cached as Data
         }
 
-        // Construct full path from storage root
+        let fullVideoPath = resolveFullVideoPath(videoPath)
+        let cgImage = try await extractFrameCGImageInternal(
+            fullVideoPath: fullVideoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+
+        // Convert to JPEG
+        let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
+
+        // Cache the result
+        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
+        return jpegData
+    }
+
+    public func extractFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> CGImage {
+        let fullVideoPath = resolveFullVideoPath(videoPath)
+        return try await extractFrameCGImageInternal(
+            fullVideoPath: fullVideoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+    }
+
+    private func resolveFullVideoPath(_ videoPath: String) -> String {
         var fullVideoPath: String
         if videoPath.hasPrefix("/") {
             fullVideoPath = videoPath
@@ -273,23 +318,28 @@ public final class AVAssetExtractor: ImageExtractor {
             }
         }
 
-        // Get or create frame generator for this video
-        let generator = try await getOrCreateGenerator(for: fullVideoPath)
+        return fullVideoPath
+    }
 
-        // Calculate CMTime from frame index
+    private func frameTime(frameIndex: Int, frameRate: Double?) -> CMTime {
         let effectiveFrameRate = frameRate ?? 30.0
-        let time: CMTime
         if effectiveFrameRate == 30.0 {
-            time = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
-        } else {
-            let timeInSeconds = Double(frameIndex) / effectiveFrameRate
-            time = CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+            return CMTime(value: Int64(frameIndex) * 20, timescale: 600)
         }
+        let timeInSeconds = Double(frameIndex) / effectiveFrameRate
+        return CMTime(seconds: timeInSeconds, preferredTimescale: 600)
+    }
 
-        // Extract frame using serialized actor
-        let cgImage: CGImage
+    private func extractFrameCGImageInternal(
+        fullVideoPath: String,
+        frameIndex: Int,
+        frameRate: Double?
+    ) async throws -> CGImage {
+        let generator = try await getOrCreateGenerator(for: fullVideoPath)
+        let time = frameTime(frameIndex: frameIndex, frameRate: frameRate)
+
         do {
-            cgImage = try await generator.cgImage(at: time)
+            return try await generator.cgImage(at: time)
         } catch {
             // On failure, invalidate cache (file may have changed)
             generatorCache.remove(fullVideoPath)
@@ -299,13 +349,6 @@ public final class AVAssetExtractor: ImageExtractor {
                 error: error
             )
         }
-
-        // Convert to JPEG
-        let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
-
-        // Cache the result
-        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
-        return jpegData
     }
 
     private func getOrCreateGenerator(for fullVideoPath: String) async throws -> FrameGenerator {

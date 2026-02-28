@@ -570,15 +570,36 @@ public struct SpotlightSearchOverlay: View {
 
         Task {
             do {
-                // 1. Fetch frame image using frameIndex (more reliable than timestamp matching)
+                // 1. Fetch frame image (prefer direct path to avoid per-thumbnail DB lookups and JPEG round-trips)
                 let fetchStart = Date()
-                let imageData = try await coordinator.getFrameImageByIndex(
-                    videoID: result.videoID,
-                    frameIndex: result.frameIndex,
-                    source: result.source
-                )
+                let fullImage: NSImage
+                if let videoPath = result.videoPath {
+                    let cgImage = try await coordinator.getFrameCGImage(
+                        videoPath: videoPath,
+                        frameIndex: result.frameIndex,
+                        frameRate: result.videoFrameRate,
+                        source: result.source
+                    )
+                    fullImage = NSImage(
+                        cgImage: cgImage,
+                        size: NSSize(width: cgImage.width, height: cgImage.height)
+                    )
+                } else {
+                    // Fallback for legacy cached results lacking video path/frame rate.
+                    let imageData = try await coordinator.getFrameImageByIndex(
+                        videoID: result.videoID,
+                        frameIndex: result.frameIndex,
+                        source: result.source
+                    )
+                    guard let decodedImage = NSImage(data: imageData) else {
+                        Log.error("\(searchLog) Failed to create NSImage from fallback data", category: .ui)
+                        viewModel.loadingThumbnails.remove(key)
+                        return
+                    }
+                    fullImage = decodedImage
+                }
                 let fetchDuration = Date().timeIntervalSince(fetchStart) * 1000
-                Log.debug("\(searchLog) Image data fetched in \(Int(fetchDuration))ms, size=\(imageData.count) bytes, source=\(result.source)", category: .ui)
+                Log.debug("\(searchLog) Frame image fetched in \(Int(fetchDuration))ms, source=\(result.source), directPath=\(result.videoPath != nil)", category: .ui)
 
                 // Check if search generation changed (user started a new search)
                 guard viewModel.searchGeneration == currentGeneration else {
@@ -586,43 +607,52 @@ public struct SpotlightSearchOverlay: View {
                     return
                 }
 
-                guard let fullImage = NSImage(data: imageData) else {
-                    Log.error("\(searchLog) Failed to create NSImage from data", category: .ui)
-                    viewModel.loadingThumbnails.remove(key)
-                    return
-                }
-
-                // 2. Get OCR nodes for this frame (use frameID for exact match)
-                let ocrStart = Date()
-                let ocrNodes = try await coordinator.getAllOCRNodes(
-                    frameID: result.frameID,
-                    source: result.source
-                )
-                let ocrDuration = Date().timeIntervalSince(ocrStart) * 1000
-                Log.debug("\(searchLog) OCR nodes fetched in \(Int(ocrDuration))ms, count=\(ocrNodes.count), source=\(result.source)", category: .ui)
-
-                // Check if search generation changed again
-                guard viewModel.searchGeneration == currentGeneration else {
-                    Log.debug("\(searchLog) Search generation changed (\(currentGeneration)->\(viewModel.searchGeneration)), discarding thumbnail for: \(key)", category: .ui)
-                    return
-                }
-
-                // 3. Find the matching OCR node for the search query
-                let matchingNode = findMatchingOCRNode(query: searchQuery, nodes: ocrNodes)
-
-                // 4. Create the highlighted thumbnail
                 let resizeStart = Date()
                 let thumbnail: NSImage
-                if let matchNode = matchingNode {
-                    Log.debug("\(searchLog) Found matching node: '\(matchNode.text.prefix(30))...' at (\(matchNode.x), \(matchNode.y))", category: .ui)
+                if let matchNode = result.highlightNode {
+                    Log.debug(
+                        "\(searchLog) Using precomputed match node id=\(matchNode.nodeID) at (\(matchNode.x), \(matchNode.y))",
+                        category: .ui
+                    )
                     thumbnail = createHighlightedThumbnail(
                         from: fullImage,
-                        matchingNode: matchNode,
+                        matchX: matchNode.x,
+                        matchY: matchNode.y,
+                        matchWidth: matchNode.width,
+                        matchHeight: matchNode.height,
                         size: thumbnailSize
                     )
                 } else {
-                    Log.debug("\(searchLog) No matching node found, creating standard thumbnail", category: .ui)
-                    thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
+                    // 2. Get OCR nodes for this frame (use frameID for exact match)
+                    let ocrStart = Date()
+                    let ocrNodes = try await coordinator.getAllOCRNodes(
+                        frameID: result.frameID,
+                        source: result.source
+                    )
+                    let ocrDuration = Date().timeIntervalSince(ocrStart) * 1000
+                    Log.debug("\(searchLog) OCR nodes fetched in \(Int(ocrDuration))ms, count=\(ocrNodes.count), source=\(result.source)", category: .ui)
+
+                    // Check if search generation changed again
+                    guard viewModel.searchGeneration == currentGeneration else {
+                        Log.debug("\(searchLog) Search generation changed (\(currentGeneration)->\(viewModel.searchGeneration)), discarding thumbnail for: \(key)", category: .ui)
+                        return
+                    }
+
+                    // 3. Find the matching OCR node for the search query
+                    let matchingNode = findMatchingOCRNode(query: searchQuery, nodes: ocrNodes)
+
+                    // 4. Create the highlighted thumbnail
+                    if let matchNode = matchingNode {
+                        Log.debug("\(searchLog) Found matching node: '\(matchNode.text.prefix(30))...' at (\(matchNode.x), \(matchNode.y))", category: .ui)
+                        thumbnail = createHighlightedThumbnail(
+                            from: fullImage,
+                            matchingNode: matchNode,
+                            size: thumbnailSize
+                        )
+                    } else {
+                        Log.debug("\(searchLog) No matching node found, creating standard thumbnail", category: .ui)
+                        thumbnail = createThumbnail(from: fullImage, size: thumbnailSize)
+                    }
                 }
                 let resizeDuration = Date().timeIntervalSince(resizeStart) * 1000
                 let totalDuration = Date().timeIntervalSince(startTime) * 1000
@@ -744,16 +774,34 @@ public struct SpotlightSearchOverlay: View {
         matchingNode: OCRNodeWithText,
         size: CGSize
     ) -> NSImage {
+        createHighlightedThumbnail(
+            from: image,
+            matchX: matchingNode.x,
+            matchY: matchingNode.y,
+            matchWidth: matchingNode.width,
+            matchHeight: matchingNode.height,
+            size: size
+        )
+    }
+
+    private func createHighlightedThumbnail(
+        from image: NSImage,
+        matchX: Double,
+        matchY: Double,
+        matchWidth: Double,
+        matchHeight: Double,
+        size: CGSize
+    ) -> NSImage {
         let imageSize = image.size
 
         // OCR coordinates use top-left origin (y=0 at top), but NSImage uses bottom-left origin (y=0 at bottom)
         // We need to flip the Y coordinate: flippedY = 1.0 - y - height
-        let flippedNodeY = 1.0 - matchingNode.y - matchingNode.height
+        let flippedNodeY = 1.0 - matchY - matchHeight
 
         // Calculate the crop region centered on the match with padding
         // OCR coordinates are normalized (0.0-1.0), convert to pixel coordinates
-        let matchCenterX = (matchingNode.x + matchingNode.width / 2) * imageSize.width
-        let matchCenterY = (flippedNodeY + matchingNode.height / 2) * imageSize.height
+        let matchCenterX = (matchX + matchWidth / 2) * imageSize.width
+        let matchCenterY = (flippedNodeY + matchHeight / 2) * imageSize.height
 
         // Determine crop size to maintain aspect ratio of thumbnail
         // Use a zoom factor to show context around the match
@@ -782,10 +830,10 @@ public struct SpotlightSearchOverlay: View {
         // Calculate where the highlight box should be drawn in the thumbnail
         // Convert match coordinates from image space to crop space, then to thumbnail space
         // Use the flipped Y coordinate for NSImage drawing
-        let matchXInCrop = (matchingNode.x * imageSize.width - cropX) / cropWidth * size.width
+        let matchXInCrop = (matchX * imageSize.width - cropX) / cropWidth * size.width
         let matchYInCrop = (flippedNodeY * imageSize.height - cropY) / cropHeight * size.height
-        let matchWidthInThumb = (matchingNode.width * imageSize.width) / cropWidth * size.width
-        let matchHeightInThumb = (matchingNode.height * imageSize.height) / cropHeight * size.height
+        let matchWidthInThumb = (matchWidth * imageSize.width) / cropWidth * size.width
+        let matchHeightInThumb = (matchHeight * imageSize.height) / cropHeight * size.height
 
         // Add some padding to the highlight box
         let padding: CGFloat = 4
@@ -882,6 +930,7 @@ public struct SpotlightSearchOverlay: View {
             if clearSearchState {
                 viewModel.searchQuery = ""
                 viewModel.clearAllFilters()
+                viewModel.resetSearchOrderToDefault()
             }
             onDismiss()
             isDismissing = false

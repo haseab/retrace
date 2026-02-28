@@ -1545,6 +1545,20 @@ public actor AppCoordinator {
         return try await adapter.getFrameImageByIndex(videoID: videoID, frameIndex: frameIndex, source: source)
     }
 
+    /// Get frame image as CGImage without JPEG encode/decode round-trips.
+    public func getFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?, source: FrameSource) async throws -> CGImage {
+        guard let adapter = await services.dataAdapter else {
+            throw NSError(domain: "AppCoordinator", code: 500, userInfo: [NSLocalizedDescriptionKey: "DataAdapter not initialized"])
+        }
+
+        return try await adapter.getFrameCGImage(
+            videoPath: videoPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate,
+            source: source
+        )
+    }
+
     /// Get frame image directly using filename-based videoID (optimized, no database lookup)
     /// Use this when you already have the video filename from a JOIN query (e.g., FrameVideoInfo)
     /// - Parameters:

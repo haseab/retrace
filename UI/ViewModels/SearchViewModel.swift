@@ -45,7 +45,7 @@ public class SearchViewModel: ObservableObject {
     @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
 
     // Search mode (tabs)
-    @Published public var searchMode: SearchMode = .relevant
+    @Published public var searchMode: SearchMode = .all
 
     // Sort order (for "all" mode)
     @Published public var sortOrder: SearchSortOrder = .newestFirst
@@ -121,6 +121,12 @@ public class SearchViewModel: ObservableObject {
     // Filter changes only auto-trigger re-search after first submit
     private var hasSubmittedSearch = false
 
+    // Pagination termination state for infinite scroll.
+    // We stop loading only when the backend returns an empty page.
+    private var didReachPaginationEnd = false
+    // Backend keyset cursor for infinite scroll.
+    private var nextPageCursor: SearchPageCursor?
+
     // One-shot suppression window for filter-change auto-search.
     // Used to avoid immediate duplicate re-search after deeplink applies filters + submits.
     private var suppressFilterAutoSearchUntil: Date?
@@ -171,7 +177,7 @@ public class SearchViewModel: ObservableObject {
     /// Key for storing the cached sort order
     private static let cachedSearchSortOrderKey = "search.cachedSearchSortOrder"
     /// Cache version - increment when data structure changes to invalidate old caches
-    private static let searchCacheVersion = 4  // v4: Advanced metadata filters (window name + browser URL)
+    private static let searchCacheVersion = 5  // v5: SearchResult carries video path/frame rate for fast thumbnail loading
     private static let searchCacheVersionKey = "search.cacheVersion"
     /// How long cached search results remain valid.
     /// Keep this aligned with timeline hidden-state cache invalidation.
@@ -219,6 +225,7 @@ public class SearchViewModel: ObservableObject {
                     self?.results = nil
                     self?.committedSearchQuery = ""
                     self?.hasSubmittedSearch = false  // Reset so filters don't auto-update for new query
+                    self?.resetSearchOrderToDefault()
                     self?.clearSearchCache()
                 }
             }
@@ -425,6 +432,8 @@ public class SearchViewModel: ObservableObject {
             Log.debug("[SearchViewModel] Empty query, clearing results", category: .ui)
             results = nil
             committedSearchQuery = ""
+            didReachPaginationEnd = false
+            nextPageCursor = nil
             return
         }
 
@@ -437,6 +446,8 @@ public class SearchViewModel: ObservableObject {
         loadingThumbnails.removeAll()  // Clear loading state for new search
         searchGeneration += 1  // Increment generation to invalidate in-flight thumbnail loads
         committedSearchQuery = query  // Set committed query for thumbnail cache keys
+        didReachPaginationEnd = false
+        nextPageCursor = nil
 
         do {
             // Check for cancellation before starting the search
@@ -445,9 +456,7 @@ public class SearchViewModel: ObservableObject {
             let searchQuery = buildSearchQuery(query)
             Log.debug("[SearchViewModel] Built search query: text='\(searchQuery.text)', limit=\(searchQuery.limit), offset=\(searchQuery.offset)", category: .ui)
 
-            let startTime = Date()
             let searchResults = try await coordinator.search(query: searchQuery)
-            let elapsed = Date().timeIntervalSince(startTime) * 1000
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
@@ -460,6 +469,8 @@ public class SearchViewModel: ObservableObject {
             // Ensure UI updates happen on main actor
             await MainActor.run {
                 results = searchResults
+                nextPageCursor = searchResults.nextCursor
+                didReachPaginationEnd = searchResults.nextCursor == nil
                 isSearching = false
             }
         } catch is CancellationError {
@@ -477,7 +488,7 @@ public class SearchViewModel: ObservableObject {
         }
     }
 
-    private func buildSearchQuery(_ text: String, offset: Int = 0) -> SearchQuery {
+    private func buildSearchQuery(_ text: String, offset: Int = 0, cursor: SearchPageCursor? = nil) -> SearchQuery {
         // Truncate query to max words to prevent performance issues with very long queries
         let truncatedText = truncateToMaxWords(text)
 
@@ -534,6 +545,7 @@ public class SearchViewModel: ObservableObject {
             filters: filters,
             limit: defaultResultLimit,
             offset: offset,
+            cursor: cursor,
             mode: searchMode,
             sortOrder: sortOrder
         )
@@ -604,8 +616,8 @@ public class SearchViewModel: ObservableObject {
 
     /// Whether more results can be loaded
     public var canLoadMore: Bool {
-        guard let results = results else { return false }
-        return results.hasMore && !isLoadingMore && !isSearching
+        guard results != nil else { return false }
+        return !didReachPaginationEnd && !isLoadingMore && !isSearching
     }
 
     /// Load more results for infinite scroll
@@ -619,13 +631,26 @@ public class SearchViewModel: ObservableObject {
             // Check for cancellation before starting
             try Task.checkCancellation()
 
-            let query = buildSearchQuery(searchQuery, offset: currentResults.results.count)
+            let query = buildSearchQuery(searchQuery, offset: 0, cursor: nextPageCursor)
             let moreResults = try await coordinator.search(query: query)
 
             // Check for cancellation after the search completes
             try Task.checkCancellation()
 
             Log.info("[SearchViewModel] Loaded \(moreResults.results.count) more results", category: .ui)
+
+            if moreResults.results.isEmpty {
+                didReachPaginationEnd = true
+                nextPageCursor = nil
+                results = SearchResults(
+                    query: currentResults.query,
+                    results: currentResults.results,
+                    totalCount: currentResults.results.count,
+                    searchTimeMs: moreResults.searchTimeMs
+                )
+                isLoadingMore = false
+                return
+            }
 
             // Append new results to existing
             let combinedResults = currentResults.results + moreResults.results
@@ -635,6 +660,8 @@ public class SearchViewModel: ObservableObject {
                 totalCount: moreResults.totalCount,
                 searchTimeMs: moreResults.searchTimeMs
             )
+            nextPageCursor = moreResults.nextCursor
+            didReachPaginationEnd = moreResults.nextCursor == nil
 
             isLoadingMore = false
         } catch is CancellationError {
@@ -834,6 +861,11 @@ public class SearchViewModel: ObservableObject {
         commentFilter = .allFrames
         windowNameFilter = nil
         browserUrlFilter = nil
+    }
+
+    public func resetSearchOrderToDefault() {
+        searchMode = .all
+        sortOrder = .newestFirst
     }
 
     /// Set app filter mode (include/exclude)
@@ -1135,6 +1167,8 @@ public class SearchViewModel: ObservableObject {
             Log.debug("[SearchCache] After restore: searchQuery='\(searchQuery)', results=\(results?.results.count ?? 0)", category: .ui)
             savedScrollPosition = CGFloat(cachedScrollPosition)
             searchGeneration += 1
+            nextPageCursor = cachedResults.nextCursor
+            didReachPaginationEnd = cachedResults.nextCursor == nil
 
             // Restore filters
             selectedAppFilters = cachedAppFilters
@@ -1211,7 +1245,10 @@ public class SearchViewModel: ObservableObject {
         results = nil
         searchQuery = ""
         committedSearchQuery = ""
+        resetSearchOrderToDefault()
         error = nil
+        didReachPaginationEnd = false
+        nextPageCursor = nil
 
         // Clear all caches
         thumbnailCache.removeAll()

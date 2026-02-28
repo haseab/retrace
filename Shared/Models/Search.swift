@@ -14,12 +14,35 @@ public enum SearchSortOrder: String, Codable, Sendable, CaseIterable {
     case oldestFirst   // ORDER BY createdAt ASC
 }
 
+/// Source-specific keyset cursor for paginating search results.
+public struct SearchSourceCursor: Codable, Sendable, Equatable {
+    public let timestamp: Date
+    public let frameID: Int64
+
+    public init(timestamp: Date, frameID: Int64) {
+        self.timestamp = timestamp
+        self.frameID = frameID
+    }
+}
+
+/// Cursor state for combined multi-source search pagination.
+public struct SearchPageCursor: Codable, Sendable, Equatable {
+    public let native: SearchSourceCursor?
+    public let rewind: SearchSourceCursor?
+
+    public init(native: SearchSourceCursor? = nil, rewind: SearchSourceCursor? = nil) {
+        self.native = native
+        self.rewind = rewind
+    }
+}
+
 /// A search query with optional filters
 public struct SearchQuery: Codable, Sendable {
     public let text: String
     public let filters: SearchFilters
     public let limit: Int
     public let offset: Int
+    public let cursor: SearchPageCursor?
     public let mode: SearchMode
     public let sortOrder: SearchSortOrder
 
@@ -28,13 +51,15 @@ public struct SearchQuery: Codable, Sendable {
         filters: SearchFilters = .none,
         limit: Int = 50,
         offset: Int = 0,
-        mode: SearchMode = .relevant,
+        cursor: SearchPageCursor? = nil,
+        mode: SearchMode = .all,
         sortOrder: SearchSortOrder = .newestFirst
     ) {
         self.text = text
         self.filters = filters
         self.limit = limit
         self.offset = offset
+        self.cursor = cursor
         self.mode = mode
         self.sortOrder = sortOrder
     }
@@ -136,6 +161,31 @@ public struct SearchFilters: Codable, Sendable {
 /// A single search result
 /// Rewind-compatible: links to both app segment (session context) and video (playback)
 public struct SearchResult: Codable, Sendable, Identifiable {
+    public struct HighlightNode: Codable, Sendable {
+        public let nodeID: Int64
+        public let nodeOrder: Int
+        public let x: Double
+        public let y: Double
+        public let width: Double
+        public let height: Double
+
+        public init(
+            nodeID: Int64,
+            nodeOrder: Int,
+            x: Double,
+            y: Double,
+            width: Double,
+            height: Double
+        ) {
+            self.nodeID = nodeID
+            self.nodeOrder = nodeOrder
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+        }
+    }
+
     public let id: FrameID
     public let timestamp: Date
     public let snippet: String       // Text snippet with match highlighted
@@ -145,7 +195,10 @@ public struct SearchResult: Codable, Sendable, Identifiable {
     public let segmentID: AppSegmentID    // App segment (session) for context
     public let videoID: VideoSegmentID    // Video chunk for playback
     public let frameIndex: Int            // Position within video (0-149)
+    public let videoPath: String?         // Relative/absolute path to backing video file
+    public let videoFrameRate: Double?    // Video frame rate for precise seek
     public var source: FrameSource        // Which data source this result came from
+    public let highlightNode: HighlightNode?
 
     public init(
         id: FrameID,
@@ -157,7 +210,10 @@ public struct SearchResult: Codable, Sendable, Identifiable {
         segmentID: AppSegmentID,
         videoID: VideoSegmentID = VideoSegmentID(value: 0),
         frameIndex: Int,
-        source: FrameSource = .native
+        videoPath: String? = nil,
+        videoFrameRate: Double? = nil,
+        source: FrameSource = .native,
+        highlightNode: HighlightNode? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -168,7 +224,10 @@ public struct SearchResult: Codable, Sendable, Identifiable {
         self.segmentID = segmentID
         self.videoID = videoID
         self.frameIndex = frameIndex
+        self.videoPath = videoPath
+        self.videoFrameRate = videoFrameRate
         self.source = source
+        self.highlightNode = highlightNode
     }
 }
 
@@ -178,17 +237,20 @@ public struct SearchResults: Codable, Sendable {
     public var results: [SearchResult]  // var to allow source tagging
     public let totalCount: Int       // Total matches (may be > results.count due to limit)
     public let searchTimeMs: Int     // How long the search took
+    public let nextCursor: SearchPageCursor?
 
     public init(
         query: SearchQuery,
         results: [SearchResult],
         totalCount: Int,
-        searchTimeMs: Int
+        searchTimeMs: Int,
+        nextCursor: SearchPageCursor? = nil
     ) {
         self.query = query
         self.results = results
         self.totalCount = totalCount
         self.searchTimeMs = searchTimeMs
+        self.nextCursor = nextCursor
     }
 
     public var isEmpty: Bool { results.isEmpty }

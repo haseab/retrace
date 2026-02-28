@@ -1028,7 +1028,7 @@ private struct SearchOrderPopover: View {
     @FocusState private var isFocused: Bool
     @State private var highlightedIndex: Int = 0
 
-    private let options: [SearchOrderOption] = SearchOrderOption.allCases
+    private let options: [SearchOrderOption] = [.newest, .oldest, .relevance]
 
     private func selectHighlightedItem() {
         guard highlightedIndex >= 0, highlightedIndex < options.count else { return }

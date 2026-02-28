@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import Shared
 import Database
 import Storage
@@ -19,6 +20,15 @@ public actor DataAdapter {
         "the", "to",
         "with"
     ]
+
+    private static let searchDedupeLookbackWindow = 3
+    private static let searchDedupeSameTextMaxXDelta: Double = 0.10
+    private static let searchDedupeDifferentTextMaxXDelta: Double = 0.01
+    private static let searchDedupeScrollShiftMinWidthRatio: Double = 0.99
+    private static let searchDedupeScrollShiftMinHeightRatio: Double = 0.8
+    private static let searchDedupeSameTextMinWidthRatio: Double = 0.92
+    private static let searchDedupeSameTextMinHeightRatio: Double = 0.8
+    private static let searchAllRawBatchSize = 150
 
     // MARK: - Connections
 
@@ -661,6 +671,38 @@ public actor DataAdapter {
         return try await retraceImageExtractor.extractFrame(videoPath: fullPath, frameIndex: frameIndex, frameRate: frameRate)
     }
 
+    /// Get frame image as CGImage without JPEG encode/decode round-trips.
+    /// Expects a video path returned by search results (relative or absolute).
+    public func getFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?, source frameSource: FrameSource) async throws -> CGImage {
+        guard isInitialized else {
+            throw DataAdapterError.notInitialized
+        }
+
+        let config = frameSource == .rewind && rewindConfig != nil
+            ? rewindConfig!
+            : retraceConfig
+        let resolvedPath: String = {
+            if videoPath.hasPrefix("/") {
+                return videoPath
+            }
+            return "\(config.storageRoot)/\(videoPath)"
+        }()
+
+        if frameSource == .rewind, let extractor = rewindImageExtractor {
+            return try await extractor.extractFrameCGImage(
+                videoPath: resolvedPath,
+                frameIndex: frameIndex,
+                frameRate: frameRate
+            )
+        }
+
+        return try await retraceImageExtractor.extractFrameCGImage(
+            videoPath: resolvedPath,
+            frameIndex: frameIndex,
+            frameRate: frameRate
+        )
+    }
+
     /// Get video info for a frame
     public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
@@ -806,105 +848,196 @@ public actor DataAdapter {
         let startTime = Date()
         let hiddenTagId = cachedHiddenTagId
         let retraceOnlySearchFilters = requiresRetraceOnly(query.filters)
+        let retraceCursor = query.cursor?.native
+        let rewindCursor = query.cursor?.rewind
+        let hasRewindSource = !retraceOnlySearchFilters && rewindConnection != nil && rewindConfig != nil
+        let isOldestFirstAll = query.mode == .all && query.sortOrder == .oldestFirst
 
-        let retraceStart = Date()
-        let retraceTask = Task.detached(priority: .userInitiated) { [query, retraceConnection, retraceConfig, hiddenTagId] in
-            try Self.searchConnection(
-                query: query,
-                connection: retraceConnection,
-                config: retraceConfig,
-                source: .native,
-                hiddenTagId: hiddenTagId
-            )
+        // Cursor-aware source skipping:
+        // - newest flow may skip Retrace after it has been exhausted (native cursor cleared)
+        // - oldest flow may skip Rewind after it has been exhausted (rewind cursor cleared)
+        let shouldSkipRetrace =
+            !isOldestFirstAll &&
+            query.cursor != nil &&
+            retraceCursor == nil &&
+            hasRewindSource
+        let shouldSkipRewind =
+            isOldestFirstAll &&
+            query.cursor != nil &&
+            rewindCursor == nil &&
+            hasRewindSource
+
+        let emptyResults = SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+
+        var retraceTask: Task<SearchResults, Error>?
+        var retraceStart: Date?
+        if shouldSkipRetrace {
+            Log.debug("[DataAdapter] Retrace exhausted for this pagination flow; skipping Retrace query", category: .app)
+        } else {
+            retraceStart = Date()
+            retraceTask = Task.detached(priority: .userInitiated) { [query, retraceConnection, retraceConfig, hiddenTagId, retraceCursor] in
+                try Self.searchConnection(
+                    query: query,
+                    connection: retraceConnection,
+                    config: retraceConfig,
+                    source: .native,
+                    sourceCursor: retraceCursor,
+                    hiddenTagId: hiddenTagId
+                )
+            }
         }
 
         var rewindTask: Task<SearchResults, Error>?
         var rewindStart: Date?
-        if !retraceOnlySearchFilters, let rewind = rewindConnection, let config = rewindConfig {
-            rewindStart = Date()
-            rewindTask = Task.detached(priority: .userInitiated) { [query, rewind, config, hiddenTagId] in
-                try Self.searchConnection(
-                    query: query,
-                    connection: rewind,
-                    config: config,
-                    source: .rewind,
-                    hiddenTagId: hiddenTagId
-                )
+        if hasRewindSource {
+            if shouldSkipRewind {
+                Log.debug("[DataAdapter] Rewind exhausted for oldest-first pagination flow; skipping Rewind query", category: .app)
+            } else if let rewind = rewindConnection, let config = rewindConfig {
+                rewindStart = Date()
+                rewindTask = Task.detached(priority: .userInitiated) { [query, rewind, config, hiddenTagId, rewindCursor] in
+                    try Self.searchConnection(
+                        query: query,
+                        connection: rewind,
+                        config: config,
+                        source: .rewind,
+                        sourceCursor: rewindCursor,
+                        hiddenTagId: hiddenTagId
+                    )
+                }
             }
         } else if retraceOnlySearchFilters {
-            Log.debug("[DataAdapter] Skipping Rewind search due to Retrace-only filters", category: .app)
+            Log.debug("[DataAdapter] Rewind disabled by Retrace-only filters", category: .app)
         }
 
-        let retraceResults: SearchResults
-        do {
-            retraceResults = try await retraceTask.value
-            let retraceElapsed = Int(Date().timeIntervalSince(retraceStart) * 1000)
-            Log.info("[DataAdapter] Retrace search completed in \(retraceElapsed)ms, found \(retraceResults.results.count) results", category: .app)
-        } catch {
-            Log.warning("[DataAdapter] Retrace search failed: \(error)", category: .app)
-            retraceResults = SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
+        func resolveSourceResult(
+            _ task: Task<SearchResults, Error>?,
+            sourceLabel: String,
+            startedAt: Date?
+        ) async -> SearchResults {
+            guard let task else { return emptyResults }
+
+            do {
+                let results = try await task.value
+                if let startedAt {
+                    let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+                    Log.info("[DataAdapter] \(sourceLabel) search completed in \(elapsed)ms, found \(results.results.count) results", category: .app)
+                }
+                return results
+            } catch is CancellationError {
+                Log.debug("[DataAdapter] \(sourceLabel) search task cancelled", category: .app)
+                return emptyResults
+            } catch {
+                Log.warning("[DataAdapter] \(sourceLabel) search failed: \(error)", category: .app)
+                return emptyResults
+            }
         }
 
-        let shouldShortCircuitNewestFirstPage =
-            query.mode == .all &&
-            query.sortOrder == .newestFirst &&
-            query.offset == 0 &&
-            retraceResults.results.count >= query.limit
+        let searchTimeMs: () -> Int = {
+            Int(Date().timeIntervalSince(startTime) * 1000)
+        }
 
-        if shouldShortCircuitNewestFirstPage {
-            rewindTask?.cancel()
-            Log.debug("[DataAdapter] Returning newest-first first page from Retrace without waiting for Rewind", category: .app)
+        if isOldestFirstAll {
+            // Oldest-first policy:
+            // 1) query both sources concurrently
+            // 2) prefer Rewind whenever it has rows
+            // 3) fallback to Retrace only when Rewind page is empty
+            let rewindResults = await resolveSourceResult(
+                rewindTask,
+                sourceLabel: "Rewind",
+                startedAt: rewindStart
+            )
 
-            let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            if !rewindResults.results.isEmpty {
+                retraceTask?.cancel()
+
+                let pageResults = rewindResults.results
+                let nextCursor: SearchPageCursor? = {
+                    if let nextRewind = rewindResults.nextCursor?.rewind {
+                        return SearchPageCursor(native: retraceCursor, rewind: nextRewind)
+                    }
+                    // Rewind exhausted: keep cursor object so next page probes Retrace.
+                    return SearchPageCursor(native: retraceCursor, rewind: nil)
+                }()
+
+                return SearchResults(
+                    query: query,
+                    results: pageResults,
+                    totalCount: rewindResults.totalCount,
+                    searchTimeMs: searchTimeMs(),
+                    nextCursor: nextCursor
+                )
+            }
+
+            let retraceResults = await resolveSourceResult(
+                retraceTask,
+                sourceLabel: "Retrace",
+                startedAt: retraceStart
+            )
+
+            let pageResults = retraceResults.results
+            let nextCursor = retraceResults.nextCursor?.native.map {
+                SearchPageCursor(native: $0, rewind: nil)
+            }
+
             return SearchResults(
                 query: query,
-                results: Array(retraceResults.results.prefix(query.limit)),
+                results: pageResults,
                 totalCount: retraceResults.totalCount,
-                searchTimeMs: searchTimeMs
+                searchTimeMs: searchTimeMs(),
+                nextCursor: nextCursor
             )
         }
 
-        var rewindResults: SearchResults?
-        if let rewindTask {
-            do {
-                rewindResults = try await rewindTask.value
-                if let rewindStart {
-                    let rewindElapsed = Int(Date().timeIntervalSince(rewindStart) * 1000)
-                    Log.info("[DataAdapter] Rewind search completed in \(rewindElapsed)ms, found \(rewindResults?.results.count ?? 0) results", category: .app)
+        // Newest-first policy:
+        // 1) query both sources concurrently
+        // 2) always use Retrace page when non-empty
+        // 3) fallback to Rewind only when Retrace page is empty
+        let retraceResults = await resolveSourceResult(
+            retraceTask,
+            sourceLabel: "Retrace",
+            startedAt: retraceStart
+        )
+
+        if !retraceResults.results.isEmpty {
+            rewindTask?.cancel()
+
+            let pageResults = retraceResults.results
+            let nextCursor: SearchPageCursor? = {
+                if let nextNative = retraceResults.nextCursor?.native {
+                    return SearchPageCursor(native: nextNative, rewind: rewindCursor)
                 }
-            } catch is CancellationError {
-                Log.debug("[DataAdapter] Rewind search task cancelled", category: .app)
-            } catch {
-                Log.warning("[DataAdapter] Rewind search failed: \(error)", category: .app)
-            }
+                if hasRewindSource {
+                    // Retrace exhausted: switch to Rewind probe on next page.
+                    return SearchPageCursor(native: nil, rewind: rewindCursor)
+                }
+                return nil
+            }()
+
+            return SearchResults(
+                query: query,
+                results: pageResults,
+                totalCount: retraceResults.totalCount,
+                searchTimeMs: searchTimeMs(),
+                nextCursor: nextCursor
+            )
         }
 
-        var allResults: [SearchResult] = retraceResults.results
-        var totalCount = retraceResults.totalCount
-        if let rewindResults {
-            allResults.append(contentsOf: rewindResults.results)
-            totalCount += rewindResults.totalCount
+        let rewindResults = await resolveSourceResult(
+            rewindTask,
+            sourceLabel: "Rewind",
+            startedAt: rewindStart
+        )
+        let pageResults = rewindResults.results
+        let nextCursor = rewindResults.nextCursor?.rewind.map {
+            SearchPageCursor(native: nil, rewind: $0)
         }
-
-        // Sort by search mode
-        switch query.mode {
-        case .relevant:
-            allResults.sort { $0.relevanceScore > $1.relevanceScore }
-        case .all:
-            if query.sortOrder == .oldestFirst {
-                allResults.sort { $0.timestamp < $1.timestamp }
-            } else {
-                allResults.sort { $0.timestamp > $1.timestamp }
-            }
-        }
-
-        let searchTimeMs = Int(Date().timeIntervalSince(startTime) * 1000)
 
         return SearchResults(
             query: query,
-            results: Array(allResults.prefix(query.limit)),
-            totalCount: totalCount,
-            searchTimeMs: searchTimeMs
+            results: pageResults,
+            totalCount: rewindResults.totalCount,
+            searchTimeMs: searchTimeMs(),
+            nextCursor: nextCursor
         )
     }
 
@@ -2695,13 +2828,28 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig,
         source: FrameSource,
+        sourceCursor: SearchSourceCursor?,
         hiddenTagId: Int64?
     ) throws -> SearchResults {
         switch query.mode {
         case .relevant:
-            return try searchRelevant(query: query, connection: connection, config: config, source: source, hiddenTagId: hiddenTagId)
+            return try searchRelevant(
+                query: query,
+                connection: connection,
+                config: config,
+                source: source,
+                sourceCursor: sourceCursor,
+                hiddenTagId: hiddenTagId
+            )
         case .all:
-            return try searchAll(query: query, connection: connection, config: config, source: source, hiddenTagId: hiddenTagId)
+            return try searchAll(
+                query: query,
+                connection: connection,
+                config: config,
+                source: source,
+                sourceCursor: sourceCursor,
+                hiddenTagId: hiddenTagId
+            )
         }
     }
 
@@ -2710,17 +2858,24 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig,
         source: FrameSource,
+        sourceCursor: SearchSourceCursor?,
         hiddenTagId: Int64?
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        let relevanceLimit = 50
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let normalizedOffset = max(0, query.offset)
+        let rankCursor = decodeRelevantCursor(sourceCursor)
+        let rawBatchLimit = max(query.limit, Self.searchAllRawBatchSize)
+        let batchOffset: Int? = rankCursor == nil ? normalizedOffset : nil
 
-        Log.info("[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? []), windowNameFilter=\(query.filters.windowNameFilter ?? "nil"), browserUrlFilter=\(query.filters.browserUrlFilter ?? "nil")", category: .app)
+        Log.info(
+            "[DataAdapter.searchRelevant] Starting: ftsQuery='\(ftsQuery)', source=\(source), appFilter=\(query.filters.appBundleIDs ?? []), windowNameFilter=\(query.filters.windowNameFilter ?? "nil"), browserUrlFilter=\(query.filters.browserUrlFilter ?? "nil"), hasCursor=\(rankCursor != nil)",
+            category: .app
+        )
 
-        // Build WHERE conditions for the outer query (filters applied after FTS subquery)
+        // Build WHERE conditions for the batch query (filters applied after FTS subquery).
         var outerWhereConditions: [String] = []
         var outerBindValues: [Any] = []
 
@@ -2770,7 +2925,6 @@ public actor DataAdapter {
         // Note: Skip tag filters for Rewind database (it doesn't have segment_tag table)
         // When no tags selected, tagJoin is empty and no join happens
         let isRewind = source == .rewind
-        let hasTagIncludeFilter = !isRewind && query.filters.selectedTagIds != nil && !query.filters.selectedTagIds!.isEmpty
         var tagJoinBindValues: [Int64] = []
         let tagJoin: String
         if !isRewind, let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
@@ -2835,44 +2989,152 @@ public actor DataAdapter {
             outerWhereConditions.append(commentClause)
         }
 
-        let outerWhereClause = outerWhereConditions.isEmpty ? "" : "WHERE " + outerWhereConditions.joined(separator: " AND ")
+        var cursorConditions: [String] = []
+        if rankCursor != nil {
+            cursorConditions.append("(r.rank > ? OR (r.rank = ? AND f.id > ?))")
+        }
 
-        // Subquery approach: FTS with bm25 FIRST (limited), then join and filter
-        // No snippet() - it's expensive and not needed (we get text from OCR nodes)
-        // Tag include uses INNER JOIN (more efficient than EXISTS in WHERE clause)
+        let dedupeTokens = parseSearchDedupeTokens(query.text)
+        let highlightTerms = dedupeTokens.map(\.matchingTerm).filter { !$0.isEmpty }
+        let highlightMatchClause: String = {
+            guard !highlightTerms.isEmpty else { return "0" }
+            return highlightTerms.map { _ in
+                "INSTR(LOWER(SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)), ?) > 0"
+            }.joined(separator: " OR ")
+        }()
+
+        struct RelevantSearchRow {
+            let frameId: Int64
+            let timestamp: Date
+            let segmentId: Int64
+            let videoId: Int64
+            let frameIndex: Int
+            let videoPath: String?
+            let videoFrameRate: Double?
+            let redactionReason: String?
+            let appBundleID: String?
+            let windowName: String?
+            let browserUrl: String?
+            let rank: Double
+            let docID: Int64
+            let highlightNode: SearchResult.HighlightNode?
+            let highlightTextSignature: String?
+        }
+
+        let allWhereConditions = outerWhereConditions + cursorConditions
+        let batchWhereClause = allWhereConditions.isEmpty ? "" : "WHERE " + allWhereConditions.joined(separator: " AND ")
+        let rankedBaseLimit = (outerWhereConditions.isEmpty && tagJoinBindValues.isEmpty && cursorConditions.isEmpty) ? rawBatchLimit : rawBatchLimit * 10
+        let rankedLimit = rankedBaseLimit + (batchOffset ?? 0)
+        let includeOffset = batchOffset != nil
+
         let sql = """
-            SELECT
-                fts.docid,
-                f.id as frame_id,
-                f.createdAt as timestamp,
-                s.id as segment_id,
-                s.bundleID as app_bundle_id,
-                s.windowName as window_title,
-                s.browserUrl as browser_url,
-                \(redactionReasonColumn),
-                f.videoId as video_id,
-                f.videoFrameIndex as frame_index,
-                fts.rank
-            FROM (
+            WITH ranked AS MATERIALIZED (
                 SELECT
-                    rowid as docid,
-                    bm25(searchRanking) as rank
+                    rowid AS docid,
+                    bm25(searchRanking) AS rank
                 FROM searchRanking
                 WHERE searchRanking MATCH ?
-                ORDER BY bm25(searchRanking)
+                ORDER BY bm25(searchRanking) ASC, rowid ASC
+                LIMIT ? \(includeOffset ? "OFFSET ?" : "")
+            ),
+            batch AS MATERIALIZED (
+                SELECT
+                    f.id AS frame_id,
+                    f.createdAt AS timestamp,
+                    f.segmentId AS segment_id,
+                    f.videoId AS video_id,
+                    f.videoFrameIndex AS frame_index,
+                    v.path AS video_path,
+                    v.frameRate AS video_frame_rate,
+                    \(redactionReasonColumn),
+                    s.bundleID AS bundle_id,
+                    s.windowName AS window_name,
+                    s.browserUrl AS browser_url,
+                    r.rank AS rank,
+                    r.docid AS docid
+                FROM ranked r
+                JOIN doc_segment ds ON r.docid = ds.docid
+                JOIN frame f ON ds.frameId = f.id
+                JOIN segment s ON f.segmentId = s.id
+                LEFT JOIN video v ON v.id = f.videoId
+                \(tagJoin)
+                \(batchWhereClause)
+                ORDER BY r.rank ASC, f.id ASC
                 LIMIT ?
-            ) fts
-            JOIN doc_segment ds ON fts.docid = ds.docid
-            JOIN frame f ON ds.frameId = f.id
-            JOIN segment s ON f.segmentId = s.id
-            \(tagJoin)
-            \(outerWhereClause)
-            ORDER BY fts.rank
-            LIMIT ? OFFSET ?
-        """
+            ),
+            node_candidates AS MATERIALIZED (
+                SELECT
+                    b.frame_id,
+                    b.docid,
+                    n.id AS node_id,
+                    n.nodeOrder AS node_order,
+                    n.leftX AS left_x,
+                    n.topY AS top_y,
+                    n.width AS node_width,
+                    n.height AS node_height,
+                    LOWER(
+                        TRIM(
+                            REPLACE(
+                                REPLACE(
+                                    SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength),
+                                    char(10),
+                                    ' '
+                                ),
+                                char(13),
+                                ' '
+                            )
+                        )
+                    ) AS node_text_signature,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY b.frame_id, b.docid
+                        ORDER BY n.nodeOrder ASC
+                    ) AS rn
+                FROM batch b
+                JOIN node n ON n.frameId = b.frame_id
+                JOIN searchRanking_content sc ON sc.id = b.docid
+                WHERE \(highlightMatchClause)
+            ),
+            first_node AS MATERIALIZED (
+                SELECT
+                    frame_id,
+                    docid,
+                    node_id,
+                    node_order,
+                    left_x,
+                    top_y,
+                    node_width,
+                    node_height,
+                    node_text_signature
+                FROM node_candidates
+                WHERE rn = 1
+            )
+            SELECT
+                b.frame_id,
+                b.timestamp,
+                b.segment_id,
+                b.video_id,
+                b.frame_index,
+                b.video_path,
+                b.video_frame_rate,
+                b.redaction_reason,
+                b.bundle_id,
+                b.window_name,
+                b.browser_url,
+                b.rank,
+                b.docid,
+                fn.node_id,
+                fn.node_order,
+                fn.left_x,
+                fn.top_y,
+                fn.node_width,
+                fn.node_height,
+                fn.node_text_signature
+            FROM batch b
+            LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+            ORDER BY b.rank ASC, b.frame_id ASC
+            """
 
         Log.info("[DataAdapter.searchRelevant] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
-        Log.info("[DataAdapter.searchRelevant] Binds: ftsQuery='\(ftsQuery)', tagJoinValues=\(tagJoinBindValues), outerFilters=\(outerBindValues), limit=\(relevanceLimit), offset=\(query.offset)", category: .app)
 
         guard let statement = try? connection.prepare(sql: sql) else {
             return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
@@ -2880,23 +3142,21 @@ public actor DataAdapter {
         defer { connection.finalize(statement) }
 
         var bindIndex: Int32 = 1
-
-        // Bind FTS query
         sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
         bindIndex += 1
-
-        // Bind inner LIMIT (for FTS subquery) - fetch more to account for filtering
-        let innerLimit = (outerWhereConditions.isEmpty && tagJoinBindValues.isEmpty) ? relevanceLimit : relevanceLimit * 10
-        sqlite3_bind_int(statement, bindIndex, Int32(innerLimit))
+        sqlite3_bind_int64(statement, bindIndex, Int64(rankedLimit))
         bindIndex += 1
 
-        // Bind tag INNER JOIN values (these come before WHERE clause values)
+        if let batchOffset {
+            sqlite3_bind_int64(statement, bindIndex, Int64(batchOffset))
+            bindIndex += 1
+        }
+
         for tagId in tagJoinBindValues {
             sqlite3_bind_int64(statement, bindIndex, tagId)
             bindIndex += 1
         }
 
-        // Bind outer WHERE values
         for value in outerBindValues {
             if let stringValue = value as? String {
                 sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
@@ -2906,54 +3166,199 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
-        // Bind outer LIMIT and OFFSET
-        sqlite3_bind_int(statement, bindIndex, Int32(relevanceLimit))
+        if let rankCursor {
+            sqlite3_bind_double(statement, bindIndex, rankCursor.rank)
+            bindIndex += 1
+            sqlite3_bind_double(statement, bindIndex, rankCursor.rank)
+            bindIndex += 1
+            sqlite3_bind_int64(statement, bindIndex, rankCursor.frameId)
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int64(statement, bindIndex, Int64(rawBatchLimit))
         bindIndex += 1
-        sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
 
-        var results: [SearchResult] = []
+        for term in highlightTerms {
+            sqlite3_bind_text(statement, bindIndex, term, -1, SQLITE_TRANSIENT)
+            bindIndex += 1
+        }
 
+        var batch: [RelevantSearchRow] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let frameId = sqlite3_column_int64(statement, 1)
-            let segmentId = sqlite3_column_int64(statement, 3)
-            let appBundleID = sqlite3_column_text(statement, 4).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(statement, 5).map { String(cString: $0) }
-            let browserUrl = sqlite3_column_text(statement, 6).map { String(cString: $0) }
+            let frameId = sqlite3_column_int64(statement, 0)
+            let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
+            let segmentId = sqlite3_column_int64(statement, 2)
+            let videoId = sqlite3_column_int64(statement, 3)
+            let frameIndex = Int(sqlite3_column_int(statement, 4))
+            let videoPath = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+            let videoFrameRate: Double? = {
+                guard sqlite3_column_type(statement, 6) != SQLITE_NULL else { return nil }
+                return sqlite3_column_double(statement, 6)
+            }()
             let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
-            let videoId = sqlite3_column_int64(statement, 8)
-            let frameIndex = Int(sqlite3_column_int(statement, 9))
-            let rank = sqlite3_column_double(statement, 10)
+            let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+            let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+            let rank = sqlite3_column_double(statement, 11)
+            let docID = sqlite3_column_int64(statement, 12)
 
-            let appName = appBundleID?.components(separatedBy: ".").last
-            let timestamp = config.parseDate(from: statement, column: 2) ?? Date()
+            let highlightNode: SearchResult.HighlightNode?
+            if sqlite3_column_type(statement, 13) != SQLITE_NULL {
+                highlightNode = SearchResult.HighlightNode(
+                    nodeID: sqlite3_column_int64(statement, 13),
+                    nodeOrder: Int(sqlite3_column_int(statement, 14)),
+                    x: sqlite3_column_double(statement, 15),
+                    y: sqlite3_column_double(statement, 16),
+                    width: sqlite3_column_double(statement, 17),
+                    height: sqlite3_column_double(statement, 18)
+                )
+            } else {
+                highlightNode = nil
+            }
+            let highlightTextSignature = sqlite3_column_text(statement, 19).map { String(cString: $0) }
 
-            let result = SearchResult(
-                id: FrameID(value: frameId),
-                timestamp: timestamp,
-                snippet: "", // Snippet not needed - OCR nodes provide text
-                matchedText: query.text,
-                relevanceScore: abs(rank) / (1.0 + abs(rank)),
-                metadata: FrameMetadata(
-                    appBundleID: appBundleID,
-                    appName: appName,
-                    windowName: windowName,
-                    browserURL: browserUrl,
+            batch.append(
+                RelevantSearchRow(
+                    frameId: frameId,
+                    timestamp: timestamp,
+                    segmentId: segmentId,
+                    videoId: videoId,
+                    frameIndex: frameIndex,
+                    videoPath: videoPath,
+                    videoFrameRate: videoFrameRate,
                     redactionReason: redactionReason,
+                    appBundleID: appBundleID,
+                    windowName: windowName,
+                    browserUrl: browserUrl,
+                    rank: rank,
+                    docID: docID,
+                    highlightNode: highlightNode,
+                    highlightTextSignature: highlightTextSignature
+                )
+            )
+        }
+
+        let sourceRowsFetched = batch.count
+        var dedupedRows: [RelevantSearchRow] = []
+        var recentAnchors: [SearchDedupeMatchBox] = []
+        var recentWindowNameSignatures: [String] = []
+        var droppedByPosition = 0
+        var droppedByWindowName = 0
+
+        for row in batch {
+            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
+            if let highlightNode = row.highlightNode {
+                let currentAnchor = SearchDedupeMatchBox(
+                    label: "highlight",
+                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
+                    nodeOrder: highlightNode.nodeOrder,
+                    xBin: quantizedNodeBin(highlightNode.x),
+                    yBin: quantizedNodeBin(highlightNode.y),
+                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
+                    hBin: max(1, quantizedNodeBin(highlightNode.height))
+                )
+                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
+                    droppedByPosition += 1
+                    continue
+                }
+                recentAnchors.append(currentAnchor)
+                if recentAnchors.count > Self.searchDedupeLookbackWindow {
+                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
+                }
+            } else {
+                recentAnchors.removeAll(keepingCapacity: true)
+            }
+
+            if let currentWindowNameSignature,
+               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
+                droppedByWindowName += 1
+                continue
+            }
+
+            dedupedRows.append(row)
+            if let currentWindowNameSignature {
+                recentWindowNameSignatures.append(currentWindowNameSignature)
+                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
+                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
+                }
+            } else {
+                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            }
+        }
+
+        Log.info(
+            "[DataAdapter.searchRelevant] Deduped single batch: tokens=\(dedupeTokens.count), lookback=\(Self.searchDedupeLookbackWindow), rawBatchLimit=\(rawBatchLimit), fetchedRows=\(sourceRowsFetched), keptRows=\(dedupedRows.count), droppedByPosition=\(droppedByPosition), droppedByWindowName=\(droppedByWindowName), offset=\(normalizedOffset), hasCursor=\(rankCursor != nil)",
+            category: .app
+        )
+
+        let nextSourceCursor: SearchSourceCursor?
+        if sourceRowsFetched == rawBatchLimit, let lastFetched = batch.last {
+            nextSourceCursor = SearchSourceCursor(
+                timestamp: encodeRelevantCursorRank(lastFetched.rank),
+                frameID: lastFetched.frameId
+            )
+        } else {
+            nextSourceCursor = nil
+        }
+        let nextCursor: SearchPageCursor? = {
+            guard let nextSourceCursor else { return nil }
+            if source == .rewind {
+                return SearchPageCursor(rewind: nextSourceCursor)
+            }
+            return SearchPageCursor(native: nextSourceCursor)
+        }()
+
+        let effectiveTotalCount: Int
+        if sourceRowsFetched < rawBatchLimit {
+            effectiveTotalCount = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
+        } else {
+            let rawTotalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
+            let lowerBound = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
+            effectiveTotalCount = max(rawTotalCount, lowerBound)
+        }
+
+        guard !dedupedRows.isEmpty else {
+            let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
+            Log.info("[DataAdapter.searchRelevant] Completed in \(elapsed)ms, found 0 results", category: .app)
+            return SearchResults(query: query, results: [], totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
+        }
+
+        let results = dedupedRows.map { row in
+            let appName = row.appBundleID?.components(separatedBy: ".").last
+            return SearchResult(
+                id: FrameID(value: row.frameId),
+                timestamp: row.timestamp,
+                snippet: "",
+                matchedText: query.text,
+                relevanceScore: abs(row.rank) / (1.0 + abs(row.rank)),
+                metadata: FrameMetadata(
+                    appBundleID: row.appBundleID,
+                    appName: appName,
+                    windowName: row.windowName,
+                    browserURL: row.browserUrl,
+                    redactionReason: row.redactionReason,
                     displayID: 0
                 ),
-                segmentID: AppSegmentID(value: segmentId),
-                videoID: VideoSegmentID(value: videoId),
-                frameIndex: frameIndex,
-                source: source
+                segmentID: AppSegmentID(value: row.segmentId),
+                videoID: VideoSegmentID(value: row.videoId),
+                frameIndex: row.frameIndex,
+                videoPath: row.videoPath,
+                videoFrameRate: row.videoFrameRate,
+                source: source,
+                highlightNode: row.highlightNode
             )
-
-            results.append(result)
         }
 
         let totalElapsed = Int(Date().timeIntervalSince(startTime) * 1000)
         Log.info("[DataAdapter.searchRelevant] Completed in \(totalElapsed)ms, found \(results.count) results", category: .app)
 
-        return SearchResults(query: query, results: results, totalCount: results.count, searchTimeMs: totalElapsed)
+        return SearchResults(
+            query: query,
+            results: results,
+            totalCount: effectiveTotalCount,
+            searchTimeMs: totalElapsed,
+            nextCursor: nextCursor
+        )
     }
 
     private static func searchAll(
@@ -2961,12 +3366,14 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig,
         source: FrameSource,
+        sourceCursor: SearchSourceCursor?,
         hiddenTagId: Int64?
     ) throws -> SearchResults {
         let startTime = Date()
         let ftsQuery = buildFTSQuery(query.text)
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let redactionReasonColumn = source == .rewind ? "NULL as redaction_reason" : "f.redactionReason as redaction_reason"
+        let normalizedOffset = max(0, query.offset)
 
         // Build WHERE conditions for outer query
         var whereConditions: [String] = []
@@ -3103,7 +3510,15 @@ public actor DataAdapter {
             (query.filters.windowNameFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ||
             (query.filters.browserUrlFilter?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
 
-        let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
+        let useRewindDocIDFastPath =
+            source == .rewind &&
+            !hasAppFilter &&
+            !hasTagFilters &&
+            !hasMetadataFilters &&
+            whereConditions.isEmpty &&
+            tagJoinBindValues.isEmpty &&
+            bindValues.isEmpty
+        let rewindDocIDOrderClause = query.sortOrder == .newestFirst ? "DESC" : "ASC"
 
         // CTE MATERIALIZED approach: Force SQLite to compute FTS results first
         // Without MATERIALIZED, SQLite may inline the CTE and optimize it poorly
@@ -3114,126 +3529,428 @@ public actor DataAdapter {
         // The no-filter fast path limits candidate docids before joining frames.
         // If this stays DESC unconditionally, oldest-first can never surface old matches.
         let ftsCandidateOrderClause = query.sortOrder == .newestFirst ? "DESC" : "ASC"
+        let dedupeTokens = parseSearchDedupeTokens(query.text)
+        let highlightTerms = dedupeTokens.map(\.matchingTerm).filter { !$0.isEmpty }
 
-        let sql: String
-        if hasAppFilter || hasTagFilters || hasMetadataFilters {
-            // With app/tag filter: CTE MATERIALIZED for FTS first, then join all tables and filter
-            sql = """
-                WITH fts_matches AS MATERIALIZED (
-                    SELECT rowid as docid FROM searchRanking WHERE searchRanking MATCH ?
+        struct FrameSearchRow {
+            let frameId: Int64
+            let timestamp: Date
+            let segmentId: Int64
+            let videoId: Int64
+            let frameIndex: Int
+            let videoPath: String?
+            let videoFrameRate: Double?
+            let redactionReason: String?
+            let appBundleID: String?
+            let windowName: String?
+            let browserUrl: String?
+            let docID: Int64
+            let highlightNode: SearchResult.HighlightNode?
+            let highlightTextSignature: String?
+        }
+
+        struct FrameCursor {
+            let timestamp: Date
+            let frameId: Int64
+        }
+
+        let highlightMatchClause: String = {
+            guard !highlightTerms.isEmpty else { return "0" }
+            return highlightTerms.map { _ in
+                "INSTR(LOWER(SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)), ?) > 0"
+            }.joined(separator: " OR ")
+        }()
+
+        func fetchFrameBatch(limit: Int, offset: Int?, cursor: FrameCursor?) -> [FrameSearchRow] {
+            let isOffsetQuery = offset != nil
+            let canUseRewindDocIDFastPath = useRewindDocIDFastPath && cursor == nil
+
+            var cursorConditions: [String] = []
+            var cursorBindValues: [Any] = []
+            if let cursor {
+                if query.sortOrder == .newestFirst {
+                    cursorConditions.append("(f.createdAt < ? OR (f.createdAt = ? AND f.id < ?))")
+                } else {
+                    cursorConditions.append("(f.createdAt > ? OR (f.createdAt = ? AND f.id > ?))")
+                }
+                let cursorDate = config.formatDate(cursor.timestamp)
+                cursorBindValues.append(cursorDate)
+                cursorBindValues.append(cursorDate)
+                cursorBindValues.append(cursor.frameId)
+            }
+
+            let batchSQL: String
+            var bindValuesForBatch: [Any] = [ftsQuery]
+
+            if canUseRewindDocIDFastPath {
+                batchSQL = """
+                    WITH fts_docs AS MATERIALIZED (
+                        SELECT rowid AS docid
+                        FROM searchRanking
+                        WHERE searchRanking MATCH ?
+                        ORDER BY rowid \(rewindDocIDOrderClause)
+                        LIMIT ? \(isOffsetQuery ? "OFFSET ?" : "")
+                    )
+                    SELECT
+                        f.id AS frame_id,
+                        f.createdAt AS timestamp,
+                        f.segmentId AS segment_id,
+                        f.videoId AS video_id,
+                        f.videoFrameIndex AS frame_index,
+                        v.path AS video_path,
+                        v.frameRate AS video_frame_rate,
+                        \(redactionReasonColumn),
+                        s.bundleID AS bundle_id,
+                        s.windowName AS window_name,
+                        s.browserUrl AS browser_url,
+                        d.docid AS docid
+                    FROM fts_docs d
+                    JOIN doc_segment ds ON ds.docid = d.docid
+                    JOIN frame f ON f.id = ds.frameId
+                    JOIN segment s ON s.id = f.segmentId
+                    LEFT JOIN video v ON v.id = f.videoId
+                    ORDER BY d.docid \(rewindDocIDOrderClause)
+                    """
+                bindValuesForBatch.append(Int64(limit))
+                if let offset {
+                    bindValuesForBatch.append(Int64(offset))
+                }
+            } else if hasAppFilter || hasTagFilters || hasMetadataFilters {
+                let allWhereConditions = whereConditions + cursorConditions
+                let batchWhereClause = allWhereConditions.isEmpty ? "" : "WHERE " + allWhereConditions.joined(separator: " AND ")
+                batchSQL = """
+                    WITH fts_matches AS MATERIALIZED (
+                        SELECT rowid AS docid FROM searchRanking WHERE searchRanking MATCH ?
+                    )
+                    SELECT
+                        f.id AS frame_id,
+                        f.createdAt AS timestamp,
+                        f.segmentId AS segment_id,
+                        f.videoId AS video_id,
+                        f.videoFrameIndex AS frame_index,
+                        v.path AS video_path,
+                        v.frameRate AS video_frame_rate,
+                        \(redactionReasonColumn),
+                        s.bundleID AS bundle_id,
+                        s.windowName AS window_name,
+                        s.browserUrl AS browser_url,
+                        ds.docid AS docid
+                    FROM fts_matches fts
+                    JOIN doc_segment ds ON fts.docid = ds.docid
+                    JOIN frame f ON ds.frameId = f.id
+                    JOIN segment s ON f.segmentId = s.id
+                    LEFT JOIN video v ON v.id = f.videoId
+                    \(tagJoin)
+                    \(batchWhereClause)
+                    ORDER BY f.createdAt \(sortOrderClause), f.id \(sortOrderClause)
+                    LIMIT ? \(isOffsetQuery ? "OFFSET ?" : "")
+                    """
+                bindValuesForBatch.append(contentsOf: tagJoinBindValues)
+                bindValuesForBatch.append(contentsOf: bindValues)
+                bindValuesForBatch.append(contentsOf: cursorBindValues)
+                bindValuesForBatch.append(Int64(limit))
+                if let offset {
+                    bindValuesForBatch.append(Int64(offset))
+                }
+            } else {
+                let docIDScopeCondition: String
+                if isOffsetQuery {
+                    let ftsLimit = limit + (offset ?? 0)
+                    docIDScopeCondition = "ds.docid IN (SELECT rowid FROM searchRanking WHERE searchRanking MATCH ? ORDER BY rowid \(ftsCandidateOrderClause) LIMIT \(ftsLimit))"
+                } else {
+                    // Cursor/keyset queries should not be bounded by an offset-oriented FTS cap.
+                    docIDScopeCondition = "ds.docid IN (SELECT rowid FROM searchRanking WHERE searchRanking MATCH ?)"
+                }
+                var allWhereConditions = [docIDScopeCondition]
+                allWhereConditions.append(contentsOf: whereConditions)
+                allWhereConditions.append(contentsOf: cursorConditions)
+                let batchWhereClause = "WHERE " + allWhereConditions.joined(separator: " AND ")
+                batchSQL = """
+                    SELECT
+                        f.id AS frame_id,
+                        f.createdAt AS timestamp,
+                        f.segmentId AS segment_id,
+                        f.videoId AS video_id,
+                        f.videoFrameIndex AS frame_index,
+                        v.path AS video_path,
+                        v.frameRate AS video_frame_rate,
+                        \(redactionReasonColumn),
+                        s.bundleID AS bundle_id,
+                        s.windowName AS window_name,
+                        s.browserUrl AS browser_url,
+                        ds.docid AS docid
+                    FROM doc_segment ds
+                    JOIN frame f ON ds.frameId = f.id
+                    JOIN segment s ON s.id = f.segmentId
+                    LEFT JOIN video v ON v.id = f.videoId
+                    \(batchWhereClause)
+                    ORDER BY f.createdAt \(sortOrderClause), f.id \(sortOrderClause)
+                    LIMIT ? \(isOffsetQuery ? "OFFSET ?" : "")
+                    """
+                bindValuesForBatch.append(contentsOf: bindValues)
+                bindValuesForBatch.append(contentsOf: cursorBindValues)
+                bindValuesForBatch.append(Int64(limit))
+                if let offset {
+                    bindValuesForBatch.append(Int64(offset))
+                }
+            }
+
+            let sql = """
+                WITH batch AS MATERIALIZED (
+                    \(batchSQL)
+                ),
+                node_candidates AS MATERIALIZED (
+                    SELECT
+                        b.frame_id,
+                        b.docid,
+                        n.id AS node_id,
+                        n.nodeOrder AS node_order,
+                        n.leftX AS left_x,
+                        n.topY AS top_y,
+                        n.width AS node_width,
+                        n.height AS node_height,
+                        LOWER(
+                            TRIM(
+                                REPLACE(
+                                    REPLACE(
+                                        SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength),
+                                        char(10),
+                                        ' '
+                                    ),
+                                    char(13),
+                                    ' '
+                                )
+                            )
+                        ) AS node_text_signature,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY b.frame_id, b.docid
+                            ORDER BY n.nodeOrder ASC
+                        ) AS rn
+                    FROM batch b
+                    JOIN node n ON n.frameId = b.frame_id
+                    JOIN searchRanking_content sc ON sc.id = b.docid
+                    WHERE \(highlightMatchClause)
+                ),
+                first_node AS MATERIALIZED (
+                    SELECT
+                        frame_id,
+                        docid,
+                        node_id,
+                        node_order,
+                        left_x,
+                        top_y,
+                        node_width,
+                        node_height,
+                        node_text_signature
+                    FROM node_candidates
+                    WHERE rn = 1
                 )
                 SELECT
-                    f.id as frame_id,
-                    f.createdAt as timestamp,
-                    f.segmentId as segment_id,
-                    f.videoId as video_id,
-                    f.videoFrameIndex as frame_index,
-                    \(redactionReasonColumn)
-                FROM fts_matches fts
-                JOIN doc_segment ds ON fts.docid = ds.docid
-                JOIN frame f ON ds.frameId = f.id
-                JOIN segment s ON f.segmentId = s.id
-                \(tagJoin)
-                \(whereClause)
-                ORDER BY f.createdAt \(sortOrderClause)
-                LIMIT ? OFFSET ?
-            """
-        } else {
-            // No app/tag filter: use IN subquery with limit (faster for no-filter case)
-            let ftsLimit = query.limit + query.offset + 200
-            let filterClause = whereConditions.isEmpty ? "" : "AND " + whereConditions.joined(separator: " AND ")
-            sql = """
-                SELECT
-                    f.id as frame_id,
-                    f.createdAt as timestamp,
-                    f.segmentId as segment_id,
-                    f.videoId as video_id,
-                    f.videoFrameIndex as frame_index,
-                    \(redactionReasonColumn)
-                FROM doc_segment ds
-                JOIN frame f ON ds.frameId = f.id
-                WHERE ds.docid IN (
-                    SELECT rowid FROM searchRanking WHERE searchRanking MATCH ? ORDER BY rowid \(ftsCandidateOrderClause) LIMIT \(ftsLimit)
-                ) \(filterClause)
-                ORDER BY f.createdAt \(sortOrderClause)
-                LIMIT ? OFFSET ?
-            """
-        }
+                    b.frame_id,
+                    b.timestamp,
+                    b.segment_id,
+                    b.video_id,
+                    b.frame_index,
+                    b.video_path,
+                    b.video_frame_rate,
+                    b.redaction_reason,
+                    b.bundle_id,
+                    b.window_name,
+                    b.browser_url,
+                    b.docid,
+                    fn.node_id,
+                    fn.node_order,
+                    fn.left_x,
+                    fn.top_y,
+                    fn.node_width,
+                    fn.node_height,
+                    fn.node_text_signature
+                FROM batch b
+                LEFT JOIN first_node fn ON fn.frame_id = b.frame_id AND fn.docid = b.docid
+                ORDER BY b.timestamp \(sortOrderClause), b.frame_id \(sortOrderClause)
+                """
 
-        Log.info("[DataAdapter.searchAll] SQL: \(sql.replacingOccurrences(of: "\n", with: " "))", category: .app)
-        Log.info("[DataAdapter.searchAll] Binds: ftsQuery='\(ftsQuery)', tagJoinValues=\(tagJoinBindValues), bindValues=\(bindValues), limit=\(query.limit), offset=\(query.offset)", category: .app)
-
-        guard let statement = try? connection.prepare(sql: sql) else {
-            Log.error("[DataAdapter.searchAll] Failed to prepare SQL statement", category: .app)
-            return SearchResults(query: query, results: [], totalCount: 0, searchTimeMs: 0)
-        }
-        defer { connection.finalize(statement) }
-
-        var bindIndex: Int32 = 1
-
-        // Bind FTS query
-        sqlite3_bind_text(statement, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
-        bindIndex += 1
-
-        // Bind tag INNER JOIN values (these come before WHERE clause values)
-        for tagId in tagJoinBindValues {
-            sqlite3_bind_int64(statement, bindIndex, tagId)
-            bindIndex += 1
-        }
-
-        // Bind WHERE clause values (cutoff, date filters, app filter, exclude tags, hidden)
-        for value in bindValues {
-            if let stringValue = value as? String {
-                sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
-            } else if let intValue = value as? Int64 {
-                sqlite3_bind_int64(statement, bindIndex, intValue)
+            guard let statement = try? connection.prepare(sql: sql) else {
+                Log.error("[DataAdapter.searchAll] Failed to prepare SQL statement", category: .app)
+                return []
             }
-            bindIndex += 1
+            defer { connection.finalize(statement) }
+
+            var bindIndex: Int32 = 1
+
+            for value in bindValuesForBatch {
+                if let stringValue = value as? String {
+                    sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+                } else if let intValue = value as? Int64 {
+                    sqlite3_bind_int64(statement, bindIndex, intValue)
+                }
+                bindIndex += 1
+            }
+
+            for term in highlightTerms {
+                sqlite3_bind_text(statement, bindIndex, term, -1, SQLITE_TRANSIENT)
+                bindIndex += 1
+            }
+
+            var batchRows: [FrameSearchRow] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let frameId = sqlite3_column_int64(statement, 0)
+                let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
+                let segmentId = sqlite3_column_int64(statement, 2)
+                let videoId = sqlite3_column_int64(statement, 3)
+                let frameIndex = Int(sqlite3_column_int(statement, 4))
+                let videoPath = sqlite3_column_text(statement, 5).map { String(cString: $0) }
+                let videoFrameRate: Double? = {
+                    guard sqlite3_column_type(statement, 6) != SQLITE_NULL else { return nil }
+                    return sqlite3_column_double(statement, 6)
+                }()
+                let redactionReason = sqlite3_column_text(statement, 7).map { String(cString: $0) }
+                let appBundleID = sqlite3_column_text(statement, 8).map { String(cString: $0) }
+                let windowName = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+                let browserUrl = sqlite3_column_text(statement, 10).map { String(cString: $0) }
+                let docID = sqlite3_column_int64(statement, 11)
+
+                let highlightNode: SearchResult.HighlightNode?
+                if sqlite3_column_type(statement, 12) != SQLITE_NULL {
+                    let nodeID = sqlite3_column_int64(statement, 12)
+                    let nodeOrder = Int(sqlite3_column_int(statement, 13))
+                    let x = sqlite3_column_double(statement, 14)
+                    let y = sqlite3_column_double(statement, 15)
+                    let width = sqlite3_column_double(statement, 16)
+                    let height = sqlite3_column_double(statement, 17)
+                    highlightNode = SearchResult.HighlightNode(
+                        nodeID: nodeID,
+                        nodeOrder: nodeOrder,
+                        x: x,
+                        y: y,
+                        width: width,
+                        height: height
+                    )
+                } else {
+                    highlightNode = nil
+                }
+                let highlightTextSignature = sqlite3_column_text(statement, 18).map { String(cString: $0) }
+
+                batchRows.append(
+                    FrameSearchRow(
+                        frameId: frameId,
+                        timestamp: timestamp,
+                        segmentId: segmentId,
+                        videoId: videoId,
+                        frameIndex: frameIndex,
+                        videoPath: videoPath,
+                        videoFrameRate: videoFrameRate,
+                        redactionReason: redactionReason,
+                        appBundleID: appBundleID,
+                        windowName: windowName,
+                        browserUrl: browserUrl,
+                        docID: docID,
+                        highlightNode: highlightNode,
+                        highlightTextSignature: highlightTextSignature
+                    )
+                )
+            }
+
+            return batchRows
         }
 
-        // Bind LIMIT and OFFSET
-        sqlite3_bind_int(statement, bindIndex, Int32(query.limit))
-        bindIndex += 1
-        sqlite3_bind_int(statement, bindIndex, Int32(query.offset))
+        var frameResults: [FrameSearchRow] = []
+        let queryStepStartTime = Date()
+        let frameCursor = sourceCursor.map { FrameCursor(timestamp: $0.timestamp, frameId: $0.frameID) }
+        let batchFetchLimit = max(query.limit, Self.searchAllRawBatchSize)
+        let batchOffset: Int? = frameCursor == nil ? normalizedOffset : nil
+        let batch = fetchFrameBatch(limit: batchFetchLimit, offset: batchOffset, cursor: frameCursor)
+        let sourceRowsFetched = batch.count
+        var dedupedRows: [FrameSearchRow] = []
+        var recentAnchors: [SearchDedupeMatchBox] = []
+        var recentWindowNameSignatures: [String] = []
+        var droppedByPosition = 0
+        var droppedByWindowName = 0
 
-        var frameResults: [(frameId: Int64, timestamp: Date, segmentId: Int64, videoId: Int64, frameIndex: Int, redactionReason: String?)] = []
+        for row in batch {
+            let currentWindowNameSignature = normalizedWindowNameSignature(row.windowName)
+            if let highlightNode = row.highlightNode {
+                let currentAnchor = SearchDedupeMatchBox(
+                    label: "highlight",
+                    textSignature: normalizedSearchDedupeTextSignature(row.highlightTextSignature) ?? "",
+                    nodeOrder: highlightNode.nodeOrder,
+                    xBin: quantizedNodeBin(highlightNode.x),
+                    yBin: quantizedNodeBin(highlightNode.y),
+                    wBin: max(1, quantizedNodeBin(highlightNode.width)),
+                    hBin: max(1, quantizedNodeBin(highlightNode.height))
+                )
+                if recentAnchors.contains(where: { areConsecutiveDedupeBoxesSimilar($0, currentAnchor) }) {
+                    droppedByPosition += 1
+                    continue
+                }
+                recentAnchors.append(currentAnchor)
+                if recentAnchors.count > Self.searchDedupeLookbackWindow {
+                    recentAnchors.removeFirst(recentAnchors.count - Self.searchDedupeLookbackWindow)
+                }
+            } else {
+                // No highlight node available; keep row and reset positional streak.
+                recentAnchors.removeAll(keepingCapacity: true)
+            }
 
-        let stepStartTime = Date()
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let frameId = sqlite3_column_int64(statement, 0)
-            let timestamp = config.parseDate(from: statement, column: 1) ?? Date()
-            let segmentId = sqlite3_column_int64(statement, 2)
-            let videoId = sqlite3_column_int64(statement, 3)
-            let frameIndex = Int(sqlite3_column_int(statement, 4))
-            let redactionReason = sqlite3_column_text(statement, 5).map { String(cString: $0) }
-            frameResults.append((
-                frameId: frameId,
-                timestamp: timestamp,
-                segmentId: segmentId,
-                videoId: videoId,
-                frameIndex: frameIndex,
-                redactionReason: redactionReason
-            ))
+            if let currentWindowNameSignature,
+               recentWindowNameSignatures.contains(where: { areConsecutiveWindowNamesSimilar($0, currentWindowNameSignature) }) {
+                droppedByWindowName += 1
+                continue
+            }
+
+            dedupedRows.append(row)
+            if let currentWindowNameSignature {
+                recentWindowNameSignatures.append(currentWindowNameSignature)
+                if recentWindowNameSignatures.count > Self.searchDedupeLookbackWindow {
+                    recentWindowNameSignatures.removeFirst(recentWindowNameSignatures.count - Self.searchDedupeLookbackWindow)
+                }
+            } else {
+                recentWindowNameSignatures.removeAll(keepingCapacity: true)
+            }
         }
-        let queryElapsed = Int(Date().timeIntervalSince(stepStartTime) * 1000)
-        Log.info("[DataAdapter.searchAll] SQL executed in \(queryElapsed)ms, found \(frameResults.count) frames, source: \(source)", category: .app)
+
+        frameResults = dedupedRows
+        Log.info(
+            "[DataAdapter.searchAll] Deduped \(query.sortOrder.rawValue) single batch: tokens=\(dedupeTokens.count), lookback=\(Self.searchDedupeLookbackWindow), rawBatchLimit=\(batchFetchLimit), fetchedRows=\(sourceRowsFetched), keptRows=\(dedupedRows.count), droppedByPosition=\(droppedByPosition), droppedByWindowName=\(droppedByWindowName), returnedRows=\(frameResults.count), offset=\(normalizedOffset), limit=\(query.limit)",
+            category: .app
+        )
+
+        let queryElapsed = Int(Date().timeIntervalSince(queryStepStartTime) * 1000)
+        Log.info("[DataAdapter.searchAll] SQL+dedupe executed in \(queryElapsed)ms, found \(frameResults.count) frames, source: \(source)", category: .app)
+
+        let nextSourceCursor: SearchSourceCursor?
+        if sourceRowsFetched == batchFetchLimit, let lastFetched = batch.last {
+            nextSourceCursor = SearchSourceCursor(timestamp: lastFetched.timestamp, frameID: lastFetched.frameId)
+        } else {
+            nextSourceCursor = nil
+        }
+        let nextCursor: SearchPageCursor? = {
+            guard let nextSourceCursor else { return nil }
+            if source == .rewind {
+                return SearchPageCursor(rewind: nextSourceCursor)
+            }
+            return SearchPageCursor(native: nextSourceCursor)
+        }()
+
+        let effectiveTotalCount: Int
+        if sourceRowsFetched < batchFetchLimit {
+            effectiveTotalCount = normalizedOffset + frameResults.count
+        } else {
+            let rawTotalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
+            effectiveTotalCount = max(rawTotalCount, normalizedOffset + frameResults.count)
+        }
 
         guard !frameResults.isEmpty else {
             let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-            let totalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
-            return SearchResults(query: query, results: [], totalCount: totalCount, searchTimeMs: elapsed)
+            return SearchResults(query: query, results: [], totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
         }
-
-        let segmentIds = Array(Set(frameResults.map { $0.segmentId }))
-        let segmentMetadata = fetchSegmentMetadata(segmentIds: segmentIds, connection: connection)
 
         var results: [SearchResult] = []
 
         for frame in frameResults {
-            let segmentMeta = segmentMetadata[frame.segmentId]
-            let appBundleID = segmentMeta?.bundleID
-            let windowName = segmentMeta?.windowName
-            let browserUrl = segmentMeta?.browserUrl
+            let appBundleID = frame.appBundleID
+            let windowName = frame.windowName
+            let browserUrl = frame.browserUrl
             let appName = appBundleID?.components(separatedBy: ".").last
 
             let result = SearchResult(
@@ -3253,42 +3970,17 @@ public actor DataAdapter {
                 segmentID: AppSegmentID(value: frame.segmentId),
                 videoID: VideoSegmentID(value: frame.videoId),
                 frameIndex: frame.frameIndex,
-                source: source
+                videoPath: frame.videoPath,
+                videoFrameRate: frame.videoFrameRate,
+                source: source,
+                highlightNode: frame.highlightNode
             )
 
             results.append(result)
         }
 
-        let totalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
-
         let elapsed = Int(Date().timeIntervalSince(startTime) * 1000)
-        return SearchResults(query: query, results: results, totalCount: totalCount, searchTimeMs: elapsed)
-    }
-
-    private static func fetchSegmentMetadata(segmentIds: [Int64], connection: DatabaseConnection) -> [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] {
-        guard !segmentIds.isEmpty else { return [:] }
-
-        let placeholders = segmentIds.map { _ in "?" }.joined(separator: ", ")
-        let sql = "SELECT id, bundleID, windowName, browserUrl FROM segment WHERE id IN (\(placeholders))"
-
-        guard let statement = try? connection.prepare(sql: sql) else { return [:] }
-        defer { connection.finalize(statement) }
-
-        for (index, segmentId) in segmentIds.enumerated() {
-            sqlite3_bind_int64(statement, Int32(index + 1), segmentId)
-        }
-
-        var metadata: [Int64: (bundleID: String?, windowName: String?, browserUrl: String?)] = [:]
-
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let id = sqlite3_column_int64(statement, 0)
-            let bundleID = sqlite3_column_text(statement, 1).map { String(cString: $0) }
-            let windowName = sqlite3_column_text(statement, 2).map { String(cString: $0) }
-            let browserUrl = sqlite3_column_text(statement, 3).map { String(cString: $0) }
-            metadata[id] = (bundleID: bundleID, windowName: windowName, browserUrl: browserUrl)
-        }
-
-        return metadata
+        return SearchResults(query: query, results: results, totalCount: effectiveTotalCount, searchTimeMs: elapsed, nextCursor: nextCursor)
     }
 
     private static func buildFTSQuery(_ text: String) -> String {
@@ -3375,6 +4067,219 @@ public actor DataAdapter {
             return true
         }
         return Self.exactMatchStopwords.contains(term.lowercased())
+    }
+
+    private enum SearchDedupeTermMatchMode {
+        case exactWord
+        case wordPrefix
+    }
+
+    private enum SearchDedupeToken {
+        case term(String, mode: SearchDedupeTermMatchMode)
+        case phrase(String)
+
+        var signatureLabel: String {
+            switch self {
+            case .term(let value, _):
+                return value
+            case .phrase(let value):
+                return "\"\(value)\""
+            }
+        }
+
+        var dedupeKey: String {
+            switch self {
+            case .term(let value, let mode):
+                switch mode {
+                case .exactWord:
+                    return "te:\(value)"
+                case .wordPrefix:
+                    return "tp:\(value)"
+                }
+            case .phrase(let value):
+                return "p:\(value)"
+            }
+        }
+
+        var matchingTerm: String {
+            switch self {
+            case .term(let value, _):
+                return value
+            case .phrase(let value):
+                return value
+            }
+        }
+    }
+
+    private static func parseSearchDedupeTokens(_ query: String) -> [SearchDedupeToken] {
+        let normalizedQuery = query
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return [] }
+
+        var tokens: [SearchDedupeToken] = []
+        var seenKeys = Set<String>()
+        var current = ""
+        var inQuotes = false
+
+        func appendToken(_ token: SearchDedupeToken) {
+            if seenKeys.insert(token.dedupeKey).inserted {
+                tokens.append(token)
+            }
+        }
+
+        func flushCurrentToken() {
+            let value = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else {
+                current = ""
+                return
+            }
+
+            if inQuotes {
+                let phrase = sanitizeFTSTerm(value)
+                if !phrase.isEmpty {
+                    appendToken(.phrase(phrase))
+                }
+            } else {
+                let terms = value
+                    .components(separatedBy: .whitespacesAndNewlines)
+                    .filter { !$0.isEmpty }
+
+                for rawTerm in terms {
+                    let term = sanitizeFTSTerm(rawTerm)
+                    guard !term.isEmpty else { continue }
+                    let mode: SearchDedupeTermMatchMode = shouldUseExactMatch(term) ? .exactWord : .wordPrefix
+                    appendToken(.term(term, mode: mode))
+                }
+            }
+
+            current = ""
+        }
+
+        for character in normalizedQuery {
+            if character == "\"" {
+                flushCurrentToken()
+                inQuotes.toggle()
+                continue
+            }
+            current.append(character)
+        }
+
+        flushCurrentToken()
+        return tokens
+    }
+
+    private struct SearchDedupeMatchBox: Hashable {
+        let label: String
+        let textSignature: String
+        let nodeOrder: Int
+        let xBin: Int
+        let yBin: Int
+        let wBin: Int
+        let hBin: Int
+
+        var minX: Double { Double(xBin) / 1000.0 }
+        var minY: Double { Double(yBin) / 1000.0 }
+        var width: Double { max(0.0, Double(wBin) / 1000.0) }
+        var height: Double { max(0.0, Double(hBin) / 1000.0) }
+        var maxX: Double { minX + width }
+        var maxY: Double { minY + height }
+        var centerX: Double { minX + (width / 2.0) }
+        var centerY: Double { minY + (height / 2.0) }
+    }
+
+    private static func areConsecutiveDedupeBoxesSimilar(
+        _ lhs: SearchDedupeMatchBox,
+        _ rhs: SearchDedupeMatchBox
+    ) -> Bool {
+        guard lhs.label == rhs.label else {
+            return false
+        }
+
+        let widthRatio = ratioSimilarity(lhs.width, rhs.width)
+        let heightRatio = ratioSimilarity(lhs.height, rhs.height)
+        let sameText = !lhs.textSignature.isEmpty && lhs.textSignature == rhs.textSignature
+        let minWidthRatio = sameText ? Self.searchDedupeSameTextMinWidthRatio : Self.searchDedupeScrollShiftMinWidthRatio
+        let minHeightRatio = sameText ? Self.searchDedupeSameTextMinHeightRatio : Self.searchDedupeScrollShiftMinHeightRatio
+        let maxXDelta = sameText ? Self.searchDedupeSameTextMaxXDelta : Self.searchDedupeDifferentTextMaxXDelta
+
+        let xCenterDelta = abs(lhs.centerX - rhs.centerX)
+        if xCenterDelta <= maxXDelta &&
+            widthRatio >= minWidthRatio &&
+            heightRatio >= minHeightRatio {
+            return true
+        }
+
+        return false
+    }
+
+    private static func ratioSimilarity(_ lhs: Double, _ rhs: Double) -> Double {
+        let maxValue = max(lhs, rhs)
+        guard maxValue > 0.0 else { return 0.0 }
+        return min(lhs, rhs) / maxValue
+    }
+
+    private static func normalizedSearchDedupeTextSignature(_ text: String?) -> String? {
+        guard let raw = text?
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+
+        let normalized = raw
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func normalizedWindowNameSignature(_ windowName: String?) -> String? {
+        guard let raw = windowName?
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+
+        var normalized = ""
+        normalized.reserveCapacity(raw.count)
+
+        for scalar in raw.unicodeScalars {
+            if CharacterSet.letters.contains(scalar) {
+                normalized.unicodeScalars.append(scalar)
+            }
+        }
+
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func areConsecutiveWindowNamesSimilar(
+        _ lhs: String?,
+        _ rhs: String?
+    ) -> Bool {
+        guard let lhs, let rhs else { return false }
+        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+        return lhs == rhs
+    }
+
+    private static func quantizedNodeBin(_ value: Double) -> Int {
+        Int((value * 1000.0).rounded())
+    }
+
+    /// Relevant-mode cursor encoding.
+    /// We store rank in the cursor timestamp field so we can keyset-page on (rank, frameID).
+    private static func encodeRelevantCursorRank(_ rank: Double) -> Date {
+        Date(timeIntervalSince1970: rank)
+    }
+
+    /// Decode relevant cursor from shared SearchSourceCursor.
+    /// Ignore cursors that look like wall-clock timestamps from other modes.
+    private static func decodeRelevantCursor(_ sourceCursor: SearchSourceCursor?) -> (rank: Double, frameId: Int64)? {
+        guard let sourceCursor else { return nil }
+        let rank = sourceCursor.timestamp.timeIntervalSince1970
+        guard rank.isFinite, abs(rank) < 1_000_000 else { return nil }
+        return (rank: rank, frameId: sourceCursor.frameID)
     }
 
     /// Build SQL clause for app filtering (IN or NOT IN based on filter mode)

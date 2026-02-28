@@ -474,24 +474,40 @@ public actor FrameProcessingQueue {
             frameId: frameID
         )
 
-        // Insert OCR nodes
-        if docid > 0 && !extractedText.regions.isEmpty {
+        // Insert OCR nodes for both main and chrome regions so any FTS hit can be highlighted.
+        let hasAnyOCRRegions = !extractedText.regions.isEmpty || !extractedText.chromeRegions.isEmpty
+        if docid > 0 && hasAnyOCRRegions {
             // Delete any existing nodes first to prevent duplicates
             // (can happen if frame is reprocessed without going through reprocessOCR)
             try await databaseManager.deleteNodes(frameID: FrameID(value: frameID))
 
-            var currentOffset = 0
             var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
+            nodeData.reserveCapacity(extractedText.regions.count + extractedText.chromeRegions.count)
 
+            // c0 offsets: main OCR text joined with single-space separators.
+            var mainOffset = 0
             for region in extractedText.regions {
                 let textLength = region.text.count
                 nodeData.append((
-                    textOffset: currentOffset,
+                    textOffset: mainOffset,
                     textLength: textLength,
                     bounds: region.bounds,
                     windowIndex: nil
                 ))
-                currentOffset += textLength + 1
+                mainOffset += textLength + 1
+            }
+
+            // c1 offsets are relative to (c0 + c1) because node text is read using COALESCE(c0,'') || COALESCE(c1,'').
+            var chromeOffset = extractedText.fullText.count
+            for region in extractedText.chromeRegions {
+                let textLength = region.text.count
+                nodeData.append((
+                    textOffset: chromeOffset,
+                    textLength: textLength,
+                    bounds: region.bounds,
+                    windowIndex: nil
+                ))
+                chromeOffset += textLength + 1
             }
 
             // Use videoSegment we already fetched above (no redundant query)
