@@ -500,6 +500,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the hint banner has already been shown for the current drag session
     private var hasShownHintThisDrag: Bool = false
 
+    // MARK: - Scroll Orientation Hint Banner State
+
+    /// Whether to show the scroll orientation hint banner
+    @Published public var showScrollOrientationHintBanner: Bool = false
+
+    /// The current orientation when the hint was triggered ("horizontal" or "vertical")
+    public var scrollOrientationHintCurrentOrientation: String = "horizontal"
+
+    /// Timer to auto-dismiss the scroll orientation hint
+    private var scrollOrientationHintTimer: Timer?
+
     // MARK: - Zoom Transition Animation State
 
     /// Whether we're currently animating the zoom transition
@@ -7263,6 +7274,42 @@ public class SimpleTimelineViewModel: ObservableObject {
         withAnimation(.easeOut(duration: 0.2)) {
             showTextSelectionHint = false
         }
+    }
+
+    // MARK: - Scroll Orientation Hint Methods
+
+    /// Show the scroll orientation hint banner with auto-dismiss after 8 seconds
+    public func showScrollOrientationHint(current: String) {
+        scrollOrientationHintCurrentOrientation = current
+        scrollOrientationHintTimer?.invalidate()
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            showScrollOrientationHintBanner = true
+        }
+
+        scrollOrientationHintTimer = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.dismissScrollOrientationHint()
+            }
+        }
+    }
+
+    /// Dismiss the scroll orientation hint banner
+    public func dismissScrollOrientationHint() {
+        scrollOrientationHintTimer?.invalidate()
+        scrollOrientationHintTimer = nil
+        withAnimation(.easeOut(duration: 0.2)) {
+            showScrollOrientationHintBanner = false
+        }
+    }
+
+    /// Switch scroll orientation to the opposite value and dismiss the hint
+    public func switchScrollOrientation() {
+        let store = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let current = store.string(forKey: "timelineScrollOrientation") ?? "horizontal"
+        let newValue = current == "horizontal" ? "vertical" : "horizontal"
+        store.set(newValue, forKey: "timelineScrollOrientation")
+        dismissScrollOrientationHint()
     }
 
     // MARK: - Zoom Region Methods (Shift+Drag)

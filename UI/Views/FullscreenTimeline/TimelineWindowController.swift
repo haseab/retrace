@@ -121,6 +121,14 @@ public class TimelineWindowController: NSObject {
     private static let liveScrollSuppressDuration: CFAbsoluteTime = 0.30
     private static let timelineSettingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
+    /// Accumulated wrong-axis and right-axis scroll magnitudes for orientation mismatch detection
+    private var wrongAxisScrollAccum: CGFloat = 0
+    private var rightAxisScrollAccum: CGFloat = 0
+    /// Timestamp when accumulation started
+    private var scrollAccumStartTime: CFAbsoluteTime = 0
+    /// Whether the orientation hint has already been shown this session (don't repeat)
+    private var hasShownScrollOrientationHint: Bool = false
+
     private enum TimelineScrollOrientation: String {
         case horizontal
         case vertical
@@ -2584,6 +2592,27 @@ public class TimelineWindowController: NSObject {
         case .vertical:
             // Optional behavior: up/down swipes move timeline.
             delta = -event.scrollingDeltaY
+        }
+
+        // --- Scroll orientation mismatch detection ---
+        if !hasShownScrollOrientationHint {
+            let wrongAxisMag = abs(orientation == .horizontal ? event.scrollingDeltaY : event.scrollingDeltaX)
+            let rightAxisMag = abs(orientation == .horizontal ? event.scrollingDeltaX : event.scrollingDeltaY)
+
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - scrollAccumStartTime > 2.0 {
+                wrongAxisScrollAccum = 0
+                rightAxisScrollAccum = 0
+                scrollAccumStartTime = now
+            }
+            wrongAxisScrollAccum += wrongAxisMag
+            rightAxisScrollAccum += rightAxisMag
+
+            if wrongAxisScrollAccum > 500,
+               rightAxisScrollAccum < 5 || wrongAxisScrollAccum > 5 * rightAxisScrollAccum {
+                hasShownScrollOrientationHint = true
+                viewModel.showScrollOrientationHint(current: orientation.rawValue)
+            }
         }
 
         // Trackpads have precise scrolling deltas, mice do not

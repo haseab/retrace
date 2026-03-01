@@ -279,6 +279,25 @@ public struct SimpleTimelineView: View {
                     .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showTextSelectionHint)
                 }
 
+                // Scroll orientation hint toast (top center)
+                if viewModel.showScrollOrientationHintBanner {
+                    VStack {
+                        ScrollOrientationHintBanner(
+                            currentOrientation: viewModel.scrollOrientationHintCurrentOrientation,
+                            onSwitch: { viewModel.switchScrollOrientation() },
+                            onDismiss: { viewModel.dismissScrollOrientationHint() }
+                        )
+                        .fixedSize()
+                        .padding(.top, 60)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity),
+                            removal: .opacity
+                        ))
+                        Spacer()
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showScrollOrientationHintBanner)
+                }
+
                 // Filter panel (floating, anchored to filter button position)
                 if viewModel.isFilterPanelVisible {
                     // Dismiss overlay for filter panel and any open dropdown
@@ -4178,6 +4197,63 @@ struct TextSelectionHintBanner: View {
                     .foregroundColor(.white.opacity(0.5))
                 KeyboardBadge(symbol: "⊹ Drag")
             }
+
+            // Dismiss button
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.retraceCaption2Bold)
+                    .foregroundColor(.white.opacity(0.6))
+                    .frame(width: 24, height: 24)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(white: 0.2).opacity(0.95))
+                .shadow(color: .black.opacity(0.3), radius: 10, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.15), lineWidth: 1)
+        )
+    }
+}
+
+/// Banner suggesting the user switch scroll orientation when scrolling the wrong axis.
+struct ScrollOrientationHintBanner: View {
+    let currentOrientation: String
+    let onSwitch: () -> Void
+    let onDismiss: () -> Void
+
+    private var isHorizontal: Bool { currentOrientation == "horizontal" }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Direction icon
+            Image(systemName: isHorizontal ? "arrow.up.arrow.down" : "arrow.left.arrow.right")
+                .font(.retraceHeadline)
+                .foregroundColor(.white.opacity(0.9))
+
+            // Message
+            Text(isHorizontal ? "Scrolling up/down?" : "Scrolling left/right?")
+                .font(.retraceCaptionMedium)
+                .foregroundColor(.white.opacity(0.9))
+
+            Text(isHorizontal ? "Timeline is set to Left/Right" : "Timeline is set to Up/Down")
+                .font(.retraceCaption)
+                .foregroundColor(.white.opacity(0.7))
+
+            // Switch action button
+            Button(action: onSwitch) {
+                Text(isHorizontal ? "Switch to Up/Down" : "Switch to Left/Right")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.accentColor)
+            }
+            .buttonStyle(.plain)
 
             // Dismiss button
             Button(action: onDismiss) {
