@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import Shared
 import Darwin
+import AppKit
 
 struct ProcessCPURow: Identifiable {
     let id: String
@@ -10,6 +11,16 @@ struct ProcessCPURow: Identifiable {
     let shareOfTrackedPercent: Double
     let capacityPercent: Double
     let averagePercent: Double
+}
+
+struct ProcessMemoryRow: Identifiable {
+    let id: String
+    let name: String
+    let currentBytes: UInt64
+    let averageBytes: UInt64
+    let peakBytes: UInt64
+    let currentSharePercent: Double
+    let averageSharePercent: Double
 }
 
 struct ProcessCPUSnapshot {
@@ -26,7 +37,12 @@ struct ProcessCPUSnapshot {
         retraceRank: nil,
         retraceGroupKey: nil,
         peakPercentByGroup: [:],
-        topProcesses: []
+        topProcesses: [],
+        totalTrackedCurrentResidentBytes: 0,
+        totalTrackedAverageResidentBytes: 0,
+        peakResidentBytesByGroup: [:],
+        topMemoryProcesses: [],
+        latestSampleTimestamp: nil
     )
 
     let sampleDurationSeconds: TimeInterval
@@ -42,9 +58,18 @@ struct ProcessCPUSnapshot {
     let retraceGroupKey: String?
     let peakPercentByGroup: [String: Double]
     let topProcesses: [ProcessCPURow]
+    let totalTrackedCurrentResidentBytes: UInt64
+    let totalTrackedAverageResidentBytes: UInt64
+    let peakResidentBytesByGroup: [String: UInt64]
+    let topMemoryProcesses: [ProcessMemoryRow]
+    let latestSampleTimestamp: TimeInterval?
 
     var hasEnoughData: Bool {
         sampleDurationSeconds >= 5 && !topProcesses.isEmpty
+    }
+
+    var hasEnoughMemoryData: Bool {
+        sampleDurationSeconds >= 5 && !topMemoryProcesses.isEmpty
     }
 }
 
@@ -68,7 +93,7 @@ final class ProcessCPUMonitor: ObservableObject {
     private static let fastPollingInterval: TimeInterval = 1
     private static let slowPollingInterval: TimeInterval = 15
     private static let batteryPollingInterval: TimeInterval = 30
-    private static let snapshotWindowDuration: TimeInterval = 24 * 60 * 60
+    private static let snapshotWindowDuration: TimeInterval = 12 * 60 * 60
 
     private init() {}
 
@@ -122,8 +147,9 @@ final class ProcessCPUMonitor: ObservableObject {
     private func restartSamplingLoop() {
         samplingTask?.cancel()
         let initialInterval = max(1, sampleIntervalSeconds)
+        let taskPriority: TaskPriority = activeConsumers.isEmpty ? .utility : .userInitiated
 
-        samplingTask = Task(priority: .utility) { [weak self] in
+        samplingTask = Task(priority: taskPriority) { [weak self] in
             guard let self else { return }
             await runSamplingLoop(initialIntervalSeconds: initialInterval)
         }
@@ -144,12 +170,22 @@ final class ProcessCPUMonitor: ObservableObject {
         while !Task.isCancelled {
             let shouldRebuildSnapshot = !activeConsumers.isEmpty
             let intervalForRequest = intervalSeconds
-            let nextSnapshot = await samplerRequestGate.runIfIdle { [sampler] in
+            var nextSnapshot = await samplerRequestGate.runIfIdle { [sampler] in
                 await sampler.sampleAndMaybeLoadSnapshot(
                     windowDuration: Self.snapshotWindowDuration,
                     expectedIntervalSeconds: intervalForRequest,
                     shouldBuildSnapshot: shouldRebuildSnapshot
                 )
+            }
+            if nextSnapshot == nil, shouldRebuildSnapshot {
+                // If we raced with a one-off reset request, try once more before reporting a miss.
+                nextSnapshot = await samplerRequestGate.runIfIdle { [sampler] in
+                    await sampler.sampleAndMaybeLoadSnapshot(
+                        windowDuration: Self.snapshotWindowDuration,
+                        expectedIntervalSeconds: intervalForRequest,
+                        shouldBuildSnapshot: shouldRebuildSnapshot
+                    )
+                }
             }
             if let nextSnapshot {
                 snapshot = nextSnapshot
@@ -176,10 +212,7 @@ final class ProcessCPUMonitor: ObservableObject {
                     expectedIntervalSeconds: intervalSeconds
                 )
             }
-            guard let refreshedSnapshot else {
-                Log.debug("[ProcessCPUMonitor] Skipping CPU sampler reset; request already in flight", category: .ui)
-                return
-            }
+            guard let refreshedSnapshot else { return }
             await MainActor.run {
                 self.snapshot = refreshedSnapshot
             }
@@ -199,9 +232,16 @@ private actor SamplerRequestGate {
 }
 
 private actor ProcessCPULogSampler {
+    private typealias ProcPidRusageFunction = @convention(c) (pid_t, Int32, UnsafeMutableRawPointer?) -> Int32
+
     private struct ProcessIdentity {
         let key: String
         let name: String
+    }
+
+    private struct ProcessTaskMetrics {
+        let cpuAbsoluteUnits: UInt64
+        let residentBytes: UInt64
     }
 
     private struct BundleMetadata {
@@ -216,6 +256,7 @@ private actor ProcessCPULogSampler {
         let retraceGroupKey: String?
         let groupDeltaNanoseconds: [String: UInt64]
         let groupDeltaUnit: String?
+        let groupResidentBytes: [String: UInt64]?
         let groupDisplayNames: [String: String]?
     }
 
@@ -224,6 +265,14 @@ private actor ProcessCPULogSampler {
     private static let displayNamePersistInterval: TimeInterval = 30
     private static let logReadChunkSize = 64 * 1024
     private static let nanosecondUnit = "ns"
+    private static let acceptedSampleGapMultiplier: TimeInterval = 4.0
+    private static let minimumAcceptedSampleGapSeconds: TimeInterval = 4.0
+    private static let procPidRusageFunction: ProcPidRusageFunction? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "proc_pid_rusage") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: ProcPidRusageFunction.self)
+    }()
     private static let machTimebaseInfo: mach_timebase_info_data_t = {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
@@ -251,6 +300,8 @@ private actor ProcessCPULogSampler {
     private var windowTotalDuration: TimeInterval = 0
     private var windowCumulativeByGroup: [String: UInt64] = [:]
     private var windowPeakPercentByGroup: [String: Double] = [:]
+    private var windowMemoryIntegralByteSecondsByGroup: [String: Double] = [:]
+    private var windowPeakResidentBytesByGroup: [String: UInt64] = [:]
     private let logFileURL: URL
     private let displayNamesFileURL: URL
     private let encoder = JSONEncoder()
@@ -318,19 +369,23 @@ private actor ProcessCPULogSampler {
         windowTotalDuration = 0
         windowCumulativeByGroup.removeAll(keepingCapacity: false)
         windowPeakPercentByGroup.removeAll(keepingCapacity: false)
+        windowMemoryIntegralByteSecondsByGroup.removeAll(keepingCapacity: false)
+        windowPeakResidentBytesByGroup.removeAll(keepingCapacity: false)
     }
 
     private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) -> CPULogEntry? {
         let allPIDs = Self.listAllProcessIDs()
 
         var currentCPUByPID: [pid_t: UInt64] = [:]
+        var currentResidentBytesByPID: [pid_t: UInt64] = [:]
         var currentIdentityByPID: [pid_t: ProcessIdentity] = [:]
 
         for pid in allPIDs {
-            guard let cpuTime = Self.processCPUTimeAbsoluteUnits(for: pid) else { continue }
+            guard let taskMetrics = Self.processTaskMetrics(for: pid) else { continue }
             guard let identity = identityByPID[pid] ?? resolveIdentity(for: pid) else { continue }
 
-            currentCPUByPID[pid] = cpuTime
+            currentCPUByPID[pid] = taskMetrics.cpuAbsoluteUnits
+            currentResidentBytesByPID[pid] = taskMetrics.residentBytes
             currentIdentityByPID[pid] = identity
             updateGroupDisplayNameIfNeeded(forKey: identity.key, name: identity.name)
             if pid == retracePID {
@@ -342,8 +397,17 @@ private actor ProcessCPULogSampler {
 
         if let lastSampleDate {
             let duration = now.timeIntervalSince(lastSampleDate)
-            let maxAcceptedSampleGap = max(1, expectedIntervalSeconds) * 2.0
-            if duration > 0, duration <= maxAcceptedSampleGap {
+            let acceptedSampleGap = max(
+                Self.minimumAcceptedSampleGapSeconds,
+                max(1, expectedIntervalSeconds) * Self.acceptedSampleGapMultiplier
+            )
+
+            let groupResidentBytes = aggregatedResidentBytes(
+                currentResidentBytesByPID: currentResidentBytesByPID,
+                currentIdentityByPID: currentIdentityByPID
+            )
+
+            if duration > 0, duration <= acceptedSampleGap {
                 var groupDeltaNanoseconds: [String: UInt64] = [:]
 
                 for (pid, currentCPU) in currentCPUByPID {
@@ -357,25 +421,58 @@ private actor ProcessCPULogSampler {
                     }
                 }
 
-                if !groupDeltaNanoseconds.isEmpty {
+                if !groupDeltaNanoseconds.isEmpty || !groupResidentBytes.isEmpty {
                     let entry = CPULogEntry(
                         timestamp: now.timeIntervalSince1970,
                         durationSeconds: duration,
                         retraceGroupKey: retraceGroupKey,
                         groupDeltaNanoseconds: groupDeltaNanoseconds,
                         groupDeltaUnit: Self.nanosecondUnit,
+                        groupResidentBytes: groupResidentBytes.isEmpty ? nil : groupResidentBytes,
                         groupDisplayNames: nil
                     )
                     appendLogEntry(entry)
                     appendedEntry = entry
                 }
+            } else if !groupResidentBytes.isEmpty {
+                // Recover quickly after long scheduling gaps by appending a memory-only heartbeat.
+                // This keeps "Now" memory fresh while avoiding oversized CPU deltas.
+                let heartbeatDuration = max(1, expectedIntervalSeconds)
+                let entry = CPULogEntry(
+                    timestamp: now.timeIntervalSince1970,
+                    durationSeconds: heartbeatDuration,
+                    retraceGroupKey: retraceGroupKey,
+                    groupDeltaNanoseconds: [:],
+                    groupDeltaUnit: Self.nanosecondUnit,
+                    groupResidentBytes: groupResidentBytes,
+                    groupDisplayNames: nil
+                )
+                appendLogEntry(entry)
+                appendedEntry = entry
             }
         }
 
         lastSampleDate = now
         lastCPUByPID = currentCPUByPID
         identityByPID = currentIdentityByPID
+
         return appendedEntry
+    }
+
+    private func aggregatedResidentBytes(
+        currentResidentBytesByPID: [pid_t: UInt64],
+        currentIdentityByPID: [pid_t: ProcessIdentity]
+    ) -> [String: UInt64] {
+        var groupResidentBytes: [String: UInt64] = [:]
+        groupResidentBytes.reserveCapacity(currentIdentityByPID.count)
+
+        for (pid, residentBytes) in currentResidentBytesByPID {
+            guard let identity = currentIdentityByPID[pid] else { continue }
+            let previous = groupResidentBytes[identity.key] ?? 0
+            groupResidentBytes[identity.key] = Self.saturatingAdd(previous, residentBytes)
+        }
+
+        return groupResidentBytes
     }
 
     private func resolveIdentity(for pid: pid_t) -> ProcessIdentity? {
@@ -390,7 +487,7 @@ private actor ProcessCPULogSampler {
             return identity
         }
 
-        if let identity = resolveBundleIdentityFromParentChain(for: pid) {
+        if let identity = resolveWebKitHostedIdentity(for: pid) {
             return identity
         }
 
@@ -425,34 +522,58 @@ private actor ProcessCPULogSampler {
         )
     }
 
-    private func resolveBundleIdentityFromParentChain(for pid: pid_t) -> ProcessIdentity? {
-        var currentPID = pid
-        var visited: Set<pid_t> = [pid]
-        let maxDepth = 8
-
-        for _ in 0..<maxDepth {
-            guard let parentPID = Self.parentPID(for: currentPID),
-                  parentPID > 1,
-                  !visited.contains(parentPID) else {
-                return nil
-            }
-
-            visited.insert(parentPID)
-            if parentPID == retracePID {
-                return ProcessIdentity(
-                    key: "bundle:\(retraceBundleID)",
-                    name: retraceDisplayName
-                )
-            }
-
-            if let identity = resolveBundleBackedIdentity(for: parentPID) {
-                return identity
-            }
-
-            currentPID = parentPID
+    private func resolveWebKitHostedIdentity(for pid: pid_t) -> ProcessIdentity? {
+        guard Self.isWebKitWebContentProcess(pid: pid) else {
+            return nil
         }
 
-        return nil
+        guard let runningApp = NSRunningApplication(processIdentifier: pid),
+              let localizedName = normalizedBundleString(runningApp.localizedName),
+              let hostName = normalizedWebKitHostName(from: localizedName) else {
+            return nil
+        }
+
+        return ProcessIdentity(
+            key: "webkit-host:\(Self.normalizedKeyComponent(hostName))",
+            name: hostName
+        )
+    }
+
+    private static func isWebKitWebContentProcess(pid: pid_t) -> Bool {
+        if let processName = processName(for: pid),
+           processName.caseInsensitiveCompare("com.apple.WebKit.WebContent") == .orderedSame {
+            return true
+        }
+
+        if let executablePath = processPath(for: pid),
+           executablePath.range(
+               of: "/com.apple.WebKit.WebContent.xpc/",
+               options: [.caseInsensitive]
+           ) != nil {
+            return true
+        }
+
+        return false
+    }
+
+    private func normalizedWebKitHostName(from localizedName: String) -> String? {
+        let trimmed = localizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.caseInsensitiveCompare("com.apple.WebKit.WebContent") == .orderedSame
+            || trimmed.caseInsensitiveCompare("Web Content") == .orderedSame {
+            return nil
+        }
+
+        let suffix = " web content"
+        let lowered = trimmed.lowercased()
+        if lowered.hasSuffix(suffix) {
+            let endIndex = trimmed.index(trimmed.endIndex, offsetBy: -suffix.count)
+            let baseName = String(trimmed[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return baseName.isEmpty ? nil : baseName
+        }
+
+        return trimmed
     }
 
     private func bundleMetadata(forAppPath appPath: String) -> BundleMetadata {
@@ -569,12 +690,27 @@ private actor ProcessCPULogSampler {
                 windowPeakPercentByGroup[key] = instantPercent
             }
         }
+
+        guard let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty else {
+            return
+        }
+
+        let sampleDuration = max(entry.durationSeconds, 0)
+        for (key, residentBytes) in groupResidentBytes {
+            if sampleDuration > 0 {
+                windowMemoryIntegralByteSecondsByGroup[key, default: 0] += Double(residentBytes) * sampleDuration
+            }
+            if residentBytes > (windowPeakResidentBytesByGroup[key] ?? 0) {
+                windowPeakResidentBytesByGroup[key] = residentBytes
+            }
+        }
     }
 
     private func pruneWindowState(cutoffTimestamp: TimeInterval) {
         guard !windowEntries.isEmpty else { return }
 
         var peakKeysToRebuild: Set<String> = []
+        var peakMemoryKeysToRebuild: Set<String> = []
         var removeCount = 0
         while removeCount < windowEntries.count, windowEntries[removeCount].timestamp < cutoffTimestamp {
             let entry = windowEntries[removeCount]
@@ -595,12 +731,34 @@ private actor ProcessCPULogSampler {
                     peakKeysToRebuild.insert(key)
                 }
             }
+
+            if let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty {
+                let sampleDuration = max(entry.durationSeconds, 0)
+                for (key, residentBytes) in groupResidentBytes {
+                    if sampleDuration > 0 {
+                        let deltaByteSeconds = Double(residentBytes) * sampleDuration
+                        let remaining = (windowMemoryIntegralByteSecondsByGroup[key] ?? 0) - deltaByteSeconds
+                        if remaining <= 0.000_001 {
+                            windowMemoryIntegralByteSecondsByGroup.removeValue(forKey: key)
+                            windowPeakResidentBytesByGroup.removeValue(forKey: key)
+                            peakMemoryKeysToRebuild.remove(key)
+                        } else {
+                            windowMemoryIntegralByteSecondsByGroup[key] = remaining
+                        }
+                    }
+
+                    if let currentPeakBytes = windowPeakResidentBytesByGroup[key], residentBytes >= currentPeakBytes {
+                        peakMemoryKeysToRebuild.insert(key)
+                    }
+                }
+            }
             removeCount += 1
         }
 
         if removeCount > 0 {
             windowEntries.removeFirst(removeCount)
             recomputePeakPercentages(for: peakKeysToRebuild)
+            recomputePeakResidentBytes(for: peakMemoryKeysToRebuild)
         }
 
         if windowTotalDuration < 0 {
@@ -614,6 +772,8 @@ private actor ProcessCPULogSampler {
         windowTotalDuration = 0
         windowCumulativeByGroup.removeAll(keepingCapacity: true)
         windowPeakPercentByGroup.removeAll(keepingCapacity: true)
+        windowMemoryIntegralByteSecondsByGroup.removeAll(keepingCapacity: true)
+        windowPeakResidentBytesByGroup.removeAll(keepingCapacity: true)
 
         let cutoffTimestamp = now.addingTimeInterval(-windowDuration).timeIntervalSince1970
         streamLogEntries { entry in
@@ -651,10 +811,38 @@ private actor ProcessCPULogSampler {
         }
     }
 
+    private func recomputePeakResidentBytes(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+
+        var recomputed: [String: UInt64] = [:]
+        for entry in windowEntries {
+            guard let residentByGroup = entry.groupResidentBytes else { continue }
+            for (key, residentBytes) in residentByGroup {
+                guard keys.contains(key) else { continue }
+                if residentBytes > (recomputed[key] ?? 0) {
+                    recomputed[key] = residentBytes
+                }
+            }
+        }
+
+        for key in keys {
+            if windowMemoryIntegralByteSecondsByGroup[key] == nil {
+                windowPeakResidentBytesByGroup.removeValue(forKey: key)
+            } else if let peakBytes = recomputed[key] {
+                windowPeakResidentBytesByGroup[key] = peakBytes
+            } else {
+                windowPeakResidentBytesByGroup.removeValue(forKey: key)
+            }
+        }
+    }
+
     private func snapshotFromWindowState() -> ProcessCPUSnapshot {
         let totalDuration = max(windowTotalDuration, 0)
         let cumulativeByGroup = windowCumulativeByGroup
         let peakPercentByGroup = windowPeakPercentByGroup
+        let memoryIntegralByteSecondsByGroup = windowMemoryIntegralByteSecondsByGroup
+        let peakResidentBytesByGroup = windowPeakResidentBytesByGroup
+        let currentResidentBytesByGroup = windowEntries.last?.groupResidentBytes ?? [:]
         let displayNamesByKey = groupDisplayNameByKey
         var effectiveRetraceGroupKey = retraceGroupKey
 
@@ -704,6 +892,56 @@ private actor ProcessCPULogSampler {
         }
         .sorted { $0.cpuSeconds > $1.cpuSeconds }
 
+        let totalTrackedCurrentResidentBytes = currentResidentBytesByGroup.values.reduce(UInt64(0), Self.saturatingAdd)
+        let totalTrackedAverageResidentBytesDouble = totalDuration > 0
+            ? memoryIntegralByteSecondsByGroup.values.reduce(0, +) / totalDuration
+            : 0
+        let totalTrackedAverageResidentBytes = Self.doubleToUInt64(totalTrackedAverageResidentBytesDouble)
+
+        let memoryKeys = Set(memoryIntegralByteSecondsByGroup.keys)
+            .union(currentResidentBytesByGroup.keys)
+            .union(peakResidentBytesByGroup.keys)
+
+        let rankedMemoryProcesses = memoryKeys
+            .map { key -> ProcessMemoryRow in
+                let currentBytes = currentResidentBytesByGroup[key] ?? 0
+                let averageBytesDouble = totalDuration > 0
+                    ? (memoryIntegralByteSecondsByGroup[key] ?? 0) / totalDuration
+                    : Double(currentBytes)
+                let averageBytes = Self.doubleToUInt64(averageBytesDouble)
+                let peakBytes = max(
+                    peakResidentBytesByGroup[key] ?? 0,
+                    currentBytes,
+                    averageBytes
+                )
+                let currentSharePercent = totalTrackedCurrentResidentBytes > 0
+                    ? (Double(currentBytes) / Double(totalTrackedCurrentResidentBytes)) * 100.0
+                    : 0
+                let averageSharePercent = totalTrackedAverageResidentBytesDouble > 0
+                    ? (averageBytesDouble / totalTrackedAverageResidentBytesDouble) * 100.0
+                    : 0
+                let name = displayNamesByKey[key] ?? key
+                return ProcessMemoryRow(
+                    id: key,
+                    name: name,
+                    currentBytes: currentBytes,
+                    averageBytes: averageBytes,
+                    peakBytes: peakBytes,
+                    currentSharePercent: currentSharePercent,
+                    averageSharePercent: averageSharePercent
+                )
+            }
+            .filter { $0.currentBytes > 0 || $0.averageBytes > 0 || $0.peakBytes > 0 }
+            .sorted { lhs, rhs in
+                if lhs.averageBytes != rhs.averageBytes {
+                    return lhs.averageBytes > rhs.averageBytes
+                }
+                if lhs.currentBytes != rhs.currentBytes {
+                    return lhs.currentBytes > rhs.currentBytes
+                }
+                return lhs.peakBytes > rhs.peakBytes
+            }
+
         let retraceRank = effectiveRetraceGroupKey.flatMap { key in
             rankedProcesses.firstIndex(where: { $0.id == key }).map { $0 + 1 }
         }
@@ -721,7 +959,12 @@ private actor ProcessCPULogSampler {
             retraceRank: retraceRank,
             retraceGroupKey: effectiveRetraceGroupKey,
             peakPercentByGroup: peakPercentByGroup,
-            topProcesses: rankedProcesses
+            topProcesses: rankedProcesses,
+            totalTrackedCurrentResidentBytes: totalTrackedCurrentResidentBytes,
+            totalTrackedAverageResidentBytes: totalTrackedAverageResidentBytes,
+            peakResidentBytesByGroup: peakResidentBytesByGroup,
+            topMemoryProcesses: rankedMemoryProcesses,
+            latestSampleTimestamp: windowEntries.last?.timestamp
         )
     }
 
@@ -819,6 +1062,8 @@ private actor ProcessCPULogSampler {
         windowTotalDuration = 0
         windowCumulativeByGroup = [:]
         windowPeakPercentByGroup = [:]
+        windowMemoryIntegralByteSecondsByGroup = [:]
+        windowPeakResidentBytesByGroup = [:]
         retraceGroupKey = nil
         lastCompactionDate = nil
     }
@@ -859,7 +1104,7 @@ private actor ProcessCPULogSampler {
         return pids.prefix(processCount).filter { $0 > 0 }
     }
 
-    private static func processCPUTimeAbsoluteUnits(for pid: pid_t) -> UInt64? {
+    private static func processTaskMetrics(for pid: pid_t) -> ProcessTaskMetrics? {
         var info = proc_taskinfo()
         let size = Int32(MemoryLayout<proc_taskinfo>.size)
         let result = withUnsafeMutablePointer(to: &info) { pointer in
@@ -867,7 +1112,35 @@ private actor ProcessCPULogSampler {
         }
 
         guard result == size else { return nil }
-        return info.pti_total_user + info.pti_total_system
+        let memoryBytes = processFootprintBytes(for: pid) ?? info.pti_resident_size
+        return ProcessTaskMetrics(
+            cpuAbsoluteUnits: info.pti_total_user + info.pti_total_system,
+            residentBytes: memoryBytes
+        )
+    }
+
+    private static func processFootprintBytes(for pid: pid_t) -> UInt64? {
+        guard let procPidRusageFunction else { return nil }
+
+        var usage = rusage_info_current()
+        let result = withUnsafeMutablePointer(to: &usage) { pointer in
+            procPidRusageFunction(pid, RUSAGE_INFO_CURRENT, UnsafeMutableRawPointer(pointer))
+        }
+        guard result == 0 else { return nil }
+        return usage.ri_phys_footprint > 0 ? usage.ri_phys_footprint : nil
+    }
+
+    private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? UInt64.max : sum
+    }
+
+    private static func doubleToUInt64(_ value: Double) -> UInt64 {
+        guard value.isFinite, value > 0 else { return 0 }
+        if value >= Double(UInt64.max) {
+            return UInt64.max
+        }
+        return UInt64(value.rounded())
     }
 
     private static func absoluteTimeToNanoseconds(_ absoluteUnits: UInt64) -> UInt64 {
@@ -900,18 +1173,6 @@ private actor ProcessCPULogSampler {
         let nameLength = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
         guard nameLength > 0 else { return nil }
         return String(cString: nameBuffer)
-    }
-
-    private static func parentPID(for pid: pid_t) -> pid_t? {
-        var info = proc_bsdinfo()
-        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        let result = withUnsafeMutablePointer(to: &info) { pointer in
-            proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, pointer, size)
-        }
-        guard result == size,
-              info.pbi_ppid > 0,
-              info.pbi_ppid <= UInt32(Int32.max) else { return nil }
-        return pid_t(info.pbi_ppid)
     }
 
     private static func appBundlePath(from executablePath: String) -> String? {

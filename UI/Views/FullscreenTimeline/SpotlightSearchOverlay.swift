@@ -557,18 +557,25 @@ public struct SpotlightSearchOverlay: View {
         let searchQuery = viewModel.committedSearchQuery
         let currentGeneration = viewModel.searchGeneration
 
-        guard viewModel.thumbnailCache[key] == nil, !viewModel.loadingThumbnails.contains(key) else {
-            if viewModel.thumbnailCache[key] != nil {
-                Log.debug("\(searchLog) Thumbnail already cached for: \(key)", category: .ui)
-            }
+        if viewModel.thumbnailCache[key] != nil {
+            viewModel.markThumbnailAccessed(key)
+            Log.debug("\(searchLog) Thumbnail already cached for: \(key)", category: .ui)
             return
         }
 
-        viewModel.loadingThumbnails.insert(key)
+        guard viewModel.beginThumbnailLoadIfNeeded(key) else {
+            return
+        }
+
         let startTime = Date()
         Log.debug("\(searchLog) Starting highlighted thumbnail load for: segmentID=\(result.segmentID.stringValue), timestamp=\(result.timestamp), query='\(searchQuery)', generation=\(currentGeneration)", category: .ui)
 
         Task {
+            if await viewModel.loadThumbnailFromDiskIfAvailable(for: key, generation: currentGeneration) {
+                viewModel.loadingThumbnails.remove(key)
+                return
+            }
+
             do {
                 // 1. Fetch frame image (prefer direct path to avoid per-thumbnail DB lookups and JPEG round-trips)
                 let fetchStart = Date()
@@ -593,7 +600,7 @@ public struct SpotlightSearchOverlay: View {
                     )
                     guard let decodedImage = NSImage(data: imageData) else {
                         Log.error("\(searchLog) Failed to create NSImage from fallback data", category: .ui)
-                        viewModel.loadingThumbnails.remove(key)
+                        viewModel.failThumbnailLoad(with: nil, for: key, generation: currentGeneration)
                         return
                     }
                     fullImage = decodedImage
@@ -604,6 +611,7 @@ public struct SpotlightSearchOverlay: View {
                 // Check if search generation changed (user started a new search)
                 guard viewModel.searchGeneration == currentGeneration else {
                     Log.debug("\(searchLog) Search generation changed (\(currentGeneration)->\(viewModel.searchGeneration)), discarding thumbnail for: \(key)", category: .ui)
+                    viewModel.failThumbnailLoad(with: nil, for: key, generation: currentGeneration)
                     return
                 }
 
@@ -635,6 +643,7 @@ public struct SpotlightSearchOverlay: View {
                     // Check if search generation changed again
                     guard viewModel.searchGeneration == currentGeneration else {
                         Log.debug("\(searchLog) Search generation changed (\(currentGeneration)->\(viewModel.searchGeneration)), discarding thumbnail for: \(key)", category: .ui)
+                        viewModel.failThumbnailLoad(with: nil, for: key, generation: currentGeneration)
                         return
                     }
 
@@ -658,11 +667,11 @@ public struct SpotlightSearchOverlay: View {
                 let totalDuration = Date().timeIntervalSince(startTime) * 1000
                 Log.debug("\(searchLog) Thumbnail created: \(Int(thumbnail.size.width))x\(Int(thumbnail.size.height)), resize=\(Int(resizeDuration))ms, total=\(Int(totalDuration))ms", category: .ui)
 
-                // Only update cache if still same generation
-                if viewModel.searchGeneration == currentGeneration {
-                    viewModel.thumbnailCache[key] = thumbnail
-                    viewModel.loadingThumbnails.remove(key)
-                }
+                viewModel.finishThumbnailLoad(
+                    thumbnail,
+                    for: key,
+                    generation: currentGeneration
+                )
             } catch {
                 let duration = Date().timeIntervalSince(startTime) * 1000
                 Log.error("\(searchLog) ❌ THUMBNAIL FAILED after \(Int(duration))ms: \(error)", category: .ui)
@@ -670,11 +679,11 @@ public struct SpotlightSearchOverlay: View {
 
                 // Create a placeholder thumbnail so the UI doesn't show infinite loading
                 let placeholder = createPlaceholderThumbnail(size: thumbnailSize)
-                // Only update if still same generation
-                if viewModel.searchGeneration == currentGeneration {
-                    viewModel.thumbnailCache[key] = placeholder
-                    viewModel.loadingThumbnails.remove(key)
-                }
+                viewModel.failThumbnailLoad(
+                    with: placeholder,
+                    for: key,
+                    generation: currentGeneration
+                )
             }
         }
     }

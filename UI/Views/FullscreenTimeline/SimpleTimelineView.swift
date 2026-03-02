@@ -7741,7 +7741,7 @@ struct FilterPanel: View {
                 .frame(height: 1)
                 .padding(.horizontal, 16)
 
-            // Two-column grid plus dedicated comments row
+            // Two-column grid plus dedicated date row
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .top, spacing: 12) {
                     // Left column: Apps and Visibility
@@ -7789,7 +7789,7 @@ struct FilterPanel: View {
                     }
                     .frame(maxWidth: .infinity)
 
-                    // Right column: Tags and Date Range
+                    // Right column: Tags and Comments
                     VStack(alignment: .leading, spacing: 12) {
                         // Tags
                         CompactFilterDropdown(
@@ -7812,48 +7812,48 @@ struct FilterPanel: View {
                             }
                         )
 
-                        // Date Range
+                        // Comments
                         CompactFilterDropdown(
-                            label: "DATE",
-                            value: dateRangeLabel,
-                            icon: "calendar",
-                            isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
-                            isOpen: viewModel.activeFilterDropdown == .dateRange,
+                            label: "COMMENTS",
+                            value: commentFilterLabel,
+                            icon: "text.bubble",
+                            isActive: viewModel.pendingFilterCriteria.commentFilter != .allFrames,
+                            isOpen: viewModel.activeFilterDropdown == .comments,
                             onTap: { frame in
                                 withAnimation(.easeOut(duration: 0.15)) {
-                                    if viewModel.activeFilterDropdown == .dateRange {
+                                    if viewModel.activeFilterDropdown == .comments {
                                         viewModel.dismissFilterDropdown()
                                     } else {
-                                        viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
+                                        viewModel.showFilterDropdown(.comments, anchorFrame: frame)
                                     }
                                 }
                             },
                             onFrameAvailable: { frame in
-                                viewModel.filterAnchorFrames[.dateRange] = frame
+                                viewModel.filterAnchorFrames[.comments] = frame
                             }
                         )
                     }
                     .frame(maxWidth: .infinity)
                 }
 
-                // Comments row
+                // Date row (full width)
                 CompactFilterDropdown(
-                    label: "COMMENTS",
-                    value: commentFilterLabel,
-                    icon: "text.bubble",
-                    isActive: viewModel.pendingFilterCriteria.commentFilter != .allFrames,
-                    isOpen: viewModel.activeFilterDropdown == .comments,
+                    label: "DATE",
+                    value: dateRangeLabel,
+                    icon: "calendar",
+                    isActive: viewModel.pendingFilterCriteria.startDate != nil || viewModel.pendingFilterCriteria.endDate != nil,
+                    isOpen: viewModel.activeFilterDropdown == .dateRange,
                     onTap: { frame in
                         withAnimation(.easeOut(duration: 0.15)) {
-                            if viewModel.activeFilterDropdown == .comments {
+                            if viewModel.activeFilterDropdown == .dateRange {
                                 viewModel.dismissFilterDropdown()
                             } else {
-                                viewModel.showFilterDropdown(.comments, anchorFrame: frame)
+                                viewModel.showFilterDropdown(.dateRange, anchorFrame: frame)
                             }
                         }
                     },
                     onFrameAvailable: { frame in
-                        viewModel.filterAnchorFrames[.comments] = frame
+                        viewModel.filterAnchorFrames[.dateRange] = frame
                     }
                 )
             }
@@ -8122,7 +8122,7 @@ struct FilterPanel: View {
                         return nil
                     }
                     if event.keyCode == 125, fieldIndex == 2 { // Down from Browser URL -> Apply
-                        viewModel.advancedFocusedFieldIndex = 0
+                        viewModel.advancedFocusedFieldIndex = -4
                         focusedActionButton = hasApplyButton ? .apply : .clear
                         return nil
                     }
@@ -8193,6 +8193,7 @@ struct FilterPanel: View {
                     if fieldIndex == 0 {
                         // Advanced header is highlighted: Tab goes to action buttons first.
                         if !isShiftHeld {
+                            viewModel.advancedFocusedFieldIndex = -4
                             focusedActionButton = leadingActionButtonFocus
                             return nil
                         }
@@ -8201,7 +8202,7 @@ struct FilterPanel: View {
                         return event
                     } else if !isShiftHeld && fieldIndex == 2 {
                         // Tab on Browser URL -> action buttons first (Clear, then Apply).
-                        viewModel.advancedFocusedFieldIndex = 0
+                        viewModel.advancedFocusedFieldIndex = -4
                         focusedActionButton = leadingActionButtonFocus
                         return nil
                     } else if isShiftHeld && fieldIndex == 2 {
@@ -8328,6 +8329,11 @@ struct AdvancedFiltersSection: View {
         viewModel.activeFilterDropdown == .advanced
     }
 
+    /// Keyboard highlight when tab focus is on the Advanced header row.
+    private var isHeaderKeyboardHighlighted: Bool {
+        isAdvancedActive && viewModel.advancedFocusedFieldIndex == 0
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Toggle header
@@ -8374,7 +8380,12 @@ struct AdvancedFiltersSection: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(isHeaderHovered ? RetraceMenuStyle.filterStrokeStrong : Color.clear, lineWidth: 1.2)
+                    .stroke(
+                        (isHeaderHovered || isHeaderKeyboardHighlighted)
+                            ? RetraceMenuStyle.filterStrokeStrong
+                            : Color.clear,
+                        lineWidth: 1.2
+                    )
                     .padding(.horizontal, 16)
             )
             .onHover { hovering in
@@ -8491,8 +8502,8 @@ struct AdvancedFiltersSection: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     focusedField = .windowName
                 }
-            } else if newValue == 0 && viewModel.activeFilterDropdown == .advanced {
-                // Tab moved focus to panel action buttons; clear text field focus/caret.
+            } else if (newValue == 0 || newValue == -4) && viewModel.activeFilterDropdown == .advanced {
+                // Advanced header (0) or action-button sentinel (-4): clear text-field focus/caret.
                 focusedField = nil
             } else if newValue == -2 && viewModel.activeFilterDropdown == .advanced {
                 // Shift+Tab from filter action buttons -> focus Browser URL.
@@ -8517,7 +8528,12 @@ struct AdvancedFiltersSection: View {
             switch newValue {
             case .windowName: viewModel.advancedFocusedFieldIndex = 1
             case .browserUrl: viewModel.advancedFocusedFieldIndex = 2
-            case nil: viewModel.advancedFocusedFieldIndex = 0
+            case nil:
+                // Preserve the "action buttons focused" sentinel so the Advanced header
+                // does not also appear keyboard-highlighted.
+                if viewModel.advancedFocusedFieldIndex != -4 {
+                    viewModel.advancedFocusedFieldIndex = 0
+                }
             }
         }
     }

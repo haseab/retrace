@@ -225,6 +225,11 @@ public struct SearchFilterBar: View {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showVisibilityDropdown = false
                         }
+                    },
+                    onKeyboardSelect: {
+                        // Keep Enter behavior aligned with Tab order:
+                        // Visibility -> Comments.
+                        viewModel.openFilterSignal = (6, UUID())
                     }
                 )
             }
@@ -255,6 +260,11 @@ public struct SearchFilterBar: View {
                         withAnimation(.easeOut(duration: 0.15)) {
                             showCommentDropdown = false
                         }
+                    },
+                    onKeyboardSelect: {
+                        // Keep Enter behavior aligned with Tab order:
+                        // Comments -> Advanced.
+                        viewModel.openFilterSignal = (7, UUID())
                     }
                 )
             }

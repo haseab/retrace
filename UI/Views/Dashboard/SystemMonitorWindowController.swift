@@ -103,9 +103,9 @@ public class SystemMonitorWindowController: NSObject {
 
         window.title = "System Monitor"
         window.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
-        window.setContentSize(NSSize(width: 781, height: 625))
-        window.minSize = NSSize(width: 781, height: 625)
-        window.maxSize = NSSize(width: 781, height: 625)
+        window.setContentSize(NSSize(width: 1220, height: 700))
+        window.minSize = NSSize(width: 1220, height: 700)
+        window.maxSize = NSSize(width: 1220, height: 700)
         window.center()
 
         window.level = .normal

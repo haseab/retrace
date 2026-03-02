@@ -127,8 +127,13 @@ public actor StorageManager: StorageProtocol {
     /// Fast single-frame extraction using AVAssetImageGenerator
     /// This is much faster than decoding all frames - AVFoundation handles B-frame decoding internally
     /// Generator instances are cached per video path for efficient scrubbing.
-    /// Cache is automatically invalidated on time mismatch (stale duration) and retried with a fresh generator.
-    private func extractSingleFrame(from videoURL: URL, frameIndex: Int, frameRate: Double = 30.0) async throws -> Data {
+    /// Cache is automatically invalidated on time mismatch (stale duration) and retried with a fresh generator in strict mode.
+    private func extractSingleFrame(
+        from videoURL: URL,
+        frameIndex: Int,
+        frameRate: Double = 30.0,
+        enforceTimestampMatch: Bool = true
+    ) async throws -> Data {
         let cacheKey = videoURL.path
 
         // Check if file exists
@@ -218,7 +223,7 @@ public actor StorageManager: StorageProtocol {
                 let actualSeconds = actualTime.seconds
                 let diffMs = abs(requestedSeconds - actualSeconds) * 1000
 
-                if diffMs > 10 { // More than 10ms difference
+                if enforceTimestampMatch, diffMs > 10 { // More than 10ms difference
                     if useCached {
                         // Cached generator returned wrong frame - retry with fresh generator
                         Log.warning("[VideoExtract] ⚠️ TIME MISMATCH (cached): frameIndex=\(frameIndex), requested=\(String(format: "%.3f", requestedSeconds))s, actual=\(String(format: "%.3f", actualSeconds))s, retrying with fresh generator", category: .storage)
@@ -266,9 +271,17 @@ public actor StorageManager: StorageProtocol {
 
     /// Read a frame from a video at a specific path
     /// Uses fast single-frame extraction via AVAssetImageGenerator
-    public func readFrameFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
+    public func readFrameFromPath(
+        videoPath: String,
+        frameIndex: Int,
+        enforceTimestampMatch: Bool = true
+    ) async throws -> Data {
         let videoURL = URL(fileURLWithPath: videoPath)
-        return try await extractSingleFrame(from: videoURL, frameIndex: frameIndex)
+        return try await extractSingleFrame(
+            from: videoURL,
+            frameIndex: frameIndex,
+            enforceTimestampMatch: enforceTimestampMatch
+        )
     }
 
     // MARK: - Legacy decode-all methods (kept for easy rollback if B-frame issues occur)

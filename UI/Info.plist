@@ -52,7 +52,7 @@
 
     <!-- Privacy - Accessibility Usage Description -->
     <key>NSAppleEventsUsageDescription</key>
-    <string>Retrace needs accessibility permission to extract text from applications. All data stays local and encrypted on your Mac.</string>
+    <string>Retrace needs Automation permission to extract the browser url. If you're getting this notice, you're likely using an application that doesn't support url extraction via accessibility APIs, so URL Extraction needs to be done via Apple Script. All data stays local and encrypted on your Mac.</string>
 
     <!-- Required Entitlements -->
     <key>com.apple.security.device.screen-recording</key>

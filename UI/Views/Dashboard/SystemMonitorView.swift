@@ -6,6 +6,8 @@ import Processing
 /// System monitor view showing background task status
 public struct SystemMonitorView: View {
     @StateObject private var viewModel: SystemMonitorViewModel
+    @StateObject private var scrollLatch = SystemMonitorScrollLatchState()
+    @State private var localScrollMonitor: Any?
 
     public init(coordinator: AppCoordinator) {
         _viewModel = StateObject(wrappedValue: SystemMonitorViewModel(coordinator: coordinator))
@@ -35,7 +37,8 @@ public struct SystemMonitorView: View {
                     VStack(alignment: .leading, spacing: 16) {
                         // OCR Processing Section
                         ocrProcessingSection
-                        processCPUSummarySection
+                            .padding(.bottom, 40)
+                        processResourceSummarySection
 
                         // Future sections placeholder
                         // - Data Transfers
@@ -46,15 +49,18 @@ public struct SystemMonitorView: View {
                     .padding(.horizontal, 32)
                     .padding(.bottom, 32)
                 }
+                .scrollDisabled(isOuterScrollDisabled)
             }
         }
         .task {
             await viewModel.startMonitoring()
         }
         .onAppear {
+            installScrollMonitorIfNeeded()
             ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: true)
         }
         .onDisappear {
+            removeScrollMonitor()
             ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
             viewModel.stopMonitoring()
         }
@@ -492,8 +498,70 @@ public struct SystemMonitorView: View {
         }
     }
 
+    private var processResourceSummarySection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Image(systemName: "gauge.with.needle")
+                    .font(.retraceCallout)
+                    .foregroundColor(.retraceSecondary)
+
+                Text("Process Resource Logs (last 12h)")
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+
+                Button("Restart Baseline") {
+                    ProcessCPUMonitor.shared.resetSampler()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(0.9))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.06))
+                .cornerRadius(6)
+                .help("Clear CPU/memory sampler history and restart baseline collection")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
+            .padding(.bottom, 10)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            HStack(alignment: .top, spacing: 12) {
+                processCPUSummarySection
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                processMemorySummarySection
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            }
+            .padding(12)
+        }
+        .background(Color.white.opacity(0.02))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
     private var processCPUSummarySection: some View {
-        ProcessCPUSummaryCard()
+        ProcessCPUSummaryCard(
+            onRowsHoverChanged: { hovering in
+                scrollLatch.updateHover(cpu: hovering)
+            },
+            isRowsScrollEnabled: isCPUScrollEnabled
+        )
+    }
+
+    private var processMemorySummarySection: some View {
+        ProcessMemorySummaryCard(
+            onRowsHoverChanged: { hovering in
+                scrollLatch.updateHover(memory: hovering)
+            },
+            isRowsScrollEnabled: isMemoryScrollEnabled
+        )
     }
 
     private var statusBadge: some View {
@@ -518,6 +586,130 @@ public struct SystemMonitorView: View {
             return String(format: "%.1fK", Double(number) / 1_000)
         }
         return "\(number)"
+    }
+
+    private var isOuterScrollDisabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .cpu, .memory:
+            return true
+        case .outer, .none:
+            return false
+        }
+    }
+
+    private var isCPUScrollEnabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .outer, .memory:
+            return false
+        case .cpu, .none:
+            return true
+        }
+    }
+
+    private var isMemoryScrollEnabled: Bool {
+        switch scrollLatch.latchedTarget {
+        case .outer, .cpu:
+            return false
+        case .memory, .none:
+            return true
+        }
+    }
+
+    private func installScrollMonitorIfNeeded() {
+        guard localScrollMonitor == nil else { return }
+
+        localScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+            scrollLatch.handleScrollEvent(event)
+            return event
+        }
+    }
+
+    private func removeScrollMonitor() {
+        if let localScrollMonitor {
+            NSEvent.removeMonitor(localScrollMonitor)
+            self.localScrollMonitor = nil
+        }
+        scrollLatch.reset()
+    }
+}
+
+@MainActor
+private final class SystemMonitorScrollLatchState: ObservableObject {
+    enum ScrollTarget {
+        case outer
+        case cpu
+        case memory
+    }
+
+    @Published private(set) var latchedTarget: ScrollTarget?
+
+    private var isHoveringCPULogTable = false
+    private var isHoveringMemoryLogTable = false
+    private var lastScrollTimestamp: CFAbsoluteTime = 0
+    private var releaseWorkItem: DispatchWorkItem?
+
+    private let scrollSequenceGap: CFAbsoluteTime = 0.12
+    private let releaseDelay: TimeInterval = 0.16
+    private let systemMonitorWindowTitle = "System Monitor"
+
+    func updateHover(cpu: Bool? = nil, memory: Bool? = nil) {
+        if let cpu {
+            isHoveringCPULogTable = cpu
+        }
+        if let memory {
+            isHoveringMemoryLogTable = memory
+        }
+    }
+
+    func handleScrollEvent(_ event: NSEvent) {
+        guard event.window?.title == systemMonitorWindowTitle else { return }
+
+        let now = CFAbsoluteTimeGetCurrent()
+        let phase = event.phase
+        let momentumPhase = event.momentumPhase
+        let startedByPhase = phase.contains(.began) || phase.contains(.mayBegin)
+        let startedByGap = latchedTarget == nil || (now - lastScrollTimestamp) > scrollSequenceGap
+
+        if startedByPhase || startedByGap {
+            latchedTarget = hoveredTarget
+        }
+        lastScrollTimestamp = now
+
+        releaseWorkItem?.cancel()
+        let hasEnded = phase.contains(.ended) || phase.contains(.cancelled) ||
+            momentumPhase.contains(.ended) || momentumPhase.contains(.cancelled)
+        if hasEnded {
+            latchedTarget = nil
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.latchedTarget = nil
+        }
+        releaseWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + releaseDelay, execute: workItem)
+    }
+
+    func reset() {
+        releaseWorkItem?.cancel()
+        releaseWorkItem = nil
+        latchedTarget = nil
+        isHoveringCPULogTable = false
+        isHoveringMemoryLogTable = false
+    }
+
+    private var hoveredTarget: ScrollTarget {
+        if isHoveringCPULogTable {
+            return .cpu
+        }
+        if isHoveringMemoryLogTable {
+            return .memory
+        }
+        return .outer
+    }
+
+    deinit {
+        releaseWorkItem?.cancel()
     }
 }
 

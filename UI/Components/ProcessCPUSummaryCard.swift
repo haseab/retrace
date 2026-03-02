@@ -3,12 +3,28 @@ import Shared
 
 struct ProcessCPUSummaryCard: View {
     private static let cpuRowsPageSize = 10
-    private static let cpuRowsContainerHeight: CGFloat = 228
+    private static let cpuRowsContainerHeight: CGFloat = 240
+
+    private let onRowsHoverChanged: ((Bool) -> Void)?
+    private let isRowsScrollEnabled: Bool
+
+    private struct DisplayedCPURow: Identifiable {
+        let row: ProcessCPURow
+        let rank: Int
+        let isPinnedRetrace: Bool
+
+        var id: String { row.id }
+    }
 
     @ObservedObject private var processCPUMonitor = ProcessCPUMonitor.shared
     @StateObject private var appMetadataCache = AppMetadataCache.shared
     @State private var cpuProcessRowsVisible = Self.cpuRowsPageSize
     @State private var cpuProcessScrollTargetID: String?
+
+    init(onRowsHoverChanged: ((Bool) -> Void)? = nil, isRowsScrollEnabled: Bool = true) {
+        self.onRowsHoverChanged = onRowsHoverChanged
+        self.isRowsScrollEnabled = isRowsScrollEnabled
+    }
 
     var body: some View {
         let snapshot = processCPUMonitor.snapshot
@@ -19,23 +35,11 @@ struct ProcessCPUSummaryCard: View {
                     .font(.retraceCallout)
                     .foregroundColor(.retraceSecondary)
 
-                Text("Cumulative CPU (from log, last 24h)")
+                Text("CPU Log")
                     .font(.retraceCalloutBold)
                     .foregroundColor(.retracePrimary)
 
                 Spacer()
-
-                Button("Restart") {
-                    processCPUMonitor.resetSampler()
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.retraceSecondary.opacity(0.9))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(6)
-                .help("Clear CPU sampler history and restart baseline collection")
             }
             .padding(.horizontal, 12)
             .padding(.top, 12)
@@ -45,16 +49,19 @@ struct ProcessCPUSummaryCard: View {
                 .background(Color.white.opacity(0.06))
 
             VStack(alignment: .leading, spacing: 12) {
-            Text("Activity Monitor %CPU is one-core scale. Total Share = %CPU ÷ \(max(snapshot.logicalCoreCount, 1)) cores. Running Share is relative to tracked processes.")
-                .font(.retraceCaption2)
-                .foregroundColor(.retraceSecondary.opacity(0.85))
+            Text("Avg % uses total machine capacity (\(max(snapshot.logicalCoreCount, 1)) cores). Run % is this table's internal share.")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.retraceSecondary.opacity(0.9))
 
             if snapshot.hasEnoughData {
                 let totalRows = snapshot.topProcesses.count
                 let visibleRows = min(max(Self.cpuRowsPageSize, cpuProcessRowsVisible), totalRows)
                 let hasMoreRows = visibleRows < totalRows
+                let displayedRows = buildDisplayedRows(from: snapshot, visibleRows: visibleRows)
+                // Keep the parent scroll area in control until the user expands past the first page.
+                let allowsInnerScroll = isRowsScrollEnabled && visibleRows > Self.cpuRowsPageSize
 
-                Text("Sampled duration: \(formatWindowDuration(snapshot.sampleDurationSeconds)) • Total tracked CPU work: \(formatCPUSec(snapshot.totalTrackedCPUSeconds)) CPU Seconds")
+                Text("Sampled duration: \(formatWindowDuration(snapshot.sampleDurationSeconds)) • Total tracked: \(formatCPUSec(snapshot.totalTrackedCPUSeconds)) CPU Seconds")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.65))
 
@@ -64,95 +71,99 @@ struct ProcessCPUSummaryCard: View {
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundColor(.retraceSecondary.opacity(0.7))
                         Spacer()
-                        VStack(alignment: .trailing, spacing: 0) {
-                            Text("CPU")
-                            Text("Seconds")
-                        }
+                        Text("CPU s")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 68, alignment: .trailing)
-                        VStack(alignment: .trailing, spacing: 0) {
-                            Text("Running")
-                            Text("Share %")
-                        }
+                        .frame(width: 50, alignment: .trailing)
+                        Text("Run %")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 58, alignment: .trailing)
-                        VStack(alignment: .trailing, spacing: 0) {
-                            Text("Avg CPU")
-                            Text("Usage %")
-                        }
+                        .frame(width: 46, alignment: .trailing)
+                        Text("Avg %")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundColor(.retraceAccent.opacity(0.95))
-                        .frame(width: 68, alignment: .trailing)
-                        VStack(alignment: .trailing, spacing: 0) {
-                            Text("Peak CPU")
-                            Text("Usage %")
-                        }
+                        .frame(width: 46, alignment: .trailing)
+                        Text("Peak %")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 100, alignment: .trailing)
+                        .frame(width: 50, alignment: .trailing)
                     }
                     .padding(.bottom, 6)
 
                     ScrollViewReader { proxy in
                         ScrollView(showsIndicators: true) {
                             LazyVStack(spacing: 0) {
-                                ForEach(Array(snapshot.topProcesses.prefix(visibleRows).enumerated()), id: \.element.id) { index, row in
-                                    let rowNumber = index + 1
+                                ForEach(Array(displayedRows.enumerated()), id: \.element.id) { index, displayedRow in
+                                    let row = displayedRow.row
+                                    let rowNumber = displayedRow.rank
                                     let peakTotalSharePercent = snapshot.logicalCoreCount > 0
                                         ? ((snapshot.peakPercentByGroup[row.id] ?? 0) / Double(snapshot.logicalCoreCount))
                                         : 0
 
-                                    HStack(spacing: 8) {
+                                    HStack(spacing: 6) {
                                         Text("\(rowNumber).")
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retraceSecondary.opacity(0.75))
                                             .lineLimit(1)
-                                            .frame(width: 26, alignment: .leading)
+                                            .frame(width: 28, alignment: .leading)
 
                                         processIconView(for: row)
-                                            .frame(width: 16, height: 16)
+                                            .frame(width: 17, height: 17)
 
                                         Text(row.name)
-                                            .font(.system(size: 11, weight: .regular))
+                                            .font(.system(size: 12, weight: .regular))
                                             .foregroundColor(.retracePrimary)
                                             .lineLimit(1)
 
-                                        Spacer(minLength: 4)
+                                        Spacer(minLength: 2)
 
                                         Text(formatCPUSec(row.cpuSeconds))
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retracePrimary)
-                                            .frame(width: 68, alignment: .trailing)
+                                            .frame(width: 50, alignment: .trailing)
 
                                         Text(formatCPUPercent(row.shareOfTrackedPercent))
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retraceSecondary.opacity(0.95))
-                                            .frame(width: 58, alignment: .trailing)
+                                            .frame(width: 46, alignment: .trailing)
 
                                         Text(formatCPUPercent(row.capacityPercent))
-                                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
                                             .foregroundColor(.retraceAccent.opacity(0.95))
-                                            .frame(width: 68, alignment: .trailing)
+                                            .frame(width: 46, alignment: .trailing)
 
                                         Text(formatCPUPercent(peakTotalSharePercent))
-                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retraceSecondary.opacity(0.95))
-                                            .frame(width: 100, alignment: .trailing)
+                                            .frame(width: 50, alignment: .trailing)
                                     }
                                     .padding(.vertical, 3)
+                                    .background(
+                                        displayedRow.isPinnedRetrace
+                                            ? Color.retraceAccent.opacity(0.08)
+                                            : Color.clear
+                                    )
+                                    .cornerRadius(4)
                                     .id(cpuProcessRowAnchorID(rowNumber))
 
-                                    if index < visibleRows - 1 {
+                                    if index < displayedRows.count - 1 {
                                         Divider()
                                             .background(Color.white.opacity(0.06))
                                     }
                                 }
                             }
                         }
+                        .scrollDisabled(!allowsInnerScroll)
                         .frame(height: Self.cpuRowsContainerHeight)
                         .clipped()
+                        .onHover { hovering in
+                            onRowsHoverChanged?(allowsInnerScroll ? hovering : false)
+                        }
+                        .onChange(of: allowsInnerScroll) { enabled in
+                            if !enabled {
+                                onRowsHoverChanged?(false)
+                            }
+                        }
                         .onChange(of: cpuProcessScrollTargetID) { targetID in
                             guard let targetID else { return }
                             DispatchQueue.main.async {
@@ -189,24 +200,7 @@ struct ProcessCPUSummaryCard: View {
                 .background(Color.black.opacity(0.18))
                 .cornerRadius(8)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Legend")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.retraceSecondary.opacity(0.75))
-                    Text("CPU Seconds: Total CPU work accumulated by the process during sampled time.")
-                        .font(.system(size: 10))
-                        .foregroundColor(.retraceSecondary.opacity(0.8))
-                    Text("Running Share %: Process share of total tracked CPU work in this table.")
-                        .font(.system(size: 10))
-                        .foregroundColor(.retraceSecondary.opacity(0.8))
-                    Text("Avg CPU Usage %: Process share of total machine CPU capacity (all cores), averaged over sampled time.")
-                        .font(.system(size: 10))
-                        .foregroundColor(.retraceSecondary.opacity(0.8))
-                    Text("Peak CPU Usage %: Highest sampled instant share of total machine CPU capacity (all cores).")
-                        .font(.system(size: 10))
-                        .foregroundColor(.retraceSecondary.opacity(0.8))
-                }
-                .padding(.top, 2)
+                cpuUsageGuidePanel
             } else {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -225,6 +219,9 @@ struct ProcessCPUSummaryCard: View {
             cpuProcessRowsVisible = Self.cpuRowsPageSize
             cpuProcessScrollTargetID = nil
         }
+        .onDisappear {
+            onRowsHoverChanged?(false)
+        }
     }
 
     private func formatCPUSec(_ seconds: Double) -> String {
@@ -235,11 +232,149 @@ struct ProcessCPUSummaryCard: View {
     }
 
     private func formatCPUPercent(_ percent: Double) -> String {
-        String(format: "%.2f%%", percent)
+        String(format: "%.1f%%", percent)
     }
 
     private func cpuProcessRowAnchorID(_ rowNumber: Int) -> String {
         "systemMonitor.cpuProcessRow.\(rowNumber)"
+    }
+
+    private var cpuUsageGuidePanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Avg CPU Usage Guide")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.retracePrimary)
+
+            cpuUsageScaleBar
+                .padding(.top, 4)
+            cpuBoundaryValueRow
+
+            Text("Note: Retrace will likely consume more Avg. CPU than other apps")
+                .font(.system(size: 10))
+                .foregroundColor(.retraceSecondary.opacity(0.85))
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+            Text("That is fine so long as it is within the green range. Pause OCR to reduce CPU usage.")
+                .font(.system(size: 10))
+                .foregroundColor(.retraceSecondary.opacity(0.85))
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+        }
+
+        .padding(10)
+        .background(Color.white.opacity(0.03))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+
+    private var cpuUsageScaleBar: some View {
+        Capsule()
+            .fill(
+                LinearGradient(
+                    stops: [
+                        .init(color: Color.green.opacity(0.85), location: 0.00),
+                        .init(color: Color.green.opacity(0.85), location: 0.33),
+                        .init(color: Color.yellow.opacity(0.90), location: 0.33),
+                        .init(color: Color.yellow.opacity(0.90), location: 0.66),
+                        .init(color: Color.red.opacity(0.90), location: 0.66),
+                        .init(color: Color.red.opacity(0.90), location: 1.00)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            )
+            .frame(height: 10)
+            .overlay {
+                GeometryReader { geometry in
+                    let width = geometry.size.width
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                        Rectangle()
+                            .fill(Color.white.opacity(0.45))
+                            .frame(width: 1, height: 12)
+                            .offset(x: max(0, (width * 0.33) - 0.5), y: -1)
+                        Rectangle()
+                            .fill(Color.white.opacity(0.45))
+                            .frame(width: 1, height: 12)
+                            .offset(x: max(0, (width * 0.66) - 0.5), y: -1)
+                    }
+                }
+                .allowsHitTesting(false)
+            }
+            .accessibilityLabel("CPU usage guide scale")
+            .accessibilityValue("Thresholds at 5 and 10 percent, with lower usage better")
+    }
+
+    private var cpuBoundaryValueRow: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            ZStack(alignment: .leading) {
+                HStack {
+                    Text("Good")
+                        .font(.system(size: 10, weight: .semibold))
+                    Spacer()
+                    Text("Bad")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+
+                Text("5%")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .frame(width: 30, alignment: .center)
+                    .offset(x: max(0, (width * 0.33) - 15))
+                Text("10%")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .frame(width: 36, alignment: .center)
+                    .offset(x: max(0, (width * 0.66) - 18))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(height: 14)
+        .foregroundColor(.retraceSecondary.opacity(0.92))
+    }
+
+    private func buildDisplayedRows(from snapshot: ProcessCPUSnapshot, visibleRows: Int) -> [DisplayedCPURow] {
+        let rankedRows = snapshot.topProcesses
+        guard !rankedRows.isEmpty else { return [] }
+        let retraceGroupKey = snapshot.retraceGroupKey
+
+        var displayed = rankedRows
+            .prefix(visibleRows)
+            .enumerated()
+            .map { offset, row in
+                DisplayedCPURow(
+                    row: row,
+                    rank: offset + 1,
+                    isPinnedRetrace: row.id == retraceGroupKey
+                )
+            }
+
+        if let retraceGroupKey,
+           let retraceIndex = rankedRows.firstIndex(where: { $0.id == retraceGroupKey }),
+           retraceIndex >= visibleRows {
+            let retraceRow = DisplayedCPURow(
+                row: rankedRows[retraceIndex],
+                rank: retraceIndex + 1,
+                isPinnedRetrace: true
+            )
+
+            if displayed.isEmpty {
+                displayed.append(retraceRow)
+            } else {
+                displayed[displayed.count - 1] = retraceRow
+            }
+        }
+
+        return displayed
     }
 
     @ViewBuilder
@@ -252,7 +387,7 @@ struct ProcessCPUSummaryCard: View {
                     .clipShape(RoundedRectangle(cornerRadius: 3))
             } else {
                 Image(systemName: "app.fill")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundColor(.retraceSecondary.opacity(0.75))
             }
         }

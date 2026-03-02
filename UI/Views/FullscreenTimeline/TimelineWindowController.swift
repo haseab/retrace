@@ -65,6 +65,12 @@ public class TimelineWindowController: NSObject {
 
     /// Shared hidden-state cache expiry used by timeline and search-state invalidation.
     static let hiddenStateCacheExpirationSeconds: TimeInterval = 60
+    /// Reopen policy: when playhead is within this many latest loaded frames, open in live mode immediately.
+    private static let instantLiveReopenFrameThreshold: Int = 3
+    /// Reopen policy: if playhead is this close (< threshold) to latest frame, allow auto-advance after expiry.
+    private static let nearLiveReopenFrameThreshold: Int = 50
+    /// Reopen policy: hidden duration required before near-live positions auto-advance to newest.
+    private static let nearLiveReopenExpirationSeconds: TimeInterval = 10
 
     /// Monotonic counter for deeplink search invocations (debug tracing).
     private var deeplinkSearchInvocationCounter = 0
@@ -464,6 +470,9 @@ public class TimelineWindowController: NSObject {
         }
 
         isPrepared = true
+        // Keep prerendered state fresh even before the first hide/show cycle.
+        // Otherwise, the first open after a long idle can surface stale timeline data.
+        startBackgroundRefreshTimer()
         Log.info("[TIMELINE-PRERENDER] ✅ prepareWindow() completed, total=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
     }
 
@@ -492,9 +501,53 @@ public class TimelineWindowController: NSObject {
         liveModeCaptureTask = nil
         captureFocusRestoreTarget()
 
-        // Only capture/use live screenshot if playhead is at or near the latest frame (last 2 frames)
+        // Only capture/use live screenshot if playhead is at or near the latest frame (last 3 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
-        let shouldUseLiveMode = timelineViewModel?.isNearLatestLoadedFrame(within: 2) ?? true
+        var shouldUseLiveMode = true
+
+        if let viewModel = timelineViewModel {
+            let framesFromNewestBefore = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
+            let hiddenElapsedSeconds = lastHiddenAt.map { Date().timeIntervalSince($0) } ?? .infinity
+            let instantEligible = framesFromNewestBefore < Self.instantLiveReopenFrameThreshold
+            let nearEligible = framesFromNewestBefore < Self.nearLiveReopenFrameThreshold
+            let nearLiveExpiryElapsed = hiddenElapsedSeconds >= Self.nearLiveReopenExpirationSeconds
+            let cacheExpired = hiddenElapsedSeconds > Self.hiddenStateCacheExpirationSeconds
+            let hasActiveFilters = viewModel.filterCriteria.hasActiveFilters
+            let shouldAutoAdvanceNearLive = !hasActiveFilters && (instantEligible || (nearEligible && nearLiveExpiryElapsed))
+            let shouldSnapToNewestOnShow = cacheExpired || shouldAutoAdvanceNearLive
+            let hiddenLabel = hiddenElapsedSeconds.isFinite ? String(format: "%.1f", hiddenElapsedSeconds) : "inf"
+
+            let snapReason: String
+            if cacheExpired {
+                snapReason = "cache_expired"
+            } else if instantEligible {
+                snapReason = "instant_near_edge"
+            } else if nearEligible && nearLiveExpiryElapsed {
+                snapReason = "near_live_expired"
+            } else {
+                snapReason = "none"
+            }
+
+            if shouldSnapToNewestOnShow, !viewModel.frames.isEmpty {
+                let newestIndex = max(0, viewModel.frames.count - 1)
+                let oldIndex = viewModel.currentIndex
+                if oldIndex != newestIndex {
+                    viewModel.currentIndex = newestIndex
+                    Log.info(
+                        "[TIMELINE-REOPEN] snapOnShow oldIndex=\(oldIndex) newIndex=\(newestIndex) reason=\(snapReason)",
+                        category: .ui
+                    )
+                }
+            }
+
+            let framesFromNewestAfter = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
+            shouldUseLiveMode = viewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold)
+
+            Log.info(
+                "[TIMELINE-REOPEN] hidden=\(hiddenLabel)s framesFromNewestBefore=\(framesFromNewestBefore) framesFromNewestAfter=\(framesFromNewestAfter) instantEligible=\(instantEligible) nearEligible=\(nearEligible) nearExpiryElapsed=\(nearLiveExpiryElapsed) cacheExpired=\(cacheExpired) hasActiveFilters=\(hasActiveFilters) shouldSnapOnShow=\(shouldSnapToNewestOnShow) liveModeOnShow=\(shouldUseLiveMode)",
+                category: .ui
+            )
+        }
 
         // Remember if dashboard was the key window before we take over
         dashboardWasKeyWindow = DashboardWindowController.shared.isVisible &&
@@ -801,7 +854,12 @@ public class TimelineWindowController: NSObject {
                 Self.isTimelineVisible = false  // For emergency escape tap
                 self?.lastHiddenAt = Date()
                 self?.suppressLiveScrollUntil = 0
-                self?.startBackgroundRefreshTimer()
+                self?.startBackgroundRefreshTimer(resetSchedule: true)
+
+                // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
+                if let coordinator = self?.coordinator {
+                    await coordinator.setTimelineVisible(false)
+                }
 
                 // Clean up live mode state AFTER fade-out completes (prevents flicker)
                 if let viewModel = self?.timelineViewModel {
@@ -815,7 +873,10 @@ public class TimelineWindowController: NSObject {
                 // Immediately refresh frame data so next open has fresh data.
                 // Use navigateToNewest: false so short hide/show cycles preserve position.
                 if let viewModel = self?.timelineViewModel {
-                    await viewModel.refreshFrameData(navigateToNewest: false)
+                    await viewModel.refreshFrameData(
+                        navigateToNewest: false,
+                        allowNearLiveAutoAdvance: false
+                    )
                     // Reset zoom region state on hide
                     viewModel.exitZoomRegion()
                 }
@@ -824,11 +885,6 @@ public class TimelineWindowController: NSObject {
 
                 // Reset the cached scale factor so it recalculates for next window
                 TimelineScaleFactor.resetCache()
-
-                // Notify coordinator to resume frame processing
-                if let coordinator = self?.coordinator {
-                    await coordinator.setTimelineVisible(false)
-                }
 
                 // Post notification so menu bar can restore recording indicator
                 NotificationCenter.default.post(name: .timelineDidClose, object: nil)
@@ -945,7 +1001,7 @@ public class TimelineWindowController: NSObject {
             let screenshot = await self.captureLiveScreenshotAsync()
             guard !Task.isCancelled else { return }
             guard self.isVisible, self.timelineViewModel === targetViewModel else { return }
-            guard targetViewModel.isNearLatestLoadedFrame(within: 2) else { return }
+            guard targetViewModel.isNearLatestLoadedFrame(within: Self.instantLiveReopenFrameThreshold) else { return }
             guard let screenshot else {
                 // Fall back to historical frame rendering if live capture fails.
                 targetViewModel.isInLiveMode = false
@@ -960,7 +1016,12 @@ public class TimelineWindowController: NSObject {
     }
 
     /// Start a repeating timer that keeps timeline data fresh while hidden
-    private func startBackgroundRefreshTimer() {
+    private func startBackgroundRefreshTimer(resetSchedule: Bool = false) {
+        if resetSchedule {
+            backgroundRefreshTimer?.invalidate()
+            backgroundRefreshTimer = nil
+        }
+
         // Don't restart if already running
         guard backgroundRefreshTimer == nil else {
             return
@@ -980,15 +1041,27 @@ public class TimelineWindowController: NSObject {
                     return
                 }
 
-                // Check if hidden-state cache has expired.
-                // If expired, navigate to newest; if not expired, preserve user's position
+                // Check hidden-state cache expiry (shared with search/filter state invalidation).
+                // Separately, enforce near-live reopen policy:
+                // - Last 3 frames: immediate live/newest on next open.
+                // - Frames 4-49 from newest: require 10s hidden before auto-advancing.
                 let cacheExpirationSeconds = Self.hiddenStateCacheExpirationSeconds
+                let hiddenElapsedSeconds: TimeInterval
                 let cacheExpired: Bool
                 if let lastHidden = self.lastHiddenAt {
-                    cacheExpired = Date().timeIntervalSince(lastHidden) > cacheExpirationSeconds
+                    hiddenElapsedSeconds = Date().timeIntervalSince(lastHidden)
+                    cacheExpired = hiddenElapsedSeconds > cacheExpirationSeconds
                 } else {
+                    hiddenElapsedSeconds = .infinity
                     cacheExpired = true // No lastHiddenAt means first show, navigate to newest
                 }
+
+                let framesFromNewest = max(0, viewModel.frames.count - 1 - viewModel.currentIndex)
+                let shouldAdvanceImmediately = framesFromNewest < Self.instantLiveReopenFrameThreshold
+                let isNearLive = framesFromNewest < Self.nearLiveReopenFrameThreshold
+                let nearLiveExpiryElapsed = hiddenElapsedSeconds >= Self.nearLiveReopenExpirationSeconds
+                let shouldAutoAdvanceNearLive = shouldAdvanceImmediately || (isNearLive && nearLiveExpiryElapsed)
+                let shouldNavigateToNewest = cacheExpired || shouldAutoAdvanceNearLive
 
                 // Expire hidden-state caches together so reopen returns to fresh timeline/search state.
                 if cacheExpired {
@@ -1002,8 +1075,10 @@ public class TimelineWindowController: NSObject {
                     }
                 }
 
-                // Only preserve position if cache hasn't expired; after 1 minute, navigate to newest
-                await viewModel.refreshFrameData(navigateToNewest: cacheExpired)
+                await viewModel.refreshFrameData(
+                    navigateToNewest: shouldNavigateToNewest,
+                    allowNearLiveAutoAdvance: shouldAutoAdvanceNearLive || cacheExpired
+                )
                 // Force video reload so AVPlayer picks up new frames appended to the video file
                 viewModel.forceVideoReload = true
             }
@@ -1333,7 +1408,7 @@ public class TimelineWindowController: NSObject {
             viewModel.pendingFilterCriteria = criteria
 
             // Query and load frames
-            let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 500, filters: criteria)
+            let frames = try? await coordinator.getMostRecentFramesWithVideoInfo(limit: 50, filters: criteria)
 
             // Load frames directly into viewModel
             await viewModel.loadFramesDirectly(frames ?? [], clickStartTime: startTime)

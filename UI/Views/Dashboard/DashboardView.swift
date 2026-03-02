@@ -201,6 +201,7 @@ public struct DashboardView: View {
                                     )
                                 }
                             }
+                            .padding(.top, 2)
                             .padding(.bottom, 20) // Extra padding for scroll affordance
                         }
 
@@ -825,7 +826,7 @@ public struct DashboardView: View {
     // MARK: - Stats Cards Row
 
     private struct StatCardData: Identifiable {
-        let id = UUID()
+        let id: String
         let icon: String
         let title: String
         let value: String
@@ -835,6 +836,7 @@ public struct DashboardView: View {
         let valueFormatter: ((Int64) -> String)?
 
         init(icon: String, title: String, value: String, subtitle: String, graphData: [DailyDataPoint]? = nil, graphColor: Color = .retraceAccent, valueFormatter: ((Int64) -> String)? = nil) {
+            self.id = title
             self.icon = icon
             self.title = title
             self.value = value

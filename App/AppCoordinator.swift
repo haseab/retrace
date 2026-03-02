@@ -1571,9 +1571,20 @@ public actor AppCoordinator {
         return try await services.storage.readFrame(segmentID: videoSegmentID, frameIndex: frameIndex)
     }
 
-    /// Get frame image from a full video path (used for Rewind frames with string-based IDs)
-    public func getFrameImageFromPath(videoPath: String, frameIndex: Int) async throws -> Data {
-        return try await services.storage.readFrameFromPath(videoPath: videoPath, frameIndex: frameIndex)
+    /// Get frame image from a full video path (used for Rewind frames with string-based IDs).
+    /// When not explicitly provided, strict timestamp matching follows timeline visibility:
+    /// strict while visible, relaxed while hidden.
+    public func getFrameImageFromPath(
+        videoPath: String,
+        frameIndex: Int,
+        enforceTimestampMatch: Bool? = nil
+    ) async throws -> Data {
+        let shouldEnforceTimestampMatch = enforceTimestampMatch ?? isTimelineVisible
+        return try await services.storage.readFrameFromPath(
+            videoPath: videoPath,
+            frameIndex: frameIndex,
+            enforceTimestampMatch: shouldEnforceTimestampMatch
+        )
     }
 
     /// Get frames in a time range

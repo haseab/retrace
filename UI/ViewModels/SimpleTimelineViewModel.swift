@@ -20,9 +20,9 @@ public enum TimelineConfig {
 
 /// Configuration for infinite scroll rolling window
 private enum WindowConfig {
-    static let maxFrames = 500           // Maximum frames in memory
-    static let loadThreshold = 100       // Start loading when within N frames of edge
-    static let loadBatchSize = 200       // Frames to load per batch
+    static let maxFrames = 100            // Maximum frames in memory
+    static let loadThreshold = 20       // Start loading when within N frames of edge
+    static let loadBatchSize = 25        // Frames to load per batch
     static let loadWindowSpanSeconds: TimeInterval = 24 * 60 * 60 // Bounded window for load-more queries
 }
 
@@ -1656,7 +1656,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Background Refresh Throttling
 
-    /// Threshold: if user is within this many frames of newest, allow background refresh
+    /// Threshold: if user is within this many frames of newest, near-live reopen policy can apply.
     private static let nearLiveEdgeFrameThreshold: Int = 50
 
     // MARK: - Playhead Position History (for Cmd+Z undo)
@@ -1688,6 +1688,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
+
+#if DEBUG
+    // Test-only hooks for deterministic concurrency race coverage around refreshProcessingStatuses().
+    struct RefreshProcessingStatusesTestHooks {
+        var getFrameProcessingStatuses: (([Int64]) async throws -> [Int64: Int])?
+        var getFrameWithVideoInfoByID: ((FrameID) async throws -> FrameWithVideoInfo?)?
+    }
+
+    var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
+#endif
 
     // MARK: - Initialization
 
@@ -5320,7 +5330,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Always pass filterCriteria to ensure hidden filter is applied (default: .hide)
             Log.debug("[SimpleTimelineViewModel] Loading frames with filters - hasActiveFilters: \(filterCriteria.hasActiveFilters), apps: \(String(describing: filterCriteria.selectedApps)), mode: \(filterCriteria.appFilterMode.rawValue)", category: .ui)
             let framesWithVideoInfo = try await fetchMostRecentFramesWithVideoInfoLogged(
-                limit: 500,
+                limit: WindowConfig.maxFrames,
                 filters: filterCriteria,
                 reason: "loadMostRecentFrame"
             )
@@ -5466,24 +5476,30 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// rather than doing a full reload. The goal is to show fresh data quickly.
     /// - Parameter navigateToNewest: If true, automatically navigate to the newest frame when new frames are found.
     ///                               If false, preserve the current position (useful for background refresh).
-    public func refreshFrameData(navigateToNewest: Bool = true) async {
+    /// - Parameter allowNearLiveAutoAdvance: When `navigateToNewest` is false, allows near-live (<50 frames away)
+    ///                                       positions to auto-advance to newest. Callers can gate this by expiry.
+    public func refreshFrameData(
+        navigateToNewest: Bool = true,
+        allowNearLiveAutoAdvance: Bool = true
+    ) async {
         // If we have frames and a current position, just refresh the current image
         if !frames.isEmpty {
             // Background refresh rules:
             // - With filters active: always respect 1-minute cache expiry (no 50-frame optimization)
             // - Hidden > 1 minute (navigateToNewest=true): always refresh and navigate to newest
-            // - Hidden < 1 minute AND within 50 frames: refresh and navigate to newest
-            // - Hidden < 1 minute AND > 50 frames away: skip refresh entirely
+            // - Hidden < 1 minute AND < 50 frames away: only auto-advance when caller allows it
+            // - Hidden < 1 minute AND >= 50 frames away: skip refresh entirely
             let framesFromNewest = frames.count - 1 - currentIndex
             let shouldNavigateToNewest: Bool
             let hasActiveFilters = filterCriteria.hasActiveFilters
 
             if !navigateToNewest, currentIndex < frames.count, !hasActiveFilters {
-                if framesFromNewest > Self.nearLiveEdgeFrameThreshold {
+                let isNearLive = framesFromNewest < Self.nearLiveEdgeFrameThreshold
+                if !isNearLive || !allowNearLiveAutoAdvance {
                     loadImageIfNeeded()
                     return
                 }
-                // Within 50 frames - allow refresh AND navigate to newest
+                // Near-live and caller-authorized: refresh AND navigate to newest.
                 shouldNavigateToNewest = true
             } else if hasActiveFilters {
                 // With filters active, always use navigateToNewest (respects 1-minute cache expiry)
@@ -5525,11 +5541,30 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                         // Navigate to newest frame
                         if shouldNavigateToNewest {
+                            let oldIndex = currentIndex
                             currentIndex = frames.count - 1
+                            if oldIndex != currentIndex {
+                                Log.info(
+                                    "[TIMELINE-REOPEN] refreshSnap source=newFrames oldIndex=\(oldIndex) newIndex=\(currentIndex) appended=\(newTimelineFrames.count) total=\(frames.count)",
+                                    category: .ui
+                                )
+                            }
                         }
 
                         // Trim if we've exceeded max frames (preserve newer since we just added new frames)
                         trimWindowIfNeeded(preserveDirection: .newer)
+                    } else if shouldNavigateToNewest {
+                        // Reopen policy requested newest even if no fresh frame was appended.
+                        // Without this, users can remain a few frames behind indefinitely on static screens.
+                        let newestIndex = max(0, frames.count - 1)
+                        if currentIndex != newestIndex {
+                            let oldIndex = currentIndex
+                            currentIndex = newestIndex
+                            Log.info(
+                                "[TIMELINE-REOPEN] refreshSnap source=noNewFrames oldIndex=\(oldIndex) newIndex=\(newestIndex) total=\(frames.count)",
+                                category: .ui
+                            )
+                        }
                     }
                 } catch {
                     Log.error("[TIMELINE-REFRESH] Failed to check for new frames: \(error)", category: .ui)
@@ -5559,48 +5594,60 @@ public class SimpleTimelineViewModel: ObservableObject {
         let frameIDs = framesToRefresh.map { $0.element.frame.id.value }
 
         do {
-            let updatedStatuses = try await coordinator.getFrameProcessingStatuses(frameIDs: frameIDs)
+            let updatedStatuses = try await fetchFrameProcessingStatusesForRefresh(frameIDs: frameIDs)
 
             var updatedCount = 0
             var currentFrameUpdated = false
 
-            for (index, frame) in framesToRefresh {
-                // Validate index is still valid (frames array may have changed)
-                guard index < frames.count else {
+            for (_, snapshotFrame) in framesToRefresh {
+                let frameID = snapshotFrame.frame.id
+                guard let newStatus = updatedStatuses[frameID.value] else {
                     continue
                 }
 
-                // Also verify the frame ID still matches (defensive check)
-                guard frames[index].frame.id == frame.frame.id else {
+                // Resolve index by ID against the live array (never trust enumerated snapshot indices).
+                guard let liveIndex = frames.firstIndex(where: { $0.frame.id == frameID }) else {
                     continue
                 }
 
-                if let newStatus = updatedStatuses[frame.frame.id.value],
-                   newStatus != frame.processingStatus {
-                    // Re-fetch the full frame with updated videoInfo
-                    if let updatedFrame = try await coordinator.getFrameWithVideoInfoByID(id: frame.frame.id) {
-                        // Create updated TimelineFrame with new status AND updated videoInfo
-                        frames[index] = TimelineFrame(
-                            frame: updatedFrame.frame,
-                            videoInfo: updatedFrame.videoInfo,
-                            processingStatus: updatedFrame.processingStatus
-                        )
+                guard frames[liveIndex].processingStatus != newStatus else {
+                    continue
+                }
 
-                        // Check if this is the current frame
-                        if let currentFrame = currentTimelineFrame,
-                           currentFrame.frame.id.value == frame.frame.id.value {
-                            currentFrameUpdated = true
-                        }
-                    } else {
-                        // Still update the status even if we can't get videoInfo
-                        frames[index] = TimelineFrame(
-                            frame: frame.frame,
-                            videoInfo: frame.videoInfo,
-                            processingStatus: newStatus
-                        )
+                // Re-fetch the full frame with updated videoInfo.
+                if let updatedFrame = try await fetchFrameWithVideoInfoByIDForRefresh(id: frameID) {
+                    // Array may have changed while awaiting; resolve again before writing.
+                    guard let liveIndexAfterAwait = frames.firstIndex(where: { $0.frame.id == frameID }) else {
+                        continue
                     }
-                    updatedCount += 1
+
+                    frames[liveIndexAfterAwait] = TimelineFrame(
+                        frame: updatedFrame.frame,
+                        videoInfo: updatedFrame.videoInfo,
+                        processingStatus: updatedFrame.processingStatus
+                    )
+                } else {
+                    // Array may have changed while awaiting; resolve again before writing.
+                    guard let liveIndexAfterAwait = frames.firstIndex(where: { $0.frame.id == frameID }) else {
+                        continue
+                    }
+
+                    // Fallback: update only the status on the latest in-memory frame snapshot.
+                    let existingFrame = frames[liveIndexAfterAwait]
+                    frames[liveIndexAfterAwait] = TimelineFrame(
+                        frame: existingFrame.frame,
+                        videoInfo: existingFrame.videoInfo,
+                        processingStatus: newStatus
+                    )
                 }
+
+                // Check if this is the current frame.
+                if let currentFrame = currentTimelineFrame,
+                   currentFrame.frame.id.value == frameID.value {
+                    currentFrameUpdated = true
+                }
+
+                updatedCount += 1
             }
 
             if updatedCount > 0 {
@@ -5612,6 +5659,24 @@ public class SimpleTimelineViewModel: ObservableObject {
         } catch {
             Log.error("[TIMELINE-REFRESH] Failed to refresh processing statuses: \(error)", category: .ui)
         }
+    }
+
+    private func fetchFrameProcessingStatusesForRefresh(frameIDs: [Int64]) async throws -> [Int64: Int] {
+#if DEBUG
+        if let override = test_refreshProcessingStatusesHooks.getFrameProcessingStatuses {
+            return try await override(frameIDs)
+        }
+#endif
+        return try await coordinator.getFrameProcessingStatuses(frameIDs: frameIDs)
+    }
+
+    private func fetchFrameWithVideoInfoByIDForRefresh(id: FrameID) async throws -> FrameWithVideoInfo? {
+#if DEBUG
+        if let override = test_refreshProcessingStatusesHooks.getFrameWithVideoInfoByID {
+            return try await override(id)
+        }
+#endif
+        return try await coordinator.getFrameWithVideoInfoByID(id: id)
     }
 
     /// Start periodic processing status refresh (every 10 seconds)
@@ -10148,10 +10213,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             // User is scrolling toward older, trim newer frames from end
             Log.info("[Memory] TRIMMING \(excessCount) newer frames from END (preserving older)", category: .ui)
             frames = Array(frames.dropLast(excessCount))
-            // Only mark that there might be more newer frames if we haven't hit the absolute end
-            if !hasReachedAbsoluteEnd {
-                hasMoreNewer = true
-            }
+            // We just discarded newer frames from memory, so forward pagination is available again
+            // regardless of whether we previously observed the absolute end.
+            hasMoreNewer = true
+            hasReachedAbsoluteEnd = false
 
         case .newer:
             // User is scrolling toward newer, trim older frames from start
@@ -10159,10 +10224,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             frames = Array(frames.dropFirst(excessCount))
             // Adjust currentIndex
             currentIndex = max(0, currentIndex - excessCount)
-            // Only mark that there might be more older frames if we haven't hit the absolute start
-            if !hasReachedAbsoluteStart {
-                hasMoreOlder = true
-            }
+            // We just discarded older frames from memory, so backward pagination is available again.
+            hasMoreOlder = true
+            hasReachedAbsoluteStart = false
         }
 
         // Update boundaries after trimming
