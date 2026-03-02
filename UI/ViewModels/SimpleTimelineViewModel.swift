@@ -9122,13 +9122,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             with: " ",
             options: .regularExpression
         )
+        let normalizedWithCompactTimes = normalizeCompactTimeFormat(collapsedInput)
 
         if collapsedInput.range(of: #"^start of (the )?day$"#, options: .regularExpression) != nil {
             return calendar.startOfDay(for: now)
         }
 
         func finalizeParsedDate(_ parsedDate: Date) -> Date {
-            let anchorMode = inferDateSearchAnchorMode(for: normalizedInput)
+            let anchorMode = inferDateSearchAnchorMode(for: normalizedWithCompactTimes)
             let dateForYearAdjustment: Date
 
             // For date-only input ("Feb 23"), normalize to start-of-day before
@@ -9161,10 +9162,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Try SwiftyChrono first for comprehensive natural language parsing
         // Handles: "next Friday", "3 days from now", "last Monday", "in 2 weeks", etc.
         let chrono = Chrono()
-        if let result = chrono.parse(text: trimmed, refDate: now, opt: [:]).first?.start.date {
-            let normalized = finalizeParsedDate(result)
-            Log.debug("[DateSearch] SwiftyChrono parsed '\(trimmed)' as \(normalized)", category: .ui)
-            return normalized
+        let chronoInputs = normalizedWithCompactTimes == collapsedInput
+            ? [trimmed]
+            : [normalizedWithCompactTimes, trimmed]
+        for chronoInput in chronoInputs {
+            if let result = chrono.parse(text: chronoInput, refDate: now, opt: [:]).first?.start.date {
+                let normalized = finalizeParsedDate(result)
+                Log.debug("[DateSearch] SwiftyChrono parsed '\(chronoInput)' as \(normalized)", category: .ui)
+                return normalized
+            }
         }
 
         // === FALLBACK: Time-only and absolute date parsing ===
@@ -9180,9 +9186,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             return finalizeParsedDate(timeOnlyDate)
         }
 
-        // Normalize compact time formats (e.g., "827am" -> "8:27am") before passing to NSDataDetector
-        // This allows "827am yesterday" to work the same as "8:27am yesterday"
-        let normalizedText = normalizeCompactTimeFormat(trimmedLower)
+        // Normalize compact time formats before passing to NSDataDetector.
+        // Examples:
+        // - "827am yesterday" -> "8:27am yesterday"
+        // - "feb 28 1417" -> "feb 28 14:17"
+        let normalizedText = normalizedWithCompactTimes
 
         // Try macOS's built-in natural language date parser (handles "dec 15 3pm", "tomorrow at 5", etc.)
         let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
@@ -9291,6 +9299,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         let normalized = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalized)
 
         if normalized.range(
             of: #"\b\d+\s*(minute|minutes|min|mins)\s+ago\b"#,
@@ -9315,7 +9324,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             options: .regularExpression
         ) != nil
         let hasDateLikeToken = hasCalendarDateToken || hasDayLevelNaturalLanguageToken
-        let hasExplicitTime = normalized.range(
+        let hasExplicitTime = normalizedWithCompactTimes.range(
             of: #"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b|\b\d{3,4}\s*(am|pm)\b|\bnoon\b|\bmidnight\b"#,
             options: .regularExpression
         ) != nil
@@ -9532,8 +9541,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Normalize compact time formats in a string to colon format for NSDataDetector
-    /// Converts "827am" -> "8:27am", "1130pm" -> "11:30pm", etc.
-    /// This allows inputs like "827am yesterday" to work the same as "8:27am yesterday"
+    /// Converts:
+    /// - "827am" -> "8:27am", "1130pm" -> "11:30pm"
+    /// - "feb 28 1417" -> "feb 28 14:17" (for date-jump compact 24-hour time)
     private func normalizeCompactTimeFormat(_ text: String) -> String {
         // Pattern matches 3-4 digit numbers followed immediately by am/pm (with optional space)
         // Examples: "827am", "827 am", "1130pm", "1130 pm"
@@ -9580,6 +9590,31 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Replace in result
             let fullMatchRange = Range(match.range, in: result)!
             result.replaceSubrange(fullMatchRange, with: normalizedTime)
+        }
+
+        // Support compact 24-hour time token in date context:
+        // "feb 28 1417" -> "feb 28 14:17"
+        if let trailingCompactRange = result.range(
+            of: #"\b\d{3,4}\b$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) {
+            let token = String(result[trailingCompactRange])
+            if let numericValue = Int(token), numericValue >= 100, numericValue <= 2359 {
+                let hour = numericValue / 100
+                let minute = numericValue % 100
+                let isPlausibleModernYear = (1900...2100).contains(numericValue)
+                if hour <= 23 && minute <= 59 && !isPlausibleModernYear {
+                    let prefix = String(result[..<trailingCompactRange.lowerBound])
+                    let hasDateContext = prefix.range(
+                        of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|today|tomorrow|yesterday|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?))\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
+                        options: [.regularExpression, .caseInsensitive]
+                    ) != nil
+                    if hasDateContext {
+                        let normalizedTime = "\(hour):\(String(format: "%02d", minute))"
+                        result = prefix + normalizedTime
+                    }
+                }
+            }
         }
 
         return result

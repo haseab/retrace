@@ -3,6 +3,13 @@ import SwiftUI
 import App
 import Shared
 
+private enum DashboardWindowSizing {
+    static let defaultWidth: CGFloat = 1000
+    static let defaultHeight: CGFloat = 700
+    static let minWidth: CGFloat = 760
+    static let minHeight: CGFloat = 700
+}
+
 /// Manages the dashboard window as an on-demand window
 /// This follows the menu bar app pattern where windows are only created when requested
 @MainActor
@@ -149,8 +156,16 @@ public class DashboardWindowController: NSObject {
         // Configure window properties
         window.title = "Dashboard"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        window.setContentSize(NSSize(width: 1000, height: 700))
-        window.minSize = NSSize(width: 1000, height: 700)
+        window.setContentSize(
+            NSSize(
+                width: DashboardWindowSizing.defaultWidth,
+                height: DashboardWindowSizing.defaultHeight
+            )
+        )
+        window.minSize = NSSize(
+            width: DashboardWindowSizing.minWidth,
+            height: DashboardWindowSizing.minHeight
+        )
         window.center()
 
         // Set window level and appearance
@@ -303,7 +318,10 @@ struct DashboardContentView: View {
                     .ignoresSafeArea()
             }
         }
-        .frame(minWidth: 1000, minHeight: 700)
+        .frame(
+            minWidth: DashboardWindowSizing.minWidth,
+            minHeight: DashboardWindowSizing.minHeight
+        )
         .task {
             await checkOnboarding()
         }

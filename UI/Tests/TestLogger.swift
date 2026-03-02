@@ -352,6 +352,30 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 16, minute: 0)
     }
 
+    func testDateWithCompact24HourTimeParsesAsExactTime() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("feb 28 1417", now: now) else {
+            XCTFail("Expected parser to resolve compact 24-hour time in date input")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 2, day: 28, hour: 14, minute: 17)
+    }
+
+    func testDateWithExplicitYearKeepsYearInterpretation() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 3, day: 1, hour: 9, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("feb 28 2024", now: now) else {
+            XCTFail("Expected parser to resolve explicit year input")
+            return
+        }
+
+        assertDateComponents(result, year: 2024, month: 2, day: 28, hour: 0, minute: 0)
+    }
+
     private func makeDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
         let calendar = Calendar.current
         let components = DateComponents(

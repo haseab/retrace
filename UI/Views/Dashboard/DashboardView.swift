@@ -40,6 +40,8 @@ private enum LayoutSize {
 
 /// Maximum width for the dashboard content area before it centers
 private let dashboardMaxWidth: CGFloat = 1100
+/// Shared breakpoint for compact dashboard-style layouts.
+let dashboardCompactLayoutThreshold: CGFloat = 850
 
 private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
     static var defaultValue: Anchor<CGRect>? = nil
@@ -181,33 +183,36 @@ public struct DashboardView: View {
             // This section expands to fill remaining height
             GeometryReader { geometry in
                 let layoutSize = LayoutSize.from(width: geometry.size.width)
+                let isCompactLayout = geometry.size.width < dashboardCompactLayoutThreshold
 
-                HStack(alignment: .top, spacing: 24) {
-                    // Left column: Stats cards (single column, fixed width)
-                    ZStack {
-                        ScrollView(showsIndicators: false) {
-                            VStack(spacing: 16) {
-                                ForEach(statsCards) { card in
-                                    statCard(
-                                        icon: card.icon,
-                                        title: card.title,
-                                        value: card.value,
-                                        subtitle: card.subtitle,
-                                        graphData: card.graphData,
-                                        graphColor: card.graphColor,
-                                        theme: currentTheme,
-                                        valueFormatter: card.valueFormatter,
-                                        layoutSize: layoutSize
-                                    )
+                HStack(alignment: .top, spacing: isCompactLayout ? 0 : 24) {
+                    if !isCompactLayout {
+                        // Left column: Stats cards (single column, fixed width)
+                        ZStack {
+                            ScrollView(showsIndicators: false) {
+                                VStack(spacing: 16) {
+                                    ForEach(statsCards) { card in
+                                        statCard(
+                                            icon: card.icon,
+                                            title: card.title,
+                                            value: card.value,
+                                            subtitle: card.subtitle,
+                                            graphData: card.graphData,
+                                            graphColor: card.graphColor,
+                                            theme: currentTheme,
+                                            valueFormatter: card.valueFormatter,
+                                            layoutSize: layoutSize
+                                        )
+                                    }
                                 }
+                                .padding(.top, 2)
+                                .padding(.bottom, 20) // Extra padding for scroll affordance
                             }
-                            .padding(.top, 2)
-                            .padding(.bottom, 20) // Extra padding for scroll affordance
-                        }
 
-                        ScrollAffordance(height: 32, color: themeBaseBackground)
+                            ScrollAffordance(height: 32, color: themeBaseBackground)
+                        }
+                        .frame(width: layoutSize.cardWidth)
                     }
-                    .frame(width: layoutSize.cardWidth)
 
                     // Right column: App usage (scrolls internally)
                     appUsageSection(layoutSize: layoutSize)

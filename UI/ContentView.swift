@@ -66,7 +66,7 @@ public struct ContentView: View {
                     .ignoresSafeArea()
             }
         }
-        .frame(minWidth: 1000, minHeight: 700)
+        .frame(minWidth: 760, minHeight: 700)
         .task {
             // Check onboarding status FIRST before anything else
             // This prevents flicker by determining what to show before rendering

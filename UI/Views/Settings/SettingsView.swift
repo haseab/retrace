@@ -414,6 +414,8 @@ public struct SettingsView: View {
 
     /// Max width for the entire settings panel before it detaches and centers
     private let settingsMaxWidth: CGFloat = 1200
+    /// Minimum width to keep settings usable while allowing split-screen layouts.
+    private let settingsMinWidth: CGFloat = 760
     static let pauseReminderIntervalTargetID = "settings.pauseReminderInterval"
     private static let pauseReminderCardAnchorID = "settings.pauseReminderCard"
     static let powerOCRCardTargetID = "settings.powerOCRCard"
@@ -443,7 +445,7 @@ public struct SettingsView: View {
             .frame(maxWidth: detached ? settingsMaxWidth : .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
-        .frame(minWidth: 900, minHeight: 650)
+        .frame(minWidth: settingsMinWidth, minHeight: 650)
         .background(
             ZStack {
                 themeBaseBackground

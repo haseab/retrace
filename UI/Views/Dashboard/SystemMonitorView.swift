@@ -18,38 +18,42 @@ public struct SystemMonitorView: View {
     private let monitorMaxWidth: CGFloat = 1100
 
     public var body: some View {
-        ZStack {
-            // Background matching dashboard - extends under titlebar
-            backgroundView
-                .ignoresSafeArea()
+        GeometryReader { geometry in
+            let isCompactLayout = geometry.size.width < dashboardCompactLayoutThreshold
 
-            VStack(spacing: 0) {
-                // Header
-                header
-                    .frame(maxWidth: monitorMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 32)
-                    .padding(.top, 28)
-                    .padding(.bottom, 24)
+            ZStack {
+                // Background matching dashboard - extends under titlebar
+                backgroundView
+                    .ignoresSafeArea()
 
-                // Main content
-                ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        // OCR Processing Section
-                        ocrProcessingSection
-                            .padding(.bottom, 40)
-                        processResourceSummarySection
+                VStack(spacing: 0) {
+                    // Header
+                    header
+                        .frame(maxWidth: monitorMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 32)
+                        .padding(.top, 28)
+                        .padding(.bottom, 24)
 
-                        // Future sections placeholder
-                        // - Data Transfers
-                        // - Migrations
+                    // Main content
+                    ScrollView(showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 16) {
+                            // OCR Processing Section
+                            ocrProcessingSection
+                                .padding(.bottom, 40)
+                            processResourceSummarySection(isCompactLayout: isCompactLayout)
+
+                            // Future sections placeholder
+                            // - Data Transfers
+                            // - Migrations
+                        }
+                        .frame(maxWidth: monitorMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 32)
+                        .padding(.bottom, 32)
                     }
-                    .frame(maxWidth: monitorMaxWidth)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 32)
+                    .scrollDisabled(isOuterScrollDisabled)
                 }
-                .scrollDisabled(isOuterScrollDisabled)
             }
         }
         .task {
@@ -498,7 +502,7 @@ public struct SystemMonitorView: View {
         }
     }
 
-    private var processResourceSummarySection: some View {
+    private func processResourceSummarySection(isCompactLayout: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Image(systemName: "gauge.with.needle")
@@ -530,11 +534,22 @@ public struct SystemMonitorView: View {
             Divider()
                 .background(Color.white.opacity(0.06))
 
-            HStack(alignment: .top, spacing: 12) {
-                processCPUSummarySection
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                processMemorySummarySection
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
+            Group {
+                if isCompactLayout {
+                    VStack(alignment: .leading, spacing: 12) {
+                        processCPUSummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        processMemorySummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                } else {
+                    HStack(alignment: .top, spacing: 12) {
+                        processCPUSummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        processMemorySummarySection
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                }
             }
             .padding(12)
         }
