@@ -13,7 +13,7 @@ import Shared
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║                  ASYNC QUEUE PIPELINE INTEGRATION TEST                       ║
 // ║                                                                              ║
-// ║  Tests the full async pipeline: JPEG → Video → Queue → Workers → Search     ║
+// ║  Tests the full async pipeline: JPEG → Video → Queue → Consumer → Search  ║
 // ║  Set TEST_SCREENSHOT_PATH environment variable to point to test data        ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
@@ -99,7 +99,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
         print("✓ All managers and queue initialized")
         print("  Database: \(testDatabasePath)")
         print("  Storage: \(storageRoot.path)")
-        print("  Workers: 2")
+        print("  Consumer: 1")
     }
 
     override func tearDown() async throws {

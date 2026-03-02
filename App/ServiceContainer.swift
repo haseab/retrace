@@ -337,7 +337,7 @@ public actor ServiceContainer {
         // Start processing queue workers immediately after initialization
         // Safe to run anytime since all DB operations go through DatabaseManager actor
         await queue.startWorkers()
-        Log.info("✓ Processing queue workers started (\(ProcessingQueueConfig.default.workerCount) workers)", category: .app)
+        Log.info("✓ Processing queue started", category: .app)
     }
 
     /// Register Rewind data source if user has opted in

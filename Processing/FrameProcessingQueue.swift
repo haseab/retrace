@@ -9,7 +9,7 @@ import AppKit
 ///
 /// Features:
 /// - Durable queue (survives app restarts)
-/// - Concurrent worker pool for OCR processing
+/// - Single AsyncStream-based consumer (wakes on enqueue, no polling)
 /// - Automatic retry on failure
 /// - Backpressure monitoring
 public actor FrameProcessingQueue {
@@ -22,7 +22,8 @@ public actor FrameProcessingQueue {
     private let search: SearchProtocol
 
     private let config: ProcessingQueueConfig
-    private var workers: [Task<Void, Never>] = []
+    private var consumerTask: Task<Void, Never>?
+    private var continuation: AsyncStream<Void>.Continuation?
     private var isRunning = false
     private var memoryReportTask: Task<Void, Never>?
 
@@ -58,12 +59,11 @@ public actor FrameProcessingQueue {
         (pauseOnLowPowerMode && isLowPowerModeEnabled)
     }
 
-    /// Minimum delay between processing frames (for rate limiting)
-    /// 0 = no delay (unlimited), otherwise nanoseconds between frames
-    private var minDelayBetweenFramesNs: UInt64 = 0
-
-    /// Task priority for worker tasks
+    /// Task priority for consumer task
     private var workerPriority: TaskPriority = .utility
+
+    /// Minimum delay between frames in nanoseconds (for FPS rate limiting)
+    private var minDelayBetweenFramesNs: UInt64 = 0
 
     /// Bundle IDs to exclude from OCR (when ocrAppFilterMode == .allExceptTheseApps)
     private var ocrExcludedBundleIDs: Set<String> = []
@@ -99,7 +99,6 @@ public actor FrameProcessingQueue {
         isLowPowerModeEnabled: Bool,
         currentPowerSource: PowerStateMonitor.PowerSource,
         maxFPS: Double,
-        workerCount: Int,
         taskPriority: TaskPriority,
         excludedBundleIDs: Set<String>,
         includedBundleIDs: Set<String>
@@ -112,72 +111,40 @@ public actor FrameProcessingQueue {
         self.ocrExcludedBundleIDs = excludedBundleIDs
         self.ocrIncludedBundleIDs = includedBundleIDs
 
-        // Convert FPS to nanosecond delay (0 = unlimited)
         if maxFPS > 0 {
             self.minDelayBetweenFramesNs = UInt64(1_000_000_000.0 / maxFPS)
         } else {
             self.minDelayBetweenFramesNs = 0
         }
 
-        // Update priority and restart workers if priority changed
+        // Update priority and restart consumer if priority changed
         let priorityChanged = self.workerPriority != taskPriority
         self.workerPriority = taskPriority
 
-        // Adjust worker count or restart if priority changed
-        if isRunning {
-            if priorityChanged {
-                // Must restart all workers to apply new priority
-                restartWorkers(count: workerCount)
-            } else if workers.count != workerCount {
-                adjustWorkerCount(to: workerCount)
-            }
+        if isRunning && priorityChanged {
+            restartConsumer()
+        }
+
+        // Wake consumer if conditions are now favorable (handles signals that were
+        // discarded while paused/disabled)
+        if isRunning && ocrEnabled && !isPausedForPowerState {
+            continuation?.yield()
         }
 
         Log.info(
-            "[Queue] Power config updated: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), pauseOnLowPowerMode=\(pauseOnLowPowerMode), isLowPowerModeEnabled=\(isLowPowerModeEnabled), power=\(currentPowerSource), maxFPS=\(maxFPS), workers=\(workers.count), priority=\(taskPriority), paused=\(isPausedForPowerState)",
+            "[Queue] Power config updated: ocrEnabled=\(ocrEnabled), pauseOnBattery=\(pauseOnBattery), pauseOnLowPowerMode=\(pauseOnLowPowerMode), isLowPowerModeEnabled=\(isLowPowerModeEnabled), power=\(currentPowerSource), priority=\(taskPriority), maxFPS=\(maxFPS), paused=\(isPausedForPowerState)",
             category: .processing
         )
     }
 
-    /// Adjust the number of running workers to the desired count
-    private func adjustWorkerCount(to desired: Int) {
-        let current = workers.count
-        if desired > current {
-            // Spawn additional workers
-            for workerID in current..<desired {
-                let priority = workerPriority
-                let task = Task(priority: priority) {
-                    await runWorker(id: workerID)
-                }
-                workers.append(task)
-            }
-            Log.info("[Queue] Scaled up workers: \(current) → \(desired)", category: .processing)
-        } else if desired < current {
-            // Cancel excess workers from the end
-            for _ in desired..<current {
-                workers.removeLast().cancel()
-            }
-            Log.info("[Queue] Scaled down workers: \(current) → \(desired)", category: .processing)
-        }
-    }
-
-    /// Restart all workers with current priority and desired count
-    private func restartWorkers(count: Int) {
-        // Cancel all existing workers
-        for worker in workers {
-            worker.cancel()
-        }
-        workers.removeAll()
-
-        // Spawn new workers with updated priority
-        let priority = workerPriority
-        for workerID in 0..<count {
-            let task = Task(priority: priority) {
-                await runWorker(id: workerID)
-            }
-            workers.append(task)
-        }
-        Log.info("[Queue] Restarted \(count) workers with priority \(priority)", category: .processing)
+    /// Restart consumer with current priority (e.g., after priority change)
+    private func restartConsumer() {
+        continuation?.finish()
+        consumerTask?.cancel()
+        consumerTask = nil
+        continuation = nil
+        startConsumer()
+        Log.info("[Queue] Restarted consumer with priority \(workerPriority)", category: .processing)
     }
 
     /// Check if OCR should be processed for a specific bundle ID
@@ -211,7 +178,7 @@ public actor FrameProcessingQueue {
     public func enqueue(frameID: Int64, priority: Int = 0) async throws {
         try await databaseManager.enqueueFrameForProcessing(frameID: frameID, priority: priority)
         currentQueueDepth += 1
-        // Log.info("[Queue-DIAG] Successfully enqueued frame \(frameID), local depth: \(currentQueueDepth), isRunning: \(isRunning)", category: .processing)
+        continuation?.yield()
     }
 
     /// Enqueue multiple frames (batch operation)
@@ -235,12 +202,11 @@ public actor FrameProcessingQueue {
         return try await databaseManager.getProcessingQueueDepth()
     }
 
-    // MARK: - Worker Pool
+    // MARK: - Consumer
 
-    /// Start processing workers
+    /// Start processing consumer
     public func startWorkers() async {
         guard !isRunning else {
-            // Log.warning("[Queue-DIAG] Workers already running, skipping startWorkers()", category: .processing)
             return
         }
 
@@ -253,133 +219,125 @@ public actor FrameProcessingQueue {
             currentQueueDepth = counts.pending + counts.processing
         }
 
-        let priority = workerPriority
-        for workerID in 0..<config.workerCount {
-            let task = Task(priority: priority) {
-                await runWorker(id: workerID)
-            }
-            workers.append(task)
-        }
-
+        startConsumer()
         startMemoryReporting()
 
-        Log.info("[Queue] Started \(workers.count) workers (priority=\(priority))", category: .processing)
+        Log.info("[Queue] Started consumer (priority=\(workerPriority))", category: .processing)
     }
 
-    /// Stop processing workers
+    /// Create AsyncStream and spawn the single consumer task
+    private func startConsumer() {
+        let (stream, newContinuation) = AsyncStream<Void>.makeStream()
+        self.continuation = newContinuation
+
+        let priority = workerPriority
+        consumerTask = Task(priority: priority) {
+            // Wait for DB ready (one-time startup)
+            try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)
+            while !Task.isCancelled {
+                if await self.databaseManager.isReady() { break }
+                try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous)
+            }
+
+            // Process pre-existing frames (crash recovery, enqueued before start)
+            await self.processAvailableFrames()
+
+            // Main loop: wake on signal, process everything available
+            for await _ in stream {
+                guard !Task.isCancelled else { break }
+                await self.processAvailableFrames()
+            }
+
+            Log.debug("[Queue] Consumer stopped", category: .processing)
+        }
+    }
+
+    /// Stop processing consumer
     public func stopWorkers() async {
         guard isRunning else { return }
 
         isRunning = false
 
-        Log.info("[Queue] Stopping workers...", category: .processing)
+        Log.info("[Queue] Stopping consumer...", category: .processing)
 
-        for worker in workers {
-            worker.cancel()
-        }
-
-        workers.removeAll()
+        continuation?.finish()
+        consumerTask?.cancel()
+        consumerTask = nil
+        continuation = nil
         memoryReportTask?.cancel()
         memoryReportTask = nil
 
-        Log.info("[Queue] Workers stopped", category: .processing)
+        Log.info("[Queue] Consumer stopped", category: .processing)
     }
 
-    /// Worker loop - processes frames from queue
-    private func runWorker(id: Int) async {
-        Log.info("[Queue] Worker \(id) STARTED (total workers: \(workers.count))", category: .processing)
+    /// Process all available frames from the SQLite queue.
+    /// Checks preconditions, then drains until empty or paused.
+    /// Called both at startup (for pre-existing frames) and on each stream signal.
+    private func processAvailableFrames() async {
+        guard ocrEnabled else { return }
+        guard !isPausedForPowerState else { return }
+        guard await databaseManager.isReady() else { return }
 
-        // Initial delay to ensure database is fully stable
-        // This prevents race conditions on first launch after onboarding
-        try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms - increased for stability
+        do {
+            while !Task.isCancelled {
+                guard let queuedFrame = try await dequeue() else { break }
+                await processQueuedFrame(queuedFrame)
 
-        while isRunning && !Task.isCancelled {
-            // Check if OCR is disabled globally
-            guard ocrEnabled else {
-                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1s poll when disabled
-                if Task.isCancelled { break }
-                continue
+                if minDelayBetweenFramesNs > 0 {
+                    try? await Task.sleep(for: .nanoseconds(Int64(minDelayBetweenFramesNs)), clock: .continuous)
+                }
+
+                // Re-check pause conditions between frames
+                guard ocrEnabled, !isPausedForPowerState else { break }
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            Log.error("[Queue] Consumer error: \(error)", category: .processing)
+            try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous)
+        }
+    }
+
+    /// Process a single dequeued frame with error handling and retry logic
+    private func processQueuedFrame(_ queuedFrame: QueuedFrame) async {
+        let startTime = Date()
+        do {
+            let result = try await processFrame(queuedFrame)
+
+            // Handle deferred processing result
+            if case .deferredSourceNotReady = result {
+                // Frame's source is not readable yet — re-enqueue for later and re-signal
+                try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
+                currentQueueDepth += 1
+                continuation?.yield()
+                try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms before next attempt
+                return
             }
 
-            // Check if paused due to battery/low-power policy
-            guard !isPausedForPowerState else {
-                try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous) // 2s poll when paused by power policy
-                if Task.isCancelled { break }
-                continue
-            }
+            totalProcessed += 1
 
-            // Wait for database to be ready before attempting any operations
-            guard await databaseManager.isReady() else {
-                // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
-                try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms
-                if Task.isCancelled { break }
-                continue
-            }
+            let elapsed = Date().timeIntervalSince(startTime)
+            Log.info("[Queue] Completed frame \(queuedFrame.frameID) in \(String(format: "%.2f", elapsed))s", category: .processing)
+
+        } catch {
+            totalFailed += 1
+
+            let isUnrecoverableError = isUnrecoverableVideoError(error)
 
             do {
-                // Try to dequeue a frame
-                guard let queuedFrame = try await dequeue() else {
-                    // Queue empty - wait before polling again
-                    try await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
-                    continue
+                if isUnrecoverableError {
+                    Log.warning("[Queue] Frame \(queuedFrame.frameID) skipped (video not ready)", category: .processing)
+                    try await markFrameAsFailed(queuedFrame.frameID, error: error, skipRetries: true)
+                } else if queuedFrame.retryCount < config.maxRetryAttempts {
+                    try await retryFrame(queuedFrame, error: error)
+                    continuation?.yield() // Re-signal so consumer wakes for retry
+                } else {
+                    try await markFrameAsFailed(queuedFrame.frameID, error: error)
                 }
-
-                // Log.info("[Queue-DIAG] Worker \(id) dequeued frame \(queuedFrame.frameID) for processing", category: .processing)
-
-                // Process the frame
-                let startTime = Date()
-                do {
-                    let result = try await processFrame(queuedFrame)
-
-                    // Handle deferred processing result
-                    if case .deferredSourceNotReady = result {
-                        // Frame's source is not readable yet (e.g. WAL write still catching up) - re-enqueue for later
-                        try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
-                        currentQueueDepth += 1
-                        try? await Task.sleep(for: .nanoseconds(Int64(500_000_000)), clock: .continuous) // 500ms before next attempt
-                        continue
-                    }
-
-                    totalProcessed += 1
-
-                    let elapsed = Date().timeIntervalSince(startTime)
-                    Log.info("[Queue-DIAG] Worker \(id) COMPLETED frame \(queuedFrame.frameID) in \(String(format: "%.2f", elapsed))s", category: .processing)
-
-                    // Apply rate limiting delay after successful processing
-                    if minDelayBetweenFramesNs > 0 {
-                        try? await Task.sleep(for: .nanoseconds(Int64(minDelayBetweenFramesNs)), clock: .continuous)
-                    }
-
-                } catch {
-                    totalFailed += 1
-
-                    // Check if this is an unrecoverable error (damaged/missing video file)
-                    // These errors won't be fixed by retrying, so fail immediately
-                    let isUnrecoverableError = isUnrecoverableVideoError(error)
-
-                    if isUnrecoverableError {
-                        // Expected for frames still being written - use warning, not error
-                        Log.warning("[Queue] Frame \(queuedFrame.frameID) skipped (video not ready)", category: .processing)
-                        try await markFrameAsFailed(queuedFrame.frameID, error: error, skipRetries: true)
-                    } else if queuedFrame.retryCount < config.maxRetryAttempts {
-                        // Retry if under limit for recoverable errors
-                        try await retryFrame(queuedFrame, error: error)
-                    } else {
-                        // Mark as failed permanently
-                        try await markFrameAsFailed(queuedFrame.frameID, error: error)
-                    }
-                }
-
-            } catch is CancellationError {
-                Log.debug("[Queue] Worker \(id) cancelled", category: .processing)
-                break
             } catch {
-                Log.error("[Queue-DIAG] Worker \(id) error: \(error)", category: .processing)
-                try? await Task.sleep(for: .nanoseconds(Int64(1_000_000_000)), clock: .continuous) // 1s backoff
+                Log.error("[Queue] Error handling failure for frame \(queuedFrame.frameID): \(error)", category: .processing)
             }
         }
-
-        Log.debug("[Queue] Worker \(id) stopped", category: .processing)
     }
 
     // MARK: - Frame Processing
@@ -806,7 +764,6 @@ public actor FrameProcessingQueue {
         }
 
         // NSCocoaErrorDomain Code=516 = file already exists (temp symlink conflict)
-        // This happens when multiple workers try to extract from same video simultaneously
         // Retrying won't help - need to fix the temp file handling, but don't spam retries
         if nsError.domain == "NSCocoaErrorDomain" && nsError.code == 516 {
             return true
@@ -851,7 +808,7 @@ public actor FrameProcessingQueue {
             processingCount: processing,
             totalProcessed: totalProcessed,
             totalFailed: totalFailed,
-            workerCount: workers.count
+            workerCount: consumerTask != nil ? 1 : 0
         )
     }
 
@@ -873,7 +830,7 @@ public actor FrameProcessingQueue {
         let queueDepth = pendingCount + processingCount
 
         Log.info(
-            "[Queue-Memory] rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(queueDepth) pending=\(pendingCount) processing=\(processingCount) workers=\(workers.count)",
+            "[Queue-Memory] rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(queueDepth) pending=\(pendingCount) processing=\(processingCount) consumer=\(consumerTask != nil ? 1 : 0)",
             category: .processing
         )
     }
@@ -891,12 +848,11 @@ public actor FrameProcessingQueue {
 // MARK: - Models
 
 public struct ProcessingQueueConfig: Sendable {
-    public let workerCount: Int
     public let maxRetryAttempts: Int
     public let maxQueueSize: Int
 
     public init(workerCount: Int = 1, maxRetryAttempts: Int = 3, maxQueueSize: Int = 1000) {
-        self.workerCount = workerCount
+        // workerCount is accepted for backward compatibility but ignored (single consumer)
         self.maxRetryAttempts = maxRetryAttempts
         self.maxQueueSize = maxQueueSize
     }
