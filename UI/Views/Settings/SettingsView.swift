@@ -1675,6 +1675,16 @@ public struct SettingsView: View {
                             showCaptureUpdateFeedback()
                         }
 
+                    if captureIntervalSeconds < 1 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                            Text("Higher CPU usage — not recommended for most users")
+                                .font(.retraceCaption2)
+                        }
+                        .foregroundColor(.orange)
+                    }
+
                     // Estimated storage description and reset button on same line
                     HStack {
                         Text(captureIntervalEstimateText)
@@ -4519,8 +4529,8 @@ private struct ColorThemePicker: View {
 private struct CaptureIntervalPicker: View {
     @Binding var selectedInterval: Double
 
-    // Discrete interval options: 2s, 5s, 10s, 15s, 30s, 60s
-    private let intervals: [Double] = [2, 5, 10, 15, 30, 60]
+    // Discrete interval options: 0.5s, 2s, 5s, 10s, 15s, 30s, 60s
+    private let intervals: [Double] = [0.5, 2, 5, 10, 15, 30, 60]
 
     var body: some View {
         HStack(spacing: 6) {
@@ -4548,6 +4558,8 @@ private struct CaptureIntervalPicker: View {
     private func intervalLabel(_ interval: Double) -> String {
         if interval >= 60 {
             return "\(Int(interval / 60))m"
+        } else if interval < 1 {
+            return "\(String(format: "%.1f", interval))s"
         } else {
             return "\(Int(interval))s"
         }
@@ -4895,6 +4907,8 @@ extension SettingsView {
         if captureIntervalSeconds >= 60 {
             let minutes = Int(captureIntervalSeconds / 60)
             return "Every \(minutes) min"
+        } else if captureIntervalSeconds < 1 {
+            return "Every \(String(format: "%.1f", captureIntervalSeconds))s"
         } else {
             return "Every \(Int(captureIntervalSeconds))s"
         }
