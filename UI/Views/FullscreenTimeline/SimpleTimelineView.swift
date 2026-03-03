@@ -2063,7 +2063,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         animationProgress = 0
         // Kick to next run loop so the 0 state is committed before we animate to 1.
         DispatchQueue.main.async {
-            withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                 animationProgress = 1.0
             }
         }
@@ -2079,12 +2079,30 @@ struct ZoomUnifiedOverlay<Content: View>: View {
 
     @ViewBuilder
     private func zoomedContentView() -> some View {
-        if let snapshot = frozenZoomSnapshot {
-            Image(nsImage: snapshot)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
+        if viewModel.isInLiveMode {
+            ZStack {
+                Color.black
+                if let snapshot = frozenZoomSnapshot {
+                    Image(nsImage: snapshot)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .transition(.identity)
+                } else {
+                    content()
+                        .transition(.identity)
+                }
+            }
         } else {
-            content()
+            // Historical mode: only render the extractor-backed snapshot (not currentImage).
+            ZStack {
+                Color.black
+                if let snapshot = frozenZoomSnapshot {
+                    Image(nsImage: snapshot)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .transition(.identity)
+                }
+            }
         }
     }
 
@@ -2192,6 +2210,13 @@ struct ZoomUnifiedOverlay<Content: View>: View {
             .allowsHitTesting(false)
 
             // LAYER 4: The zoomed content - visual only (interaction handled by overlay on top)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.black)
+                .frame(width: targetRect.width, height: targetRect.height)
+                .position(x: targetRect.midX, y: targetRect.midY)
+                .allowsHitTesting(false)
+
+            // LAYER 5: The zoomed content - visual only (interaction handled by overlay on top)
             zoomedContentView()
                 .frame(width: containerSize.width, height: containerSize.height)
                 .scaleEffect(targetScale, anchor: .center)
@@ -2204,14 +2229,14 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                 }
                 .allowsHitTesting(false)
 
-            // LAYER 5: White border - visual only, no interaction
+            // LAYER 6: White border - visual only, no interaction
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.white.opacity(0.9), lineWidth: lerp(2, 3, progress))
                 .frame(width: targetRect.width, height: targetRect.height)
                 .position(x: targetRect.midX, y: targetRect.midY)
                 .allowsHitTesting(false)
 
-            // LAYER 6: Text selection overlay - interactive within zoomed region only
+            // LAYER 7: Text selection overlay - interactive within zoomed region only
             if !isTransitioning && !isExitTransitioning && !viewModel.ocrNodes.isEmpty {
                 ZoomedTextSelectionOverlay(
                     viewModel: viewModel,
@@ -2222,7 +2247,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                 // This layer handles text selection - allows hit testing only within its bounds
             }
 
-            // LAYER 7: Action menu - interactive, should receive clicks
+            // LAYER 8: Action menu - interactive, should receive clicks
             ZoomActionMenu(
                 viewModel: viewModel,
                 zoomRegion: zoomRegion
@@ -2238,11 +2263,13 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         }
         .allowsHitTesting(!isTransitioning && !isExitTransitioning)
         // Animate all interpolated values together
-        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: animationProgress)
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: animationProgress)
+        // Never fade/cross-dissolve when snapshot is swapped mid-transition.
+        .animation(nil, value: viewModel.shiftDragDisplaySnapshotFrameID)
         .onAppear {
             // Always capture fresh snapshot when appearing - don't reuse stale snapshots
             // from previous zoom sessions that may have persisted in @State
-            frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage
+            frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.shiftDragDisplaySnapshot
 
             // Start at 0 when appearing during enter transition
             if isTransitioning {
@@ -2257,7 +2284,7 @@ struct ZoomUnifiedOverlay<Content: View>: View {
         }
         .onChange(of: isTransitioning) { newValue in
             if newValue {
-                frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage
+                frozenZoomSnapshot = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.shiftDragDisplaySnapshot
                 startLocalTransitionAnimation()
             }
         }
@@ -2266,11 +2293,14 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                 startExitAnimation()
             }
         }
-        .onChange(of: viewModel.currentImage) { newValue in
-            // If we didn't have a snapshot at transition start (e.g. image still loading),
-            // freeze it as soon as it's available to avoid instantiating a second AVPlayer view.
-            if isTransitioning, frozenZoomSnapshot == nil, let image = newValue {
-                frozenZoomSnapshot = image
+        .onChange(of: viewModel.shiftDragDisplaySnapshot) { newValue in
+            // If the extractor snapshot arrives after transition start, adopt it immediately.
+            if (isTransitioning || !viewModel.isInLiveMode), let image = newValue {
+                var noAnimationTransaction = Transaction()
+                noAnimationTransaction.animation = nil
+                withTransaction(noAnimationTransaction) {
+                    frozenZoomSnapshot = image
+                }
             }
         }
     }

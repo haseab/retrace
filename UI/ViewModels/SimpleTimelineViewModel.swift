@@ -489,6 +489,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Current end point of zoom region drag (normalized coordinates)
     @Published public var zoomRegionDragEnd: CGPoint?
 
+    /// Shift+drag snapshot/session state for extractor-backed zoom display.
+    private var shiftDragSessionCounter = 0
+    private var activeShiftDragSessionID = 0
+    private var shiftDragStartFrameID: Int64?
+    private var shiftDragStartVideoInfo: FrameVideoInfo?
+    /// Snapshot image used by zoom overlay after Shift+Drag (sourced from AVAssetImageGenerator).
+    @Published public var shiftDragDisplaySnapshot: NSImage?
+    @Published public var shiftDragDisplaySnapshotFrameID: Int64?
+    private var shiftDragDisplayRequestID: Int = 0
+
     // MARK: - Text Selection Hint Banner State
 
     /// Whether to show the text selection hint banner ("Try area selection mode: Shift + Drag")
@@ -7616,12 +7626,53 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private var zoomUpdateCount = 0
 
+    private func startZoomEntryTransition(for sessionID: Int) {
+        // Ignore stale callbacks from older drag sessions.
+        guard sessionID == activeShiftDragSessionID else { return }
+
+        // Keep the drag preview visible until we can start transition,
+        // then clear drag state at the exact handoff moment.
+        isDraggingZoomRegion = false
+        zoomRegionDragStart = nil
+        zoomRegionDragEnd = nil
+
+        isZoomTransitioning = true
+        zoomTransitionProgress = 0
+        zoomTransitionBlurOpacity = 0
+
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            zoomTransitionProgress = 1.0
+            zoomTransitionBlurOpacity = 1.0
+        }
+
+        // After animation completes, switch to final zoom state
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            guard let self else { return }
+            guard sessionID == self.activeShiftDragSessionID else { return }
+            self.isZoomRegionActive = true
+            self.zoomTransitionStartRect = nil
+            // Disable transition on next run loop to ensure smooth handoff
+            DispatchQueue.main.async {
+                guard sessionID == self.activeShiftDragSessionID else { return }
+                self.isZoomTransitioning = false
+            }
+        }
+    }
+
     /// Start creating a zoom region (Shift+Drag)
     public func startZoomRegion(at point: CGPoint) {
         zoomUpdateCount = 0
         isDraggingZoomRegion = true
         zoomRegionDragStart = point
         zoomRegionDragEnd = point
+        shiftDragDisplaySnapshot = nil
+        shiftDragDisplaySnapshotFrameID = nil
+
+        shiftDragSessionCounter += 1
+        activeShiftDragSessionID = shiftDragSessionCounter
+        shiftDragStartFrameID = currentFrame?.id.value
+        shiftDragStartVideoInfo = currentVideoInfo
+
         // Clear any existing text selection when starting zoom
         clearTextSelection()
     }
@@ -7649,12 +7700,19 @@ public class SimpleTimelineViewModel: ObservableObject {
         let width = maxX - minX
         let height = maxY - minY
 
+        let sessionID = activeShiftDragSessionID
+        let startFrameIDValue = shiftDragStartFrameID
+        let startVideoInfoValue = shiftDragStartVideoInfo
+        let endFrameIDValue = currentFrame?.id.value
+        let endVideoInfoValue = currentVideoInfo
 
         // Only create zoom region if it's large enough (at least 1% of screen)
         guard width > 0.01 && height > 0.01 else {
             isDraggingZoomRegion = false
             zoomRegionDragStart = nil
             zoomRegionDragEnd = nil
+            shiftDragStartFrameID = nil
+            shiftDragStartVideoInfo = nil
             return
         }
 
@@ -7675,31 +7733,98 @@ public class SimpleTimelineViewModel: ObservableObject {
         zoomTransitionStartRect = finalRect
         zoomRegion = finalRect
 
-        // Clear drag state
-        isDraggingZoomRegion = false
-        zoomRegionDragStart = nil
-        zoomRegionDragEnd = nil
+        let probeVideoInfo = endVideoInfoValue ?? startVideoInfoValue
+        let probeFrameID = endFrameIDValue ?? startFrameIDValue
+        loadShiftDragDisplaySnapshot(
+            frameID: probeFrameID,
+            videoInfo: probeVideoInfo
+        ) { [weak self] in
+            self?.startZoomEntryTransition(for: sessionID)
+        }
+        shiftDragStartFrameID = nil
+        shiftDragStartVideoInfo = nil
+    }
 
-        // Start the transition animation
-        isZoomTransitioning = true
-        zoomTransitionProgress = 0
-        zoomTransitionBlurOpacity = 0
+    /// Loads a snapshot for the Shift+Drag zoom display from AVAssetImageGenerator.
+    private func loadShiftDragDisplaySnapshot(
+        frameID: Int64?,
+        videoInfo: FrameVideoInfo?,
+        completion: (() -> Void)? = nil
+    ) {
+        shiftDragDisplayRequestID += 1
+        let requestID = shiftDragDisplayRequestID
 
-        // Animate to final state
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
-            zoomTransitionProgress = 1.0
-            zoomTransitionBlurOpacity = 1.0
+        if isInLiveMode {
+            shiftDragDisplaySnapshot = liveScreenshot
+            shiftDragDisplaySnapshotFrameID = frameID
+            completion?()
+            return
         }
 
-        // After animation completes, switch to final zoom state
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
-            self?.isZoomRegionActive = true
-            self?.zoomTransitionStartRect = nil
-            // Disable transition on next run loop to ensure smooth handoff
+        guard let videoInfo else {
+            completion?()
+            return
+        }
+
+        guard let url = resolveVideoURLForShiftDragProbe(videoInfo: videoInfo) else {
+            completion?()
+            return
+        }
+
+        let requestedTime = videoInfo.frameTimeCMTime
+
+        let asset = AVURLAsset(url: url)
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.requestedTimeToleranceBefore = .zero
+        imageGenerator.requestedTimeToleranceAfter = .zero
+
+        imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: requestedTime)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
-                self?.isZoomTransitioning = false
+                guard requestID == self.shiftDragDisplayRequestID else {
+                    return
+                }
+
+                if let cgImage = cgImage {
+                    self.shiftDragDisplaySnapshot = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+                    self.shiftDragDisplaySnapshotFrameID = frameID
+                } else {
+                    self.shiftDragDisplaySnapshot = nil
+                    self.shiftDragDisplaySnapshotFrameID = nil
+                }
+                completion?()
             }
         }
+    }
+
+    private func resolveVideoURLForShiftDragProbe(videoInfo: FrameVideoInfo) -> URL? {
+        var actualVideoPath = videoInfo.videoPath
+        if !FileManager.default.fileExists(atPath: actualVideoPath) {
+            let pathWithExtension = actualVideoPath + ".mp4"
+            if FileManager.default.fileExists(atPath: pathWithExtension) {
+                actualVideoPath = pathWithExtension
+            } else {
+                return nil
+            }
+        }
+
+        if actualVideoPath.hasSuffix(".mp4") {
+            return URL(fileURLWithPath: actualVideoPath)
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory
+        let fileName = (actualVideoPath as NSString).lastPathComponent
+        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+
+        if !FileManager.default.fileExists(atPath: symlinkPath) {
+            do {
+                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+            } catch {
+                return nil
+            }
+        }
+
+        return URL(fileURLWithPath: symlinkPath)
     }
 
     /// Exit zoom region mode with reverse animation
@@ -7734,6 +7859,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         isDraggingZoomRegion = false
         zoomRegionDragStart = nil
         zoomRegionDragEnd = nil
+        shiftDragDisplaySnapshot = nil
+        shiftDragDisplaySnapshotFrameID = nil
         // Also clear text selection
         clearTextSelection()
     }
@@ -8448,15 +8575,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        // Try static image first
-        if let image = currentImage {
-            completion(image)
-            return
-        }
+        // Always extract historical images from video to avoid stale in-memory snapshots.
 
         // Fall back to extracting from video
         guard let videoInfo = currentVideoInfo else {
-            Log.warning("[ZoomCopy] No currentImage and no currentVideoInfo", category: .ui)
+            Log.warning("[ZoomCopy] No currentVideoInfo for historical frame image extraction", category: .ui)
             completion(nil)
             return
         }
@@ -8502,7 +8625,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Use integer arithmetic to avoid floating point precision issues
         let time = videoInfo.frameTimeCMTime
-
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
                 if let cgImage = cgImage {
