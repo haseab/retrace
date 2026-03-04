@@ -368,12 +368,14 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         // Update cache with merged results
         let allTiles = changeDetector.createTileGrid(frameWidth: frame.width, frameHeight: frame.height)
         await cache.setFullFrameResults(regions: mergedRegions, tileGrid: allTiles)
+        let tilesOCRed = min(changeResult.totalTiles, reOCRTtiles.count)
+        let tilesCached = max(0, changeResult.totalTiles - tilesOCRed)
 
         return RegionOCRResult(
             regions: mergedRegions,
             stats: RegionOCRStats(
-                tilesOCRed: changeResult.changedTiles.count,
-                tilesCached: changeResult.unchangedTiles.count,
+                tilesOCRed: tilesOCRed,
+                tilesCached: tilesCached,
                 totalTiles: changeResult.totalTiles,
                 changeDetectionTimeMs: changeResult.detectionTimeMs,
                 ocrTimeMs: ocrTime,

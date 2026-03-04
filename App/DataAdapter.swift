@@ -3439,13 +3439,20 @@ public actor DataAdapter {
             return SearchPageCursor(native: nextSourceCursor)
         }()
 
+        let lowerBound = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
         let effectiveTotalCount: Int
-        if sourceRowsFetched < rawBatchLimit {
-            effectiveTotalCount = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
+        if sourceRowsFetched < rawBatchLimit, rankCursor == nil {
+            effectiveTotalCount = lowerBound
         } else {
-            let rawTotalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
-            let lowerBound = rankCursor == nil ? (normalizedOffset + dedupedRows.count) : dedupedRows.count
-            effectiveTotalCount = max(rawTotalCount, lowerBound)
+            let filteredTotalCount = getSearchTotalCount(
+                ftsQuery: ftsQuery,
+                connection: connection,
+                whereConditions: outerWhereConditions,
+                bindValues: outerBindValues,
+                tagJoin: tagJoin,
+                tagJoinBindValues: tagJoinBindValues
+            )
+            effectiveTotalCount = max(filteredTotalCount, lowerBound)
         }
 
         guard !dedupedRows.isEmpty else {
@@ -4066,12 +4073,20 @@ public actor DataAdapter {
             return SearchPageCursor(native: nextSourceCursor)
         }()
 
+        let lowerBound = normalizedOffset + frameResults.count
         let effectiveTotalCount: Int
-        if sourceRowsFetched < batchFetchLimit {
-            effectiveTotalCount = normalizedOffset + frameResults.count
+        if sourceRowsFetched < batchFetchLimit, frameCursor == nil {
+            effectiveTotalCount = lowerBound
         } else {
-            let rawTotalCount = getSearchTotalCount(ftsQuery: ftsQuery, connection: connection)
-            effectiveTotalCount = max(rawTotalCount, normalizedOffset + frameResults.count)
+            let filteredTotalCount = getSearchTotalCount(
+                ftsQuery: ftsQuery,
+                connection: connection,
+                whereConditions: whereConditions,
+                bindValues: bindValues,
+                tagJoin: tagJoin,
+                tagJoinBindValues: tagJoinBindValues
+            )
+            effectiveTotalCount = max(filteredTotalCount, lowerBound)
         }
 
         guard !frameResults.isEmpty else {
@@ -4333,7 +4348,8 @@ public actor DataAdapter {
                 bindValues: ["%\(phrase)%"]
             )
         case .tokens(let tokens):
-            let tokenJoiner = negate ? " OR " : " OR "
+            // Exclusion must reject rows matching any token, so combine NOT LIKE terms with AND.
+            let tokenJoiner = negate ? " AND " : " OR "
             let clause = tokens.map { _ in
                 "COALESCE(\(columnName), '') \(op) ?"
             }.joined(separator: tokenJoiner)
@@ -4654,18 +4670,75 @@ public actor DataAdapter {
         }
     }
 
-    private static func getSearchTotalCount(ftsQuery: String, connection: DatabaseConnection) -> Int {
+    private static func getSearchTotalCount(
+        ftsQuery: String,
+        connection: DatabaseConnection,
+        whereConditions: [String],
+        bindValues: [Any],
+        tagJoin: String,
+        tagJoinBindValues: [Int64]
+    ) -> Int {
+        let trimmedTagJoin = tagJoin.trimmingCharacters(in: .whitespacesAndNewlines)
+        if whereConditions.isEmpty, trimmedTagJoin.isEmpty, tagJoinBindValues.isEmpty {
+            let countSQL = """
+                SELECT COUNT(*)
+                FROM searchRanking
+                WHERE searchRanking MATCH ?
+            """
+
+            guard let countStmt = try? connection.prepare(sql: countSQL) else { return 0 }
+            defer { connection.finalize(countStmt) }
+
+            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            sqlite3_bind_text(countStmt, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+
+            if sqlite3_step(countStmt) == SQLITE_ROW {
+                return Int(sqlite3_column_int(countStmt, 0))
+            }
+            return 0
+        }
+
+        let whereClause = whereConditions.isEmpty ? "" : "WHERE " + whereConditions.joined(separator: " AND ")
         let countSQL = """
-            SELECT COUNT(*)
-            FROM searchRanking
-            WHERE searchRanking MATCH ?
+            WITH fts_matches AS MATERIALIZED (
+                SELECT rowid AS docid
+                FROM searchRanking
+                WHERE searchRanking MATCH ?
+            )
+            SELECT COUNT(DISTINCT f.id)
+            FROM fts_matches fts
+            JOIN doc_segment ds ON fts.docid = ds.docid
+            JOIN frame f ON ds.frameId = f.id
+            JOIN segment s ON f.segmentId = s.id
+            \(tagJoin)
+            \(whereClause)
         """
 
         guard let countStmt = try? connection.prepare(sql: countSQL) else { return 0 }
         defer { connection.finalize(countStmt) }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_text(countStmt, 1, ftsQuery, -1, SQLITE_TRANSIENT)
+        var bindIndex: Int32 = 1
+        sqlite3_bind_text(countStmt, bindIndex, ftsQuery, -1, SQLITE_TRANSIENT)
+        bindIndex += 1
+
+        for tagID in tagJoinBindValues {
+            sqlite3_bind_int64(countStmt, bindIndex, tagID)
+            bindIndex += 1
+        }
+
+        for value in bindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(countStmt, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            } else if let int64Value = value as? Int64 {
+                sqlite3_bind_int64(countStmt, bindIndex, int64Value)
+            } else if let intValue = value as? Int {
+                sqlite3_bind_int64(countStmt, bindIndex, Int64(intValue))
+            } else {
+                sqlite3_bind_null(countStmt, bindIndex)
+            }
+            bindIndex += 1
+        }
 
         if sqlite3_step(countStmt) == SQLITE_ROW {
             return Int(sqlite3_column_int(countStmt, 0))
