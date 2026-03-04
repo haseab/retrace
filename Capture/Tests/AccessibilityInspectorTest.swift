@@ -16,6 +16,7 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     // File handle for logging - make it an instance variable so other methods can access it
     private var logFileHandle: FileHandle?
+    private let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
     // Interactive inspector should only run when explicitly opted in.
     private let interactiveInspectorEnabled = ProcessInfo.processInfo.environment["RUN_INTERACTIVE_ACCESSIBILITY_INSPECTOR"] == "1"
@@ -118,6 +119,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var lastWindowTitle = ""
         var lastBrowserURL = ""
         var lastAXDocument = ""
+        var lastBodyLinks: [String] = []
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
@@ -126,13 +128,25 @@ final class AccessibilityInspectorTest: XCTestCase {
                 // Only print when something changes
                 let currentURL = data.browserURL ?? ""
                 let currentAXDocument = data.focusedWindowAXDocument ?? ""
-                if data.appBundleID != lastAppBundleID || data.windowTitle != lastWindowTitle || currentURL != lastBrowserURL || currentAXDocument != lastAXDocument {
+                if data.appBundleID != lastAppBundleID ||
+                    data.windowTitle != lastWindowTitle ||
+                    currentURL != lastBrowserURL ||
+                    currentAXDocument != lastAXDocument ||
+                    data.bodyLinks != lastBodyLinks {
                     log("\n⏱  \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
                     log("🪟 Window Title:   \(data.windowTitle ?? "(none)")")
                     log("🌐 URL:            \(data.browserURL ?? "(URL not found)")")
                     log("🧪 AXDocument:     \(data.focusedWindowAXDocument ?? "(none)")")
+                    log("🔗 AX Links:       \(data.bodyLinks.count)")
+                    if data.bodyLinks.isEmpty {
+                        log("   (none)")
+                    } else {
+                        for (index, link) in data.bodyLinks.enumerated() {
+                            log("   [\(index + 1)] \(link)")
+                        }
+                    }
                     if let method = data.urlExtractionMethod {
                         log("   └─ Method:      \(method)")
                     }
@@ -147,6 +161,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                     lastWindowTitle = data.windowTitle ?? ""
                     lastBrowserURL = currentURL
                     lastAXDocument = currentAXDocument
+                    lastBodyLinks = data.bodyLinks
                 }
             }
 
@@ -178,6 +193,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var urlMethod: String?
         var chromeText: String?
         var focusedWindowAXDocument: String?
+        var bodyLinks: [String] = []
 
         // Get focused window
         if let focusedWindow: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
@@ -203,6 +219,10 @@ final class AccessibilityInspectorTest: XCTestCase {
                 // Try to get status bar / menu bar text (chrome text)
                 chromeText = getChromeText(windowElement: focusedWindow)
             }
+
+            if isBrowserApp(appBundleID) || browserURL != nil {
+                bodyLinks = collectAllLinksInAXTree(focusedWindow)
+            }
         }
 
         return AccessibilityData(
@@ -212,7 +232,8 @@ final class AccessibilityInspectorTest: XCTestCase {
             browserURL: browserURL,
             urlExtractionMethod: urlMethod,
             chromeText: chromeText,
-            focusedWindowAXDocument: focusedWindowAXDocument
+            focusedWindowAXDocument: focusedWindowAXDocument,
+            bodyLinks: bodyLinks
         )
     }
 
@@ -640,6 +661,128 @@ final class AccessibilityInspectorTest: XCTestCase {
         return nil
     }
 
+    // MARK: - Full Tree Link Extraction
+
+    private func collectAllLinksInAXTree(_ root: AXUIElement) -> [String] {
+        var links: [String] = []
+        var seenLinks = Set<String>()
+        var visited = Set<UnsafeRawPointer>()
+        var visitedCount = 0
+
+        collectLinks(
+            in: root,
+            depth: 0,
+            maxDepth: 40,
+            maxNodes: 20_000,
+            visited: &visited,
+            visitedCount: &visitedCount,
+            links: &links,
+            seenLinks: &seenLinks
+        )
+
+        return links
+    }
+
+    private func collectLinks(
+        in element: AXUIElement,
+        depth: Int,
+        maxDepth: Int,
+        maxNodes: Int,
+        visited: inout Set<UnsafeRawPointer>,
+        visitedCount: inout Int,
+        links: inout [String],
+        seenLinks: inout Set<String>
+    ) {
+        guard depth <= maxDepth, visitedCount < maxNodes else { return }
+
+        let identity = Unmanaged.passUnretained(element).toOpaque()
+        guard !visited.contains(identity) else { return }
+        visited.insert(identity)
+        visitedCount += 1
+
+        appendLinkAttribute(kAXURLAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        appendLinkAttribute(kAXDocumentAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        appendLinkAttribute(kAXValueAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        appendLinkAttribute(kAXTitleAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        appendLinkAttribute(kAXDescriptionAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        appendLinkAttribute("AXHelp" as CFString, from: element, to: &links, seenLinks: &seenLinks)
+
+        guard let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) else {
+            return
+        }
+
+        for child in children {
+            collectLinks(
+                in: child,
+                depth: depth + 1,
+                maxDepth: maxDepth,
+                maxNodes: maxNodes,
+                visited: &visited,
+                visitedCount: &visitedCount,
+                links: &links,
+                seenLinks: &seenLinks
+            )
+        }
+    }
+
+    private func appendLinkAttribute(
+        _ attribute: CFString,
+        from element: AXUIElement,
+        to links: inout [String],
+        seenLinks: inout Set<String>
+    ) {
+        if let value: String = getAttributeValue(element, attribute: attribute) {
+            for candidate in extractURLCandidates(from: value) {
+                guard seenLinks.insert(candidate).inserted else { continue }
+                links.append(candidate)
+            }
+            return
+        }
+
+        if let value: URL = getAttributeValue(element, attribute: attribute) {
+            let candidate = value.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty, seenLinks.insert(candidate).inserted else { return }
+            links.append(candidate)
+            return
+        }
+
+        if let value: NSAttributedString = getAttributeValue(element, attribute: attribute) {
+            for candidate in extractURLCandidates(from: value.string) {
+                guard seenLinks.insert(candidate).inserted else { continue }
+                links.append(candidate)
+            }
+        }
+    }
+
+    private func extractURLCandidates(from text: String) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var results: [String] = []
+        var seen = Set<String>()
+
+        if let detector = linkDetector {
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            for match in detector.matches(in: trimmed, range: range) {
+                guard let link = match.url?.absoluteString, !link.isEmpty else { continue }
+                if seen.insert(link).inserted {
+                    results.append(link)
+                }
+            }
+        }
+
+        let punctuationToTrim = CharacterSet(charactersIn: "[](){}<>,;\"'")
+        for rawToken in trimmed.components(separatedBy: .whitespacesAndNewlines) {
+            let token = rawToken.trimmingCharacters(in: punctuationToTrim)
+            guard !token.isEmpty, looksLikeURL(token) else { continue }
+            if seen.insert(token).inserted {
+                results.append(token)
+            }
+        }
+
+        return results
+    }
+
     private func looksLikeURL(_ string: String) -> Bool {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("http://") ||
@@ -769,4 +912,5 @@ private struct AccessibilityData {
     let urlExtractionMethod: String?
     let chromeText: String?
     let focusedWindowAXDocument: String?
+    let bodyLinks: [String]
 }

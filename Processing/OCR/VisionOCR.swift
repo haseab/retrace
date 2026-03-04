@@ -312,13 +312,19 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             )
         }
 
-        // Find which cached regions are affected by the changed tiles
-        // Any region that intersects a changed tile needs to be re-OCR'd
-        // We don't need to expand to adjacent tiles - if text moved there, those tiles would also be changed
-        let (_, unaffectedRegions) = await cache.findAffectedRegions(changedTiles: changeResult.changedTiles)
+        // Find which cached regions are affected by the changed tiles.
+        let (affectedRegions, unaffectedRegions) = await cache.findAffectedRegions(changedTiles: changeResult.changedTiles)
 
-        // Calculate the bounding box covering changed tiles only
-        let reOCRBounds = calculateBoundingBox(for: changeResult.changedTiles)
+        // Expand OCR coverage to whole tiles touched by affected regions.
+        // This avoids a boundary case where a region intersects changed tiles by only a few pixels.
+        let reOCRTtiles = expandReOCRTiles(
+            changedTiles: changeResult.changedTiles,
+            affectedRegions: affectedRegions,
+            frameWidth: frame.width,
+            frameHeight: frame.height,
+            changeDetector: changeDetector
+        )
+        let reOCRBounds = calculateBoundingBox(for: reOCRTtiles)
 
         // Perform OCR only on the affected region using regionOfInterest
         let ocrStartTime = Date()
@@ -410,6 +416,30 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         }
 
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Expand changed tiles with every tile that intersects affected text regions.
+    private func expandReOCRTiles(
+        changedTiles: [TileInfo],
+        affectedRegions: [TextRegion],
+        frameWidth: Int,
+        frameHeight: Int,
+        changeDetector: TileChangeDetector
+    ) -> [TileInfo] {
+        guard !affectedRegions.isEmpty else { return changedTiles }
+
+        var tilesByKey: [String: TileInfo] = Dictionary(
+            uniqueKeysWithValues: changedTiles.map { ($0.cacheKey, $0) }
+        )
+
+        for tile in changeDetector.createTileGrid(frameWidth: frameWidth, frameHeight: frameHeight) {
+            guard tilesByKey[tile.cacheKey] == nil else { continue }
+            if affectedRegions.contains(where: { $0.bounds.intersects(tile.pixelBounds) }) {
+                tilesByKey[tile.cacheKey] = tile
+            }
+        }
+
+        return Array(tilesByKey.values)
     }
 
     /// Perform OCR on a specific region of the frame using regionOfInterest
