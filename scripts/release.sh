@@ -152,12 +152,17 @@ else
 fi
 
 # Step 10: Update frontend
-echo -e "${YELLOW}[10/10] Updating frontend...${NC}"
+echo -e "${YELLOW}[10/11] Updating frontend...${NC}"
 sed -i '' "s|https://cdn.retrace.to/Retrace-v[^\"]*\.dmg|https://cdn.retrace.to/${DMG_NAME}|g" "${FRONTEND_DIR}/src/lib/track-download.ts"
 sed -i '' "s/version: \"[^\"]*\"/version: \"${VERSION}\"/" "${FRONTEND_DIR}/src/lib/track-download.ts"
 sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/ui/download-button.tsx"
 sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/sections/hero-base.tsx"
 echo -e "${GREEN}✓ Frontend download URL/text updated${NC}"
+
+# Step 11: Stage app version bump file
+echo -e "${YELLOW}[11/11] Staging app version bump file...${NC}"
+git -C "${PROJECT_DIR}" add project.yml
+echo -e "${GREEN}✓ Staged ${PROJECT_DIR}/project.yml${NC}"
 
 # Generate appcast entry
 PUBDATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
@@ -204,8 +209,12 @@ if [ "$WRANGLER_AVAILABLE" = false ]; then
     echo "1. Upload ${DMG_NAME} to R2 manually"
     echo "2. Add the above <item> to ${FRONTEND_DIR}/public/appcast.xml"
     echo "3. Push frontend: cd ${FRONTEND_DIR} && git add . && git commit -m 'Release v${VERSION}' && git push"
+    echo "4. Commit app version bump: cd ${PROJECT_DIR} && git commit -m 'Bump version to v${VERSION} (build ${BUILD_NUMBER})' && git push"
+    echo "5. Tag release: cd ${PROJECT_DIR} && git tag v${VERSION} && git push origin v${VERSION}"
 else
     echo "1. Add the above <item> to ${FRONTEND_DIR}/public/appcast.xml"
     echo "2. Push frontend: cd ${FRONTEND_DIR} && git add . && git commit -m 'Release v${VERSION}' && git push"
+    echo "3. Commit app version bump: cd ${PROJECT_DIR} && git commit -m 'Bump version to v${VERSION} (build ${BUILD_NUMBER})' && git push"
+    echo "4. Tag release: cd ${PROJECT_DIR} && git tag v${VERSION} && git push origin v${VERSION}"
 fi
 echo ""
