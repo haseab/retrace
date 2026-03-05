@@ -34,13 +34,19 @@ echo -e "${BLUE}  Retrace Release Builder${NC}"
 echo -e "${BLUE}================================================${NC}"
 echo ""
 
-# Get version from argument or prompt
-VERSION="$1"
+# Get version from argument; prompt only for interactive terminals.
+VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-    # Try to get from project.yml
-    CURRENT_VERSION=$(grep "MARKETING_VERSION" project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-    echo -e "Current version in project.yml: ${YELLOW}${CURRENT_VERSION}${NC}"
-    read -p "Enter new version number (e.g., 1.0.1): " VERSION
+    if [ -t 0 ]; then
+        # Try to get from project.yml
+        CURRENT_VERSION=$(grep "MARKETING_VERSION" project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+        echo -e "Current version in project.yml: ${YELLOW}${CURRENT_VERSION}${NC}"
+        read -r -p "Enter new version number (e.g., 1.0.1): " VERSION
+    else
+        echo -e "${RED}ERROR: Version number is required in non-interactive mode${NC}"
+        echo "Usage: ./scripts/create-release.sh <version>"
+        exit 2
+    fi
 fi
 
 if [ -z "$VERSION" ]; then
@@ -75,6 +81,28 @@ else
     exit 1
 fi
 
+# Step 2.5: Prepare build metadata for Info.plist keys
+echo ""
+echo -e "${YELLOW}Step 2.5: Preparing build info...${NC}"
+BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GIT_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+XCODE_BUILDINFO_ARGS=(
+    "INFOPLIST_KEY_RetraceVersion=${VERSION}"
+    "INFOPLIST_KEY_RetraceBuildNumber=${BUILD_NUMBER}"
+    "INFOPLIST_KEY_RetraceGitCommit=${GIT_COMMIT}"
+    "INFOPLIST_KEY_RetraceGitCommitFull=${GIT_COMMIT_FULL}"
+    "INFOPLIST_KEY_RetraceGitBranch=${GIT_BRANCH}"
+    "INFOPLIST_KEY_RetraceBuildDate=${BUILD_DATE}"
+    "INFOPLIST_KEY_RetraceBuildConfig=release"
+    "INFOPLIST_KEY_RetraceIsDevBuild=NO"
+    "INFOPLIST_KEY_RetraceForkName="
+)
+
+echo "  Prepared v${VERSION} build ${BUILD_NUMBER} commit ${GIT_COMMIT}"
+
 # Step 3: Archive the app
 echo ""
 echo -e "${YELLOW}Step 3: Archiving...${NC}"
@@ -86,12 +114,14 @@ xcodebuild -project Retrace.xcodeproj \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
     clean archive \
+    "${XCODE_BUILDINFO_ARGS[@]}" \
     CODE_SIGN_IDENTITY="Developer ID Application" \
     | xcbeautify || xcodebuild -project Retrace.xcodeproj \
     -scheme Retrace \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
     clean archive \
+    "${XCODE_BUILDINFO_ARGS[@]}" \
     CODE_SIGN_IDENTITY="Developer ID Application"
 
 if [ ! -d "$ARCHIVE_PATH" ]; then

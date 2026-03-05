@@ -348,7 +348,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return Int(displayCount)
     }
-
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
