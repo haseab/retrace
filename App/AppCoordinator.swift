@@ -166,6 +166,48 @@ public actor AppCoordinator {
         }
     }
 
+    public struct FrameInPageURLRow: Sendable, Equatable {
+        public let order: Int
+        public let url: String
+        public let nodeID: Int
+        public let x: Double
+        public let y: Double
+        public let w: Double
+        public let h: Double
+
+        public init(order: Int, url: String, nodeID: Int, x: Double, y: Double, w: Double, h: Double) {
+            self.order = order
+            self.url = url
+            self.nodeID = nodeID
+            self.x = x
+            self.y = y
+            self.w = w
+            self.h = h
+        }
+    }
+
+    public struct FrameInPageURLState: Sendable, Equatable {
+        public let mouseX: Double?
+        public let mouseY: Double?
+        public let scrollX: Double?
+        public let scrollY: Double?
+        public let videoCurrentTime: Double?
+
+        public init(
+            mouseX: Double?,
+            mouseY: Double?,
+            scrollX: Double?,
+            scrollY: Double?,
+            videoCurrentTime: Double?
+        ) {
+            self.mouseX = mouseX
+            self.mouseY = mouseY
+            self.scrollX = scrollX
+            self.scrollY = scrollY
+            self.videoCurrentTime = videoCurrentTime
+        }
+    }
+
     // MARK: - Properties
 
     private let services: ServiceContainer
@@ -1010,6 +1052,10 @@ public actor AppCoordinator {
                     source: .native
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
+                scheduleInPageURLMetadataCaptureIfNeeded(
+                    frameID: frameID,
+                    frameMetadata: frame.metadata
+                )
 
                 // Persist WAL mapping for exact frameID -> raw frame lookup while segment is unfinalized.
                 if let storageManager = services.storage as? StorageManager {
@@ -2241,6 +2287,76 @@ public actor AppCoordinator {
         return try await adapter.getURLBoundingBox(timestamp: timestamp, source: source)
     }
 
+    /// Persist optional per-frame metadata JSON payload.
+    public func saveFrameMetadata(frameID: FrameID, metadataJSON: String?) async throws {
+        try await services.database.updateFrameMetadata(frameID: frameID, metadataJSON: metadataJSON)
+    }
+
+    /// Load per-frame metadata JSON payload.
+    public func getFrameMetadata(frameID: FrameID) async throws -> String? {
+        try await services.database.getFrameMetadata(frameID: frameID)
+    }
+
+    public func replaceFrameInPageURLData(
+        frameID: FrameID,
+        state: FrameInPageURLState?,
+        rows: [FrameInPageURLRow]
+    ) async throws {
+        let dbState = state.map {
+            Database.FrameInPageURLState(
+                mouseX: $0.mouseX,
+                mouseY: $0.mouseY,
+                scrollX: $0.scrollX,
+                scrollY: $0.scrollY,
+                videoCurrentTime: $0.videoCurrentTime
+            )
+        }
+        let dbRows = rows.map {
+            Database.FrameInPageURLRow(
+                order: $0.order,
+                url: $0.url,
+                nodeID: $0.nodeID,
+                x: $0.x,
+                y: $0.y,
+                w: $0.w,
+                h: $0.h
+            )
+        }
+        try await services.database.replaceFrameInPageURLData(
+            frameID: frameID,
+            state: dbState,
+            rows: dbRows
+        )
+    }
+
+    public func getFrameInPageURLRows(frameID: FrameID) async throws -> [FrameInPageURLRow] {
+        let rows = try await services.database.getFrameInPageURLRows(frameID: frameID)
+        return rows.map {
+            FrameInPageURLRow(
+                order: $0.order,
+                url: $0.url,
+                nodeID: $0.nodeID,
+                x: $0.x,
+                y: $0.y,
+                w: $0.w,
+                h: $0.h
+            )
+        }
+    }
+
+    public func getFrameInPageURLState(frameID: FrameID) async throws -> FrameInPageURLState? {
+        let state = try await services.database.getFrameInPageURLState(frameID: frameID)
+        return state.map {
+            FrameInPageURLState(
+                mouseX: $0.mouseX,
+                mouseY: $0.mouseY,
+                scrollX: $0.scrollX,
+                scrollY: $0.scrollY,
+                videoCurrentTime: $0.videoCurrentTime
+            )
+        }
+    }
+
     // MARK: - OCR Node Detection (for text selection)
 
     /// Get all OCR nodes for a given frame by timestamp
@@ -2632,6 +2748,745 @@ public actor AppCoordinator {
     /// Get database schema description for debugging
     public func getDatabaseSchemaDescription() async throws -> String {
         try await services.database.getSchemaDescription()
+    }
+
+    // MARK: - In-Page URL Metadata Capture
+
+    private static let inPageURLCollectionExperimentalKey = "collectInPageURLsExperimental"
+    private static let inPageURLChromiumBundleIDs: Set<String> = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.sigmaos.sigmaos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.sigmaos.sigmaos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLRawLinkLimit = 100
+    private static let inPageURLAppleScriptTimeoutSeconds: TimeInterval = 4
+    private static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
+    private static let inPageURLCaptureCoordinator = InPageURLCaptureCoordinator()
+
+    private actor InPageURLCaptureCoordinator {
+        private struct CaptureKey: Hashable {
+            let bundleID: String
+            let preferredURLNeedle: String
+        }
+
+        private struct BundleTaskState {
+            let token: UUID
+            let task: Task<String?, Error>
+        }
+
+        private var inFlightByKey: [CaptureKey: Task<String?, Error>] = [:]
+        private var inFlightByBundle: [String: BundleTaskState] = [:]
+
+        func capture(
+            bundleID: String,
+            preferredURL: String?,
+            operation: @escaping @Sendable () async throws -> String?
+        ) async throws -> String? {
+            let key = CaptureKey(
+                bundleID: bundleID,
+                preferredURLNeedle: AppCoordinator.preferredURLNeedle(from: preferredURL) ?? ""
+            )
+
+            if let existingTask = inFlightByKey[key] {
+                return try await existingTask.value
+            }
+
+            // Arc/Safari automation can time out when multiple in-page scripts hit the same
+            // browser concurrently. Serialize execution per bundle while still coalescing by key.
+            while let activeBundleTask = inFlightByBundle[bundleID] {
+                _ = try? await activeBundleTask.task.value
+                if inFlightByBundle[bundleID]?.token == activeBundleTask.token {
+                    inFlightByBundle[bundleID] = nil
+                }
+                if let existingTask = inFlightByKey[key] {
+                    return try await existingTask.value
+                }
+            }
+
+            let token = UUID()
+            let task = Task<String?, Error> {
+                try await operation()
+            }
+            inFlightByKey[key] = task
+            inFlightByBundle[bundleID] = BundleTaskState(token: token, task: task)
+            defer {
+                inFlightByKey[key] = nil
+                if inFlightByBundle[bundleID]?.token == token {
+                    inFlightByBundle[bundleID] = nil
+                }
+            }
+            return try await task.value
+        }
+    }
+
+    private struct InPageCapturedDOMLink: Codable, Sendable {
+        let href: String
+        let text: String
+        let left: Double
+        let top: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct InPageCapturedDOMMousePosition: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct InPageCapturedDOMScrollPosition: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct InPageCapturedDOMVideoPosition: Codable, Sendable {
+        let currentTime: Double
+    }
+
+    private struct InPageCapturedDOMPayload: Decodable, Sendable {
+        let pageUrl: String
+        let links: [InPageCapturedDOMLink]
+        let mousePosition: InPageCapturedDOMMousePosition?
+        let scrollPosition: InPageCapturedDOMScrollPosition?
+        let videoPosition: InPageCapturedDOMVideoPosition?
+    }
+
+    private struct PendingInPageURLMetadataRect: Codable, Sendable {
+        let x: Double
+        let y: Double
+        let w: Double
+        let h: Double
+    }
+
+    private struct PendingInPageURLMetadataResolvedURL: Codable, Sendable {
+        let url: String
+        let nid: Int
+        let p: PendingInPageURLMetadataRect
+    }
+
+    private struct PendingInPageURLMetadataRawLink: Codable, Sendable {
+        let url: String
+        let text: String
+        let left: Double
+        let top: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct PendingInPageURLMetadataPoint: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct PendingInPageURLMetadataVideoPosition: Codable, Sendable {
+        let currenttime: Double
+    }
+
+    private struct PendingInPageURLMetadataPayload: Codable, Sendable {
+        let pageurl: String
+        let rawlinks: [PendingInPageURLMetadataRawLink]
+        let urls: [PendingInPageURLMetadataResolvedURL]
+        let mouseposition: PendingInPageURLMetadataPoint?
+        let scrollposition: PendingInPageURLMetadataPoint?
+        let videoposition: PendingInPageURLMetadataVideoPosition?
+    }
+
+    private enum InPageURLCaptureError: Error {
+        case unsupportedBundleID
+        case noWindows
+        case noMatchingWindow
+        case scriptFailed(String)
+        case invalidOutput(String)
+    }
+
+    private func scheduleInPageURLMetadataCaptureIfNeeded(
+        frameID: Int64,
+        frameMetadata: FrameMetadata
+    ) {
+        guard Self.isInPageURLCollectionEnabled(),
+              let bundleID = frameMetadata.appBundleID,
+              Self.isInPageURLCaptureSupported(bundleID: bundleID) else {
+            return
+        }
+
+        let database = services.database
+        let services = self.services
+        let frameIDValue = frameID
+        let preferredURL = frameMetadata.browserURL
+        let preferredURLNeedle = Self.preferredURLNeedle(from: preferredURL) ?? "<none>"
+
+        Task.detached(priority: .utility) {
+            do {
+                guard let metadataJSON = try await Self.inPageURLCaptureCoordinator.capture(
+                    bundleID: bundleID,
+                    preferredURL: preferredURL,
+                    operation: {
+                        try await Self.capturePendingInPageURLMetadataJSON(
+                            bundleID: bundleID,
+                            preferredURL: preferredURL
+                        )
+                    }
+                ) else {
+                    return
+                }
+
+                try await database.updateFrameMetadata(
+                    frameID: FrameID(value: frameIDValue),
+                    metadataJSON: metadataJSON
+                )
+
+                if let processingQueue = await services.processingQueue {
+                    try await processingQueue.resolveInPageURLMetadataIfPossible(frameID: frameIDValue)
+                }
+            } catch {
+                Log.debug(
+                    "[InPageURL][Capture] Pending metadata capture failed for frameID=\(frameIDValue), bundleID=\(bundleID), needle=\(preferredURLNeedle): \(error)",
+                    category: .app
+                )
+            }
+        }
+    }
+
+    private static func isInPageURLCollectionEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
+            return false
+        }
+        return defaults.bool(forKey: inPageURLCollectionExperimentalKey)
+    }
+
+    private static func isInPageURLCaptureSupported(bundleID: String) -> Bool {
+        if bundleID == "com.apple.Safari" {
+            return true
+        }
+        if inPageURLChromiumBundleIDs.contains(bundleID) {
+            return true
+        }
+        return inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
+            bundleID.hasPrefix(prefix + ".app.")
+        }
+    }
+
+    static func inPageURLHostBrowserBundleID(for bundleID: String) -> String? {
+        if inPageURLChromiumBundleIDs.contains(bundleID) {
+            return bundleID
+        }
+
+        for prefix in inPageURLChromiumHostBundleIDPrefixes where bundleID.hasPrefix(prefix + ".app.") {
+            return prefix
+        }
+
+        return nil
+    }
+
+    private static func isInPageURLChromiumAppShimBundleID(_ bundleID: String) -> Bool {
+        guard let hostBrowserBundleID = inPageURLHostBrowserBundleID(for: bundleID) else {
+            return false
+        }
+        return hostBrowserBundleID != bundleID
+    }
+
+    private static func capturePendingInPageURLMetadataJSON(
+        bundleID: String,
+        preferredURL: String?
+    ) async throws -> String? {
+        let scriptLines = try inPageURLCaptureScriptLines(
+            bundleID: bundleID,
+            preferredURL: preferredURL
+        )
+        let rawOutput = try await runInPageURLAppleScript(lines: scriptLines)
+        let trimmed = rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed == "__NO_WINDOWS__" {
+            throw InPageURLCaptureError.noWindows
+        }
+        if trimmed == inPageURLNoMatchingWindowToken {
+            throw InPageURLCaptureError.noMatchingWindow
+        }
+
+        let payload: InPageCapturedDOMPayload
+        do {
+            payload = try decodeInPageCapturedDOMPayload(from: trimmed)
+        } catch {
+            var preview = trimmed.replacingOccurrences(of: "\n", with: "\\n")
+            if preview.count > 160 {
+                preview = String(preview.prefix(160)) + "..."
+            }
+            throw InPageURLCaptureError.invalidOutput("json decode failed: \(error), outputPreview=\(preview)")
+        }
+
+        var dedupedRawLinks: [PendingInPageURLMetadataRawLink] = []
+        dedupedRawLinks.reserveCapacity(min(payload.links.count, inPageURLRawLinkLimit))
+        var seenKeys: Set<String> = []
+        seenKeys.reserveCapacity(min(payload.links.count, inPageURLRawLinkLimit))
+        for link in payload.links {
+            if dedupedRawLinks.count >= inPageURLRawLinkLimit {
+                break
+            }
+
+            let url = link.href.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = link.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty, !text.isEmpty else { continue }
+
+            let roundedLeft = roundedMetadataCoordinate(link.left)
+            let roundedTop = roundedMetadataCoordinate(link.top)
+            let roundedWidth = roundedMetadataCoordinate(link.width)
+            let roundedHeight = roundedMetadataCoordinate(link.height)
+            guard roundedWidth > 0, roundedHeight > 0 else { continue }
+
+            let key = "\(url)|\(text)|\(roundedLeft)|\(roundedTop)|\(roundedWidth)|\(roundedHeight)"
+            guard seenKeys.insert(key).inserted else { continue }
+
+            dedupedRawLinks.append(
+                PendingInPageURLMetadataRawLink(
+                    url: url,
+                    text: text,
+                    left: roundedLeft,
+                    top: roundedTop,
+                    width: roundedWidth,
+                    height: roundedHeight
+                )
+            )
+        }
+
+        let metadataPayload = PendingInPageURLMetadataPayload(
+            pageurl: payload.pageUrl,
+            rawlinks: dedupedRawLinks,
+            urls: [],
+            mouseposition: payload.mousePosition.map {
+                PendingInPageURLMetadataPoint(
+                    x: roundedMetadataCoordinate($0.x),
+                    y: roundedMetadataCoordinate($0.y)
+                )
+            },
+            scrollposition: payload.scrollPosition.map {
+                PendingInPageURLMetadataPoint(
+                    x: roundedMetadataCoordinate($0.x),
+                    y: roundedMetadataCoordinate($0.y)
+                )
+            },
+            videoposition: payload.videoPosition.map {
+                PendingInPageURLMetadataVideoPosition(
+                    currenttime: $0.currentTime
+                )
+            }
+        )
+
+        let encodedData = try JSONEncoder().encode(metadataPayload)
+        return String(data: encodedData, encoding: .utf8)
+    }
+
+    private static func decodeInPageCapturedDOMPayload(
+        from rawOutput: String
+    ) throws -> InPageCapturedDOMPayload {
+        guard let data = rawOutput.data(using: .utf8) else {
+            throw InPageURLCaptureError.invalidOutput("utf8 conversion failed")
+        }
+
+        let decoder = JSONDecoder()
+        do {
+            return try decoder.decode(InPageCapturedDOMPayload.self, from: data)
+        } catch let directError {
+            // Arc can return JSON-stringified payloads wrapped as a string literal.
+            if let wrappedJSONString = try? decoder.decode(String.self, from: data),
+               let wrappedData = wrappedJSONString.data(using: .utf8),
+               let payload = try? decoder.decode(InPageCapturedDOMPayload.self, from: wrappedData) {
+                return payload
+            }
+            throw directError
+        }
+    }
+
+    private static func inPageURLCaptureScriptLines(
+        bundleID: String,
+        preferredURL: String?
+    ) throws -> [String] {
+        let escapedJS = appleScriptEscaped(inPageURLCaptureJavaScript)
+        let preferredNeedle = appleScriptEscaped(preferredURLNeedle(from: preferredURL) ?? "")
+
+        if bundleID == "com.apple.Safari" {
+            return [
+                "set __retraceNeedle to \"\(preferredNeedle)\"",
+                "tell application id \"com.apple.Safari\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set t to missing value",
+                "if __retraceNeedle is not \"\" then",
+                "repeat with w in windows",
+                "repeat with candidateTab in tabs of w",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set t to candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "if t is not missing value then exit repeat",
+                "end repeat",
+                "end if",
+                "if t is missing value then set t to current tab of front window",
+                "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+                "return do JavaScript \"\(escapedJS)\" in t",
+                "end timeout",
+                "end tell",
+            ]
+        }
+
+        guard isInPageURLCaptureSupported(bundleID: bundleID) else {
+            throw InPageURLCaptureError.unsupportedBundleID
+        }
+
+        if isInPageURLChromiumAppShimBundleID(bundleID),
+           let hostBrowserBundleID = inPageURLHostBrowserBundleID(for: bundleID) {
+            return chromiumAppShimInPageURLCaptureScriptLines(
+                appShimBundleID: bundleID,
+                hostBrowserBundleID: hostBrowserBundleID,
+                preferredNeedle: preferredNeedle,
+                escapedJS: escapedJS
+            )
+        }
+
+        if bundleID == "company.thebrowser.Browser" {
+            // Arc returns UUID-backed object references that can fail when coerced via
+            // intermediate tab variables; resolve through tab id within front window.
+            return [
+                "set __retraceNeedle to \"\(preferredNeedle)\"",
+                "tell application id \"\(bundleID)\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set targetTabID to id of active tab of front window",
+                "if __retraceNeedle is not \"\" then",
+                "repeat with candidateTab in tabs of front window",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set targetTabID to id of candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "end if",
+                "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+                "return execute (tab id targetTabID of front window) javascript \"\(escapedJS)\"",
+                "end timeout",
+                "end tell",
+            ]
+        }
+
+        return chromiumInPageURLCaptureScriptLines(
+            bundleID: bundleID,
+            preferredNeedle: preferredNeedle,
+            escapedJS: escapedJS
+        )
+    }
+
+    private static func chromiumInPageURLCaptureScriptLines(
+        bundleID: String,
+        preferredNeedle: String,
+        escapedJS: String
+    ) -> [String] {
+        [
+            "set __retraceNeedle to \"\(preferredNeedle)\"",
+            "tell application id \"\(bundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set t to missing value",
+            "if __retraceNeedle is not \"\" then",
+            "repeat with w in windows",
+            "repeat with candidateTab in tabs of w",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "if tabURL contains __retraceNeedle then",
+            "set t to candidateTab",
+            "exit repeat",
+            "end if",
+            "end try",
+            "end repeat",
+            "if t is not missing value then exit repeat",
+            "end repeat",
+            "end if",
+            "if t is missing value then set t to active tab of front window",
+            "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+            "return execute t javascript \"\(escapedJS)\"",
+            "end timeout",
+            "end tell",
+        ]
+    }
+
+    private static func chromiumAppShimInPageURLCaptureScriptLines(
+        appShimBundleID: String,
+        hostBrowserBundleID: String,
+        preferredNeedle: String,
+        escapedJS: String
+    ) -> [String] {
+        [
+            "set __retraceNeedle to \"\(preferredNeedle)\"",
+            "set __retraceWindowTitle to \"\"",
+            "tell application id \"\(appShimBundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "try",
+            "set __retraceWindowTitle to name of front window",
+            "end try",
+            "end tell",
+            "tell application id \"\(hostBrowserBundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set targetWindowIndex to -1",
+            "set targetTabIndex to -1",
+            "set wIndex to 1",
+            "repeat with w in windows",
+            "set tIndex to 1",
+            "repeat with candidateTab in tabs of w",
+            "set tabURL to \"\"",
+            "set tabTitle to \"\"",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "set tabTitle to title of candidateTab",
+            "end try",
+            "if targetTabIndex is -1 and __retraceNeedle is not \"\" and tabURL is not \"\" then",
+            "if tabURL contains __retraceNeedle then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "end if",
+            "if targetTabIndex is -1 and __retraceWindowTitle is not \"\" and tabTitle is not \"\" then",
+            "if __retraceWindowTitle is equal to tabTitle then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "if __retraceWindowTitle ends with (\" - \" & tabTitle) then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "end if",
+            "set tIndex to tIndex + 1",
+            "end repeat",
+            "if targetTabIndex is not -1 then exit repeat",
+            "set wIndex to wIndex + 1",
+            "end repeat",
+            "if targetTabIndex is -1 then return \"\(inPageURLNoMatchingWindowToken)\"",
+            "with timeout of \(Int(inPageURLAppleScriptTimeoutSeconds)) seconds",
+            "return execute (tab targetTabIndex of window targetWindowIndex) javascript \"\(escapedJS)\"",
+            "end timeout",
+            "end tell",
+        ]
+    }
+
+    private static func preferredURLNeedle(from rawURL: String?) -> String? {
+        guard let rawURL,
+              let parsed = URL(string: rawURL),
+              let host = parsed.host?.lowercased() else {
+            return nil
+        }
+        let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        let path = parsed.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty || path == "/" {
+            return normalizedHost
+        }
+        return normalizedHost + path.lowercased()
+    }
+
+    private static func runInPageURLAppleScript(lines: [String]) async throws -> String {
+        try await Task.detached(priority: .utility) {
+            let startTime = CFAbsoluteTimeGetCurrent()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = lines.flatMap { ["-e", $0] }
+
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(inPageURLAppleScriptTimeoutSeconds + 1)
+            while process.isRunning && Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20), clock: .continuous)
+            }
+
+            if process.isRunning {
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1_000.0
+                process.terminate()
+                process.waitUntilExit()
+                throw InPageURLCaptureError.scriptFailed(
+                    "Timed out waiting for browser response after \(inPageURLAppleScriptTimeoutSeconds)s (elapsed=\(String(format: "%.1f", elapsedMs))ms)"
+                )
+            }
+
+            let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+            let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: outputData, encoding: .utf8) ?? ""
+            let errors = String(data: errorData, encoding: .utf8) ?? ""
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1_000.0
+
+            if process.terminationStatus != 0 {
+                throw InPageURLCaptureError.scriptFailed(
+                    errors.isEmpty
+                    ? "exit \(process.terminationStatus), elapsed=\(String(format: "%.1f", elapsedMs))ms"
+                    : "\(errors) (elapsed=\(String(format: "%.1f", elapsedMs))ms)"
+                )
+            }
+
+            if elapsedMs >= 1_000 {
+                Log.debug(
+                    "[InPageURL][Capture] AppleScript slow-path elapsed=\(String(format: "%.1f", elapsedMs))ms outputBytes=\(outputData.count)",
+                    category: .app
+                )
+            }
+
+            return output
+        }.value
+    }
+
+    private static func roundedMetadataCoordinate(_ value: Double) -> Double {
+        let rounded = (value * 1_000.0).rounded() / 1_000.0
+        if rounded == -0 {
+            return 0
+        }
+        return rounded
+    }
+
+    private static var inPageURLCaptureJavaScript: String {
+        """
+        (function() {
+            if (!window.__retraceMouseTrackingInstalled) {
+                window.__retraceMouseTrackingInstalled = true;
+                window.addEventListener('mousemove', function(event) {
+                    window.__retraceLastMousePosition = { x: event.clientX, y: event.clientY };
+                }, { passive: true });
+            }
+
+            const links = document.links;
+            const maxLinks = \(inPageURLRawLinkLimit);
+            const maxScannedLinks = 800;
+            const scanBudgetMs = 1200;
+            const scanStartTime = (window.performance && typeof window.performance.now === 'function')
+                ? window.performance.now()
+                : Date.now();
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            const out = [];
+
+            for (let index = 0; index < links.length; index += 1) {
+                if (out.length >= maxLinks) break;
+                if (index >= maxScannedLinks) break;
+                const scanNow = (window.performance && typeof window.performance.now === 'function')
+                    ? window.performance.now()
+                    : Date.now();
+                if ((scanNow - scanStartTime) > scanBudgetMs) break;
+                const link = links[index];
+                if (!link) continue;
+                const href = (link.href || '').trim();
+                if (!href) continue;
+
+                const rect = link.getBoundingClientRect();
+                if (!rect || rect.width <= 1 || rect.height <= 1) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) continue;
+                const visibleLeft = Math.max(0, rect.left);
+                const visibleTop = Math.max(0, rect.top);
+                const visibleRight = Math.min(viewportWidth, rect.right);
+                const visibleBottom = Math.min(viewportHeight, rect.bottom);
+                const visibleWidth = visibleRight - visibleLeft;
+                const visibleHeight = visibleBottom - visibleTop;
+                if (visibleWidth <= 1 || visibleHeight <= 1) continue;
+
+                const text = ((link.textContent || link.innerText || '').replace(/\\s+/g, ' ').trim());
+                if (!text) continue;
+
+                out.push({
+                    href: href,
+                    text: text,
+                    left: visibleLeft,
+                    top: visibleTop,
+                    width: visibleWidth,
+                    height: visibleHeight
+                });
+            }
+
+            let mousePosition = null;
+            if (window.__retraceLastMousePosition &&
+                typeof window.__retraceLastMousePosition.x === 'number' &&
+                typeof window.__retraceLastMousePosition.y === 'number') {
+                mousePosition = {
+                    x: window.__retraceLastMousePosition.x,
+                    y: window.__retraceLastMousePosition.y
+                };
+            }
+
+            let scrollPosition = (() => {
+                const rawX = Number(window.scrollX);
+                const fallbackX = Number(window.pageXOffset);
+                const rawY = Number(window.scrollY);
+                const fallbackY = Number(window.pageYOffset);
+                return {
+                    x: Number.isFinite(rawX) ? rawX : (Number.isFinite(fallbackX) ? fallbackX : 0),
+                    y: Number.isFinite(rawY) ? rawY : (Number.isFinite(fallbackY) ? fallbackY : 0)
+                };
+            })();
+
+            let videoPosition = null;
+            const videos = document.getElementsByTagName('video');
+            for (let index = 0; index < videos.length; index += 1) {
+                const video = videos[index];
+                if (!video) continue;
+                const rect = video.getBoundingClientRect();
+                if (!rect) continue;
+                if (rect.width <= 1 || rect.height <= 1) continue;
+                if (rect.bottom < 0 || rect.right < 0 || rect.top > viewportHeight || rect.left > viewportWidth) continue;
+
+                const currentTime = Number(video.currentTime);
+                if (!Number.isFinite(currentTime)) continue;
+
+                const durationRaw = Number(video.duration);
+                const duration = Number.isFinite(durationRaw) ? durationRaw : null;
+                videoPosition = {
+                    currentTime: currentTime,
+                    duration: duration,
+                    paused: !!video.paused
+                };
+                break;
+            }
+
+            return JSON.stringify({
+                pageUrl: location.href,
+                links: out,
+                mousePosition: mousePosition,
+                scrollPosition: scrollPosition,
+                videoPosition: videoPosition
+            });
+        })();
+        """
+    }
+
+    private static func appleScriptEscaped(_ input: String) -> String {
+        input
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: " ")
     }
 }
 

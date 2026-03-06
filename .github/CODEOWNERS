@@ -1,2 +1,2 @@
-# Default code owner for all files.
-* @haseab
+# Intentionally left without default owners so reviewers are requested manually.
+# Add targeted ownership rules here only if you want specific paths auto-requested.

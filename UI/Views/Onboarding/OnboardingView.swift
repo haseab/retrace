@@ -18,6 +18,14 @@ private struct AutomationPreflightTarget: Identifiable, Hashable, Sendable {
     var id: String { bundleID }
 }
 
+private struct UnsupportedAutomationTarget: Identifiable, Hashable, Sendable {
+    let bundleID: String
+    let displayName: String
+    let appURL: URL?
+
+    var id: String { bundleID }
+}
+
 private enum AutomationPreflightStatus: String, Sendable {
     case granted
     case skipped
@@ -91,6 +99,12 @@ public struct OnboardingView: View {
             return String(prefix.dropLast(5))
         }
     )
+    private static let unsupportedFirefoxBundleIDs: [String] = [
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxbeta",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
+    ]
     // Exact apps where Retrace uses AppleScript-based URL extraction.
     private static let automationPreflightBaseTargets: [AutomationPreflightTarget] = [
         AutomationPreflightTarget(bundleID: "com.apple.finder", displayName: "Finder", appURL: nil),
@@ -151,6 +165,7 @@ public struct OnboardingView: View {
     @State private var isHoveringAppURLContinueButton = false
     @State private var automationPermissionDecisionMonitorTasksByBundleID: [String: Task<Void, Never>] = [:]
     @State private var creatorProfileImage: NSImage? = nil
+    @State private var unsupportedAutomationTargets: [UnsupportedAutomationTarget] = []
 
     // Rewind data flow state
     @State private var hasRewindData: Bool? = nil
@@ -778,7 +793,7 @@ public struct OnboardingView: View {
                         .font(.retraceCaption)
                         .foregroundColor(.retraceSecondary)
                 }
-            } else if automationPreflightTargets.isEmpty {
+            } else if automationPreflightTargets.isEmpty && unsupportedAutomationTargets.isEmpty {
                 Text("No eligible apps found on this Mac.")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
@@ -890,7 +905,14 @@ public struct OnboardingView: View {
                     VStack(spacing: 0) {
                         ForEach(Array(automationPreflightTargets.enumerated()), id: \.element.id) { index, target in
                             automationPreflightTargetRow(target: target)
-                            if index < automationPreflightTargets.count - 1 {
+                            if index < automationPreflightTargets.count - 1 || !unsupportedAutomationTargets.isEmpty {
+                                Divider()
+                                    .background(Color.white.opacity(0.08))
+                            }
+                        }
+                        ForEach(Array(unsupportedAutomationTargets.enumerated()), id: \.element.id) { index, target in
+                            unsupportedAutomationTargetRow(target: target)
+                            if index < unsupportedAutomationTargets.count - 1 {
                                 Divider()
                                     .background(Color.white.opacity(0.08))
                             }
@@ -950,6 +972,71 @@ public struct OnboardingView: View {
                 .stroke(Color.white.opacity(0.08), lineWidth: 1)
         )
         .cornerRadius(.cornerRadiusL)
+    }
+
+    @MainActor
+    private func refreshUnsupportedAutomationTargets() async {
+        unsupportedAutomationTargets = Self.unsupportedFirefoxBundleIDs.compactMap { bundleID in
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return nil
+            }
+
+            let displayName: String
+            if let bundle = Bundle(url: appURL) {
+                displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+            } else {
+                displayName = appURL.deletingPathExtension().lastPathComponent
+            }
+
+            return UnsupportedAutomationTarget(
+                bundleID: bundleID,
+                displayName: displayName,
+                appURL: appURL
+            )
+        }
+    }
+
+    private func unsupportedAutomationTargetRow(target: UnsupportedAutomationTarget) -> some View {
+        HStack(spacing: .spacingL) {
+            Group {
+                if let appURL = target.appURL {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                        .resizable()
+                        .frame(width: 30, height: 30)
+                } else {
+                    Image(systemName: "app.fill")
+                        .font(.retraceBody)
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 30)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: .spacingS) {
+                Text(target.displayName)
+                    .font(.retraceBody)
+                    .foregroundColor(.retracePrimary.opacity(0.7))
+
+                Text("Firefox is not supported for in-page URL extraction.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            Spacer()
+
+            Text("Not supported")
+                .font(.retraceCaption2)
+                .foregroundColor(.retraceSecondary)
+                .padding(.horizontal, .spacingS)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.08))
+                .clipShape(Capsule())
+        }
+        .padding(.horizontal, .spacingL)
+        .padding(.vertical, .spacingM)
+        .opacity(0.85)
     }
 
     private func automationPreflightTargetRow(target: AutomationPreflightTarget) -> some View {
@@ -2857,6 +2944,7 @@ public struct OnboardingView: View {
     private func refreshAutomationPreflightTargets() async {
         let previousTargetCount = automationPreflightTargets.count
         let previousStatusCount = automationPreflightStatusByBundleID.count
+        await refreshUnsupportedAutomationTargets()
         let targets = await buildAutomationPreflightTargets()
         automationPreflightTargets = targets
         hasLoadedAutomationPreflightTargets = true

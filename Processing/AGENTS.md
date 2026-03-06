@@ -23,6 +23,7 @@ Processing/
 │   ├── ProcessingQueue.swift       # Background processing queue
 │   └── FrameProcessor.swift        # Single frame processor
 └── Tests/
+    ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry/resolve coverage
     ├── VisionOCRTests.swift
     ├── AccessibilityTests.swift
     └── TextMergerTests.swift

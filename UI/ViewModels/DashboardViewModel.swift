@@ -841,6 +841,26 @@ public class DashboardViewModel: ObservableObject {
         return json
     }
 
+    public static func recordBrowserLinkOpened(
+        coordinator: AppCoordinator,
+        source: String,
+        url: String,
+        usedTextFragment: Bool,
+        usedYouTubeTimestamp: Bool
+    ) {
+        let metadata = jsonMetadata([
+            "source": source,
+            "url": url,
+            "usedTextFragment": usedTextFragment,
+            "usedYouTubeTimestamp": usedYouTubeTimestamp
+        ])
+        recordMetric(
+            coordinator: coordinator,
+            type: .browserLinkOpened,
+            metadata: metadata
+        )
+    }
+
     public static func recordSegmentHide(
         coordinator: AppCoordinator,
         source: String,

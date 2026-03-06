@@ -3,6 +3,56 @@ import SQLCipher
 import Shared
 import CryptoKit
 
+public struct FrameInPageURLRow: Sendable, Equatable {
+    public let order: Int
+    public let url: String
+    public let nodeID: Int
+    public let x: Double
+    public let y: Double
+    public let w: Double
+    public let h: Double
+
+    public init(
+        order: Int,
+        url: String,
+        nodeID: Int,
+        x: Double,
+        y: Double,
+        w: Double,
+        h: Double
+    ) {
+        self.order = order
+        self.url = url
+        self.nodeID = nodeID
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+    }
+}
+
+public struct FrameInPageURLState: Sendable, Equatable {
+    public let mouseX: Double?
+    public let mouseY: Double?
+    public let scrollX: Double?
+    public let scrollY: Double?
+    public let videoCurrentTime: Double?
+
+    public init(
+        mouseX: Double?,
+        mouseY: Double?,
+        scrollX: Double?,
+        scrollY: Double?,
+        videoCurrentTime: Double?
+    ) {
+        self.mouseX = mouseX
+        self.mouseY = mouseY
+        self.scrollX = scrollX
+        self.scrollY = scrollY
+        self.videoCurrentTime = videoCurrentTime
+    }
+}
+
 /// Main database manager implementing DatabaseProtocol
 /// Owner: DATABASE agent
 ///
@@ -91,6 +141,9 @@ public actor DatabaseManager: DatabaseProtocol {
         let migrationRunner = MigrationRunner(db: db!)
         try await migrationRunner.runMigrations()
         Log.debug("[DatabaseManager] Migrations complete", category: .database)
+
+        try FrameQueries.ensureInPageURLSchema(db: db!)
+        Log.debug("[DatabaseManager] In-page URL schema verified", category: .database)
 
         // Offset AUTOINCREMENT to avoid collision with Rewind's frozen data
         Log.debug("[DatabaseManager] Setting AUTOINCREMENT offset...", category: .database)
@@ -364,6 +417,50 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FrameQueries.updateVideoLink(db: db, frameId: frameID.value, videoId: videoID.value, videoFrameIndex: frameIndex)
+    }
+
+    public func updateFrameMetadata(frameID: FrameID, metadataJSON: String?) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try FrameQueries.updateMetadata(db: db, frameId: frameID.value, metadataJSON: metadataJSON)
+    }
+
+    public func getFrameMetadata(frameID: FrameID) async throws -> String? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getMetadata(db: db, frameId: frameID.value)
+    }
+
+    public func replaceFrameInPageURLData(
+        frameID: FrameID,
+        state: FrameInPageURLState?,
+        rows: [FrameInPageURLRow]
+    ) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        try FrameQueries.replaceInPageURLData(
+            db: db,
+            frameId: frameID.value,
+            state: state,
+            rows: rows
+        )
+    }
+
+    public func getFrameInPageURLRows(frameID: FrameID) async throws -> [FrameInPageURLRow] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getInPageURLRows(db: db, frameId: frameID.value)
+    }
+
+    public func getFrameInPageURLState(frameID: FrameID) async throws -> FrameInPageURLState? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try FrameQueries.getInPageURLState(db: db, frameId: frameID.value)
     }
 
     // MARK: - OCR Node Operations

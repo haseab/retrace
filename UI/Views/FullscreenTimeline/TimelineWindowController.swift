@@ -224,9 +224,17 @@ public class TimelineWindowController: NSObject {
             processIdentifier: frontmost.processIdentifier,
             bundleIdentifier: frontmost.bundleIdentifier
         )
+        Log.debug(
+            "[TIMELINE-FOCUS] Captured restore target pid=\(frontmost.processIdentifier) bundleID=\(frontmost.bundleIdentifier ?? "nil")",
+            category: .ui
+        )
     }
 
-    private func restoreFocusIfNeeded(requestedRestore: Bool, wasHidingToShowDashboard: Bool) {
+    private func restoreFocusIfNeeded(
+        requestedRestore: Bool,
+        wasHidingToShowDashboard: Bool,
+        hideRequestedAt: CFAbsoluteTime? = nil
+    ) {
         defer {
             focusRestoreTarget = nil
         }
@@ -241,14 +249,52 @@ public class TimelineWindowController: NSObject {
             return
         }
 
+        let hideElapsedMs = hideRequestedAt.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 }
         guard let app = NSRunningApplication(processIdentifier: target.processIdentifier),
               !app.isTerminated else {
-            Log.debug("[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier)", category: .ui)
+            if let hideElapsedMs {
+                Log.debug(
+                    "[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier) afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
+                    category: .ui
+                )
+            } else {
+                Log.debug("[TIMELINE-FOCUS] Skip restore: prior app no longer running pid=\(target.processIdentifier)", category: .ui)
+            }
             return
         }
 
+        if let hideElapsedMs {
+            Log.recordLatency(
+                "timeline.focus.restore_after_hide_ms",
+                valueMs: hideElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 350,
+                criticalThresholdMs: 700
+            )
+            Log.info(
+                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
+                category: .ui
+            )
+        } else {
+            Log.info(
+                "[TIMELINE-FOCUS] Restoring app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
+                category: .ui
+            )
+        }
+
         if !app.activate(options: [.activateIgnoringOtherApps]) {
-            Log.warning("[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")", category: .ui)
+            if let hideElapsedMs {
+                Log.warning(
+                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil") afterHide=\(String(format: "%.1f", hideElapsedMs))ms",
+                    category: .ui
+                )
+            } else {
+                Log.warning(
+                    "[TIMELINE-FOCUS] Failed to restore app focus pid=\(target.processIdentifier) bundleID=\(target.bundleIdentifier ?? "nil")",
+                    category: .ui
+                )
+            }
         }
     }
 
@@ -847,6 +893,7 @@ public class TimelineWindowController: NSObject {
             "[TimelineToggle] hide requested restorePreviousFocus=\(restorePreviousFocus) searchOverlayVisible=\(timelineViewModel?.isSearchOverlayVisible ?? false)",
             category: .ui
         )
+        let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
         isHiding = true
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
@@ -939,12 +986,30 @@ public class TimelineWindowController: NSObject {
                 // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
                 window.ignoresMouseEvents = true
                 window.orderOut(nil)
-                // Detach is deferred so quick reopen avoids remount/layout hitch.
-                self?.scheduleDeferredHostingViewDetach()
                 self?.isVisible = false
                 Self.isTimelineVisible = false  // For emergency escape tap
                 self?.lastHiddenAt = Date()
                 self?.suppressLiveScrollUntil = 0
+                let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestStartedAt) * 1000
+                Log.recordLatency(
+                    "timeline.hide.window_hidden_ms",
+                    valueMs: hideElapsedMs,
+                    category: .ui,
+                    summaryEvery: 10,
+                    warningThresholdMs: 300,
+                    criticalThresholdMs: 600
+                )
+                Log.info(
+                    "[TimelineToggle] window hidden after \(String(format: "%.1f", hideElapsedMs))ms",
+                    category: .ui
+                )
+                self?.restoreFocusIfNeeded(
+                    requestedRestore: restorePreviousFocus,
+                    wasHidingToShowDashboard: wasHidingToShowDashboard,
+                    hideRequestedAt: hideRequestStartedAt
+                )
+                // Detach is deferred so quick reopen avoids remount/layout hitch.
+                self?.scheduleDeferredHostingViewDetach()
                 self?.startBackgroundRefreshTimer(resetSchedule: true)
 
                 // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
@@ -979,10 +1044,6 @@ public class TimelineWindowController: NSObject {
 
                 // Post notification so menu bar can restore recording indicator
                 NotificationCenter.default.post(name: .timelineDidClose, object: nil)
-                self?.restoreFocusIfNeeded(
-                    requestedRestore: restorePreviousFocus,
-                    wasHidingToShowDashboard: wasHidingToShowDashboard
-                )
             }
         })
     }

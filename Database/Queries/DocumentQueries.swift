@@ -2,53 +2,81 @@ import Foundation
 import SQLCipher
 import Shared
 
-/// CRUD operations for documents table
+/// CRUD operations for indexed documents stored in FTS/doc-segment tables
 enum DocumentQueries {
+    private struct EncodedOtherText: Codable {
+        let appName: String?
+        let browserURL: String?
+    }
 
     // MARK: - Insert
 
     static func insert(db: OpaquePointer, document: IndexedDocument) throws -> Int64 {
-        let sql = """
-            INSERT INTO documents (
-                frame_id, content, app_name, window_name, browser_url, timestamp
-            ) VALUES (?, ?, ?, ?, ?, ?);
-            """
-
+        let lookupSQL = "SELECT segmentId FROM frame WHERE id = ? LIMIT 1;"
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
         }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, lookupSQL, -1, &statement, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(
-                query: sql,
+                query: lookupSQL,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
 
-        // Bind parameters
-        sqlite3_bind_text(statement, 1, document.frameID.stringValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_text(statement, 2, document.content, -1, SQLITE_TRANSIENT)
-        bindTextOrNull(statement, 3, document.appName)
-        bindTextOrNull(statement, 4, document.windowName)
-        bindTextOrNull(statement, 5, document.browserURL)
-        sqlite3_bind_int64(statement, 6, Schema.dateToTimestamp(document.timestamp))
+        sqlite3_bind_int64(statement, 1, document.frameID.value)
 
-        guard sqlite3_step(statement) == SQLITE_DONE else {
+        guard sqlite3_step(statement) == SQLITE_ROW else {
             throw DatabaseError.queryFailed(
-                query: sql,
+                query: lookupSQL,
+                underlying: "Missing frame for indexed document \(document.frameID.value)"
+            )
+        }
+
+        let segmentID = sqlite3_column_int64(statement, 0)
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+
+        let existingDocidSQL = """
+            SELECT docid
+            FROM doc_segment
+            WHERE frameId = ?
+            LIMIT 1;
+            """
+        guard sqlite3_prepare_v2(db, existingDocidSQL, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: existingDocidSQL,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
 
-        // Return the rowid of the inserted document
-        return sqlite3_last_insert_rowid(db)
+        sqlite3_bind_int64(statement, 1, document.frameID.value)
+        if sqlite3_step(statement) == SQLITE_ROW {
+            throw DatabaseError.queryFailed(
+                query: existingDocidSQL,
+                underlying: "UNIQUE constraint failed: doc_segment.frameId"
+            )
+        }
+
+        return try FTSQueries.indexFrame(
+            db: db,
+            mainText: document.content,
+            chromeText: encodeOtherText(appName: document.appName, browserURL: document.browserURL),
+            windowTitle: document.windowName,
+            segmentId: segmentID,
+            frameId: document.frameID.value
+        )
     }
 
     // MARK: - Update
 
     static func update(db: OpaquePointer, id: Int64, content: String) throws {
-        let sql = "UPDATE documents SET content = ? WHERE id = ?;"
+        let sql = """
+            UPDATE searchRanking
+            SET text = ?
+            WHERE rowid = ?;
+            """
 
         var statement: OpaquePointer?
         defer {
@@ -76,16 +104,17 @@ enum DocumentQueries {
     // MARK: - Delete
 
     static func delete(db: OpaquePointer, id: Int64) throws {
-        let sql = "DELETE FROM documents WHERE id = ?;"
+        let deleteDocSegmentSQL = "DELETE FROM doc_segment WHERE docid = ?;"
+        let deleteSearchSQL = "DELETE FROM searchRanking WHERE rowid = ?;"
 
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
         }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+        guard sqlite3_prepare_v2(db, deleteDocSegmentSQL, -1, &statement, nil) == SQLITE_OK else {
             throw DatabaseError.queryFailed(
-                query: sql,
+                query: deleteDocSegmentSQL,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
@@ -94,7 +123,26 @@ enum DocumentQueries {
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
-                query: sql,
+                query: deleteDocSegmentSQL,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+
+        guard sqlite3_prepare_v2(db, deleteSearchSQL, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: deleteSearchSQL,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, id)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: deleteSearchSQL,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
@@ -104,9 +152,13 @@ enum DocumentQueries {
 
     static func getByFrameID(db: OpaquePointer, frameID: FrameID) throws -> IndexedDocument? {
         let sql = """
-            SELECT id, frame_id, content, app_name, window_name, browser_url, timestamp
-            FROM documents
-            WHERE frame_id = ?;
+            SELECT sr.rowid, ds.frameId, sr.text, sr.otherText, sr.title, f.createdAt, s.browserUrl
+            FROM doc_segment ds
+            JOIN frame f ON f.id = ds.frameId
+            JOIN searchRanking sr ON sr.rowid = ds.docid
+            LEFT JOIN segment s ON s.id = f.segmentId
+            WHERE ds.frameId = ?
+            LIMIT 1;
             """
 
         var statement: OpaquePointer?
@@ -121,7 +173,7 @@ enum DocumentQueries {
             )
         }
 
-        sqlite3_bind_text(statement, 1, frameID.stringValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 1, frameID.value)
 
         guard sqlite3_step(statement) == SQLITE_ROW else {
             return nil
@@ -133,8 +185,11 @@ enum DocumentQueries {
     // MARK: - Count
 
     static func getCount(db: OpaquePointer) throws -> Int {
-        // Use Rewind-compatible table name
-        let sql = "SELECT COUNT(*) FROM searchRanking_content;"
+        let sql = """
+            SELECT COUNT(*)
+            FROM doc_segment ds
+            JOIN frame f ON f.id = ds.frameId;
+            """
 
         var statement: OpaquePointer?
         defer {
@@ -162,12 +217,7 @@ enum DocumentQueries {
         let id = sqlite3_column_int64(statement, 0)
 
         // Column 1: frame_id
-        guard let frameIDString = sqlite3_column_text(statement, 1) else {
-            throw DatabaseError.queryFailed(query: "parseDocumentRow", underlying: "Missing frame ID")
-        }
-        guard let frameID = FrameID(string: String(cString: frameIDString)) else {
-            throw DatabaseError.queryFailed(query: "parseDocumentRow", underlying: "Invalid frame ID")
-        }
+        let frameID = FrameID(value: sqlite3_column_int64(statement, 1))
 
         // Column 2: content
         guard let contentText = sqlite3_column_text(statement, 2) else {
@@ -175,13 +225,13 @@ enum DocumentQueries {
         }
         let content = String(cString: contentText)
 
-        // Columns 3-5: nullable metadata
-        let appName = getTextOrNil(statement, 3)
+        // Columns 3-4: stored metadata and window title
+        let (appName, encodedBrowserURL) = decodeOtherText(getTextOrNil(statement, 3))
         let windowName = getTextOrNil(statement, 4)
-        let browserURL = getTextOrNil(statement, 5)
+        let browserURL = encodedBrowserURL ?? getTextOrNil(statement, 6)
 
-        // Column 6: timestamp
-        let timestampMs = sqlite3_column_int64(statement, 6)
+        // Column 5: timestamp
+        let timestampMs = sqlite3_column_int64(statement, 5)
         let timestamp = Schema.timestampToDate(timestampMs)
 
         return IndexedDocument(
@@ -208,5 +258,30 @@ enum DocumentQueries {
             return nil
         }
         return String(cString: text)
+    }
+
+    private static func encodeOtherText(appName: String?, browserURL: String?) -> String? {
+        guard appName != nil || browserURL != nil else {
+            return nil
+        }
+
+        let payload = EncodedOtherText(appName: appName, browserURL: browserURL)
+        guard let data = try? JSONEncoder().encode(payload) else {
+            return appName ?? browserURL
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private static func decodeOtherText(_ rawValue: String?) -> (appName: String?, browserURL: String?) {
+        guard let rawValue, !rawValue.isEmpty else {
+            return (nil, nil)
+        }
+
+        if let data = rawValue.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(EncodedOtherText.self, from: data) {
+            return (decoded.appName, decoded.browserURL)
+        }
+
+        return (rawValue, nil)
     }
 }

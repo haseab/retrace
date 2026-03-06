@@ -20,15 +20,15 @@ final class FTSManagerTests: XCTestCase {
 
     var database: DatabaseManager!
     var ftsManager: FTSManager!
+    var databasePath: String!
     private static var hasPrintedSeparator = false
 
     override func setUp() async throws {
-        // Use one shared in-memory DB for both managers.
-        // `:memory:` creates a separate DB per connection, so DatabaseManager() + FTSManager()
-        // would not see the same schema/data.
-        let sharedPath = "file:fts_tests_\(UUID().uuidString)?mode=memory&cache=shared"
-        database = DatabaseManager(databasePath: sharedPath)
-        ftsManager = FTSManager(databasePath: sharedPath)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fts_tests_\(UUID().uuidString).sqlite")
+        databasePath = fileURL.path
+        database = DatabaseManager(databasePath: databasePath)
+        ftsManager = FTSManager(databasePath: databasePath)
 
         try await database.initialize()
         try await ftsManager.initialize()
@@ -44,11 +44,21 @@ final class FTSManagerTests: XCTestCase {
         try await ftsManager.close()
         database = nil
         ftsManager = nil
+        if let databasePath {
+            try? FileManager.default.removeItem(atPath: databasePath)
+            try? FileManager.default.removeItem(atPath: "\(databasePath)-shm")
+            try? FileManager.default.removeItem(atPath: "\(databasePath)-wal")
+        }
+        databasePath = nil
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────┐
     // │ HELPER METHODS                                                          │
     // └─────────────────────────────────────────────────────────────────────────┘
+
+    private func insertFrame(_ frame: FrameReference) async throws -> FrameID {
+        FrameID(value: try await database.insertFrame(frame))
+    }
 
     private func createTestData() async throws -> (VideoSegmentID, FrameID, FrameID, FrameID) {
         let baseTime = Date()
@@ -68,24 +78,39 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = VideoSegmentID(value: insertedVideoID)
 
-        // Create app segment
-        let segmentID = try await database.insertSegment(
+        let safariSegmentID = try await database.insertSegment(
             bundleID: "com.apple.Safari",
             startDate: frame1Time,
-            endDate: frame3Time,
-            windowName: "Test Window",
+            endDate: frame1Time.addingTimeInterval(30),
+            windowName: "GitHub",
+            browserUrl: nil,
+            type: 0
+        )
+        let xcodeSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Xcode",
+            startDate: frame2Time,
+            endDate: frame2Time.addingTimeInterval(30),
+            windowName: "Retrace Project",
+            browserUrl: nil,
+            type: 0
+        )
+        let terminalSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Terminal",
+            startDate: frame3Time,
+            endDate: frame3Time.addingTimeInterval(30),
+            windowName: "bash",
             browserUrl: nil,
             type: 0
         )
 
-        // Create frames
         let frame1 = FrameReference(
             id: FrameID(value: 0),
             timestamp: frame1Time,
-            segmentID: AppSegmentID(value: segmentID),
-            videoID: videoSegment.id,
+            segmentID: AppSegmentID(value: safariSegmentID),
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(appName: "Safari", windowName: "GitHub")
@@ -94,8 +119,8 @@ final class FTSManagerTests: XCTestCase {
         let frame2 = FrameReference(
             id: FrameID(value: 0),
             timestamp: frame2Time,
-            segmentID: AppSegmentID(value: segmentID),
-            videoID: videoSegment.id,
+            segmentID: AppSegmentID(value: xcodeSegmentID),
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: FrameMetadata(appName: "Xcode", windowName: "Retrace Project")
@@ -104,21 +129,21 @@ final class FTSManagerTests: XCTestCase {
         let frame3 = FrameReference(
             id: FrameID(value: 0),
             timestamp: frame3Time,
-            segmentID: AppSegmentID(value: segmentID),
-            videoID: videoSegment.id,
+            segmentID: AppSegmentID(value: terminalSegmentID),
+            videoID: storedVideoID,
             frameIndexInSegment: 2,
             encodingStatus: .success,
             metadata: FrameMetadata(appName: "Terminal", windowName: "bash")
         )
 
-        try await database.insertFrame(frame1)
-        try await database.insertFrame(frame2)
-        try await database.insertFrame(frame3)
+        let frame1ID = try await insertFrame(frame1)
+        let frame2ID = try await insertFrame(frame2)
+        let frame3ID = try await insertFrame(frame3)
 
         // Create documents with different content
         let doc1 = IndexedDocument(
             id: 0,
-            frameID: frame1.id,
+            frameID: frame1ID,
             timestamp: frame1Time,
             content: "Swift programming language documentation for macOS development",
             appName: "Safari",
@@ -127,7 +152,7 @@ final class FTSManagerTests: XCTestCase {
 
         let doc2 = IndexedDocument(
             id: 0,
-            frameID: frame2.id,
+            frameID: frame2ID,
             timestamp: frame2Time,
             content: "Retrace screen recording and search application source code",
             appName: "Xcode",
@@ -136,7 +161,7 @@ final class FTSManagerTests: XCTestCase {
 
         let doc3 = IndexedDocument(
             id: 0,
-            frameID: frame3.id,
+            frameID: frame3ID,
             timestamp: frame3Time,
             content: "Terminal commands for git commit and push operations",
             appName: "Terminal",
@@ -147,7 +172,7 @@ final class FTSManagerTests: XCTestCase {
         _ = try await database.insertDocument(doc2)
         _ = try await database.insertDocument(doc3)
 
-        return (videoSegment.id, frame1.id, frame2.id, frame3.id)
+        return (storedVideoID, frame1ID, frame2ID, frame3ID)
     }
 
     private func createMetadataFilterTestData() async throws -> (frameIDGitHub: FrameID, frameIDApple: FrameID) {
@@ -164,7 +189,8 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = VideoSegmentID(value: insertedVideoID)
 
         let segmentGitHub = try await database.insertSegment(
             bundleID: "com.google.Chrome",
@@ -188,7 +214,7 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: baseTime,
             segmentID: AppSegmentID(value: segmentGitHub),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(appName: "Chrome", windowName: "GitHub - retrace issue")
@@ -198,18 +224,18 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: baseTime.addingTimeInterval(60),
             segmentID: AppSegmentID(value: segmentApple),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: FrameMetadata(appName: "Safari", windowName: "Apple Docs - SwiftUI")
         )
 
-        try await database.insertFrame(frameGitHub)
-        try await database.insertFrame(frameApple)
+        let frameGitHubID = try await insertFrame(frameGitHub)
+        let frameAppleID = try await insertFrame(frameApple)
 
         let gitHubDoc = IndexedDocument(
             id: 0,
-            frameID: frameGitHub.id,
+            frameID: frameGitHubID,
             timestamp: baseTime,
             content: "debugging issue reproduction steps and error details",
             appName: "Chrome",
@@ -218,7 +244,7 @@ final class FTSManagerTests: XCTestCase {
 
         let appleDoc = IndexedDocument(
             id: 0,
-            frameID: frameApple.id,
+            frameID: frameAppleID,
             timestamp: baseTime.addingTimeInterval(60),
             content: "debugging issue reproduction steps and error details",
             appName: "Safari",
@@ -228,7 +254,7 @@ final class FTSManagerTests: XCTestCase {
         _ = try await database.insertDocument(gitHubDoc)
         _ = try await database.insertDocument(appleDoc)
 
-        return (frameIDGitHub: frameGitHub.id, frameIDApple: frameApple.id)
+        return (frameIDGitHub: frameGitHubID, frameIDApple: frameAppleID)
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────┐
@@ -243,7 +269,7 @@ final class FTSManagerTests: XCTestCase {
 
         XCTAssertEqual(results.count, 1)
         XCTAssertTrue(results[0].snippet.contains("Swift"))
-        XCTAssertEqual(results[0].appName, "Safari")
+        XCTAssertEqual(results[0].appName, "com.apple.Safari")
     }
 
     func testSearchMultipleResults() async throws {
@@ -324,7 +350,7 @@ final class FTSManagerTests: XCTestCase {
         // Should only find the Terminal document (frame3) which is recent
         XCTAssertEqual(results.count, 1)
         guard results.count == 1 else { return }
-        XCTAssertEqual(results[0].appName, "Terminal")
+        XCTAssertEqual(results[0].appName, "com.apple.Terminal")
     }
 
     func testSearchWithOldTimeFilter() async throws {
@@ -365,7 +391,7 @@ final class FTSManagerTests: XCTestCase {
         // Should only find the Safari document
         XCTAssertEqual(results.count, 1)
         guard results.count == 1 else { return }
-        XCTAssertEqual(results[0].appName, "Safari")
+        XCTAssertEqual(results[0].appName, "com.apple.Safari")
     }
 
     func testSearchWithAppBundleIDFilter() async throws {
@@ -382,7 +408,8 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = VideoSegmentID(value: insertedVideoID)
 
         let segmentID1 = try await database.insertSegment(
             bundleID: "com.google.Chrome",
@@ -406,7 +433,7 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: baseTime,
             segmentID: AppSegmentID(value: segmentID1),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -420,7 +447,7 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: baseTime.addingTimeInterval(50),
             segmentID: AppSegmentID(value: segmentID2),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -430,12 +457,12 @@ final class FTSManagerTests: XCTestCase {
             )
         )
 
-        try await database.insertFrame(frame1)
-        try await database.insertFrame(frame2)
+        let frame1ID = try await insertFrame(frame1)
+        let frame2ID = try await insertFrame(frame2)
 
         let doc1 = IndexedDocument(
             id: 0,
-            frameID: frame1.id,
+            frameID: frame1ID,
             timestamp: baseTime,
             content: "Chrome browser testing",
             appName: "Chrome",
@@ -444,7 +471,7 @@ final class FTSManagerTests: XCTestCase {
 
         let doc2 = IndexedDocument(
             id: 0,
-            frameID: frame2.id,
+            frameID: frame2ID,
             timestamp: baseTime.addingTimeInterval(50),
             content: "Safari browser testing",
             appName: "Safari",
@@ -469,7 +496,7 @@ final class FTSManagerTests: XCTestCase {
         // Should only find the Chrome document
         XCTAssertEqual(results.count, 1)
         guard results.count == 1 else { return }
-        XCTAssertEqual(results[0].appName, "Chrome")
+        XCTAssertEqual(results[0].appName, "com.google.Chrome")
     }
 
     func testSearchWithAppFilterPartialMatch() async throws {
@@ -490,7 +517,7 @@ final class FTSManagerTests: XCTestCase {
         // Should find the Safari document via partial match
         XCTAssertEqual(results.count, 1)
         guard results.count == 1 else { return }
-        XCTAssertEqual(results[0].appName, "Safari")
+        XCTAssertEqual(results[0].appName, "com.apple.Safari")
     }
 
     func testSearchWithMultipleAppFilters() async throws {
@@ -511,7 +538,7 @@ final class FTSManagerTests: XCTestCase {
         // Should find documents from both Safari and Xcode
         XCTAssertGreaterThanOrEqual(results.count, 1)
         for result in results {
-            XCTAssertTrue(result.appName == "Safari" || result.appName == "Xcode")
+            XCTAssertTrue(result.appName == "com.apple.Safari" || result.appName == "com.apple.Xcode")
         }
     }
 
@@ -532,7 +559,7 @@ final class FTSManagerTests: XCTestCase {
 
         // Should not find Terminal documents
         for result in results {
-            XCTAssertNotEqual(result.appName, "Terminal")
+            XCTAssertNotEqual(result.appName, "com.apple.Terminal")
         }
     }
 
@@ -615,7 +642,8 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = VideoSegmentID(value: insertedVideoID)
 
         let segmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -632,15 +660,15 @@ final class FTSManagerTests: XCTestCase {
                 id: FrameID(value: 0),
                 timestamp: startTime.addingTimeInterval(Double(i * 10)),
                 segmentID: AppSegmentID(value: segmentID),
-                videoID: videoSegment.id,
+                videoID: storedVideoID,
                 frameIndexInSegment: i,
                 metadata: .empty
             )
-            try await database.insertFrame(frame)
+            let frameID = try await insertFrame(frame)
 
             let doc = IndexedDocument(
                 id: 0,
-                frameID: frame.id,
+                frameID: frameID,
                 timestamp: Date().addingTimeInterval(Double(i * 10)),
                 content: "Document number \(i) containing the word database"
             )
@@ -682,7 +710,8 @@ final class FTSManagerTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = VideoSegmentID(value: insertedVideoID)
 
         let segmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -698,7 +727,7 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: startTime,
             segmentID: AppSegmentID(value: segmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty
@@ -708,19 +737,19 @@ final class FTSManagerTests: XCTestCase {
             id: FrameID(value: 0),
             timestamp: startTime.addingTimeInterval(10),
             segmentID: AppSegmentID(value: segmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: .empty
         )
 
-        try await database.insertFrame(frame1)
-        try await database.insertFrame(frame2)
+        let frame1ID = try await insertFrame(frame1)
+        let frame2ID = try await insertFrame(frame2)
 
         // Document with single match
         let doc1 = IndexedDocument(
             id: 0,
-            frameID: frame1.id,
+            frameID: frame1ID,
             timestamp: Date(),
             content: "This document mentions Python once"
         )
@@ -728,7 +757,7 @@ final class FTSManagerTests: XCTestCase {
         // Document with multiple matches (should rank higher)
         let doc2 = IndexedDocument(
             id: 0,
-            frameID: frame2.id,
+            frameID: frame2ID,
             timestamp: Date().addingTimeInterval(10),
             content: "Python Python Python - this document is all about Python programming"
         )
@@ -742,7 +771,7 @@ final class FTSManagerTests: XCTestCase {
         guard results.count == 2 else { return }
         // Query orders by BM25 rank; lower is more relevant.
         XCTAssertLessThanOrEqual(results[0].rank, results[1].rank)
-        XCTAssertEqual(results[0].frameID, frame2.id)
+        XCTAssertEqual(results[0].frameID, frame2ID)
     }
 
     // ┌─────────────────────────────────────────────────────────────────────────┐
@@ -803,7 +832,7 @@ final class FTSManagerTests: XCTestCase {
 
         // Should find documents with "application" but not "Terminal"
         for result in results {
-            XCTAssertFalse(result.appName == "Terminal")
+            XCTAssertFalse(result.appName == "com.apple.Terminal")
         }
     }
 }

@@ -519,6 +519,19 @@ public actor FrameProcessingQueue {
             )
         }
 
+        do {
+            try await resolveInPageURLMetadataIfPossible(
+                frameID: frameID,
+                frameWidth: videoSegment.width,
+                frameHeight: videoSegment.height
+            )
+        } catch {
+            Log.warning(
+                "[Queue] Failed to resolve pending in-page metadata for frame \(frameID): \(error.localizedDescription)",
+                category: .processing
+            )
+        }
+
         // Mark as completed
         try await updateFrameProcessingStatus(frameID, status: .completed)
 
@@ -627,6 +640,631 @@ public actor FrameProcessingQueue {
         return lower.contains("out of range")
             || lower.contains("incomplete")
             || lower.contains("empty")
+    }
+
+    // MARK: - In-Page URL Metadata Resolution
+
+    private static let inPageURLMinimumMatchScore = 78
+    private static let inPageURLMinimumMatchScoreMultiToken = 68
+    private static let inPageURLMinimumMatchScoreLongPhrase = 64
+    private static let inPageURLNodeReuseLimit = 2
+    private static let inPageURLTextStopwords: Set<String> = [
+        "edit", "view", "talk", "history", "jump", "search", "help", "more", "log", "in", "out"
+    ]
+
+    private struct InPageURLMetadataRect: Codable, Sendable {
+        let x: Double
+        let y: Double
+        let w: Double
+        let h: Double
+
+        private enum CodingKeys: String, CodingKey {
+            case x
+            case y
+            case w
+            case h
+            case width
+            case height
+        }
+
+        init(x: Double, y: Double, w: Double, h: Double) {
+            self.x = x
+            self.y = y
+            self.w = w
+            self.h = h
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            x = try container.decode(Double.self, forKey: .x)
+            y = try container.decode(Double.self, forKey: .y)
+
+            if let compactWidth = try container.decodeIfPresent(Double.self, forKey: .w) {
+                w = compactWidth
+            } else {
+                w = try container.decode(Double.self, forKey: .width)
+            }
+
+            if let compactHeight = try container.decodeIfPresent(Double.self, forKey: .h) {
+                h = compactHeight
+            } else {
+                h = try container.decode(Double.self, forKey: .height)
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(x, forKey: .x)
+            try container.encode(y, forKey: .y)
+            try container.encode(w, forKey: .w)
+            try container.encode(h, forKey: .h)
+        }
+    }
+
+    private struct InPageURLMetadataResolvedURL: Codable, Sendable {
+        let url: String
+        let nid: Int
+        let p: InPageURLMetadataRect
+
+        private enum CodingKeys: String, CodingKey {
+            case url
+            case nid
+            case p
+            case nodeid
+            case position
+        }
+
+        init(url: String, nid: Int, p: InPageURLMetadataRect) {
+            self.url = url
+            self.nid = nid
+            self.p = p
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            url = try container.decode(String.self, forKey: .url)
+
+            if let compactNodeID = try container.decodeIfPresent(Int.self, forKey: .nid) {
+                nid = compactNodeID
+            } else {
+                nid = try container.decode(Int.self, forKey: .nodeid)
+            }
+
+            if let compactPosition = try container.decodeIfPresent(InPageURLMetadataRect.self, forKey: .p) {
+                p = compactPosition
+            } else {
+                p = try container.decode(InPageURLMetadataRect.self, forKey: .position)
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(url, forKey: .url)
+            try container.encode(nid, forKey: .nid)
+            try container.encode(p, forKey: .p)
+        }
+    }
+
+    private struct InPageURLMetadataRawLink: Codable, Sendable {
+        let url: String
+        let text: String
+        let left: Double
+        let top: Double
+        let width: Double
+        let height: Double
+    }
+
+    private struct InPageURLMetadataPoint: Codable, Sendable {
+        let x: Double
+        let y: Double
+    }
+
+    private struct InPageURLMetadataVideoPosition: Codable, Sendable {
+        let currenttime: Double
+    }
+
+    private struct InPageURLMetadataPayload: Codable, Sendable {
+        var pageurl: String?
+        var rawlinks: [InPageURLMetadataRawLink]
+        var urls: [InPageURLMetadataResolvedURL]
+        var mouseposition: InPageURLMetadataPoint?
+        var scrollposition: InPageURLMetadataPoint?
+        var videoposition: InPageURLMetadataVideoPosition?
+
+        private enum CodingKeys: String, CodingKey {
+            case pageurl
+            case rawlinks
+            case urls
+            case mouseposition
+            case scrollposition
+            case videoposition
+        }
+
+        init(
+            pageurl: String?,
+            rawlinks: [InPageURLMetadataRawLink],
+            urls: [InPageURLMetadataResolvedURL],
+            mouseposition: InPageURLMetadataPoint?,
+            scrollposition: InPageURLMetadataPoint?,
+            videoposition: InPageURLMetadataVideoPosition?
+        ) {
+            self.pageurl = pageurl
+            self.rawlinks = rawlinks
+            self.urls = urls
+            self.mouseposition = mouseposition
+            self.scrollposition = scrollposition
+            self.videoposition = videoposition
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            pageurl = try container.decodeIfPresent(String.self, forKey: .pageurl)
+            rawlinks = try container.decodeIfPresent([InPageURLMetadataRawLink].self, forKey: .rawlinks) ?? []
+            urls = try container.decodeIfPresent([InPageURLMetadataResolvedURL].self, forKey: .urls) ?? []
+            mouseposition = try container.decodeIfPresent(InPageURLMetadataPoint.self, forKey: .mouseposition)
+            scrollposition = try container.decodeIfPresent(InPageURLMetadataPoint.self, forKey: .scrollposition)
+            videoposition = try container.decodeIfPresent(InPageURLMetadataVideoPosition.self, forKey: .videoposition)
+        }
+    }
+
+    private struct PreparedInPageOCRNode: Sendable {
+        let nodeOrder: Int
+        let normalizedText: String
+        let tokenSet: Set<String>
+        let x: Double
+        let y: Double
+        let width: Double
+        let height: Double
+    }
+
+    public func resolveInPageURLMetadataIfPossible(frameID: Int64) async throws {
+        try await resolveInPageURLMetadataIfPossible(
+            frameID: frameID,
+            frameWidth: nil,
+            frameHeight: nil
+        )
+    }
+
+    private func resolveInPageURLMetadataIfPossible(
+        frameID: Int64,
+        frameWidth: Int?,
+        frameHeight: Int?
+    ) async throws {
+        let frameIDRef = FrameID(value: frameID)
+        guard let metadataJSON = try await databaseManager.getFrameMetadata(frameID: frameIDRef),
+              !metadataJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        let existingRows = try await databaseManager.getFrameInPageURLRows(frameID: frameIDRef)
+        if !existingRows.isEmpty {
+            try await databaseManager.updateFrameMetadata(
+                frameID: frameIDRef,
+                metadataJSON: nil
+            )
+            return
+        }
+
+        let resolvedFrameWidth: Int
+        let resolvedFrameHeight: Int
+        if let frameWidth, let frameHeight, frameWidth > 0, frameHeight > 0 {
+            resolvedFrameWidth = frameWidth
+            resolvedFrameHeight = frameHeight
+        } else if let dimensions = try await inPageURLFrameDimensions(frameID: frameIDRef) {
+            resolvedFrameWidth = dimensions.width
+            resolvedFrameHeight = dimensions.height
+        } else {
+            return
+        }
+
+        try await resolvePendingInPageURLMetadataIfNeeded(
+            frameID: frameIDRef,
+            metadataJSON: metadataJSON,
+            frameWidth: resolvedFrameWidth,
+            frameHeight: resolvedFrameHeight
+        )
+    }
+
+    private func inPageURLFrameDimensions(frameID: FrameID) async throws -> (width: Int, height: Int)? {
+        if let frameWithInfo = try await databaseManager.getFrameWithVideoInfoByID(id: frameID) {
+            if let width = frameWithInfo.videoInfo?.width,
+               let height = frameWithInfo.videoInfo?.height,
+               width > 0,
+               height > 0 {
+                return (width, height)
+            }
+
+            let videoID = frameWithInfo.frame.videoID
+            if videoID.value > 0,
+               let videoSegment = try await databaseManager.getVideoSegment(id: videoID),
+               videoSegment.width > 0,
+               videoSegment.height > 0 {
+                return (videoSegment.width, videoSegment.height)
+            }
+        }
+
+        if let frame = try await databaseManager.getFrame(id: frameID),
+           frame.videoID.value > 0,
+           let videoSegment = try await databaseManager.getVideoSegment(id: frame.videoID),
+           videoSegment.width > 0,
+           videoSegment.height > 0 {
+            return (videoSegment.width, videoSegment.height)
+        }
+
+        return nil
+    }
+
+    private func resolvePendingInPageURLMetadataIfNeeded(
+        frameID: FrameID,
+        metadataJSON: String,
+        frameWidth: Int,
+        frameHeight: Int
+    ) async throws {
+        guard let data = metadataJSON.data(using: .utf8) else {
+            return
+        }
+
+        var payload: InPageURLMetadataPayload
+        do {
+            payload = try JSONDecoder().decode(InPageURLMetadataPayload.self, from: data)
+        } catch {
+            return
+        }
+
+        let hasInPagePayload =
+            payload.pageurl != nil ||
+            payload.mouseposition != nil ||
+            payload.scrollposition != nil ||
+            payload.videoposition != nil ||
+            !payload.rawlinks.isEmpty ||
+            !payload.urls.isEmpty
+        guard hasInPagePayload else {
+            return
+        }
+
+        let resolvedURLs: [InPageURLMetadataResolvedURL]
+        if !payload.urls.isEmpty {
+            resolvedURLs = payload.urls
+        } else if !payload.rawlinks.isEmpty {
+            let nodesWithText = try await databaseManager.getNodesWithText(
+                frameID: frameID,
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
+            guard !nodesWithText.isEmpty else {
+                return
+            }
+            resolvedURLs = Self.resolveInPageRawLinks(
+                payload.rawlinks,
+                nodesWithText: nodesWithText,
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
+            guard !resolvedURLs.isEmpty else {
+                return
+            }
+        } else {
+            resolvedURLs = []
+        }
+
+        let state = FrameInPageURLState(
+            mouseX: payload.mouseposition?.x,
+            mouseY: payload.mouseposition?.y,
+            scrollX: payload.scrollposition?.x,
+            scrollY: payload.scrollposition?.y,
+            videoCurrentTime: payload.videoposition?.currenttime
+        )
+        let rows: [FrameInPageURLRow] = resolvedURLs.enumerated().map { index, resolved in
+            FrameInPageURLRow(
+                order: index,
+                url: Self.compactInPageURL(resolved.url, pageURL: payload.pageurl),
+                nodeID: resolved.nid,
+                x: resolved.p.x,
+                y: resolved.p.y,
+                w: resolved.p.w,
+                h: resolved.p.h
+            )
+        }
+
+        try await databaseManager.replaceFrameInPageURLData(
+            frameID: frameID,
+            state: state,
+            rows: rows
+        )
+
+        try await databaseManager.updateFrameMetadata(
+            frameID: frameID,
+            metadataJSON: nil
+        )
+    }
+
+    private static func resolveInPageRawLinks(
+        _ rawLinks: [InPageURLMetadataRawLink],
+        nodesWithText: [(node: OCRNode, text: String)],
+        frameWidth: Int,
+        frameHeight: Int
+    ) -> [InPageURLMetadataResolvedURL] {
+        guard frameWidth > 0, frameHeight > 0, !rawLinks.isEmpty, !nodesWithText.isEmpty else {
+            return []
+        }
+
+        let preparedNodes: [PreparedInPageOCRNode] = nodesWithText.compactMap { entry in
+            let normalizedText = normalizeInPageText(entry.text)
+            let tokenSet = inPageURLTokenSet(normalizedText)
+            guard !normalizedText.isEmpty || !tokenSet.isEmpty else {
+                return nil
+            }
+
+            let nodeOrder = entry.node.nodeOrder
+            let normalizedX = clampInPageCoordinate(Double(entry.node.bounds.origin.x) / Double(frameWidth))
+            let normalizedY = clampInPageCoordinate(Double(entry.node.bounds.origin.y) / Double(frameHeight))
+            let normalizedWidth = clampInPageCoordinate(Double(entry.node.bounds.width) / Double(frameWidth))
+            let normalizedHeight = clampInPageCoordinate(Double(entry.node.bounds.height) / Double(frameHeight))
+            guard normalizedWidth > 0, normalizedHeight > 0 else {
+                return nil
+            }
+
+            return PreparedInPageOCRNode(
+                nodeOrder: nodeOrder,
+                normalizedText: normalizedText,
+                tokenSet: tokenSet,
+                x: normalizedX,
+                y: normalizedY,
+                width: normalizedWidth,
+                height: normalizedHeight
+            )
+        }
+        guard !preparedNodes.isEmpty else {
+            return []
+        }
+
+        var assignedNodeUseCount: [Int: Int] = [:]
+        assignedNodeUseCount.reserveCapacity(preparedNodes.count)
+
+        var resolved: [InPageURLMetadataResolvedURL] = []
+        resolved.reserveCapacity(min(rawLinks.count, 160))
+        var seenResolvedKeys: Set<String> = []
+        seenResolvedKeys.reserveCapacity(min(rawLinks.count, 160))
+
+        for rawLink in rawLinks {
+            if resolved.count >= 160 {
+                break
+            }
+
+            let url = rawLink.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = rawLink.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty, !text.isEmpty else { continue }
+
+            let normalizedCandidateText = normalizeInPageText(text)
+            let candidateTokens = inPageURLTokenSet(normalizedCandidateText)
+            guard !normalizedCandidateText.isEmpty || !candidateTokens.isEmpty else { continue }
+
+            var bestNode: PreparedInPageOCRNode?
+            var bestScore = Int.min
+
+            for node in preparedNodes {
+                let usageCount = assignedNodeUseCount[node.nodeOrder, default: 0]
+                guard usageCount < inPageURLNodeReuseLimit else { continue }
+
+                let score = inPageURLMatchScore(
+                    nodeNormalizedText: node.normalizedText,
+                    nodeTokens: node.tokenSet,
+                    candidateNormalizedText: normalizedCandidateText,
+                    candidateTokens: candidateTokens,
+                    candidateURL: url
+                )
+
+                if score > bestScore {
+                    bestScore = score
+                    bestNode = node
+                }
+            }
+
+            guard let bestNode else { continue }
+            let minimumScore = inPageURLMinimumScore(forCandidateTokenCount: candidateTokens.count)
+            guard bestScore >= minimumScore else { continue }
+
+            let rect = InPageURLMetadataRect(
+                x: roundedInPageCoordinate(bestNode.x),
+                y: roundedInPageCoordinate(bestNode.y),
+                w: roundedInPageCoordinate(bestNode.width),
+                h: roundedInPageCoordinate(bestNode.height)
+            )
+            let dedupeKey = "\(bestNode.nodeOrder)|\(url)|\(rect.x)|\(rect.y)|\(rect.w)|\(rect.h)"
+            guard seenResolvedKeys.insert(dedupeKey).inserted else { continue }
+
+            resolved.append(
+                InPageURLMetadataResolvedURL(
+                    url: url,
+                    nid: bestNode.nodeOrder,
+                    p: rect
+                )
+            )
+            assignedNodeUseCount[bestNode.nodeOrder, default: 0] += 1
+        }
+
+        return resolved
+    }
+
+    private static func inPageURLMatchScore(
+        nodeNormalizedText: String,
+        nodeTokens: Set<String>,
+        candidateNormalizedText: String,
+        candidateTokens: Set<String>,
+        candidateURL: String
+    ) -> Int {
+        var score = 0
+
+        if nodeNormalizedText == candidateNormalizedText {
+            score += 125
+        } else {
+            let containsRelation = nodeNormalizedText.contains(candidateNormalizedText)
+                || candidateNormalizedText.contains(nodeNormalizedText)
+            if containsRelation {
+                score += 85
+                let lengthDelta = abs(nodeNormalizedText.count - candidateNormalizedText.count)
+                score -= min(lengthDelta, 20)
+            }
+        }
+
+        let commonTokenCount = approximateInPageTokenOverlapCount(lhs: nodeTokens, rhs: candidateTokens)
+        if commonTokenCount > 0 {
+            let overlapBase = max(nodeTokens.count, candidateTokens.count)
+            let ratio = Double(commonTokenCount) / Double(max(overlapBase, 1))
+            score += Int(ratio * 95.0)
+
+            let candidateCoverage = Double(commonTokenCount) / Double(max(candidateTokens.count, 1))
+            score += Int(candidateCoverage * 72.0)
+        }
+
+        if candidateURL.hasPrefix("https://") {
+            score += 4
+        }
+
+        return score
+    }
+
+    private static func approximateInPageTokenOverlapCount(lhs: Set<String>, rhs: Set<String>) -> Int {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
+
+        var consumedRHS: Set<String> = []
+        var overlapCount = 0
+
+        let orderedLHS = lhs.sorted { left, right in
+            if left.count != right.count {
+                return left.count > right.count
+            }
+            return left < right
+        }
+
+        for lhsToken in orderedLHS {
+            if rhs.contains(lhsToken), !consumedRHS.contains(lhsToken) {
+                consumedRHS.insert(lhsToken)
+                overlapCount += 1
+                continue
+            }
+
+            if let fuzzyMatch = rhs
+                .filter({ !consumedRHS.contains($0) })
+                .sorted(by: { $0.count > $1.count })
+                .first(where: { rhsToken in
+                    inPageURLTokensLikelyMatch(lhsToken, rhsToken)
+                }) {
+                consumedRHS.insert(fuzzyMatch)
+                overlapCount += 1
+            }
+        }
+
+        return overlapCount
+    }
+
+    private static func inPageURLTokensLikelyMatch(_ lhs: String, _ rhs: String) -> Bool {
+        if lhs == rhs { return true }
+        let minimumLength = min(lhs.count, rhs.count)
+        guard minimumLength >= 4 else { return false }
+        return lhs.hasPrefix(rhs) || rhs.hasPrefix(lhs)
+    }
+
+    private static func inPageURLMinimumScore(forCandidateTokenCount tokenCount: Int) -> Int {
+        if tokenCount >= 4 {
+            return inPageURLMinimumMatchScoreLongPhrase
+        }
+        if tokenCount >= 2 {
+            return inPageURLMinimumMatchScoreMultiToken
+        }
+        return inPageURLMinimumMatchScore
+    }
+
+    private static func normalizeInPageText(_ text: String) -> String {
+        let folded = text
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+            .lowercased()
+
+        var normalized = ""
+        normalized.reserveCapacity(folded.count)
+        var lastWasSpace = false
+
+        for scalar in folded.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                normalized.unicodeScalars.append(scalar)
+                lastWasSpace = false
+            } else if !lastWasSpace {
+                normalized.append(" ")
+                lastWasSpace = true
+            }
+        }
+
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func inPageURLTokenSet(_ normalizedText: String) -> Set<String> {
+        Set(
+            normalizedText
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+                .filter { $0.count >= 2 && !inPageURLTextStopwords.contains($0) }
+        )
+    }
+
+    private static func roundedInPageCoordinate(_ value: Double) -> Double {
+        let rounded = (value * 1_000.0).rounded() / 1_000.0
+        if rounded == -0 {
+            return 0
+        }
+        return rounded
+    }
+
+    private static func clampInPageCoordinate(_ value: Double) -> Double {
+        max(0, min(1, value))
+    }
+
+    private static func compactInPageURL(_ urlString: String, pageURL: String?) -> String {
+        guard let pageURL,
+              let url = URL(string: urlString),
+              let page = URL(string: pageURL),
+              url.scheme?.lowercased() == page.scheme?.lowercased(),
+              normalizeHost(url.host) == normalizeHost(page.host),
+              (url.port ?? defaultPort(forScheme: url.scheme)) == (page.port ?? defaultPort(forScheme: page.scheme))
+        else {
+            return urlString
+        }
+
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return urlString
+        }
+
+        var compact = components.percentEncodedPath
+        if compact.isEmpty {
+            compact = "/"
+        }
+        if let query = components.percentEncodedQuery, !query.isEmpty {
+            compact += "?\(query)"
+        }
+        if let fragment = components.percentEncodedFragment, !fragment.isEmpty {
+            compact += "#\(fragment)"
+        }
+        return compact
+    }
+
+    private static func normalizeHost(_ host: String?) -> String? {
+        guard let host else { return nil }
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("www.") {
+            return String(trimmed.dropFirst(4)).lowercased()
+        }
+        return trimmed.lowercased()
+    }
+
+    private static func defaultPort(forScheme scheme: String?) -> Int? {
+        guard let scheme else { return nil }
+        switch scheme.lowercased() {
+        case "https":
+            return 443
+        case "http":
+            return 80
+        default:
+            return nil
+        }
     }
 
     // MARK: - Status Management

@@ -61,6 +61,10 @@ public enum DailyMetricsQueries {
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
         case systemMonitorOpenPowerOCRPriority = "system_monitor_open_power_ocr_priority"
+        case inPageURLCollectionToggle = "in_page_url_collection_toggle"
+        case inPageURLPermissionProbe = "in_page_url_permission_probe"
+        case inPageURLVerification = "in_page_url_verification"
+        case browserLinkOpened = "browser_link_opened"
 
         // Delete actions
         case frameDeleted = "frame_deleted"

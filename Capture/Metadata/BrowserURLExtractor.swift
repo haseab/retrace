@@ -921,7 +921,7 @@ struct BrowserURLExtractor: Sendable {
                 """
                 tell application "Arc"
                     if (count of windows) > 0 then
-                        get URL of current tab of window 1
+                        get URL of active tab of window 1
                     end if
                 end tell
                 """,

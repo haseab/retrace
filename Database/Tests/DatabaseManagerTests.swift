@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import Shared
+import SQLCipher
 @testable import Database
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -308,6 +309,407 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(retrieved?.segmentID.value, appSegmentID)
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.apple.Safari")
         XCTAssertEqual(retrieved?.metadata.windowName, "Retrace - GitHub")
+    }
+
+    func testUpdateAndGetFrameMetadata() async throws {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/metadata-test.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(120),
+            windowName: "Metadata Test",
+            browserUrl: "https://example.com",
+            type: 0
+        )
+
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: VideoSegmentID(value: insertedVideoID),
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        )
+
+        let insertedFrameID = try await database.insertFrame(frame)
+        let frameID = FrameID(value: insertedFrameID)
+        let metadataJSON = #"{"urls":[{"url":"https://example.com","nodeid":101,"position":{"x":0.1,"y":0.2,"width":0.3,"height":0.04},"nodetext":"example","domtext":"example","highlightstartindex":0,"highlightendindex":7,"confidence":0.9}],"mouseposition":{"x":12.0,"y":24.0},"videoposition":null}"#
+
+        try await database.updateFrameMetadata(frameID: frameID, metadataJSON: metadataJSON)
+        let stored = try await database.getFrameMetadata(frameID: frameID)
+
+        XCTAssertEqual(stored, metadataJSON)
+    }
+
+    func testReplaceInPageURLData_AllowsNodeIDAboveInt32Max() async throws {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/in-page-url-large-node-id.mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.apple.Safari",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(120),
+            windowName: "Large Node ID",
+            browserUrl: "https://example.com",
+            type: 0
+        )
+
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: VideoSegmentID(value: insertedVideoID),
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        )
+
+        let insertedFrameID = try await database.insertFrame(frame)
+        let frameID = FrameID(value: insertedFrameID)
+        let largeNodeID = Int(Int32.max) + 1234
+
+        let state = FrameInPageURLState(
+            mouseX: 10.0,
+            mouseY: 20.0,
+            scrollX: 0.0,
+            scrollY: 4500.0,
+            videoCurrentTime: 42.5
+        )
+        let rows = [
+            FrameInPageURLRow(
+                order: 0,
+                url: "https://example.com/path",
+                nodeID: largeNodeID,
+                x: 0.1,
+                y: 0.2,
+                w: 0.3,
+                h: 0.04
+            )
+        ]
+
+        try await database.replaceFrameInPageURLData(
+            frameID: frameID,
+            state: state,
+            rows: rows
+        )
+
+        let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
+        XCTAssertEqual(storedRows.count, 1)
+        XCTAssertEqual(storedRows.first?.nodeID, largeNodeID)
+
+        let storedState = try await database.getFrameInPageURLState(frameID: frameID)
+        XCTAssertEqual(storedState, state)
+
+        guard let db = await database.getConnection() else {
+            XCTFail("Expected active database connection")
+            return
+        }
+
+        let sql = "SELECT mousePosition, scrollPosition, videoCurrentTime FROM frame WHERE id = ?;"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        XCTAssertEqual(sqlite3_prepare_v2(db, sql, -1, &statement, nil), SQLITE_OK)
+        sqlite3_bind_int64(statement, 1, frameID.value)
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+        XCTAssertEqual(sqlite3_column_text(statement, 0).map { String(cString: $0) }, "10.0,20.0")
+        XCTAssertEqual(sqlite3_column_text(statement, 1).map { String(cString: $0) }, "0.0,4500.0")
+        XCTAssertEqual(sqlite3_column_double(statement, 2), 42.5, accuracy: 0.0001)
+    }
+
+    func testReplaceInPageURLData_ReusesSharedURLTextAndCleansUpOrphans() async throws {
+        let firstFrameID = try await insertTestFrame(browserURL: "https://example.com/a")
+        let secondFrameID = try await insertTestFrame(browserURL: "https://example.com/b")
+
+        let firstRows = [
+            FrameInPageURLRow(
+                order: 0,
+                url: "/shared/path",
+                nodeID: 101,
+                x: 0.125,
+                y: 0.25,
+                w: 0.375,
+                h: 0.05
+            )
+        ]
+        let secondRows = [
+            FrameInPageURLRow(
+                order: 0,
+                url: "/shared/path",
+                nodeID: 202,
+                x: 0.625,
+                y: 0.5,
+                w: 0.25,
+                h: 0.08
+            )
+        ]
+
+        try await database.replaceFrameInPageURLData(frameID: firstFrameID, state: nil, rows: firstRows)
+        try await database.replaceFrameInPageURLData(frameID: secondFrameID, state: nil, rows: secondRows)
+
+        let storedFirstRows = try await database.getFrameInPageURLRows(frameID: firstFrameID)
+        let storedSecondRows = try await database.getFrameInPageURLRows(frameID: secondFrameID)
+        XCTAssertEqual(storedFirstRows.first?.nodeID, 101)
+        XCTAssertEqual(storedSecondRows.first?.nodeID, 202)
+        if let storedFirstRow = storedFirstRows.first {
+            XCTAssertEqual(storedFirstRow.x, 0.125, accuracy: 0.0001)
+        } else {
+            XCTFail("Expected first stored in-page URL row")
+        }
+        if let storedSecondRow = storedSecondRows.first {
+            XCTAssertEqual(storedSecondRow.x, 0.625, accuracy: 0.0001)
+        } else {
+            XCTFail("Expected second stored in-page URL row")
+        }
+
+        let sharedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
+        let distinctURLReferenceCount = try await fetchInt64(
+            "SELECT COUNT(DISTINCT urlId) FROM frame_in_page_url;"
+        )
+        XCTAssertEqual(sharedURLTextCount, 1)
+        XCTAssertEqual(distinctURLReferenceCount, 1)
+
+        try await database.replaceFrameInPageURLData(frameID: firstFrameID, state: nil, rows: [])
+        let countAfterFirstFrameRemoval = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
+        XCTAssertEqual(countAfterFirstFrameRemoval, 1)
+
+        try await database.replaceFrameInPageURLData(frameID: secondFrameID, state: nil, rows: [])
+        let countAfterSecondFrameRemoval = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
+        XCTAssertEqual(countAfterSecondFrameRemoval, 0)
+    }
+
+    func testEnsureInPageURLSchema_MigratesLegacyPerFrameRows() async throws {
+        let frameID = try await insertTestFrame(browserURL: "https://example.com/legacy")
+        let db = try await databaseConnection()
+
+        try await executeRawSQL("""
+            DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;
+            DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;
+            DROP TABLE IF EXISTS frame_in_page_url;
+            DROP TABLE IF EXISTS in_page_url_row_def;
+            DROP TABLE IF EXISTS in_page_url_text;
+            CREATE TABLE frame_in_page_url (
+                frameId INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                nid INTEGER NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                w REAL NOT NULL,
+                h REAL NOT NULL,
+                PRIMARY KEY (frameId, ord),
+                FOREIGN KEY (frameId) REFERENCES frame(id) ON DELETE CASCADE
+            );
+            """)
+
+        var insertStatement: OpaquePointer?
+        defer { sqlite3_finalize(insertStatement) }
+
+        let insertSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, url, nid, x, y, w, h)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """
+        XCTAssertEqual(sqlite3_prepare_v2(db, insertSQL, -1, &insertStatement, nil), SQLITE_OK)
+        sqlite3_bind_int64(insertStatement, 1, frameID.value)
+        sqlite3_bind_int64(insertStatement, 2, 0)
+        sqlite3_bind_text(insertStatement, 3, "/legacy/shared", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(insertStatement, 4, 77)
+        sqlite3_bind_double(insertStatement, 5, 0.111)
+        sqlite3_bind_double(insertStatement, 6, 0.222)
+        sqlite3_bind_double(insertStatement, 7, 0.333)
+        sqlite3_bind_double(insertStatement, 8, 0.044)
+        XCTAssertEqual(sqlite3_step(insertStatement), SQLITE_DONE)
+
+        try FrameQueries.ensureInPageURLSchema(db: db)
+
+        let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
+        XCTAssertEqual(storedRows.count, 1)
+        XCTAssertEqual(storedRows.first?.url, "/legacy/shared")
+        XCTAssertEqual(storedRows.first?.nodeID, 77)
+        if let storedRow = storedRows.first {
+            XCTAssertEqual(storedRow.x, 0.111, accuracy: 0.0001)
+            XCTAssertEqual(storedRow.y, 0.222, accuracy: 0.0001)
+            XCTAssertEqual(storedRow.w, 0.333, accuracy: 0.0001)
+            XCTAssertEqual(storedRow.h, 0.044, accuracy: 0.0001)
+        } else {
+            XCTFail("Expected migrated in-page URL row")
+        }
+
+        let migratedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
+        let migratedFrameRowCount = try await fetchInt64("SELECT COUNT(*) FROM frame_in_page_url;")
+        let legacyRowDefTableCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'in_page_url_row_def';"
+        )
+        XCTAssertEqual(migratedURLTextCount, 1)
+        XCTAssertEqual(migratedFrameRowCount, 1)
+        XCTAssertEqual(legacyRowDefTableCount, 0)
+    }
+
+    func testEnsureInPageURLSchema_MigratesSharedRowDefinitionsToURLTextStorage() async throws {
+        let firstFrameID = try await insertTestFrame(browserURL: "https://example.com/shared-a")
+        let secondFrameID = try await insertTestFrame(browserURL: "https://example.com/shared-b")
+        let db = try await databaseConnection()
+
+        try await executeRawSQL("""
+            DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;
+            DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;
+            DROP TABLE IF EXISTS frame_in_page_url;
+            DROP TABLE IF EXISTS in_page_url_text;
+            DROP TABLE IF EXISTS in_page_url_row_def;
+            CREATE TABLE in_page_url_row_def (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                x1000 INTEGER NOT NULL,
+                y1000 INTEGER NOT NULL,
+                w1000 INTEGER NOT NULL,
+                h1000 INTEGER NOT NULL,
+                UNIQUE(url, x1000, y1000, w1000, h1000)
+            );
+            CREATE TABLE frame_in_page_url (
+                frameId INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                rowDefId INTEGER NOT NULL,
+                nid INTEGER NOT NULL,
+                PRIMARY KEY (frameId, ord),
+                FOREIGN KEY (frameId) REFERENCES frame(id) ON DELETE CASCADE,
+                FOREIGN KEY (rowDefId) REFERENCES in_page_url_row_def(id)
+            );
+            CREATE INDEX idx_frame_in_page_url_frameId
+            ON frame_in_page_url(frameId);
+            CREATE INDEX idx_frame_in_page_url_rowDefId
+            ON frame_in_page_url(rowDefId);
+            CREATE TRIGGER trg_frame_in_page_url_cleanup_row_def
+            AFTER DELETE ON frame_in_page_url
+            BEGIN
+                DELETE FROM in_page_url_row_def
+                WHERE id = OLD.rowDefId
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM frame_in_page_url
+                      WHERE rowDefId = OLD.rowDefId
+                  );
+            END;
+            """)
+
+        var insertRowDefStatement: OpaquePointer?
+        defer { sqlite3_finalize(insertRowDefStatement) }
+
+        let insertRowDefSQL = """
+            INSERT INTO in_page_url_row_def (url, x1000, y1000, w1000, h1000)
+            VALUES (?, ?, ?, ?, ?);
+            """
+        XCTAssertEqual(sqlite3_prepare_v2(db, insertRowDefSQL, -1, &insertRowDefStatement, nil), SQLITE_OK)
+
+        sqlite3_bind_text(insertRowDefStatement, 1, "/shared/path", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(insertRowDefStatement, 2, 125)
+        sqlite3_bind_int64(insertRowDefStatement, 3, 250)
+        sqlite3_bind_int64(insertRowDefStatement, 4, 375)
+        sqlite3_bind_int64(insertRowDefStatement, 5, 50)
+        XCTAssertEqual(sqlite3_step(insertRowDefStatement), SQLITE_DONE)
+        let firstRowDefID = sqlite3_last_insert_rowid(db)
+
+        sqlite3_reset(insertRowDefStatement)
+        sqlite3_clear_bindings(insertRowDefStatement)
+        sqlite3_bind_text(insertRowDefStatement, 1, "/shared/path", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(insertRowDefStatement, 2, 625)
+        sqlite3_bind_int64(insertRowDefStatement, 3, 500)
+        sqlite3_bind_int64(insertRowDefStatement, 4, 250)
+        sqlite3_bind_int64(insertRowDefStatement, 5, 80)
+        XCTAssertEqual(sqlite3_step(insertRowDefStatement), SQLITE_DONE)
+        let secondRowDefID = sqlite3_last_insert_rowid(db)
+
+        var insertFrameRowStatement: OpaquePointer?
+        defer { sqlite3_finalize(insertFrameRowStatement) }
+
+        let insertFrameRowSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, rowDefId, nid)
+            VALUES (?, ?, ?, ?);
+            """
+        XCTAssertEqual(sqlite3_prepare_v2(db, insertFrameRowSQL, -1, &insertFrameRowStatement, nil), SQLITE_OK)
+
+        sqlite3_bind_int64(insertFrameRowStatement, 1, firstFrameID.value)
+        sqlite3_bind_int64(insertFrameRowStatement, 2, 0)
+        sqlite3_bind_int64(insertFrameRowStatement, 3, firstRowDefID)
+        sqlite3_bind_int64(insertFrameRowStatement, 4, 101)
+        XCTAssertEqual(sqlite3_step(insertFrameRowStatement), SQLITE_DONE)
+
+        sqlite3_reset(insertFrameRowStatement)
+        sqlite3_clear_bindings(insertFrameRowStatement)
+        sqlite3_bind_int64(insertFrameRowStatement, 1, secondFrameID.value)
+        sqlite3_bind_int64(insertFrameRowStatement, 2, 0)
+        sqlite3_bind_int64(insertFrameRowStatement, 3, secondRowDefID)
+        sqlite3_bind_int64(insertFrameRowStatement, 4, 202)
+        XCTAssertEqual(sqlite3_step(insertFrameRowStatement), SQLITE_DONE)
+
+        try FrameQueries.ensureInPageURLSchema(db: db)
+
+        let migratedFirstRows = try await database.getFrameInPageURLRows(frameID: firstFrameID)
+        let migratedSecondRows = try await database.getFrameInPageURLRows(frameID: secondFrameID)
+        XCTAssertEqual(migratedFirstRows.count, 1)
+        XCTAssertEqual(migratedSecondRows.count, 1)
+        XCTAssertEqual(migratedFirstRows.first?.url, "/shared/path")
+        XCTAssertEqual(migratedSecondRows.first?.url, "/shared/path")
+        XCTAssertEqual(migratedFirstRows.first?.nodeID, 101)
+        XCTAssertEqual(migratedSecondRows.first?.nodeID, 202)
+        if let migratedFirstRow = migratedFirstRows.first {
+            XCTAssertEqual(migratedFirstRow.x, 0.125, accuracy: 0.0001)
+        } else {
+            XCTFail("Expected migrated first in-page URL row")
+        }
+        if let migratedSecondRow = migratedSecondRows.first {
+            XCTAssertEqual(migratedSecondRow.x, 0.625, accuracy: 0.0001)
+        } else {
+            XCTFail("Expected migrated second in-page URL row")
+        }
+
+        let migratedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
+        let migratedFrameRowCount = try await fetchInt64("SELECT COUNT(*) FROM frame_in_page_url;")
+        let distinctURLReferenceCount = try await fetchInt64(
+            "SELECT COUNT(DISTINCT urlId) FROM frame_in_page_url;"
+        )
+        let urlIDIndexCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_frame_in_page_url_urlId';"
+        )
+        let frameIDIndexCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_frame_in_page_url_frameId';"
+        )
+        let rowDefTableCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'in_page_url_row_def';"
+        )
+
+        XCTAssertEqual(migratedURLTextCount, 1)
+        XCTAssertEqual(migratedFrameRowCount, 2)
+        XCTAssertEqual(distinctURLReferenceCount, 1)
+        XCTAssertEqual(urlIDIndexCount, 1)
+        XCTAssertEqual(frameIDIndexCount, 0)
+        XCTAssertEqual(rowDefTableCount, 0)
     }
 
     func testGetFramesByTimeRange() async throws {
@@ -1013,5 +1415,87 @@ final class DatabaseManagerTests: XCTestCase {
             type: 0
         )
         return SegmentID(value: id)
+    }
+
+    private func insertTestFrame(
+        browserURL: String?,
+        bundleID: String = "com.apple.Safari"
+    ) async throws -> FrameID {
+        let timestamp = Date()
+        let videoSegment = VideoSegment(
+            id: VideoSegmentID(value: 0),
+            startTime: timestamp,
+            endTime: timestamp.addingTimeInterval(120),
+            frameCount: 1,
+            fileSizeBytes: 1024,
+            relativePath: "segments/test-\(UUID().uuidString).mp4",
+            width: 1920,
+            height: 1080,
+            source: .native
+        )
+        let insertedVideoID = try await database.insertVideoSegment(videoSegment)
+        let appSegmentID = try await database.insertSegment(
+            bundleID: bundleID,
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(120),
+            windowName: "Test Window",
+            browserUrl: browserURL,
+            type: 0
+        )
+
+        let frame = FrameReference(
+            id: FrameID(value: 0),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: VideoSegmentID(value: insertedVideoID),
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        )
+
+        return FrameID(value: try await database.insertFrame(frame))
+    }
+
+    private func databaseConnection() async throws -> OpaquePointer {
+        guard let db = await database.getConnection() else {
+            throw NSError(domain: "DatabaseManagerTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Expected active database connection"])
+        }
+        return db
+    }
+
+    private func executeRawSQL(_ sql: String) async throws {
+        let db = try await databaseConnection()
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        defer { sqlite3_free(errorMessage) }
+
+        guard sqlite3_exec(db, sql, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown SQL error"
+            throw NSError(domain: "DatabaseManagerTests", code: 2, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+    }
+
+    private func fetchInt64(
+        _ sql: String,
+        bind: ((OpaquePointer?) -> Void)? = nil
+    ) async throws -> Int64 {
+        let db = try await databaseConnection()
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw NSError(
+                domain: "DatabaseManagerTests",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(db))]
+            )
+        }
+
+        bind?(statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw NSError(domain: "DatabaseManagerTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "Expected one row for query: \(sql)"])
+        }
+
+        return sqlite3_column_int64(statement, 0)
     }
 }

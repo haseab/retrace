@@ -55,6 +55,32 @@ public struct TimelineFrame: Identifiable, Equatable {
     public let videoInfo: FrameVideoInfo?
     /// Processing status: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
     public let processingStatus: Int
+    public let videoCurrentTime: Double?
+    public let scrollY: Double?
+
+    public init(
+        frame: FrameReference,
+        videoInfo: FrameVideoInfo?,
+        processingStatus: Int,
+        videoCurrentTime: Double? = nil,
+        scrollY: Double? = nil
+    ) {
+        self.frame = frame
+        self.videoInfo = videoInfo
+        self.processingStatus = processingStatus
+        self.videoCurrentTime = videoCurrentTime
+        self.scrollY = scrollY
+    }
+
+    public init(frameWithVideoInfo: FrameWithVideoInfo) {
+        self.init(
+            frame: frameWithVideoInfo.frame,
+            videoInfo: frameWithVideoInfo.videoInfo,
+            processingStatus: frameWithVideoInfo.processingStatus,
+            videoCurrentTime: frameWithVideoInfo.videoCurrentTime,
+            scrollY: frameWithVideoInfo.scrollY
+        )
+    }
 
     public var id: FrameID { frame.id }
 
@@ -182,6 +208,81 @@ public struct CommentTimelineRow: Identifiable, Sendable, Equatable {
     }
 }
 
+/// OCR node mapped to a browser hyperlink extracted from live DOM.
+/// Coordinates are normalized (0.0-1.0) in the same space as OCR nodes.
+public struct OCRHyperlinkMatch: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let nodeID: Int
+    public let x: CGFloat
+    public let y: CGFloat
+    public let width: CGFloat
+    public let height: CGFloat
+    public let url: String
+    public let nodeText: String
+    public let domText: String
+    public let highlightStartIndex: Int
+    public let highlightEndIndex: Int
+    public let confidence: Double
+
+    public init(
+        id: String,
+        nodeID: Int,
+        x: CGFloat,
+        y: CGFloat,
+        width: CGFloat,
+        height: CGFloat,
+        url: String,
+        nodeText: String,
+        domText: String,
+        highlightStartIndex: Int,
+        highlightEndIndex: Int,
+        confidence: Double
+    ) {
+        self.id = id
+        self.nodeID = nodeID
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.url = url
+        self.nodeText = nodeText
+        self.domText = domText
+        self.highlightStartIndex = highlightStartIndex
+        self.highlightEndIndex = highlightEndIndex
+        self.confidence = confidence
+    }
+
+    /// Normalized X origin for the linked word span (falls back to full node).
+    public var highlightX: CGFloat {
+        let range = clampedHighlightRange
+        let textCount = max(nodeText.count, 1)
+        let startFraction = CGFloat(range.start) / CGFloat(textCount)
+        return x + (width * startFraction)
+    }
+
+    /// Normalized width for the linked word span (falls back to full node).
+    public var highlightWidth: CGFloat {
+        let range = clampedHighlightRange
+        let textCount = max(nodeText.count, 1)
+        let minimumFraction = 1.0 / CGFloat(textCount)
+        let spanFraction = max(CGFloat(range.end - range.start) / CGFloat(textCount), minimumFraction)
+        return width * min(spanFraction, 1.0)
+    }
+
+    private var clampedHighlightRange: (start: Int, end: Int) {
+        let textCount = nodeText.count
+        guard textCount > 0 else { return (start: 0, end: 1) }
+
+        var start = min(max(highlightStartIndex, 0), textCount - 1)
+        var end = min(max(highlightEndIndex, start + 1), textCount)
+        if end <= start {
+            start = 0
+            end = textCount
+        }
+        return (start, end)
+    }
+}
+
 /// Simple ViewModel for the redesigned fullscreen timeline view
 /// All state derives from currentIndex - this is the SINGLE source of truth
 @MainActor
@@ -256,6 +357,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         let previousCurrentIndex: Int
         let previousSelectedFrameIndex: Int?
         let undoMessage: String
+    }
+
+    nonisolated private static let inPageURLCollectionExperimentalKey = "collectInPageURLsExperimental"
+
+    private static func isInPageURLCollectionEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.object(forKey: inPageURLCollectionExperimentalKey) != nil else {
+            return false
+        }
+        return defaults.bool(forKey: inPageURLCollectionExperimentalKey)
     }
 
     // MARK: - Published State
@@ -447,6 +558,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the mouse is currently hovering over the URL bounding box
     @Published public var isHoveringURL: Bool = false
 
+    /// Hyperlinks mapped from live DOM to OCR node bounds for the current frame.
+    @Published public var hyperlinkMatches: [OCRHyperlinkMatch] = []
+
+
     /// Flag to force video reload on next updateNSView (clears AVPlayer's stale cache)
     /// Set this when window becomes visible after background refresh
     public var forceVideoReload: Bool = false
@@ -510,6 +625,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Current version of ocrNodes (incremented on change)
     private var currentNodesVersion: Int = 0
+
+    /// Current in-flight task for stored hyperlink row loading.
+    private var hyperlinkMappingTask: Task<Void, Never>?
 
     // MARK: - Zoom Region State (Shift+Drag focus rectangle)
 
@@ -2529,7 +2647,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if !framesWithVideoInfo.isEmpty {
                 let timelineFrames = framesWithVideoInfo.map {
-                    TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus)
+                    TimelineFrame(frameWithVideoInfo: $0)
                 }
                 let closestIndex = Self.findClosestFrameIndex(in: timelineFrames, to: timestamp)
                 pendingCurrentIndexAfterFrameReplacement = closestIndex
@@ -5896,7 +6014,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Convert to TimelineFrame - video info is already included from the JOIN
             // Reverse so oldest is first (index 0), newest is last
             // This matches the timeline UI which displays left-to-right as past-to-future
-            frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            frames = framesWithVideoInfo.reversed().map { TimelineFrame(frameWithVideoInfo: $0) }
 
             // Initialize window boundary timestamps for infinite scroll
             updateWindowBoundaries()
@@ -5991,7 +6109,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Convert to TimelineFrame - reverse so oldest is first (index 0), newest is last
-        frames = framesWithVideoInfo.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+        frames = framesWithVideoInfo.reversed().map { TimelineFrame(frameWithVideoInfo: $0) }
 
         // Initialize window boundary timestamps for infinite scroll
         updateWindowBoundaries()
@@ -6085,7 +6203,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         }
 
                         // Add new frames to the end (they're newer, so they go at the end)
-                        let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+                        let newTimelineFrames = newFrames.reversed().map { TimelineFrame(frameWithVideoInfo: $0) }
 
                         frames.append(contentsOf: newTimelineFrames)
 
@@ -6174,11 +6292,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                         continue
                     }
 
-                    frames[liveIndexAfterAwait] = TimelineFrame(
-                        frame: updatedFrame.frame,
-                        videoInfo: updatedFrame.videoInfo,
-                        processingStatus: updatedFrame.processingStatus
-                    )
+                    frames[liveIndexAfterAwait] = TimelineFrame(frameWithVideoInfo: updatedFrame)
                 } else {
                     // Array may have changed while awaiting; resolve again before writing.
                     guard let liveIndexAfterAwait = frames.firstIndex(where: { $0.frame.id == frameID }) else {
@@ -6190,7 +6304,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     frames[liveIndexAfterAwait] = TimelineFrame(
                         frame: existingFrame.frame,
                         videoInfo: existingFrame.videoInfo,
-                        processingStatus: newStatus
+                        processingStatus: newStatus,
+                        videoCurrentTime: existingFrame.videoCurrentTime,
+                        scrollY: existingFrame.scrollY
                     )
                 }
 
@@ -6592,7 +6708,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame - video info is already included from the JOIN
-            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            let timelineFrames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
 
             // Replace current frames with new window
             frames = timelineFrames
@@ -7103,13 +7219,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load image for image-based frames (Retrace) if needed
     private func loadImageIfNeeded() {
         // Skip during live mode - live screenshot is already displayed and OCR is handled separately
-        guard !isInLiveMode else { return }
+        guard !isInLiveMode else {
+            clearHyperlinkMatches()
+            return
+        }
         cancelDiskFrameBufferInactivityCleanup()
 
         guard let timelineFrame = currentTimelineFrame else {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
             }
+            clearHyperlinkMatches()
             return
         }
 
@@ -7128,6 +7248,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             ocrStatusPollingTask?.cancel()
             ocrStatusPollingTask = nil
             urlBoundingBox = nil
+            clearHyperlinkMatches()
             clearTextSelection()
         }
 
@@ -7667,14 +7788,80 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// - Returns: `true` if a valid URL was opened.
     @discardableResult
     public func openCurrentBrowserURL() -> Bool {
-        guard let urlString = currentFrame?.metadata.browserURL,
-              !urlString.isEmpty,
-              let url = URL(string: urlString) else {
+        guard let timelineFrame = currentTimelineFrame,
+              let urlString = timelineFrame.frame.metadata.browserURL,
+              !urlString.isEmpty else {
             return false
         }
 
-        NSWorkspace.shared.open(url)
-        Log.info("[Timeline] Opened current browser URL: \(urlString)", category: .ui)
+        Log.debug(
+            "[BrowserLinkOpen] start frameId=\(timelineFrame.frame.id.value) baseURL=\(urlString) scrollY=\(String(describing: timelineFrame.scrollY)) videoCurrentTime=\(String(describing: timelineFrame.videoCurrentTime))",
+            category: .ui
+        )
+        let finalURLString = currentBrowserOpenURLString(
+            baseURLString: urlString,
+            videoCurrentTime: timelineFrame.videoCurrentTime,
+            scrollY: timelineFrame.scrollY
+        )
+        Log.debug(
+            "[BrowserLinkOpen] resolved frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
+            category: .ui
+        )
+        guard let finalURL = URL(string: finalURLString) else {
+            Log.warning(
+                "[BrowserLinkOpen] invalid final URL frameId=\(timelineFrame.frame.id.value) finalURL=\(finalURLString)",
+                category: .ui
+            )
+            return false
+        }
+
+        let usedTextFragment = Self.urlContainsTextFragment(finalURLString)
+        let usedYouTubeTimestamp = Self.urlContainsYouTubeTimestamp(finalURLString)
+
+        guard let browserApplicationURL = Self.hyperlinkBrowserApplicationURL(for: finalURL) else {
+            let opened = NSWorkspace.shared.open(finalURL)
+            if opened {
+                Log.info("[Timeline] Opened current browser URL via fallback dispatch: \(finalURLString)", category: .ui)
+                DashboardViewModel.recordBrowserLinkOpened(
+                    coordinator: coordinator,
+                    source: "current_browser_url",
+                    url: finalURLString,
+                    usedTextFragment: usedTextFragment,
+                    usedYouTubeTimestamp: usedYouTubeTimestamp
+                )
+            } else {
+                Log.warning("[Timeline] Failed to open current browser URL: \(finalURLString)", category: .ui)
+            }
+            return true
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+
+        NSWorkspace.shared.open([finalURL], withApplicationAt: browserApplicationURL, configuration: configuration) { [weak self] _, error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    Log.warning(
+                        "[Timeline] Failed to open current browser URL in explicit browser \(browserApplicationURL.path): \(finalURLString) | \(error.localizedDescription)",
+                        category: .ui
+                    )
+                } else {
+                    Log.info(
+                        "[Timeline] Opened current browser URL in explicit browser \(browserApplicationURL.path): \(finalURLString)",
+                        category: .ui
+                    )
+                    DashboardViewModel.recordBrowserLinkOpened(
+                        coordinator: self.coordinator,
+                        source: "current_browser_url",
+                        url: finalURLString,
+                        usedTextFragment: usedTextFragment,
+                        usedYouTubeTimestamp: usedYouTubeTimestamp
+                    )
+                }
+            }
+        }
         return true
     }
 
@@ -7682,19 +7869,605 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// - Returns: `true` if a valid URL was copied.
     @discardableResult
     public func copyCurrentBrowserURL() -> Bool {
-        guard let currentFrame,
-              let urlString = currentFrame.metadata.browserURL,
-              !urlString.isEmpty,
-              URL(string: urlString) != nil else {
+        guard let timelineFrame = currentTimelineFrame,
+              let urlString = timelineFrame.frame.metadata.browserURL,
+              !urlString.isEmpty else {
+            return false
+        }
+
+        let finalURLString = timestampedCurrentBrowserURLString(
+            baseURLString: urlString,
+            videoCurrentTime: timelineFrame.videoCurrentTime
+        )
+        guard URL(string: finalURLString) != nil else {
             return false
         }
 
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.setString(urlString, forType: .string)
+        pasteboard.setString(finalURLString, forType: .string)
         showToast("Link copied")
-        Log.info("[Timeline] Copied current browser URL: \(urlString)", category: .ui)
+        Log.info("[Timeline] Copied current browser URL: \(finalURLString)", category: .ui)
         return true
+    }
+
+    private func timestampedCurrentBrowserURLString(
+        baseURLString: String,
+        videoCurrentTime: Double?
+    ) -> String {
+        Self.youtubeTimestampedBrowserURLString(
+            baseURLString,
+            videoCurrentTime: videoCurrentTime
+        )
+    }
+
+    private func currentBrowserOpenURLString(
+        baseURLString: String,
+        videoCurrentTime: Double?,
+        scrollY: Double?
+    ) -> String {
+        _ = scrollY
+        return timestampedCurrentBrowserURLString(
+            baseURLString: baseURLString,
+            videoCurrentTime: videoCurrentTime
+        )
+    }
+
+    static func youtubeTimestampedBrowserURLString(
+        _ urlString: String,
+        videoCurrentTime: Double?
+    ) -> String {
+        guard let videoCurrentTime,
+              videoCurrentTime.isFinite,
+              videoCurrentTime >= 0,
+              let url = URL(string: urlString),
+              Self.isYouTubeWatchURL(url),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return urlString
+        }
+
+        let seconds = Int(floor(videoCurrentTime))
+        var queryItems = components.queryItems ?? []
+        queryItems.removeAll { $0.name.caseInsensitiveCompare("t") == .orderedSame }
+        queryItems.append(URLQueryItem(name: "t", value: "\(seconds)"))
+        components.queryItems = queryItems
+        return components.url?.absoluteString ?? urlString
+    }
+
+    private static func isYouTubeWatchURL(_ url: URL) -> Bool {
+        normalizedHost(url.host) == "youtube.com" && url.path.lowercased() == "/watch"
+    }
+
+    private func hasScrolledPastFirstViewport(scrollY: Double?) -> Bool {
+        guard let scrollY,
+              scrollY.isFinite,
+              scrollY > 0 else {
+            return false
+        }
+
+        guard let estimatedViewportHeight = estimatedViewportHeightForCurrentFrame() else {
+            return true
+        }
+        return scrollY >= estimatedViewportHeight
+    }
+
+    private func estimatedViewportHeightForCurrentFrame() -> Double? {
+        if let imageHeight = currentImage?.size.height,
+           imageHeight > 1 {
+            return Double(imageHeight)
+        }
+
+        if let videoHeight = currentTimelineFrame?.videoInfo?.height,
+           videoHeight > 1 {
+            let scale = max(NSScreen.main?.backingScaleFactor ?? 2.0, 1.0)
+            return Double(videoHeight) / scale
+        }
+
+        return nil
+    }
+
+    private static func shouldUseSmartTextFragment(for url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return false
+        }
+
+        let host = normalizedHost(url.host)
+        guard !host.isEmpty else {
+            return false
+        }
+
+        return !textFragmentExcludedDomains.contains { blocked in
+            host == blocked || host.hasSuffix(".\(blocked)")
+        }
+    }
+
+    private struct BrowserTextFragmentNodeCandidate {
+        let startText: String
+        let endText: String?
+        let centerY: CGFloat
+        let isolationScore: CGFloat
+    }
+
+    private func smartTextFragmentDirectiveForCurrentFrame() -> String? {
+        if let selectedDirective = Self.smartTextFragmentDirective(startText: selectedText, endText: nil) {
+            Log.debug(
+                "[BrowserLinkOpen] fragment candidate selectedText length=\(selectedText.count) directive=\(selectedDirective)",
+                category: .ui
+            )
+            return selectedDirective
+        }
+
+        let candidates = visibleOCRTextFragmentNodeCandidates()
+        guard let bestCandidateIndex = Self.bestTextFragmentNodeCandidateIndex(candidates) else {
+            Log.debug(
+                "[BrowserLinkOpen] fragment candidates empty count=\(candidates.count)",
+                category: .ui
+            )
+            return nil
+        }
+
+        let candidate = candidates[bestCandidateIndex]
+        let directive = Self.smartTextFragmentDirective(
+            startText: candidate.startText,
+            endText: candidate.endText
+        )
+        Log.debug(
+            "[BrowserLinkOpen] fragment candidate chosen start=\(candidate.startText) end=\(candidate.endText ?? "<none>") centerY=\(candidate.centerY) isolation=\(candidate.isolationScore) directive=\(String(describing: directive)) candidates=\(candidates.count)",
+            category: .ui
+        )
+        return directive
+    }
+
+    private func visibleOCRTextFragmentNodeCandidates() -> [BrowserTextFragmentNodeCandidate] {
+        let nodes = isZoomRegionActive ? ocrNodesInZoomRegion : ocrNodes
+        guard !nodes.isEmpty else { return [] }
+
+        let orderedNodes = nodes.sorted {
+            if abs($0.y - $1.y) > Self.searchHighlightLineTolerance {
+                return $0.y < $1.y
+            }
+            return $0.x < $1.x
+        }
+
+        let nodeWords: [(node: OCRNodeWithText, words: [String])] = orderedNodes.compactMap { node in
+            guard let visibleText = visibleTextFragmentText(for: node) else {
+                return nil
+            }
+
+            let words = Self.cleanTextFragmentWords(from: visibleText)
+            guard words.count >= 3 else {
+                return nil
+            }
+
+            return (node: node, words: words)
+        }
+
+        guard !nodeWords.isEmpty else { return [] }
+
+        return nodeWords.enumerated().compactMap { index, entry in
+            let startText = Self.textFragmentWordSlice(from: entry.words)
+            guard !startText.isEmpty else {
+                return nil
+            }
+
+            let endText = Self.nextTextFragmentEndText(after: index, in: nodeWords)
+            return BrowserTextFragmentNodeCandidate(
+                startText: startText,
+                endText: endText,
+                centerY: entry.node.y + (entry.node.height / 2.0),
+                isolationScore: isolationScore(for: entry.node, among: orderedNodes)
+            )
+        }
+    }
+
+    private func visibleTextFragmentText(for node: OCRNodeWithText) -> String? {
+        let rawText = node.text
+        let trimmedFullText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFullText.isEmpty else { return nil }
+
+        guard let range = getVisibleCharacterRange(for: node) else {
+            return trimmedFullText
+        }
+
+        let clampedStart = min(max(range.start, 0), rawText.count)
+        let clampedEnd = min(max(range.end, clampedStart), rawText.count)
+        guard clampedStart < clampedEnd else { return nil }
+
+        let startIndex = rawText.index(rawText.startIndex, offsetBy: clampedStart)
+        let endIndex = rawText.index(rawText.startIndex, offsetBy: clampedEnd)
+        let clippedText = String(rawText[startIndex..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return clippedText.isEmpty ? nil : clippedText
+    }
+
+    private func isolationScore(for target: OCRNodeWithText, among nodes: [OCRNodeWithText]) -> CGFloat {
+        let targetCenterY = target.y + (target.height / 2.0)
+        let targetMinX = target.x
+        let targetMaxX = target.x + target.width
+
+        var nearestGap: CGFloat = 1.0
+
+        for node in nodes where node.id != target.id {
+            let nodeCenterY = node.y + (node.height / 2.0)
+            guard abs(nodeCenterY - targetCenterY) <= Self.searchHighlightLineTolerance else {
+                continue
+            }
+
+            let nodeMinX = node.x
+            let nodeMaxX = node.x + node.width
+            let gap: CGFloat
+            if nodeMaxX <= targetMinX {
+                gap = targetMinX - nodeMaxX
+            } else if nodeMinX >= targetMaxX {
+                gap = nodeMinX - targetMaxX
+            } else {
+                gap = 0
+            }
+
+            nearestGap = min(nearestGap, gap)
+        }
+
+        return nearestGap
+    }
+
+    private static func bestTextFragmentNodeCandidateIndex(_ candidates: [BrowserTextFragmentNodeCandidate]) -> Int? {
+        guard !candidates.isEmpty else { return nil }
+
+        var bestIndex: Int?
+        var bestScore = -Double.greatestFiniteMagnitude
+
+        for (index, candidate) in candidates.enumerated() {
+            let centerPenalty = Double(abs(candidate.centerY - 0.5)) * 120.0
+            let combinedText = candidate.startText + (candidate.endText.map { " " + $0 } ?? "")
+            let usefulLength = min(Double(combinedText.count), 96.0)
+            let shortPenalty = candidate.endText == nil ? 20.0 : 0.0
+            let isolationBonus = Double(min(candidate.isolationScore, 0.12)) * 320.0
+            let score = usefulLength + isolationBonus - centerPenalty - shortPenalty
+            if score > bestScore {
+                bestScore = score
+                bestIndex = index
+            }
+        }
+
+        return bestIndex
+    }
+
+    private static func smartTextFragmentDirective(startText: String, endText: String?) -> String? {
+        guard let normalizedStartText = normalizedTextFragmentComponent(
+            startText,
+            maxLength: 48,
+            minimumLength: 8
+        ) else {
+            return nil
+        }
+
+        let encodedStartText = encodedTextFragmentComponent(normalizedStartText)
+
+        guard let endText,
+              let normalizedEndText = normalizedTextFragmentComponent(
+                endText,
+                maxLength: 48,
+                minimumLength: 8
+              ) else {
+            return ":~:text=" + encodedStartText
+        }
+
+        return ":~:text=" + encodedStartText + "," + encodedTextFragmentComponent(normalizedEndText)
+    }
+
+    static func appendingSmartTextFragment(to urlString: String, directive: String?) -> String {
+        guard let directive,
+              !directive.isEmpty,
+              var components = URLComponents(string: urlString) else {
+            return urlString
+        }
+
+        let existingFragment = components.percentEncodedFragment ?? ""
+        guard !existingFragment.contains(":~:text=") else {
+            return urlString
+        }
+
+        components.percentEncodedFragment = existingFragment.isEmpty
+            ? directive
+            : existingFragment + directive
+        return components.string ?? urlString
+    }
+
+    private static func normalizedTextFragmentComponent(
+        _ text: String?,
+        maxLength: Int,
+        minimumLength: Int
+    ) -> String? {
+        guard let text else { return nil }
+        let collapsed = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count >= minimumLength else { return nil }
+        if collapsed.count <= maxLength {
+            return collapsed
+        }
+
+        let truncated = String(collapsed.prefix(maxLength))
+        let whitespace = CharacterSet.whitespacesAndNewlines
+
+        if let lastWhitespaceIndex = truncated.lastIndex(where: {
+            $0.unicodeScalars.allSatisfy(whitespace.contains)
+        }) {
+            let wordSafe = truncated[..<lastWhitespaceIndex].trimmingCharacters(in: .whitespacesAndNewlines)
+            if wordSafe.count >= minimumLength {
+                return wordSafe
+            }
+        }
+
+        return truncated.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func cleanTextFragmentWords(from text: String) -> [String] {
+        let collapsed = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !collapsed.isEmpty else { return [] }
+
+        return collapsed
+            .components(separatedBy: .whitespacesAndNewlines)
+            .map { token in
+                token.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            }
+            .filter { $0.count >= 2 }
+    }
+
+    private static func textFragmentWordSlice(from words: [String], count: Int = 3) -> String {
+        Array(words.prefix(count)).joined(separator: " ")
+    }
+
+    private static func nextTextFragmentEndText(
+        after index: Int,
+        in entries: [(node: OCRNodeWithText, words: [String])]
+    ) -> String? {
+        guard index + 1 < entries.count else {
+            return nil
+        }
+
+        for nextIndex in (index + 1)..<entries.count {
+            let endText = textFragmentWordSlice(from: entries[nextIndex].words)
+            if !endText.isEmpty {
+                return endText
+            }
+        }
+
+        return nil
+    }
+
+    private static func encodedTextFragmentComponent(_ text: String) -> String {
+        text.addingPercentEncoding(withAllowedCharacters: textFragmentAllowedCharacters) ?? text
+    }
+
+    private static let textFragmentAllowedCharacters: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "#&?=,+-")
+        return allowed
+    }()
+
+    private static let textFragmentExcludedDomains: [String] = [
+        "youtube.com",
+        "youtu.be",
+        "x.com",
+        "twitter.com",
+        "facebook.com",
+        "instagram.com",
+        "tiktok.com"
+    ]
+
+    private static func urlContainsTextFragment(_ urlString: String) -> Bool {
+        urlString.contains(":~:text=")
+    }
+
+    private static func urlContainsYouTubeTimestamp(_ urlString: String) -> Bool {
+        guard let url = URL(string: urlString),
+              isYouTubeWatchURL(url),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        return components.queryItems?.contains(where: { $0.name.caseInsensitiveCompare("t") == .orderedSame }) == true
+    }
+
+    @discardableResult
+    public func openHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
+        guard let resolvedURLString = resolvedHyperlinkURLString(for: match),
+              let url = URL(string: resolvedURLString) else {
+            return false
+        }
+
+        guard let browserApplicationURL = Self.hyperlinkBrowserApplicationURL(for: url) else {
+            let opened = NSWorkspace.shared.open(url)
+            if opened {
+                Log.info("[HyperlinkMap] Opened mapped hyperlink via fallback dispatch: \(resolvedURLString)", category: .ui)
+            } else {
+                Log.warning("[HyperlinkMap] Failed to open mapped hyperlink: \(resolvedURLString)", category: .ui)
+            }
+            return opened
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+
+        NSWorkspace.shared.open([url], withApplicationAt: browserApplicationURL, configuration: configuration) { _, error in
+            if let error {
+                Log.warning(
+                    "[HyperlinkMap] Failed to open mapped hyperlink in explicit browser \(browserApplicationURL.path): \(resolvedURLString) | \(error.localizedDescription)",
+                    category: .ui
+                )
+            } else {
+                Log.info(
+                    "[HyperlinkMap] Opened mapped hyperlink in explicit browser \(browserApplicationURL.path): \(resolvedURLString)",
+                    category: .ui
+                )
+            }
+        }
+        return true
+    }
+
+    public func resolvedHyperlinkURLString(for match: OCRHyperlinkMatch) -> String? {
+        let resolvedURLString = Self.resolveStoredHyperlinkURL(
+            match.url,
+            baseURL: currentFrame?.metadata.browserURL
+        )
+        guard URL(string: resolvedURLString) != nil else {
+            return nil
+        }
+        return resolvedURLString
+    }
+
+    /// Copy a mapped hyperlink to the clipboard using the same URL resolution path as open.
+    @discardableResult
+    public func copyHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
+        guard let resolvedURLString = resolvedHyperlinkURLString(for: match) else {
+            return false
+        }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(resolvedURLString, forType: .string)
+        showToast("Link copied")
+        Log.info("[HyperlinkMap] Copied mapped hyperlink: \(resolvedURLString)", category: .ui)
+        return true
+    }
+
+    private func clearHyperlinkMatches() {
+        hyperlinkMappingTask?.cancel()
+        hyperlinkMappingTask = nil
+        hyperlinkMatches = []
+    }
+
+    private func startHyperlinkMapping(frame: FrameReference, nodes: [OCRNodeWithText]) {
+        guard !isInLiveMode else {
+            clearHyperlinkMatches()
+            return
+        }
+
+        guard Self.isInPageURLCollectionEnabled() else {
+            clearHyperlinkMatches()
+            return
+        }
+
+        guard !nodes.isEmpty else {
+            clearHyperlinkMatches()
+            return
+        }
+
+        hyperlinkMappingTask?.cancel()
+        hyperlinkMatches = []
+        hyperlinkMappingTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let storedRows = try await self.coordinator.getFrameInPageURLRows(frameID: frame.id)
+                let storedMatches = Self.hyperlinkMatchesFromStoredRows(
+                    storedRows,
+                    nodes: nodes
+                )
+
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    self.hyperlinkMatches = storedMatches
+                }
+            } catch {
+                await MainActor.run {
+                    guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    self.hyperlinkMatches = []
+                }
+                Log.warning("[HyperlinkMap] DOM extraction failed: \(error)", category: .ui)
+            }
+        }
+    }
+
+    private static func hyperlinkMatchesFromStoredRows(
+        _ rows: [AppCoordinator.FrameInPageURLRow],
+        nodes: [OCRNodeWithText]
+    ) -> [OCRHyperlinkMatch] {
+        guard !rows.isEmpty else { return [] }
+        let nodesByID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        var parsedMatches: [OCRHyperlinkMatch] = []
+        parsedMatches.reserveCapacity(rows.count)
+        var seenKeys: Set<String> = []
+        seenKeys.reserveCapacity(rows.count)
+
+        for row in rows {
+            let width = CGFloat(row.w)
+            let height = CGFloat(row.h)
+            guard width > 0, height > 0 else { continue }
+
+            let nodeText = nodesByID[row.nodeID]?.text ?? row.url
+            let highlightEndIndex = max(nodeText.count, 1)
+            let key = "\(row.nodeID)|\(row.url)|\(row.x)|\(row.y)|\(row.w)|\(row.h)"
+            guard seenKeys.insert(key).inserted else { continue }
+
+            parsedMatches.append(
+                OCRHyperlinkMatch(
+                    id: key,
+                    nodeID: row.nodeID,
+                    x: CGFloat(row.x),
+                    y: CGFloat(row.y),
+                    width: width,
+                    height: height,
+                    url: row.url,
+                    nodeText: nodeText,
+                    domText: nodeText,
+                    highlightStartIndex: 0,
+                    highlightEndIndex: highlightEndIndex,
+                    confidence: 1.0
+                )
+            )
+        }
+
+        return parsedMatches
+    }
+
+    static func resolveStoredHyperlinkURL(_ storedURL: String, baseURL: String?) -> String {
+        if let parsed = URL(string: storedURL),
+           parsed.scheme != nil {
+            return storedURL
+        }
+
+        guard let baseURL,
+              let base = hostRootURL(from: baseURL),
+              let resolved = URL(string: storedURL, relativeTo: base)?.absoluteURL else {
+            return storedURL
+        }
+        return resolved.absoluteString
+    }
+
+    static func hyperlinkBrowserApplicationURL(
+        for url: URL,
+        browserResolver: (URL) -> URL? = { NSWorkspace.shared.urlForApplication(toOpen: $0) }
+    ) -> URL? {
+        browserResolver(url)
+    }
+
+    private static func hostRootURL(from rawURL: String) -> URL? {
+        guard let parsed = URL(string: rawURL),
+              var components = URLComponents(url: parsed, resolvingAgainstBaseURL: false),
+              components.scheme != nil,
+              components.host != nil else {
+            return nil
+        }
+        components.percentEncodedPath = "/"
+        components.percentEncodedQuery = nil
+        components.percentEncodedFragment = nil
+        return components.url
+    }
+
+    private static func normalizedHost(_ host: String?) -> String {
+        guard var host else { return "" }
+        host = host.lowercased()
+        if host.hasPrefix("www.") {
+            return String(host.dropFirst(4))
+        }
+        return host
     }
 
     // MARK: - OCR Node Loading and Text Selection
@@ -7719,6 +8492,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             ocrStatus = .unknown
             ocrStatusPollingTask?.cancel()
             ocrStatusPollingTask = nil
+            clearHyperlinkMatches()
             clearTextSelection()
             return
         }
@@ -7741,6 +8515,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let timelineFrame = currentTimelineFrame else {
             setOCRNodes([])
             ocrStatus = .unknown
+            clearHyperlinkMatches()
             return
         }
 
@@ -7776,11 +8551,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
 
                 setOCRNodes(filteredNodes)
+                startHyperlinkMapping(frame: frame, nodes: filteredNodes)
             }
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
             setOCRNodes([])
             ocrStatus = .unknown
+            clearHyperlinkMatches()
         }
     }
 
@@ -7854,8 +8631,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             setOCRNodes(filteredNodes)
+            startHyperlinkMapping(frame: frame, nodes: filteredNodes)
         } catch {
             Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
+            clearHyperlinkMatches()
         }
     }
 
@@ -9619,7 +10398,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.info("[Memory] Cleared disk frame buffer on calendar navigation (\(oldCacheCount) frames removed)", category: .ui)
             }
 
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
 
             updateWindowBoundaries()
             resetBoundaryStateForReloadWindow()
@@ -9753,7 +10532,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame - video info is already included from the JOIN
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
 
             // Reset infinite scroll state for new window
             updateWindowBoundaries()
@@ -9858,7 +10637,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             // Convert to TimelineFrame
-            frames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            frames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
 
             // Reset infinite scroll state for new window
             updateWindowBoundaries()
@@ -10794,7 +11573,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // getFramesWithVideoInfoBefore returns DESC (nearest older first). Reverse to ASC before prepending.
             let newTimelineFrames = framesWithVideoInfoDescending.reversed().map {
-                TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus)
+                TimelineFrame(frameWithVideoInfo: $0)
             }
 
             // If timeline state changed while the query was in-flight (filter/apply/reload), drop stale results.
@@ -10979,7 +11758,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             // Convert to TimelineFrame - video info is already included from the JOIN
             // framesWithVideoInfo are returned ASC (oldest first), which is correct for appending
-            let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frame: $0.frame, videoInfo: $0.videoInfo, processingStatus: $0.processingStatus) }
+            let newTimelineFrames = framesWithVideoInfo.map { TimelineFrame(frameWithVideoInfo: $0) }
 
             let existingFrameIDs = Set(frames.map { $0.frame.id })
             let uniqueTimelineFrames = newTimelineFrames.filter { !existingFrameIDs.contains($0.frame.id) }

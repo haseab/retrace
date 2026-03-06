@@ -109,6 +109,19 @@ public actor DataAdapter {
         Log.info("[DataAdapter] Rewind source disconnected", category: .app)
     }
 
+    private func decodeStoredPoint(_ rawValue: String?) -> (x: Double, y: Double)? {
+        guard let rawValue else {
+            return nil
+        }
+        let parts = rawValue.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let x = Double(parts[0]),
+              let y = Double(parts[1]) else {
+            return nil
+        }
+        return (x, y)
+    }
+
     /// Initialize the adapter
     public func initialize() async throws {
         isInitialized = true
@@ -1294,13 +1307,14 @@ public actor DataAdapter {
         let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
         let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
+        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 ORDER BY createdAt DESC
                 LIMIT ?
@@ -1485,7 +1499,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -1682,7 +1696,7 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -1884,7 +1898,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2106,7 +2120,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2330,7 +2344,7 @@ public actor DataAdapter {
         let sql = """
             \(combinedCTE)
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             INNER JOIN segment s ON f.segmentId = s.id
@@ -2447,13 +2461,14 @@ public actor DataAdapter {
         let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
         let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
+        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt DESC
@@ -2535,13 +2550,14 @@ public actor DataAdapter {
         let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
         let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
+        let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM (
-                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason)
+                SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
                 WHERE \(whereClause)
                 ORDER BY createdAt ASC
@@ -2599,7 +2615,7 @@ public actor DataAdapter {
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
-                   s.bundleID, s.windowName, s.browserUrl,
+                   s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
                    v.path, v.frameRate, v.width, v.height
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
@@ -4808,11 +4824,13 @@ public actor DataAdapter {
         let bundleID = getTextOrNil(statement, 8) ?? ""
         let windowName = getTextOrNil(statement, 9)
         let browserUrl = getTextOrNil(statement, 10)
+        let scrollY = decodeStoredPoint(getTextOrNil(statement, 11))?.y
+        let videoCurrentTime = sqlite3_column_type(statement, 12) != SQLITE_NULL ? sqlite3_column_double(statement, 12) : nil
 
-        let videoPath = getTextOrNil(statement, 11)
-        let frameRate = sqlite3_column_type(statement, 12) != SQLITE_NULL ? sqlite3_column_double(statement, 12) : nil
-        let width = sqlite3_column_type(statement, 13) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 13)) : nil
-        let height = sqlite3_column_type(statement, 14) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 14)) : nil
+        let videoPath = getTextOrNil(statement, 13)
+        let frameRate = sqlite3_column_type(statement, 14) != SQLITE_NULL ? sqlite3_column_double(statement, 14) : nil
+        let width = sqlite3_column_type(statement, 15) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 15)) : nil
+        let height = sqlite3_column_type(statement, 16) != SQLITE_NULL ? Int(sqlite3_column_int(statement, 16)) : nil
 
         let metadata = FrameMetadata(
             appBundleID: bundleID.isEmpty ? nil : bundleID,
@@ -4848,7 +4866,13 @@ public actor DataAdapter {
             videoInfo = nil
         }
 
-        return FrameWithVideoInfo(frame: frame, videoInfo: videoInfo, processingStatus: processingStatus)
+        return FrameWithVideoInfo(
+            frame: frame,
+            videoInfo: videoInfo,
+            processingStatus: processingStatus,
+            videoCurrentTime: videoCurrentTime,
+            scrollY: scrollY
+        )
     }
 
     private func parseSegment(statement: OpaquePointer, config: DatabaseConfig) throws -> Segment {

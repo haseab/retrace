@@ -54,6 +54,12 @@ public protocol DatabaseProtocol: Actor {
     /// Update frame's videoId and videoFrameIndex after video encoding
     func updateFrameVideoLink(frameID: FrameID, videoID: VideoSegmentID, frameIndex: Int) async throws
 
+    /// Persist optional per-frame metadata JSON payload.
+    func updateFrameMetadata(frameID: FrameID, metadataJSON: String?) async throws
+
+    /// Read per-frame metadata JSON payload.
+    func getFrameMetadata(frameID: FrameID) async throws -> String?
+
     /// Get processing status for multiple frames in a single query
     /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
     func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int]

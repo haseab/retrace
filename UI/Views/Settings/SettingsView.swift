@@ -2,11 +2,13 @@ import SwiftUI
 import Shared
 import AppKit
 import App
+import Database
 import Carbon.HIToolbox
 import ScreenCaptureKit
 import SQLCipher
 import ServiceManagement
 import Darwin
+import Carbon
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -41,6 +43,7 @@ enum SettingsDefaults {
     static let deleteDuplicateFrames = true
     static let deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold
     static let captureOnWindowChange = true
+    static let collectInPageURLsExperimental = false
 
     // MARK: Storage
     static let retentionDays: Int = 0  // 0 = forever
@@ -85,6 +88,56 @@ struct SettingsSearchEntry: Identifiable {
     let searchableText: [String]
 
     var breadcrumb: String { "\(tab.rawValue) > \(cardTitle)" }
+}
+
+private struct InPageURLBrowserTarget: Identifiable, Hashable {
+    let bundleID: String
+    let displayName: String
+    let appURL: URL?
+
+    var id: String { bundleID }
+}
+
+private struct UnsupportedInPageURLTarget: Identifiable, Hashable {
+    let bundleID: String
+    let displayName: String
+    let appURL: URL?
+
+    var id: String { bundleID }
+}
+
+private enum InPageURLPermissionState: Equatable {
+    case granted
+    case denied
+    case needsConsent
+    case unavailable(OSStatus)
+}
+
+private enum InPageURLVerificationState: Equatable {
+    case pending
+    case success(String)
+    case warning(String)
+    case failed(String)
+}
+
+private struct InPageURLAppleScriptRunResult {
+    let stdout: String
+    let stderr: String
+    let exitCode: Int32
+    let didTimeOut: Bool
+    let elapsedMs: Double
+}
+
+private struct InPageURLVerificationTraceContext {
+    let traceID: String
+    let bundleID: String
+    let displayName: String
+    let verificationMode: String
+    let startedAtUptime: TimeInterval
+
+    var logPrefix: String {
+        "[InPageURL][SettingsTest][\(bundleID)][\(traceID)]"
+    }
 }
 
 /// Main settings view with sidebar navigation
@@ -164,6 +217,8 @@ public struct SettingsView: View {
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = SettingsDefaults.deleteDuplicateFrames
     @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = SettingsDefaults.deduplicationThreshold
     @AppStorage("captureOnWindowChange", store: settingsStore) private var captureOnWindowChange: Bool = SettingsDefaults.captureOnWindowChange
+    @AppStorage("collectInPageURLsExperimental", store: settingsStore) private var collectInPageURLsExperimental: Bool = SettingsDefaults.collectInPageURLsExperimental
+    @AppStorage("inPageURLPermissionCache", store: settingsStore) private var inPageURLPermissionCacheRaw = ""
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = SettingsDefaults.retentionDays
@@ -306,6 +361,19 @@ public struct SettingsView: View {
     // Permission states
     @State private var hasScreenRecordingPermission = false
     @State private var hasAccessibilityPermission = false
+    @State private var browserExtractionPermissionStatus: PermissionStatus = .notDetermined
+    @State private var inPageURLTargets: [InPageURLBrowserTarget] = []
+    @State private var inPageURLPermissionStateByBundleID: [String: InPageURLPermissionState] = [:]
+    @State private var inPageURLBusyBundleIDs: Set<String> = []
+    @State private var inPageURLRunningBundleIDs: Set<String> = []
+    @State private var inPageURLIconByBundleID: [String: NSImage] = [:]
+    @State private var inPageURLVerificationByBundleID: [String: InPageURLVerificationState] = [:]
+    @State private var inPageURLVerificationBusyBundleIDs: Set<String> = []
+    @State private var isRefreshingInPageURLTargets = false
+    @State private var inPageURLVerificationSummary: String? = nil
+    @State private var isSafariInPageInstructionsExpanded = false
+    @State private var isChromeInPageInstructionsExpanded = false
+    @State private var unsupportedInPageURLTargets: [UnsupportedInPageURLTarget] = []
 
     // Quick delete state
     @State private var quickDeleteConfirmation: QuickDeleteOption? = nil
@@ -367,6 +435,8 @@ public struct SettingsView: View {
             searchableText: ["compression", "video quality", "deduplication", "duplicate frames", "storage size"]),
         SettingsSearchEntry(id: "capture.pauseReminder", tab: .capture, cardTitle: "Pause Reminder", cardIcon: "bell.badge",
             searchableText: ["pause reminder", "remind me later", "notification", "reminder interval"]),
+        SettingsSearchEntry(id: "capture.inPageURLs", tab: .capture, cardTitle: "In-Page URLs (Experimental)", cardIcon: "link.badge.plus",
+            searchableText: ["in-page urls", "experimental", "automation", "apple script", "javascript from apple events", "wikipedia test"]),
         // Storage
         SettingsSearchEntry(id: "storage.rewindData", tab: .storage, cardTitle: "Rewind Data", cardIcon: "arrow.counterclockwise",
             searchableText: ["rewind data", "use rewind", "rewind recordings", "import rewind"]),
@@ -434,6 +504,48 @@ public struct SettingsView: View {
     private static let powerOCRCardAnchorID = "settings.powerOCRCardAnchor"
     static let powerOCRPriorityTargetID = "settings.powerOCRPriority"
     private static let powerOCRPriorityAnchorID = "settings.powerOCRPriorityAnchor"
+    private static let inPageURLPermissionProbeQueue = DispatchQueue(
+        label: "io.retrace.settings.inPageURLPermissionProbe",
+        qos: .utility,
+        attributes: .concurrent
+    )
+    private static let inPageURLKnownBrowserBundleIDs: [String] = [
+        "com.apple.Safari",
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.sigmaos.sigmaos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLUnsupportedFirefoxBundleIDs: [String] = [
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxbeta",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
+    ]
+    private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "org.chromium.Chromium",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.vivaldi.Vivaldi",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "com.cometbrowser.Comet",
+        "com.aspect.browser",
+        "com.sigmaos.sigmaos",
+        "com.nicklockwood.Thorium",
+    ]
+    private static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
+    private static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
 
     public var body: some View {
         GeometryReader { geometry in
@@ -1734,6 +1846,7 @@ public struct SettingsView: View {
                 .frame(height: 0)
                 .id(Self.pauseReminderCardAnchorID)
             pauseReminderCard
+            inPageURLCollectionCard
 
             // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
 //            ModernSettingsCard(title: "Display Options", icon: "display") {
@@ -2031,6 +2144,486 @@ public struct SettingsView: View {
                 )
                 .animation(.easeInOut(duration: 0.2), value: isPauseReminderCardHighlighted)
         }
+    }
+
+    @ViewBuilder
+    private var inPageURLCollectionCard: some View {
+        ModernSettingsCard(title: "In-Page URLs", icon: "link.badge.plus") {
+            VStack(alignment: .leading, spacing: 16) {
+                ModernToggleRow(
+                    title: "Collect in-page URLs",
+                    subtitle: "Collect visible links from browser pages using AppleScript automation. Default is off.",
+                    isOn: $collectInPageURLsExperimental,
+                    badge: "Experimental"
+                )
+                .onChange(of: collectInPageURLsExperimental) { enabled in
+                    recordInPageURLMetric(
+                        type: .inPageURLCollectionToggle,
+                        payload: ["enabled": enabled]
+                    )
+                    if enabled {
+                        Task {
+                            await checkPermissions()
+                            await refreshInPageURLTargets()
+                        }
+                    } else {
+                        inPageURLVerificationByBundleID = [:]
+                        inPageURLVerificationBusyBundleIDs = []
+                        inPageURLVerificationSummary = nil
+                    }
+                }
+
+                if collectInPageURLsExperimental {
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Step 1: Grant automation access one app at a time")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+
+                        if !hasAccessibilityPermission {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.retraceWarning)
+                                    .font(.system(size: 12))
+                                Text("Accessibility is required for stable browser/window context.")
+                                    .font(.retraceCaption)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+
+                            ModernPermissionRow(
+                                label: "Accessibility",
+                                status: .notDetermined,
+                                enableAction: { requestAccessibilityPermission() },
+                                openSettingsAction: { openAccessibilitySettings() }
+                            )
+                        }
+
+                        if inPageURLTargets.isEmpty && unsupportedInPageURLTargets.isEmpty {
+                            if isRefreshingInPageURLTargets {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Scanning installed Safari/Chromium browsers...")
+                                        .font(.retraceCaption)
+                                        .foregroundColor(.retraceSecondary)
+                                }
+                            } else {
+                                Text("No supported Safari/Chromium browsers found on this Mac.")
+                                    .font(.retraceCaption)
+                                    .foregroundColor(.retraceSecondary)
+                            }
+                        } else {
+                            VStack(spacing: 0) {
+                                ForEach(Array(inPageURLTargets.enumerated()), id: \.element.bundleID) { index, target in
+                                    inPageURLPermissionRow(target: target)
+                                    if index < inPageURLTargets.count - 1 || !unsupportedInPageURLTargets.isEmpty {
+                                        Divider()
+                                            .background(Color.white.opacity(0.08))
+                                    }
+                                }
+                                ForEach(Array(unsupportedInPageURLTargets.enumerated()), id: \.element.bundleID) { index, target in
+                                    unsupportedInPageURLTargetRow(target: target)
+                                    if index < unsupportedInPageURLTargets.count - 1 {
+                                        Divider()
+                                            .background(Color.white.opacity(0.08))
+                                    }
+                                }
+                            }
+                            .background(Color.white.opacity(0.03))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+
+                        HStack {
+                            Spacer()
+                            Button(action: {
+                                Task { await refreshInPageURLTargets(force: true) }
+                            }) {
+                                HStack(spacing: 6) {
+                                    if isRefreshingInPageURLTargets {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Image(systemName: "arrow.clockwise")
+                                            .font(.system(size: 10))
+                                    }
+                                    Text(isRefreshingInPageURLTargets ? "Refreshing..." : "Refresh Browser List")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.8))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isRefreshingInPageURLTargets)
+                        }
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Step 2: Enable JavaScript from Apple Events")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Text("Expand the browser you want setup instructions for.")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+
+                        VStack(spacing: 10) {
+                            InPageURLInstructionsDisclosure(
+                                title: "Safari Instructions",
+                                isExpanded: $isSafariInPageInstructionsExpanded
+                            ) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("1. Open Safari.")
+                                    Text("2. If the Develop menu is missing, enable it in Safari Settings > Advanced.")
+                                    Text("3. Open Develop > Developer Settings...")
+
+                                    if let safariMenuImage = resolveSafariInPageURLMenuImage() {
+                                        inPageURLInstructionImage(safariMenuImage)
+                                    }
+
+                                    Text("4. In the Developer tab, turn on Allow JavaScript from Apple Events.")
+
+                                    if let safariToggleImage = resolveSafariInPageURLToggleImage() {
+                                        inPageURLInstructionImage(safariToggleImage)
+                                    }
+
+                                    Text("5. When Safari shows the warning dialog, click Allow.")
+
+                                    if let safariAllowImage = resolveSafariInPageURLAllowImage() {
+                                        inPageURLInstructionImage(safariAllowImage)
+                                    }
+                                }
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+
+                                InPageURLSecurityWarning(showSafariSpecificLine: true)
+                            }
+
+                            InPageURLInstructionsDisclosure(
+                                title: "Chrome / Arc / Edge / Brave / Chromium Instructions",
+                                isExpanded: $isChromeInPageInstructionsExpanded
+                            ) {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("Open your Chromium-based browser, then go to View > Developer > Allow JavaScript from Apple Events.")
+                                        .font(.retraceCaption2)
+                                        .foregroundColor(.retraceSecondary)
+
+                                    if let chromiumInstructionsImage = resolveChromiumInPageURLInstructionsImage() {
+                                        inPageURLInstructionImage(chromiumInstructionsImage)
+                                    }
+                                }
+
+                                InPageURLSecurityWarning(showSafariSpecificLine: false)
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        let grantedTargets = inPageURLTargets.filter {
+                            inPageURLPermissionStateByBundleID[$0.bundleID] == .granted
+                        }
+                        let browserTargets = grantedTargets.filter { !Self.isInPageURLChromiumWebAppBundleID($0.bundleID) }
+                        let chromeAppTargets = grantedTargets.filter { Self.isInPageURLChromiumWebAppBundleID($0.bundleID) }
+
+                        Text("Step 3: Test granted browsers and Chrome apps")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Text("Test URL: \(Self.inPageURLTestURLString)")
+                            .font(.retraceCaption)
+                            .foregroundColor(.retraceSecondary)
+                        Text("Standard browsers open the test page. PWAs stay on their current page and only verify that a URL can be scraped.")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+
+                        if grantedTargets.isEmpty {
+                            Text("No granted automation permissions found yet. Complete Step 1 first.")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        } else {
+                            VStack(alignment: .leading, spacing: 10) {
+                                if !browserTargets.isEmpty {
+                                    inPageURLVerificationSection(
+                                        title: "Browsers",
+                                        subtitle: nil,
+                                        targets: browserTargets
+                                    )
+                                }
+
+                                if !chromeAppTargets.isEmpty {
+                                    inPageURLVerificationSection(
+                                        title: "Chrome Apps",
+                                        subtitle: "These inherit the host browser's JavaScript from Apple Events setting.",
+                                        targets: chromeAppTargets
+                                    )
+                                }
+                            }
+                        }
+
+                        if let summary = inPageURLVerificationSummary {
+                            Text(summary)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+                    }
+                }
+            }
+        }
+        .task(id: collectInPageURLsExperimental) {
+            guard collectInPageURLsExperimental else { return }
+            await checkPermissions()
+            await refreshUnsupportedInPageURLTargets()
+            await refreshInPageURLTargets()
+        }
+    }
+
+    @ViewBuilder
+    private func inPageURLVerificationSection(
+        title: String,
+        subtitle: String?,
+        targets: [InPageURLBrowserTarget]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.retraceCaption2Bold)
+                .foregroundColor(.retracePrimary)
+
+            if let subtitle {
+                Text(subtitle)
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(targets) { target in
+                    inPageURLVerificationRow(for: target)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inPageURLVerificationRow(for target: InPageURLBrowserTarget) -> some View {
+        let isTesting = inPageURLVerificationBusyBundleIDs.contains(target.bundleID)
+        let verificationState = inPageURLVerificationByBundleID[target.bundleID]
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Group {
+                    if let icon = inPageURLIconByBundleID[target.bundleID] {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 16, height: 16)
+                    } else {
+                        Image(systemName: "globe")
+                            .font(.system(size: 12))
+                            .foregroundColor(.retraceSecondary)
+                            .frame(width: 16, height: 16)
+                    }
+                }
+
+                Text(target.displayName)
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+
+                Button(action: {
+                    Log.info(
+                        "[InPageURL][SettingsTest][\(target.bundleID)] button_clicked displayName=\(target.displayName) busy=\(isTesting)",
+                        category: .ui
+                    )
+                    Task { await runInPageURLVerification(for: target) }
+                }) {
+                    HStack(spacing: 8) {
+                        if isTesting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "checkmark.circle")
+                                .font(.system(size: 12))
+                        }
+                        Text(isTesting ? "Testing..." : "Test")
+                            .font(.retraceCaption2Bold)
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceAccent.opacity(0.85))
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .disabled(isTesting)
+            }
+
+            if let verificationState {
+                HStack(spacing: 8) {
+                    switch verificationState {
+                    case .pending:
+                        ProgressView()
+                            .controlSize(.small)
+                    case .success:
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.retraceSuccess)
+                    case .warning:
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.retraceWarning)
+                    case .failed:
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.retraceDanger)
+                    }
+                    Text(inPageURLVerificationDescription(verificationState))
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.04))
+        .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private func inPageURLPermissionRow(target: InPageURLBrowserTarget) -> some View {
+        let permissionState = inPageURLPermissionStateByBundleID[target.bundleID]
+        let isRunning = inPageURLRunningBundleIDs.contains(target.bundleID)
+        let isGranted = permissionState == .granted
+        let buttonTitle = isGranted ? "Change" : (isRunning ? "Allow" : "Launch")
+        let buttonBusyTitle = isRunning ? "Allowing..." : "Launching..."
+
+        HStack(spacing: 12) {
+            Group {
+                if let icon = inPageURLIconByBundleID[target.bundleID] {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "globe")
+                        .font(.system(size: 12))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 20, height: 20)
+                }
+            }
+
+            Text(target.displayName)
+                .font(.retraceCalloutMedium)
+                .foregroundColor(.retracePrimary)
+
+            Spacer()
+
+            inPageURLPermissionBadge(for: permissionState)
+
+            Button(action: {
+                if isGranted {
+                    openAutomationSettings()
+                    recordInPageURLMetric(
+                        type: .inPageURLPermissionProbe,
+                        payload: [
+                            "bundleID": target.bundleID,
+                            "action": "change_open_settings",
+                            "status": "Granted"
+                        ]
+                    )
+                    return
+                }
+                Task {
+                    if isRunning {
+                        await requestInPageURLPermission(for: target)
+                    } else {
+                        await launchInPageURLTarget(target)
+                    }
+                }
+            }) {
+                if inPageURLBusyBundleIDs.contains(target.bundleID) {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(buttonBusyTitle)
+                    }
+                } else {
+                    Text(buttonTitle)
+                }
+            }
+            .font(.retraceCaption2Bold)
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.retraceAccent.opacity(0.75))
+            .cornerRadius(8)
+            .buttonStyle(.plain)
+            .disabled(
+                inPageURLBusyBundleIDs.contains(target.bundleID) ||
+                (!isGranted && !hasAccessibilityPermission)
+            )
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private func unsupportedInPageURLTargetRow(target: UnsupportedInPageURLTarget) -> some View {
+        HStack(spacing: 12) {
+            Group {
+                if let appURL = target.appURL {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "globe")
+                        .font(.system(size: 12))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 20, height: 20)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(target.displayName)
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary.opacity(0.7))
+                Text("Firefox does not support in-page URL extraction in Retrace.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            Spacer()
+
+            Text("Not supported")
+                .font(.retraceCaption2Bold)
+                .foregroundColor(.retraceSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white.opacity(0.08))
+                .cornerRadius(8)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .opacity(0.85)
+    }
+
+    @ViewBuilder
+    private func inPageURLPermissionBadge(for state: InPageURLPermissionState?) -> some View {
+        let text = inPageURLPermissionDescription(for: state)
+        let color = inPageURLPermissionColor(for: state)
+        Text(text)
+            .font(.retraceCaption2Bold)
+            .foregroundColor(color)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(color.opacity(0.14))
+            .cornerRadius(8)
     }
 
     // MARK: - Storage Settings
@@ -2750,6 +3343,13 @@ public struct SettingsView: View {
                 status: hasAccessibilityPermission ? .granted : .notDetermined,
                 enableAction: hasAccessibilityPermission ? nil : { requestAccessibilityPermission() },
                 openSettingsAction: { openAccessibilitySettings() }
+            )
+
+            ModernPermissionRow(
+                label: "Browser URL Extraction Permissions",
+                status: browserExtractionPermissionStatus,
+                enableAction: { openAutomationSettings() },
+                openSettingsAction: { openAutomationSettings() }
             )
         }
         .task {
@@ -3916,6 +4516,7 @@ public struct SettingsView: View {
         case "capture.rate": captureRateCard
         case "capture.compression": compressionCard
         case "capture.pauseReminder": pauseReminderCard
+        case "capture.inPageURLs": inPageURLCollectionCard
         case "storage.rewindData": rewindDataCard
         case "storage.databaseLocations": databaseLocationsCard
         case "storage.retentionPolicy": retentionPolicyCard
@@ -4259,6 +4860,7 @@ private struct ModernPermissionRow: View {
     let status: PermissionStatus
     var enableAction: (() -> Void)? = nil
     var openSettingsAction: (() -> Void)? = nil
+    @State private var isHoveringGrantedControl = false
 
     var body: some View {
         HStack {
@@ -4269,20 +4871,43 @@ private struct ModernPermissionRow: View {
             Spacer()
 
             if status == .granted {
-                // Show granted status
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(Color.retraceSuccess)
-                        .frame(width: 8, height: 8)
+                ZStack {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(Color.retraceSuccess)
+                            .frame(width: 8, height: 8)
 
-                    Text(status.rawValue)
-                        .font(.retraceCaptionMedium)
-                        .foregroundColor(.retraceSuccess)
+                        Text(status.rawValue)
+                            .font(.retraceCaptionMedium)
+                            .foregroundColor(.retraceSuccess)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceSuccess.opacity(0.1))
+                    .cornerRadius(8)
+                    .opacity((openSettingsAction != nil && isHoveringGrantedControl) ? 0 : 1)
+
+                    if let openSettingsAction {
+                        Button(action: openSettingsAction) {
+                            Text("Change")
+                                .font(.retraceCaption2Bold)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .background(Color.retraceAccent)
+                                .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(isHoveringGrantedControl ? 1 : 0)
+                        .allowsHitTesting(isHoveringGrantedControl)
+                    }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color.retraceSuccess.opacity(0.1))
-                .cornerRadius(8)
+                .onHover { hovering in
+                    guard openSettingsAction != nil else { return }
+                    withAnimation(.easeInOut(duration: 0.12)) {
+                        isHoveringGrantedControl = hovering
+                    }
+                }
             } else {
                 // Show enable button when not granted
                 HStack(spacing: 12) {
@@ -4866,6 +5491,84 @@ private struct RetentionPolicyPicker: View {
                         .foregroundColor(index == Int(sliderIndex) ? .retracePrimary : .retraceSecondary)
                         .frame(maxWidth: .infinity)
                 }
+            }
+        }
+    }
+}
+
+private struct InPageURLInstructionsDisclosure<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                    isExpanded.toggle()
+                }
+            }) {
+                HStack(spacing: 10) {
+                    Text(title)
+                        .font(.retraceCaption2Bold)
+                        .foregroundColor(.retracePrimary)
+
+                    Spacer()
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 10) {
+                    content()
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background(Color.white.opacity(0.04))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+private struct InPageURLSecurityWarning: View {
+    let showSafariSpecificLine: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.retraceWarning)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Important security warning")
+                    .font(.retraceCaption2Bold)
+                    .foregroundColor(.retraceWarning)
+                if showSafariSpecificLine {
+                    Text("Safari may show a very severe warning when you enable this setting.")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                }
+                Text("After turning this on, be very careful which apps you grant Automation permission to. Granting it to untrusted apps can expose you to account takeover or data theft.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
+                Text("Retrace only uses this access to extract in-page browser URLs, mouse position, and video playback position.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
             }
         }
     }
@@ -6376,6 +7079,7 @@ extension SettingsView {
     func checkPermissions() async {
         hasScreenRecordingPermission = checkScreenRecordingPermission()
         hasAccessibilityPermission = checkAccessibilityPermission()
+        browserExtractionPermissionStatus = await checkBrowserExtractionPermissionStatus()
     }
 
     /// Check screen recording permission without prompting
@@ -6441,6 +7145,1599 @@ extension SettingsView {
     func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
+    }
+
+    /// Open System Settings to the Automation pane (AppleScript permissions).
+    /// This is where users can allow/deny browser Apple Events access for Retrace.
+    func openAutomationSettings() {
+        if let automationURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"),
+           NSWorkspace.shared.open(automationURL) {
+            return
+        }
+
+        if let privacyURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy") {
+            NSWorkspace.shared.open(privacyURL)
+        }
+    }
+
+    private func checkBrowserExtractionPermissionStatus() async -> PermissionStatus {
+        let probeBundleIDs = ["com.apple.Safari", "com.google.Chrome"]
+        var cachedStates = inPageURLCachedPermissionStates()
+
+        var installedBundleIDs: [String] = []
+        await MainActor.run {
+            installedBundleIDs = probeBundleIDs.filter {
+                NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil
+            }
+        }
+
+        guard !installedBundleIDs.isEmpty else {
+            return .notDetermined
+        }
+
+        var allGranted = true
+        var anyDenied = false
+
+        for bundleID in installedBundleIDs {
+            let status = await inPageURLPermissionStatusAsync(
+                for: bundleID,
+                askUserIfNeeded: false
+            )
+            let resolvedState = resolvedInPageURLPermissionState(
+                from: status,
+                bundleID: bundleID,
+                previousState: nil,
+                cachedState: cachedStates[bundleID]
+            )
+            if inPageURLPermissionStateForCache(resolvedState) != nil {
+                cachedStates[bundleID] = resolvedState
+            }
+
+            switch resolvedState {
+            case .granted:
+                continue
+            case .denied:
+                anyDenied = true
+                allGranted = false
+            case .needsConsent, .unavailable:
+                allGranted = false
+            }
+        }
+
+        if allGranted {
+            persistInPageURLCachedPermissionStates(cachedStates)
+            return .granted
+        }
+        if anyDenied {
+            persistInPageURLCachedPermissionStates(cachedStates)
+            return .denied
+        }
+        persistInPageURLCachedPermissionStates(cachedStates)
+        return .notDetermined
+    }
+
+    private func inPageURLCachedPermissionStates() -> [String: InPageURLPermissionState] {
+        guard !inPageURLPermissionCacheRaw.isEmpty,
+              let data = inPageURLPermissionCacheRaw.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+
+        var states: [String: InPageURLPermissionState] = [:]
+        for (bundleID, rawState) in decoded {
+            if let state = inPageURLPermissionStateFromCache(rawState) {
+                states[bundleID] = state
+            }
+        }
+        return states
+    }
+
+    private func persistInPageURLCachedPermissionStates(_ states: [String: InPageURLPermissionState]) {
+        let encodable = states.compactMapValues(inPageURLPermissionStateForCache)
+        guard !encodable.isEmpty else {
+            inPageURLPermissionCacheRaw = ""
+            return
+        }
+
+        guard let data = try? JSONEncoder().encode(encodable),
+              let raw = String(data: data, encoding: .utf8) else {
+            return
+        }
+        inPageURLPermissionCacheRaw = raw
+    }
+
+    private func inPageURLPermissionStateForCache(_ state: InPageURLPermissionState) -> String? {
+        switch state {
+        case .granted:
+            return "granted"
+        case .denied:
+            return "denied"
+        case .needsConsent:
+            return "needsAllow"
+        case .unavailable:
+            return nil
+        }
+    }
+
+    private func inPageURLPermissionStateFromCache(_ raw: String) -> InPageURLPermissionState? {
+        switch raw {
+        case "granted":
+            return .granted
+        case "denied":
+            return .denied
+        case "needsAllow":
+            return .needsConsent
+        default:
+            return nil
+        }
+    }
+
+    private func isStableInPageURLPermissionState(_ state: InPageURLPermissionState) -> Bool {
+        switch state {
+        case .granted, .denied, .needsConsent:
+            return true
+        case .unavailable:
+            return false
+        }
+    }
+
+    @MainActor
+    private func openInPageURLTestLink(
+        in bundleID: String,
+        traceContext: InPageURLVerificationTraceContext
+    ) {
+        guard let url = URL(string: Self.inPageURLTestURLString),
+              let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "open_test_link_skipped",
+                details: "reason=missing_url_or_app appBundleID=\(bundleID)"
+            )
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        let openStartedAt = Self.inPageURLVerificationNow()
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "open_test_link_started",
+            details: "url=\(Self.inPageURLTestURLString) appPath=\(appURL.path)"
+        )
+
+        NSWorkspace.shared.open([url], withApplicationAt: appURL, configuration: configuration) { _, error in
+            if let error {
+                Self.logInPageURLVerification(
+                    traceContext,
+                    stage: "open_test_link_finished",
+                    details: "success=false elapsedMs=\(Self.inPageURLElapsedMilliseconds(since: openStartedAt)) error=\(error.localizedDescription)"
+                )
+                Log.warning("[SettingsView] Failed to open in-page URL test link in \(bundleID): \(error.localizedDescription)", category: .ui)
+            } else {
+                Self.logInPageURLVerification(
+                    traceContext,
+                    stage: "open_test_link_finished",
+                    details: "success=true elapsedMs=\(Self.inPageURLElapsedMilliseconds(since: openStartedAt))"
+                )
+                Log.info("[SettingsView] Opened in-page URL test link in \(bundleID)", category: .ui)
+            }
+        }
+
+        recordInPageURLMetric(
+            type: .inPageURLVerification,
+            payload: [
+                "phase": "open_test_link",
+                "bundleID": bundleID,
+                "url": Self.inPageURLTestURLString
+            ]
+        )
+    }
+
+    @MainActor
+    private func bringRetraceToFront() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+    }
+
+    private func inPageURLDisplayName(for bundleID: String) -> String {
+        switch bundleID {
+        case "com.apple.Safari":
+            return "Safari"
+        case "com.google.Chrome":
+            return "Chrome"
+        case "com.google.Chrome.canary":
+            return "Chrome Canary"
+        case "org.chromium.Chromium":
+            return "Chromium"
+        case "com.microsoft.edgemac":
+            return "Edge"
+        case "com.brave.Browser":
+            return "Brave"
+        case "com.vivaldi.Vivaldi":
+            return "Vivaldi"
+        case "com.operasoftware.Opera":
+            return "Opera"
+        case "company.thebrowser.Browser":
+            return "Arc"
+        case "com.cometbrowser.Comet":
+            return "Comet"
+        case "com.aspect.browser":
+            return "Dia"
+        case "com.sigmaos.sigmaos":
+            return "SigmaOS"
+        case "com.nicklockwood.Thorium":
+            return "Thorium"
+        default:
+            return bundleID
+        }
+    }
+
+    @MainActor
+    private func refreshUnsupportedInPageURLTargets() async {
+        unsupportedInPageURLTargets = Self.inPageURLUnsupportedFirefoxBundleIDs.compactMap { bundleID in
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return nil
+            }
+
+            let displayName: String
+            if let bundle = Bundle(url: appURL) {
+                displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+            } else {
+                displayName = appURL.deletingPathExtension().lastPathComponent
+            }
+
+            return UnsupportedInPageURLTarget(
+                bundleID: bundleID,
+                displayName: displayName,
+                appURL: appURL
+            )
+        }
+    }
+
+    private func inPageURLJavaScriptFromAppleEventsReminder(for bundleID: String) -> String {
+        let automationBundleID = Self.resolvedInPageURLAutomationBundleID(for: bundleID)
+        guard automationBundleID != bundleID else {
+            return "Enable 'Allow JavaScript from Apple Events' (see Step 2)"
+        }
+
+        let hostDisplayName = inPageURLDisplayName(for: automationBundleID)
+        return "Enable 'Allow JavaScript from Apple Events' for \(hostDisplayName) (see Step 2)"
+    }
+
+    @MainActor
+    private func refreshInPageURLTargets(force: Bool = false) async {
+        if isRefreshingInPageURLTargets && !force {
+            return
+        }
+        isRefreshingInPageURLTargets = true
+        defer { isRefreshingInPageURLTargets = false }
+
+        await refreshUnsupportedInPageURLTargets()
+        let targets = await buildInPageURLTargets()
+        inPageURLTargets = targets
+        refreshInPageURLRunningBundleIDs()
+        inPageURLIconByBundleID = Dictionary(uniqueKeysWithValues: targets.compactMap { target in
+            guard let appURL = target.appURL else { return nil }
+            return (target.bundleID, NSWorkspace.shared.icon(forFile: appURL.path))
+        })
+
+        var cachedStates = inPageURLCachedPermissionStates()
+        var nextPermissionStates: [String: InPageURLPermissionState] = [:]
+        for target in targets {
+            let status = await inPageURLPermissionStatusAsync(
+                for: target.bundleID,
+                askUserIfNeeded: false
+            )
+            let state = resolvedInPageURLPermissionState(
+                from: status,
+                bundleID: target.bundleID,
+                previousState: inPageURLPermissionStateByBundleID[target.bundleID],
+                cachedState: cachedStates[target.bundleID]
+            )
+            nextPermissionStates[target.bundleID] = state
+            if inPageURLPermissionStateForCache(state) != nil {
+                cachedStates[target.bundleID] = state
+            }
+        }
+        inPageURLPermissionStateByBundleID = nextPermissionStates
+        persistInPageURLCachedPermissionStates(cachedStates)
+        refreshInPageURLVerificationSummary()
+    }
+
+    @MainActor
+    private func refreshInPageURLRunningBundleIDs() {
+        let runningBundleIDs = Set(
+            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        )
+        inPageURLRunningBundleIDs = Set(
+            inPageURLTargets.map(\.bundleID).filter { runningBundleIDs.contains($0) }
+        )
+    }
+
+    private func buildInPageURLTargets() async -> [InPageURLBrowserTarget] {
+        var targetsByBundleID: [String: InPageURLBrowserTarget] = [:]
+        for bundleID in Self.inPageURLKnownBrowserBundleIDs {
+            if let target = await installedInPageURLTarget(bundleID: bundleID) {
+                targetsByBundleID[target.bundleID] = target
+            }
+        }
+
+        for target in discoveredInPageURLWebAppTargets() {
+            targetsByBundleID[target.bundleID] = target
+        }
+
+        return Array(targetsByBundleID.values).sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+        }
+    }
+
+    private func discoveredInPageURLWebAppTargets() -> [InPageURLBrowserTarget] {
+        let fileManager = FileManager.default
+        let homeApplications = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true)
+        let systemApplications = URL(fileURLWithPath: "/Applications", isDirectory: true)
+
+        var searchDirectories: Set<URL> = [homeApplications, systemApplications]
+        inPageURLWebAppContainerDirectories(in: homeApplications).forEach { searchDirectories.insert($0) }
+        inPageURLWebAppContainerDirectories(in: systemApplications).forEach { searchDirectories.insert($0) }
+
+        var webAppTargets: [InPageURLBrowserTarget] = []
+        var seenBundleIDs: Set<String> = []
+
+        for directoryURL in searchDirectories {
+            let appURLs = inPageURLAppBundleURLs(in: directoryURL)
+            for appURL in appURLs {
+                guard let bundle = Bundle(url: appURL),
+                      let bundleID = bundle.bundleIdentifier,
+                      isInPageURLChromiumWebApp(bundle: bundle, bundleID: bundleID),
+                      !seenBundleIDs.contains(bundleID) else {
+                    continue
+                }
+
+                let displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+
+                webAppTargets.append(
+                    InPageURLBrowserTarget(
+                        bundleID: bundleID,
+                        displayName: displayName,
+                        appURL: appURL
+                    )
+                )
+                seenBundleIDs.insert(bundleID)
+            }
+        }
+
+        return webAppTargets
+    }
+
+    private func inPageURLWebAppContainerDirectories(in rootDirectory: URL) -> [URL] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: rootDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return entries.filter { entry in
+            let lowercased = entry.lastPathComponent.lowercased()
+            return lowercased.hasSuffix(".localized") && lowercased.contains("apps")
+        }
+    }
+
+    private func inPageURLAppBundleURLs(in directoryURL: URL) -> [URL] {
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return entries.filter { $0.pathExtension.lowercased() == "app" }
+    }
+
+    private func isInPageURLChromiumWebApp(bundle: Bundle, bundleID: String) -> Bool {
+        if bundle.object(forInfoDictionaryKey: "CrAppModeShortcutID") != nil {
+            return true
+        }
+
+        return Self.inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
+            bundleID.hasPrefix(prefix + ".app.")
+        }
+    }
+
+    private func installedInPageURLTarget(bundleID: String) async -> InPageURLBrowserTarget? {
+        let fallbackDisplayName = inPageURLDisplayName(for: bundleID)
+        return await MainActor.run { () -> InPageURLBrowserTarget? in
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return nil
+            }
+
+            let displayName: String
+            if let bundle = Bundle(url: appURL) {
+                displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+            } else {
+                displayName = fallbackDisplayName
+            }
+
+            return InPageURLBrowserTarget(
+                bundleID: bundleID,
+                displayName: displayName,
+                appURL: appURL
+            )
+        }
+    }
+
+    @MainActor
+    private func requestInPageURLPermission(for target: InPageURLBrowserTarget) async {
+        guard !inPageURLBusyBundleIDs.contains(target.bundleID) else { return }
+        inPageURLBusyBundleIDs.insert(target.bundleID)
+        defer { inPageURLBusyBundleIDs.remove(target.bundleID) }
+
+        let status = await inPageURLPermissionStatusAsync(
+            for: target.bundleID,
+            askUserIfNeeded: true
+        )
+        var cachedStates = inPageURLCachedPermissionStates()
+        let state = resolvedInPageURLPermissionState(
+            from: status,
+            bundleID: target.bundleID,
+            previousState: inPageURLPermissionStateByBundleID[target.bundleID],
+            cachedState: cachedStates[target.bundleID]
+        )
+        inPageURLPermissionStateByBundleID[target.bundleID] = state
+        if inPageURLPermissionStateForCache(state) != nil {
+            cachedStates[target.bundleID] = state
+            persistInPageURLCachedPermissionStates(cachedStates)
+        }
+        refreshInPageURLRunningBundleIDs()
+
+        recordInPageURLMetric(
+            type: .inPageURLPermissionProbe,
+            payload: [
+                "bundleID": target.bundleID,
+                "status": inPageURLPermissionDescription(for: state)
+            ]
+        )
+    }
+
+    @MainActor
+    private func launchInPageURLTarget(_ target: InPageURLBrowserTarget) async {
+        guard !inPageURLBusyBundleIDs.contains(target.bundleID) else { return }
+        inPageURLBusyBundleIDs.insert(target.bundleID)
+        defer { inPageURLBusyBundleIDs.remove(target.bundleID) }
+
+        if let appURL = target.appURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.addsToRecentItems = false
+            _ = try? await NSWorkspace.shared.openApplication(at: appURL, configuration: configuration)
+        }
+
+        // Give LaunchServices a brief moment to register running state before we refresh.
+        try? await Task.sleep(for: .milliseconds(160), clock: .continuous)
+        refreshInPageURLRunningBundleIDs()
+
+        let status = await inPageURLPermissionStatusAsync(
+            for: target.bundleID,
+            askUserIfNeeded: false
+        )
+        var cachedStates = inPageURLCachedPermissionStates()
+        let state = resolvedInPageURLPermissionState(
+            from: status,
+            bundleID: target.bundleID,
+            previousState: inPageURLPermissionStateByBundleID[target.bundleID],
+            cachedState: cachedStates[target.bundleID]
+        )
+        inPageURLPermissionStateByBundleID[target.bundleID] = state
+        if inPageURLPermissionStateForCache(state) != nil {
+            cachedStates[target.bundleID] = state
+            persistInPageURLCachedPermissionStates(cachedStates)
+        }
+
+        recordInPageURLMetric(
+            type: .inPageURLPermissionProbe,
+            payload: [
+                "bundleID": target.bundleID,
+                "action": "launch",
+                "status": inPageURLPermissionDescription(for: inPageURLPermissionStateByBundleID[target.bundleID])
+            ]
+        )
+    }
+
+    private func inPageURLPermissionStatusAsync(
+        for bundleID: String,
+        askUserIfNeeded: Bool
+    ) async -> OSStatus {
+        await withCheckedContinuation { continuation in
+            Self.inPageURLPermissionProbeQueue.async {
+                let status = Self.inPageURLPermissionStatus(
+                    for: bundleID,
+                    askUserIfNeeded: askUserIfNeeded
+                )
+                continuation.resume(returning: status)
+            }
+        }
+    }
+
+    private static func inPageURLPermissionStatus(
+        for bundleID: String,
+        askUserIfNeeded: Bool
+    ) -> OSStatus {
+        let automationBundleID = resolvedInPageURLAutomationBundleID(for: bundleID)
+        var targetDesc = AEDesc()
+        let bundleIDCString = automationBundleID.utf8CString
+        let createStatus = bundleIDCString.withUnsafeBufferPointer { bufferPointer in
+            AECreateDesc(
+                DescType(typeApplicationBundleID),
+                bufferPointer.baseAddress,
+                max(0, bufferPointer.count - 1),
+                &targetDesc
+            )
+        }
+
+        guard createStatus == noErr else {
+            return OSStatus(createStatus)
+        }
+        defer { AEDisposeDesc(&targetDesc) }
+
+        return AEDeterminePermissionToAutomateTarget(
+            &targetDesc,
+            AEEventClass(typeWildCard),
+            AEEventID(typeWildCard),
+            askUserIfNeeded
+        )
+    }
+
+    private func inPageURLPermissionState(from status: OSStatus) -> InPageURLPermissionState {
+        switch status {
+        case noErr:
+            return .granted
+        case OSStatus(errAEEventNotPermitted):
+            return .denied
+        case OSStatus(errAEEventWouldRequireUserConsent):
+            return .needsConsent
+        default:
+            return .unavailable(status)
+        }
+    }
+
+    private func resolvedInPageURLPermissionState(
+        from status: OSStatus,
+        bundleID: String,
+        previousState: InPageURLPermissionState?,
+        cachedState: InPageURLPermissionState?
+    ) -> InPageURLPermissionState {
+        if status == OSStatus(procNotFound) {
+            if let settingsState = inPageURLPermissionStateFromSystemSettings(for: bundleID) {
+                return settingsState
+            }
+            if let previousState, isStableInPageURLPermissionState(previousState) {
+                return previousState
+            }
+            if let cachedState, isStableInPageURLPermissionState(cachedState) {
+                return cachedState
+            }
+            return .needsConsent
+        }
+
+        return inPageURLPermissionState(from: status)
+    }
+
+    private func inPageURLPermissionStateFromSystemSettings(for targetBundleID: String) -> InPageURLPermissionState? {
+        guard let clientBundleID = Bundle.main.bundleIdentifier else {
+            return nil
+        }
+        let automationBundleID = Self.resolvedInPageURLAutomationBundleID(for: targetBundleID)
+
+        let tccDBPath = NSHomeDirectory() + "/Library/Application Support/com.apple.TCC/TCC.db"
+        var db: OpaquePointer?
+        let openResult = sqlite3_open_v2(tccDBPath, &db, SQLITE_OPEN_READONLY, nil)
+        guard openResult == SQLITE_OK, let db else {
+            if db != nil {
+                sqlite3_close(db)
+            }
+            return nil
+        }
+        defer { sqlite3_close(db) }
+
+        let query = """
+        SELECT auth_value
+        FROM access
+        WHERE service = 'kTCCServiceAppleEvents'
+          AND client = ?
+          AND indirect_object_identifier = ?
+        ORDER BY last_modified DESC
+        LIMIT 1;
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else {
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+
+        let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let bindClientResult = clientBundleID.withCString { cString in
+            sqlite3_bind_text(statement, 1, cString, -1, sqliteTransient)
+        }
+        let bindTargetResult = automationBundleID.withCString { cString in
+            sqlite3_bind_text(statement, 2, cString, -1, sqliteTransient)
+        }
+        guard bindClientResult == SQLITE_OK, bindTargetResult == SQLITE_OK else {
+            return nil
+        }
+
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            let authValue = sqlite3_column_int(statement, 0)
+            switch authValue {
+            case 2:
+                return .granted
+            case 0:
+                return .denied
+            default:
+                return .needsConsent
+            }
+        case SQLITE_DONE:
+            return .needsConsent
+        default:
+            return nil
+        }
+    }
+
+    private func inPageURLPermissionDescription(for state: InPageURLPermissionState?) -> String {
+        guard let state else { return "Unknown" }
+        switch state {
+        case .granted:
+            return "Granted"
+        case .denied:
+            return "Denied"
+        case .needsConsent:
+            return "Needs Allow"
+        case .unavailable(let status):
+            return "Unavailable (\(status))"
+        }
+    }
+
+    private func inPageURLPermissionColor(for state: InPageURLPermissionState?) -> Color {
+        guard let state else { return .retraceSecondary }
+        switch state {
+        case .granted:
+            return .retraceSuccess
+        case .denied:
+            return .retraceDanger
+        case .needsConsent:
+            return .retraceWarning
+        case .unavailable:
+            return .retraceSecondary
+        }
+    }
+
+    @MainActor
+    private func runInPageURLVerification(for target: InPageURLBrowserTarget) async {
+        let requiresTestPage = Self.shouldUseDedicatedInPageURLTestPage(for: target.bundleID)
+        guard !inPageURLVerificationBusyBundleIDs.contains(target.bundleID) else {
+            Log.info(
+                "[InPageURL][SettingsTest][\(target.bundleID)] duplicate_request_ignored verificationMode=\(requiresTestPage ? "test_page" : "current_page")",
+                category: .ui
+            )
+            return
+        }
+
+        let traceContext = Self.makeInPageURLVerificationTraceContext(
+            target: target,
+            requiresTestPage: requiresTestPage
+        )
+        let automationBundleID = Self.resolvedInPageURLAutomationBundleID(for: target.bundleID)
+        let isRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: target.bundleID).isEmpty
+
+        inPageURLVerificationBusyBundleIDs.insert(target.bundleID)
+        inPageURLVerificationByBundleID[target.bundleID] = .pending
+        inPageURLVerificationSummary = nil
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "verification_started",
+            details: "displayName=\(target.displayName) automationBundleID=\(automationBundleID) isRunning=\(isRunning) appURLPresent=\(target.appURL != nil)"
+        )
+
+        recordInPageURLMetric(
+            type: .inPageURLVerification,
+            payload: [
+                "phase": "single_browser_started",
+                "bundleID": target.bundleID,
+                "verificationMode": requiresTestPage ? "test_page" : "current_page"
+            ]
+        )
+
+        if requiresTestPage {
+            openInPageURLTestLink(in: target.bundleID, traceContext: traceContext)
+        } else {
+            await activateInPageURLTargetForCurrentPageProbe(target, traceContext: traceContext)
+        }
+
+        let preProbeDelayMs = target.bundleID == "company.thebrowser.Browser" && !requiresTestPage ? 1000 : 1400
+
+        // Allow navigation and initial page render before probing.
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "pre_probe_wait_started",
+            details: "delayMs=\(preProbeDelayMs)"
+        )
+        let preProbeWaitStart = Self.inPageURLVerificationNow()
+        try? await Task.sleep(for: .milliseconds(preProbeDelayMs), clock: .continuous)
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "pre_probe_wait_finished",
+            details: "waitElapsedMs=\(Self.inPageURLElapsedMilliseconds(since: preProbeWaitStart))"
+        )
+
+        let result = await verifyInPageURLExtractionWithRetry(
+            bundleID: target.bundleID,
+            requiresTestPage: requiresTestPage,
+            traceContext: traceContext
+        )
+        inPageURLVerificationByBundleID[target.bundleID] = result
+        inPageURLVerificationBusyBundleIDs.remove(target.bundleID)
+        refreshInPageURLVerificationSummary()
+        bringRetraceToFront()
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "verification_finished",
+            details: "result=\(inPageURLVerificationDescription(result))"
+        )
+
+        recordInPageURLMetric(
+            type: .inPageURLVerification,
+            payload: [
+                "phase": "single_browser_finished",
+                "bundleID": target.bundleID,
+                "verificationMode": requiresTestPage ? "test_page" : "current_page",
+                "result": inPageURLVerificationDescription(result)
+            ]
+        )
+    }
+
+    @MainActor
+    private func activateInPageURLTargetForCurrentPageProbe(
+        _ target: InPageURLBrowserTarget,
+        traceContext: InPageURLVerificationTraceContext
+    ) async {
+        let activationStart = Self.inPageURLVerificationNow()
+        if let runningApp = NSRunningApplication.runningApplications(withBundleIdentifier: target.bundleID).first {
+            let activated = runningApp.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "activate_current_page_probe_finished",
+                details: "path=running_app activated=\(activated) elapsedMs=\(Self.inPageURLElapsedMilliseconds(since: activationStart))"
+            )
+            Log.info("[SettingsView] Activated \(target.bundleID) for current-page in-page URL probe (activated=\(activated))", category: .ui)
+        } else if let appURL = target.appURL {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "activate_current_page_probe_started",
+                details: "path=launch_app appPath=\(appURL.path)"
+            )
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.addsToRecentItems = false
+            _ = try? await NSWorkspace.shared.openApplication(at: appURL, configuration: configuration)
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "activate_current_page_probe_finished",
+                details: "path=launch_app elapsedMs=\(Self.inPageURLElapsedMilliseconds(since: activationStart))"
+            )
+            Log.info("[SettingsView] Launched \(target.bundleID) for current-page in-page URL probe", category: .ui)
+        } else {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "activate_current_page_probe_skipped",
+                details: "reason=no_running_app_and_no_app_url"
+            )
+        }
+
+        recordInPageURLMetric(
+            type: .inPageURLVerification,
+            payload: [
+                "phase": "activate_current_page_probe",
+                "bundleID": target.bundleID
+            ]
+        )
+    }
+
+    @MainActor
+    private func refreshInPageURLVerificationSummary() {
+        let grantedBundleIDs = inPageURLTargets
+            .filter { inPageURLPermissionStateByBundleID[$0.bundleID] == .granted }
+            .map(\.bundleID)
+
+        guard !grantedBundleIDs.isEmpty else {
+            inPageURLVerificationSummary = nil
+            return
+        }
+
+        let finishedResults = grantedBundleIDs.compactMap { inPageURLVerificationByBundleID[$0] }
+        guard !finishedResults.isEmpty else {
+            inPageURLVerificationSummary = nil
+            return
+        }
+
+        let allGrantedBrowsersPassed = grantedBundleIDs.allSatisfy { bundleID in
+            guard let state = inPageURLVerificationByBundleID[bundleID] else { return false }
+            if case .success = state { return true }
+            return false
+        }
+
+        if allGrantedBrowsersPassed {
+            inPageURLVerificationSummary = "Success: in-page URL extraction works for all granted browsers and apps."
+        } else {
+            inPageURLVerificationSummary = "Some browser or app tests failed. Review each row and retry."
+        }
+    }
+
+    private func verifyInPageURLExtractionWithRetry(
+        bundleID: String,
+        requiresTestPage: Bool,
+        traceContext: InPageURLVerificationTraceContext
+    ) async -> InPageURLVerificationState {
+        let maxAttempts = bundleID == "company.thebrowser.Browser" && !requiresTestPage ? 1 : 6
+        var latestResult: InPageURLVerificationState = .failed("Verification did not run")
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "retry_loop_started",
+            details: "maxAttempts=\(maxAttempts)"
+        )
+
+        for attempt in 1...maxAttempts {
+            let attemptStart = Self.inPageURLVerificationNow()
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "attempt_started",
+                details: "attempt=\(attempt) of \(maxAttempts)"
+            )
+            latestResult = await verifyInPageURLExtraction(
+                bundleID: bundleID,
+                requiresTestPage: requiresTestPage,
+                attempt: attempt,
+                traceContext: traceContext
+            )
+            let shouldRetry = shouldRetryInPageURLVerification(latestResult) && attempt < maxAttempts
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "attempt_finished",
+                details: "attempt=\(attempt) result=\(inPageURLVerificationDescription(latestResult)) attemptElapsedMs=\(Self.inPageURLElapsedMilliseconds(since: attemptStart)) willRetry=\(shouldRetry)"
+            )
+            if !shouldRetry {
+                return latestResult
+            }
+
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "retry_wait_started",
+                details: "attempt=\(attempt) delayMs=700"
+            )
+            try? await Task.sleep(for: .milliseconds(700), clock: .continuous)
+        }
+
+        return latestResult
+    }
+
+    private func shouldRetryInPageURLVerification(_ state: InPageURLVerificationState) -> Bool {
+        switch state {
+        case .pending, .success:
+            return false
+        case .warning(let message):
+            return
+                message.localizedCaseInsensitiveContains("Open \(Self.inPageURLTestURLString)") ||
+                message.localizedCaseInsensitiveContains("No URLs detected")
+        case .failed(let message):
+            return
+                message.localizedCaseInsensitiveContains("No browser window is open") ||
+                message.localizedCaseInsensitiveContains("Timed out")
+        }
+    }
+
+    private func verifyInPageURLExtraction(
+        bundleID: String,
+        requiresTestPage: Bool,
+        attempt: Int,
+        traceContext: InPageURLVerificationTraceContext
+    ) async -> InPageURLVerificationState {
+        let hostBrowserBundleID = Self.chromiumHostBrowserBundleID(for: bundleID)
+        let probeTimeoutSeconds: TimeInterval =
+            bundleID == "company.thebrowser.Browser" && !requiresTestPage ? 8 : 25
+        let (scriptMode, scriptLines): (String, [String]) = if bundleID == "com.apple.Safari" {
+            ("safari", Self.safariWikipediaProbeScriptLines)
+        } else if let hostBrowserBundleID, hostBrowserBundleID != bundleID {
+            ("chromium_hosted_web_app", Self.chromiumWikipediaProbeScriptLines(
+                bundleID: bundleID,
+                requiresTestPage: requiresTestPage
+            ))
+        } else {
+            ("chromium_direct", Self.chromiumWikipediaProbeScriptLines(
+                bundleID: bundleID,
+                requiresTestPage: requiresTestPage
+            ))
+        }
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "probe_started",
+            details: "attempt=\(attempt) scriptMode=\(scriptMode) hostBundleID=\(hostBrowserBundleID ?? "nil") scriptLines=\(scriptLines.count)"
+        )
+
+        let runResult = await Self.runAppleScript(
+            lines: scriptLines,
+            timeoutSeconds: probeTimeoutSeconds,
+            logPrefix: traceContext.logPrefix,
+            attempt: attempt,
+            scriptMode: scriptMode
+        )
+
+        if runResult.didTimeOut {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_timeout",
+                details: "attempt=\(attempt) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+            )
+            return .failed("Timed out waiting for browser response. Open a url and try again")
+        }
+
+        if runResult.exitCode != 0 {
+            let stderr = runResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_failed",
+                details: "attempt=\(attempt) exitCode=\(runResult.exitCode) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs)) stderrPreview=\(Self.inPageURLLogPreview(stderr))"
+            )
+            if stderr.contains("-1743") || stderr.localizedCaseInsensitiveContains("not authorized") {
+                return .failed("Automation permission denied")
+            }
+            if stderr.contains("Allow JavaScript from Apple Events") {
+                return .warning(inPageURLJavaScriptFromAppleEventsReminder(for: bundleID))
+            }
+            return .failed(stderr.isEmpty ? "AppleScript failed (exit \(runResult.exitCode))" : stderr)
+        }
+
+        let output = runResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if output == "__NO_WINDOWS__" {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_no_windows",
+                details: "attempt=\(attempt) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+            )
+            return .failed("No browser window is open")
+        }
+        if output == "__NO_SCRIPTABLE_TAB__" {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_no_scriptable_tab",
+                details: "attempt=\(attempt) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+            )
+            return .warning("Open a normal Arc tab first")
+        }
+        if requiresTestPage && output == Self.inPageURLNoMatchingWindowToken {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_no_matching_window",
+                details: "attempt=\(attempt) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+            )
+            return .warning("Open \(Self.inPageURLTestURLString) first")
+        }
+
+        let parts = output.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2 else {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_unexpected_output",
+                details: "attempt=\(attempt) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs)) outputPreview=\(Self.inPageURLLogPreview(output))"
+            )
+            return .failed("Unexpected probe response")
+        }
+
+        let pageURL = String(parts[0])
+        let scrapedURL = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if requiresTestPage && !pageURL.localizedCaseInsensitiveContains("wikipedia.org/wiki/cat") {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_wrong_page",
+                details: "attempt=\(attempt) pageURL=\(Self.inPageURLLogPreview(pageURL))"
+            )
+            return .warning("Open \(Self.inPageURLTestURLString) first (current: \(pageURL))")
+        }
+
+        if scrapedURL.isEmpty {
+            Self.logInPageURLVerification(
+                traceContext,
+                stage: "probe_no_scraped_urls",
+                details: "attempt=\(attempt) pageURL=\(Self.inPageURLLogPreview(pageURL)) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+            )
+            Log.debug(
+                "[SettingsView] In-page URL probe returned no scraped URLs for \(bundleID). rawOutput=\(output)",
+                category: .ui
+            )
+            return .warning("No URLs detected on the current page")
+        }
+
+        Self.logInPageURLVerification(
+            traceContext,
+            stage: "probe_succeeded",
+            details: "attempt=\(attempt) pageURL=\(Self.inPageURLLogPreview(pageURL)) scrapedURL=\(Self.inPageURLLogPreview(scrapedURL)) appleScriptElapsedMs=\(Self.inPageURLFormatMilliseconds(runResult.elapsedMs))"
+        )
+
+        if requiresTestPage {
+            return .success("Scraped an in-page URL from \(pageURL)")
+        }
+
+        return .success("Scraped an in-page URL from the current page")
+    }
+
+    private func inPageURLVerificationDescription(_ state: InPageURLVerificationState) -> String {
+        switch state {
+        case .pending:
+            return "Checking..."
+        case .success(let message):
+            return message
+        case .warning(let message):
+            return message
+        case .failed(let message):
+            return message
+        }
+    }
+
+    nonisolated private static func makeInPageURLVerificationTraceContext(
+        target: InPageURLBrowserTarget,
+        requiresTestPage: Bool
+    ) -> InPageURLVerificationTraceContext {
+        InPageURLVerificationTraceContext(
+            traceID: String(UUID().uuidString.prefix(8)).lowercased(),
+            bundleID: target.bundleID,
+            displayName: target.displayName,
+            verificationMode: requiresTestPage ? "test_page" : "current_page",
+            startedAtUptime: inPageURLVerificationNow()
+        )
+    }
+
+    nonisolated private static func inPageURLVerificationNow() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
+    }
+
+    nonisolated private static func inPageURLElapsedMilliseconds(since start: TimeInterval) -> String {
+        inPageURLFormatMilliseconds((inPageURLVerificationNow() - start) * 1000)
+    }
+
+    nonisolated private static func inPageURLFormatMilliseconds(_ milliseconds: Double) -> String {
+        String(format: "%.1f", milliseconds)
+    }
+
+    nonisolated private static func inPageURLLogPreview(_ text: String, limit: Int = 180) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+
+        guard collapsed.count > limit else { return collapsed }
+        return String(collapsed.prefix(limit)) + "..."
+    }
+
+    nonisolated private static func logInPageURLVerification(
+        _ traceContext: InPageURLVerificationTraceContext,
+        stage: String,
+        details: String
+    ) {
+        Log.info(
+            "\(traceContext.logPrefix) stage=\(stage) totalElapsedMs=\(inPageURLElapsedMilliseconds(since: traceContext.startedAtUptime)) displayName=\(traceContext.displayName) verificationMode=\(traceContext.verificationMode) \(details)",
+            category: .ui
+        )
+    }
+
+    private func recordInPageURLMetric(
+        type: DailyMetricsQueries.MetricType,
+        payload: [String: Any]
+    ) {
+        Task {
+            let metadata = Self.inPageURLMetricMetadata(payload)
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: type,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func inPageURLMetricMetadata(_ payload: [String: Any]) -> String? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    @ViewBuilder
+    private func inPageURLInstructionImage(_ image: NSImage) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(maxWidth: 760)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+    }
+
+    private func resolveChromiumInPageURLInstructionsImage() -> NSImage? {
+        resolveInPageURLInstructionImage(
+            assetName: "InPageURLInstructions",
+            fileName: "safari_instructions.png",
+            logName: "chromium in-page URL instructions"
+        )
+    }
+
+    private func resolveSafariInPageURLMenuImage() -> NSImage? {
+        resolveInPageURLInstructionImage(
+            assetName: "SafariInPageURLMenu",
+            fileName: "safari_instructions_1.png",
+            logName: "safari in-page URL menu instructions"
+        )
+    }
+
+    private func resolveSafariInPageURLToggleImage() -> NSImage? {
+        resolveInPageURLInstructionImage(
+            assetName: "SafariInPageURLToggle",
+            fileName: "safari_instructions_2.png",
+            logName: "safari in-page URL toggle instructions"
+        )
+    }
+
+    private func resolveSafariInPageURLAllowImage() -> NSImage? {
+        resolveInPageURLInstructionImage(
+            assetName: "SafariInPageURLAllow",
+            fileName: "safari_instructions_3.png",
+            logName: "safari in-page URL allow instructions"
+        )
+    }
+
+    private func resolveInPageURLInstructionImage(
+        assetName: String,
+        fileName: String,
+        logName: String
+    ) -> NSImage? {
+        let imageName = NSImage.Name(assetName)
+
+        if let image = NSImage(named: imageName) {
+            Log.info("[SettingsView] Loaded \(logName) via NSImage(named:)", category: .ui)
+            return image
+        }
+
+        if let image = Bundle.main.image(forResource: imageName) {
+            Log.info("[SettingsView] Loaded \(logName) via Bundle.main.image(forResource:)", category: .ui)
+            return image
+        }
+
+#if SWIFT_PACKAGE
+        if let image = Bundle.module.image(forResource: imageName) {
+            Log.info("[SettingsView] Loaded \(logName) via Bundle.module.image(forResource:)", category: .ui)
+            return image
+        }
+#endif
+
+        let fileManager = FileManager.default
+        let resourcePath = Bundle.main.resourcePath ?? ""
+        let bundleCandidates: [(label: String, path: String)] = [
+            ("bundle/\(fileName)", "\(resourcePath)/\(fileName)"),
+            ("bundle/Assets.xcassets/\(assetName).imageset/\(fileName)", "\(resourcePath)/Assets.xcassets/\(assetName).imageset/\(fileName)")
+        ]
+
+        for candidate in bundleCandidates where fileManager.fileExists(atPath: candidate.path) {
+            if let image = NSImage(contentsOfFile: candidate.path) {
+                Log.warning("[SettingsView] Loaded \(logName) via file fallback \(candidate.label)", category: .ui)
+                return image
+            }
+        }
+
+#if SWIFT_PACKAGE
+        let moduleResourcePath = Bundle.module.resourcePath ?? ""
+        let moduleCandidates: [(label: String, path: String)] = [
+            ("module/\(fileName)", "\(moduleResourcePath)/\(fileName)"),
+            ("module/Assets.xcassets/\(assetName).imageset/\(fileName)", "\(moduleResourcePath)/Assets.xcassets/\(assetName).imageset/\(fileName)")
+        ]
+
+        for candidate in moduleCandidates where fileManager.fileExists(atPath: candidate.path) {
+            if let image = NSImage(contentsOfFile: candidate.path) {
+                Log.warning("[SettingsView] Loaded \(logName) via SwiftPM module file fallback \(candidate.label)", category: .ui)
+                return image
+            }
+        }
+#endif
+
+        let debugWorkingTreePath = "\(fileManager.currentDirectoryPath)/UI/Assets.xcassets/\(assetName).imageset/\(fileName)"
+        if fileManager.fileExists(atPath: debugWorkingTreePath),
+           let image = NSImage(contentsOfFile: debugWorkingTreePath) {
+            Log.warning("[SettingsView] Loaded \(logName) via working-tree fallback path", category: .ui)
+            return image
+        }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "nil"
+        let bundlePath = Bundle.main.bundlePath
+        let hasAssetsCar = fileManager.fileExists(atPath: "\(resourcePath)/Assets.car")
+        let candidateSummary = bundleCandidates
+            .map { "\($0.label)=\(fileManager.fileExists(atPath: $0.path) ? "exists" : "missing")" }
+            .joined(separator: ",")
+
+        Log.error(
+            "[SettingsView] \(logName) missing. bundleID=\(bundleID), bundlePath=\(bundlePath), hasAssetsCar=\(hasAssetsCar), fileCandidates=\(candidateSummary)",
+            category: .ui
+        )
+
+        return nil
+    }
+
+    private static var safariWikipediaProbeScriptLines: [String] {
+        let targetNeedle = appleScriptEscapedForProbe(wikipediaProbeNeedle)
+        return [
+            "set __retraceNeedle to \"\(targetNeedle)\"",
+            "tell application id \"com.apple.Safari\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set t to missing value",
+            "set targetWindow to missing value",
+            "if __retraceNeedle is not \"\" then",
+            "repeat with w in windows",
+            "repeat with candidateTab in tabs of w",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "if tabURL contains __retraceNeedle then",
+            "set t to candidateTab",
+            "set targetWindow to w",
+            "exit repeat",
+            "end if",
+            "end try",
+            "end repeat",
+            "if t is not missing value then exit repeat",
+            "end repeat",
+            "end if",
+            "if t is missing value then",
+            "set targetWindow to front window",
+            "set t to current tab of targetWindow",
+            "end if",
+            "if targetWindow is not missing value then",
+            "set index of targetWindow to 1",
+            "set current tab of targetWindow to t",
+            "end if",
+            "activate",
+            "delay 0.25",
+            "set pageURL to URL of t",
+            "set scrapedURLValue to do JavaScript \"(()=>{const link=document.querySelector('a[href]'); return (link && link.href) ? String(link.href) : '';})()\" in t",
+            "return pageURL & \"|\" & scrapedURLValue",
+            "end tell"
+        ]
+    }
+
+    private static func chromiumWikipediaProbeScriptLines(
+        bundleID: String,
+        requiresTestPage: Bool
+    ) -> [String] {
+        let targetNeedle = requiresTestPage ? appleScriptEscapedForProbe(wikipediaProbeNeedle) : ""
+        if bundleID == "company.thebrowser.Browser" {
+            // Arc can open external links in detached Little Arc surfaces that do not
+            // appear in its AppleScript window list. Probe any real tab that Arc
+            // exposes across windows instead of relying on the command-bar surface.
+            return [
+                "set __retraceNeedle to \"\(targetNeedle)\"",
+                "tell application id \"\(bundleID)\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set targetWindowIndex to missing value",
+                "set targetTabID to missing value",
+                "if __retraceNeedle is not \"\" then",
+                "repeat with w in windows",
+                "repeat with candidateTab in tabs of w",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set targetWindowIndex to index of w",
+                "set targetTabID to id of candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "if targetTabID is not missing value then exit repeat",
+                "end repeat",
+                "end if",
+                "if targetTabID is missing value then",
+                "try",
+                "set targetWindowIndex to 1",
+                "set targetTabID to id of active tab of front window",
+                "end try",
+                "end if",
+                "if targetTabID is missing value then",
+                "repeat with w in windows",
+                "repeat with candidateTab in tabs of w",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL is not missing value and tabURL is not \"\" then",
+                "set targetWindowIndex to index of w",
+                "set targetTabID to id of candidateTab",
+                "exit repeat",
+                "end if",
+                "end try",
+                "end repeat",
+                "if targetTabID is not missing value then exit repeat",
+                "end repeat",
+                "end if",
+                "if targetTabID is missing value then return \"__NO_SCRIPTABLE_TAB__\"",
+                "try",
+                "set index of window targetWindowIndex to 1",
+                "end try",
+                "activate",
+                "delay 0.25",
+                "set pageURL to URL of (tab id targetTabID of window targetWindowIndex)",
+                "set scrapedURLValue to execute (tab id targetTabID of window targetWindowIndex) javascript \"(()=>{const link=document.querySelector('a[href]'); return (link && link.href) ? String(link.href) : '';})()\"",
+                "return pageURL & \"|\" & scrapedURLValue",
+                "end tell"
+            ]
+        }
+
+        if let hostBrowserBundleID = chromiumHostBrowserBundleID(for: bundleID),
+           hostBrowserBundleID != bundleID {
+            return [
+                "set __retraceNeedle to \"\(targetNeedle)\"",
+                "tell application id \"\(hostBrowserBundleID)\"",
+                "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+                "set targetWindowIndex to -1",
+                "set targetTabIndex to -1",
+                "set wIndex to 1",
+                "repeat with w in windows",
+                "set tIndex to 1",
+                "repeat with candidateTab in tabs of w",
+                "try",
+                "set tabURL to URL of candidateTab",
+                "if tabURL contains __retraceNeedle then",
+                "set targetWindowIndex to wIndex",
+                "set targetTabIndex to tIndex",
+                "exit repeat",
+                "end if",
+                "end try",
+                "set tIndex to tIndex + 1",
+                "end repeat",
+                "if targetTabIndex is not -1 then exit repeat",
+                "set wIndex to wIndex + 1",
+                "end repeat",
+                "if __retraceNeedle is not \"\" and targetTabIndex is -1 then return \"\(inPageURLNoMatchingWindowToken)\"",
+                "if targetTabIndex is -1 then",
+                "set targetWindowIndex to 1",
+                "set targetTabIndex to 1",
+                "end if",
+                "try",
+                "set index of window targetWindowIndex to 1",
+                "end try",
+                "activate",
+                "delay 0.25",
+                "set pageURL to URL of tab targetTabIndex of window targetWindowIndex",
+                "set scrapedURLValue to execute tab targetTabIndex of window targetWindowIndex javascript \"(()=>{const link=document.querySelector('a[href]'); return (link && link.href) ? String(link.href) : '';})()\"",
+                "return pageURL & \"|\" & scrapedURLValue",
+                "end tell"
+            ]
+        }
+
+        return [
+            "set __retraceNeedle to \"\(targetNeedle)\"",
+            "tell application id \"\(bundleID)\"",
+            "if (count of windows) = 0 then return \"__NO_WINDOWS__\"",
+            "set targetWindowIndex to -1",
+            "set targetTabIndex to -1",
+            "set wIndex to 1",
+            "if __retraceNeedle is not \"\" then",
+            "repeat with w in windows",
+            "set tIndex to 1",
+            "repeat with candidateTab in tabs of w",
+            "try",
+            "set tabURL to URL of candidateTab",
+            "if tabURL contains __retraceNeedle then",
+            "set targetWindowIndex to wIndex",
+            "set targetTabIndex to tIndex",
+            "exit repeat",
+            "end if",
+            "end try",
+            "set tIndex to tIndex + 1",
+            "end repeat",
+            "if targetTabIndex is not -1 then exit repeat",
+            "set wIndex to wIndex + 1",
+            "end repeat",
+            "end if",
+            "if targetTabIndex is -1 then",
+            "set targetWindowIndex to 1",
+            "set targetTabIndex to 1",
+            "end if",
+            "try",
+            "set index of window targetWindowIndex to 1",
+            "end try",
+            "activate",
+            "delay 0.25",
+            "set pageURL to URL of tab targetTabIndex of window targetWindowIndex",
+            "set scrapedURLValue to execute tab targetTabIndex of window targetWindowIndex javascript \"(()=>{const link=document.querySelector('a[href]'); return (link && link.href) ? String(link.href) : '';})()\"",
+            "return pageURL & \"|\" & scrapedURLValue",
+            "end tell"
+        ]
+    }
+
+    private static func chromiumHostBrowserBundleID(for bundleID: String) -> String? {
+        if inPageURLChromiumHostBundleIDPrefixes.contains(bundleID) {
+            return bundleID
+        }
+
+        for prefix in inPageURLChromiumHostBundleIDPrefixes where bundleID.hasPrefix(prefix + ".app.") {
+            return prefix
+        }
+
+        return nil
+    }
+
+    private static func resolvedInPageURLAutomationBundleID(for bundleID: String) -> String {
+        chromiumHostBrowserBundleID(for: bundleID) ?? bundleID
+    }
+
+    private static func isInPageURLChromiumWebAppBundleID(_ bundleID: String) -> Bool {
+        inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
+            bundleID.hasPrefix(prefix + ".app.")
+        }
+    }
+
+    private static func shouldUseDedicatedInPageURLTestPage(for bundleID: String) -> Bool {
+        if bundleID == "company.thebrowser.Browser" {
+            return false
+        }
+        let automationBundleID = resolvedInPageURLAutomationBundleID(for: bundleID)
+        return automationBundleID == bundleID
+    }
+
+    private static var wikipediaProbeNeedle: String {
+        guard let parsedURL = URL(string: inPageURLTestURLString),
+              let host = parsedURL.host?.lowercased() else {
+            return "wikipedia.org/wiki/cat"
+        }
+
+        let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        let normalizedPath = parsedURL.path.lowercased()
+        if normalizedPath.isEmpty || normalizedPath == "/" {
+            return normalizedHost
+        }
+        return normalizedHost + normalizedPath
+    }
+
+    private static func appleScriptEscapedForProbe(_ input: String) -> String {
+        input
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private static func runAppleScript(
+        lines: [String],
+        timeoutSeconds: TimeInterval,
+        logPrefix: String,
+        attempt: Int,
+        scriptMode: String
+    ) async -> InPageURLAppleScriptRunResult {
+        await Task.detached(priority: .userInitiated) {
+            let startUptime = inPageURLVerificationNow()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = lines.flatMap { ["-e", $0] }
+
+            let outputPipe = Pipe()
+            let errorPipe = Pipe()
+            process.standardOutput = outputPipe
+            process.standardError = errorPipe
+
+            Log.info(
+                "\(logPrefix) stage=osascript_started attempt=\(attempt) scriptMode=\(scriptMode) timeoutSeconds=\(timeoutSeconds) lineCount=\(lines.count)",
+                category: .ui
+            )
+
+            do {
+                try process.run()
+                Log.info(
+                    "\(logPrefix) stage=osascript_process_launched attempt=\(attempt) scriptMode=\(scriptMode) pid=\(process.processIdentifier)",
+                    category: .ui
+                )
+            } catch {
+                let elapsedMs = (inPageURLVerificationNow() - startUptime) * 1000
+                Log.warning(
+                    "\(logPrefix) stage=osascript_launch_failed attempt=\(attempt) scriptMode=\(scriptMode) elapsedMs=\(inPageURLFormatMilliseconds(elapsedMs)) error=\(error.localizedDescription)",
+                    category: .ui
+                )
+                return InPageURLAppleScriptRunResult(
+                    stdout: "",
+                    stderr: error.localizedDescription,
+                    exitCode: -1,
+                    didTimeOut: false,
+                    elapsedMs: elapsedMs
+                )
+            }
+
+            let didTimeOut = await waitForProcessExitOrTimeout(process: process, timeoutSeconds: timeoutSeconds)
+            if didTimeOut {
+                process.terminate()
+                await waitForProcessExit(process)
+            }
+
+            let stdoutData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+            let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+            let elapsedMs = (inPageURLVerificationNow() - startUptime) * 1000
+
+            Log.info(
+                "\(logPrefix) stage=osascript_finished attempt=\(attempt) scriptMode=\(scriptMode) elapsedMs=\(inPageURLFormatMilliseconds(elapsedMs)) exitCode=\(process.terminationStatus) didTimeOut=\(didTimeOut) stdoutBytes=\(stdoutData.count) stderrBytes=\(stderrData.count) stdoutPreview=\(inPageURLLogPreview(stdout)) stderrPreview=\(inPageURLLogPreview(stderr))",
+                category: .ui
+            )
+
+            return InPageURLAppleScriptRunResult(
+                stdout: stdout,
+                stderr: stderr,
+                exitCode: process.terminationStatus,
+                didTimeOut: didTimeOut,
+                elapsedMs: elapsedMs
+            )
+        }.value
+    }
+
+    private static func waitForProcessExit(_ process: Process) async {
+        while process.isRunning {
+            try? await Task.sleep(for: .milliseconds(15), clock: .continuous)
+        }
+    }
+
+    private static func waitForProcessExitOrTimeout(
+        process: Process,
+        timeoutSeconds: TimeInterval
+    ) async -> Bool {
+        final class ResumeState {
+            private let lock = NSLock()
+            private var didResume = false
+
+            func resumeOnce(_ continuation: CheckedContinuation<Bool, Never>, value: Bool) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+        }
+
+        let state = ResumeState()
+
+        return await withCheckedContinuation { continuation in
+            process.terminationHandler = { _ in
+                state.resumeOnce(continuation, value: false)
+            }
+
+            if !process.isRunning {
+                state.resumeOnce(continuation, value: false)
+                return
+            }
+
+            Task.detached(priority: .utility) {
+                try? await Task.sleep(for: .seconds(timeoutSeconds), clock: .continuous)
+                state.resumeOnce(continuation, value: true)
+            }
+        }
     }
 }
 
@@ -6672,6 +8969,10 @@ extension SettingsView {
         deduplicationThreshold = SettingsDefaults.deduplicationThreshold
         deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
         captureOnWindowChange = SettingsDefaults.captureOnWindowChange
+        collectInPageURLsExperimental = SettingsDefaults.collectInPageURLsExperimental
+        inPageURLVerificationByBundleID = [:]
+        inPageURLVerificationBusyBundleIDs = []
+        inPageURLVerificationSummary = nil
 
         // Apply capture config changes immediately
         Task {

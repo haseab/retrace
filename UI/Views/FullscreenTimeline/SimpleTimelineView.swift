@@ -1865,6 +1865,25 @@ struct FrameWithURLOverlay<Content: View>: View {
                 containerSize: geometry.size,
                 actualFrameRect: actualFrameRect
             )
+            let showsHyperlinkVisualOverlays = !viewModel.isInLiveMode
+            let openHyperlink: (OCRHyperlinkMatch) -> Void = { match in
+                let didOpen = viewModel.openHyperlinkMatch(match)
+                if didOpen {
+                    // Keep browser frontmost after opening external link.
+                    TimelineWindowController.shared.hide(restorePreviousFocus: false)
+                }
+            }
+            let hyperlinkContextMenuEntries = (showsHyperlinkVisualOverlays ? viewModel.hyperlinkMatches : []).compactMap { match -> HyperlinkContextMenuEntry? in
+                let rect = transformedHyperlinkContextMenuRect(
+                    for: match,
+                    actualFrameRect: actualFrameRect,
+                    containerSize: geometry.size,
+                    scale: viewModel.frameZoomScale,
+                    offset: viewModel.frameZoomOffset
+                )
+                guard rect.width > 1, rect.height > 1 else { return nil }
+                return HyperlinkContextMenuEntry(match: match, rect: rect)
+            }
 
             ZStack {
                 // The actual frame content (always present as base layer)
@@ -1914,6 +1933,8 @@ struct FrameWithURLOverlay<Content: View>: View {
                         viewModel: viewModel,
                         containerSize: geometry.size,
                         actualFrameRect: actualFrameRect,
+                        hyperlinkMatches: viewModel.hyperlinkMatches,
+                        onHyperlinkOpen: openHyperlink,
                         isInteractionDisabled: viewModel.isInLiveMode && viewModel.ocrNodes.isEmpty,
                         onDragStart: { point, isCommandDrag in
                             viewModel.startDragSelection(
@@ -1957,7 +1978,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                     .offset(viewModel.frameZoomOffset)
 
                     // URL bounding box overlay (if URL detected)
-                    if let box = viewModel.urlBoundingBox {
+                    if showsHyperlinkVisualOverlays, let box = viewModel.urlBoundingBox {
                         URLBoundingBoxOverlay(
                             boundingBox: box,
                             containerSize: geometry.size,
@@ -1968,18 +1989,33 @@ struct FrameWithURLOverlay<Content: View>: View {
                             },
                             onClick: {
                                 viewModel.openURLInBrowser()
-                                // Close the timeline view after opening URL
-                                onURLClicked()
+                                // Keep browser frontmost after opening external link.
+                                TimelineWindowController.shared.hide(restorePreviousFocus: false)
                             }
                         )
                         // Apply the same zoom transformations as the frame content
                         .scaleEffect(viewModel.frameZoomScale)
                         .offset(viewModel.frameZoomOffset)
                     }
+
+                    if showsHyperlinkVisualOverlays, !viewModel.hyperlinkMatches.isEmpty {
+                        OCRHyperlinkOverlay(
+                            matches: viewModel.hyperlinkMatches,
+                            actualFrameRect: actualFrameRect,
+                            onOpen: openHyperlink
+                        )
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
+                    }
                 }
 
             }
-            .onRightClick { location in
+            .onRightClick(
+                hyperlinkEntries: hyperlinkContextMenuEntries,
+                onHyperlinkCopy: { match in
+                    _ = viewModel.copyHyperlinkMatch(match)
+                }
+            ) { location in
                 // Keep right-clicks on the floating filter card from opening the frame menu behind it.
                 guard !viewModel.isFilterPanelVisible else { return }
                 viewModel.contextMenuLocation = location
@@ -2094,6 +2130,41 @@ struct FrameWithURLOverlay<Content: View>: View {
 
         return false
     }
+}
+
+private func transformedHyperlinkContextMenuRect(
+    for match: OCRHyperlinkMatch,
+    actualFrameRect: CGRect,
+    containerSize: CGSize,
+    scale: CGFloat,
+    offset: CGSize
+) -> CGRect {
+    let rect = CGRect(
+        x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+        y: actualFrameRect.origin.y + (match.y * actualFrameRect.height),
+        width: match.highlightWidth * actualFrameRect.width,
+        height: match.height * actualFrameRect.height
+    )
+
+    guard scale != 1 else {
+        return rect.offsetBy(dx: offset.width, dy: offset.height)
+    }
+
+    let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    let scaledOrigin = CGPoint(
+        x: center.x + ((rect.origin.x - center.x) * scale) + offset.width,
+        y: center.y + ((rect.origin.y - center.y) * scale) + offset.height
+    )
+
+    return CGRect(
+        origin: scaledOrigin,
+        size: CGSize(width: rect.width * scale, height: rect.height * scale)
+    )
+}
+
+struct HyperlinkContextMenuEntry {
+    let match: OCRHyperlinkMatch
+    let rect: CGRect
 }
 
 // MARK: - Frame Zoom Indicator
@@ -2877,6 +2948,7 @@ struct ZoomFinalStateOverlay<Content: View>: View {
             }
         }
     }
+
 }
 
 // MARK: - Zoomed Region View
@@ -3506,6 +3578,174 @@ class URLOverlayView: NSView {
     }
 }
 
+struct OCRHyperlinkOverlay: NSViewRepresentable {
+    let matches: [OCRHyperlinkMatch]
+    let actualFrameRect: CGRect
+    let onOpen: (OCRHyperlinkMatch) -> Void
+
+    func makeNSView(context: Context) -> OCRHyperlinkOverlayView {
+        let view = OCRHyperlinkOverlayView()
+        view.onOpen = onOpen
+        return view
+    }
+
+    func updateNSView(_ nsView: OCRHyperlinkOverlayView, context: Context) {
+        nsView.onOpen = onOpen
+        nsView.entries = matches.compactMap { match in
+            let rect = CGRect(
+                x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+                y: actualFrameRect.origin.y + (match.y * actualFrameRect.height),
+                width: match.highlightWidth * actualFrameRect.width,
+                height: match.height * actualFrameRect.height
+            )
+            guard rect.width > 1, rect.height > 1 else { return nil }
+            return OCRHyperlinkOverlayView.Entry(match: match, rect: rect)
+        }
+    }
+}
+
+final class OCRHyperlinkOverlayView: NSView {
+    struct Entry {
+        let match: OCRHyperlinkMatch
+        let rect: CGRect
+    }
+
+    var entries: [Entry] = [] {
+        didSet {
+            if hoveredMatchID.flatMap({ id in entries.first(where: { $0.match.id == id }) }) == nil {
+                hoveredMatchID = nil
+            }
+            needsDisplay = true
+            needsLayout = true
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    var onOpen: ((OCRHyperlinkMatch) -> Void)?
+
+    private var trackingArea: NSTrackingArea?
+    private var hoveredMatchID: String?
+    private let idleBorderOffset: CGFloat = 2.5
+    private let idleBorderThickness: CGFloat = 1.25
+    private let borderCornerRadius: CGFloat = 6
+    private let interactionPadding: CGFloat = 3
+
+    override var isFlipped: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect]
+        let newTrackingArea = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+        addTrackingArea(newTrackingArea)
+        trackingArea = newTrackingArea
+    }
+
+    override func resetCursorRects() {
+        discardCursorRects()
+        for entry in entries {
+            addCursorRect(interactionRect(for: entry), cursor: .pointingHand)
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard match(at: point) != nil else { return nil }
+        return self
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHoverState(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHoverState(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        setHoveredMatch(nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        guard let match = match(at: location) else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        onOpen?(match)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        for entry in entries {
+            guard entry.match.id != hoveredMatchID else { continue }
+            drawIdleBorder(for: entry)
+        }
+
+        if let hoveredEntry {
+            let hoverRect = outlineRect(for: hoveredEntry)
+            let path = NSBezierPath(
+                roundedRect: hoverRect,
+                xRadius: borderCornerRadius,
+                yRadius: borderCornerRadius
+            )
+            path.lineWidth = 2
+            path.setLineDash([5, 3], count: 2, phase: 0)
+
+            NSColor.systemBlue.withAlphaComponent(0.20).setFill()
+            path.fill()
+
+            NSColor.systemBlue.withAlphaComponent(0.95).setStroke()
+            path.stroke()
+        }
+    }
+
+    private func match(at point: CGPoint) -> OCRHyperlinkMatch? {
+        entries.first(where: { interactionRect(for: $0).contains(point) })?.match
+    }
+
+    private func updateHoverState(at point: CGPoint) {
+        setHoveredMatch(match(at: point)?.id)
+    }
+
+    private func setHoveredMatch(_ matchID: String?) {
+        guard hoveredMatchID != matchID else { return }
+        hoveredMatchID = matchID
+        needsDisplay = true
+    }
+
+    private var hoveredEntry: Entry? {
+        guard let hoveredMatchID else { return nil }
+        return entries.first(where: { $0.match.id == hoveredMatchID })
+    }
+
+    private func drawIdleBorder(for entry: Entry) {
+        let borderPath = NSBezierPath(
+            roundedRect: outlineRect(for: entry),
+            xRadius: borderCornerRadius,
+            yRadius: borderCornerRadius
+        )
+        borderPath.lineWidth = idleBorderThickness
+        NSColor.systemBlue.withAlphaComponent(0.58).setStroke()
+        borderPath.stroke()
+    }
+
+    private func outlineRect(for entry: Entry) -> CGRect {
+        entry.rect.insetBy(dx: -idleBorderOffset, dy: -idleBorderOffset)
+    }
+
+    private func interactionRect(for entry: Entry) -> CGRect {
+        entry.rect.insetBy(dx: -interactionPadding, dy: -interactionPadding)
+    }
+}
+
 // MARK: - Text Selection Overlay
 
 /// Overlay for selecting text from OCR nodes via click-drag or Cmd+A
@@ -3515,6 +3755,8 @@ struct TextSelectionOverlay: NSViewRepresentable {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     let containerSize: CGSize
     let actualFrameRect: CGRect
+    let hyperlinkMatches: [OCRHyperlinkMatch]
+    let onHyperlinkOpen: (OCRHyperlinkMatch) -> Void
     var isInteractionDisabled: Bool = false
     let onDragStart: (CGPoint, Bool) -> Void
     let onDragUpdate: (CGPoint, Bool) -> Void
@@ -3539,6 +3781,7 @@ struct TextSelectionOverlay: NSViewRepresentable {
         view.onZoomRegionEnd = onZoomRegionEnd
         view.onDoubleClick = onDoubleClick
         view.onTripleClick = onTripleClick
+        view.onHyperlinkOpen = onHyperlinkOpen
         return view
     }
 
@@ -3562,9 +3805,21 @@ struct TextSelectionOverlay: NSViewRepresentable {
 
         nsView.containerSize = containerSize
         nsView.actualFrameRect = actualFrameRect
+        nsView.onHyperlinkOpen = onHyperlinkOpen
+        nsView.hyperlinkEntries = hyperlinkMatches.compactMap { match in
+            let rect = NSRect(
+                x: actualFrameRect.origin.x + (match.highlightX * actualFrameRect.width),
+                y: actualFrameRect.origin.y + ((1.0 - match.y - match.height) * actualFrameRect.height),
+                width: match.highlightWidth * actualFrameRect.width,
+                height: match.height * actualFrameRect.height
+            )
+            guard rect.width > 1, rect.height > 1 else { return nil }
+            return TextSelectionView.HyperlinkEntry(match: match, rect: rect)
+        }
         nsView.isDraggingSelection = viewModel.dragStartPoint != nil
         nsView.isDraggingZoomRegion = viewModel.isDraggingZoomRegion
         nsView.isInteractionDisabled = isInteractionDisabled
+        nsView.refreshCursorForCurrentMouseLocation()
 
         nsView.needsDisplay = true
     }
@@ -3573,6 +3828,12 @@ struct TextSelectionOverlay: NSViewRepresentable {
 /// Custom NSView for text selection with mouse tracking
 /// Supports both text selection (normal drag) and zoom region (Shift+Drag)
 class TextSelectionView: NSView {
+    private enum CursorMode {
+        case none
+        case iBeam
+        case pointingHand
+    }
+
     /// Data for each OCR node including selection state
     struct NodeData {
         let id: Int
@@ -3581,9 +3842,15 @@ class TextSelectionView: NSView {
         let selectionRange: (start: Int, end: Int)?  // Character range selected within this node
     }
 
+    struct HyperlinkEntry {
+        let match: OCRHyperlinkMatch
+        let rect: NSRect
+    }
+
     var nodeData: [NodeData] = []
     var containerSize: CGSize = .zero
     var actualFrameRect: CGRect = .zero
+    var hyperlinkEntries: [HyperlinkEntry] = []
     var isDraggingSelection: Bool = false
     var isDraggingZoomRegion: Bool = false
     var isInteractionDisabled: Bool = false
@@ -3602,6 +3869,7 @@ class TextSelectionView: NSView {
     // Multi-click callbacks
     var onDoubleClick: ((CGPoint) -> Void)?
     var onTripleClick: ((CGPoint) -> Void)?
+    var onHyperlinkOpen: ((OCRHyperlinkMatch) -> Void)?
 
     private var isDragging = false
     private var isCommandDragging = false
@@ -3611,11 +3879,18 @@ class TextSelectionView: NSView {
     private var commandDragStartPoint: CGPoint?
     private var commandDragCurrentPoint: CGPoint?
     private var trackingArea: NSTrackingArea?
-    private var isShowingIBeamCursor = false  // Track cursor state to avoid redundant push/pop
+    private var cursorMode: CursorMode = .none
 
     /// Padding in screen points to expand hit area around OCR bounding boxes
     /// This makes it easier to start selection from slightly outside the text
     private let boundingBoxPadding: CGFloat = 8.0
+    private let hyperlinkPadding: CGFloat = 3.0
+
+    deinit {
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+    }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -3649,11 +3924,7 @@ class TextSelectionView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
-        // Reset cursor when leaving the view
-        if isShowingIBeamCursor {
-            NSCursor.pop()
-            isShowingIBeamCursor = false
-        }
+        applyCursorMode(.none)
     }
 
     /// Check if a screen point is near any OCR bounding box (within padding tolerance)
@@ -3668,19 +3939,66 @@ class TextSelectionView: NSView {
         return false
     }
 
+    /// Returns the hyperlink entry near the point, if any.
+    private func hyperlinkEntryContaining(screenPoint: CGPoint) -> HyperlinkEntry? {
+        for entry in hyperlinkEntries {
+            let expandedRect = entry.rect.insetBy(dx: -hyperlinkPadding, dy: -hyperlinkPadding)
+            if expandedRect.contains(screenPoint) {
+                return entry
+            }
+        }
+        return nil
+    }
+
+    private func applyCursorMode(_ mode: CursorMode) {
+        guard mode != cursorMode else { return }
+
+        if cursorMode != .none {
+            NSCursor.pop()
+        }
+
+        switch mode {
+        case .none:
+            break
+        case .iBeam:
+            NSCursor.iBeam.push()
+        case .pointingHand:
+            NSCursor.pointingHand.push()
+        }
+
+        cursorMode = mode
+    }
+
+    /// Re-evaluate cursor using the current pointer location when overlays/data update
+    /// without a fresh mouse-move event.
+    func refreshCursorForCurrentMouseLocation() {
+        guard let window else {
+            applyCursorMode(.none)
+            return
+        }
+
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(location) else {
+            applyCursorMode(.none)
+            return
+        }
+
+        updateCursorForLocation(location)
+    }
+
     /// Update cursor based on whether we're near an OCR bounding box
     private func updateCursorForLocation(_ location: CGPoint) {
+        let hyperlinkEntry = hyperlinkEntryContaining(screenPoint: location)
         let isNearNode = isNearAnyNode(screenPoint: location)
-
-        if isNearNode && !isShowingIBeamCursor {
-            // Entering text area - show IBeam cursor
-            NSCursor.iBeam.push()
-            isShowingIBeamCursor = true
-        } else if !isNearNode && isShowingIBeamCursor {
-            // Leaving text area - restore normal cursor
-            NSCursor.pop()
-            isShowingIBeamCursor = false
+        let targetMode: CursorMode = if hyperlinkEntry != nil {
+            .pointingHand
+        } else if isNearNode {
+            .iBeam
+        } else {
+            .none
         }
+
+        applyCursorMode(targetMode)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -3691,6 +4009,16 @@ class TextSelectionView: NSView {
         hasMoved = false
         commandDragStartPoint = nil
         commandDragCurrentPoint = nil
+        let hyperlinkModifierFlags: NSEvent.ModifierFlags = [.shift, .command, .control, .option]
+        let hasHyperlinkOverrideModifiers = !event.modifierFlags.intersection(hyperlinkModifierFlags).isEmpty
+
+        if event.clickCount == 1,
+           !hasHyperlinkOverrideModifiers,
+           let hyperlinkEntry = hyperlinkEntryContaining(screenPoint: location)
+        {
+            onHyperlinkOpen?(hyperlinkEntry.match)
+            return
+        }
 
         // Convert screen coordinates to normalized frame coordinates
         let normalizedPoint = screenToNormalizedCoords(location)
@@ -5294,9 +5622,49 @@ extension Notification.Name {
 /// NSViewRepresentable that detects right-clicks and reports the location
 /// View modifier that monitors for right-clicks using a local event monitor
 struct RightClickOverlay: ViewModifier {
+    final class HyperlinkMenuTarget: NSObject {
+        var match: OCRHyperlinkMatch?
+        var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
+
+        @objc func copyLinkAction(_ sender: Any?) {
+            guard let match else { return }
+            onCopyHyperlink(match)
+        }
+    }
+
+    final class MonitorState: ObservableObject {
+        var hyperlinkEntries: [HyperlinkContextMenuEntry] = []
+        var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
+        var onRightClick: (CGPoint) -> Void = { _ in }
+        var viewBounds: CGRect = .zero
+        let hyperlinkMenuTarget = HyperlinkMenuTarget()
+    }
+
+    struct MonitorStateSyncView: NSViewRepresentable {
+        let monitorState: MonitorState
+        let hyperlinkEntries: [HyperlinkContextMenuEntry]
+        let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
+        let onRightClick: (CGPoint) -> Void
+        let viewBounds: CGRect
+
+        func makeNSView(context: Context) -> NSView {
+            NSView(frame: .zero)
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {
+            monitorState.hyperlinkEntries = hyperlinkEntries
+            monitorState.onCopyHyperlink = onHyperlinkCopy
+            monitorState.onRightClick = onRightClick
+            monitorState.viewBounds = viewBounds
+        }
+    }
+
+    let hyperlinkEntries: [HyperlinkContextMenuEntry]
+    let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
     let onRightClick: (CGPoint) -> Void
     @State private var eventMonitor: Any?
     @State private var viewBounds: CGRect = .zero
+    @StateObject private var monitorState = MonitorState()
 
     /// Height of the timeline tape area at the bottom (tape height + bottom padding)
     /// Clicks in this area are passed through to SwiftUI's native contextMenu
@@ -5306,6 +5674,15 @@ struct RightClickOverlay: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .background(
+                MonitorStateSyncView(
+                    monitorState: monitorState,
+                    hyperlinkEntries: hyperlinkEntries,
+                    onHyperlinkCopy: onHyperlinkCopy,
+                    onRightClick: onRightClick,
+                    viewBounds: viewBounds
+                )
+            )
             .background(
                 GeometryReader { geo in
                     Color.clear
@@ -5318,6 +5695,7 @@ struct RightClickOverlay: ViewModifier {
                 }
             )
             .onAppear {
+                syncMonitorState()
                 setupEventMonitor()
             }
             .onDisappear {
@@ -5335,7 +5713,15 @@ struct RightClickOverlay: ViewModifier {
 
         if hasMeaningfulDelta || viewBounds == .zero {
             viewBounds = newFrame
+            monitorState.viewBounds = newFrame
         }
+    }
+
+    private func syncMonitorState() {
+        monitorState.hyperlinkEntries = hyperlinkEntries
+        monitorState.onCopyHyperlink = onHyperlinkCopy
+        monitorState.onRightClick = onRightClick
+        monitorState.viewBounds = viewBounds
     }
 
     private func setupEventMonitor() {
@@ -5353,21 +5739,39 @@ struct RightClickOverlay: ViewModifier {
             )
 
             // Check if click is within our view bounds (in SwiftUI global coordinates)
-            if viewBounds.contains(swiftUILocation) {
+            let currentViewBounds = monitorState.viewBounds
+            if currentViewBounds.contains(swiftUILocation) {
                 // Convert to view-local coordinates
-                let localX = swiftUILocation.x - viewBounds.minX
-                let localY = swiftUILocation.y - viewBounds.minY
+                let localX = swiftUILocation.x - currentViewBounds.minX
+                let localY = swiftUILocation.y - currentViewBounds.minY
+                let localPoint = CGPoint(x: localX, y: localY)
+                let hyperlinkEntries = monitorState.hyperlinkEntries
+                let matchedHyperlink = hyperlinkEntries.first(where: { $0.rect.contains(localPoint) })
 
                 // Check if click is in the timeline tape area at the bottom
                 // If so, let the event pass through to SwiftUI's native contextMenu
-                let distanceFromBottom = viewBounds.height - localY
+                let distanceFromBottom = currentViewBounds.height - localY
+
+                if let matchedHyperlink, let contentView = window.contentView {
+                    let target = monitorState.hyperlinkMenuTarget
+                    target.match = matchedHyperlink.match
+                    target.onCopyHyperlink = monitorState.onCopyHyperlink
+
+                    let menu = NSMenu()
+                    let copyItem = NSMenuItem(title: "Copy Link", action: #selector(HyperlinkMenuTarget.copyLinkAction(_:)), keyEquivalent: "")
+                    copyItem.target = target
+                    menu.addItem(copyItem)
+                    NSMenu.popUpContextMenu(menu, with: event, for: contentView)
+                    return nil
+                }
+
                 if distanceFromBottom < timelineExclusionHeight {
                     // Pass through to SwiftUI for timeline tape context menu
                     return event
                 }
 
                 DispatchQueue.main.async {
-                    onRightClick(CGPoint(x: localX, y: localY))
+                    monitorState.onRightClick(localPoint)
                 }
                 return nil // Consume the event
             }
@@ -5384,8 +5788,18 @@ struct RightClickOverlay: ViewModifier {
 }
 
 extension View {
-    func onRightClick(perform action: @escaping (CGPoint) -> Void) -> some View {
-        modifier(RightClickOverlay(onRightClick: action))
+    func onRightClick(
+        hyperlinkEntries: [HyperlinkContextMenuEntry] = [],
+        onHyperlinkCopy: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
+        perform action: @escaping (CGPoint) -> Void
+    ) -> some View {
+        modifier(
+            RightClickOverlay(
+                hyperlinkEntries: hyperlinkEntries,
+                onHyperlinkCopy: onHyperlinkCopy,
+                onRightClick: action
+            )
+        )
     }
 }
 

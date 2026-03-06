@@ -309,10 +309,24 @@ public struct FrameWithVideoInfo: Sendable, Equatable, Codable {
     /// Processing status: 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable
     public let processingStatus: Int
 
-    public init(frame: FrameReference, videoInfo: FrameVideoInfo?, processingStatus: Int = 0) {
+    /// Browser-reported playback time for video pages like YouTube.
+    public let videoCurrentTime: Double?
+
+    /// Browser-reported vertical scroll offset for the page.
+    public let scrollY: Double?
+
+    public init(
+        frame: FrameReference,
+        videoInfo: FrameVideoInfo?,
+        processingStatus: Int = 0,
+        videoCurrentTime: Double? = nil,
+        scrollY: Double? = nil
+    ) {
         self.frame = frame
         self.videoInfo = videoInfo
         self.processingStatus = processingStatus
+        self.videoCurrentTime = videoCurrentTime
+        self.scrollY = scrollY
     }
 }
 

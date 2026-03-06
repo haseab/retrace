@@ -76,6 +76,20 @@ final class QueryBuilderTests: XCTestCase {
         )
     }
 
+    private func insertFrame(_ frame: FrameReference) throws -> FrameReference {
+        let insertedID = try FrameQueries.insert(db: db!, frame: frame)
+        return FrameReference(
+            id: FrameID(value: insertedID),
+            timestamp: frame.timestamp,
+            segmentID: frame.segmentID,
+            videoID: frame.videoID,
+            frameIndexInSegment: frame.frameIndexInSegment,
+            encodingStatus: frame.encodingStatus,
+            metadata: frame.metadata,
+            source: frame.source
+        )
+    }
+
     // ╔═════════════════════════════════════════════════════════════════════════╗
     // ║                      SEGMENT QUERIES TESTS                              ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
@@ -115,13 +129,13 @@ final class QueryBuilderTests: XCTestCase {
 
     func testSegmentQueries_GetByID_ReturnsCorrectSegment() throws {
         let segment = makeSegment(frameCount: 100, fileSizeBytes: 1024000)
-        try SegmentQueries.insert(db: db!, segment: segment)
+        let insertedID = try SegmentQueries.insert(db: db!, segment: segment)
 
-        let retrieved = try SegmentQueries.getByID(db: db!, id: segment.id)
+        let retrieved = try SegmentQueries.getByID(db: db!, id: VideoSegmentID(value: insertedID))
 
         XCTAssertNotNil(retrieved)
-        XCTAssertEqual(retrieved?.id.stringValue, segment.id.stringValue)
-        XCTAssertEqual(retrieved?.frameCount, 100)
+        XCTAssertEqual(retrieved?.id.value, insertedID)
+        XCTAssertEqual(retrieved?.frameCount, 150)
         XCTAssertEqual(retrieved?.fileSizeBytes, 1024000)
         XCTAssertEqual(retrieved?.width, 1920)
         XCTAssertEqual(retrieved?.height, 1080)
@@ -135,22 +149,55 @@ final class QueryBuilderTests: XCTestCase {
     func testSegmentQueries_GetByTimestamp_FindsContainingSegment() throws {
         let startTime = Date()
         let segment = makeSegment(startTime: startTime, endTime: startTime.addingTimeInterval(300))
-        try SegmentQueries.insert(db: db!, segment: segment)
+        let insertedVideoID = try SegmentQueries.insert(db: db!, segment: segment)
 
-        // Query in middle of segment
+        let appSegmentID = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: startTime.addingTimeInterval(300),
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+
         let midpoint = startTime.addingTimeInterval(150)
-        let result = try SegmentQueries.getByTimestamp(db: db!, timestamp: midpoint)
+        _ = try insertFrame(
+            makeFrame(
+                timestamp: midpoint,
+                segmentID: AppSegmentID(value: appSegmentID),
+                videoID: VideoSegmentID(value: insertedVideoID)
+            )
+        )
 
+        let result = try SegmentQueries.getByTimestamp(db: db!, timestamp: midpoint)
         XCTAssertNotNil(result)
-        XCTAssertEqual(result?.id.stringValue, segment.id.stringValue)
+        XCTAssertEqual(result?.id.value, insertedVideoID)
     }
 
     func testSegmentQueries_GetByTimestamp_ReturnsNilOutsideRange() throws {
         let startTime = Date()
         let segment = makeSegment(startTime: startTime, endTime: startTime.addingTimeInterval(300))
-        try SegmentQueries.insert(db: db!, segment: segment)
+        let insertedVideoID = try SegmentQueries.insert(db: db!, segment: segment)
 
-        // Query outside segment
+        let appSegmentID = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: startTime.addingTimeInterval(300),
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+
+        _ = try insertFrame(
+            makeFrame(
+                timestamp: startTime,
+                segmentID: AppSegmentID(value: appSegmentID),
+                videoID: VideoSegmentID(value: insertedVideoID)
+            )
+        )
+
         let beforeStart = startTime.addingTimeInterval(-100)
         let result = try SegmentQueries.getByTimestamp(db: db!, timestamp: beforeStart)
 
@@ -174,11 +221,60 @@ final class QueryBuilderTests: XCTestCase {
             relativePath: "seg3.mp4"
         )
 
-        try SegmentQueries.insert(db: db!, segment: seg1)
-        try SegmentQueries.insert(db: db!, segment: seg2)
-        try SegmentQueries.insert(db: db!, segment: seg3)
+        let videoID1 = try SegmentQueries.insert(db: db!, segment: seg1)
+        let videoID2 = try SegmentQueries.insert(db: db!, segment: seg2)
+        let videoID3 = try SegmentQueries.insert(db: db!, segment: seg3)
 
-        // Query range: 1200-1600 (overlaps seg1 end and seg2 start)
+        let appSegment1 = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.one",
+            startDate: seg1.startTime,
+            endDate: seg1.endTime,
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+        let appSegment2 = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.two",
+            startDate: seg2.startTime,
+            endDate: seg2.endTime,
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+        let appSegment3 = try AppSegmentQueries.insert(
+            db: db!,
+            bundleID: "com.test.three",
+            startDate: seg3.startTime,
+            endDate: seg3.endTime,
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+
+        _ = try insertFrame(
+            makeFrame(
+                timestamp: Date(timeIntervalSince1970: 1250),
+                segmentID: AppSegmentID(value: appSegment1),
+                videoID: VideoSegmentID(value: videoID1)
+            )
+        )
+        _ = try insertFrame(
+            makeFrame(
+                timestamp: Date(timeIntervalSince1970: 1550),
+                segmentID: AppSegmentID(value: appSegment2),
+                videoID: VideoSegmentID(value: videoID2)
+            )
+        )
+        _ = try insertFrame(
+            makeFrame(
+                timestamp: Date(timeIntervalSince1970: 5050),
+                segmentID: AppSegmentID(value: appSegment3),
+                videoID: VideoSegmentID(value: videoID3)
+            )
+        )
+
         let results = try SegmentQueries.getByTimeRange(
             db: db!,
             from: Date(timeIntervalSince1970: 1200),
@@ -190,11 +286,12 @@ final class QueryBuilderTests: XCTestCase {
 
     func testSegmentQueries_Delete_RemovesSegment() throws {
         let segment = makeSegment(relativePath: "to-delete.mp4")
-        try SegmentQueries.insert(db: db!, segment: segment)
+        let insertedID = try SegmentQueries.insert(db: db!, segment: segment)
 
-        XCTAssertNotNil(try SegmentQueries.getByID(db: db!, id: segment.id))
-        try SegmentQueries.delete(db: db!, id: segment.id)
-        XCTAssertNil(try SegmentQueries.getByID(db: db!, id: segment.id))
+        let videoID = VideoSegmentID(value: insertedID)
+        XCTAssertNotNil(try SegmentQueries.getByID(db: db!, id: videoID))
+        try SegmentQueries.delete(db: db!, id: videoID)
+        XCTAssertNil(try SegmentQueries.getByID(db: db!, id: videoID))
     }
 
     func testSegmentQueries_GetCount_ReturnsCorrectCount() throws {
@@ -204,7 +301,7 @@ final class QueryBuilderTests: XCTestCase {
                 endTime: Date().addingTimeInterval(Double(i * 300 + 299)),
                 relativePath: "seg-\(i).mp4"
             )
-            try SegmentQueries.insert(db: db!, segment: segment)
+            _ = try SegmentQueries.insert(db: db!, segment: segment)
         }
 
         let count = try SegmentQueries.getCount(db: db!)
@@ -221,7 +318,7 @@ final class QueryBuilderTests: XCTestCase {
                 fileSizeBytes: size,
                 relativePath: "seg-\(i).mp4"
             )
-            try SegmentQueries.insert(db: db!, segment: segment)
+            _ = try SegmentQueries.insert(db: db!, segment: segment)
         }
 
         let total = try SegmentQueries.getTotalStorageBytes(db: db!)
@@ -232,76 +329,81 @@ final class QueryBuilderTests: XCTestCase {
     // ║                       FRAME QUERIES TESTS                               ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
 
-    private func createTestSegment() throws -> AppSegmentID {
+    private func createTestSegment(
+        bundleID: String = "com.test.app",
+        windowName: String? = nil,
+        browserURL: String? = nil
+    ) throws -> AppSegmentID {
         // Create video segment first
         let videoSegment = makeSegment(
             startTime: Date().addingTimeInterval(-3600),
             endTime: Date().addingTimeInterval(3600)
         )
-        try SegmentQueries.insert(db: db!, segment: videoSegment)
+        _ = try SegmentQueries.insert(db: db!, segment: videoSegment)
 
         // Create app segment
         let appSegmentID = try AppSegmentQueries.insert(
             db: db!,
-            bundleID: "com.test.app",
+            bundleID: bundleID,
             startDate: Date().addingTimeInterval(-3600),
             endDate: Date().addingTimeInterval(3600),
-            windowName: nil,
-            browserUrl: nil,
+            windowName: windowName,
+            browserUrl: browserURL,
             type: 0
         )
         return AppSegmentID(value: appSegmentID)
     }
 
-    func testFrameQueries_Insert_StoresAllFields() throws {
-        let segmentID = try createTestSegment()
+    func testFrameQueries_GetByID_UsesJoinedSegmentMetadata() throws {
+        let segmentID = try createTestSegment(
+            bundleID: "com.apple.Safari",
+            windowName: "GitHub - retrace",
+            browserURL: "https://github.com/retrace"
+        )
 
-        let frame = makeFrame(
+        let frame = try insertFrame(
+            makeFrame(
             segmentID: segmentID,
             frameIndex: 42,
             metadata: FrameMetadata(
-                appBundleID: "com.apple.Safari",
-                appName: "Safari",
-                windowName: "GitHub - retrace",
-                browserURL: "https://github.com/retrace"
+                appBundleID: "com.apple.Terminal",
+                appName: "Terminal",
+                windowName: "Ignored Window",
+                browserURL: "https://ignored.example"
             )
-        )
-
-        try FrameQueries.insert(db: db!, frame: frame)
+        ))
 
         let retrieved = try FrameQueries.getByID(db: db!, id: frame.id)
         XCTAssertNotNil(retrieved)
         XCTAssertEqual(retrieved?.frameIndexInSegment, 42)
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.apple.Safari")
-        XCTAssertEqual(retrieved?.metadata.appName, "Safari")
+        XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertEqual(retrieved?.metadata.windowName, "GitHub - retrace")
         XCTAssertEqual(retrieved?.metadata.browserURL, "https://github.com/retrace")
     }
 
-    func testFrameQueries_Insert_WithNullMetadata_StoresCorrectly() throws {
+    func testFrameQueries_Insert_WithNullMetadata_UsesSegmentMetadataWhenAvailable() throws {
         let segmentID = try createTestSegment()
-        let frame = makeFrame(segmentID: segmentID, metadata: FrameMetadata())
-
-        try FrameQueries.insert(db: db!, frame: frame)
+        let frame = try insertFrame(makeFrame(segmentID: segmentID, metadata: FrameMetadata()))
 
         let retrieved = try FrameQueries.getByID(db: db!, id: frame.id)
-        XCTAssertNil(retrieved?.metadata.appBundleID)
+        XCTAssertEqual(retrieved?.metadata.appBundleID, "com.test.app")
         XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertNil(retrieved?.metadata.windowName)
         XCTAssertNil(retrieved?.metadata.browserURL)
     }
 
-    func testFrameQueries_GetByTimeRange_ReturnsOrderedByTimestampDesc() throws {
+    func testFrameQueries_GetByTimeRange_ReturnsOrderedByTimestampAsc() throws {
         let segmentID = try createTestSegment()
         let timestamps = [100.0, 300.0, 200.0, 500.0, 400.0]
 
         for (i, offset) in timestamps.enumerated() {
-            let frame = makeFrame(
+            _ = try insertFrame(
+                makeFrame(
                 timestamp: Date(timeIntervalSince1970: offset),
                 segmentID: segmentID,
                 frameIndex: i
-            )
-            try FrameQueries.insert(db: db!, frame: frame)
+            ))
         }
 
         let results = try FrameQueries.getByTimeRange(
@@ -314,7 +416,7 @@ final class QueryBuilderTests: XCTestCase {
         XCTAssertEqual(results.count, 5)
 
         for i in 0..<(results.count - 1) {
-            XCTAssertGreaterThan(
+            XCTAssertLessThanOrEqual(
                 results[i].timestamp.timeIntervalSince1970,
                 results[i + 1].timestamp.timeIntervalSince1970
             )
@@ -325,12 +427,12 @@ final class QueryBuilderTests: XCTestCase {
         let segmentID = try createTestSegment()
 
         for i in 0..<10 {
-            let frame = makeFrame(
+            _ = try insertFrame(
+                makeFrame(
                 timestamp: Date().addingTimeInterval(Double(i)),
                 segmentID: segmentID,
                 frameIndex: i
-            )
-            try FrameQueries.insert(db: db!, frame: frame)
+            ))
         }
 
         let results = try FrameQueries.getByTimeRange(
@@ -344,17 +446,28 @@ final class QueryBuilderTests: XCTestCase {
     }
 
     func testFrameQueries_GetByApp_FiltersCorrectly() throws {
-        let segmentID = try createTestSegment()
+        let videoID = try SegmentQueries.insert(db: db!, segment: makeSegment(relativePath: "app-filter.mp4"))
         let apps = ["com.apple.Safari", "com.apple.Xcode", "com.apple.Safari", "com.apple.Terminal"]
 
         for (i, app) in apps.enumerated() {
-            let frame = makeFrame(
-                timestamp: Date().addingTimeInterval(Double(i)),
-                segmentID: segmentID,
-                frameIndex: i,
-                metadata: FrameMetadata(appBundleID: app)
+            let appSegmentID = try AppSegmentQueries.insert(
+                db: db!,
+                bundleID: app,
+                startDate: Date().addingTimeInterval(Double(i)),
+                endDate: Date().addingTimeInterval(Double(i + 1)),
+                windowName: nil,
+                browserUrl: nil,
+                type: 0
             )
-            try FrameQueries.insert(db: db!, frame: frame)
+            _ = try insertFrame(
+                makeFrame(
+                    timestamp: Date().addingTimeInterval(Double(i)),
+                    segmentID: AppSegmentID(value: appSegmentID),
+                    videoID: VideoSegmentID(value: videoID),
+                    frameIndex: i,
+                    metadata: FrameMetadata(appBundleID: app)
+                )
+            )
         }
 
         let safariFrames = try FrameQueries.getByApp(
@@ -376,22 +489,22 @@ final class QueryBuilderTests: XCTestCase {
 
         // 5 old frames
         for i in 0..<5 {
-            let frame = makeFrame(
+            _ = try insertFrame(
+                makeFrame(
                 timestamp: now.addingTimeInterval(-86400 * Double(100 + i)),
                 segmentID: segmentID,
                 frameIndex: i
-            )
-            try FrameQueries.insert(db: db!, frame: frame)
+            ))
         }
 
         // 3 recent frames
         for i in 0..<3 {
-            let frame = makeFrame(
+            _ = try insertFrame(
+                makeFrame(
                 timestamp: now.addingTimeInterval(-Double(i)),
                 segmentID: segmentID,
                 frameIndex: 5 + i
-            )
-            try FrameQueries.insert(db: db!, frame: frame)
+            ))
         }
 
         let cutoff = now.addingTimeInterval(-86400 * 30)
@@ -408,8 +521,7 @@ final class QueryBuilderTests: XCTestCase {
     private func createTestFrame() throws -> FrameID {
         let segmentID = try createTestSegment()
         let frame = makeFrame(segmentID: segmentID)
-        try FrameQueries.insert(db: db!, frame: frame)
-        return frame.id
+        return FrameID(value: try FrameQueries.insert(db: db!, frame: frame))
     }
 
     func testDocumentQueries_Insert_ReturnsAutoIncrementID() throws {

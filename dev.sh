@@ -19,10 +19,8 @@ BUILD_NUMBER=$(grep 'CURRENT_PROJECT_VERSION' project.yml | head -1 | sed 's/.*"
 # Require a clean working tree so the embedded commit hash is accurate
 # ---------------------------------------------------------------------------
 if [ -n "$(git diff --name-only HEAD 2>/dev/null)" ]; then
-    echo "INFO: Building with local uncommitted changes."
-    echo "      Build metadata will use HEAD commit (local diff is not encoded)."
-    echo "      Local changes:"
-    git diff --stat
+    CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')
+    echo "INFO: Local repo has ${CHANGED_FILES} uncommitted file(s); build metadata uses local HEAD."
 fi
 
 # ---------------------------------------------------------------------------

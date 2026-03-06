@@ -16,13 +16,15 @@ final class IntegrationTests: XCTestCase {
 
     var database: DatabaseManager!
     var ftsManager: FTSManager!
+    var databasePath: String!
     private static var hasPrintedSeparator = false
 
     override func setUp() async throws {
-        // Use one shared in-memory DB for both managers.
-        let sharedPath = "file:integration_tests_\(UUID().uuidString)?mode=memory&cache=shared"
-        database = DatabaseManager(databasePath: sharedPath)
-        ftsManager = FTSManager(databasePath: sharedPath)
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("integration_tests_\(UUID().uuidString).sqlite")
+        databasePath = fileURL.path
+        database = DatabaseManager(databasePath: databasePath)
+        ftsManager = FTSManager(databasePath: databasePath)
         try await database.initialize()
         try await ftsManager.initialize()
 
@@ -37,6 +39,30 @@ final class IntegrationTests: XCTestCase {
         try await database.close()
         database = nil
         ftsManager = nil
+        if let databasePath {
+            try? FileManager.default.removeItem(atPath: databasePath)
+            try? FileManager.default.removeItem(atPath: "\(databasePath)-shm")
+            try? FileManager.default.removeItem(atPath: "\(databasePath)-wal")
+        }
+        databasePath = nil
+    }
+
+    private func insertVideoSegment(_ segment: VideoSegment) async throws -> VideoSegmentID {
+        VideoSegmentID(value: try await database.insertVideoSegment(segment))
+    }
+
+    private func insertFrame(_ frame: FrameReference) async throws -> FrameReference {
+        let insertedID = try await database.insertFrame(frame)
+        return FrameReference(
+            id: FrameID(value: insertedID),
+            timestamp: frame.timestamp,
+            segmentID: frame.segmentID,
+            videoID: frame.videoID,
+            frameIndexInSegment: frame.frameIndexInSegment,
+            encodingStatus: frame.encodingStatus,
+            metadata: frame.metadata,
+            source: frame.source
+        )
     }
 
     // ╔═════════════════════════════════════════════════════════════════════════╗
@@ -62,7 +88,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         // Create app segment for frame
         let appSegmentID = try await database.insertSegment(
@@ -75,11 +101,11 @@ final class IntegrationTests: XCTestCase {
         )
 
         // STEP 2: Simulate frame capture with app metadata
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -88,18 +114,17 @@ final class IntegrationTests: XCTestCase {
                 windowName: "Retrace - Screen Recording App",
                 browserURL: "https://github.com/retrace/app"
             )
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // STEP 3: Simulate OCR processing - index extracted text
         let document = IndexedDocument(
             id: 0,
-            frameID: frame.id,
-            timestamp: frame.timestamp,
+            frameID: storedFrame.id,
+            timestamp: storedFrame.timestamp,
             content: "Retrace is a powerful screen recording application that captures your screen and makes it searchable. Built for macOS with privacy in mind.",
-            appName: frame.metadata.appName,
-            windowName: frame.metadata.windowName,
-            browserURL: frame.metadata.browserURL
+            appName: storedFrame.metadata.appName,
+            windowName: storedFrame.metadata.windowName,
+            browserURL: storedFrame.metadata.browserURL
         )
         let docID = try await database.insertDocument(document)
         XCTAssertGreaterThan(docID, 0, "Document should be indexed")
@@ -113,8 +138,8 @@ final class IntegrationTests: XCTestCase {
 
         // VERIFY: Search finds the captured content
         XCTAssertEqual(searchResults.count, 1, "Should find one result")
-        XCTAssertEqual(searchResults[0].frameID, frame.id, "Result should reference correct frame")
-        XCTAssertEqual(searchResults[0].appName, "Safari", "Should have correct app name")
+        XCTAssertEqual(searchResults[0].frameID, storedFrame.id, "Result should reference correct frame")
+        XCTAssertEqual(searchResults[0].appName, "com.apple.Safari", "Should have current segment bundle ID")
         XCTAssertTrue(searchResults[0].snippet.lowercased().contains("screen"), "Snippet should contain match")
     }
 
@@ -133,7 +158,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -145,16 +170,15 @@ final class IntegrationTests: XCTestCase {
         )
 
         // Old frame (30 days ago)
-        let oldFrame = FrameReference(
+        let oldFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: oldTime,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty
-        )
-        try await database.insertFrame(oldFrame)
+        ))
 
         let oldDoc = IndexedDocument(
             id: 0,
@@ -165,16 +189,15 @@ final class IntegrationTests: XCTestCase {
         _ = try await database.insertDocument(oldDoc)
 
         // Recent frame (today)
-        let recentFrame = FrameReference(
+        let recentFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: recentTime,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: .empty
-        )
-        try await database.insertFrame(recentFrame)
+        ))
 
         let recentDoc = IndexedDocument(
             id: 0,
@@ -219,7 +242,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         // Create 3 app segments for 3 different apps
         let safariSegmentID = try await database.insertSegment(
@@ -250,11 +273,11 @@ final class IntegrationTests: XCTestCase {
         )
 
         // Frame 1: Safari
-        let safariFrame = FrameReference(
+        let safariFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: baseTime,
             segmentID: AppSegmentID(value: safariSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -262,8 +285,7 @@ final class IntegrationTests: XCTestCase {
                 appName: "Safari",
                 windowName: "GitHub"
             )
-        )
-        try await database.insertFrame(safariFrame)
+        ))
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
             frameID: safariFrame.id,
@@ -273,11 +295,11 @@ final class IntegrationTests: XCTestCase {
         ))
 
         // Frame 2: Xcode
-        let xcodeFrame = FrameReference(
+        let xcodeFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: baseTime.addingTimeInterval(60),
             segmentID: AppSegmentID(value: xcodeSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -285,8 +307,7 @@ final class IntegrationTests: XCTestCase {
                 appName: "Xcode",
                 windowName: "DatabaseManager.swift"
             )
-        )
-        try await database.insertFrame(xcodeFrame)
+        ))
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
             frameID: xcodeFrame.id,
@@ -296,11 +317,11 @@ final class IntegrationTests: XCTestCase {
         ))
 
         // Frame 3: Terminal
-        let terminalFrame = FrameReference(
+        let terminalFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: baseTime.addingTimeInterval(120),
             segmentID: AppSegmentID(value: terminalSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 2,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -308,8 +329,7 @@ final class IntegrationTests: XCTestCase {
                 appName: "Terminal",
                 windowName: "bash"
             )
-        )
-        try await database.insertFrame(terminalFrame)
+        ))
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
             frameID: terminalFrame.id,
@@ -325,7 +345,8 @@ final class IntegrationTests: XCTestCase {
             offset: 0
         )
         XCTAssertEqual(safariFrames.count, 1)
-        XCTAssertEqual(safariFrames[0].metadata.appName, "Safari")
+        XCTAssertEqual(safariFrames[0].metadata.appBundleID, "com.apple.Safari")
+        XCTAssertNil(safariFrames[0].metadata.appName)
 
         // Search should find content from all apps
         let codeResults = try await ftsManager.search(query: "code", limit: 10, offset: 0)
@@ -336,7 +357,7 @@ final class IntegrationTests: XCTestCase {
     // ║                    DELETION CASCADES                                    ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
 
-    func testDeleteSegment_CascadesToFramesAndDocuments() async throws {
+    func testDeleteVideoSegment_PreservesFramesAndDocumentsAndUnlinksVideo() async throws {
         // Setup: segment → frame → document
         let timestamp = Date()
         let videoSegment = VideoSegment(
@@ -350,7 +371,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -361,46 +382,45 @@ final class IntegrationTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty
-        )
-        try await database.insertFrame(frame)
+        ))
 
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
-            frameID: frame.id,
-            timestamp: frame.timestamp,
+            frameID: storedFrame.id,
+            timestamp: storedFrame.timestamp,
             content: "Cascade test content"
         ))
 
         // Verify all exist
-        let segmentExists = try await database.getVideoSegment(id: videoSegment.id)
-        let frameExists = try await database.getFrame(id: frame.id)
-        let documentExists = try await database.getDocument(frameID: frame.id)
+        let segmentExists = try await database.getVideoSegment(id: storedVideoID)
+        let frameExists = try await database.getFrame(id: storedFrame.id)
+        let documentExists = try await database.getDocument(frameID: storedFrame.id)
         XCTAssertNotNil(segmentExists)
         XCTAssertNotNil(frameExists)
         XCTAssertNotNil(documentExists)
 
-        // Delete segment
-        try await database.deleteVideoSegment(id: videoSegment.id)
+        // Delete video row
+        try await database.deleteVideoSegment(id: storedVideoID)
 
-        // All should be gone
-        let segmentAfterDelete = try await database.getVideoSegment(id: videoSegment.id)
-        let frameAfterDelete = try await database.getFrame(id: frame.id)
-        let documentAfterDelete = try await database.getDocument(frameID: frame.id)
+        let segmentAfterDelete = try await database.getVideoSegment(id: storedVideoID)
+        let frameAfterDelete = try await database.getFrame(id: storedFrame.id)
+        let documentAfterDelete = try await database.getDocument(frameID: storedFrame.id)
         XCTAssertNil(segmentAfterDelete, "Segment should be deleted")
-        XCTAssertNil(frameAfterDelete, "Frame should cascade delete")
-        XCTAssertNil(documentAfterDelete, "Document should cascade delete")
+        XCTAssertNotNil(frameAfterDelete, "Frames currently survive video deletion")
+        XCTAssertEqual(frameAfterDelete?.videoID.value, 0, "Video link should be cleared")
+        XCTAssertNotNil(documentAfterDelete, "Documents currently survive video deletion")
 
-        // FTS should also be updated (via trigger)
         let searchResults = try await ftsManager.search(query: "Cascade", limit: 10, offset: 0)
-        XCTAssertEqual(searchResults.count, 0, "FTS should not find deleted content")
+        XCTAssertEqual(searchResults.count, 1, "FTS should still find surviving indexed content")
+        XCTAssertEqual(searchResults[0].frameID, storedFrame.id)
     }
 
     func testDeleteOldFrames_RemovesAssociatedDocuments() async throws {
@@ -418,7 +438,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -430,16 +450,15 @@ final class IntegrationTests: XCTestCase {
         )
 
         // Old frame
-        let oldFrame = FrameReference(
+        let oldFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: oldTime,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty
-        )
-        try await database.insertFrame(oldFrame)
+        ))
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
             frameID: oldFrame.id,
@@ -448,16 +467,15 @@ final class IntegrationTests: XCTestCase {
         ))
 
         // Recent frame
-        let recentFrame = FrameReference(
+        let recentFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: recentTime,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: videoSegment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: .empty
-        )
-        try await database.insertFrame(recentFrame)
+        ))
         _ = try await database.insertDocument(IndexedDocument(
             id: 0,
             frameID: recentFrame.id,
@@ -513,7 +531,7 @@ final class IntegrationTests: XCTestCase {
                 height: 1080,
                 source: .native
             )
-            try await database.insertVideoSegment(videoSegment)
+            let storedVideoID = try await insertVideoSegment(videoSegment)
 
             let appSegmentID = try await database.insertSegment(
                 bundleID: "com.test.app",
@@ -526,15 +544,14 @@ final class IntegrationTests: XCTestCase {
 
             // Add frames to each segment
             for j in 0..<5 {
-                let frame = FrameReference(
+                let frame = try await insertFrame(FrameReference(
                     id: FrameID(value: 0),
                     timestamp: Date().addingTimeInterval(Double(i * 100 + j * 10)),
                     segmentID: AppSegmentID(value: appSegmentID),
-                    videoID: videoSegment.id,
+                    videoID: storedVideoID,
                     frameIndexInSegment: j,
                     metadata: .empty
-                )
-                try await database.insertFrame(frame)
+                ))
 
                 // Add document to some frames
                 if j % 2 == 0 {
@@ -578,7 +595,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -597,7 +614,7 @@ final class IntegrationTests: XCTestCase {
                         id: FrameID(value: 0),
                         timestamp: Date().addingTimeInterval(Double(i)),
                         segmentID: AppSegmentID(value: appSegmentID),
-                        videoID: videoSegment.id,
+                        videoID: storedVideoID,
                         frameIndexInSegment: i,
                         metadata: FrameMetadata(appName: "App \(i)")
                     )
@@ -624,7 +641,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -641,7 +658,7 @@ final class IntegrationTests: XCTestCase {
                 id: FrameID(value: 0),
                 timestamp: Date().addingTimeInterval(Double(i)),
                 segmentID: AppSegmentID(value: appSegmentID),
-                videoID: videoSegment.id,
+                videoID: storedVideoID,
                 frameIndexInSegment: i,
                 metadata: .empty
             )
@@ -665,7 +682,7 @@ final class IntegrationTests: XCTestCase {
                         id: FrameID(value: 0),
                         timestamp: Date().addingTimeInterval(Double(i)),
                         segmentID: AppSegmentID(value: appSegmentID),
-                        videoID: videoSegment.id,
+                        videoID: storedVideoID,
                         frameIndexInSegment: i,
                         metadata: .empty
                     )
@@ -701,7 +718,7 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(videoSegment)
+        let storedVideoID = try await insertVideoSegment(videoSegment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -717,22 +734,21 @@ final class IntegrationTests: XCTestCase {
                 id: FrameID(value: 0),
                 timestamp: Date().addingTimeInterval(Double(i)),
                 segmentID: AppSegmentID(value: appSegmentID),
-                videoID: videoSegment.id,
+                videoID: storedVideoID,
                 frameIndexInSegment: i,
                 metadata: .empty
             )
             try await database.insertFrame(frame)
         }
 
-        // Delete segment (cascades to frames)
-        try await database.deleteVideoSegment(id: videoSegment.id)
+        try await database.deleteVideoSegment(id: storedVideoID)
 
         // Vacuum should complete without error
         try await database.vacuum()
 
-        // Database should still work
+        // Database should still work and preserve frames whose video link was nulled out.
         let count = try await database.getFrameCount()
-        XCTAssertEqual(count, 0)
+        XCTAssertEqual(count, 10)
     }
 
     func testAnalyze_CompletesSuccessfully() async throws {
@@ -747,13 +763,13 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         // Analyze should complete without error
         try await database.analyze()
 
         // Database should still work
-        let retrieved = try await database.getVideoSegment(id: segment.id)
+        let retrieved = try await database.getVideoSegment(id: storedVideoID)
         XCTAssertNotNil(retrieved)
     }
 
@@ -769,13 +785,13 @@ final class IntegrationTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         // Checkpoint should complete without error
         try await database.checkpoint()
 
         // Database should still work
-        let retrieved = try await database.getVideoSegment(id: segment.id)
+        let retrieved = try await database.getVideoSegment(id: storedVideoID)
         XCTAssertNotNil(retrieved)
     }
 }

@@ -10,7 +10,11 @@ You are the **UI** agent responsible for building the SwiftUI interface for Retr
 UI/
 ├── Assets.xcassets/
 │   ├── AppIcon.appiconset/             # App icon assets
-│   └── CreatorProfile.imageset/        # Creator profile image shown in onboarding/milestones
+│   ├── CreatorProfile.imageset/        # Creator profile image shown in onboarding/milestones
+│   ├── InPageURLInstructions.imageset/ # Settings screenshot for Chromium browser in-page URL setup
+│   ├── SafariInPageURLMenu.imageset/   # Safari screenshot: open Develop > Developer Settings
+│   ├── SafariInPageURLToggle.imageset/ # Safari screenshot: enable Allow JavaScript from Apple Events
+│   └── SafariInPageURLAllow.imageset/  # Safari screenshot: confirmation dialog with Allow button
 ├── Views/
 │   ├── Timeline/
 │   │   ├── TimelineView.swift           # Main timeline scrubber

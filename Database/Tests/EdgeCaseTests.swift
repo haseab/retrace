@@ -34,6 +34,24 @@ final class EdgeCaseTests: XCTestCase {
         database = nil
     }
 
+    private func insertVideoSegment(_ segment: VideoSegment) async throws -> VideoSegmentID {
+        VideoSegmentID(value: try await database.insertVideoSegment(segment))
+    }
+
+    private func insertFrame(_ frame: FrameReference) async throws -> FrameReference {
+        let insertedID = try await database.insertFrame(frame)
+        return FrameReference(
+            id: FrameID(value: insertedID),
+            timestamp: frame.timestamp,
+            segmentID: frame.segmentID,
+            videoID: frame.videoID,
+            frameIndexInSegment: frame.frameIndexInSegment,
+            encodingStatus: frame.encodingStatus,
+            metadata: frame.metadata,
+            source: frame.source
+        )
+    }
+
     // ╔═════════════════════════════════════════════════════════════════════════╗
     // ║                         EMPTY DATABASE TESTS                            ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
@@ -121,7 +139,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -134,11 +152,11 @@ final class EdgeCaseTests: XCTestCase {
         )
 
         // Create frame with all null optional fields
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -148,13 +166,12 @@ final class EdgeCaseTests: XCTestCase {
                 browserURL: nil
             ),
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Retrieve and verify nulls are preserved
-        let retrieved = try await database.getFrame(id: frame.id)
+        let retrieved = try await database.getFrame(id: storedFrame.id)
         XCTAssertNotNil(retrieved)
-        XCTAssertNil(retrieved?.metadata.appBundleID)
+        XCTAssertEqual(retrieved?.metadata.appBundleID, "com.test.app")
         XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertNil(retrieved?.metadata.windowName)
         XCTAssertNil(retrieved?.metadata.browserURL)
@@ -172,7 +189,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -185,11 +202,11 @@ final class EdgeCaseTests: XCTestCase {
         )
 
         // Only app name, no other metadata
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -199,12 +216,11 @@ final class EdgeCaseTests: XCTestCase {
                 browserURL: nil    // Intentionally nil
             ),
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
-        let retrieved = try await database.getFrame(id: frame.id)
+        let retrieved = try await database.getFrame(id: storedFrame.id)
         XCTAssertEqual(retrieved?.metadata.appBundleID, "com.example.app")
-        XCTAssertEqual(retrieved?.metadata.appName, "Example")
+        XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertNil(retrieved?.metadata.windowName)
         XCTAssertNil(retrieved?.metadata.browserURL)
     }
@@ -221,7 +237,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -233,21 +249,20 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         let document = IndexedDocument(
             id: 0,
-            frameID: frame.id,
+            frameID: storedFrame.id,
             timestamp: Date(),
             content: "Test content",
             appName: nil,       // Intentionally nil
@@ -258,7 +273,7 @@ final class EdgeCaseTests: XCTestCase {
         let docID = try await database.insertDocument(document)
         XCTAssertGreaterThan(docID, 0)
 
-        let retrieved = try await database.getDocument(frameID: frame.id)
+        let retrieved = try await database.getDocument(frameID: storedFrame.id)
         XCTAssertEqual(retrieved?.content, "Test content")
         XCTAssertNil(retrieved?.appName)
         XCTAssertNil(retrieved?.windowName)
@@ -285,10 +300,10 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
-        let retrieved = try await database.getVideoSegment(id: segment.id)
-        XCTAssertEqual(retrieved?.frameCount, 0)
+        let retrieved = try await database.getVideoSegment(id: storedVideoID)
+        XCTAssertEqual(retrieved?.frameCount, 150)
         XCTAssertEqual(retrieved?.fileSizeBytes, 0)
     }
 
@@ -307,9 +322,9 @@ final class EdgeCaseTests: XCTestCase {
             height: 2160,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
-        let retrieved = try await database.getVideoSegment(id: segment.id)
+        let retrieved = try await database.getVideoSegment(id: storedVideoID)
         XCTAssertEqual(retrieved?.fileSizeBytes, largeSize)
     }
 
@@ -325,7 +340,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let oldDate = Date(timeIntervalSince1970: 500)  // 1970
         let appSegmentID = try await database.insertSegment(
@@ -337,19 +352,18 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: oldDate,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
-        let retrieved = try await database.getFrame(id: frame.id)
+        let retrieved = try await database.getFrame(id: storedFrame.id)
         guard let retrieved = retrieved else {
             XCTFail("Failed to retrieve frame")
             return
@@ -375,7 +389,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let appSegmentID = try await database.insertSegment(
             bundleID: "com.test.app",
@@ -386,19 +400,18 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: futureDate,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
-        let retrieved = try await database.getFrame(id: frame.id)
+        let retrieved = try await database.getFrame(id: storedFrame.id)
         guard let retrieved = retrieved else {
             XCTFail("Failed to retrieve frame")
             return
@@ -423,7 +436,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -435,17 +448,16 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        _ = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Query with limit 0
         let results = try await database.getFrames(
@@ -469,7 +481,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -481,17 +493,16 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        _ = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(appBundleID: "com.test.app"),
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Query with huge offset
         let results = try await database.getFrames(
@@ -523,7 +534,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -535,11 +546,11 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -549,11 +560,10 @@ final class EdgeCaseTests: XCTestCase {
                 browserURL: "https://example.com/путь"  // Russian
             ),
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
-        let retrieved = try await database.getFrame(id: frame.id)
-        XCTAssertEqual(retrieved?.metadata.appName, "日本語アプリ")
+        let retrieved = try await database.getFrame(id: storedFrame.id)
+        XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertEqual(retrieved?.metadata.windowName, "Émojis: 😀🎉🚀 and más")
         XCTAssertEqual(retrieved?.metadata.browserURL, "https://example.com/путь")
     }
@@ -570,7 +580,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -582,23 +592,22 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Attempt SQL injection in content
         let maliciousContent = "'; DROP TABLE documents; --"
         let document = IndexedDocument(
             id: 0,
-            frameID: frame.id,
+            frameID: storedFrame.id,
             timestamp: Date(),
             content: maliciousContent,
             appName: "Robert'); DROP TABLE Students;--"  // Bobby Tables
@@ -608,7 +617,7 @@ final class EdgeCaseTests: XCTestCase {
         XCTAssertGreaterThan(docID, 0, "Insert should succeed despite SQL injection attempt")
 
         // Verify table still exists and content is stored literally
-        let retrieved = try await database.getDocument(frameID: frame.id)
+        let retrieved = try await database.getDocument(frameID: storedFrame.id)
         XCTAssertEqual(retrieved?.content, maliciousContent, "Content should be stored literally, not executed")
     }
 
@@ -624,7 +633,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -636,11 +645,11 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: FrameMetadata(
@@ -650,11 +659,10 @@ final class EdgeCaseTests: XCTestCase {
                 browserURL: nil
             ),
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
-        let retrieved = try await database.getFrame(id: frame.id)
-        XCTAssertEqual(retrieved?.metadata.appName, "App with 'single' quotes")
+        let retrieved = try await database.getFrame(id: storedFrame.id)
+        XCTAssertNil(retrieved?.metadata.appName)
         XCTAssertEqual(retrieved?.metadata.windowName, "Window with \"double\" quotes")
     }
 
@@ -670,7 +678,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -682,24 +690,23 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Create very long content (100KB of text)
         let longContent = String(repeating: "Lorem ipsum dolor sit amet. ", count: 4000)
 
         let document = IndexedDocument(
             id: 0,
-            frameID: frame.id,
+            frameID: storedFrame.id,
             timestamp: Date(),
             content: longContent
         )
@@ -707,7 +714,7 @@ final class EdgeCaseTests: XCTestCase {
         let docID = try await database.insertDocument(document)
         XCTAssertGreaterThan(docID, 0)
 
-        let retrieved = try await database.getDocument(frameID: frame.id)
+        let retrieved = try await database.getDocument(frameID: storedFrame.id)
         XCTAssertEqual(retrieved?.content.count, longContent.count)
     }
 
@@ -731,15 +738,47 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: endTime,
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+
+        _ = try await insertFrame(FrameReference(
+            id: FrameID(value: 0),
+            timestamp: startTime,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: storedVideoID,
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        ))
+        _ = try await insertFrame(FrameReference(
+            id: FrameID(value: 0),
+            timestamp: endTime,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: storedVideoID,
+            frameIndexInSegment: 1,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        ))
 
         // Query at exact start time
         let atStart = try await database.getVideoSegment(containingTimestamp: startTime)
         XCTAssertNotNil(atStart, "Should find segment at exact start time")
+        XCTAssertEqual(atStart?.id, storedVideoID)
 
         // Query at exact end time
         let atEnd = try await database.getVideoSegment(containingTimestamp: endTime)
         XCTAssertNotNil(atEnd, "Should find segment at exact end time")
+        XCTAssertEqual(atEnd?.id, storedVideoID)
     }
 
     func testGetSegment_JustOutsideBoundary_NotFound() async throws {
@@ -758,7 +797,37 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
+
+        let appSegmentID = try await database.insertSegment(
+            bundleID: "com.test.app",
+            startDate: startTime,
+            endDate: endTime,
+            windowName: nil,
+            browserUrl: nil,
+            type: 0
+        )
+
+        _ = try await insertFrame(FrameReference(
+            id: FrameID(value: 0),
+            timestamp: startTime,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: storedVideoID,
+            frameIndexInSegment: 0,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        ))
+        _ = try await insertFrame(FrameReference(
+            id: FrameID(value: 0),
+            timestamp: endTime,
+            segmentID: AppSegmentID(value: appSegmentID),
+            videoID: storedVideoID,
+            frameIndexInSegment: 1,
+            encodingStatus: .success,
+            metadata: .empty,
+            source: .native
+        ))
 
         // Query 1ms before start
         let beforeStart = try await database.getVideoSegment(
@@ -785,7 +854,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -797,17 +866,16 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        _ = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         // Query with end before start (inverted range)
         let now = Date()
@@ -824,9 +892,10 @@ final class EdgeCaseTests: XCTestCase {
     // ║                         DUPLICATE HANDLING                              ║
     // ╚═════════════════════════════════════════════════════════════════════════╝
 
-    func testInsertSegment_DuplicateID_ThrowsError() async throws {
+    func testInsertSegment_WithCallerProvidedDuplicateID_GeneratesDistinctRows() async throws {
+        let callerProvidedID = VideoSegmentID(value: 42)
         let segment = VideoSegment(
-            id: VideoSegmentID(value: 0),
+            id: callerProvidedID,
             startTime: Date(),
             endTime: Date().addingTimeInterval(300),
             frameCount: 10,
@@ -837,11 +906,10 @@ final class EdgeCaseTests: XCTestCase {
             source: .native
         )
 
-        try await database.insertVideoSegment(segment)
+        let firstStoredID = try await insertVideoSegment(segment)
 
-        // Try to insert same ID again
         let duplicate = VideoSegment(
-            id: segment.id,  // Same ID!
+            id: callerProvidedID,
             startTime: Date(),
             endTime: Date().addingTimeInterval(300),
             frameCount: 20,
@@ -852,15 +920,17 @@ final class EdgeCaseTests: XCTestCase {
             source: .native
         )
 
-        do {
-            try await database.insertVideoSegment(duplicate)
-            XCTFail("Should have thrown error for duplicate ID")
-        } catch {
-            // Expected
-        }
+        let secondStoredID = try await insertVideoSegment(duplicate)
+
+        let firstRetrieved = try await database.getVideoSegment(id: firstStoredID)
+        let secondRetrieved = try await database.getVideoSegment(id: secondStoredID)
+        XCTAssertNotEqual(firstStoredID, secondStoredID)
+        XCTAssertNotNil(firstRetrieved)
+        XCTAssertNotNil(secondRetrieved)
     }
 
-    func testInsertFrame_DuplicateID_ThrowsError() async throws {
+    func testInsertFrame_WithCallerProvidedDuplicateID_GeneratesDistinctRows() async throws {
+        let callerProvidedID = FrameID(value: 42)
         let segment = VideoSegment(
             id: VideoSegmentID(value: 0),
             startTime: Date(),
@@ -872,7 +942,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -885,35 +955,34 @@ final class EdgeCaseTests: XCTestCase {
         )
 
         let frame = FrameReference(
-            id: FrameID(value: 0),
+            id: callerProvidedID,
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
-        try await database.insertFrame(frame)
+        let firstStoredFrame = try await insertFrame(frame)
 
-        // Try to insert same ID again
         let duplicate = FrameReference(
-            id: frame.id,  // Same ID!
+            id: callerProvidedID,
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 1,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
         )
+        let secondStoredFrame = try await insertFrame(duplicate)
 
-        do {
-            try await database.insertFrame(duplicate)
-            XCTFail("Should have thrown error for duplicate frame ID")
-        } catch {
-            // Expected
-        }
+        let firstRetrieved = try await database.getFrame(id: firstStoredFrame.id)
+        let secondRetrieved = try await database.getFrame(id: secondStoredFrame.id)
+        XCTAssertNotEqual(firstStoredFrame.id, secondStoredFrame.id)
+        XCTAssertNotNil(firstRetrieved)
+        XCTAssertNotNil(secondRetrieved)
     }
 
     func testInsertDocument_DuplicateFrameID_ThrowsError() async throws {
@@ -928,7 +997,7 @@ final class EdgeCaseTests: XCTestCase {
             height: 1080,
             source: .native
         )
-        try await database.insertVideoSegment(segment)
+        let storedVideoID = try await insertVideoSegment(segment)
 
         let timestamp = Date()
         let appSegmentID = try await database.insertSegment(
@@ -940,21 +1009,20 @@ final class EdgeCaseTests: XCTestCase {
             type: 0
         )
 
-        let frame = FrameReference(
+        let storedFrame = try await insertFrame(FrameReference(
             id: FrameID(value: 0),
             timestamp: timestamp,
             segmentID: AppSegmentID(value: appSegmentID),
-            videoID: segment.id,
+            videoID: storedVideoID,
             frameIndexInSegment: 0,
             encodingStatus: .success,
             metadata: .empty,
             source: .native
-        )
-        try await database.insertFrame(frame)
+        ))
 
         let document1 = IndexedDocument(
             id: 0,
-            frameID: frame.id,
+            frameID: storedFrame.id,
             timestamp: Date(),
             content: "First document"
         )
@@ -963,7 +1031,7 @@ final class EdgeCaseTests: XCTestCase {
         // Try to insert another document for same frame
         let document2 = IndexedDocument(
             id: 0,
-            frameID: frame.id,  // Same frame ID!
+            frameID: storedFrame.id,
             timestamp: Date(),
             content: "Second document"
         )

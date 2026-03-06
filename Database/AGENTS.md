@@ -23,7 +23,8 @@ Database/
 │   ├── V8_SegmentComments.swift
 │   ├── V9_SegmentCommentFrameAnchor.swift
 │   ├── V10_SegmentCommentSearchIndex.swift
-│   └── V11_SegmentCommentLinkCompositeIndex.swift
+│   ├── V11_SegmentCommentLinkCompositeIndex.swift
+│   └── V12_FrameMetadata.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
