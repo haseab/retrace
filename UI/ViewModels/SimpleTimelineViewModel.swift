@@ -7203,6 +7203,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func performForegroundFrameLoad(_ timelineFrame: TimelineFrame) async {
         let frame = timelineFrame.frame
         let frameID = frame.id
+        // Hidden timeline refresh/pre-render loads are best-effort and should not page
+        // attention with interactive-path slow-sample warnings/criticals.
+        let shouldEmitInteractiveSlowSampleAlerts = TimelineWindowController.shared.isVisible
 
         do {
             let imageData: Data
@@ -7246,8 +7249,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                     valueMs: storageReadMs,
                     category: .ui,
                     summaryEvery: 25,
-                    warningThresholdMs: 45,
-                    criticalThresholdMs: 150
+                    warningThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 45 : nil,
+                    criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 150 : nil
                 )
                 try Task.checkCancellation()
                 await storeFrameDataInDiskFrameBuffer(frameID: frameID, data: imageData)
@@ -7286,8 +7289,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 valueMs: totalMs,
                 category: .ui,
                 summaryEvery: 20,
-                warningThresholdMs: 80,
-                criticalThresholdMs: 220
+                warningThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 80 : nil,
+                criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 220 : nil
             )
             Log.recordLatency(
                 loadedFromDiskBuffer
@@ -7296,8 +7299,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                 valueMs: totalMs,
                 category: .ui,
                 summaryEvery: 20,
-                warningThresholdMs: loadedFromDiskBuffer ? 45 : 100,
-                criticalThresholdMs: loadedFromDiskBuffer ? 120 : 260
+                warningThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? (loadedFromDiskBuffer ? 45 : 100) : nil,
+                criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? (loadedFromDiskBuffer ? 120 : 260) : nil
             )
 
             if currentTimelineFrame?.frame.id == frame.id {
@@ -7538,13 +7541,14 @@ public class SimpleTimelineViewModel: ObservableObject {
                     frameIndex: descriptor.frameIndex
                 )
                 let storageReadMs = (CFAbsoluteTimeGetCurrent() - storageReadStart) * 1000
+                let shouldEmitInteractiveSlowSampleAlerts = TimelineWindowController.shared.isVisible
                 Log.recordLatency(
                     "timeline.cache_more.storage_read_ms",
                     valueMs: storageReadMs,
                     category: .ui,
                     summaryEvery: 25,
-                    warningThresholdMs: 55,
-                    criticalThresholdMs: 180
+                    warningThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 55 : nil,
+                    criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 180 : nil
                 )
 
                 if Task.isCancelled {
