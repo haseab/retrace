@@ -89,11 +89,17 @@ struct RetraceApp: App {
 
         CommandMenu("View") {
             Button("Dashboard") {
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
                 DashboardWindowController.shared.show()
             }
             .keyboardShortcut("1", modifiers: .command)
 
             Button("Changelog") {
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
                 DashboardWindowController.shared.showChangelog()
             }
             .keyboardShortcut("2", modifiers: .command)
@@ -108,6 +114,9 @@ struct RetraceApp: App {
             Divider()
 
             Button("Settings") {
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
                 DashboardWindowController.shared.toggleSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
