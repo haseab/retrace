@@ -1291,6 +1291,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Used so Escape can close the calendar first instead of closing the full dropdown.
     @Published public var isDateRangeCalendarEditing: Bool = false
 
+    /// Set when filters are cleared without an immediate reload so the next refresh
+    /// rebuilds the window instead of merging unfiltered frames into stale filtered ones.
+    private var requiresFullReloadOnNextRefresh = false
+
     // MARK: - Filter Dropdown State (lifted to ViewModel for proper rendering outside FilterPanel)
 
     /// Which filter dropdown is currently open (rendered at SimpleTimelineView level to avoid clipping)
@@ -3537,10 +3541,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 currentIndex = max(0, min(currentIndex, frames.count - 1))
             }
 
+            updateWindowBoundaries()
             hidingSegmentBlockRange = nil
 
             // Load image for new current frame
             loadImageIfNeeded()
+            checkAndLoadMoreFrames(reason: "performHideSegment.postRemoval")
 
             Log.debug("[Tags] Hidden \(segmentIds.count) segments in block, removed \(removedCount) frames from UI", category: .ui)
         }
@@ -3645,10 +3651,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                     currentIndex = max(0, min(currentIndex, frames.count - 1))
                 }
 
+                updateWindowBoundaries()
                 hidingSegmentBlockRange = nil
 
                 // Load image for new current frame
                 loadImageIfNeeded()
+                checkAndLoadMoreFrames(reason: "performUnhideSegment.postRemoval")
 
                 Log.debug("[Tags] Unhidden \(segmentIdsToUnhide.count) segments in block, removed \(removedCount) frames from Only Hidden view", category: .ui)
             }
@@ -5230,6 +5238,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Invalidate peek cache since filters are changing.
         invalidatePeekCache()
+        requiresFullReloadOnNextRefresh = true
         clearFilterState()
 
         if isFilterPanelVisible {
@@ -6174,6 +6183,23 @@ public class SimpleTimelineViewModel: ObservableObject {
                 shouldNavigateToNewest = navigateToNewest
             }
 
+            if requiresFullReloadOnNextRefresh {
+                requiresFullReloadOnNextRefresh = false
+                Log.info(
+                    "[TIMELINE-REOPEN] forcing full reload after filter expiry navigateToNewest=\(shouldNavigateToNewest) frames=\(frames.count) index=\(currentIndex)",
+                    category: .ui
+                )
+
+                if shouldNavigateToNewest {
+                    await loadMostRecentFrame()
+                } else if let timestamp = currentTimestamp {
+                    await reloadFramesAroundTimestamp(timestamp)
+                } else {
+                    await loadMostRecentFrame()
+                }
+                return
+            }
+
             // Check if there are newer frames available
             if let newestCachedTimestamp = frames.last?.frame.timestamp {
                 do {
@@ -6813,7 +6839,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Get OCR nodes that match the search query (for highlighting).
-    /// Preserves quoted phrases so exact phrase searches do not over-highlight short words.
+    /// Each comma-separated entry is treated as its own exact phrase match.
     public var searchHighlightNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
         guard let query = searchHighlightQuery, !query.isEmpty, isShowingSearchHighlight else {
             return []
@@ -6822,7 +6848,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         let queryTokens = tokenizeSearchHighlightQuery(query)
         guard !queryTokens.isEmpty else { return [] }
 
-        let tokenDescriptions = queryTokens.map(\.debugDescription)
         var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
 
         for node in ocrNodes {
@@ -6835,14 +6860,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if !ranges.isEmpty {
                 matchingNodes.append((node: node, ranges: ranges))
-            }
-        }
-
-        if !matchingNodes.isEmpty {
-            let totalMatches = matchingNodes.reduce(0) { $0 + $1.ranges.count }
-        } else {
-            // Log first few nodes to see what text they contain
-            for (i, node) in ocrNodes.prefix(10).enumerated() {
             }
         }
 
@@ -6925,38 +6942,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         DashboardViewModel.recordTextCopy(coordinator: coordinator, text: textToCopy)
     }
 
-    private static let searchHighlightExactMatchStopwords: Set<String> = [
-        "a", "an", "and", "as", "at",
-        "be", "but", "by",
-        "for", "from",
-        "if", "in", "into", "is", "it",
-        "of", "on", "or",
-        "the", "to",
-        "with"
-    ]
-
-    private enum SearchHighlightTermMatchMode {
-        case exactWord
-        case wordPrefix
-    }
-
     private enum SearchHighlightToken {
-        case term(String, mode: SearchHighlightTermMatchMode)
         case phrase(String)
-
-        var debugDescription: String {
-            switch self {
-            case .term(let term, let mode):
-                switch mode {
-                case .exactWord:
-                    return "termExact(\(term))"
-                case .wordPrefix:
-                    return "termPrefix(\(term))"
-                }
-            case .phrase(let phrase):
-                return "phrase(\(phrase))"
-            }
-        }
     }
 
     private func tokenizeSearchHighlightQuery(_ query: String) -> [SearchHighlightToken] {
@@ -6965,39 +6952,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedQuery.isEmpty else { return [] }
 
-        var tokens: [SearchHighlightToken] = []
-        var current = ""
-        var inQuotes = false
-
-        func flushCurrentToken() {
-            let value = current.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty else {
-                current = ""
-                return
+        return normalizedQuery
+            .split(separator: ",", omittingEmptySubsequences: false)
+            .compactMap { rawComponent in
+                let value = rawComponent
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                guard !value.isEmpty else { return nil }
+                return .phrase(value)
             }
-
-            if inQuotes {
-                tokens.append(.phrase(value))
-            } else {
-                let terms = value.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-                for term in terms {
-                    tokens.append(.term(term, mode: searchHighlightMatchMode(for: term)))
-                }
-            }
-            current = ""
-        }
-
-        for character in normalizedQuery {
-            if character == "\"" {
-                flushCurrentToken()
-                inQuotes.toggle()
-                continue
-            }
-            current.append(character)
-        }
-
-        flushCurrentToken()
-        return tokens
     }
 
     private func rangesForSearchHighlightToken(
@@ -7005,81 +6968,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         in text: String
     ) -> [Range<String.Index>] {
         switch token {
-        case .term(let term, let mode):
-            switch mode {
-            case .exactWord:
-                return wordRanges(exactlyMatching: term, in: text)
-            case .wordPrefix:
-                return wordRanges(withPrefix: term, in: text)
-            }
         case .phrase(let phrase):
             return allRanges(of: phrase, in: text)
-        }
-    }
-
-    private func searchHighlightMatchMode(for term: String) -> SearchHighlightTermMatchMode {
-        if term.count <= 2 {
-            return .exactWord
-        }
-        if Self.searchHighlightExactMatchStopwords.contains(term) {
-            return .exactWord
-        }
-        return .wordPrefix
-    }
-
-    private func wordRanges(
-        exactlyMatching needle: String,
-        in haystack: String
-    ) -> [Range<String.Index>] {
-        guard !needle.isEmpty else { return [] }
-        return wordTokenRanges(in: haystack)
-            .filter { $0.token == needle }
-            .map(\.range)
-    }
-
-    private func wordRanges(
-        withPrefix needle: String,
-        in haystack: String
-    ) -> [Range<String.Index>] {
-        guard !needle.isEmpty else { return [] }
-        return wordTokenRanges(in: haystack)
-            .filter { $0.token.hasPrefix(needle) }
-            .map(\.range)
-    }
-
-    private func wordTokenRanges(in text: String) -> [(token: String, range: Range<String.Index>)] {
-        guard !text.isEmpty else { return [] }
-
-        var tokens: [(token: String, range: Range<String.Index>)] = []
-        var tokenStart: String.Index?
-        var index = text.startIndex
-
-        while index < text.endIndex {
-            let nextIndex = text.index(after: index)
-            let character = text[index]
-
-            if isSearchHighlightTokenCharacter(character) {
-                if tokenStart == nil {
-                    tokenStart = index
-                }
-            } else if let start = tokenStart {
-                tokens.append((token: String(text[start..<index]), range: start..<index))
-                tokenStart = nil
-            }
-
-            index = nextIndex
-        }
-
-        if let start = tokenStart {
-            tokens.append((token: String(text[start..<text.endIndex]), range: start..<text.endIndex))
-        }
-
-        return tokens
-    }
-
-    private func isSearchHighlightTokenCharacter(_ character: Character) -> Bool {
-        character.unicodeScalars.allSatisfy { scalar in
-            CharacterSet.alphanumerics.contains(scalar) || scalar.value == 95 // underscore
         }
     }
 

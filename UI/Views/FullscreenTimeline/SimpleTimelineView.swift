@@ -4354,6 +4354,8 @@ struct SearchHighlightOverlay: View {
     private let tooltipSize = CGSize(width: 210, height: 34)
     private let tooltipInset: CGFloat = 12
     private let tooltipGap: CGFloat = 8
+    private let highlightHorizontalPaddingFraction: CGFloat = 0.12
+    private let highlightVerticalPaddingFraction: CGFloat = 0.14
 
     private var liveMatches: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
         viewModel.searchHighlightNodes
@@ -4487,11 +4489,18 @@ struct SearchHighlightOverlay: View {
     }
 
     private var highlightedRects: [CGRect] {
-        var seenNodeIDs = Set<Int>()
-        return liveMatches.compactMap { match -> CGRect? in
-            guard seenNodeIDs.insert(match.node.id).inserted else { return nil }
-            let rect = screenRect(for: match.node)
-            return rect.isEmpty ? nil : rect
+        liveMatches.flatMap { match in
+            let rects = match.ranges.compactMap { range -> CGRect? in
+                let rect = screenRect(for: match.node, range: range)
+                return rect.isEmpty ? nil : rect
+            }
+
+            if rects.isEmpty {
+                let fallbackRect = screenRect(for: match.node)
+                return fallbackRect.isEmpty ? [] : [fallbackRect]
+            }
+
+            return rects
         }
     }
 
@@ -4587,6 +4596,44 @@ struct SearchHighlightOverlay: View {
             y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
             width: node.width * actualFrameRect.width,
             height: node.height * actualFrameRect.height
+        )
+    }
+
+    private func screenRect(
+        for node: OCRNodeWithText,
+        range: Range<String.Index>
+    ) -> CGRect {
+        let textCount = node.text.count
+        guard textCount > 0 else { return screenRect(for: node) }
+
+        let lowerBound = node.text.distance(from: node.text.startIndex, to: range.lowerBound)
+        let upperBound = node.text.distance(from: node.text.startIndex, to: range.upperBound)
+        let clampedLowerBound = min(max(lowerBound, 0), textCount - 1)
+        let clampedUpperBound = min(max(upperBound, clampedLowerBound + 1), textCount)
+
+        let startFraction = CGFloat(clampedLowerBound) / CGFloat(textCount)
+        let endFraction = CGFloat(clampedUpperBound) / CGFloat(textCount)
+        let horizontalPadding = min(
+            highlightHorizontalPaddingFraction / CGFloat(textCount),
+            startFraction
+        )
+        let trailingPadding = min(
+            highlightHorizontalPaddingFraction / CGFloat(textCount),
+            max(0, 1.0 - endFraction)
+        )
+        let paddedStartFraction = max(0, startFraction - horizontalPadding)
+        let paddedEndFraction = min(1.0, endFraction + trailingPadding)
+        let widthFraction = max(
+            paddedEndFraction - paddedStartFraction,
+            1.0 / CGFloat(textCount)
+        )
+        let verticalPadding = node.height * highlightVerticalPaddingFraction
+
+        return CGRect(
+            x: actualFrameRect.origin.x + ((node.x + (node.width * paddedStartFraction)) * actualFrameRect.width),
+            y: actualFrameRect.origin.y + ((node.y - verticalPadding) * actualFrameRect.height),
+            width: node.width * min(widthFraction, 1.0) * actualFrameRect.width,
+            height: min(node.height + (verticalPadding * 2), max(0, 1.0 - max(0, node.y - verticalPadding))) * actualFrameRect.height
         )
     }
 }
