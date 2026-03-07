@@ -34,6 +34,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         "org.chromium.Chromium",
         "com.sigmaos.sigmaos",
         "com.cometbrowser.Comet",
+        "company.thebrowser.dia",
         "com.aspect.browser",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
@@ -48,6 +49,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
+        "company.thebrowser.dia.app.",
         "com.aspect.browser.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
@@ -257,6 +259,7 @@ final class AccessibilityInspectorTest: XCTestCase {
             "com.brave.Browser",
             "com.vivaldi.Vivaldi",
             "com.operasoftware.Opera",
+            "company.thebrowser.dia",
             "com.aspect.browser",
             "company.thebrowser.Browser"  // Arc
         ]

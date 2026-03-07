@@ -354,6 +354,7 @@ actor BrowserURLAppleScriptCoordinator {
 ///
 /// Strategy by browser:
 /// - Safari: AXToolbar → AXTextField (address bar value)
+/// - Dia: AX tree scan for the first AXURL/AXDocument outside the menu bar
 /// - Chrome/Edge/Brave: AXDocument attribute on window, with AXManualAccessibility fallback
 /// - Arc: AppleScript (Chromium-based but AX tree often incomplete)
 /// - Firefox: Disabled (URL extraction intentionally skipped)
@@ -369,13 +370,14 @@ struct BrowserURLExtractor: Sendable {
         "com.microsoft.edgemac",
         "com.brave.Browser",
         "company.thebrowser.Browser",  // Arc
+        "company.thebrowser.dia",      // Dia
         "org.mozilla.firefox",
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "com.nickvision.browser",      // GNOME Web
         "com.openai.chat",             // ChatGPT desktop app
         "com.cometbrowser.Comet",      // Comet Browser
-        "com.aspect.browser",          // Dia Browser
+        "com.aspect.browser",          // Dia legacy bundle ID
         "org.chromium.Chromium",       // Chromium
         "com.sigmaos.sigmaos",         // SigmaOS
         "com.nicklockwood.Duckduckgo", // DuckDuckGo
@@ -405,6 +407,7 @@ struct BrowserURLExtractor: Sendable {
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
+        "company.thebrowser.dia.app.",
         "com.aspect.browser.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
@@ -422,9 +425,14 @@ struct BrowserURLExtractor: Sendable {
         "org.chromium.Chromium",
         "com.sigmaos.sigmaos",
         "com.cometbrowser.Comet",
+        "company.thebrowser.dia",
         "com.aspect.browser",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
+    ]
+    private static let diaExactBundleIDs: Set<String> = [
+        "company.thebrowser.dia",
+        "com.aspect.browser",
     ]
 
     private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
@@ -464,6 +472,10 @@ struct BrowserURLExtractor: Sendable {
         }
 
         return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
+    }
+
+    static func isDiaBrowser(_ bundleID: String) -> Bool {
+        diaExactBundleIDs.contains(bundleID)
     }
 
     /// Check whether a bundle ID should use Chromium-specific URL extraction.
@@ -519,6 +531,8 @@ struct BrowserURLExtractor: Sendable {
         let url: String?
         if bundleID == "com.apple.Safari" {
             url = getSafariURL(pid: pid)
+        } else if isDiaBrowser(bundleID) {
+            url = getDiaURL(pid: pid)
         } else if isChromiumBrowser(bundleID) {
             url = await getChromiumURL(
                 bundleID: bundleID,
@@ -572,6 +586,32 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 3: Deep search for text field with URL
         return findURLInElement(window, depth: 0, maxDepth: 10)
+    }
+
+    // MARK: - Dia
+
+    /// Extract URL from Dia using AXURL/AXDocument traversal.
+    /// Dia's AX tree can expose the current page URL on elements other than the
+    /// address bar, so prefer a generic AX scan before Chromium heuristics.
+    private static func getDiaURL(pid: pid_t) -> String? {
+        let appRef = AXUIElementCreateApplication(pid)
+        enableAccessibilityIfNeeded(appRef)
+
+        if let window: AXUIElement = getAXAttribute(appRef, kAXFocusedWindowAttribute) {
+            if let url = findURLExcludingMenuBar(window, depth: 0, maxDepth: 15) {
+                return url
+            }
+            if let url = findURLInWebArea(window) {
+                return url
+            }
+            if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
+                return url
+            }
+        }
+
+        return findURLExcludingMenuBar(appRef, depth: 0, maxDepth: 15)
+            ?? findURLInWebArea(appRef)
+            ?? findURLInElement(appRef, depth: 0, maxDepth: 8)
     }
 
     // MARK: - Chromium-based Browsers (Chrome, Edge, Brave, Vivaldi)
@@ -1068,6 +1108,40 @@ struct BrowserURLExtractor: Sendable {
 
         for child in children.prefix(25) {
             if let url = findURLInElement(child, depth: depth + 1, maxDepth: maxDepth) {
+                return url
+            }
+        }
+
+        return nil
+    }
+
+    /// Recursively search for the first AXURL/AXDocument while ignoring menu-bar branches.
+    private static func findURLExcludingMenuBar(_ element: AXUIElement, depth: Int, maxDepth: Int) -> String? {
+        guard depth < maxDepth else { return nil }
+
+        if let role: String = getAXAttribute(element, kAXRoleAttribute),
+           role == kAXMenuBarRole as String {
+            return nil
+        }
+
+        if let url: String = getAXAttribute(element, kAXURLAttribute),
+           !url.isEmpty,
+           looksLikeURL(url) {
+            return url
+        }
+
+        if let documentURL: String = getAXAttribute(element, kAXDocumentAttribute),
+           !documentURL.isEmpty,
+           looksLikeURL(documentURL) {
+            return documentURL
+        }
+
+        guard let children: [AXUIElement] = getAXAttribute(element, kAXChildrenAttribute) else {
+            return nil
+        }
+
+        for child in children.prefix(40) {
+            if let url = findURLExcludingMenuBar(child, depth: depth + 1, maxDepth: maxDepth) {
                 return url
             }
         }

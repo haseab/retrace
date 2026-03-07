@@ -520,6 +520,7 @@ public struct SettingsView: View {
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
+        "company.thebrowser.dia",
         "com.aspect.browser",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
@@ -540,6 +541,7 @@ public struct SettingsView: View {
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
+        "company.thebrowser.dia",
         "com.aspect.browser",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
@@ -7363,7 +7365,7 @@ extension SettingsView {
             return "Arc"
         case "com.cometbrowser.Comet":
             return "Comet"
-        case "com.aspect.browser":
+        case "company.thebrowser.dia", "com.aspect.browser":
             return "Dia"
         case "com.sigmaos.sigmaos":
             return "SigmaOS"

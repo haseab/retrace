@@ -294,11 +294,19 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.microsoft.edgemac.app.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.brave.Browser.app.cccccccccccccccccccccccccccccccc"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("org.chromium.Chromium.app.dddddddddddddddddddddddddddddddd"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.aspect.browser.app.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
     }
 
-    func testIsBrowserRecognizesDiaBundleID() {
+    func testIsBrowserRecognizesDiaBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.aspect.browser"))
+    }
+
+    func testIsDiaBrowserRecognizesDiaBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isDiaBrowser("company.thebrowser.dia"))
+        XCTAssertTrue(BrowserURLExtractor.isDiaBrowser("com.aspect.browser"))
+        XCTAssertFalse(BrowserURLExtractor.isDiaBrowser("com.google.Chrome"))
     }
 
     func testIsBrowserRejectsSafariWebApps() {
