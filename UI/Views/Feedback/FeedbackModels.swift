@@ -36,6 +36,34 @@ public enum FeedbackType: String, CaseIterable, Identifiable {
     }
 }
 
+public struct FeedbackLaunchContext {
+    public enum Source: String {
+        case manual
+        case watchdogCrashBanner
+    }
+
+    public enum PreferredFocusField {
+        case email
+    }
+
+    public let source: Source
+    public let feedbackType: FeedbackType
+    public let prefilledDescription: String?
+    public let preferredFocusField: PreferredFocusField?
+
+    public init(
+        source: Source = .manual,
+        feedbackType: FeedbackType = .bug,
+        prefilledDescription: String? = nil,
+        preferredFocusField: PreferredFocusField? = nil
+    ) {
+        self.source = source
+        self.feedbackType = feedbackType
+        self.prefilledDescription = prefilledDescription
+        self.preferredFocusField = preferredFocusField
+    }
+}
+
 // MARK: - Diagnostic Info
 
 /// System and app diagnostic information included with feedback.

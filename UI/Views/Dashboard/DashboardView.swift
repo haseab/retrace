@@ -64,6 +64,8 @@ public struct DashboardView: View {
     @ObservedObject private var updaterManager = UpdaterManager.shared
     @State private var isPulsing = false
     @State private var showFeedbackSheet = false
+    @State private var feedbackLaunchContext: FeedbackLaunchContext?
+    @State private var feedbackPresentationID = UUID()
     @State private var usageViewMode: AppUsageViewMode = Self.loadSavedViewMode()
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
@@ -134,6 +136,7 @@ public struct DashboardView: View {
                 )
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 .padding(.top, 20)
             }
 
@@ -151,6 +154,7 @@ public struct DashboardView: View {
                 )
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 .padding(.top, viewModel.showAccessibilityWarning ? 12 : 20)
             }
 
@@ -168,7 +172,40 @@ public struct DashboardView: View {
                 )
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
                 .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
+            }
+
+            if let recentWatchdogCrash = viewModel.recentWatchdogCrash {
+                WatchdogCrashBanner(
+                    report: recentWatchdogCrash,
+                    onSubmitBugReport: {
+                        presentFeedbackSheet(
+                            launchContext: DashboardViewModel.makeWatchdogCrashFeedbackLaunchContext(
+                                for: recentWatchdogCrash
+                            )
+                        )
+                    },
+                    onDetails: {
+                        viewModel.recordRecentWatchdogCrashDetailsOpened()
+                        NSWorkspace.shared.selectFile(
+                            recentWatchdogCrash.fileURL.path,
+                            inFileViewerRootedAtPath: recentWatchdogCrash.fileURL.deletingLastPathComponent().path
+                        )
+                    },
+                    onDismiss: {
+                        viewModel.dismissRecentWatchdogCrash()
+                    }
+                )
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(
+                    .top,
+                    (viewModel.showAccessibilityWarning
+                        || viewModel.showScreenRecordingWarning
+                        || launchOnLoginReminderManager.shouldShowReminder) ? 12 : 20
+                )
             }
 
             // Header
@@ -229,6 +266,16 @@ public struct DashboardView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 32)
                 .padding(.bottom, 24)
+        }
+        .sheet(
+            isPresented: $showFeedbackSheet,
+            onDismiss: {
+                feedbackLaunchContext = nil
+            }
+        ) {
+            FeedbackFormView(launchContext: feedbackLaunchContext)
+                .id(feedbackPresentationID)
+            .environmentObject(coordinatorWrapper)
         }
         .background(
             ZStack {
@@ -512,10 +559,6 @@ public struct DashboardView: View {
                 }
                 settingsButton
             }
-        }
-        .sheet(isPresented: $showFeedbackSheet) {
-            FeedbackFormView()
-                .environmentObject(coordinatorWrapper)
         }
     }
 
@@ -1337,7 +1380,9 @@ public struct DashboardView: View {
                     .fill(Color.retraceSecondary.opacity(0.5))
                     .frame(width: 3, height: 3)
 
-                Button(action: { showFeedbackSheet = true }) {
+                Button(action: {
+                    presentFeedbackSheet()
+                }) {
                     HStack(spacing: 6) {
                         Image(systemName: "questionmark.circle")
                             .font(.retraceCalloutMedium)
@@ -1422,6 +1467,10 @@ public struct DashboardView: View {
                             MilestoneCelebrationManager.setDebugThemeOverride(nil)
                         }
                     }
+                    Divider()
+                    Button("Trigger Watchdog Hang (15s)") {
+                        triggerDebugWatchdogHang()
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "ant.fill")
@@ -1468,9 +1517,100 @@ public struct DashboardView: View {
         }
     }
 
+    private func triggerDebugWatchdogHang() {
+        DashboardViewModel.recordDebugWatchdogHangTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional main-thread hang to exercise watchdog auto-quit", category: .ui)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            // DEBUG-only: intentionally block the main thread long enough to trigger
+            // the watchdog auto-quit/relaunch path and generate a watchdog report.
+            Thread.sleep(forTimeInterval: 15)
+        }
+    }
+
+    private func presentFeedbackSheet(launchContext: FeedbackLaunchContext? = nil) {
+        feedbackLaunchContext = launchContext
+        feedbackPresentationID = UUID()
+        if launchContext?.source == .watchdogCrashBanner {
+            viewModel.recordRecentWatchdogCrashFeedbackOpened()
+        }
+        showFeedbackSheet = true
+    }
+
 }
 
 // MARK: - Preview
+
+private struct WatchdogCrashBanner: View {
+    let report: WatchdogCrashReportSummary
+    let onSubmitBugReport: () -> Void
+    let onDetails: () -> Void
+    let onDismiss: () -> Void
+
+    private var messageText: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Retrace crashed recently at \(formatter.string(from: report.capturedAt)). Please submit a bug report."
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.arrow.trianglehead.2.clockwise.rotate.90")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                Button("Details", action: onDetails)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.92))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .buttonStyle(.plain)
+
+                Button("Submit Bug Report", action: onSubmitBugReport)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
 
 // MARK: - Scroll Affordance
 

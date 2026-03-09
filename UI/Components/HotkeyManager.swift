@@ -1,10 +1,13 @@
 import AppKit
 import Carbon.HIToolbox
+import CoreGraphics
 import Shared
 
 /// Manages global keyboard shortcuts for the application
 /// Allows timeline to be triggered even when app is not in focus
 public class HotkeyManager: NSObject {
+
+    private static let accessibilityPermissionRevokedNotification = Notification.Name("AccessibilityPermissionRevoked")
 
     // MARK: - Singleton
 
@@ -39,6 +42,7 @@ public class HotkeyManager: NSObject {
 
         // Listen for keyboard layout changes
         setupKeyboardLayoutObserver()
+        setupPermissionObservers()
     }
 
     deinit {
@@ -48,8 +52,8 @@ public class HotkeyManager: NSObject {
     // MARK: - Permission Check
 
     /// Check if accessibility permission is granted (required for global hotkeys)
-    private func hasAccessibilityPermission() -> Bool {
-        return AXIsProcessTrusted()
+    private func hasHotkeyPermission() -> Bool {
+        AXIsProcessTrusted() && CGPreflightListenEventAccess()
     }
 
     // MARK: - Public API
@@ -153,11 +157,29 @@ public class HotkeyManager: NSObject {
         }
     }
 
+    private func setupPermissionObservers() {
+        NotificationCenter.default.addObserver(
+            forName: Self.accessibilityPermissionRevokedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.suspendEventTapForPermissionLoss()
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.retrySetupIfNeeded()
+        }
+    }
+
     // MARK: - Event Tap
 
     private func startEventTap() {
         // Check accessibility permission first - don't attempt if not granted
-        guard hasAccessibilityPermission() else {
+        guard hasHotkeyPermission() else {
             // Silently skip - hotkeys will be set up when permissions are granted
             // and the app restarts or when retrySetupIfNeeded() is called
             withStateLock {
@@ -167,12 +189,18 @@ public class HotkeyManager: NSObject {
         }
 
         // If tap already exists, just ensure it is enabled.
-        if let tap = withStateLock({ eventTap }) {
+        if let tap = withStateLock({ eventTap }), CFMachPortIsValid(tap) {
             CGEvent.tapEnable(tap: tap, enable: true)
             withStateLock {
                 pendingSetup = false
             }
             return
+        }
+
+        withStateLock {
+            eventTap = nil
+            runLoopSource = nil
+            eventTapRunLoop = nil
         }
 
         let shouldSetup = withStateLock { () -> Bool in
@@ -213,7 +241,7 @@ public class HotkeyManager: NSObject {
             withStateLock {
                 isSettingUpEventTap = false
             }
-            Log.error("[HotkeyManager] Failed to create event tap. Check accessibility permissions.", category: .ui)
+            Log.error("[HotkeyManager] Failed to create event tap. Check accessibility/listen-event permissions.", category: .ui)
             return
         }
 
@@ -240,6 +268,17 @@ public class HotkeyManager: NSObject {
         CFRunLoopRun()
     }
 
+    private func suspendEventTapForPermissionLoss() {
+        if let tap = withStateLock({ eventTap }), CFMachPortIsValid(tap) {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            Log.warning("[HotkeyManager] Suspended global hotkey event tap after permission revoke", category: .ui)
+        }
+
+        withStateLock {
+            pendingSetup = true
+        }
+    }
+
     private func stopEventTap() {
         if let tap = withStateLock({ eventTap }) {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -253,8 +292,16 @@ public class HotkeyManager: NSObject {
     ) -> Unmanaged<CGEvent>? {
         // Handle tap disabled event
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            guard hasHotkeyPermission() else {
+                withStateLock {
+                    pendingSetup = true
+                }
+                Log.warning("[HotkeyManager] Event tap disabled while permission is unavailable; leaving tap suspended", category: .ui)
+                return Unmanaged.passUnretained(event)
+            }
+
             // Re-enable the tap
-            if let tap = withStateLock({ eventTap }) {
+            if let tap = withStateLock({ eventTap }), CFMachPortIsValid(tap) {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
             return Unmanaged.passUnretained(event)

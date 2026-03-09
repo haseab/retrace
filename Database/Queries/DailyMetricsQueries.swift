@@ -65,6 +65,8 @@ public enum DailyMetricsQueries {
         case inPageURLPermissionProbe = "in_page_url_permission_probe"
         case inPageURLVerification = "in_page_url_verification"
         case browserLinkOpened = "browser_link_opened"
+        case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
+        case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
 
         // Delete actions
         case frameDeleted = "frame_deleted"

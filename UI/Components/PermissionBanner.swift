@@ -9,7 +9,7 @@ struct PermissionBanner: View {
     let onDismiss: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             // Warning icon
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.orange)
@@ -43,7 +43,8 @@ struct PermissionBanner: View {
             }
             .buttonStyle(.plain)
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
         .background(Color.orange.opacity(0.1))
         .cornerRadius(8)
         .overlay(

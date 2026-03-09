@@ -1,4 +1,5 @@
 import SwiftUI
+import Dispatch
 
 // MARK: - Feedback Form View
 
@@ -6,11 +7,28 @@ public struct FeedbackFormView: View {
 
     // MARK: - Properties
 
-    @StateObject private var viewModel = FeedbackViewModel()
+    @StateObject private var viewModel: FeedbackViewModel
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
     @Environment(\.dismiss) private var dismiss
 
     private let liveChatURL = URL(string: "https://retrace.to/chat")!
+    private let launchContext: FeedbackLaunchContext?
+    private let onSuccessfulSubmit: (() -> Void)?
+
+    @FocusState private var focusedField: FocusedField?
+
+    private enum FocusedField {
+        case email
+    }
+
+    public init(
+        launchContext: FeedbackLaunchContext? = nil,
+        onSuccessfulSubmit: (() -> Void)? = nil
+    ) {
+        self.launchContext = launchContext
+        self.onSuccessfulSubmit = onSuccessfulSubmit
+        _viewModel = StateObject(wrappedValue: FeedbackViewModel(launchContext: launchContext))
+    }
 
     // MARK: - Body
 
@@ -30,9 +48,14 @@ public struct FeedbackFormView: View {
         .onAppear {
             viewModel.setCoordinator(coordinatorWrapper)
             setupEscapeKeyHandler()
+            applyInitialFocusIfNeeded()
         }
         .onDisappear {
             removeEscapeKeyHandler()
+        }
+        .onChange(of: viewModel.isSubmitted) { isSubmitted in
+            guard isSubmitted else { return }
+            onSuccessfulSubmit?()
         }
     }
 
@@ -54,6 +77,13 @@ public struct FeedbackFormView: View {
         if let monitor = escapeKeyMonitor {
             NSEvent.removeMonitor(monitor)
             escapeKeyMonitor = nil
+        }
+    }
+
+    private func applyInitialFocusIfNeeded() {
+        guard launchContext?.preferredFocusField == .email else { return }
+        DispatchQueue.main.async {
+            focusedField = .email
         }
     }
 
@@ -241,6 +271,7 @@ public struct FeedbackFormView: View {
                 .font(.retraceCaption)
                 .foregroundColor(.retracePrimary)
                 .textFieldStyle(.plain)
+                .focused($focusedField, equals: .email)
                 .padding(10)
                 .background(Color.white.opacity(0.03))
                 .cornerRadius(8)

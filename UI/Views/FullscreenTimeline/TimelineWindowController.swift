@@ -11,6 +11,8 @@ import UniformTypeIdentifiers
 @MainActor
 public class TimelineWindowController: NSObject {
 
+    private static let accessibilityPermissionRevokedNotification = Notification.Name("AccessibilityPermissionRevoked")
+
     // MARK: - Singleton
 
     public static let shared = TimelineWindowController()
@@ -46,6 +48,7 @@ public class TimelineWindowController: NSObject {
     private nonisolated(unsafe) static var emergencyEventTap: CFMachPort?
     private nonisolated(unsafe) static var emergencyRunLoopSource: CFRunLoopSource?
     private nonisolated(unsafe) static var emergencyRunLoop: CFRunLoop?
+    private nonisolated(unsafe) static var isInstallingEmergencyTap = false
     private nonisolated(unsafe) static var isTimelineVisible: Bool = false
     /// Whether a dialog/overlay is open that uses escape to close (search, filter, etc.)
     private nonisolated(unsafe) static var isDialogOpen: Bool = false
@@ -302,14 +305,54 @@ public class TimelineWindowController: NSObject {
 
     private override init() {
         super.init()
+        setupEmergencyTapPermissionObservers()
         setupEmergencyEscapeTap()
     }
 
     // MARK: - Emergency Escape CGEvent Tap
 
+    private func setupEmergencyTapPermissionObservers() {
+        NotificationCenter.default.addObserver(
+            forName: Self.accessibilityPermissionRevokedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.suspendEmergencyEscapeTapForPermissionLoss()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.resumeEmergencyEscapeTapIfNeeded()
+            }
+        }
+    }
+
+    private nonisolated static func hasEmergencyTapPermission() -> Bool {
+        CGPreflightListenEventAccess()
+    }
+
     /// Sets up a CGEvent tap on a background thread to handle Escape key
     /// This works even when the main thread is completely frozen
     private func setupEmergencyEscapeTap() {
+        guard Self.hasEmergencyTapPermission() else {
+            Log.warning("[TIMELINE] Skipping emergency escape event tap setup because listen-event access is unavailable", category: .ui)
+            return
+        }
+
+        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            return
+        }
+
+        guard !Self.isInstallingEmergencyTap else { return }
+        Self.isInstallingEmergencyTap = true
+
         DispatchQueue.global(qos: .userInteractive).async {
             // Create event tap for key down events
             let eventMask = (1 << CGEventType.keyDown.rawValue)
@@ -321,7 +364,12 @@ public class TimelineWindowController: NSObject {
                 eventsOfInterest: CGEventMask(eventMask),
                 callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
                     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                        if let tap = TimelineWindowController.emergencyEventTap {
+                        guard TimelineWindowController.hasEmergencyTapPermission() else {
+                            Log.warning("[TIMELINE] Emergency escape tap disabled while permission is unavailable; leaving tap suspended", category: .ui)
+                            return Unmanaged.passUnretained(event)
+                        }
+
+                        if let tap = TimelineWindowController.emergencyEventTap, CFMachPortIsValid(tap) {
                             CGEvent.tapEnable(tap: tap, enable: true)
                         }
                         return Unmanaged.passUnretained(event)
@@ -377,6 +425,7 @@ public class TimelineWindowController: NSObject {
                 },
                 userInfo: nil
             ) else {
+                TimelineWindowController.isInstallingEmergencyTap = false
                 Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
                 return
             }
@@ -396,12 +445,31 @@ public class TimelineWindowController: NSObject {
 
             // Enable the tap
             CGEvent.tapEnable(tap: eventTap, enable: true)
+            TimelineWindowController.isInstallingEmergencyTap = false
 
             Log.info("[TIMELINE] Emergency escape event tap installed on background thread", category: .ui)
 
             // Run the loop (this blocks the thread, keeping it alive)
             CFRunLoopRun()
         }
+    }
+
+    private func suspendEmergencyEscapeTapForPermissionLoss() {
+        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            Log.warning("[TIMELINE] Suspended emergency escape event tap after permission revoke", category: .ui)
+        }
+    }
+
+    private func resumeEmergencyEscapeTapIfNeeded() {
+        guard Self.hasEmergencyTapPermission() else { return }
+
+        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            return
+        }
+
+        setupEmergencyEscapeTap()
     }
 
     /// Update whether a dialog/overlay is open (search, filter, tag submenu, etc.)

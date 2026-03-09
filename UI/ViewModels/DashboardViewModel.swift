@@ -6,6 +6,12 @@ import Database
 import ApplicationServices
 import Dispatch
 
+struct WatchdogCrashReportSummary: Equatable {
+    let fileName: String
+    let fileURL: URL
+    let capturedAt: Date
+}
+
 /// ViewModel for the Dashboard view
 /// Manages weekly app usage statistics from the database
 @MainActor
@@ -55,6 +61,7 @@ public class DashboardViewModel: ObservableObject {
     // Permission warnings
     @Published public var showAccessibilityWarning = false
     @Published public var showScreenRecordingWarning = false
+    @Published var recentWatchdogCrash: WatchdogCrashReportSummary?
 
     // Track user dismissals — re-nag after 30 minutes
     private var accessibilityDismissedUntil: Date?
@@ -62,14 +69,18 @@ public class DashboardViewModel: ObservableObject {
 
     /// How long to suppress a permission warning after the user dismisses it
     private static let dismissSnoozeInterval: TimeInterval = 30 * 60 // 30 minutes
+    nonisolated private static let watchdogCrashRecentWindow: TimeInterval = 7 * 24 * 60 * 60
+    private static let acknowledgedWatchdogCrashReportKey = "acknowledgedWatchdogCrashReportFileName"
 
     // MARK: - Dependencies
 
     private let coordinator: AppCoordinator
+    private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private var cancellables = Set<AnyCancellable>()
     private var refreshTimer: DispatchSourceTimer?
     /// Prevents the 2s poll from clobbering optimistic toggle UI while start/stop is in flight.
     private var isRecordingToggleInFlight = false
+    private var lastTrackedWatchdogCrashBannerFileName: String?
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -261,6 +272,153 @@ public class DashboardViewModel: ObservableObject {
         screenRecordingDismissedUntil = Date().addingTimeInterval(Self.dismissSnoozeInterval)
     }
 
+    public func dismissRecentWatchdogCrash() {
+        acknowledgeRecentWatchdogCrash(action: "dismissed")
+    }
+
+    public func recordRecentWatchdogCrashFeedbackOpened() {
+        guard let report = recentWatchdogCrash else { return }
+        recordWatchdogCrashBannerAction("submit_bug_report_clicked", report: report)
+    }
+
+    public func recordRecentWatchdogCrashDetailsOpened() {
+        guard let report = recentWatchdogCrash else { return }
+        recordWatchdogCrashBannerAction("details_opened", report: report)
+    }
+
+    nonisolated static func makeWatchdogCrashFeedbackLaunchContext(
+        for report: WatchdogCrashReportSummary,
+        now: Date = Date()
+    ) -> FeedbackLaunchContext {
+        FeedbackLaunchContext(
+            source: .watchdogCrashBanner,
+            feedbackType: .bug,
+            prefilledDescription: makeWatchdogCrashFeedbackDescription(for: report, now: now),
+            preferredFocusField: .email
+        )
+    }
+
+    nonisolated static func loadRecentWatchdogCrash(
+        fileManager: FileManager = .default,
+        crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
+        now: Date = Date(),
+        acknowledgedFileName: String? = nil
+    ) -> WatchdogCrashReportSummary? {
+        let directoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .contentModificationDateKey,
+            .creationDateKey
+        ]
+
+        guard let fileURLs = try? fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let prefix = "retrace-emergency-watchdog_auto_quit-"
+
+        let reports = fileURLs.compactMap { fileURL -> WatchdogCrashReportSummary? in
+            let fileName = fileURL.lastPathComponent
+            guard fileName.hasPrefix(prefix), fileURL.pathExtension == "txt" else {
+                return nil
+            }
+
+            let resourceValues = try? fileURL.resourceValues(forKeys: resourceKeys)
+            if resourceValues?.isRegularFile == false {
+                return nil
+            }
+
+            let capturedAt = resourceValues?.contentModificationDate
+                ?? resourceValues?.creationDate
+                ?? parseWatchdogCrashTimestamp(from: fileName)
+                ?? .distantPast
+
+            guard now.timeIntervalSince(capturedAt) <= watchdogCrashRecentWindow else {
+                return nil
+            }
+
+            return WatchdogCrashReportSummary(
+                fileName: fileName,
+                fileURL: fileURL,
+                capturedAt: capturedAt
+            )
+        }
+        .sorted { $0.capturedAt > $1.capturedAt }
+
+        return reports.first { $0.fileName != acknowledgedFileName }
+    }
+
+    nonisolated static func makeWatchdogCrashFeedbackDescription(
+        for _: WatchdogCrashReportSummary,
+        now _: Date = Date()
+    ) -> String {
+        return """
+        Retrace Auto Quit Crash Logging
+
+        Enter any other relevant context here:
+        """
+    }
+
+    nonisolated private static func parseWatchdogCrashTimestamp(from fileName: String) -> Date? {
+        let prefix = "retrace-emergency-watchdog_auto_quit-"
+        let suffix = ".txt"
+
+        guard fileName.hasPrefix(prefix), fileName.hasSuffix(suffix) else {
+            return nil
+        }
+
+        let timestamp = String(fileName.dropFirst(prefix.count).dropLast(suffix.count))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        return formatter.date(from: timestamp)
+    }
+
+    private func refreshRecentWatchdogCrashState(now: Date = Date()) {
+        let acknowledgedFileName = settingsStore.string(forKey: Self.acknowledgedWatchdogCrashReportKey)
+        let report = Self.loadRecentWatchdogCrash(
+            now: now,
+            acknowledgedFileName: acknowledgedFileName
+        )
+
+        recentWatchdogCrash = report
+
+        guard let report, report.fileName != lastTrackedWatchdogCrashBannerFileName else {
+            return
+        }
+
+        lastTrackedWatchdogCrashBannerFileName = report.fileName
+        recordWatchdogCrashBannerAction("banner_shown", report: report, now: now)
+    }
+
+    private func acknowledgeRecentWatchdogCrash(action: String) {
+        guard let report = recentWatchdogCrash else { return }
+        settingsStore.set(report.fileName, forKey: Self.acknowledgedWatchdogCrashReportKey)
+        recordWatchdogCrashBannerAction(action, report: report)
+        recentWatchdogCrash = nil
+    }
+
+    private func recordWatchdogCrashBannerAction(
+        _ action: String,
+        report: WatchdogCrashReportSummary,
+        now: Date = Date()
+    ) {
+        let metadata = Self.jsonMetadata([
+            "action": action,
+            "fileName": report.fileName,
+            "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
+        ])
+        Self.recordMetric(
+            coordinator: coordinator,
+            type: .watchdogCrashBannerAction,
+            metadata: metadata
+        )
+    }
+
     // MARK: - Data Loading
 
     public func loadStatistics() async {
@@ -270,6 +428,7 @@ public class DashboardViewModel: ObservableObject {
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
+        refreshRecentWatchdogCrashState()
 
         do {
             // Calculate last 7 days date range
@@ -774,6 +933,11 @@ public class DashboardViewModel: ObservableObject {
         Task {
             try? await coordinator.recordMetricEvent(metricType: .keyboardShortcut, metadata: shortcut)
         }
+    }
+
+    /// Record a debug-only watchdog hang trigger from the dashboard.
+    public static func recordDebugWatchdogHangTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)
     }
 
     public static func recordDateSearchSubmitted(

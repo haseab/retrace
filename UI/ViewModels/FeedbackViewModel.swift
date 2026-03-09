@@ -83,7 +83,11 @@ public final class FeedbackViewModel: ObservableObject {
 
     // MARK: - Initialization
 
-    public init() {
+    public init(launchContext: FeedbackLaunchContext? = nil) {
+        if let launchContext {
+            feedbackType = launchContext.feedbackType
+            description = launchContext.prefilledDescription ?? ""
+        }
         // Don't load diagnostics on init - load lazily when needed
     }
 
