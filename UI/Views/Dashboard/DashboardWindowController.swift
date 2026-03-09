@@ -136,6 +136,12 @@ public class DashboardWindowController: NSObject {
         Log.info("[DashboardWindowController] bringToFront completed state=\(windowStateSnapshot())", category: .ui)
     }
 
+    /// Show the dashboard window and route to the main dashboard view.
+    public func showDashboard() {
+        show()
+        NotificationCenter.default.post(name: .openDashboard, object: nil)
+    }
+
     /// Update the dashboard window title used for metadata/window-list consumers.
     func updateWindowTitle(_ title: String) {
         window?.title = title

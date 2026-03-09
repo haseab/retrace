@@ -69,7 +69,10 @@ struct RetraceApp: App {
         // Add Dashboard and Timeline to the app menu (top left, after "About Retrace")
         CommandGroup(after: .appInfo) {
             Button("Open Dashboard") {
-                DashboardWindowController.shared.show()
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
+                DashboardWindowController.shared.showDashboard()
             }
             // Note: Global hotkey is registered via HotkeyManager from saved settings
             // Don't add a static .keyboardShortcut here as it would conflict
@@ -89,14 +92,15 @@ struct RetraceApp: App {
 
         CommandMenu("View") {
             Button("Dashboard") {
-                DashboardWindowController.shared.show()
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
+                DashboardWindowController.shared.showDashboard()
             }
-            .keyboardShortcut("1", modifiers: .command)
 
             Button("Changelog") {
                 DashboardWindowController.shared.showChangelog()
             }
-            .keyboardShortcut("2", modifiers: .command)
 
             Button("Timeline") {
                 // Open fullscreen timeline overlay
@@ -108,7 +112,10 @@ struct RetraceApp: App {
             Divider()
 
             Button("Settings") {
-                DashboardWindowController.shared.toggleSettings()
+                if TimelineWindowController.shared.isVisible {
+                    TimelineWindowController.shared.hideToShowDashboard()
+                }
+                DashboardWindowController.shared.showSettings()
             }
             .keyboardShortcut(",", modifiers: .command)
         }

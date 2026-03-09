@@ -1161,7 +1161,12 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openDashboard() {
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+            }
+            DashboardWindowController.shared.showDashboard()
+        }
     }
 
     @objc private func hideDashboardFromMenu() {
