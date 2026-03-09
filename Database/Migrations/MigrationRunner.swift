@@ -99,7 +99,8 @@ actor MigrationRunner {
             V9_SegmentCommentFrameAnchor(),
             V10_SegmentCommentSearchIndex(),
             V11_SegmentCommentLinkCompositeIndex(),
-            V12_FrameMetadata()
+            V12_FrameMetadata(),
+            V13_RemoveInPageURLRects()
         ]
     }
 

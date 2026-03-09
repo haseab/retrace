@@ -24,7 +24,8 @@ Database/
 │   ├── V9_SegmentCommentFrameAnchor.swift
 │   ├── V10_SegmentCommentSearchIndex.swift
 │   ├── V11_SegmentCommentLinkCompositeIndex.swift
-│   └── V12_FrameMetadata.swift
+│   ├── V12_FrameMetadata.swift
+│   └── V13_RemoveInPageURLRects.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations

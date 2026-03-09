@@ -7,27 +7,11 @@ public struct FrameInPageURLRow: Sendable, Equatable {
     public let order: Int
     public let url: String
     public let nodeID: Int
-    public let x: Double
-    public let y: Double
-    public let w: Double
-    public let h: Double
 
-    public init(
-        order: Int,
-        url: String,
-        nodeID: Int,
-        x: Double,
-        y: Double,
-        w: Double,
-        h: Double
-    ) {
+    public init(order: Int, url: String, nodeID: Int) {
         self.order = order
         self.url = url
         self.nodeID = nodeID
-        self.x = x
-        self.y = y
-        self.w = w
-        self.h = h
     }
 }
 
@@ -507,6 +491,7 @@ public actor DatabaseManager: DatabaseProtocol {
         var results: [OCRNodeWithText] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let id = Int(sqlite3_column_int64(statement, 0))
+            let nodeOrder = Int(sqlite3_column_int(statement, 1))
             let textOffset = Int(sqlite3_column_int(statement, 2))
             let textLength = Int(sqlite3_column_int(statement, 3))
             let leftX = sqlite3_column_double(statement, 4)
@@ -537,6 +522,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
             results.append(OCRNodeWithText(
                 id: id,
+                nodeOrder: nodeOrder,
                 frameId: nodeFrameId,
                 x: leftX,
                 y: topY,

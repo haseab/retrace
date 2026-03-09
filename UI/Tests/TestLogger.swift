@@ -188,6 +188,55 @@ final class TimelineRefreshTrimRegressionTests: XCTestCase {
         )
     }
 
+    func testDeferredTrimTracksLatestScrubbedFrameBeforeScrollEnds() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_030_000)
+
+        viewModel.frames = (0..<100).map { offset in
+            makeTimelineFrame(
+                id: Int64(offset + 1),
+                timestamp: baseDate.addingTimeInterval(TimeInterval(offset)),
+                frameIndex: offset,
+                processingStatus: 4
+            )
+        }
+        viewModel.currentIndex = 95
+        viewModel.isActivelyScrolling = true
+
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { limit, _ in
+            XCTAssertEqual(limit, 50)
+            return (100..<112).reversed().map { offset in
+                let timestamp = baseDate.addingTimeInterval(TimeInterval(offset))
+                return self.makeFrameWithVideoInfo(
+                    id: Int64(offset + 1),
+                    timestamp: timestamp,
+                    frameIndex: offset,
+                    processingStatus: 4
+                )
+            }
+        }
+
+        await viewModel.refreshFrameData(navigateToNewest: true)
+
+        XCTAssertEqual(viewModel.frames.count, 112)
+        XCTAssertEqual(viewModel.currentIndex, 111)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 112)
+
+        // Simulate the user continuing to scrub after the trim was deferred.
+        viewModel.currentIndex = 95
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 96)
+
+        viewModel.isActivelyScrolling = false
+
+        XCTAssertEqual(viewModel.frames.count, 100)
+        XCTAssertEqual(viewModel.currentIndex, 83)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 96)
+        XCTAssertEqual(
+            viewModel.currentTimelineFrame?.frame.timestamp,
+            baseDate.addingTimeInterval(95)
+        )
+    }
+
     func testRefreshFrameDataDoesNotForceNewestReloadWhenNavigateToNewestIsFalseAndWindowIsStale() async {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let baseDate = Date(timeIntervalSince1970: 1_700_100_000)

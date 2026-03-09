@@ -95,10 +95,16 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         try await queue.resolveInPageURLMetadataIfPossible(frameID: fixture.frameID.value)
 
         let rows = try await database.getFrameInPageURLRows(frameID: fixture.frameID)
+        let storedNodes = try await database.getNodes(
+            frameID: fixture.frameID,
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
         let clearedMetadata = try await database.getFrameMetadata(frameID: fixture.frameID)
+        let storedNodeID = try XCTUnwrap(storedNodes.first?.id)
         XCTAssertEqual(rows.count, 1)
         XCTAssertEqual(rows.first?.url, "/docs/install")
-        XCTAssertEqual(rows.first?.nodeID, 0)
+        XCTAssertEqual(rows.first?.nodeID, Int(storedNodeID))
         XCTAssertNil(clearedMetadata)
     }
 

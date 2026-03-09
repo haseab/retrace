@@ -393,7 +393,11 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
 /// OCR Node with normalized coordinates (0.0-1.0) and text content
 /// Used for text selection UI layer - compatible with both Rewind and Retrace data
 public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
-    public let id: Int  // nodeOrder from database
+    /// Primary key for stored OCR nodes.
+    /// Live OCR uses a transient in-memory identifier.
+    public let id: Int
+    /// Reading order within the frame.
+    public let nodeOrder: Int
     /// The frame ID this node belongs to (for debugging frame offset issues)
     public let frameId: Int64
     /// Normalized X coordinate (0.0-1.0)
@@ -407,8 +411,18 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
     /// The text content of this node
     public let text: String
 
-    public init(id: Int, frameId: Int64, x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, text: String) {
+    public init(
+        id: Int,
+        nodeOrder: Int? = nil,
+        frameId: Int64,
+        x: CGFloat,
+        y: CGFloat,
+        width: CGFloat,
+        height: CGFloat,
+        text: String
+    ) {
         self.id = id
+        self.nodeOrder = nodeOrder ?? id
         self.frameId = frameId
         self.x = x
         self.y = y

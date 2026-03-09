@@ -652,72 +652,19 @@ public actor FrameProcessingQueue {
         "edit", "view", "talk", "history", "jump", "search", "help", "more", "log", "in", "out"
     ]
 
-    private struct InPageURLMetadataRect: Codable, Sendable {
-        let x: Double
-        let y: Double
-        let w: Double
-        let h: Double
-
-        private enum CodingKeys: String, CodingKey {
-            case x
-            case y
-            case w
-            case h
-            case width
-            case height
-        }
-
-        init(x: Double, y: Double, w: Double, h: Double) {
-            self.x = x
-            self.y = y
-            self.w = w
-            self.h = h
-        }
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            x = try container.decode(Double.self, forKey: .x)
-            y = try container.decode(Double.self, forKey: .y)
-
-            if let compactWidth = try container.decodeIfPresent(Double.self, forKey: .w) {
-                w = compactWidth
-            } else {
-                w = try container.decode(Double.self, forKey: .width)
-            }
-
-            if let compactHeight = try container.decodeIfPresent(Double.self, forKey: .h) {
-                h = compactHeight
-            } else {
-                h = try container.decode(Double.self, forKey: .height)
-            }
-        }
-
-        func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(x, forKey: .x)
-            try container.encode(y, forKey: .y)
-            try container.encode(w, forKey: .w)
-            try container.encode(h, forKey: .h)
-        }
-    }
-
     private struct InPageURLMetadataResolvedURL: Codable, Sendable {
         let url: String
         let nid: Int
-        let p: InPageURLMetadataRect
 
         private enum CodingKeys: String, CodingKey {
             case url
             case nid
-            case p
             case nodeid
-            case position
         }
 
-        init(url: String, nid: Int, p: InPageURLMetadataRect) {
+        init(url: String, nid: Int) {
             self.url = url
             self.nid = nid
-            self.p = p
         }
 
         init(from decoder: Decoder) throws {
@@ -730,18 +677,12 @@ public actor FrameProcessingQueue {
                 nid = try container.decode(Int.self, forKey: .nodeid)
             }
 
-            if let compactPosition = try container.decodeIfPresent(InPageURLMetadataRect.self, forKey: .p) {
-                p = compactPosition
-            } else {
-                p = try container.decode(InPageURLMetadataRect.self, forKey: .position)
-            }
         }
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(url, forKey: .url)
             try container.encode(nid, forKey: .nid)
-            try container.encode(p, forKey: .p)
         }
     }
 
@@ -808,6 +749,7 @@ public actor FrameProcessingQueue {
     }
 
     private struct PreparedInPageOCRNode: Sendable {
+        let nodeID: Int
         let nodeOrder: Int
         let normalizedText: String
         let tokenSet: Set<String>
@@ -958,11 +900,7 @@ public actor FrameProcessingQueue {
             FrameInPageURLRow(
                 order: index,
                 url: Self.compactInPageURL(resolved.url, pageURL: payload.pageurl),
-                nodeID: resolved.nid,
-                x: resolved.p.x,
-                y: resolved.p.y,
-                w: resolved.p.w,
-                h: resolved.p.h
+                nodeID: resolved.nid
             )
         }
 
@@ -995,6 +933,13 @@ public actor FrameProcessingQueue {
                 return nil
             }
 
+            let nodeID: Int
+            if let rawNodeID = entry.node.id,
+               let resolvedNodeID = Int(exactly: rawNodeID) {
+                nodeID = resolvedNodeID
+            } else {
+                nodeID = entry.node.nodeOrder
+            }
             let nodeOrder = entry.node.nodeOrder
             let normalizedX = clampInPageCoordinate(Double(entry.node.bounds.origin.x) / Double(frameWidth))
             let normalizedY = clampInPageCoordinate(Double(entry.node.bounds.origin.y) / Double(frameHeight))
@@ -1005,6 +950,7 @@ public actor FrameProcessingQueue {
             }
 
             return PreparedInPageOCRNode(
+                nodeID: nodeID,
                 nodeOrder: nodeOrder,
                 normalizedText: normalizedText,
                 tokenSet: tokenSet,
@@ -1043,7 +989,7 @@ public actor FrameProcessingQueue {
             var bestScore = Int.min
 
             for node in preparedNodes {
-                let usageCount = assignedNodeUseCount[node.nodeOrder, default: 0]
+                let usageCount = assignedNodeUseCount[node.nodeID, default: 0]
                 guard usageCount < inPageURLNodeReuseLimit else { continue }
 
                 let score = inPageURLMatchScore(
@@ -1064,23 +1010,16 @@ public actor FrameProcessingQueue {
             let minimumScore = inPageURLMinimumScore(forCandidateTokenCount: candidateTokens.count)
             guard bestScore >= minimumScore else { continue }
 
-            let rect = InPageURLMetadataRect(
-                x: roundedInPageCoordinate(bestNode.x),
-                y: roundedInPageCoordinate(bestNode.y),
-                w: roundedInPageCoordinate(bestNode.width),
-                h: roundedInPageCoordinate(bestNode.height)
-            )
-            let dedupeKey = "\(bestNode.nodeOrder)|\(url)|\(rect.x)|\(rect.y)|\(rect.w)|\(rect.h)"
+            let dedupeKey = "\(bestNode.nodeID)|\(url)"
             guard seenResolvedKeys.insert(dedupeKey).inserted else { continue }
 
             resolved.append(
                 InPageURLMetadataResolvedURL(
                     url: url,
-                    nid: bestNode.nodeOrder,
-                    p: rect
+                    nid: bestNode.nodeID
                 )
             )
-            assignedNodeUseCount[bestNode.nodeOrder, default: 0] += 1
+            assignedNodeUseCount[bestNode.nodeID, default: 0] += 1
         }
 
         return resolved

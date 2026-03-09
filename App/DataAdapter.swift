@@ -4901,6 +4901,7 @@ public actor DataAdapter {
 
     private func parseOCRNodeFromRow(statement: OpaquePointer) -> OCRNodeWithText? {
         let id = Int(sqlite3_column_int64(statement, 0))
+        let nodeOrder = Int(sqlite3_column_int(statement, 1))
         let textOffset = Int(sqlite3_column_int(statement, 2))
         let textLength = Int(sqlite3_column_int(statement, 3))
         let leftX = sqlite3_column_double(statement, 4)
@@ -4930,6 +4931,7 @@ public actor DataAdapter {
 
         return OCRNodeWithText(
             id: id,
+            nodeOrder: nodeOrder,
             frameId: frameId,
             x: leftX,
             y: topY,

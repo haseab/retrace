@@ -442,6 +442,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                         frameLoadError = false
                     }
                 }
+
+                updateDeferredTrimAnchorForCurrentSelectionIfNeeded()
             }
         }
     }
@@ -8275,33 +8277,66 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private static func hyperlinkMatchesFromStoredRows(
+    nonisolated static func hyperlinkMatchesFromStoredRows(
         _ rows: [AppCoordinator.FrameInPageURLRow],
         nodes: [OCRNodeWithText]
     ) -> [OCRHyperlinkMatch] {
         guard !rows.isEmpty else { return [] }
-        let nodesByID = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+        var nodesByID: [Int: OCRNodeWithText] = [:]
+        nodesByID.reserveCapacity(nodes.count)
+        var nodesByNodeOrder: [Int: OCRNodeWithText] = [:]
+        nodesByNodeOrder.reserveCapacity(nodes.count)
+        var duplicateNodeIDs: [Int] = []
+        var loggedDuplicateNodeIDs: Set<Int> = []
+        loggedDuplicateNodeIDs.reserveCapacity(min(nodes.count, 8))
+
+        for node in nodes {
+            if nodesByID[node.id] == nil {
+                nodesByID[node.id] = node
+            } else if loggedDuplicateNodeIDs.insert(node.id).inserted {
+                duplicateNodeIDs.append(node.id)
+            }
+
+            if nodesByNodeOrder[node.nodeOrder] == nil {
+                nodesByNodeOrder[node.nodeOrder] = node
+            }
+        }
+
+        if !duplicateNodeIDs.isEmpty {
+            let sampleIDs = duplicateNodeIDs.prefix(3).map(String.init).joined(separator: ", ")
+            let frameIDDescription = nodes.first.map { String($0.frameId) } ?? "unknown"
+            Log.warning(
+                "[HyperlinkMap] Duplicate OCR node IDs for frame \(frameIDDescription); duplicates=\(duplicateNodeIDs.count); sampleIDs=[\(sampleIDs)]. Using first occurrence.",
+                category: .ui
+            )
+        }
+
         var parsedMatches: [OCRHyperlinkMatch] = []
         parsedMatches.reserveCapacity(rows.count)
         var seenKeys: Set<String> = []
         seenKeys.reserveCapacity(rows.count)
 
         for row in rows {
-            let width = CGFloat(row.w)
-            let height = CGFloat(row.h)
+            guard let resolvedNode = nodesByID[row.nodeID] ?? nodesByNodeOrder[row.nodeID] else {
+                continue
+            }
+            let x = resolvedNode.x
+            let y = resolvedNode.y
+            let width = resolvedNode.width
+            let height = resolvedNode.height
             guard width > 0, height > 0 else { continue }
 
-            let nodeText = nodesByID[row.nodeID]?.text ?? row.url
+            let nodeText = resolvedNode.text
             let highlightEndIndex = max(nodeText.count, 1)
-            let key = "\(row.nodeID)|\(row.url)|\(row.x)|\(row.y)|\(row.w)|\(row.h)"
+            let key = "\(row.order)|\(row.nodeID)|\(row.url)"
             guard seenKeys.insert(key).inserted else { continue }
 
             parsedMatches.append(
                 OCRHyperlinkMatch(
                     id: key,
                     nodeID: row.nodeID,
-                    x: CGFloat(row.x),
-                    y: CGFloat(row.y),
+                    x: x,
+                    y: y,
                     width: width,
                     height: height,
                     url: row.url,
@@ -11793,6 +11828,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             reason: "deferred.\(trigger)",
             allowDeferral: false
         )
+    }
+
+    private func updateDeferredTrimAnchorForCurrentSelectionIfNeeded() {
+        guard isActivelyScrolling, deferredTrimDirection == .newer else { return }
+        guard let currentFrame = currentTimelineFrame?.frame else { return }
+
+        deferredTrimAnchorFrameID = currentFrame.id
+        deferredTrimAnchorTimestamp = currentFrame.timestamp
     }
 
     /// Trim the window if it exceeds max frames

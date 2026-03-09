@@ -170,19 +170,11 @@ public actor AppCoordinator {
         public let order: Int
         public let url: String
         public let nodeID: Int
-        public let x: Double
-        public let y: Double
-        public let w: Double
-        public let h: Double
 
-        public init(order: Int, url: String, nodeID: Int, x: Double, y: Double, w: Double, h: Double) {
+        public init(order: Int, url: String, nodeID: Int) {
             self.order = order
             self.url = url
             self.nodeID = nodeID
-            self.x = x
-            self.y = y
-            self.w = w
-            self.h = h
         }
     }
 
@@ -2315,11 +2307,7 @@ public actor AppCoordinator {
             Database.FrameInPageURLRow(
                 order: $0.order,
                 url: $0.url,
-                nodeID: $0.nodeID,
-                x: $0.x,
-                y: $0.y,
-                w: $0.w,
-                h: $0.h
+                nodeID: $0.nodeID
             )
         }
         try await services.database.replaceFrameInPageURLData(
@@ -2335,11 +2323,7 @@ public actor AppCoordinator {
             FrameInPageURLRow(
                 order: $0.order,
                 url: $0.url,
-                nodeID: $0.nodeID,
-                x: $0.x,
-                y: $0.y,
-                w: $0.w,
-                h: $0.h
+                nodeID: $0.nodeID
             )
         }
     }

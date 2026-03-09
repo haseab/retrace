@@ -5,8 +5,6 @@ import Shared
 /// CRUD operations for frame table (Rewind-compatible schema)
 /// Uses: id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus
 enum FrameQueries {
-    private static let inPageURLCoordinateScale: Double = 1_000.0
-
     // MARK: - Insert
 
     /// Insert a new frame and return the auto-generated ID
@@ -194,7 +192,7 @@ enum FrameQueries {
     static func getInPageURLRows(db: OpaquePointer, frameId: Int64) throws -> [FrameInPageURLRow] {
         try ensureInPageURLSchema(db: db)
         let sql = """
-            SELECT r.ord, t.url, r.nid, r.x1000, r.y1000, r.w1000, r.h1000
+            SELECT r.ord, t.url, r.nid
             FROM frame_in_page_url r
             INNER JOIN in_page_url_text t
                 ON t.id = r.urlId
@@ -219,11 +217,7 @@ enum FrameQueries {
                 FrameInPageURLRow(
                     order: Int(sqlite3_column_int64(statement, 0)),
                     url: getTextOrNil(statement!, 1) ?? "",
-                    nodeID: Int(sqlite3_column_int64(statement, 2)),
-                    x: unscaleInPageCoordinate(sqlite3_column_int64(statement, 3)),
-                    y: unscaleInPageCoordinate(sqlite3_column_int64(statement, 4)),
-                    w: unscaleInPageCoordinate(sqlite3_column_int64(statement, 5)),
-                    h: unscaleInPageCoordinate(sqlite3_column_int64(statement, 6))
+                    nodeID: Int(sqlite3_column_int64(statement, 2))
                 )
             )
         }
@@ -274,7 +268,7 @@ enum FrameQueries {
             videoCurrentTime: videoCurrentTime
         )
     }
-    static func ensureInPageURLSchema(db: OpaquePointer) throws {
+    private static func ensureInPageURLFrameColumns(db: OpaquePointer) throws {
         if !(try hasColumn(db: db, table: "frame", column: "mousePosition")) {
             try executeSQL(db: db, sql: "ALTER TABLE frame ADD COLUMN mousePosition TEXT;")
         }
@@ -284,6 +278,10 @@ enum FrameQueries {
         if !(try hasColumn(db: db, table: "frame", column: "videoCurrentTime")) {
             try executeSQL(db: db, sql: "ALTER TABLE frame ADD COLUMN videoCurrentTime REAL;")
         }
+    }
+
+    static func ensureInPageURLSchema(db: OpaquePointer) throws {
+        try ensureInPageURLFrameColumns(db: db)
 
         let usesLegacyInlineRows = try usesLegacyInPageURLRowStorage(db: db)
         let usesSharedRowDefinitions: Bool
@@ -292,8 +290,9 @@ enum FrameQueries {
         } else {
             usesSharedRowDefinitions = try usesSharedInPageURLRowDefinitionStorage(db: db)
         }
+        let usesURLTextWithRects = try usesURLTextInPageURLStorageWithRects(db: db)
 
-        if usesLegacyInlineRows || usesSharedRowDefinitions {
+        if usesLegacyInlineRows || usesSharedRowDefinitions || usesURLTextWithRects {
             let managesOwnTransaction = sqlite3_get_autocommit(db) != 0
             if managesOwnTransaction {
                 try beginTransaction(db: db)
@@ -301,8 +300,10 @@ enum FrameQueries {
             do {
                 if usesLegacyInlineRows {
                     try migrateLegacyInPageURLRowsToURLTextStorage(db: db)
-                } else {
+                } else if usesSharedRowDefinitions {
                     try migrateSharedInPageURLRowsToURLTextStorage(db: db)
+                } else {
+                    try migrateURLTextInPageURLRowsToNodeOnlyStorage(db: db)
                 }
                 try dropObsoleteInPageURLArtifacts(db: db)
                 if managesOwnTransaction {
@@ -344,8 +345,8 @@ enum FrameQueries {
         rows: [FrameInPageURLRow]
     ) throws {
         let insertMappingSQL = """
-            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid, x1000, y1000, w1000, h1000)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            VALUES (?, ?, ?, ?);
             """
         let insertURLTextSQL = """
             INSERT OR IGNORE INTO in_page_url_text (url)
@@ -394,10 +395,6 @@ enum FrameQueries {
             sqlite3_bind_int64(insertMappingStatement, 2, Int64(row.order))
             sqlite3_bind_int64(insertMappingStatement, 3, urlID)
             sqlite3_bind_int64(insertMappingStatement, 4, Int64(row.nodeID))
-            sqlite3_bind_int64(insertMappingStatement, 5, scaleInPageCoordinate(row.x))
-            sqlite3_bind_int64(insertMappingStatement, 6, scaleInPageCoordinate(row.y))
-            sqlite3_bind_int64(insertMappingStatement, 7, scaleInPageCoordinate(row.w))
-            sqlite3_bind_int64(insertMappingStatement, 8, scaleInPageCoordinate(row.h))
 
             guard sqlite3_step(insertMappingStatement) == SQLITE_DONE else {
                 throw DatabaseError.queryFailed(query: insertMappingSQL, underlying: String(cString: sqlite3_errmsg(db)))
@@ -491,7 +488,7 @@ enum FrameQueries {
         return try hasColumn(db: db, table: "frame_in_page_url", column: "rowDefId")
     }
 
-    private static func usesURLTextInPageURLStorage(db: OpaquePointer) throws -> Bool {
+    private static func usesURLTextInPageURLStorageWithRects(db: OpaquePointer) throws -> Bool {
         guard try tableExists(db: db, table: "frame_in_page_url"),
               try tableExists(db: db, table: "in_page_url_text")
         else {
@@ -499,10 +496,26 @@ enum FrameQueries {
         }
 
         return try hasColumn(db: db, table: "frame_in_page_url", column: "urlId")
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "nid"))
             && (try hasColumn(db: db, table: "frame_in_page_url", column: "x1000"))
             && (try hasColumn(db: db, table: "frame_in_page_url", column: "y1000"))
             && (try hasColumn(db: db, table: "frame_in_page_url", column: "w1000"))
             && (try hasColumn(db: db, table: "frame_in_page_url", column: "h1000"))
+    }
+
+    private static func usesURLTextInPageURLStorageWithoutRects(db: OpaquePointer) throws -> Bool {
+        guard try tableExists(db: db, table: "frame_in_page_url"),
+              try tableExists(db: db, table: "in_page_url_text")
+        else {
+            return false
+        }
+
+        return try hasColumn(db: db, table: "frame_in_page_url", column: "urlId")
+            && (try hasColumn(db: db, table: "frame_in_page_url", column: "nid"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "x1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "y1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "w1000"))
+            && !(try hasColumn(db: db, table: "frame_in_page_url", column: "h1000"))
     }
 
     private static func createURLTextInPageURLSchema(db: OpaquePointer) throws {
@@ -518,10 +531,6 @@ enum FrameQueries {
                 ord INTEGER NOT NULL,
                 urlId INTEGER NOT NULL,
                 nid INTEGER NOT NULL,
-                x1000 INTEGER NOT NULL,
-                y1000 INTEGER NOT NULL,
-                w1000 INTEGER NOT NULL,
-                h1000 INTEGER NOT NULL,
                 PRIMARY KEY (frameId, ord),
                 FOREIGN KEY (frameId) REFERENCES frame(id) ON DELETE CASCADE,
                 FOREIGN KEY (urlId) REFERENCES in_page_url_text(id)
@@ -564,16 +573,12 @@ enum FrameQueries {
             FROM frame_in_page_url_legacy;
             """
         let insertRowsSQL = """
-            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid, x1000, y1000, w1000, h1000)
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
             SELECT
                 legacy.frameId,
                 legacy.ord,
                 texts.id,
-                legacy.nid,
-                CAST(ROUND(legacy.x * 1000.0) AS INTEGER),
-                CAST(ROUND(legacy.y * 1000.0) AS INTEGER),
-                CAST(ROUND(legacy.w * 1000.0) AS INTEGER),
-                CAST(ROUND(legacy.h * 1000.0) AS INTEGER)
+                legacy.nid
             FROM frame_in_page_url_legacy legacy
             INNER JOIN in_page_url_text texts
                 ON texts.url = legacy.url;
@@ -599,16 +604,12 @@ enum FrameQueries {
             FROM in_page_url_row_def_legacy;
             """
         let insertRowsSQL = """
-            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid, x1000, y1000, w1000, h1000)
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
             SELECT
                 legacy.frameId,
                 legacy.ord,
                 texts.id,
-                legacy.nid,
-                defs.x1000,
-                defs.y1000,
-                defs.w1000,
-                defs.h1000
+                legacy.nid
             FROM frame_in_page_url_legacy legacy
             INNER JOIN in_page_url_row_def_legacy defs
                 ON defs.id = legacy.rowDefId
@@ -622,12 +623,30 @@ enum FrameQueries {
         try executeSQL(db: db, sql: "DROP TABLE IF EXISTS in_page_url_row_def_legacy;")
     }
 
+    private static func migrateURLTextInPageURLRowsToNodeOnlyStorage(db: OpaquePointer) throws {
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+        try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;")
+        try executeSQL(db: db, sql: "ALTER TABLE frame_in_page_url RENAME TO frame_in_page_url_legacy;")
+        try createURLTextInPageURLSchema(db: db)
+
+        let insertRowsSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
+            SELECT frameId, ord, urlId, nid
+            FROM frame_in_page_url_legacy;
+            """
+
+        try executeSQL(db: db, sql: insertRowsSQL)
+        try executeSQL(db: db, sql: "DROP TABLE IF EXISTS frame_in_page_url_legacy;")
+    }
+
     private static func dropObsoleteInPageURLArtifacts(db: OpaquePointer) throws {
         try executeSQL(db: db, sql: "DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_row_def;")
         try executeSQL(db: db, sql: "DROP INDEX IF EXISTS idx_frame_in_page_url_frameId;")
         try executeSQL(db: db, sql: "DROP INDEX IF EXISTS idx_frame_in_page_url_rowDefId;")
 
-        if try usesURLTextInPageURLStorage(db: db) {
+        let usesURLTextStorageWithRects = try usesURLTextInPageURLStorageWithRects(db: db)
+        let usesURLTextStorageWithoutRects = try usesURLTextInPageURLStorageWithoutRects(db: db)
+        if usesURLTextStorageWithRects || usesURLTextStorageWithoutRects {
             try executeSQL(db: db, sql: "DROP TABLE IF EXISTS in_page_url_row_def;")
         }
     }
@@ -667,14 +686,6 @@ enum FrameQueries {
         sqlite3_reset(statement)
         sqlite3_clear_bindings(statement)
         sqlite3_bind_text(statement, 1, text, -1, SQLITE_TRANSIENT)
-    }
-
-    private static func scaleInPageCoordinate(_ value: Double) -> Int64 {
-        Int64((value * inPageURLCoordinateScale).rounded())
-    }
-
-    private static func unscaleInPageCoordinate(_ value: Int64) -> Double {
-        Double(value) / inPageURLCoordinateScale
     }
 
     private static func executeSQL(db: OpaquePointer, sql: String) throws {

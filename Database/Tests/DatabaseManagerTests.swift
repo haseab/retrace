@@ -406,11 +406,7 @@ final class DatabaseManagerTests: XCTestCase {
             FrameInPageURLRow(
                 order: 0,
                 url: "https://example.com/path",
-                nodeID: largeNodeID,
-                x: 0.1,
-                y: 0.2,
-                w: 0.3,
-                h: 0.04
+                nodeID: largeNodeID
             )
         ]
 
@@ -452,22 +448,14 @@ final class DatabaseManagerTests: XCTestCase {
             FrameInPageURLRow(
                 order: 0,
                 url: "/shared/path",
-                nodeID: 101,
-                x: 0.125,
-                y: 0.25,
-                w: 0.375,
-                h: 0.05
+                nodeID: 101
             )
         ]
         let secondRows = [
             FrameInPageURLRow(
                 order: 0,
                 url: "/shared/path",
-                nodeID: 202,
-                x: 0.625,
-                y: 0.5,
-                w: 0.25,
-                h: 0.08
+                nodeID: 202
             )
         ]
 
@@ -476,18 +464,8 @@ final class DatabaseManagerTests: XCTestCase {
 
         let storedFirstRows = try await database.getFrameInPageURLRows(frameID: firstFrameID)
         let storedSecondRows = try await database.getFrameInPageURLRows(frameID: secondFrameID)
-        XCTAssertEqual(storedFirstRows.first?.nodeID, 101)
-        XCTAssertEqual(storedSecondRows.first?.nodeID, 202)
-        if let storedFirstRow = storedFirstRows.first {
-            XCTAssertEqual(storedFirstRow.x, 0.125, accuracy: 0.0001)
-        } else {
-            XCTFail("Expected first stored in-page URL row")
-        }
-        if let storedSecondRow = storedSecondRows.first {
-            XCTAssertEqual(storedSecondRow.x, 0.625, accuracy: 0.0001)
-        } else {
-            XCTFail("Expected second stored in-page URL row")
-        }
+        XCTAssertEqual(storedFirstRows, firstRows)
+        XCTAssertEqual(storedSecondRows, secondRows)
 
         let sharedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
         let distinctURLReferenceCount = try await fetchInt64(
@@ -553,14 +531,6 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(storedRows.count, 1)
         XCTAssertEqual(storedRows.first?.url, "/legacy/shared")
         XCTAssertEqual(storedRows.first?.nodeID, 77)
-        if let storedRow = storedRows.first {
-            XCTAssertEqual(storedRow.x, 0.111, accuracy: 0.0001)
-            XCTAssertEqual(storedRow.y, 0.222, accuracy: 0.0001)
-            XCTAssertEqual(storedRow.w, 0.333, accuracy: 0.0001)
-            XCTAssertEqual(storedRow.h, 0.044, accuracy: 0.0001)
-        } else {
-            XCTFail("Expected migrated in-page URL row")
-        }
 
         let migratedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
         let migratedFrameRowCount = try await fetchInt64("SELECT COUNT(*) FROM frame_in_page_url;")
@@ -678,16 +648,6 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(migratedSecondRows.first?.url, "/shared/path")
         XCTAssertEqual(migratedFirstRows.first?.nodeID, 101)
         XCTAssertEqual(migratedSecondRows.first?.nodeID, 202)
-        if let migratedFirstRow = migratedFirstRows.first {
-            XCTAssertEqual(migratedFirstRow.x, 0.125, accuracy: 0.0001)
-        } else {
-            XCTFail("Expected migrated first in-page URL row")
-        }
-        if let migratedSecondRow = migratedSecondRows.first {
-            XCTAssertEqual(migratedSecondRow.x, 0.625, accuracy: 0.0001)
-        } else {
-            XCTFail("Expected migrated second in-page URL row")
-        }
 
         let migratedURLTextCount = try await fetchInt64("SELECT COUNT(*) FROM in_page_url_text;")
         let migratedFrameRowCount = try await fetchInt64("SELECT COUNT(*) FROM frame_in_page_url;")
@@ -710,6 +670,90 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(urlIDIndexCount, 1)
         XCTAssertEqual(frameIDIndexCount, 0)
         XCTAssertEqual(rowDefTableCount, 0)
+    }
+
+    func testMigrationRunner_V13RemovesRectColumnsFromExistingV12Table() async throws {
+        let frameID = try await insertTestFrame(browserURL: "https://example.com/v12-upgrade")
+        let db = try await databaseConnection()
+
+        try await executeRawSQL("""
+            DELETE FROM schema_migrations;
+            INSERT INTO schema_migrations (version, applied_at) VALUES (12, 0);
+            DROP TRIGGER IF EXISTS trg_frame_in_page_url_cleanup_text;
+            DROP TABLE IF EXISTS frame_in_page_url;
+            DROP TABLE IF EXISTS in_page_url_text;
+            CREATE TABLE in_page_url_text (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE frame_in_page_url (
+                frameId INTEGER NOT NULL,
+                ord INTEGER NOT NULL,
+                urlId INTEGER NOT NULL,
+                nid INTEGER NOT NULL,
+                x1000 INTEGER NOT NULL,
+                y1000 INTEGER NOT NULL,
+                w1000 INTEGER NOT NULL,
+                h1000 INTEGER NOT NULL,
+                PRIMARY KEY (frameId, ord),
+                FOREIGN KEY (frameId) REFERENCES frame(id) ON DELETE CASCADE,
+                FOREIGN KEY (urlId) REFERENCES in_page_url_text(id)
+            );
+            CREATE INDEX idx_frame_in_page_url_urlId
+            ON frame_in_page_url(urlId);
+            CREATE TRIGGER trg_frame_in_page_url_cleanup_text
+            AFTER DELETE ON frame_in_page_url
+            BEGIN
+                DELETE FROM in_page_url_text
+                WHERE id = OLD.urlId
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM frame_in_page_url
+                      WHERE urlId = OLD.urlId
+                  );
+            END;
+            INSERT INTO in_page_url_text (id, url)
+            VALUES (1, '/v12/path');
+            """)
+
+        var insertStatement: OpaquePointer?
+        defer { sqlite3_finalize(insertStatement) }
+
+        let insertSQL = """
+            INSERT INTO frame_in_page_url (frameId, ord, urlId, nid, x1000, y1000, w1000, h1000)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """
+        XCTAssertEqual(sqlite3_prepare_v2(db, insertSQL, -1, &insertStatement, nil), SQLITE_OK)
+        sqlite3_bind_int64(insertStatement, 1, frameID.value)
+        sqlite3_bind_int64(insertStatement, 2, 0)
+        sqlite3_bind_int64(insertStatement, 3, 1)
+        sqlite3_bind_int64(insertStatement, 4, 321)
+        sqlite3_bind_int64(insertStatement, 5, 125)
+        sqlite3_bind_int64(insertStatement, 6, 250)
+        sqlite3_bind_int64(insertStatement, 7, 375)
+        sqlite3_bind_int64(insertStatement, 8, 50)
+        XCTAssertEqual(sqlite3_step(insertStatement), SQLITE_DONE)
+
+        let runner = MigrationRunner(db: db)
+        try await runner.runMigrations()
+
+        let currentVersion = try await fetchInt64("SELECT MAX(version) FROM schema_migrations;")
+        let columnNames = try await tableColumnNames("frame_in_page_url")
+        let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
+
+        XCTAssertEqual(currentVersion, 13)
+        XCTAssertTrue(columnNames.contains("frameId"))
+        XCTAssertTrue(columnNames.contains("ord"))
+        XCTAssertTrue(columnNames.contains("urlId"))
+        XCTAssertTrue(columnNames.contains("nid"))
+        XCTAssertFalse(columnNames.contains("x1000"))
+        XCTAssertFalse(columnNames.contains("y1000"))
+        XCTAssertFalse(columnNames.contains("w1000"))
+        XCTAssertFalse(columnNames.contains("h1000"))
+        XCTAssertEqual(
+            storedRows,
+            [FrameInPageURLRow(order: 0, url: "/v12/path", nodeID: 321)]
+        )
     }
 
     func testGetFramesByTimeRange() async throws {
@@ -1497,5 +1541,29 @@ final class DatabaseManagerTests: XCTestCase {
         }
 
         return sqlite3_column_int64(statement, 0)
+    }
+
+    private func tableColumnNames(_ table: String) async throws -> [String] {
+        let db = try await databaseConnection()
+        let sql = "PRAGMA table_info(\(table));"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw NSError(
+                domain: "DatabaseManagerTests",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(db))]
+            )
+        }
+
+        var columnNames: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = sqlite3_column_text(statement, 1).map({ String(cString: $0) }) {
+                columnNames.append(name)
+            }
+        }
+
+        return columnNames
     }
 }
