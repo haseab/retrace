@@ -243,7 +243,7 @@ struct PrivateWindowDetector {
         switch bundleID {
         case "com.google.Chrome", "com.google.Chrome.canary", "com.microsoft.edgemac",
              "com.brave.Browser", "org.chromium.Chromium", "com.vivaldi.Vivaldi",
-             "company.thebrowser.dia", "com.aspect.browser":
+             "company.thebrowser.dia":
             return checkChromiumPrivate(element)
 
         case "com.apple.Safari", "com.apple.SafariTechnologyPreview":

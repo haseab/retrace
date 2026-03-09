@@ -2764,7 +2764,6 @@ public actor AppCoordinator {
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
         "company.thebrowser.dia",
-        "com.aspect.browser",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]
@@ -2779,7 +2778,6 @@ public actor AppCoordinator {
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
         "company.thebrowser.dia",
-        "com.aspect.browser",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]

@@ -15,10 +15,6 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
             AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.dia"),
             "company.thebrowser.dia"
         )
-        XCTAssertEqual(
-            AppCoordinator.inPageURLHostBrowserBundleID(for: "com.aspect.browser"),
-            "com.aspect.browser"
-        )
     }
 
     func testHostBrowserBundleIDMapsChromiumAppShimToHostBrowser() {

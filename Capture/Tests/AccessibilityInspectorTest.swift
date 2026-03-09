@@ -35,7 +35,6 @@ final class AccessibilityInspectorTest: XCTestCase {
         "com.sigmaos.sigmaos",
         "com.cometbrowser.Comet",
         "company.thebrowser.dia",
-        "com.aspect.browser",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
     ]
@@ -50,7 +49,6 @@ final class AccessibilityInspectorTest: XCTestCase {
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
         "company.thebrowser.dia.app.",
-        "com.aspect.browser.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
@@ -121,7 +119,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var lastWindowTitle = ""
         var lastBrowserURL = ""
         var lastAXDocument = ""
-        var lastBodyLinks: [String] = []
+        var lastBodyLinkObservations: [AXLinkObservation] = []
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
@@ -134,19 +132,27 @@ final class AccessibilityInspectorTest: XCTestCase {
                     data.windowTitle != lastWindowTitle ||
                     currentURL != lastBrowserURL ||
                     currentAXDocument != lastAXDocument ||
-                    data.bodyLinks != lastBodyLinks {
+                    data.bodyLinkObservations != lastBodyLinkObservations {
                     log("\n⏱  \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
                     log("🪟 Window Title:   \(data.windowTitle ?? "(none)")")
                     log("🌐 URL:            \(data.browserURL ?? "(URL not found)")")
                     log("🧪 AXDocument:     \(data.focusedWindowAXDocument ?? "(none)")")
-                    log("🔗 AX Links:       \(data.bodyLinks.count)")
-                    if data.bodyLinks.isEmpty {
+                    log("🔗 AX Links:       \(data.uniqueBodyLinks.count) unique URLs (\(data.bodyLinkObservations.count) observations)")
+                    if data.bodyLinkObservations.isEmpty {
                         log("   (none)")
                     } else {
-                        for (index, link) in data.bodyLinks.enumerated() {
-                            log("   [\(index + 1)] \(link)")
+                        for (index, observation) in data.bodyLinkObservations.enumerated() {
+                            log("   [\(index + 1)] \(observation.url)")
+                            log("       attr=\(observation.attribute) role=\(observation.role)\(observation.subrole.map { " subrole=\($0)" } ?? "") inWebArea=\(observation.isWithinWebArea ? "yes" : "no") depth=\(observation.depth)")
+                            log("       path=\(observation.path)")
+                            if let title = observation.titlePreview {
+                                log("       title=\(title)")
+                            }
+                            if let source = observation.sourceTextPreview {
+                                log("       source=\(source)")
+                            }
                         }
                     }
                     if let method = data.urlExtractionMethod {
@@ -163,7 +169,7 @@ final class AccessibilityInspectorTest: XCTestCase {
                     lastWindowTitle = data.windowTitle ?? ""
                     lastBrowserURL = currentURL
                     lastAXDocument = currentAXDocument
-                    lastBodyLinks = data.bodyLinks
+                    lastBodyLinkObservations = data.bodyLinkObservations
                 }
             }
 
@@ -195,7 +201,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         var urlMethod: String?
         var chromeText: String?
         var focusedWindowAXDocument: String?
-        var bodyLinks: [String] = []
+        var bodyLinkObservations: [AXLinkObservation] = []
 
         // Get focused window
         if let focusedWindow: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
@@ -223,7 +229,7 @@ final class AccessibilityInspectorTest: XCTestCase {
             }
 
             if isBrowserApp(appBundleID) || browserURL != nil {
-                bodyLinks = collectAllLinksInAXTree(focusedWindow)
+                bodyLinkObservations = collectAllLinksInAXTree(focusedWindow)
             }
         }
 
@@ -235,7 +241,7 @@ final class AccessibilityInspectorTest: XCTestCase {
             urlExtractionMethod: urlMethod,
             chromeText: chromeText,
             focusedWindowAXDocument: focusedWindowAXDocument,
-            bodyLinks: bodyLinks
+            bodyLinkObservations: bodyLinkObservations
         )
     }
 
@@ -260,7 +266,6 @@ final class AccessibilityInspectorTest: XCTestCase {
             "com.vivaldi.Vivaldi",
             "com.operasoftware.Opera",
             "company.thebrowser.dia",
-            "com.aspect.browser",
             "company.thebrowser.Browser"  // Arc
         ]
         if browsers.contains(bundleID) {
@@ -666,9 +671,9 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     // MARK: - Full Tree Link Extraction
 
-    private func collectAllLinksInAXTree(_ root: AXUIElement) -> [String] {
-        var links: [String] = []
-        var seenLinks = Set<String>()
+    private func collectAllLinksInAXTree(_ root: AXUIElement) -> [AXLinkObservation] {
+        var observations: [AXLinkObservation] = []
+        var seenObservations = Set<AXLinkObservationKey>()
         var visited = Set<UnsafeRawPointer>()
         var visitedCount = 0
 
@@ -677,13 +682,16 @@ final class AccessibilityInspectorTest: XCTestCase {
             depth: 0,
             maxDepth: 40,
             maxNodes: 20_000,
+            path: [],
+            childIndex: nil,
+            isWithinWebArea: false,
             visited: &visited,
             visitedCount: &visitedCount,
-            links: &links,
-            seenLinks: &seenLinks
+            observations: &observations,
+            seenObservations: &seenObservations
         )
 
-        return links
+        return observations
     }
 
     private func collectLinks(
@@ -691,10 +699,13 @@ final class AccessibilityInspectorTest: XCTestCase {
         depth: Int,
         maxDepth: Int,
         maxNodes: Int,
+        path: [String],
+        childIndex: Int?,
+        isWithinWebArea: Bool,
         visited: inout Set<UnsafeRawPointer>,
         visitedCount: inout Int,
-        links: inout [String],
-        seenLinks: inout Set<String>
+        observations: inout [AXLinkObservation],
+        seenObservations: inout Set<AXLinkObservationKey>
     ) {
         guard depth <= maxDepth, visitedCount < maxNodes else { return }
 
@@ -703,27 +714,46 @@ final class AccessibilityInspectorTest: XCTestCase {
         visited.insert(identity)
         visitedCount += 1
 
-        appendLinkAttribute(kAXURLAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
-        appendLinkAttribute(kAXDocumentAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
-        appendLinkAttribute(kAXValueAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
-        appendLinkAttribute(kAXTitleAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
-        appendLinkAttribute(kAXDescriptionAttribute as CFString, from: element, to: &links, seenLinks: &seenLinks)
-        appendLinkAttribute("AXHelp" as CFString, from: element, to: &links, seenLinks: &seenLinks)
+        let role: String = getAttributeValue(element, attribute: kAXRoleAttribute as CFString) ?? "unknown"
+        let subrole: String? = getAttributeValue(element, attribute: kAXSubroleAttribute as CFString)
+        let titlePreview = makePreview(getAttributeValue(element, attribute: kAXTitleAttribute as CFString) as String?)
+        let currentPathComponent = makePathComponent(role: role, subrole: subrole, childIndex: childIndex)
+        let currentPath = path.isEmpty ? [currentPathComponent] : path + [currentPathComponent]
+        let currentWithinWebArea = isWithinWebArea || role == "AXWebArea"
+
+        let context = AXLinkObservationContext(
+            role: role,
+            subrole: subrole,
+            titlePreview: titlePreview,
+            path: currentPath.joined(separator: " > "),
+            depth: depth,
+            isWithinWebArea: currentWithinWebArea
+        )
+
+        appendLinkAttribute(kAXURLAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        appendLinkAttribute(kAXDocumentAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        appendLinkAttribute(kAXValueAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        appendLinkAttribute(kAXTitleAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        appendLinkAttribute(kAXDescriptionAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        appendLinkAttribute("AXHelp" as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
 
         guard let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) else {
             return
         }
 
-        for child in children {
+        for (childIndex, child) in children.enumerated() {
             collectLinks(
                 in: child,
                 depth: depth + 1,
                 maxDepth: maxDepth,
                 maxNodes: maxNodes,
+                path: currentPath,
+                childIndex: childIndex,
+                isWithinWebArea: currentWithinWebArea,
                 visited: &visited,
                 visitedCount: &visitedCount,
-                links: &links,
-                seenLinks: &seenLinks
+                observations: &observations,
+                seenObservations: &seenObservations
             )
         }
     }
@@ -731,30 +761,98 @@ final class AccessibilityInspectorTest: XCTestCase {
     private func appendLinkAttribute(
         _ attribute: CFString,
         from element: AXUIElement,
-        to links: inout [String],
-        seenLinks: inout Set<String>
+        context: AXLinkObservationContext,
+        to observations: inout [AXLinkObservation],
+        seenObservations: inout Set<AXLinkObservationKey>
     ) {
         if let value: String = getAttributeValue(element, attribute: attribute) {
             for candidate in extractURLCandidates(from: value) {
-                guard seenLinks.insert(candidate).inserted else { continue }
-                links.append(candidate)
+                let observation = AXLinkObservation(
+                    url: candidate,
+                    attribute: attribute as String,
+                    role: context.role,
+                    subrole: context.subrole,
+                    titlePreview: context.titlePreview,
+                    sourceTextPreview: makeSourcePreview(value, extractedURL: candidate),
+                    path: context.path,
+                    depth: context.depth,
+                    isWithinWebArea: context.isWithinWebArea
+                )
+                guard seenObservations.insert(observation.key).inserted else { continue }
+                observations.append(observation)
             }
             return
         }
 
         if let value: URL = getAttributeValue(element, attribute: attribute) {
             let candidate = value.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !candidate.isEmpty, seenLinks.insert(candidate).inserted else { return }
-            links.append(candidate)
+            guard !candidate.isEmpty else { return }
+            let observation = AXLinkObservation(
+                url: candidate,
+                attribute: attribute as String,
+                role: context.role,
+                subrole: context.subrole,
+                titlePreview: context.titlePreview,
+                sourceTextPreview: nil,
+                path: context.path,
+                depth: context.depth,
+                isWithinWebArea: context.isWithinWebArea
+            )
+            guard seenObservations.insert(observation.key).inserted else { return }
+            observations.append(observation)
             return
         }
 
         if let value: NSAttributedString = getAttributeValue(element, attribute: attribute) {
             for candidate in extractURLCandidates(from: value.string) {
-                guard seenLinks.insert(candidate).inserted else { continue }
-                links.append(candidate)
+                let observation = AXLinkObservation(
+                    url: candidate,
+                    attribute: attribute as String,
+                    role: context.role,
+                    subrole: context.subrole,
+                    titlePreview: context.titlePreview,
+                    sourceTextPreview: makeSourcePreview(value.string, extractedURL: candidate),
+                    path: context.path,
+                    depth: context.depth,
+                    isWithinWebArea: context.isWithinWebArea
+                )
+                guard seenObservations.insert(observation.key).inserted else { continue }
+                observations.append(observation)
             }
         }
+    }
+
+    private func makePathComponent(role: String, subrole: String?, childIndex: Int?) -> String {
+        var component = role
+        if let subrole, !subrole.isEmpty {
+            component += "{\(subrole)}"
+        }
+        if let childIndex {
+            component += "[\(childIndex)]"
+        }
+        return component
+    }
+
+    private func makePreview(_ value: String?, limit: Int = 80) -> String? {
+        guard let value else { return nil }
+        let collapsed = value
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !collapsed.isEmpty else { return nil }
+        if collapsed.count <= limit {
+            return collapsed
+        }
+        return String(collapsed.prefix(limit)) + "..."
+    }
+
+    private func makeSourcePreview(_ value: String, extractedURL: String) -> String? {
+        let preview = makePreview(value, limit: 120)
+        guard let preview, preview != extractedURL else {
+            return nil
+        }
+        return preview
     }
 
     private func extractURLCandidates(from text: String) -> [String] {
@@ -915,5 +1013,49 @@ private struct AccessibilityData {
     let urlExtractionMethod: String?
     let chromeText: String?
     let focusedWindowAXDocument: String?
-    let bodyLinks: [String]
+    let bodyLinkObservations: [AXLinkObservation]
+
+    var uniqueBodyLinks: [String] {
+        var seen = Set<String>()
+        var urls: [String] = []
+        for observation in bodyLinkObservations where seen.insert(observation.url).inserted {
+            urls.append(observation.url)
+        }
+        return urls
+    }
+}
+
+private struct AXLinkObservationContext {
+    let role: String
+    let subrole: String?
+    let titlePreview: String?
+    let path: String
+    let depth: Int
+    let isWithinWebArea: Bool
+}
+
+private struct AXLinkObservationKey: Hashable {
+    let url: String
+    let attribute: String
+    let path: String
+}
+
+private struct AXLinkObservation: Hashable {
+    let url: String
+    let attribute: String
+    let role: String
+    let subrole: String?
+    let titlePreview: String?
+    let sourceTextPreview: String?
+    let path: String
+    let depth: Int
+    let isWithinWebArea: Bool
+
+    var key: AXLinkObservationKey {
+        AXLinkObservationKey(
+            url: url,
+            attribute: attribute,
+            path: path
+        )
+    }
 }

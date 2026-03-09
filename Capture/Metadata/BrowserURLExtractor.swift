@@ -354,8 +354,7 @@ actor BrowserURLAppleScriptCoordinator {
 ///
 /// Strategy by browser:
 /// - Safari: AXToolbar → AXTextField (address bar value)
-/// - Dia: AX tree scan for the first AXURL/AXDocument outside the menu bar
-/// - Chrome/Edge/Brave: AXDocument attribute on window, with AXManualAccessibility fallback
+/// - Chromium browsers (Chrome/Edge/Brave/Dia/etc.): AXDocument attribute on window, with AXManualAccessibility fallback
 /// - Arc: AppleScript (Chromium-based but AX tree often incomplete)
 /// - Firefox: Disabled (URL extraction intentionally skipped)
 /// - Generic fallback: Find AXWebArea element and read AXURL attribute
@@ -377,7 +376,6 @@ struct BrowserURLExtractor: Sendable {
         "com.nickvision.browser",      // GNOME Web
         "com.openai.chat",             // ChatGPT desktop app
         "com.cometbrowser.Comet",      // Comet Browser
-        "com.aspect.browser",          // Dia legacy bundle ID
         "org.chromium.Chromium",       // Chromium
         "com.sigmaos.sigmaos",         // SigmaOS
         "com.nicklockwood.Duckduckgo", // DuckDuckGo
@@ -408,7 +406,6 @@ struct BrowserURLExtractor: Sendable {
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
         "company.thebrowser.dia.app.",
-        "com.aspect.browser.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
@@ -426,15 +423,9 @@ struct BrowserURLExtractor: Sendable {
         "com.sigmaos.sigmaos",
         "com.cometbrowser.Comet",
         "company.thebrowser.dia",
-        "com.aspect.browser",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
     ]
-    private static let diaExactBundleIDs: Set<String> = [
-        "company.thebrowser.dia",
-        "com.aspect.browser",
-    ]
-
     private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
         runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout, scriptLabel in
             await runAppleScriptViaProcess(
@@ -472,10 +463,6 @@ struct BrowserURLExtractor: Sendable {
         }
 
         return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
-    }
-
-    static func isDiaBrowser(_ bundleID: String) -> Bool {
-        diaExactBundleIDs.contains(bundleID)
     }
 
     /// Check whether a bundle ID should use Chromium-specific URL extraction.
@@ -531,8 +518,6 @@ struct BrowserURLExtractor: Sendable {
         let url: String?
         if bundleID == "com.apple.Safari" {
             url = getSafariURL(pid: pid)
-        } else if isDiaBrowser(bundleID) {
-            url = getDiaURL(pid: pid)
         } else if isChromiumBrowser(bundleID) {
             url = await getChromiumURL(
                 bundleID: bundleID,
@@ -588,32 +573,6 @@ struct BrowserURLExtractor: Sendable {
         return findURLInElement(window, depth: 0, maxDepth: 10)
     }
 
-    // MARK: - Dia
-
-    /// Extract URL from Dia using AXURL/AXDocument traversal.
-    /// Dia's AX tree can expose the current page URL on elements other than the
-    /// address bar, so prefer a generic AX scan before Chromium heuristics.
-    private static func getDiaURL(pid: pid_t) -> String? {
-        let appRef = AXUIElementCreateApplication(pid)
-        enableAccessibilityIfNeeded(appRef)
-
-        if let window: AXUIElement = getAXAttribute(appRef, kAXFocusedWindowAttribute) {
-            if let url = findURLExcludingMenuBar(window, depth: 0, maxDepth: 15) {
-                return url
-            }
-            if let url = findURLInWebArea(window) {
-                return url
-            }
-            if let url = findURLInElement(window, depth: 0, maxDepth: 8) {
-                return url
-            }
-        }
-
-        return findURLExcludingMenuBar(appRef, depth: 0, maxDepth: 15)
-            ?? findURLInWebArea(appRef)
-            ?? findURLInElement(appRef, depth: 0, maxDepth: 8)
-    }
-
     // MARK: - Chromium-based Browsers (Chrome, Edge, Brave, Vivaldi)
 
     /// Extract URL from Chromium browsers using AXDocument attribute
@@ -658,7 +617,7 @@ struct BrowserURLExtractor: Sendable {
         }
 
         // Method 1: AXDocument attribute on window (most reliable for Chrome)
-        if let url: String = getAXAttribute(window, kAXDocumentAttribute), !url.isEmpty {
+        if let url = getAXURLString(window, kAXDocumentAttribute) {
             return url
         }
 
@@ -669,10 +628,10 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 3: Try focused element's URL attribute
         if let focused: AXUIElement = getAXAttribute(appRef, kAXFocusedUIElementAttribute) {
-            if let url: String = getAXAttribute(focused, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXURLAttribute) {
                 return url
             }
-            if let url: String = getAXAttribute(focused, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1041,10 +1000,10 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 2: Focused element direct URL/document attributes
         if let focused: AXUIElement = getAXAttribute(appRef, kAXFocusedUIElementAttribute) {
-            if let url: String = getAXAttribute(focused, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXURLAttribute) {
                 return url
             }
-            if let url: String = getAXAttribute(focused, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1061,11 +1020,11 @@ struct BrowserURLExtractor: Sendable {
         if let role: String = getAXAttribute(element, kAXRoleAttribute),
            role == "AXWebArea" {
             // Try AXURL attribute (the documented way)
-            if let url: String = getAXAttribute(element, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(element, kAXURLAttribute) {
                 return url
             }
             // Also try AXDocument as fallback
-            if let url: String = getAXAttribute(element, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(element, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1089,7 +1048,7 @@ struct BrowserURLExtractor: Sendable {
         guard depth < maxDepth else { return nil }
 
         // Check for AXURL attribute
-        if let url: String = getAXAttribute(element, kAXURLAttribute), !url.isEmpty {
+        if let url = getAXURLString(element, kAXURLAttribute) {
             return url
         }
 
@@ -1108,40 +1067,6 @@ struct BrowserURLExtractor: Sendable {
 
         for child in children.prefix(25) {
             if let url = findURLInElement(child, depth: depth + 1, maxDepth: maxDepth) {
-                return url
-            }
-        }
-
-        return nil
-    }
-
-    /// Recursively search for the first AXURL/AXDocument while ignoring menu-bar branches.
-    private static func findURLExcludingMenuBar(_ element: AXUIElement, depth: Int, maxDepth: Int) -> String? {
-        guard depth < maxDepth else { return nil }
-
-        if let role: String = getAXAttribute(element, kAXRoleAttribute),
-           role == kAXMenuBarRole as String {
-            return nil
-        }
-
-        if let url: String = getAXAttribute(element, kAXURLAttribute),
-           !url.isEmpty,
-           looksLikeURL(url) {
-            return url
-        }
-
-        if let documentURL: String = getAXAttribute(element, kAXDocumentAttribute),
-           !documentURL.isEmpty,
-           looksLikeURL(documentURL) {
-            return documentURL
-        }
-
-        guard let children: [AXUIElement] = getAXAttribute(element, kAXChildrenAttribute) else {
-            return nil
-        }
-
-        for child in children.prefix(40) {
-            if let url = findURLExcludingMenuBar(child, depth: depth + 1, maxDepth: maxDepth) {
                 return url
             }
         }
@@ -1191,6 +1116,40 @@ struct BrowserURLExtractor: Sendable {
     /// Generic helper to get an AX attribute value (String version)
     private static func getAXAttribute<T>(_ element: AXUIElement, _ attribute: String) -> T? {
         return getAXAttribute(element, attribute as CFString)
+    }
+
+    static func normalizedAXURLValue(from value: Any?) -> String? {
+        let rawValue: String?
+
+        switch value {
+        case let string as String:
+            rawValue = string
+        case let url as URL:
+            rawValue = url.absoluteString
+        case let nsURL as NSURL:
+            rawValue = nsURL.absoluteString
+        default:
+            rawValue = nil
+        }
+
+        guard let rawValue else {
+            return nil
+        }
+
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func getAXURLString(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return normalizedAXURLValue(from: value)
+    }
+
+    private static func getAXURLString(_ element: AXUIElement, _ attribute: String) -> String? {
+        return getAXURLString(element, attribute as CFString)
     }
 
     /// Check if a string looks like a URL
