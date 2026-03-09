@@ -71,6 +71,7 @@ public class DashboardViewModel: ObservableObject {
     private static let dismissSnoozeInterval: TimeInterval = 30 * 60 // 30 minutes
     nonisolated private static let watchdogCrashRecentWindow: TimeInterval = 7 * 24 * 60 * 60
     private static let acknowledgedWatchdogCrashReportKey = "acknowledgedWatchdogCrashReportFileName"
+    private static let acknowledgedWatchdogCrashReportKeysKey = "acknowledgedWatchdogCrashReportFileNames"
 
     // MARK: - Dependencies
 
@@ -302,7 +303,7 @@ public class DashboardViewModel: ObservableObject {
         fileManager: FileManager = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
         now: Date = Date(),
-        acknowledgedFileName: String? = nil
+        acknowledgedFileNames: Set<String> = []
     ) -> WatchdogCrashReportSummary? {
         let directoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
         let resourceKeys: Set<URLResourceKey> = [
@@ -349,7 +350,7 @@ public class DashboardViewModel: ObservableObject {
         }
         .sorted { $0.capturedAt > $1.capturedAt }
 
-        return reports.first { $0.fileName != acknowledgedFileName }
+        return reports.first { !acknowledgedFileNames.contains($0.fileName) }
     }
 
     nonisolated static func makeWatchdogCrashFeedbackDescription(
@@ -379,10 +380,10 @@ public class DashboardViewModel: ObservableObject {
     }
 
     private func refreshRecentWatchdogCrashState(now: Date = Date()) {
-        let acknowledgedFileName = settingsStore.string(forKey: Self.acknowledgedWatchdogCrashReportKey)
+        let acknowledgedFileNames = loadAcknowledgedWatchdogCrashFileNames()
         let report = Self.loadRecentWatchdogCrash(
             now: now,
-            acknowledgedFileName: acknowledgedFileName
+            acknowledgedFileNames: acknowledgedFileNames
         )
 
         recentWatchdogCrash = report
@@ -397,9 +398,31 @@ public class DashboardViewModel: ObservableObject {
 
     private func acknowledgeRecentWatchdogCrash(action: String) {
         guard let report = recentWatchdogCrash else { return }
-        settingsStore.set(report.fileName, forKey: Self.acknowledgedWatchdogCrashReportKey)
+        var acknowledgedFileNames = loadAcknowledgedWatchdogCrashFileNames()
+        acknowledgedFileNames.insert(report.fileName)
+        persistAcknowledgedWatchdogCrashFileNames(acknowledgedFileNames)
         recordWatchdogCrashBannerAction(action, report: report)
         recentWatchdogCrash = nil
+    }
+
+    private func loadAcknowledgedWatchdogCrashFileNames() -> Set<String> {
+        var acknowledgedFileNames = Set(
+            settingsStore.stringArray(forKey: Self.acknowledgedWatchdogCrashReportKeysKey) ?? []
+        )
+
+        if let legacyAcknowledgedFileName = settingsStore.string(
+            forKey: Self.acknowledgedWatchdogCrashReportKey
+        ) {
+            acknowledgedFileNames.insert(legacyAcknowledgedFileName)
+        }
+
+        return acknowledgedFileNames
+    }
+
+    private func persistAcknowledgedWatchdogCrashFileNames(_ fileNames: Set<String>) {
+        settingsStore.set(fileNames.sorted(), forKey: Self.acknowledgedWatchdogCrashReportKeysKey)
+        settingsStore.removeObject(forKey: Self.acknowledgedWatchdogCrashReportKey)
+        settingsStore.synchronize()
     }
 
     private func recordWatchdogCrashBannerAction(

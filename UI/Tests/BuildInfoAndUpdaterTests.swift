@@ -151,10 +151,40 @@ final class WatchdogCrashSupportTests: XCTestCase {
             fileManager: fileManager,
             crashReportDirectory: directoryURL.path,
             now: Date(timeIntervalSince1970: 1_773_093_600),
-            acknowledgedFileName: acknowledgedReport.lastPathComponent
+            acknowledgedFileNames: [acknowledgedReport.lastPathComponent]
         )
 
         XCTAssertEqual(result?.fileName, fallbackReport.lastPathComponent)
+    }
+
+    func testLoadRecentWatchdogCrashSkipsEveryAcknowledgedRecentReport() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let firstReport = try createCrashReport(
+            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_100000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_086_400),
+            in: directoryURL
+        )
+        let secondReport = try createCrashReport(
+            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: directoryURL
+        )
+
+        let result = DashboardViewModel.loadRecentWatchdogCrash(
+            fileManager: fileManager,
+            crashReportDirectory: directoryURL.path,
+            now: Date(timeIntervalSince1970: 1_773_093_600),
+            acknowledgedFileNames: [
+                firstReport.lastPathComponent,
+                secondReport.lastPathComponent
+            ]
+        )
+
+        XCTAssertNil(result)
     }
 
     func testWatchdogCrashLaunchContextPrefillsBugReportAndEmailFocus() {
