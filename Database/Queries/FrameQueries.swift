@@ -171,14 +171,16 @@ enum FrameQueries {
         state: FrameInPageURLState?,
         rows: [FrameInPageURLRow]
     ) throws {
+        let sanitizedState = sanitizeInPageURLState(state, frameId: frameId)
+        let sanitizedRows = sanitizeInPageURLRows(rows, frameId: frameId)
         try ensureInPageURLSchema(db: db)
         try beginTransaction(db: db)
         do {
             try deleteInPageURLRows(db: db, frameId: frameId)
-            try updateInPageURLState(db: db, frameId: frameId, state: state)
+            try updateInPageURLState(db: db, frameId: frameId, state: sanitizedState)
 
-            if !rows.isEmpty {
-                try insertInPageURLRows(db: db, frameId: frameId, rows: rows)
+            if !sanitizedRows.isEmpty {
+                try insertInPageURLRows(db: db, frameId: frameId, rows: sanitizedRows)
             }
 
             try commitTransaction(db: db)
@@ -339,10 +341,16 @@ enum FrameQueries {
         }
     }
 
+    private struct SanitizedInPageURLRow {
+        let order: Int64
+        let url: String
+        let nodeID: Int64
+    }
+
     private static func insertInPageURLRows(
         db: OpaquePointer,
         frameId: Int64,
-        rows: [FrameInPageURLRow]
+        rows: [SanitizedInPageURLRow]
     ) throws {
         let insertMappingSQL = """
             INSERT INTO frame_in_page_url (frameId, ord, urlId, nid)
@@ -392,7 +400,7 @@ enum FrameQueries {
             sqlite3_reset(insertMappingStatement)
             sqlite3_clear_bindings(insertMappingStatement)
             sqlite3_bind_int64(insertMappingStatement, 1, frameId)
-            sqlite3_bind_int64(insertMappingStatement, 2, Int64(row.order))
+            sqlite3_bind_int64(insertMappingStatement, 2, row.order)
             sqlite3_bind_int64(insertMappingStatement, 3, urlID)
             sqlite3_bind_int64(insertMappingStatement, 4, Int64(row.nodeID))
 
@@ -688,6 +696,86 @@ enum FrameQueries {
         sqlite3_bind_text(statement, 1, text, -1, SQLITE_TRANSIENT)
     }
 
+    private static func sanitizeInPageURLRows(
+        _ rows: [FrameInPageURLRow],
+        frameId: Int64
+    ) -> [SanitizedInPageURLRow] {
+        guard !rows.isEmpty else { return [] }
+
+        var sanitizedRows: [SanitizedInPageURLRow] = []
+        sanitizedRows.reserveCapacity(rows.count)
+
+        var seenOrders: Set<Int> = []
+        seenOrders.reserveCapacity(rows.count)
+
+        var emptyURLCount = 0
+        var duplicateOrderCount = 0
+
+        for row in rows.sorted(by: { $0.order < $1.order }) {
+            let trimmedURL = row.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedURL.isEmpty else {
+                emptyURLCount += 1
+                continue
+            }
+
+            guard seenOrders.insert(row.order).inserted else {
+                duplicateOrderCount += 1
+                continue
+            }
+
+            sanitizedRows.append(
+                SanitizedInPageURLRow(
+                    order: Int64(row.order),
+                    url: trimmedURL,
+                    nodeID: Int64(row.nodeID)
+                )
+            )
+        }
+
+        let skippedCount = emptyURLCount + duplicateOrderCount
+        if skippedCount > 0 {
+            Log.warning(
+                "[FrameQueries] Skipped \(skippedCount) malformed in-page URL rows for frame \(frameId) (emptyURL=\(emptyURLCount), duplicateOrder=\(duplicateOrderCount))",
+                category: .database
+            )
+        }
+
+        return sanitizedRows
+    }
+
+    private static func sanitizeInPageURLState(
+        _ state: FrameInPageURLState?,
+        frameId: Int64
+    ) -> FrameInPageURLState? {
+        guard let state else { return nil }
+
+        let mousePosition = sanitizePoint(x: state.mouseX, y: state.mouseY)
+        let scrollPosition = sanitizePoint(x: state.scrollX, y: state.scrollY)
+        let videoCurrentTime = sanitizeFiniteValue(state.videoCurrentTime)
+
+        let droppedMousePosition = (state.mouseX != nil || state.mouseY != nil) && mousePosition == nil
+        let droppedScrollPosition = (state.scrollX != nil || state.scrollY != nil) && scrollPosition == nil
+        let droppedVideoCurrentTime = state.videoCurrentTime != nil && videoCurrentTime == nil
+
+        if droppedMousePosition || droppedScrollPosition || droppedVideoCurrentTime {
+            Log.warning(
+                "[FrameQueries] Dropped malformed in-page URL state for frame \(frameId) (mouse=\(droppedMousePosition), scroll=\(droppedScrollPosition), video=\(droppedVideoCurrentTime))",
+                category: .database
+            )
+        }
+
+        guard mousePosition != nil || scrollPosition != nil || videoCurrentTime != nil else {
+            return nil
+        }
+
+        return FrameInPageURLState(
+            mouseX: mousePosition?.x,
+            mouseY: mousePosition?.y,
+            scrollX: scrollPosition?.x,
+            scrollY: scrollPosition?.y,
+            videoCurrentTime: videoCurrentTime
+        )
+    }
     private static func executeSQL(db: OpaquePointer, sql: String) throws {
         var errorPointer: UnsafeMutablePointer<CChar>?
         let result = sqlite3_exec(db, sql, nil, nil, &errorPointer)
@@ -704,6 +792,27 @@ enum FrameQueries {
         } else {
             sqlite3_bind_null(statement, index)
         }
+    }
+
+    private static func sanitizePoint(x: Double?, y: Double?) -> (x: Double, y: Double)? {
+        guard let sanitizedX = sanitizeFiniteValue(x),
+              let sanitizedY = sanitizeFiniteValue(y) else {
+            return nil
+        }
+
+        return (sanitizedX, sanitizedY)
+    }
+
+    private static func sanitizeFiniteValue(_ value: Double?) -> Double? {
+        guard let value, value.isFinite else {
+            return nil
+        }
+
+        if value == -0 {
+            return 0
+        }
+
+        return value
     }
 
     private static func encodePoint(x: Double?, y: Double?) -> String? {

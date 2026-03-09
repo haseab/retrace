@@ -483,6 +483,62 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(countAfterSecondFrameRemoval, 0)
     }
 
+    func testReplaceInPageURLData_SkipsMalformedRowsAndDropsNonFiniteState() async throws {
+        let frameID = try await insertTestFrame(browserURL: "https://example.com/malformed")
+
+        let state = FrameInPageURLState(
+            mouseX: .nan,
+            mouseY: 24.0,
+            scrollX: 0.0,
+            scrollY: .infinity,
+            videoCurrentTime: -.infinity
+        )
+        let rows = [
+            FrameInPageURLRow(
+                order: 0,
+                url: "https://example.com/valid",
+                nodeID: 100
+            ),
+            FrameInPageURLRow(
+                order: 1,
+                url: "https://example.com/nan",
+                nodeID: 101
+            ),
+            FrameInPageURLRow(
+                order: 2,
+                url: "   ",
+                nodeID: 102
+            ),
+            FrameInPageURLRow(
+                order: 0,
+                url: "https://example.com/duplicate-order",
+                nodeID: 103
+            )
+        ]
+
+        try await database.replaceFrameInPageURLData(frameID: frameID, state: state, rows: rows)
+
+        let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
+        XCTAssertEqual(
+            storedRows,
+            [
+                FrameInPageURLRow(
+                    order: 0,
+                    url: "https://example.com/valid",
+                    nodeID: 100
+                ),
+                FrameInPageURLRow(
+                    order: 1,
+                    url: "https://example.com/nan",
+                    nodeID: 101
+                )
+            ]
+        )
+
+        let storedState = try await database.getFrameInPageURLState(frameID: frameID)
+        XCTAssertNil(storedState)
+    }
+
     func testEnsureInPageURLSchema_MigratesLegacyPerFrameRows() async throws {
         let frameID = try await insertTestFrame(browserURL: "https://example.com/legacy")
         let db = try await databaseConnection()
