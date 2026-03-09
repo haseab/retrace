@@ -1881,6 +1881,8 @@ public struct DateRangeFilterPopover: View {
     @State private var parseError: String?
     @State private var hasCommittedPrimaryRange = false
     @State private var additionalRangeInputTexts: [String] = []
+    // Keep per-row identity stable so TextField bindings do not outlive a removed array index.
+    @State private var additionalRangeIDs: [UUID] = []
     @State private var additionalParseErrors: [String?] = []
     @State private var additionalParsedRanges: [DateRangeCriterion?] = []
     @State private var isCalendarVisible = false
@@ -1891,7 +1893,7 @@ public struct DateRangeFilterPopover: View {
     @State private var focusedItem: Int = 0
     @State private var keyboardMonitor: Any?
     @FocusState private var isRangeInputFocused: Bool
-    @FocusState private var focusedAdditionalRangeIndex: Int?
+    @FocusState private var focusedAdditionalRangeID: UUID?
 
     private let calendar = Calendar.current
     private let weekdaySymbols = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
@@ -1911,7 +1913,7 @@ public struct DateRangeFilterPopover: View {
 
     private enum CalendarTarget: Equatable {
         case primary
-        case additional(Int)
+        case additional(UUID)
     }
 
     private var canAddAnotherRange: Bool {
@@ -1930,7 +1932,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private var isAnyRangeInputFocused: Bool {
-        isRangeInputFocused || focusedAdditionalRangeIndex != nil
+        isRangeInputFocused || focusedAdditionalRangeID != nil
     }
 
     public init(
@@ -1977,10 +1979,12 @@ public struct DateRangeFilterPopover: View {
                         parseError = nil
                         hasCommittedPrimaryRange = false
                         additionalRangeInputTexts.removeAll()
+                        additionalRangeIDs.removeAll()
                         additionalParseErrors.removeAll()
                         additionalParsedRanges.removeAll()
                         activeCalendarTarget = .primary
                         lastFocusedCalendarTarget = .primary
+                        focusedAdditionalRangeID = nil
                         onClear()
                         onDismiss?()
                     }
@@ -2052,7 +2056,7 @@ public struct DateRangeFilterPopover: View {
                 )
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    focusedAdditionalRangeIndex = nil
+                    focusedAdditionalRangeID = nil
                     isRangeInputFocused = true
                 }
 
@@ -2063,27 +2067,27 @@ public struct DateRangeFilterPopover: View {
                         .padding(.horizontal, 2)
                 }
 
-                ForEach(additionalRangeInputTexts.indices, id: \.self) { index in
+                ForEach(additionalRangeIDs, id: \.self) { rangeID in
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white.opacity(0.3))
 
                         TextField(
-                            "Additional range #\(index + 2)",
-                            text: additionalRangeBinding(for: index)
+                            additionalRangePlaceholder(for: rangeID),
+                            text: additionalRangeBinding(for: rangeID)
                         )
                         .textFieldStyle(.plain)
                         .font(.system(size: 12, weight: .regular))
                         .foregroundColor(.white)
-                        .focused($focusedAdditionalRangeIndex, equals: index)
+                        .focused($focusedAdditionalRangeID, equals: rangeID)
                         .modifier(FocusEffectDisabledModifier())
                         .onSubmit {
-                            applyAdditionalRangeInput(at: index)
+                            applyAdditionalRangeInput(for: rangeID)
                         }
 
                         Button(action: {
-                            removeAdditionalRange(at: index)
+                            removeAdditionalRange(id: rangeID)
                         }) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 12, weight: .medium))
@@ -2100,17 +2104,17 @@ public struct DateRangeFilterPopover: View {
                     .overlay(
                         RoundedRectangle(cornerRadius: 6)
                             .stroke(
-                                focusedAdditionalRangeIndex == index ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
+                                focusedAdditionalRangeID == rangeID ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
                                 lineWidth: 1
                             )
                     )
                     .contentShape(Rectangle())
                     .onTapGesture {
                         isRangeInputFocused = false
-                        focusedAdditionalRangeIndex = index
+                        focusedAdditionalRangeID = rangeID
                     }
 
-                    if let additionalError = additionalParseErrorMessage(at: index) {
+                    if let additionalError = additionalParseErrorMessage(for: rangeID) {
                         Text(additionalError)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundColor(.orange.opacity(0.9))
@@ -2159,7 +2163,7 @@ public struct DateRangeFilterPopover: View {
                     if isCalendarVisible {
                         synchronizeCalendarStateFromTarget(lastFocusedCalendarTarget)
                         isRangeInputFocused = false
-                        focusedAdditionalRangeIndex = nil
+                        focusedAdditionalRangeID = nil
                     }
                 }
             }) {
@@ -2244,13 +2248,13 @@ public struct DateRangeFilterPopover: View {
         .onChange(of: isCalendarVisible) { isVisible in
             onCalendarEditingChange?(isVisible)
         }
-        .onChange(of: focusedAdditionalRangeIndex) { index in
-            if let index {
+        .onChange(of: focusedAdditionalRangeID) { focusedID in
+            if let focusedID {
                 focusedItem = -1
                 isRangeInputFocused = false
-                lastFocusedCalendarTarget = .additional(index)
+                lastFocusedCalendarTarget = .additional(focusedID)
                 if isCalendarVisible {
-                    synchronizeCalendarStateFromTarget(.additional(index))
+                    synchronizeCalendarStateFromTarget(.additional(focusedID))
                 }
             }
         }
@@ -2445,6 +2449,7 @@ public struct DateRangeFilterPopover: View {
 
         let extras = normalizedRanges.dropFirst()
         additionalRangeInputTexts = extras.map { formatRangeInputText(for: $0) }
+        additionalRangeIDs = extras.map { _ in UUID() }
         additionalParseErrors = Array(repeating: nil, count: extras.count)
         additionalParsedRanges = Array(extras)
         normalizeAdditionalRangeState()
@@ -2485,8 +2490,8 @@ public struct DateRangeFilterPopover: View {
         switch target {
         case .primary:
             return .primary
-        case .additional(let index):
-            return additionalRangeInputTexts.indices.contains(index) ? .additional(index) : .primary
+        case .additional(let id):
+            return additionalRangeIDs.contains(id) ? .additional(id) : .primary
         }
     }
 
@@ -2497,8 +2502,9 @@ public struct DateRangeFilterPopover: View {
             guard !trimmed.isEmpty, let parsed = parseDateRangeInput(trimmed) else { return nil }
             return parsed
 
-        case .additional(let index):
-            guard additionalRangeInputTexts.indices.contains(index) else { return nil }
+        case .additional(let id):
+            guard let index = additionalRangeIndex(for: id),
+                  additionalRangeInputTexts.indices.contains(index) else { return nil }
 
             if additionalParsedRanges.indices.contains(index),
                let parsed = additionalParsedRanges[index],
@@ -2560,8 +2566,9 @@ public struct DateRangeFilterPopover: View {
                 )
             }
 
-        case .additional(let index):
-            guard additionalRangeInputTexts.indices.contains(index),
+        case .additional(let id):
+            guard let index = additionalRangeIndex(for: id),
+                  additionalRangeInputTexts.indices.contains(index),
                   additionalParseErrors.indices.contains(index),
                   additionalParsedRanges.indices.contains(index) else {
                 return
@@ -2655,6 +2662,7 @@ public struct DateRangeFilterPopover: View {
             parseError = nil
             hasCommittedPrimaryRange = false
             additionalRangeInputTexts.removeAll()
+            additionalRangeIDs.removeAll()
             additionalParseErrors.removeAll()
             additionalParsedRanges.removeAll()
             normalizeAdditionalRangeState()
@@ -2690,25 +2698,28 @@ public struct DateRangeFilterPopover: View {
 
     private func addAdditionalRangeInput() {
         guard additionalRangeInputTexts.count < 4 else { return }
+        let newID = UUID()
         additionalRangeInputTexts.append("")
+        additionalRangeIDs.append(newID)
         additionalParseErrors.append(nil)
         additionalParsedRanges.append(nil)
         normalizeAdditionalRangeState()
-        let newIndex = additionalRangeInputTexts.count - 1
         DispatchQueue.main.async {
-            focusedAdditionalRangeIndex = newIndex
+            focusedAdditionalRangeID = newID
             isRangeInputFocused = false
         }
     }
 
-    private func removeAdditionalRange(at index: Int) {
-        guard additionalRangeInputTexts.indices.contains(index),
+    private func removeAdditionalRange(id: UUID) {
+        guard let index = additionalRangeIndex(for: id),
+              additionalRangeInputTexts.indices.contains(index),
               additionalParseErrors.indices.contains(index),
               additionalParsedRanges.indices.contains(index) else {
             return
         }
 
         additionalRangeInputTexts.remove(at: index)
+        additionalRangeIDs.remove(at: index)
         additionalParseErrors.remove(at: index)
         additionalParsedRanges.remove(at: index)
         normalizeAdditionalRangeState()
@@ -2718,8 +2729,9 @@ public struct DateRangeFilterPopover: View {
         applyAllRanges(moveToNextDropdown: false)
     }
 
-    private func applyAdditionalRangeInput(at index: Int) {
-        guard additionalRangeInputTexts.indices.contains(index),
+    private func applyAdditionalRangeInput(for id: UUID) {
+        guard let index = additionalRangeIndex(for: id),
+              additionalRangeInputTexts.indices.contains(index),
               additionalParseErrors.indices.contains(index),
               additionalParsedRanges.indices.contains(index) else {
             return
@@ -2816,14 +2828,27 @@ public struct DateRangeFilterPopover: View {
         }
     }
 
-    private func additionalRangeBinding(for index: Int) -> Binding<String> {
+    private func additionalRangeIndex(for id: UUID) -> Int? {
+        additionalRangeIDs.firstIndex(of: id)
+    }
+
+    private func additionalRangePlaceholder(for id: UUID) -> String {
+        guard let index = additionalRangeIndex(for: id) else {
+            return "Additional range"
+        }
+        return "Additional range #\(index + 2)"
+    }
+
+    private func additionalRangeBinding(for id: UUID) -> Binding<String> {
         Binding(
             get: {
-                guard additionalRangeInputTexts.indices.contains(index) else { return "" }
+                guard let index = additionalRangeIndex(for: id),
+                      additionalRangeInputTexts.indices.contains(index) else { return "" }
                 return additionalRangeInputTexts[index]
             },
             set: { newValue in
-                guard additionalRangeInputTexts.indices.contains(index) else { return }
+                guard let index = additionalRangeIndex(for: id),
+                      additionalRangeInputTexts.indices.contains(index) else { return }
                 additionalRangeInputTexts[index] = newValue
                 if additionalParseErrors.indices.contains(index) {
                     additionalParseErrors[index] = nil
@@ -2832,8 +2857,9 @@ public struct DateRangeFilterPopover: View {
         )
     }
 
-    private func additionalParseErrorMessage(at index: Int) -> String? {
-        guard additionalParseErrors.indices.contains(index) else { return nil }
+    private func additionalParseErrorMessage(for id: UUID) -> String? {
+        guard let index = additionalRangeIndex(for: id),
+              additionalParseErrors.indices.contains(index) else { return nil }
         return additionalParseErrors[index]
     }
 
@@ -2856,18 +2882,26 @@ public struct DateRangeFilterPopover: View {
             additionalParsedRanges.removeLast(additionalParsedRanges.count - targetCount)
         }
 
-        if let focusedIndex = focusedAdditionalRangeIndex,
-           !additionalRangeInputTexts.indices.contains(focusedIndex) {
-            focusedAdditionalRangeIndex = nil
+        if additionalRangeIDs.count < targetCount {
+            additionalRangeIDs.append(
+                contentsOf: Array(repeating: (), count: targetCount - additionalRangeIDs.count).map { _ in UUID() }
+            )
+        } else if additionalRangeIDs.count > targetCount {
+            additionalRangeIDs.removeLast(additionalRangeIDs.count - targetCount)
         }
 
-        if case .additional(let index) = activeCalendarTarget,
-           !additionalRangeInputTexts.indices.contains(index) {
+        if let focusedID = focusedAdditionalRangeID,
+           !additionalRangeIDs.contains(focusedID) {
+            focusedAdditionalRangeID = nil
+        }
+
+        if case .additional(let id) = activeCalendarTarget,
+           !additionalRangeIDs.contains(id) {
             activeCalendarTarget = .primary
         }
 
-        if case .additional(let index) = lastFocusedCalendarTarget,
-           !additionalRangeInputTexts.indices.contains(index) {
+        if case .additional(let id) = lastFocusedCalendarTarget,
+           !additionalRangeIDs.contains(id) {
             lastFocusedCalendarTarget = .primary
         }
     }
@@ -3225,8 +3259,8 @@ public struct DateRangeFilterPopover: View {
                     applyCurrentSelection(moveToNextDropdown: true)
                     return nil
                 }
-                if let additionalIndex = focusedAdditionalRangeIndex {
-                    applyAdditionalRangeInput(at: additionalIndex)
+                if let additionalID = focusedAdditionalRangeID {
+                    applyAdditionalRangeInput(for: additionalID)
                     return nil
                 }
 
@@ -3248,7 +3282,7 @@ public struct DateRangeFilterPopover: View {
                         focusedItem = 0
                     }
                     isRangeInputFocused = false
-                    focusedAdditionalRangeIndex = nil
+                    focusedAdditionalRangeID = nil
                     return nil
                 }
                 if isCalendarVisible {
@@ -3264,7 +3298,7 @@ public struct DateRangeFilterPopover: View {
                         focusedItem = 0
                     }
                     isRangeInputFocused = false
-                    focusedAdditionalRangeIndex = nil
+                    focusedAdditionalRangeID = nil
                     return nil
                 }
                 if isCalendarVisible {
@@ -3326,7 +3360,7 @@ public struct DateRangeFilterPopover: View {
         withAnimation(.easeOut(duration: 0.1)) {
             focusedItem = max(0, min(itemCount - 1, focusedItem + offset))
             isRangeInputFocused = false
-            focusedAdditionalRangeIndex = nil
+            focusedAdditionalRangeID = nil
         }
     }
 
@@ -3359,7 +3393,7 @@ public struct DateRangeFilterPopover: View {
             case 126: // Up
                 if focusedItem == 0 {
                     isRangeInputFocused = true
-                    focusedAdditionalRangeIndex = nil
+                    focusedAdditionalRangeID = nil
                     return
                 } else if (1...4).contains(focusedItem) {
                     focusedItem = 0
@@ -3372,7 +3406,7 @@ public struct DateRangeFilterPopover: View {
             }
 
             isRangeInputFocused = false
-            focusedAdditionalRangeIndex = nil
+            focusedAdditionalRangeID = nil
         }
     }
 
