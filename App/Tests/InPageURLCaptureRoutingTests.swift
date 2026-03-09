@@ -11,6 +11,10 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
             AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.Browser"),
             "company.thebrowser.Browser"
         )
+        XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.dia"),
+            "company.thebrowser.dia"
+        )
     }
 
     func testHostBrowserBundleIDMapsChromiumAppShimToHostBrowser() {
@@ -21,6 +25,10 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
         XCTAssertEqual(
             AppCoordinator.inPageURLHostBrowserBundleID(for: "com.brave.Browser.app.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "com.brave.Browser"
+        )
+        XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"),
+            "company.thebrowser.dia"
         )
     }
 

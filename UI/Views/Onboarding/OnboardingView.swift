@@ -88,7 +88,7 @@ public struct OnboardingView: View {
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
-        "com.aspect.browser.app.",
+        "company.thebrowser.dia.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",

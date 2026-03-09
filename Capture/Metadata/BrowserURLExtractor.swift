@@ -354,7 +354,7 @@ actor BrowserURLAppleScriptCoordinator {
 ///
 /// Strategy by browser:
 /// - Safari: AXToolbar → AXTextField (address bar value)
-/// - Chrome/Edge/Brave: AXDocument attribute on window, with AXManualAccessibility fallback
+/// - Chromium browsers (Chrome/Edge/Brave/Dia/etc.): AXDocument attribute on window, with AXManualAccessibility fallback
 /// - Arc: AppleScript (Chromium-based but AX tree often incomplete)
 /// - Firefox: Disabled (URL extraction intentionally skipped)
 /// - Generic fallback: Find AXWebArea element and read AXURL attribute
@@ -369,13 +369,13 @@ struct BrowserURLExtractor: Sendable {
         "com.microsoft.edgemac",
         "com.brave.Browser",
         "company.thebrowser.Browser",  // Arc
+        "company.thebrowser.dia",      // Dia
         "org.mozilla.firefox",
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "com.nickvision.browser",      // GNOME Web
         "com.openai.chat",             // ChatGPT desktop app
         "com.cometbrowser.Comet",      // Comet Browser
-        "com.aspect.browser",          // Dia Browser
         "org.chromium.Chromium",       // Chromium
         "com.sigmaos.sigmaos",         // SigmaOS
         "com.nicklockwood.Duckduckgo", // DuckDuckGo
@@ -405,7 +405,7 @@ struct BrowserURLExtractor: Sendable {
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
         "com.cometbrowser.Comet.app.",
-        "com.aspect.browser.app.",
+        "company.thebrowser.dia.app.",
         "com.sigmaos.sigmaos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
@@ -422,11 +422,10 @@ struct BrowserURLExtractor: Sendable {
         "org.chromium.Chromium",
         "com.sigmaos.sigmaos",
         "com.cometbrowser.Comet",
-        "com.aspect.browser",
+        "company.thebrowser.dia",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
     ]
-
     private static let appleScriptCoordinator = BrowserURLAppleScriptCoordinator(
         runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout, scriptLabel in
             await runAppleScriptViaProcess(
@@ -618,7 +617,7 @@ struct BrowserURLExtractor: Sendable {
         }
 
         // Method 1: AXDocument attribute on window (most reliable for Chrome)
-        if let url: String = getAXAttribute(window, kAXDocumentAttribute), !url.isEmpty {
+        if let url = getAXURLString(window, kAXDocumentAttribute) {
             return url
         }
 
@@ -629,10 +628,10 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 3: Try focused element's URL attribute
         if let focused: AXUIElement = getAXAttribute(appRef, kAXFocusedUIElementAttribute) {
-            if let url: String = getAXAttribute(focused, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXURLAttribute) {
                 return url
             }
-            if let url: String = getAXAttribute(focused, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1001,10 +1000,10 @@ struct BrowserURLExtractor: Sendable {
 
         // Method 2: Focused element direct URL/document attributes
         if let focused: AXUIElement = getAXAttribute(appRef, kAXFocusedUIElementAttribute) {
-            if let url: String = getAXAttribute(focused, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXURLAttribute) {
                 return url
             }
-            if let url: String = getAXAttribute(focused, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(focused, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1021,11 +1020,11 @@ struct BrowserURLExtractor: Sendable {
         if let role: String = getAXAttribute(element, kAXRoleAttribute),
            role == "AXWebArea" {
             // Try AXURL attribute (the documented way)
-            if let url: String = getAXAttribute(element, kAXURLAttribute), !url.isEmpty {
+            if let url = getAXURLString(element, kAXURLAttribute) {
                 return url
             }
             // Also try AXDocument as fallback
-            if let url: String = getAXAttribute(element, kAXDocumentAttribute), !url.isEmpty {
+            if let url = getAXURLString(element, kAXDocumentAttribute) {
                 return url
             }
         }
@@ -1049,7 +1048,7 @@ struct BrowserURLExtractor: Sendable {
         guard depth < maxDepth else { return nil }
 
         // Check for AXURL attribute
-        if let url: String = getAXAttribute(element, kAXURLAttribute), !url.isEmpty {
+        if let url = getAXURLString(element, kAXURLAttribute) {
             return url
         }
 
@@ -1117,6 +1116,40 @@ struct BrowserURLExtractor: Sendable {
     /// Generic helper to get an AX attribute value (String version)
     private static func getAXAttribute<T>(_ element: AXUIElement, _ attribute: String) -> T? {
         return getAXAttribute(element, attribute as CFString)
+    }
+
+    static func normalizedAXURLValue(from value: Any?) -> String? {
+        let rawValue: String?
+
+        switch value {
+        case let string as String:
+            rawValue = string
+        case let url as URL:
+            rawValue = url.absoluteString
+        case let nsURL as NSURL:
+            rawValue = nsURL.absoluteString
+        default:
+            rawValue = nil
+        }
+
+        guard let rawValue else {
+            return nil
+        }
+
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func getAXURLString(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return normalizedAXURLValue(from: value)
+    }
+
+    private static func getAXURLString(_ element: AXUIElement, _ attribute: String) -> String? {
+        return getAXURLString(element, attribute as CFString)
     }
 
     /// Check if a string looks like a URL

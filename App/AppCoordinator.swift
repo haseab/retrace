@@ -2763,7 +2763,7 @@ public actor AppCoordinator {
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
-        "com.aspect.browser",
+        "company.thebrowser.dia",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]
@@ -2777,7 +2777,7 @@ public actor AppCoordinator {
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
         "com.cometbrowser.Comet",
-        "com.aspect.browser",
+        "company.thebrowser.dia",
         "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]

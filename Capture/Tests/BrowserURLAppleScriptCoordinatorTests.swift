@@ -294,11 +294,11 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.microsoft.edgemac.app.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.brave.Browser.app.cccccccccccccccccccccccccccccccc"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("org.chromium.Chromium.app.dddddddddddddddddddddddddddddddd"))
-        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.aspect.browser.app.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"))
     }
 
-    func testIsBrowserRecognizesDiaBundleID() {
-        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.aspect.browser"))
+    func testIsBrowserRecognizesDiaBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia"))
     }
 
     func testIsBrowserRejectsSafariWebApps() {
@@ -308,5 +308,25 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
     func testIsBrowserRejectsNonBrowserBundleID() {
         XCTAssertFalse(BrowserURLExtractor.isBrowser("com.example.notabrowser"))
         XCTAssertFalse(BrowserURLExtractor.isBrowser("com.google.Chromeapp.fake"))
+    }
+
+    func testNormalizedAXURLValueAcceptsStringAndURLInstances() {
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: "  https://example.com/string  "),
+            "https://example.com/string"
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: URL(string: "https://example.com/url")!),
+            "https://example.com/url"
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.normalizedAXURLValue(from: NSURL(string: "https://example.com/nsurl")!),
+            "https://example.com/nsurl"
+        )
+    }
+
+    func testNormalizedAXURLValueRejectsEmptyAndUnsupportedValues() {
+        XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: "   "))
+        XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: 42))
     }
 }
