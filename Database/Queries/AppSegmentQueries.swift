@@ -1094,18 +1094,14 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(date: Date, value: Int64)] {
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
-
-        // Group segments by local day by adding timezone offset before grouping
         let sql = """
             SELECT
-                ((startDate + ?) / 86400000) * 86400000 - ? as day,
+                date(startDate / 1000.0, 'unixepoch', 'localtime') as local_day,
                 SUM(endDate - startDate) as total_duration_ms
             FROM segment
             WHERE startDate >= ? AND startDate <= ?
-            GROUP BY ((startDate + ?) / 86400000)
-            ORDER BY day ASC
+            GROUP BY local_day
+            ORDER BY local_day ASC
             """
 
         var statement: OpaquePointer?
@@ -1118,50 +1114,46 @@ enum AppSegmentQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, tzOffsetMs)
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(startDate))
-        sqlite3_bind_int64(statement, 4, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 5, tzOffsetMs)
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
 
         var results: [(date: Date, value: Int64)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
+            guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                continue
+            }
             let durationMs = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
             // Convert milliseconds to tenths of hours for graph display (allows 1 decimal place)
             let tenthsOfHours = durationMs / (1000 * 60 * 6)
-            results.append((date: date, value: tenthsOfHours))
+            results.append((date: localDay, value: tenthsOfHours))
         }
 
         return results
     }
 
     /// Get daily screen time totals for a date range (for 7-day graphs)
-    /// Calculates actual screen time from frame gaps, capping gaps > 5 minutes as idle
+    /// Calculates actual screen time from frame gaps, capping gaps > 2 minutes as idle
     /// Returns array of (date, tenthsOfHours) tuples sorted by date ascending, grouped by local timezone
     static func getDailyScreenTime(
         db: OpaquePointer,
         from startDate: Date,
         to endDate: Date
     ) throws -> [(date: Date, value: Int64)] {
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
         let maxGapMs: Int64 = 120_000  // 2 minutes - gaps larger than this are considered idle
 
         // Calculate screen time from frame gaps, grouped by local day
-        // Uses LAG to get previous frame time, then caps gaps at 5 minutes
+        // Uses LAG to get previous frame time, then caps gaps at 2 minutes
         let sql = """
             WITH frame_gaps AS (
                 SELECT
                     createdAt,
-                    ((createdAt + ?) / 86400000) as local_day,
+                    date(createdAt / 1000.0, 'unixepoch', 'localtime') as local_day,
                     createdAt - LAG(createdAt) OVER (ORDER BY createdAt) as gap_ms
                 FROM frame
                 WHERE createdAt >= ? AND createdAt <= ?
             )
             SELECT
-                (local_day * 86400000) - ? as day,
+                local_day,
                 SUM(CASE
                     WHEN gap_ms IS NULL THEN 0
                     WHEN gap_ms > ? THEN ?
@@ -1169,7 +1161,7 @@ enum AppSegmentQueries {
                 END) as total_duration_ms
             FROM frame_gaps
             GROUP BY local_day
-            ORDER BY day ASC
+            ORDER BY local_day ASC
             """
 
         var statement: OpaquePointer?
@@ -1182,23 +1174,39 @@ enum AppSegmentQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(startDate))
-        sqlite3_bind_int64(statement, 3, Schema.dateToTimestamp(endDate))
-        sqlite3_bind_int64(statement, 4, tzOffsetMs)
-        sqlite3_bind_int64(statement, 5, maxGapMs)
-        sqlite3_bind_int64(statement, 6, maxGapMs)
+        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
+        sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
+        sqlite3_bind_int64(statement, 3, maxGapMs)
+        sqlite3_bind_int64(statement, 4, maxGapMs)
 
         var results: [(date: Date, value: Int64)] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
+            guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                continue
+            }
             let durationMs = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
             // Return raw milliseconds - conversion happens in UI layer to preserve precision
-            results.append((date: date, value: durationMs))
+            results.append((date: localDay, value: durationMs))
         }
 
         return results
+    }
+
+    private static func parseLocalDay(_ localDayText: UnsafePointer<UInt8>?) -> Date? {
+        guard let localDayText else { return nil }
+
+        let components = String(cString: localDayText).split(separator: "-")
+        guard components.count == 3,
+              let year = Int(components[0]),
+              let month = Int(components[1]),
+              let day = Int(components[2]) else {
+            return nil
+        }
+
+        var calendar = Calendar.current
+        calendar.timeZone = .current
+
+        return calendar.date(from: DateComponents(year: year, month: month, day: day))
     }
 
     // MARK: - Delete

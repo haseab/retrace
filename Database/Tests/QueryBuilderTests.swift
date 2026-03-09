@@ -1,5 +1,6 @@
 import XCTest
 import SQLite3
+import Darwin
 import Shared
 @testable import Database
 
@@ -88,6 +89,54 @@ final class QueryBuilderTests: XCTestCase {
             metadata: frame.metadata,
             source: frame.source
         )
+    }
+
+    private func withProcessTimeZone<T>(
+        _ identifier: String,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let previousTZ = ProcessInfo.processInfo.environment["TZ"]
+        let previousDefaultTimeZone = NSTimeZone.default
+
+        setenv("TZ", identifier, 1)
+        tzset()
+        if let timeZone = TimeZone(identifier: identifier) {
+            NSTimeZone.default = timeZone
+        }
+
+        defer {
+            if let previousTZ {
+                setenv("TZ", previousTZ, 1)
+            } else {
+                unsetenv("TZ")
+            }
+            tzset()
+            NSTimeZone.default = previousDefaultTimeZone
+        }
+
+        return try body()
+    }
+
+    private func dateWithDifferentOffset(
+        relativeTo referenceDate: Date,
+        timeZone: TimeZone
+    ) -> Date? {
+        let currentOffset = timeZone.secondsFromGMT(for: referenceDate)
+        let dayInterval: TimeInterval = 86_400
+
+        for dayOffset in 1...370 {
+            let futureCandidate = referenceDate.addingTimeInterval(Double(dayOffset) * dayInterval)
+            if timeZone.secondsFromGMT(for: futureCandidate) != currentOffset {
+                return futureCandidate
+            }
+
+            let pastCandidate = referenceDate.addingTimeInterval(-Double(dayOffset) * dayInterval)
+            if timeZone.secondsFromGMT(for: pastCandidate) != currentOffset {
+                return pastCandidate
+            }
+        }
+
+        return nil
     }
 
     // ╔═════════════════════════════════════════════════════════════════════════╗
@@ -512,6 +561,82 @@ final class QueryBuilderTests: XCTestCase {
 
         XCTAssertEqual(deleted, 5)
         XCTAssertEqual(try FrameQueries.getCount(db: db!), 3)
+    }
+
+    func testAppSegmentQueries_GetDailyScreenTime_UsesPerRowLocalDayAcrossDST() throws {
+        try withProcessTimeZone("America/Los_Angeles") {
+            guard let timeZone = TimeZone(identifier: "America/Los_Angeles"),
+                  let shiftedDate = dateWithDifferentOffset(relativeTo: Date(), timeZone: timeZone) else {
+                XCTFail("Expected a DST-shifted date in America/Los_Angeles")
+                return
+            }
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+
+            let targetDayStart = calendar.startOfDay(for: shiftedDate)
+            let previousDayStart = calendar.date(byAdding: .day, value: -1, to: targetDayStart)!
+            let queryEnd = targetDayStart.addingTimeInterval(15 * 60)
+
+            let segmentID = try createTestSegment()
+            _ = try insertFrame(
+                makeFrame(
+                    timestamp: targetDayStart.addingTimeInterval(10 * 60),
+                    segmentID: segmentID,
+                    frameIndex: 0
+                )
+            )
+            _ = try insertFrame(
+                makeFrame(
+                    timestamp: targetDayStart.addingTimeInterval((11 * 60) + 30),
+                    segmentID: segmentID,
+                    frameIndex: 1
+                )
+            )
+
+            let results = try AppSegmentQueries.getDailyScreenTime(
+                db: db!,
+                from: previousDayStart,
+                to: queryEnd
+            )
+
+            XCTAssertEqual(results.count, 1)
+            XCTAssertEqual(calendar.startOfDay(for: results[0].date), targetDayStart)
+            XCTAssertEqual(results[0].value, 90_000)
+        }
+    }
+
+    func testDailyMetricsQueries_GetDailyCounts_UsesPerRowLocalDayAcrossDST() throws {
+        try withProcessTimeZone("America/Los_Angeles") {
+            guard let timeZone = TimeZone(identifier: "America/Los_Angeles"),
+                  let shiftedDate = dateWithDifferentOffset(relativeTo: Date(), timeZone: timeZone) else {
+                XCTFail("Expected a DST-shifted date in America/Los_Angeles")
+                return
+            }
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = timeZone
+
+            let targetDayStart = calendar.startOfDay(for: shiftedDate)
+            let previousDayStart = calendar.date(byAdding: .day, value: -1, to: targetDayStart)!
+
+            try DailyMetricsQueries.recordEvent(
+                db: db!,
+                metricType: .searches,
+                timestamp: targetDayStart.addingTimeInterval(10 * 60)
+            )
+
+            let results = try DailyMetricsQueries.getDailyCounts(
+                db: db!,
+                metricType: .searches,
+                from: previousDayStart,
+                to: targetDayStart
+            )
+
+            XCTAssertEqual(results.count, 1)
+            XCTAssertEqual(calendar.startOfDay(for: results[0].date), targetDayStart)
+            XCTAssertEqual(results[0].value, 1)
+        }
     }
 
     // ╔═════════════════════════════════════════════════════════════════════════╗

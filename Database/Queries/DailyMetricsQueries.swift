@@ -128,18 +128,14 @@ public enum DailyMetricsQueries {
         let startTimestamp = startOfDay(startDate)
         let endTimestamp = endOfDay(endDate)
 
-        // Get local timezone offset in milliseconds
-        let tzOffsetMs = Int64(TimeZone.current.secondsFromGMT()) * 1000
-
-        // Group by local day by adding timezone offset before grouping
         let sql = """
             SELECT
-                ((timestamp + ?) / 86400000) * 86400000 - ? as day,
+                date(timestamp / 1000.0, 'unixepoch', 'localtime') as local_day,
                 COUNT(*) as count
             FROM daily_metrics
             WHERE metricType = ? AND timestamp >= ? AND timestamp <= ?
-            GROUP BY ((timestamp + ?) / 86400000)
-            ORDER BY day ASC
+            GROUP BY local_day
+            ORDER BY local_day ASC
             """
 
         var statement: OpaquePointer?
@@ -153,19 +149,17 @@ public enum DailyMetricsQueries {
         }
 
         let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_int64(statement, 1, tzOffsetMs)
-        sqlite3_bind_int64(statement, 2, tzOffsetMs)
-        sqlite3_bind_text(statement, 3, metricType.rawValue, -1, SQLITE_TRANSIENT)
-        sqlite3_bind_int64(statement, 4, startTimestamp)
-        sqlite3_bind_int64(statement, 5, endTimestamp)
-        sqlite3_bind_int64(statement, 6, tzOffsetMs)
+        sqlite3_bind_text(statement, 1, metricType.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, startTimestamp)
+        sqlite3_bind_int64(statement, 3, endTimestamp)
 
         var results: [(date: Date, value: Int64)] = []
 
         while sqlite3_step(statement) == SQLITE_ROW {
-            let dayTimestamp = sqlite3_column_int64(statement, 0)
+            guard let date = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                continue
+            }
             let count = sqlite3_column_int64(statement, 1)
-            let date = Date(timeIntervalSince1970: Double(dayTimestamp) / 1000)
             results.append((date: date, value: count))
         }
 
@@ -225,5 +219,22 @@ public enum DailyMetricsQueries {
         let startOfDay = calendar.startOfDay(for: date)
         let endOfDay = calendar.date(byAdding: .day, value: 1, to: startOfDay)!.addingTimeInterval(-0.001)
         return Int64(endOfDay.timeIntervalSince1970 * 1000)
+    }
+
+    private static func parseLocalDay(_ localDayText: UnsafePointer<UInt8>?) -> Date? {
+        guard let localDayText else { return nil }
+
+        let components = String(cString: localDayText).split(separator: "-")
+        guard components.count == 3,
+              let year = Int(components[0]),
+              let month = Int(components[1]),
+              let day = Int(components[2]) else {
+            return nil
+        }
+
+        var calendar = Calendar.current
+        calendar.timeZone = .current
+
+        return calendar.date(from: DateComponents(year: year, month: month, day: day))
     }
 }
