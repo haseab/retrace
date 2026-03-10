@@ -96,6 +96,19 @@ public actor DataAdapter {
         Log.info("[DataAdapter] Rewind source configured with cutoff \(cutoffDate)", category: .app)
     }
 
+    @discardableResult
+    public func updateRewindCutoffDate(_ cutoffDate: Date) -> Bool {
+        guard rewindConnection != nil else {
+            Log.info("[DataAdapter] Ignoring Rewind cutoff update because Rewind is not connected", category: .app)
+            return false
+        }
+
+        self.rewindConfig = DatabaseConfig.rewind(cutoffDate: cutoffDate)
+        self.cutoffDate = cutoffDate
+        Log.info("[DataAdapter] Rewind cutoff updated in place to \(cutoffDate)", category: .app)
+        return true
+    }
+
     /// Disconnect Rewind data source (clears connection without deleting data)
     public func disconnectRewind() {
         guard rewindConnection != nil else {
@@ -146,11 +159,18 @@ public actor DataAdapter {
 
     // MARK: - Connection Selection
 
+    private var effectiveRetraceConfig: DatabaseConfig {
+        guard rewindConnection != nil, let cutoffDate else {
+            return retraceConfig
+        }
+        return retraceConfig.withMinimumDate(cutoffDate)
+    }
+
     private func connectionForTimestamp(_ timestamp: Date) -> (DatabaseConnection, DatabaseConfig) {
         if let cutoff = cutoffDate, let rewind = rewindConnection, let config = rewindConfig, timestamp < cutoff {
             return (rewind, config)
         }
-        return (retraceConnection, retraceConfig)
+        return (retraceConnection, effectiveRetraceConfig)
     }
 
     /// Filters that require Retrace-only semantics because Rewind lacks supporting tables/data.
@@ -209,6 +229,30 @@ public actor DataAdapter {
         return ("(" + dateClauses.joined(separator: " OR ") + ")", bindValues)
     }
 
+    private static func buildSourceBoundaryClause(
+        config: DatabaseConfig,
+        columnName: String
+    ) -> (clause: String?, bindValues: [Date]) {
+        var clauses: [String] = []
+        var bindValues: [Date] = []
+
+        if let minimumDate = config.minimumDate {
+            clauses.append("\(columnName) >= ?")
+            bindValues.append(minimumDate)
+        }
+
+        if let cutoffDate = config.cutoffDate {
+            clauses.append("\(columnName) < ?")
+            bindValues.append(cutoffDate)
+        }
+
+        guard !clauses.isEmpty else {
+            return (nil, [])
+        }
+
+        return ("(" + clauses.joined(separator: " AND ") + ")", bindValues)
+    }
+
     private func hasDateRangeIntersectingRewind(_ ranges: [DateRangeCriterion]) -> Bool {
         guard let cutoffDate else { return true }
         guard !ranges.isEmpty else { return true }
@@ -226,6 +270,8 @@ public actor DataAdapter {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
+
+        let retraceConfig = effectiveRetraceConfig
 
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
@@ -262,6 +308,7 @@ public actor DataAdapter {
     private func getFramesInRangeWithFilters(from startDate: Date, to endDate: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
+        let retraceConfig = effectiveRetraceConfig
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -350,6 +397,8 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
+        let retraceConfig = effectiveRetraceConfig
+
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getMostRecentFramesWithFilters(limit: limit, filters: filters)
@@ -377,6 +426,7 @@ public actor DataAdapter {
     private func getMostRecentFramesWithFilters(limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
+        let retraceConfig = effectiveRetraceConfig
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -435,6 +485,8 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
+        let retraceConfig = effectiveRetraceConfig
+
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getFramesBeforeWithFilters(timestamp: timestamp, limit: limit, filters: filters)
@@ -464,6 +516,7 @@ public actor DataAdapter {
     private func getFramesBeforeWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
+        let retraceConfig = effectiveRetraceConfig
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -538,6 +591,8 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
+        let retraceConfig = effectiveRetraceConfig
+
         // Use filtered query when filters are provided (always applies hidden filter by default)
         if let filters = filters {
             return try await getFramesAfterWithFilters(timestamp: timestamp, limit: limit, filters: filters)
@@ -566,6 +621,7 @@ public actor DataAdapter {
     private func getFramesAfterWithFilters(timestamp: Date, limit: Int, filters: FilterCriteria) async throws -> [FrameWithVideoInfo] {
         var allFrames: [FrameWithVideoInfo] = []
         var remaining = limit
+        let retraceConfig = effectiveRetraceConfig
 
         // Check if we should exclude sources based on source filter
         let excludeRetrace = filters.selectedSources?.contains(.rewind) == true &&
@@ -642,6 +698,8 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
+        let retraceConfig = effectiveRetraceConfig
+
         // Try Retrace first (more likely for recent frames)
         if let frame = try queryFrameWithVideoInfoByID(id: id, connection: retraceConnection, config: retraceConfig) {
             return frame
@@ -671,7 +729,7 @@ public actor DataAdapter {
 
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
             ? (rewindConnection!, rewindConfig!)
-            : (retraceConnection, retraceConfig)
+            : (retraceConnection, effectiveRetraceConfig)
 
         // Get video info
         guard let videoInfo = try getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, connection: connection, config: config) else {
@@ -700,7 +758,7 @@ public actor DataAdapter {
 
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
             ? (rewindConnection!, rewindConfig!)
-            : (retraceConnection, retraceConfig)
+            : (retraceConnection, effectiveRetraceConfig)
 
         // Query video info directly
         let sql = """
@@ -772,7 +830,7 @@ public actor DataAdapter {
     public func getFrameVideoInfo(segmentID: VideoSegmentID, timestamp: Date, source frameSource: FrameSource) async throws -> FrameVideoInfo? {
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
             ? (rewindConnection!, rewindConfig!)
-            : (retraceConnection, retraceConfig)
+            : (retraceConnection, effectiveRetraceConfig)
         return try getFrameVideoInfo(segmentID: segmentID, timestamp: timestamp, connection: connection, config: config)
     }
 
@@ -783,6 +841,8 @@ public actor DataAdapter {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
+
+        let retraceConfig = effectiveRetraceConfig
 
         let cacheKey = SegmentCacheKey(startDate: startDate, endDate: endDate)
 
@@ -836,7 +896,7 @@ public actor DataAdapter {
 
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
             ? (rewindConnection!, rewindConfig!)
-            : (retraceConnection, retraceConfig)
+            : (retraceConnection, effectiveRetraceConfig)
 
         return try getAllOCRNodes(timestamp: timestamp, connection: connection, config: config)
     }
@@ -865,24 +925,20 @@ public actor DataAdapter {
         }
 
         let startTime = CFAbsoluteTimeGetCurrent()
-        var bundleIDs: [String] = []
+        var bundleIDs = Set<String>()
 
-        // Try Rewind first (more historical data)
-        if let rewind = rewindConnection {
+        if let rewind = rewindConnection, let config = rewindConfig {
             let queryStart = CFAbsoluteTimeGetCurrent()
-            bundleIDs = try queryDistinctApps(connection: rewind)
+            bundleIDs.formUnion(try queryDistinctApps(connection: rewind, config: config))
             Log.debug("[DataAdapter] Rewind query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
         }
 
-        // If empty, try Retrace
-        if bundleIDs.isEmpty {
-            let queryStart = CFAbsoluteTimeGetCurrent()
-            bundleIDs = try queryDistinctApps(connection: retraceConnection)
-            Log.debug("[DataAdapter] Retrace query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
-        }
+        let queryStart = CFAbsoluteTimeGetCurrent()
+        bundleIDs.formUnion(try queryDistinctApps(connection: retraceConnection, config: effectiveRetraceConfig))
+        Log.debug("[DataAdapter] Retrace query took \(Int((CFAbsoluteTimeGetCurrent() - queryStart) * 1000))ms, found \(bundleIDs.count) bundle IDs", category: .database)
 
         Log.debug("[DataAdapter] getDistinctAppBundleIDs total: \(Int((CFAbsoluteTimeGetCurrent() - startTime) * 1000))ms", category: .database)
-        return bundleIDs
+        return Array(bundleIDs).sorted()
     }
 
     // MARK: - URL Bounding Box Detection
@@ -895,7 +951,7 @@ public actor DataAdapter {
 
         let (connection, config) = frameSource == .rewind && rewindConnection != nil
             ? (rewindConnection!, rewindConfig!)
-            : (retraceConnection, retraceConfig)
+            : (retraceConnection, effectiveRetraceConfig)
 
         return try getURLBoundingBox(timestamp: timestamp, connection: connection, config: config)
     }
@@ -916,6 +972,7 @@ public actor DataAdapter {
         let startTime = Date()
         let hiddenTagId = cachedHiddenTagId
         let retraceOnlySearchFilters = requiresRetraceOnly(query.filters)
+        let retraceConfig = effectiveRetraceConfig
         let retraceCursor = query.cursor?.native
         let rewindCursor = query.cursor?.rewind
         let hasRewindSource = !retraceOnlySearchFilters && rewindConnection != nil && rewindConfig != nil
@@ -1205,8 +1262,9 @@ public actor DataAdapter {
         config: DatabaseConfig,
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        let effectiveStartDate = config.applyLowerBound(to: startDate)
         let effectiveEndDate = config.applyCutoff(to: endDate)
-        guard startDate < effectiveEndDate else { return [] }
+        guard effectiveStartDate < effectiveEndDate else { return [] }
 
         // Build WHERE clause based on filters
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
@@ -1264,7 +1322,7 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
-        config.bindDate(startDate, to: statement, at: 1)
+        config.bindDate(effectiveStartDate, to: statement, at: 1)
         config.bindDate(effectiveEndDate, to: statement, at: 2)
 
         // Bind app bundle IDs
@@ -1302,12 +1360,18 @@ public actor DataAdapter {
         config: DatabaseConfig,
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        if let minimumDate = config.minimumDate, let cutoffDate = config.cutoffDate, minimumDate >= cutoffDate {
+            return []
+        }
+
         // Rewind database doesn't have processingStatus column
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
         let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
         let subqueryProcessingStatus = config.source == .rewind ? "-1 as processingStatus" : "processingStatus"
         let subqueryRedactionReason = config.source == .rewind ? "NULL as redactionReason" : "redactionReason"
         let subqueryVideoCurrentTime = config.source == .rewind ? "NULL as videoCurrentTime" : "videoCurrentTime"
+        let boundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
+        let boundaryWhereClause = boundaryFilter.clause.map { "WHERE \($0)" } ?? ""
 
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
@@ -1316,6 +1380,7 @@ public actor DataAdapter {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, \(subqueryProcessingStatus), \(subqueryRedactionReason), \(config.source == .rewind ? "NULL as scrollPosition" : "scrollPosition"), \(subqueryVideoCurrentTime)
                 FROM frame
+                \(boundaryWhereClause)
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
@@ -1327,7 +1392,13 @@ public actor DataAdapter {
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
 
-        sqlite3_bind_int(statement, 1, Int32(limit))
+        var bindIndex = 1
+        for date in boundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
+        sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
         var frames: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1451,6 +1522,10 @@ public actor DataAdapter {
         if let dateRangeClause = dateRangeFilter.clause {
             whereClauses.append(dateRangeClause)
         }
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
+        }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
         if hasTagFilter && tagFilterMode == .exclude {
@@ -1568,6 +1643,12 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            Log.debug("[Filter] Binding source boundary at index \(bindIndex)", category: .database)
+            config.bindDate(date, to: stmt, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
             for (index, tagId) in tagsToFilter.enumerated() {
@@ -1665,6 +1746,10 @@ public actor DataAdapter {
         if let dateRangeClause = dateRangeFilter.clause {
             whereClauses.append(dateRangeClause)
         }
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
+        }
 
         // Rewind database doesn't have segment_tag; hidden filter only applies on Retrace.
         if !isRewindDatabase, filters.hiddenFilter == .hide, cachedHiddenTagId != nil {
@@ -1730,6 +1815,11 @@ public actor DataAdapter {
             bindIndex += 1
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
         if !isRewindDatabase, filters.hiddenFilter == .hide, let hiddenTagId = cachedHiddenTagId {
             sqlite3_bind_int64(statement, Int32(bindIndex), hiddenTagId)
             bindIndex += 1
@@ -1757,6 +1847,7 @@ public actor DataAdapter {
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
         let effectiveTimestamp = config.applyCutoff(to: timestamp)
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
 
         var whereClauses = ["f.createdAt < ?"]
         var bindIndex = 1
@@ -1849,6 +1940,9 @@ public actor DataAdapter {
         )
         if let dateRangeClause = dateRangeFilter.clause {
             whereClauses.append(dateRangeClause)
+        }
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -1947,6 +2041,11 @@ public actor DataAdapter {
             currentBindIndex += 1
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
+        }
+
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
             for (index, tagId) in tagsToFilter.enumerated() {
@@ -1986,6 +2085,7 @@ public actor DataAdapter {
     ) throws -> [FrameWithVideoInfo] {
         var whereClauses = ["f.createdAt > ?"]
         var bindIndex = 1
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
 
         // Build tag filter including hidden filter logic
         // Note: Rewind database doesn't have segment_tag table, so skip tag filters for Rewind
@@ -2071,6 +2171,9 @@ public actor DataAdapter {
         )
         if let dateRangeClause = dateRangeFilter.clause {
             whereClauses.append(dateRangeClause)
+        }
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
         }
 
         // Tag exclude filter: Exclude segments that have any of the selected tags
@@ -2169,6 +2272,11 @@ public actor DataAdapter {
             currentBindIndex += 1
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(currentBindIndex))
+            currentBindIndex += 1
+        }
+
         // Bind tag IDs for exclude mode (NOT EXISTS in WHERE clause)
         if hasTagFilter && tagFilterMode == .exclude {
             for (index, tagId) in tagsToFilter.enumerated() {
@@ -2207,8 +2315,9 @@ public actor DataAdapter {
         filters: FilterCriteria,
         isRewindDatabase: Bool = false
     ) throws -> [FrameWithVideoInfo] {
+        let effectiveStartDate = config.applyLowerBound(to: startDate)
         let effectiveEndDate = config.applyCutoff(to: endDate)
-        guard startDate < effectiveEndDate else { return [] }
+        guard effectiveStartDate < effectiveEndDate else { return [] }
 
         var whereClauses = ["f.createdAt >= ?", "f.createdAt <= ?"]
         var bindIndex = 1
@@ -2371,7 +2480,7 @@ public actor DataAdapter {
         }
 
         // Bind timestamps
-        config.bindDate(startDate, to: statement, at: Int32(currentBindIndex))
+        config.bindDate(effectiveStartDate, to: statement, at: Int32(currentBindIndex))
         currentBindIndex += 1
         config.bindDate(effectiveEndDate, to: statement, at: Int32(currentBindIndex))
         currentBindIndex += 1
@@ -2432,6 +2541,7 @@ public actor DataAdapter {
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
         let effectiveTimestamp = config.applyCutoff(to: timestamp)
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
 
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt < ?"]
@@ -2452,6 +2562,10 @@ public actor DataAdapter {
         if let tags = filters?.selectedTags, !tags.isEmpty {
             let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
             whereClauses.append("st.tagId IN (\(placeholders))")
+        }
+
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
         }
 
         let whereClause = whereClauses.joined(separator: " AND ")
@@ -2502,6 +2616,11 @@ public actor DataAdapter {
             bindIndex += tags.count
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
         // Bind limit
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
@@ -2522,6 +2641,8 @@ public actor DataAdapter {
         config: DatabaseConfig,
         filters: FilterCriteria? = nil
     ) throws -> [FrameWithVideoInfo] {
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
+
         // Build WHERE clause based on filters
         var whereClauses = ["createdAt > ?"]
         var bindIndex = 2 // 1 is for timestamp
@@ -2541,6 +2662,10 @@ public actor DataAdapter {
         if let tags = filters?.selectedTags, !tags.isEmpty {
             let placeholders = tags.map { _ in "?" }.joined(separator: ", ")
             whereClauses.append("st.tagId IN (\(placeholders))")
+        }
+
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereClauses.append(sourceBoundaryClause)
         }
 
         let whereClause = whereClauses.joined(separator: " AND ")
@@ -2591,6 +2716,11 @@ public actor DataAdapter {
             bindIndex += tags.count
         }
 
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
+
         // Bind limit
         sqlite3_bind_int(statement, Int32(bindIndex), Int32(limit))
 
@@ -2613,6 +2743,9 @@ public actor DataAdapter {
         let processingStatusColumn = config.source == .rewind ? "-1 as processingStatus" : "f.processingStatus"
         let redactionReasonColumn = config.source == .rewind ? "NULL as redactionReason" : "f.redactionReason"
 
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
+
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, \(processingStatusColumn), \(redactionReasonColumn),
                    s.bundleID, s.windowName, s.browserUrl, \(config.source == .rewind ? "NULL" : "f.scrollPosition"), \(config.source == .rewind ? "NULL" : "f.videoCurrentTime"),
@@ -2620,13 +2753,18 @@ public actor DataAdapter {
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.id = ?
+            WHERE f.id = ?\(boundaryClause)
             """
 
         guard let statement = try? connection.prepare(sql: sql) else { return nil }
         defer { connection.finalize(statement) }
 
         sqlite3_bind_int64(statement, 1, id.value)
+        var bindIndex = 2
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
 
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
@@ -2639,6 +2777,8 @@ public actor DataAdapter {
         connection: DatabaseConnection,
         config: DatabaseConfig
     ) throws -> FrameVideoInfo? {
+        guard config.contains(timestamp) else { return nil }
+
         let sql = """
             SELECT v.id, v.path, v.width, v.height, v.frameRate, f.videoFrameIndex
             FROM frame f
@@ -2702,6 +2842,8 @@ public actor DataAdapter {
     }
 
     private func getAllOCRNodes(timestamp: Date, connection: DatabaseConnection, config: DatabaseConfig) throws -> [OCRNodeWithText] {
+        guard config.contains(timestamp) else { return [] }
+
         // First find the frame ID
         let frameSql = "SELECT id FROM frame WHERE createdAt = ? LIMIT 1;"
         guard let frameStatement = try? connection.prepare(sql: frameSql) else { return [] }
@@ -2750,16 +2892,25 @@ public actor DataAdapter {
         return nodes
     }
 
-    private func queryDistinctApps(connection: DatabaseConnection) throws -> [String] {
+    private func queryDistinctApps(connection: DatabaseConnection, config: DatabaseConfig) throws -> [String] {
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        let boundaryClause = sourceBoundaryFilter.clause.map { " AND \($0)" } ?? ""
         let sql = """
-            SELECT DISTINCT bundleID
-            FROM segment
-            WHERE bundleID IS NOT NULL AND bundleID != ''
+            SELECT DISTINCT s.bundleID
+            FROM segment s
+            JOIN frame f ON f.segmentId = s.id
+            WHERE s.bundleID IS NOT NULL AND s.bundleID != ''\(boundaryClause)
             LIMIT 100;
             """
 
         guard let statement = try? connection.prepare(sql: sql) else { return [] }
         defer { connection.finalize(statement) }
+
+        var bindIndex = 1
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
 
         var bundleIDs: [String] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -2771,6 +2922,8 @@ public actor DataAdapter {
     }
 
     private func getURLBoundingBox(timestamp: Date, connection: DatabaseConnection, config: DatabaseConfig) throws -> URLBoundingBox? {
+        guard config.contains(timestamp) else { return nil }
+
         // Get frameId and browserUrl
         let frameSQL = """
             SELECT f.id, s.browserUrl
@@ -3023,11 +3176,6 @@ public actor DataAdapter {
         var outerWhereConditions: [String] = []
         var outerBindValues: [Any] = []
 
-        if let cutoffDate = config.cutoffDate {
-            outerWhereConditions.append("f.createdAt < ?")
-            outerBindValues.append(config.formatDate(cutoffDate))
-        }
-
         let outerDateRangeFilter = buildDateRangeUnionClause(
             ranges: query.filters.effectiveDateRanges,
             columnName: "f.createdAt"
@@ -3035,6 +3183,11 @@ public actor DataAdapter {
         if let dateRangeClause = outerDateRangeFilter.clause {
             outerWhereConditions.append(dateRangeClause)
             outerBindValues.append(contentsOf: outerDateRangeFilter.bindValues.map(config.formatDate))
+        }
+        let sourceBoundaryFilter = buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            outerWhereConditions.append(sourceBoundaryClause)
+            outerBindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
         }
 
         // App include filter
@@ -3535,10 +3688,6 @@ public actor DataAdapter {
         var whereConditions: [String] = []
         var bindValues: [Any] = []
 
-        if let cutoffDate = config.cutoffDate {
-            whereConditions.append("f.createdAt < ?")
-            bindValues.append(config.formatDate(cutoffDate))
-        }
         let whereDateRangeFilter = buildDateRangeUnionClause(
             ranges: query.filters.effectiveDateRanges,
             columnName: "f.createdAt"
@@ -3546,6 +3695,11 @@ public actor DataAdapter {
         if let dateRangeClause = whereDateRangeFilter.clause {
             whereConditions.append(dateRangeClause)
             bindValues.append(contentsOf: whereDateRangeFilter.bindValues.map(config.formatDate))
+        }
+        let sourceBoundaryFilter = buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereConditions.append(sourceBoundaryClause)
+            bindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
         }
 
         // App include filter
@@ -4956,14 +5110,14 @@ public actor DataAdapter {
         let calendar = Calendar.current
 
         // Get dates from Retrace
-        let retraceDates = try queryDistinctDates(connection: retraceConnection)
+        let retraceDates = try queryDistinctDates(connection: retraceConnection, config: effectiveRetraceConfig)
         for date in retraceDates {
             allDates.insert(calendar.startOfDay(for: date))
         }
 
         // Get dates from Rewind if connected
-        if let rewind = rewindConnection {
-            let rewindDates = try queryDistinctDates(connection: rewind)
+        if let rewind = rewindConnection, let config = rewindConfig {
+            let rewindDates = try queryDistinctDates(connection: rewind, config: config)
             for date in rewindDates {
                 allDates.insert(calendar.startOfDay(for: date))
             }
@@ -4973,23 +5127,43 @@ public actor DataAdapter {
     }
 
     /// Query distinct dates from a specific connection
-    private func queryDistinctDates(connection: DatabaseConnection) throws -> [Date] {
-        let sql = """
-            SELECT MIN(createdAt) as dayTimestamp
-            FROM frame
-            GROUP BY date(createdAt / 1000, 'unixepoch', 'localtime')
-            ORDER BY dayTimestamp DESC
-            """
+    private func queryDistinctDates(connection: DatabaseConnection, config: DatabaseConfig) throws -> [Date] {
+        let sourceBoundaryFilter = Self.buildSourceBoundaryClause(config: config, columnName: "createdAt")
+        let whereClause = sourceBoundaryFilter.clause.map { "WHERE \($0)" } ?? ""
+
+        let sql: String
+        if config.dateFormatter == nil {
+            sql = """
+                SELECT MIN(createdAt) as dayTimestamp
+                FROM frame
+                \(whereClause)
+                GROUP BY date(createdAt / 1000, 'unixepoch', 'localtime')
+                ORDER BY dayTimestamp DESC
+                """
+        } else {
+            sql = """
+                SELECT MIN(createdAt) as dayTimestamp
+                FROM frame
+                \(whereClause)
+                GROUP BY date(createdAt, 'localtime')
+                ORDER BY dayTimestamp DESC
+                """
+        }
 
         guard let statement = try? connection.prepare(sql: sql) else {
             return []
         }
-        defer { sqlite3_finalize(statement) }
+        defer { connection.finalize(statement) }
+
+        var bindIndex = 1
+        for date in sourceBoundaryFilter.bindValues {
+            config.bindDate(date, to: statement, at: Int32(bindIndex))
+            bindIndex += 1
+        }
 
         var dates: [Date] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let timestamp = sqlite3_column_int64(statement, 0)
-            let date = Date(timeIntervalSince1970: Double(timestamp) / 1000.0)
+            guard let date = config.parseDate(from: statement, column: 0) else { continue }
             dates.append(date)
         }
 
@@ -5004,7 +5178,8 @@ public actor DataAdapter {
     /// Get distinct dates from Rewind only (for parallel loading)
     public func getRewindDistinctDates() throws -> [Date] {
         guard let rewind = rewindConnection else { return [] }
-        return try queryDistinctDates(connection: rewind)
+        guard let config = rewindConfig else { return [] }
+        return try queryDistinctDates(connection: rewind, config: config)
     }
 
     /// Get Rewind storage root path for storage calculations (returns nil if Rewind not connected)
@@ -5027,6 +5202,7 @@ public actor DataAdapter {
         // Query Retrace database
         let retraceHours = try queryDistinctHoursRetrace(
             connection: retraceConnection,
+            config: effectiveRetraceConfig,
             startOfDay: startOfDay,
             endOfDay: endOfDay
         )
@@ -5052,11 +5228,16 @@ public actor DataAdapter {
     /// so that navigation can find frames around that time
     private func queryDistinctHoursRetrace(
         connection: DatabaseConnection,
+        config: DatabaseConfig,
         startOfDay: Date,
         endOfDay: Date
     ) throws -> [Date] {
-        let startMs = Int64(startOfDay.timeIntervalSince1970 * 1000)
-        let endMs = Int64(endOfDay.timeIntervalSince1970 * 1000)
+        let effectiveStartOfDay = config.applyLowerBound(to: startOfDay)
+        let effectiveEndOfDay = config.applyCutoff(to: endOfDay)
+        guard effectiveStartOfDay < effectiveEndOfDay else { return [] }
+
+        let startMs = Int64(effectiveStartOfDay.timeIntervalSince1970 * 1000)
+        let endMs = Int64(effectiveEndOfDay.timeIntervalSince1970 * 1000)
 
         let sql = """
             SELECT MIN(createdAt) as hourTimestamp
@@ -5095,11 +5276,20 @@ public actor DataAdapter {
         endOfDay: Date
     ) throws -> [Date] {
         guard let formatter = config.dateFormatter else {
-            return []
+            return try queryDistinctHoursRetrace(
+                connection: connection,
+                config: config,
+                startOfDay: startOfDay,
+                endOfDay: endOfDay
+            )
         }
 
-        let startISO = formatter.string(from: startOfDay)
-        let endISO = formatter.string(from: endOfDay)
+        let effectiveStartOfDay = config.applyLowerBound(to: startOfDay)
+        let effectiveEndOfDay = config.applyCutoff(to: endOfDay)
+        guard effectiveStartOfDay < effectiveEndOfDay else { return [] }
+
+        let startISO = formatter.string(from: effectiveStartOfDay)
+        let endISO = formatter.string(from: effectiveEndOfDay)
 
         // Rewind stores TEXT timestamps like '2025-12-18T22:00:02.655'
         // Extract hour using substr (faster than strftime on TEXT)
@@ -5107,7 +5297,7 @@ public actor DataAdapter {
             SELECT MIN(createdAt) as hourTimestamp
             FROM frame
             WHERE createdAt >= ? AND createdAt < ?
-            GROUP BY substr(createdAt, 12, 2)
+            GROUP BY strftime('%H', createdAt, 'localtime')
             ORDER BY hourTimestamp ASC
             """
 

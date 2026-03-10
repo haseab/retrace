@@ -24,6 +24,7 @@ private enum WindowConfig {
     static let loadThreshold = 20       // Start loading when within N frames of edge
     static let loadBatchSize = 25        // Frames to load per batch
     static let loadWindowSpanSeconds: TimeInterval = 24 * 60 * 60 // Bounded window for load-more queries
+    static let nearestFallbackBatchSize = 50 // Frames to fetch when a bounded older probe comes back empty
 }
 
 /// Memory tracking for debugging frame accumulation issues
@@ -1949,6 +1950,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     struct WindowFetchTestHooks {
         var getFramesWithVideoInfo: ((Date, Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
         var getFramesWithVideoInfoBefore: ((Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
+        var getFramesWithVideoInfoAfter: ((Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
     }
 
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
@@ -2497,6 +2499,67 @@ public class SimpleTimelineViewModel: ObservableObject {
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
             Log.recordLatency(
                 "timeline.fetch.before_frames_ms",
+                valueMs: elapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 250,
+                criticalThresholdMs: 750
+            )
+            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
+            if elapsedMs >= 750 {
+                Log.warning(message, category: .ui)
+            } else {
+                Log.info(message, category: .ui)
+            }
+            return framesWithVideoInfo
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
+            Log.error(
+                "[TIMELINE-FETCH][\(traceID)] FAIL reason='\(reason)' after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .ui
+            )
+            throw error
+        }
+    }
+
+    private func fetchFramesWithVideoInfoAfterLogged(
+        timestamp: Date,
+        limit: Int,
+        filters: FilterCriteria,
+        reason: String
+    ) async throws -> [FrameWithVideoInfo] {
+        let traceID = nextFetchTraceID(prefix: "after")
+        let fetchStart = CFAbsoluteTimeGetCurrent()
+        let effectiveDateRanges = filters.effectiveDateRanges
+        let boundedStart = effectiveDateRanges.first?.start.map { Log.timestamp(from: $0) } ?? "nil"
+        let boundedEnd = effectiveDateRanges.first?.end.map { Log.timestamp(from: $0) } ?? "nil"
+        Log.info(
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' after=\(Log.timestamp(from: timestamp)) limit=\(limit) boundedRange=[\(boundedStart) → \(boundedEnd)] filters={\(summarizeFiltersForLog(filters))}",
+            category: .ui
+        )
+
+        do {
+            let framesWithVideoInfo: [FrameWithVideoInfo]
+#if DEBUG
+            if let override = test_windowFetchHooks.getFramesWithVideoInfoAfter {
+                framesWithVideoInfo = try await override(timestamp, limit, filters, reason)
+            } else {
+                framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
+                    timestamp: timestamp,
+                    limit: limit,
+                    filters: filters
+                )
+            }
+#else
+            framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
+                timestamp: timestamp,
+                limit: limit,
+                filters: filters
+            )
+#endif
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
+            Log.recordLatency(
+                "timeline.fetch.after_frames_ms",
                 valueMs: elapsedMs,
                 category: .ui,
                 summaryEvery: 10,
@@ -10828,6 +10891,27 @@ public class SimpleTimelineViewModel: ObservableObject {
         self.hasMoreOlder = hasMoreOlder
         self.hasMoreNewer = hasMoreNewer
     }
+
+    func test_loadOlderFrames(reason: String = "test") async {
+        await loadOlderFrames(reason: reason, cmdFTrace: nil)
+    }
+
+    func test_loadNewerFrames(reason: String = "test") async {
+        await loadNewerFrames(reason: reason, cmdFTrace: nil)
+    }
+
+    func test_boundaryPaginationState() -> (
+        hasMoreOlder: Bool,
+        hasMoreNewer: Bool,
+        hasReachedAbsoluteStart: Bool,
+        hasReachedAbsoluteEnd: Bool
+    ) {
+        (hasMoreOlder, hasMoreNewer, hasReachedAbsoluteStart, hasReachedAbsoluteEnd)
+    }
+
+    func test_updateWindowBoundaries() {
+        updateWindowBoundaries()
+    }
 #endif
 
     private enum DateSearchAnchorMode: String {
@@ -11444,7 +11528,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
             let queryStart = CFAbsoluteTimeGetCurrent()
-            let framesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
+            var framesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
                 timestamp: oldestTimestamp,
                 limit: WindowConfig.loadBatchSize,
                 filters: queryFilters,
@@ -11467,6 +11551,33 @@ public class SimpleTimelineViewModel: ObservableObject {
                     "[BoundaryOlder] RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", queryElapsedMs))ms",
                     category: .ui
                 )
+            }
+
+            if framesWithVideoInfoDescending.isEmpty, !hasMetadataFilter {
+                Log.info(
+                    "[BoundaryOlder] FALLBACK_START reason=\(reason) strategy=nearest before=\(Log.timestamp(from: oldestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
+                    category: .ui
+                )
+                let fallbackStart = CFAbsoluteTimeGetCurrent()
+                framesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
+                    timestamp: oldestTimestamp,
+                    limit: WindowConfig.nearestFallbackBatchSize,
+                    filters: filterCriteria,
+                    reason: "loadOlderFrames.reason=\(reason).nearestFallback"
+                )
+                let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
+
+                if let nearest = framesWithVideoInfoDescending.first, let farthest = framesWithVideoInfoDescending.last {
+                    Log.info(
+                        "[BoundaryOlder] FALLBACK_RESULT reason=\(reason) count=\(framesWithVideoInfoDescending.count) nearest=\(Log.timestamp(from: nearest.frame.timestamp)) farthest=\(Log.timestamp(from: farthest.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        category: .ui
+                    )
+                } else {
+                    Log.info(
+                        "[BoundaryOlder] FALLBACK_RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        category: .ui
+                    )
+                }
             }
 
             guard !framesWithVideoInfoDescending.isEmpty else {
@@ -11628,7 +11739,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 category: .ui
             )
             let queryStart = CFAbsoluteTimeGetCurrent()
-            let framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
+            var framesWithVideoInfo = try await fetchFramesWithVideoInfoLogged(
                 from: rangeStart,
                 to: rangeEnd,
                 limit: WindowConfig.loadBatchSize,
@@ -11652,6 +11763,33 @@ public class SimpleTimelineViewModel: ObservableObject {
                     "[BoundaryNewer] RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", queryElapsedMs))ms",
                     category: .ui
                 )
+            }
+
+            if framesWithVideoInfo.isEmpty {
+                Log.info(
+                    "[BoundaryNewer] FALLBACK_START reason=\(reason) strategy=nearest after=\(Log.timestamp(from: newestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
+                    category: .ui
+                )
+                let fallbackStart = CFAbsoluteTimeGetCurrent()
+                framesWithVideoInfo = try await fetchFramesWithVideoInfoAfterLogged(
+                    timestamp: newestTimestamp,
+                    limit: WindowConfig.nearestFallbackBatchSize,
+                    filters: filterCriteria,
+                    reason: "loadNewerFrames.reason=\(reason).nearestFallback"
+                )
+                let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
+
+                if let first = framesWithVideoInfo.first, let last = framesWithVideoInfo.last {
+                    Log.info(
+                        "[BoundaryNewer] FALLBACK_RESULT reason=\(reason) count=\(framesWithVideoInfo.count) first=\(Log.timestamp(from: first.frame.timestamp)) last=\(Log.timestamp(from: last.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        category: .ui
+                    )
+                } else {
+                    Log.info(
+                        "[BoundaryNewer] FALLBACK_RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        category: .ui
+                    )
+                }
             }
 
             guard !framesWithVideoInfo.isEmpty else {

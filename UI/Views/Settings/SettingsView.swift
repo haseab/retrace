@@ -12,6 +12,7 @@ import Carbon
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+private let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 
 // MARK: - Settings Defaults (Single Source of Truth)
 
@@ -49,6 +50,7 @@ enum SettingsDefaults {
     static let retentionDays: Int = 0  // 0 = forever
     static let maxStorageGB: Double = 50.0
     static let useRewindData = false
+    static let rewindCutoffDate = ServiceContainer.defaultRewindCutoffDate()
 
     // MARK: Privacy
     static let excludedApps = ""
@@ -230,6 +232,13 @@ public struct SettingsView: View {
     @State private var previewRetentionDays: Int?  // Visual preview while selecting
     @AppStorage("maxStorageGB", store: settingsStore) private var maxStorageGB: Double = SettingsDefaults.maxStorageGB
     @AppStorage("useRewindData", store: settingsStore) private var useRewindData: Bool = SettingsDefaults.useRewindData
+    @State private var rewindCutoffDateSelection: Date = ServiceContainer.rewindCutoffDate(in: settingsStore)
+    @State private var isRefreshingRewindCutoff = false
+    @State private var settingsToastMessage: String?
+    @State private var settingsToastVisible = false
+    @State private var settingsToastIsError = false
+    @State private var settingsToastDismissTask: Task<Void, Never>?
+    @State private var rewindCutoffRefreshTask: Task<Void, Never>?
 
     // Retention exclusion settings - data from these won't be deleted during cleanup
     @AppStorage("retentionExcludedApps", store: settingsStore) private var retentionExcludedAppsString = ""
@@ -358,6 +367,19 @@ public struct SettingsView: View {
         return FileManager.default.fileExists(atPath: dbPath)
     }
 
+    private var hasCustomRewindCutoffDate: Bool {
+        rewindCutoffDateSelection != SettingsDefaults.rewindCutoffDate
+    }
+
+    private var defaultRewindCutoffDateDescription: String {
+        SettingsDefaults.rewindCutoffDate.formatted(date: .long, time: .omitted)
+    }
+
+    private var customRewindCutoffWarningText: String {
+        let formattedCutoff = rewindCutoffDateSelection.formatted(date: .abbreviated, time: .shortened)
+        return "When Rewind data is enabled, any native Retrace data before \(formattedCutoff) will not be available."
+    }
+
     // Permission states
     @State private var hasScreenRecordingPermission = false
     @State private var hasAccessibilityPermission = false
@@ -379,7 +401,6 @@ public struct SettingsView: View {
     @State private var quickDeleteConfirmation: QuickDeleteOption? = nil
     @State private var deletingOption: QuickDeleteOption? = nil
     @State private var isDeleting = false
-    @State private var deleteResult: DeleteResultInfo? = nil
 
     // Danger zone confirmation states
     @State private var showingResetConfirmation = false
@@ -389,22 +410,6 @@ public struct SettingsView: View {
     // Database schema display
     @State private var showingDatabaseSchema = false
     @State private var databaseSchemaText: String = ""
-
-    // Cache clear feedback
-    @State private var cacheClearMessage: String? = nil
-
-    // Compression settings feedback
-    @State private var compressionUpdateMessage: String? = nil
-
-    // Scrubbing animation settings feedback
-    @State private var scrubbingAnimationUpdateMessage: String? = nil
-
-    // Capture interval settings feedback
-    @State private var captureUpdateMessage: String? = nil
-
-    // Excluded apps feedback
-    @State private var excludedAppsUpdateMessage: String? = nil
-    @State private var redactionRulesUpdateMessage: String? = nil
 
     // App coordinator for deletion operations
     @EnvironmentObject private var coordinatorWrapper: AppCoordinatorWrapper
@@ -439,7 +444,7 @@ public struct SettingsView: View {
             searchableText: ["in-page urls", "experimental", "automation", "apple script", "javascript from apple events", "wikipedia test"]),
         // Storage
         SettingsSearchEntry(id: "storage.rewindData", tab: .storage, cardTitle: "Rewind Data", cardIcon: "arrow.counterclockwise",
-            searchableText: ["rewind data", "use rewind", "rewind recordings", "import rewind"]),
+            searchableText: ["rewind data", "use rewind", "rewind recordings", "import rewind", "rewind cutoff", "rewind cutoff date", "rewind cutoff time"]),
         SettingsSearchEntry(id: "storage.databaseLocations", tab: .storage, cardTitle: "Database Locations", cardIcon: "externaldrive",
             searchableText: ["database locations", "retrace database folder", "rewind database", "choose folder", "storage location", "db path"]),
         SettingsSearchEntry(id: "storage.retentionPolicy", tab: .storage, cardTitle: "Retention Policy", cardIcon: "calendar.badge.clock",
@@ -656,10 +661,37 @@ public struct SettingsView: View {
             timelineScrollOrientationHighlightTask?.cancel()
             timelineScrollOrientationHighlightTask = nil
             isTimelineScrollOrientationHighlighted = false
+            settingsToastDismissTask?.cancel()
+            settingsToastDismissTask = nil
+            rewindCutoffRefreshTask?.cancel()
+            rewindCutoffRefreshTask = nil
         }
         .overlay {
             settingsSearchOverlay
                 .animation(.easeOut(duration: 0.15), value: showSettingsSearch)
+        }
+        .overlay(alignment: .top) {
+            if let message = settingsToastMessage {
+                HStack(spacing: 10) {
+                    Image(systemName: settingsToastIsError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(settingsToastIsError ? .orange : .green)
+                    Text(message)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retracePrimary)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke((settingsToastIsError ? Color.orange : Color.green).opacity(0.35), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.18), radius: 16, x: 0, y: 10)
+                .padding(.top, 16)
+                .scaleEffect(settingsToastVisible ? 1.0 : 0.9)
+                .opacity(settingsToastVisible ? 1.0 : 0.0)
+            }
         }
         .background {
             // Hidden button for Cmd+K shortcut
@@ -1528,20 +1560,7 @@ public struct SettingsView: View {
                         }
                     }
 
-                    // Update feedback message
-                    if let message = scrubbingAnimationUpdateMessage {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 12))
-                            Text(message)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
                 }
-                .animation(.easeInOut(duration: 0.2), value: scrubbingAnimationUpdateMessage)
 
                 Divider()
                     .background(Color.retraceBorder)
@@ -1931,19 +1950,6 @@ public struct SettingsView: View {
                         }
                     }
 
-                    // Update feedback message
-                    if let message = captureUpdateMessage {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 12))
-                            Text(message)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
                     Divider()
                         .background(Color.white.opacity(0.1))
 
@@ -1966,7 +1972,6 @@ public struct SettingsView: View {
                             }
                     }
                 }
-                .animation(.easeInOut(duration: 0.2), value: captureUpdateMessage)
         }
     }
 
@@ -2071,20 +2076,7 @@ public struct SettingsView: View {
                         }
                     }
 
-                    // Update feedback message
-                    if let message = compressionUpdateMessage {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 12))
-                            Text(message)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
                 }
-                .animation(.easeInOut(duration: 0.2), value: compressionUpdateMessage)
         }
     }
 
@@ -2641,6 +2633,7 @@ public struct SettingsView: View {
     @ViewBuilder
     private var rewindDataCard: some View {
         ModernSettingsCard(title: "Rewind Data", icon: "arrow.counterclockwise") {
+            VStack(alignment: .leading, spacing: 16) {
                 ModernToggleRow(
                     title: "Use Rewind data",
                     subtitle: "Show your old Rewind recordings in the timeline",
@@ -2666,6 +2659,91 @@ public struct SettingsView: View {
                         }
                     )
                 )
+
+                Divider()
+                    .background(Color.white.opacity(0.1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .center) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Rewind cutoff date")
+                                .font(.retraceCalloutMedium)
+                                .foregroundColor(.retracePrimary)
+                            Text("Only Rewind frames before this date and time are shown. Default is \(defaultRewindCutoffDateDescription).")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.8))
+                        }
+
+                        Spacer()
+
+                        DatePicker(
+                            "",
+                            selection: Binding(
+                                get: { rewindCutoffDateSelection },
+                                set: { newValue in
+                                    applyRewindCutoffDate(newValue)
+                                }
+                            ),
+                            displayedComponents: [.date, .hourAndMinute]
+                        )
+                        .datePickerStyle(.compact)
+                        .labelsHidden()
+                        .disabled(isRefreshingRewindCutoff)
+                    }
+
+                    if hasCustomRewindCutoffDate {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.retraceWarning)
+                                .padding(.top, 1)
+
+                            Text(customRewindCutoffWarningText)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.retraceWarning.opacity(0.08))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .strokeBorder(Color.retraceWarning.opacity(0.25), lineWidth: 1)
+                                )
+                        )
+                    }
+
+                    HStack {
+                        if hasCustomRewindCutoffDate {
+                            Button(action: {
+                                applyRewindCutoffDate(SettingsDefaults.rewindCutoffDate)
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isRefreshingRewindCutoff)
+                        }
+
+                        if isRefreshingRewindCutoff {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Updating...")
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary)
+                        }
+
+                        Spacer()
+                    }
+                }
+            }
         }
     }
 
@@ -3158,26 +3236,12 @@ public struct SettingsView: View {
                         }
                     }
 
-                    // Update feedback message
-                    if let message = excludedAppsUpdateMessage {
-                        HStack(spacing: 6) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 12))
-                            Text(message)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary)
-                        }
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                    }
-
                     ModernButton(title: "Add App", icon: "plus", style: .secondary) {
                         showAppPickerMultiple { apps in
                             addExcludedApps(apps)
                         }
                     }
                 }
-                .animation(.easeInOut(duration: 0.2), value: excludedAppsUpdateMessage)
         }
     }
 
@@ -3218,19 +3282,6 @@ public struct SettingsView: View {
                     }
                 }
 
-                // Show result message after deletion
-                if let result = deleteResult {
-                    HStack(spacing: 6) {
-                        Image(systemName: result.success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .font(.retraceCaption2)
-                            .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
-                        Text(result.message)
-                            .font(.retraceCaption2Medium)
-                            .foregroundColor(result.success ? .retraceSuccess : .retraceWarning)
-                    }
-                    .padding(.top, 4)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
             }
         }
         .alert(item: $quickDeleteConfirmation) { option in
@@ -3273,18 +3324,6 @@ public struct SettingsView: View {
                     )
                 }
 
-                if let message = redactionRulesUpdateMessage {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 12))
-                        Text(message)
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
-
                 Text("Note: Window redaction does not currently work in Firefox.")
                     .font(.retraceCaption2)
                     .foregroundColor(.retraceSecondary.opacity(0.85))
@@ -3295,7 +3334,6 @@ public struct SettingsView: View {
             .onChange(of: redactBrowserURLPatternsRaw) { _ in
                 updateRedactionRulesConfig()
             }
-            .animation(.easeInOut(duration: 0.2), value: redactionRulesUpdateMessage)
         }
     }
 
@@ -4365,19 +4403,7 @@ public struct SettingsView: View {
                     }
                 }
 
-                if let message = cacheClearMessage {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 12))
-                        Text(message)
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                }
             }
-            .animation(.easeInOut(duration: 0.2), value: cacheClearMessage)
         }
     }
 
@@ -6483,14 +6509,13 @@ extension SettingsView {
     func clearAppNameCache() {
         let entriesCleared = AppNameResolver.shared.clearCache()
         if entriesCleared > 0 {
-            cacheClearMessage = "Cleared \(entriesCleared) cached app names. Changes take effect immediately."
+            Task { @MainActor in
+                showSettingsToast("Cleared \(entriesCleared) cached app names. Changes take effect immediately.")
+            }
         } else {
-            cacheClearMessage = "Cache was already empty. No restart needed."
-        }
-
-        // Auto-hide the message after 5 seconds
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            cacheClearMessage = nil
+            Task { @MainActor in
+                showSettingsToast("Cache was already empty. No restart needed.")
+            }
         }
     }
 
@@ -6740,12 +6765,6 @@ enum QuickDeleteOption: String, Identifiable {
     }
 }
 
-/// Result info for delete operation feedback
-struct DeleteResultInfo {
-    let success: Bool
-    let message: String
-}
-
 /// Custom button for quick delete with loading state
 private struct QuickDeleteButton: View {
     let title: String
@@ -6791,7 +6810,6 @@ extension SettingsView {
     func performQuickDelete(option: QuickDeleteOption) {
         isDeleting = true
         deletingOption = option
-        deleteResult = nil
 
         Task {
             do {
@@ -6802,37 +6820,18 @@ extension SettingsView {
                     isDeleting = false
                     deletingOption = nil
                     if result.deletedFrames > 0 {
-                        deleteResult = DeleteResultInfo(
-                            success: true,
-                            message: "Deleted \(result.deletedFrames) frames from the \(option.displayName)"
-                        )
+                        showSettingsToast("Deleted \(result.deletedFrames) frames from the \(option.displayName)")
                         // Notify timeline to reload so deleted frames don't appear
                         NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
                     } else {
-                        deleteResult = DeleteResultInfo(
-                            success: true,
-                            message: "No recordings found in the \(option.displayName)"
-                        )
-                    }
-
-                    // Auto-hide result after 5 seconds
-                    Task {
-                        try? await Task.sleep(for: .nanoseconds(Int64(5_000_000_000)), clock: .continuous)
-                        await MainActor.run {
-                            withAnimation {
-                                deleteResult = nil
-                            }
-                        }
+                        showSettingsToast("No recordings found in the \(option.displayName)")
                     }
                 }
             } catch {
                 await MainActor.run {
                     isDeleting = false
                     deletingOption = nil
-                    deleteResult = DeleteResultInfo(
-                        success: false,
-                        message: "Delete failed: \(error.localizedDescription)"
-                    )
+                    showSettingsToast("Delete failed: \(error.localizedDescription)", isError: true)
                 }
             }
         }
@@ -6989,39 +6988,23 @@ extension SettingsView {
     }
 
     private func showRedactionRulesUpdateFeedback() {
-        redactionRulesUpdateMessage = "Updated"
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                redactionRulesUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast("Redaction rules updated")
         }
     }
 
     /// Show brief feedback for excluded apps changes
     private func showExcludedAppsUpdateFeedback(added: Int) {
         let message = added == 1 ? "App excluded" : "\(added) apps excluded"
-        excludedAppsUpdateMessage = message
-
-        // Auto-dismiss after 2 seconds
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                excludedAppsUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast(message)
         }
     }
 
     /// Show brief feedback for app removal
     private func showExcludedAppsUpdateFeedback(removed appName: String) {
-        excludedAppsUpdateMessage = "\(appName) removed"
-
-        // Auto-dismiss after 2 seconds
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                excludedAppsUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast("\(appName) removed")
         }
     }
 
@@ -8259,6 +8242,88 @@ extension SettingsView {
         }
     }
 
+    private func recordRewindCutoffMetric(_ cutoffDate: Date) {
+        Task {
+            let metadata = Self.inPageURLMetricMetadata([
+                "cutoffTimestampMs": Int64(cutoffDate.timeIntervalSince1970 * 1000)
+            ])
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .rewindCutoffDateUpdated,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func applyRewindCutoffDate(_ cutoffDate: Date) {
+        guard cutoffDate != rewindCutoffDateSelection else {
+            return
+        }
+
+        rewindCutoffDateSelection = cutoffDate
+        settingsStore.set(cutoffDate, forKey: rewindCutoffDateDefaultsKey)
+        Log.info("Updated Rewind cutoff date to: \(cutoffDate)", category: .ui)
+        recordRewindCutoffMetric(cutoffDate)
+        rewindCutoffRefreshTask?.cancel()
+        isRefreshingRewindCutoff = true
+
+        let shouldRefreshLiveSource = useRewindData
+        rewindCutoffRefreshTask = Task {
+            if shouldRefreshLiveSource {
+                let refreshed = await coordinatorWrapper.coordinator.refreshRewindCutoffDate()
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    isRefreshingRewindCutoff = false
+                    if refreshed {
+                        SearchViewModel.clearPersistedSearchCache()
+                        NotificationCenter.default.post(name: .dataSourceDidChange, object: nil)
+                        Log.info("✓ Timeline notified of Rewind cutoff change", category: .ui)
+                        showSettingsToast("Rewind cutoff updated")
+                    } else {
+                        showSettingsToast("Saved cutoff, but couldn't refresh Rewind data", isError: true)
+                    }
+                }
+                return
+            }
+
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                isRefreshingRewindCutoff = false
+                showSettingsToast("Rewind cutoff saved")
+            }
+        }
+    }
+
+    @MainActor
+    private func showSettingsToast(
+        _ message: String,
+        isError: Bool = false,
+        duration: Duration = .seconds(2.4)
+    ) {
+        settingsToastDismissTask?.cancel()
+        settingsToastMessage = message
+        settingsToastIsError = isError
+
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+            settingsToastVisible = true
+        }
+
+        settingsToastDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: duration)
+            guard !Task.isCancelled else { return }
+
+            withAnimation(.easeOut(duration: 0.18)) {
+                settingsToastVisible = false
+            }
+
+            try? await Task.sleep(for: .seconds(0.2))
+            guard !Task.isCancelled else { return }
+
+            settingsToastMessage = nil
+            settingsToastIsError = false
+        }
+    }
+
     private static func inPageURLMetricMetadata(_ payload: [String: Any]) -> String? {
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
@@ -8891,40 +8956,22 @@ extension SettingsView {
 
     /// Show brief "Updated" feedback for compression settings
     private func showCompressionUpdateFeedback() {
-        compressionUpdateMessage = "Updated"
-
-        // Auto-dismiss after 2 seconds
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                compressionUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast("Compression settings updated")
         }
     }
 
     /// Show brief "Updated" feedback for capture interval settings
     private func showCaptureUpdateFeedback() {
-        captureUpdateMessage = "Updated"
-
-        // Auto-dismiss after 2 seconds
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                captureUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast("Capture settings updated")
         }
     }
 
     /// Show brief "Updated" feedback for scrubbing animation settings
     private func showScrubbingAnimationUpdateFeedback() {
-        scrubbingAnimationUpdateMessage = "Updated"
-
-        // Auto-dismiss after 2 seconds
-        Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(2_000_000_000)), clock: .continuous)
-            await MainActor.run {
-                scrubbingAnimationUpdateMessage = nil
-            }
+        Task { @MainActor in
+            showSettingsToast("Scrubbing animation updated")
         }
     }
 

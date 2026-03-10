@@ -17,22 +17,36 @@ public struct DatabaseConfig: Sendable {
     /// Optional cutoff date - data is only available before this date
     public let cutoffDate: Date?
 
+    /// Optional lower bound - data is only available on/after this date
+    public let minimumDate: Date?
+
     public init(
         dateFormatter: DateFormatter?,
         storageRoot: String,
         source: FrameSource,
-        cutoffDate: Date?
+        cutoffDate: Date?,
+        minimumDate: Date? = nil
     ) {
         self.dateFormatter = dateFormatter
         self.storageRoot = storageRoot
         self.source = source
         self.cutoffDate = cutoffDate
+        self.minimumDate = minimumDate
     }
 }
 
 // MARK: - Preset Configurations
 
 extension DatabaseConfig {
+    /// Shared formatter for Rewind's ISO8601 TEXT timestamps.
+    public static var rewindDateFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
+        formatter.timeZone = TimeZone(secondsFromGMT: 0) // UTC
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }
+
     /// Configuration for native Retrace data source
     /// - INTEGER timestamps (milliseconds since epoch)
     /// - No cutoff date (current/future data)
@@ -43,32 +57,24 @@ extension DatabaseConfig {
             dateFormatter: nil, // Use INTEGER milliseconds
             storageRoot: AppPaths.expandedStorageRoot,
             source: .native,
-            cutoffDate: nil // No cutoff
+            cutoffDate: nil, // No cutoff
+            minimumDate: nil
         )
     }
 
     /// Configuration for Rewind AI data source
     /// - TEXT timestamps (ISO8601 format)
-    /// - Cutoff date: December 20, 2025 00:00:00 UTC (frozen historical data)
+    /// - Cutoff date: user-selected handoff date/time (default December 20, 2025)
     /// - Storage in ~/Library/Application Support/com.memoryvault.MemoryVault/chunks (or custom location)
-    public static var rewind: DatabaseConfig {
+    public static func rewind(cutoffDate: Date) -> DatabaseConfig {
         let storageRoot = AppPaths.expandedRewindStorageRoot + "/chunks"
 
-        // ISO8601 formatter for Rewind's TEXT timestamps
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS"
-        formatter.timeZone = TimeZone(secondsFromGMT: 0) // UTC
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-
-        // Rewind cutoff: December 20, 2025 00:00:00 UTC
-        // Unix timestamp: 1766217600
-        let cutoffDate = Date(timeIntervalSince1970: 1766217600)
-
         return DatabaseConfig(
-            dateFormatter: formatter,
+            dateFormatter: rewindDateFormatter,
             storageRoot: storageRoot,
             source: .rewind,
-            cutoffDate: cutoffDate
+            cutoffDate: cutoffDate,
+            minimumDate: nil
         )
     }
 }
@@ -76,6 +82,16 @@ extension DatabaseConfig {
 // MARK: - Helper Methods
 
 extension DatabaseConfig {
+    public func withMinimumDate(_ minimumDate: Date?) -> DatabaseConfig {
+        DatabaseConfig(
+            dateFormatter: dateFormatter,
+            storageRoot: storageRoot,
+            source: source,
+            cutoffDate: cutoffDate,
+            minimumDate: minimumDate
+        )
+    }
+
     /// Convert Date to database-specific format for binding
     /// - Returns: Either Int64 (INTEGER) or String (TEXT ISO8601)
     public func formatDate(_ date: Date) -> Any {
@@ -119,5 +135,22 @@ extension DatabaseConfig {
     public func applyCutoff(to endDate: Date) -> Date {
         guard let cutoffDate = cutoffDate else { return endDate }
         return min(endDate, cutoffDate)
+    }
+
+    /// Apply lower bound to a query start date (if applicable)
+    public func applyLowerBound(to startDate: Date) -> Date {
+        guard let minimumDate = minimumDate else { return startDate }
+        return max(startDate, minimumDate)
+    }
+
+    /// Whether a specific timestamp falls within this config's visible window.
+    public func contains(_ timestamp: Date) -> Bool {
+        if let minimumDate, timestamp < minimumDate {
+            return false
+        }
+        if let cutoffDate, timestamp >= cutoffDate {
+            return false
+        }
+        return true
     }
 }

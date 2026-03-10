@@ -11,6 +11,7 @@ import SQLCipher
 /// Dependency injection container for all app services
 /// Owner: APP integration
 public actor ServiceContainer {
+    private static let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 
     // MARK: - Services
 
@@ -405,6 +406,41 @@ public actor ServiceContainer {
         }
     }
 
+    @discardableResult
+    public func refreshRewindCutoffDate() async -> Bool {
+        guard isInitialized else {
+            Log.warning("Cannot refresh Rewind cutoff - ServiceContainer not initialized", category: .app)
+            return false
+        }
+
+        guard let adapter = dataAdapter else {
+            Log.warning("Cannot refresh Rewind cutoff - DataAdapter not available", category: .app)
+            return false
+        }
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.bool(forKey: "useRewindData") else {
+            Log.info("Rewind cutoff updated in settings while Rewind data is disabled", category: .app)
+            return false
+        }
+
+        let cutoffDate = Self.rewindCutoffDate(in: defaults)
+        if await adapter.updateRewindCutoffDate(cutoffDate) {
+            Log.info("✓ Active Rewind cutoff refreshed to \(cutoffDate)", category: .app)
+            return true
+        }
+
+        await configureRewindSource(adapter: adapter)
+        let sources = await adapter.registeredSources
+        let refreshed = sources.contains(.rewind)
+        if refreshed {
+            Log.info("✓ Rewind source configured with refreshed cutoff \(cutoffDate)", category: .app)
+        } else {
+            Log.warning("Failed to refresh Rewind cutoff because Rewind source could not be configured", category: .app)
+        }
+        return refreshed
+    }
+
     /// Helper to configure Rewind source on DataAdapter
     private func configureRewindSource(adapter: DataAdapter) async {
         let rewindDBPath = NSString(string: AppPaths.rewindDBPath).expandingTildeInPath
@@ -456,14 +492,26 @@ public actor ServiceContainer {
         }
         sqlite3_finalize(testStmt)
 
+        guard let rewindDB = db else {
+            Log.error("[ServiceContainer] Rewind database pointer unexpectedly nil after verification", category: .app)
+            return
+        }
+
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let cutoffDate = Self.rewindCutoffDate(in: defaults)
+        if Self.storedRewindCutoffDate(in: defaults) != nil {
+            Log.info("[ServiceContainer] Using user-configured Rewind cutoff \(cutoffDate)", category: .app)
+        } else {
+            Log.info("[ServiceContainer] Using default Rewind cutoff \(cutoffDate)", category: .app)
+        }
+
         // Create connection and config
-        let rewindConnection = SQLCipherConnection(db: db)
-        let rewindConfig = DatabaseConfig.rewind
+        let rewindConnection = SQLCipherConnection(db: rewindDB)
+        let rewindConfig = DatabaseConfig.rewind(cutoffDate: cutoffDate)
         // Chunks directory is always in the same parent directory as the database
         let rewindDBDir = (rewindDBPath as NSString).deletingLastPathComponent
         let rewindChunksPath = "\(rewindDBDir)/chunks"
         let rewindImageExtractor = AVAssetExtractor(storageRoot: rewindChunksPath)
-        let cutoffDate = Date(timeIntervalSince1970: 1766217600) // Dec 20, 2025 00:00:00 UTC
 
         await adapter.configureRewind(
             connection: rewindConnection,
@@ -472,6 +520,37 @@ public actor ServiceContainer {
             cutoffDate: cutoffDate
         )
         Log.info("✓ Rewind source configured during initialization", category: .app)
+    }
+
+    public nonisolated static func defaultRewindCutoffDate(calendar: Calendar = .current) -> Date {
+        var components = DateComponents()
+        components.year = 2025
+        components.month = 12
+        components.day = 20
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+
+        return calendar.date(from: components) ?? Date(timeIntervalSince1970: 1_766_188_800)
+    }
+
+    public nonisolated static func storedRewindCutoffDate(in defaults: UserDefaults) -> Date? {
+        if let storedDate = defaults.object(forKey: rewindCutoffDateDefaultsKey) as? Date {
+            return storedDate
+        }
+
+        if let storedNumber = defaults.object(forKey: rewindCutoffDateDefaultsKey) as? NSNumber {
+            return Date(timeIntervalSince1970: storedNumber.doubleValue)
+        }
+
+        return nil
+    }
+
+    public nonisolated static func rewindCutoffDate(
+        in defaults: UserDefaults,
+        calendar: Calendar = .current
+    ) -> Date {
+        storedRewindCutoffDate(in: defaults) ?? defaultRewindCutoffDate(calendar: calendar)
     }
 
     /// Shutdown all services gracefully

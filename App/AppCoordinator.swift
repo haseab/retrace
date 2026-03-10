@@ -446,6 +446,11 @@ public actor AppCoordinator {
         await services.setRewindSourceEnabled(enabled)
     }
 
+    @discardableResult
+    public func refreshRewindCutoffDate() async -> Bool {
+        await services.refreshRewindCutoffDate()
+    }
+
     /// Setup callback for accessibility permission warnings
     public func setupAccessibilityWarningCallback(_ callback: @escaping @Sendable () -> Void) async {
         services.capture.onAccessibilityPermissionWarning = callback
