@@ -50,10 +50,6 @@ public class TimelineWindowController: NSObject {
     private nonisolated(unsafe) static var emergencyRunLoop: CFRunLoop?
     private nonisolated(unsafe) static var isInstallingEmergencyTap = false
     private nonisolated(unsafe) static var isTimelineVisible: Bool = false
-    /// Whether a dialog/overlay is open that uses escape to close (search, filter, etc.)
-    private nonisolated(unsafe) static var isDialogOpen: Bool = false
-    /// Track escape key timestamps for triple-escape detection
-    private nonisolated(unsafe) static var escapeTimestamps: [CFAbsoluteTime] = []
 
     /// Whether the window has been pre-rendered and is ready to show
     private var isPrepared = false
@@ -399,27 +395,8 @@ public class TimelineWindowController: NSObject {
                         exit(0)
                     }
 
-                    // Track escape presses for triple-escape detection
-                    // Skip if a dialog is open (search, filter, tag submenu) since escape closes those
-                    if keyCode == 53 &&
-                       flags.rawValue & (CGEventFlags.maskCommand.rawValue | CGEventFlags.maskAlternate.rawValue | CGEventFlags.maskControl.rawValue) == 0 &&
-                       !TimelineWindowController.isDialogOpen {
-                        let now = CFAbsoluteTimeGetCurrent()
-
-                        // Remove old timestamps (older than 1.5 seconds)
-                        TimelineWindowController.escapeTimestamps = TimelineWindowController.escapeTimestamps.filter { now - $0 < 1.5 }
-
-                        // Add current timestamp
-                        TimelineWindowController.escapeTimestamps.append(now)
-
-                        // Check for triple-escape (3 presses within 1.5 seconds)
-                        if TimelineWindowController.escapeTimestamps.count >= 3 {
-                            TimelineWindowController.escapeTimestamps.removeAll()
-                            EmergencyDiagnostics.capture(trigger: "triple_escape")
-                            TimelineWindowController.isTimelineVisible = false
-                            exit(0)  // Force quit immediately
-                        }
-                    }
+                    // Triple-escape emergency termination is disabled for now.
+                    // The watchdog auto-quit path remains the fallback for frozen UI recovery.
 
                     return Unmanaged.passUnretained(event)
                 },
@@ -470,12 +447,6 @@ public class TimelineWindowController: NSObject {
         }
 
         setupEmergencyEscapeTap()
-    }
-
-    /// Update whether a dialog/overlay is open (search, filter, tag submenu, etc.)
-    /// This prevents triple-escape from triggering while dialogs are open
-    public func setDialogOpen(_ isOpen: Bool) {
-        Self.isDialogOpen = isOpen
     }
 
     // MARK: - Shortcut Loading

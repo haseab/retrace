@@ -1992,31 +1992,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        // Observe dialog states to update emergency escape tracking
-        // This prevents triple-escape from triggering while dialogs are open
-        setupDialogStateObserver()
-
         // Persist search overlay visibility preference
         setupSearchOverlayPersistence()
         initializeDiskFrameBuffer()
         startDiskFrameBufferMemoryReporting()
-    }
-
-    /// Set up Combine observer to track when any dialog/overlay is open
-    private func setupDialogStateObserver() {
-        Publishers.CombineLatest4(
-            $isSearchOverlayVisible,
-            $isFilterDropdownOpen,
-            $showTagSubmenu,
-            $isDateSearchActive
-        )
-        .combineLatest($isCalendarPickerVisible)
-        .sink { combined, isCalendarVisible in
-            let (isSearch, isFilter, isTag, isDateSearch) = combined
-            let isAnyDialogOpen = isSearch || isFilter || isTag || isDateSearch || isCalendarVisible
-            TimelineWindowController.shared.setDialogOpen(isAnyDialogOpen)
-        }
-        .store(in: &cancellables)
     }
 
     /// Persist search overlay visibility state across app launches
