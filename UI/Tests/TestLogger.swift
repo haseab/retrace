@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import Combine
 import Shared
 import App
 @testable import Retrace
@@ -836,6 +837,140 @@ final class DateJumpTimeOnlyParsingTests: XCTestCase {
         XCTAssertEqual(components.day, day)
         XCTAssertEqual(components.hour, hour)
         XCTAssertEqual(components.minute, minute)
+    }
+}
+
+@MainActor
+final class DateJumpFrameIDFallbackTests: XCTestCase {
+    func testCompactNumericTimeFallbackDoesNotFlashFrameNotFoundError() async {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let key = "enableFrameIDSearch"
+        let originalValue = defaults.object(forKey: key)
+        defer {
+            if let originalValue {
+                defaults.set(originalValue, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        defaults.set(true, forKey: key)
+
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        var observedErrors: [String] = []
+        var cancellables = Set<AnyCancellable>()
+        var didAttemptFrameLookup = false
+
+        viewModel.$error
+            .compactMap { $0 }
+            .sink { observedErrors.append($0) }
+            .store(in: &cancellables)
+
+        viewModel.test_frameLookupHooks.getFrameWithVideoInfoByID = { _ in
+            didAttemptFrameLookup = true
+            return nil
+        }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, _, _, reason in
+            switch reason {
+            case "searchForDate":
+                let midpoint = start.addingTimeInterval(end.timeIntervalSince(start) / 2)
+                return [self.makeFrameWithVideoInfo(id: 9001, timestamp: midpoint, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("1312")
+
+        XCTAssertFalse(didAttemptFrameLookup)
+        XCTAssertFalse(observedErrors.contains("Frame #1312 not found"))
+        XCTAssertEqual(viewModel.frames.count, 1)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 9001)
+    }
+
+    private func makeFrameWithVideoInfo(id: Int64, timestamp: Date, processingStatus: Int) -> FrameWithVideoInfo {
+        let frame = FrameReference(
+            id: FrameID(value: id),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: id),
+            frameIndexInSegment: 0,
+            metadata: FrameMetadata(
+                appBundleID: "test.app",
+                appName: "Test App",
+                displayID: 1
+            )
+        )
+
+        return FrameWithVideoInfo(frame: frame, videoInfo: nil, processingStatus: processingStatus)
+    }
+}
+
+@MainActor
+final class DateJumpRelativeDayAnchoringTests: XCTestCase {
+    func testDaysAgoUsesFirstFrameInResolvedDay() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        var anchoredTimestamp: Date?
+        var sawDayAnchorFetch = false
+        var sawWindowFetch = false
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, _, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInDay":
+                sawDayAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertGreaterThan(end.timeIntervalSince(start), (24 * 60 * 60) - 1)
+                let firstFrameInDay = start.addingTimeInterval(123)
+                anchoredTimestamp = firstFrameInDay
+                return [self.makeFrameWithVideoInfo(id: 7001, timestamp: firstFrameInDay, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected day anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(limit, 1000)
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7001, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("2 days ago")
+
+        XCTAssertTrue(sawDayAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7001)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+    }
+
+    private func makeFrameWithVideoInfo(id: Int64, timestamp: Date, processingStatus: Int) -> FrameWithVideoInfo {
+        let frame = FrameReference(
+            id: FrameID(value: id),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: id),
+            frameIndexInSegment: 0,
+            metadata: FrameMetadata(
+                appBundleID: "test.app",
+                appName: "Test App",
+                displayID: 1
+            )
+        )
+
+        return FrameWithVideoInfo(frame: frame, videoInfo: nil, processingStatus: processingStatus)
     }
 }
 

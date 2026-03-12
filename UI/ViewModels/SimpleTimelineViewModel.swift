@@ -1977,11 +1977,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     struct ForegroundFrameLoadTestHooks {
         var loadFrameData: ((TimelineFrame) async throws -> Data)?
     }
-
+    struct FrameLookupTestHooks {
+        var getFrameWithVideoInfoByID: ((FrameID) async throws -> FrameWithVideoInfo?)?
+    }
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
     var test_foregroundFrameLoadHooks = ForegroundFrameLoadTestHooks()
+    var test_frameLookupHooks = FrameLookupTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -10369,6 +10372,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - Date Search
 
+    /// Lower bound for Cmd+G frame-ID interpretation.
+    /// Real frame IDs are much larger, so small numeric input should stay in time/date parsing.
+    private static let minimumFrameIDSearchValue: Int64 = 10_000
+
     /// Whether frame ID search is enabled (read from UserDefaults)
     public var enableFrameIDSearch: Bool {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -10646,7 +10653,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func searchForDate(_ searchText: String, source: String = "timeline_date_search") async {
         let trimmedSearchText = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSearchText.isEmpty else { return }
-        let lookedLikeFrameID = Int64(trimmedSearchText) != nil
+        let numericFrameID = Int64(trimmedSearchText)
+        let qualifiesForFrameIDSearch = numericFrameID.map { $0 >= Self.minimumFrameIDSearchValue } ?? false
         var frameIDLookupAttempted = false
 
         DashboardViewModel.recordDateSearchSubmitted(
@@ -10655,7 +10663,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             query: trimmedSearchText,
             queryLength: trimmedSearchText.count,
             frameIDSearchEnabled: enableFrameIDSearch,
-            lookedLikeFrameID: lookedLikeFrameID
+            lookedLikeFrameID: qualifiesForFrameIDSearch
         )
 
         setLoadingState(true, reason: "searchForDate")
@@ -10675,9 +10683,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             // If frame ID search is enabled and input looks like a frame ID (pure number), try that first
-            if enableFrameIDSearch, let frameID = Int64(trimmedSearchText) {
+            if enableFrameIDSearch,
+               qualifiesForFrameIDSearch,
+               let frameID = numericFrameID {
                 frameIDLookupAttempted = true
-                if await searchForFrameID(frameID) {
+                if await searchForFrameID(frameID, showFailureUI: false) {
                     DashboardViewModel.recordDateSearchOutcome(
                         coordinator: coordinator,
                         source: source,
@@ -10698,13 +10708,23 @@ public class SimpleTimelineViewModel: ObservableObject {
                 targetDate = playheadRelativeDate
             } else {
                 guard let parsedDate = parseNaturalLanguageDate(trimmedSearchText) else {
-                    showErrorWithAutoDismiss("Could not understand: \(searchText)")
-                    setLoadingState(false, reason: "searchForDate.parseFailed")
+                    let parseFailedReason: String
+                    let outcome: String
+                    if frameIDLookupAttempted, let frameID = numericFrameID {
+                        showErrorWithAutoDismiss("Frame #\(frameID) not found")
+                        parseFailedReason = "searchForDate.frameIDNotFoundAfterParseFailed"
+                        outcome = "frame_id_not_found"
+                    } else {
+                        showErrorWithAutoDismiss("Could not understand: \(searchText)")
+                        parseFailedReason = "searchForDate.parseFailed"
+                        outcome = "parse_failed"
+                    }
+                    setLoadingState(false, reason: parseFailedReason)
                     DashboardViewModel.recordDateSearchOutcome(
                         coordinator: coordinator,
                         source: source,
                         query: trimmedSearchText,
-                        outcome: "parse_failed",
+                        outcome: outcome,
                         queryLength: trimmedSearchText.count,
                         frameIDLookupAttempted: frameIDLookupAttempted
                     )
@@ -10812,16 +10832,22 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Search for a frame by its ID and navigate to it
     /// Returns true if frame was found and navigation succeeded
-    private func searchForFrameID(_ frameID: Int64, includeHiddenSegments: Bool = false) async -> Bool {
+    private func searchForFrameID(
+        _ frameID: Int64,
+        includeHiddenSegments: Bool = false,
+        showFailureUI: Bool = true
+    ) async -> Bool {
         cancelBoundaryLoadTasks(reason: "searchForFrameID")
         cancelPendingStoppedPositionRecording()
         _ = recordCurrentPositionImmediatelyForUndo(reason: "searchForFrameID.source")
 
         do {
             // Try to get the frame by ID
-            guard let frameWithVideo = try await coordinator.getFrameWithVideoInfoByID(id: FrameID(value: frameID)) else {
-                error = "Frame #\(frameID) not found"
-                setLoadingState(false, reason: "searchForFrameID.notFound")
+            guard let frameWithVideo = try await fetchFrameWithVideoInfoByIDForLookup(id: FrameID(value: frameID)) else {
+                if showFailureUI {
+                    error = "Frame #\(frameID) not found"
+                    setLoadingState(false, reason: "searchForFrameID.notFound")
+                }
                 return false
             }
 
@@ -10850,8 +10876,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             guard !framesWithVideoInfo.isEmpty else {
-                showErrorWithAutoDismiss("No frames found around frame #\(frameID)")
-                setLoadingState(false, reason: "searchForFrameID.noFramesInWindow")
+                if showFailureUI {
+                    showErrorWithAutoDismiss("No frames found around frame #\(frameID)")
+                    setLoadingState(false, reason: "searchForFrameID.noFramesInWindow")
+                }
                 return false
             }
 
@@ -10908,6 +10936,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Don't set error here - let date search try as fallback
             return false
         }
+    }
+
+    private func fetchFrameWithVideoInfoByIDForLookup(id: FrameID) async throws -> FrameWithVideoInfo? {
+#if DEBUG
+        if let override = test_frameLookupHooks.getFrameWithVideoInfoByID {
+            return try await override(id)
+        }
+#endif
+        return try await coordinator.getFrameWithVideoInfoByID(id: id)
     }
 
     /// Parse relative offsets like "3 hours later" / "10 minutes earlier" / "1 hour before"
@@ -11214,7 +11251,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             of: #"\b(?:today|tomorrow|yesterday|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b"#,
             options: .regularExpression
         ) != nil
-        let hasDateLikeToken = hasCalendarDateToken || hasDayLevelNaturalLanguageToken
+        let hasDayLevelRelativeOffsetToken = normalized.range(
+            of: #"\b(?:in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now))\b"#,
+            options: .regularExpression
+        ) != nil
+        let hasDateLikeToken = hasCalendarDateToken
+            || hasDayLevelNaturalLanguageToken
+            || hasDayLevelRelativeOffsetToken
         let hasExplicitTime = normalizedWithCompactTimes.range(
             of: #"\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(am|pm)\b|\b\d{3,4}\s*(am|pm)\b|\bnoon\b|\bmidnight\b"#,
             options: .regularExpression
