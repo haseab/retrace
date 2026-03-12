@@ -19,7 +19,10 @@ public class HotkeyManager: NSObject {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var eventTapRunLoop: CFRunLoop?
+    private var eventTapThread: Thread?
+    private var eventTapRetainedSelf: UnsafeMutableRawPointer?
     private var isSettingUpEventTap = false
+    private var eventTapSetupToken: UInt64 = 0
 
     /// Registered hotkeys with their callbacks
     /// Uses character-based matching to support non-QWERTY keyboard layouts (DVORAK, Colemak, etc.)
@@ -46,6 +49,7 @@ public class HotkeyManager: NSObject {
     }
 
     deinit {
+        tearDownEventTap()
         DistributedNotificationCenter.default().removeObserver(self)
     }
 
@@ -98,10 +102,17 @@ public class HotkeyManager: NSObject {
     public func unregisterAll() {
         let count = withStateLock { hotkeys.count }
         Log.info("[HotkeyManager] Unregistering all hotkeys (count: \(count))", category: .ui)
-        stopEventTap()
         withStateLock {
             hotkeys.removeAll()
         }
+        disableEventTap()
+    }
+
+    func shutdown() {
+        withStateLock {
+            hotkeys.removeAll()
+        }
+        tearDownEventTap()
     }
 
     /// Helper to describe modifiers for logging
@@ -197,17 +208,12 @@ public class HotkeyManager: NSObject {
             return
         }
 
-        withStateLock {
-            eventTap = nil
-            runLoopSource = nil
-            eventTapRunLoop = nil
-        }
-
         let shouldSetup = withStateLock { () -> Bool in
             guard !isSettingUpEventTap else {
                 return false
             }
             isSettingUpEventTap = true
+            eventTapSetupToken &+= 1
             return true
         }
 
@@ -215,13 +221,36 @@ public class HotkeyManager: NSObject {
             return
         }
 
-        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            self?.setupEventTapOnBackgroundRunLoop()
+        if withStateLock({ eventTap != nil || runLoopSource != nil || eventTapRunLoop != nil }) {
+            tearDownEventTap()
+            withStateLock {
+                isSettingUpEventTap = true
+                eventTapSetupToken &+= 1
+            }
         }
+
+        let setupToken = withStateLock { eventTapSetupToken }
+        let thread = Thread { [self] in
+            setupEventTapOnDedicatedThread(expectedSetupToken: setupToken)
+        }
+        thread.name = "RetraceHotkeyEventTap"
+        thread.qualityOfService = .userInteractive
+
+        withStateLock {
+            eventTapThread = thread
+        }
+
+        thread.start()
     }
 
-    private func setupEventTapOnBackgroundRunLoop() {
+    private func setupEventTapOnDedicatedThread(expectedSetupToken: UInt64) {
+        guard shouldContinueInstallingEventTap(expectedSetupToken: expectedSetupToken) else {
+            clearEventTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+            return
+        }
+
         let eventMask = (1 << CGEventType.keyDown.rawValue)
+        let retainedSelf = Unmanaged.passRetained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -236,10 +265,14 @@ public class HotkeyManager: NSObject {
                 let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
                 return manager.handleEvent(proxy: proxy, type: type, event: event)
             },
-            userInfo: Unmanaged.passUnretained(self).toOpaque()
+            userInfo: retainedSelf
         ) else {
+            Unmanaged<HotkeyManager>.fromOpaque(retainedSelf).release()
             withStateLock {
-                isSettingUpEventTap = false
+                if eventTapSetupToken == expectedSetupToken {
+                    isSettingUpEventTap = false
+                    eventTapThread = nil
+                }
             }
             Log.error("[HotkeyManager] Failed to create event tap. Check accessibility/listen-event permissions.", category: .ui)
             return
@@ -247,11 +280,23 @@ public class HotkeyManager: NSObject {
 
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         let runLoop = CFRunLoopGetCurrent()
+        let thread = Thread.current
+
+        guard shouldContinueInstallingEventTap(expectedSetupToken: expectedSetupToken) else {
+            cleanupAbortedEventTapSetup(
+                tap: tap,
+                retainedSelf: retainedSelf,
+                expectedSetupToken: expectedSetupToken
+            )
+            return
+        }
 
         withStateLock {
             eventTap = tap
             runLoopSource = source
             eventTapRunLoop = runLoop
+            eventTapThread = thread
+            eventTapRetainedSelf = retainedSelf
             pendingSetup = false
             isSettingUpEventTap = false
         }
@@ -266,6 +311,8 @@ public class HotkeyManager: NSObject {
 
         // Keep this thread alive so the event tap remains active.
         CFRunLoopRun()
+
+        finalizeEventTapThreadExit(thread: thread, retainedSelf: retainedSelf)
     }
 
     private func suspendEventTapForPermissionLoss() {
@@ -279,9 +326,116 @@ public class HotkeyManager: NSObject {
         }
     }
 
-    private func stopEventTap() {
-        if let tap = withStateLock({ eventTap }) {
+    private func disableEventTap() {
+        if let tap = withStateLock({ eventTap }), CFMachPortIsValid(tap) {
             CGEvent.tapEnable(tap: tap, enable: false)
+        }
+    }
+
+    private func tearDownEventTap() {
+        let teardownState = withStateLock {
+            eventTapSetupToken &+= 1
+            isSettingUpEventTap = false
+
+            let snapshot = (
+                tap: eventTap,
+                source: runLoopSource,
+                runLoop: eventTapRunLoop,
+                retainedSelf: eventTapRetainedSelf
+            )
+
+            eventTap = nil
+            runLoopSource = nil
+            eventTapRunLoop = nil
+            eventTapThread = nil
+            eventTapRetainedSelf = nil
+
+            return snapshot
+        }
+
+        guard teardownState.tap != nil ||
+                teardownState.source != nil ||
+                teardownState.runLoop != nil ||
+                teardownState.retainedSelf != nil else {
+            return
+        }
+
+        if let runLoop = teardownState.runLoop {
+            CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes! as AnyObject) { [tap = teardownState.tap, source = teardownState.source, retainedSelf = teardownState.retainedSelf] in
+                if let source {
+                    CFRunLoopRemoveSource(runLoop, source, .commonModes)
+                }
+                if let tap {
+                    CGEvent.tapEnable(tap: tap, enable: false)
+                    CFMachPortInvalidate(tap)
+                }
+                if let retainedSelf {
+                    Unmanaged<HotkeyManager>.fromOpaque(retainedSelf).release()
+                }
+                CFRunLoopStop(runLoop)
+            }
+            CFRunLoopWakeUp(runLoop)
+            return
+        }
+
+        if let tap = teardownState.tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
+        }
+        if let retainedSelf = teardownState.retainedSelf {
+            Unmanaged<HotkeyManager>.fromOpaque(retainedSelf).release()
+        }
+    }
+
+    private func shouldContinueInstallingEventTap(expectedSetupToken: UInt64) -> Bool {
+        withStateLock {
+            eventTapSetupToken == expectedSetupToken
+        }
+    }
+
+    private func clearEventTapInstallStateIfCurrent(expectedSetupToken: UInt64) {
+        withStateLock {
+            guard eventTapSetupToken == expectedSetupToken else { return }
+            isSettingUpEventTap = false
+            if eventTapThread === Thread.current {
+                eventTapThread = nil
+            }
+        }
+    }
+
+    private func cleanupAbortedEventTapSetup(
+        tap: CFMachPort,
+        retainedSelf: UnsafeMutableRawPointer,
+        expectedSetupToken: UInt64
+    ) {
+        CGEvent.tapEnable(tap: tap, enable: false)
+        CFMachPortInvalidate(tap)
+        Unmanaged<HotkeyManager>.fromOpaque(retainedSelf).release()
+        clearEventTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+    }
+
+    private func finalizeEventTapThreadExit(
+        thread: Thread,
+        retainedSelf: UnsafeMutableRawPointer
+    ) {
+        var retainedSelfToRelease: UnsafeMutableRawPointer?
+
+        withStateLock {
+            if eventTapThread === thread {
+                eventTapThread = nil
+            }
+            if eventTapRetainedSelf == retainedSelf {
+                eventTapRetainedSelf = nil
+                retainedSelfToRelease = retainedSelf
+            }
+            if eventTapRunLoop != nil, eventTap == nil, runLoopSource == nil {
+                eventTapRunLoop = nil
+            }
+            isSettingUpEventTap = false
+        }
+
+        if let retainedSelfToRelease {
+            Unmanaged<HotkeyManager>.fromOpaque(retainedSelfToRelease).release()
         }
     }
 

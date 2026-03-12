@@ -1303,6 +1303,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         DistributedNotificationCenter.default().removeObserver(self)
         ProcessCPUMonitor.shared.stop()
+        HotkeyManager.shared.shutdown()
 
         Log.info("[AppDelegate] Application terminating", category: .app)
     }

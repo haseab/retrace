@@ -48,7 +48,9 @@ public class TimelineWindowController: NSObject {
     private nonisolated(unsafe) static var emergencyEventTap: CFMachPort?
     private nonisolated(unsafe) static var emergencyRunLoopSource: CFRunLoopSource?
     private nonisolated(unsafe) static var emergencyRunLoop: CFRunLoop?
+    private nonisolated(unsafe) static var emergencyTapThread: Thread?
     private nonisolated(unsafe) static var isInstallingEmergencyTap = false
+    private nonisolated(unsafe) static var emergencyTapSetupToken: UInt64 = 0
     private nonisolated(unsafe) static var isTimelineVisible: Bool = false
 
     /// Whether a prepared headless timeline state exists and is ready to mount on demand.
@@ -333,7 +335,7 @@ public class TimelineWindowController: NSObject {
         CGPreflightListenEventAccess()
     }
 
-    /// Sets up a CGEvent tap on a background thread to handle Escape key
+    /// Sets up a CGEvent tap on a dedicated thread to handle Escape key
     /// This works even when the main thread is completely frozen
     private func setupEmergencyEscapeTap() {
         guard Self.hasEmergencyTapPermission() else {
@@ -348,87 +350,16 @@ public class TimelineWindowController: NSObject {
 
         guard !Self.isInstallingEmergencyTap else { return }
         Self.isInstallingEmergencyTap = true
+        Self.emergencyTapSetupToken &+= 1
+        let setupToken = Self.emergencyTapSetupToken
 
-        DispatchQueue.global(qos: .userInteractive).async {
-            // Create event tap for key down events
-            let eventMask = (1 << CGEventType.keyDown.rawValue)
-
-            guard let eventTap = CGEvent.tapCreate(
-                tap: .cgSessionEventTap,
-                place: .headInsertEventTap,
-                options: .listenOnly,
-                eventsOfInterest: CGEventMask(eventMask),
-                callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                        guard TimelineWindowController.hasEmergencyTapPermission() else {
-                            Log.warning("[TIMELINE] Emergency escape tap disabled while permission is unavailable; leaving tap suspended", category: .ui)
-                            return Unmanaged.passUnretained(event)
-                        }
-
-                        if let tap = TimelineWindowController.emergencyEventTap, CFMachPortIsValid(tap) {
-                            CGEvent.tapEnable(tap: tap, enable: true)
-                        }
-                        return Unmanaged.passUnretained(event)
-                    }
-
-                    guard type == .keyDown else {
-                        return Unmanaged.passUnretained(event)
-                    }
-
-                    // Only process if timeline is visible
-                    guard TimelineWindowController.isTimelineVisible else {
-                        return Unmanaged.passUnretained(event)
-                    }
-
-                    // Check for Escape key (keycode 53) or Cmd+Option+Escape
-                    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-                    let flags = event.flags
-
-                    let isCmdOptEscape = keyCode == 53 &&
-                        flags.contains(.maskCommand) &&
-                        flags.contains(.maskAlternate)
-
-                    // Cmd+Option+Escape: EMERGENCY - capture diagnostics then terminate
-                    if isCmdOptEscape {
-                        EmergencyDiagnostics.capture(trigger: "cmd_opt_escape")
-                        TimelineWindowController.isTimelineVisible = false
-                        exit(0)
-                    }
-
-                    // Triple-escape emergency termination is disabled for now.
-                    // The watchdog auto-quit path remains the fallback for frozen UI recovery.
-
-                    return Unmanaged.passUnretained(event)
-                },
-                userInfo: nil
-            ) else {
-                TimelineWindowController.isInstallingEmergencyTap = false
-                Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
-                return
-            }
-
-            TimelineWindowController.emergencyEventTap = eventTap
-
-            // Create run loop source
-            let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
-            TimelineWindowController.emergencyRunLoopSource = runLoopSource
-
-            // Get current run loop for this thread
-            let runLoop = CFRunLoopGetCurrent()
-            TimelineWindowController.emergencyRunLoop = runLoop
-
-            // Add to run loop
-            CFRunLoopAddSource(runLoop, runLoopSource, .commonModes)
-
-            // Enable the tap
-            CGEvent.tapEnable(tap: eventTap, enable: true)
-            TimelineWindowController.isInstallingEmergencyTap = false
-
-            Log.info("[TIMELINE] Emergency escape event tap installed on background thread", category: .ui)
-
-            // Run the loop (this blocks the thread, keeping it alive)
-            CFRunLoopRun()
+        let thread = Thread {
+            Self.installEmergencyEscapeTap(expectedSetupToken: setupToken)
         }
+        thread.name = "RetraceTimelineEmergencyTap"
+        thread.qualityOfService = .userInteractive
+        Self.emergencyTapThread = thread
+        thread.start()
     }
 
     private func suspendEmergencyEscapeTapForPermissionLoss() {
@@ -447,6 +378,116 @@ public class TimelineWindowController: NSObject {
         }
 
         setupEmergencyEscapeTap()
+    }
+
+    private nonisolated static func installEmergencyEscapeTap(expectedSetupToken: UInt64) {
+        guard shouldContinueInstallingEmergencyTap(expectedSetupToken: expectedSetupToken) else {
+            clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+            return
+        }
+
+        let eventMask = (1 << CGEventType.keyDown.rawValue)
+
+        guard let eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(eventMask),
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    guard TimelineWindowController.hasEmergencyTapPermission() else {
+                        Log.warning("[TIMELINE] Emergency escape tap disabled while permission is unavailable; leaving tap suspended", category: .ui)
+                        return Unmanaged.passUnretained(event)
+                    }
+
+                    if let tap = TimelineWindowController.emergencyEventTap, CFMachPortIsValid(tap) {
+                        CGEvent.tapEnable(tap: tap, enable: true)
+                    }
+                    return Unmanaged.passUnretained(event)
+                }
+
+                guard type == .keyDown else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Only process if timeline is visible
+                guard TimelineWindowController.isTimelineVisible else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Check for Escape key (keycode 53) or Cmd+Option+Escape
+                let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                let flags = event.flags
+
+                let isCmdOptEscape = keyCode == 53 &&
+                    flags.contains(.maskCommand) &&
+                    flags.contains(.maskAlternate)
+
+                // Cmd+Option+Escape: EMERGENCY - capture diagnostics then terminate
+                if isCmdOptEscape {
+                    EmergencyDiagnostics.capture(trigger: "cmd_opt_escape")
+                    TimelineWindowController.isTimelineVisible = false
+                    exit(0)
+                }
+
+                // Triple-escape emergency termination is disabled for now.
+                // The watchdog auto-quit path remains the fallback for frozen UI recovery.
+
+                return Unmanaged.passUnretained(event)
+            },
+            userInfo: nil
+        ) else {
+            if emergencyTapSetupToken == expectedSetupToken {
+                isInstallingEmergencyTap = false
+                emergencyTapThread = nil
+            }
+            Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
+            return
+        }
+
+        let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+        let runLoop = CFRunLoopGetCurrent()
+        let thread = Thread.current
+
+        guard shouldContinueInstallingEmergencyTap(expectedSetupToken: expectedSetupToken) else {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+            CFMachPortInvalidate(eventTap)
+            clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: expectedSetupToken)
+            return
+        }
+
+        emergencyEventTap = eventTap
+        emergencyRunLoopSource = runLoopSource
+        emergencyRunLoop = runLoop
+        emergencyTapThread = thread
+
+        if let runLoopSource {
+            CFRunLoopAddSource(runLoop, runLoopSource, .commonModes)
+        }
+
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        isInstallingEmergencyTap = false
+
+        Log.info("[TIMELINE] Emergency escape event tap installed on dedicated thread", category: .ui)
+
+        CFRunLoopRun()
+
+        if emergencyTapThread === thread {
+            emergencyTapThread = nil
+        }
+        isInstallingEmergencyTap = false
+    }
+
+    private nonisolated static func shouldContinueInstallingEmergencyTap(expectedSetupToken: UInt64) -> Bool {
+        emergencyTapSetupToken == expectedSetupToken
+    }
+
+    private nonisolated static func clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: UInt64) {
+        guard emergencyTapSetupToken == expectedSetupToken else { return }
+        isInstallingEmergencyTap = false
+        if emergencyTapThread === Thread.current {
+            emergencyTapThread = nil
+        }
     }
 
     // MARK: - Shortcut Loading
