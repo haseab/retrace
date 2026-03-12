@@ -2170,43 +2170,53 @@ struct CalendarPickerView: View {
     private func dayCell(for day: Date?) -> some View {
         Group {
             if let day = day {
-                let isToday = calendar.isDateInToday(day)
-                let isSelected = viewModel.selectedCalendarDate.map { calendar.isDate($0, inSameDayAs: day) } ?? false
-                let hasFrames = dateHasFrames(day)
-                let isCurrentMonth = calendar.isDate(day, equalTo: displayedMonth, toGranularity: .month)
+                let normalizedDay = calendar.startOfDay(for: day)
+                let isToday = calendar.isDateInToday(normalizedDay)
+                let isSelected = viewModel.selectedCalendarDate.map { calendar.isDate($0, inSameDayAs: normalizedDay) } ?? false
+                let hasFrames = dateHasFrames(normalizedDay)
+                let isCurrentMonth = calendar.isDate(normalizedDay, equalTo: displayedMonth, toGranularity: .month)
 
                 Button(action: {
                     if hasFrames {
                         viewModel.focusCalendarDateGrid()
+                        viewModel.selectedCalendarDate = normalizedDay
+                        viewModel.selectedCalendarHour = nil
+                        viewModel.hoursWithFrames = []
                         Task {
-                            await viewModel.loadHoursForDate(day)
+                            await viewModel.loadHoursForDate(normalizedDay)
                         }
                     }
                 }) {
-                    Text("\(calendar.component(.day, from: day))")
-                        .font(isToday ? .retraceCaptionBold : .retraceCaption)
-                        .foregroundColor(
-                            hasFrames
-                                ? (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.9 : 0.4))
-                                : .white.opacity(isCurrentMonth ? 0.25 : 0.1)
-                        )
-                        .frame(width: 32, height: 32)
-                        .background(
-                            ZStack {
-                                if isSelected {
-                                    Circle()
-                                        .fill(RetraceMenuStyle.actionBlue)
-                                    if viewModel.calendarKeyboardFocus == .dateGrid {
+                    ZStack {
+                        Text("\(calendar.component(.day, from: normalizedDay))")
+                            .font(isToday ? .retraceCaptionBold : .retraceCaption)
+                            .foregroundColor(
+                                hasFrames
+                                    ? (isSelected ? .white : .white.opacity(isCurrentMonth ? 0.9 : 0.4))
+                                    : .white.opacity(isCurrentMonth ? 0.25 : 0.1)
+                            )
+                            .frame(width: 32, height: 32)
+                            .background(
+                                ZStack {
+                                    if isSelected {
                                         Circle()
-                                            .stroke(Color.white.opacity(0.95), lineWidth: 1.5)
+                                            .fill(RetraceMenuStyle.actionBlue)
+                                        if viewModel.calendarKeyboardFocus == .dateGrid {
+                                            Circle()
+                                                .stroke(Color.white.opacity(0.95), lineWidth: 1.5)
+                                        }
+                                    } else if isToday {
+                                        Circle()
+                                            .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1.5)
                                     }
-                                } else if isToday {
-                                    Circle()
-                                        .stroke(RetraceMenuStyle.actionBlue, lineWidth: 1.5)
                                 }
-                            }
-                        )
+                            )
+                    }
+                    // Plain macOS buttons otherwise only hit-test the visible glyphs here.
+                    .frame(maxWidth: .infinity, minHeight: 36)
+                    .contentShape(Rectangle())
                 }
+                .accessibilityIdentifier(Self.dayAccessibilityIdentifier(for: normalizedDay, calendar: calendar))
                 .buttonStyle(.plain)
                 .disabled(!hasFrames)
                 .onHover { h in
@@ -2217,7 +2227,7 @@ struct CalendarPickerView: View {
                 }
             } else {
                 Color.clear
-                    .frame(width: 32, height: 32)
+                    .frame(maxWidth: .infinity, minHeight: 36)
             }
         }
     }
@@ -2283,6 +2293,15 @@ struct CalendarPickerView: View {
         if !calendar.isDate(displayedMonth, equalTo: targetMonth, toGranularity: .month) {
             displayedMonth = targetMonth
         }
+    }
+
+    static func dayAccessibilityIdentifier(for day: Date, calendar: Calendar = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return "timeline-calendar-day-\(formatter.string(from: calendar.startOfDay(for: day)))"
     }
 }
 

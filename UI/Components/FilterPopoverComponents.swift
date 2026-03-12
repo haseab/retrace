@@ -2347,27 +2347,31 @@ public struct DateRangeFilterPopover: View {
                     Button(action: {
                         selectDay(normalizedDay)
                     }) {
-                        Text("\(calendar.component(.day, from: normalizedDay))")
-                            .font(.system(size: 11, weight: (isToday || isStart || isEnd) ? .semibold : .regular))
-                            .foregroundColor(
-                                isFuture
-                                    ? .white.opacity(0.2)
-                                    : ((isStart || isEnd)
-                                       ? .white
-                                       : .white.opacity(isCurrentMonth ? 0.82 : 0.35))
-                            )
-                            .frame(width: 26, height: 26)
-                            .background(
-                                ZStack {
-                                    if isStart || isEnd {
-                                        Circle()
-                                            .fill(RetraceMenuStyle.actionBlue)
-                                    } else if isToday {
-                                        Circle()
-                                            .stroke(RetraceMenuStyle.uiBlue, lineWidth: 1)
+                        ZStack {
+                            Text("\(calendar.component(.day, from: normalizedDay))")
+                                .font(.system(size: 11, weight: (isToday || isStart || isEnd) ? .semibold : .regular))
+                                .foregroundColor(
+                                    isFuture
+                                        ? .white.opacity(0.2)
+                                        : ((isStart || isEnd)
+                                           ? .white
+                                           : .white.opacity(isCurrentMonth ? 0.82 : 0.35))
+                                )
+                                .frame(width: 26, height: 26)
+                                .background(
+                                    ZStack {
+                                        if isStart || isEnd {
+                                            Circle()
+                                                .fill(RetraceMenuStyle.actionBlue)
+                                        } else if isToday {
+                                            Circle()
+                                                .stroke(RetraceMenuStyle.uiBlue, lineWidth: 1)
+                                        }
                                     }
-                                }
-                            )
+                                )
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .disabled(isFuture)
@@ -2380,7 +2384,7 @@ public struct DateRangeFilterPopover: View {
                 .frame(maxWidth: .infinity)
             } else {
                 Color.clear
-                    .frame(width: 26, height: 26)
+                    .frame(maxWidth: .infinity, minHeight: 30)
             }
         }
     }
