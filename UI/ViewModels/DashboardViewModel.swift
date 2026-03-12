@@ -6,10 +6,20 @@ import Database
 import ApplicationServices
 import Dispatch
 
-struct WatchdogCrashReportSummary: Equatable {
+enum DashboardCrashReportSource: String, Equatable {
+    case watchdogAutoQuit = "watchdog_auto_quit"
+    case macOSDiagnosticReport = "macos_diagnostic_report"
+}
+
+struct DashboardCrashReportSummary: Equatable {
+    let source: DashboardCrashReportSource
     let fileName: String
     let fileURL: URL
     let capturedAt: Date
+
+    var acknowledgmentIdentifier: String {
+        "\(source.rawValue):\(fileURL.resolvingSymlinksInPath().path)"
+    }
 }
 
 /// ViewModel for the Dashboard view
@@ -61,7 +71,7 @@ public class DashboardViewModel: ObservableObject {
     // Permission warnings
     @Published public var showAccessibilityWarning = false
     @Published public var showScreenRecordingWarning = false
-    @Published var recentWatchdogCrash: WatchdogCrashReportSummary?
+    @Published var recentCrashReport: DashboardCrashReportSummary?
 
     // Track user dismissals — re-nag after 30 minutes
     private var accessibilityDismissedUntil: Date?
@@ -69,9 +79,17 @@ public class DashboardViewModel: ObservableObject {
 
     /// How long to suppress a permission warning after the user dismisses it
     private static let dismissSnoozeInterval: TimeInterval = 30 * 60 // 30 minutes
-    nonisolated private static let watchdogCrashRecentWindow: TimeInterval = 7 * 24 * 60 * 60
-    private static let acknowledgedWatchdogCrashReportKey = "acknowledgedWatchdogCrashReportFileName"
-    private static let acknowledgedWatchdogCrashReportKeysKey = "acknowledgedWatchdogCrashReportFileNames"
+    nonisolated private static let recentCrashReportWindow: TimeInterval = 7 * 24 * 60 * 60
+    nonisolated private static var diagnosticCrashReportDirectories: [String] {
+        [
+            NSString(string: "~/Library/Logs/DiagnosticReports").expandingTildeInPath,
+            "/Library/Logs/DiagnosticReports"
+        ]
+    }
+    private static let acknowledgedCrashReportIDsKey = "acknowledgedCrashReportIDs"
+    private static let acknowledgedCrashReportCutoffTimestampMsKey = "acknowledgedCrashReportCutoffTimestampMs"
+    private static let legacyAcknowledgedWatchdogCrashReportKey = "acknowledgedWatchdogCrashReportFileName"
+    private static let legacyAcknowledgedWatchdogCrashReportKeysKey = "acknowledgedWatchdogCrashReportFileNames"
 
     // MARK: - Dependencies
 
@@ -81,7 +99,7 @@ public class DashboardViewModel: ObservableObject {
     private var refreshTimer: DispatchSourceTimer?
     /// Prevents the 2s poll from clobbering optimistic toggle UI while start/stop is in flight.
     private var isRecordingToggleInFlight = false
-    private var lastTrackedWatchdogCrashBannerFileName: String?
+    private var lastTrackedCrashBannerIdentifier: String?
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -273,56 +291,90 @@ public class DashboardViewModel: ObservableObject {
         screenRecordingDismissedUntil = Date().addingTimeInterval(Self.dismissSnoozeInterval)
     }
 
-    public func dismissRecentWatchdogCrash() {
-        acknowledgeRecentWatchdogCrash(action: "dismissed")
+    public func dismissRecentCrashReport() {
+        acknowledgeRecentCrashReport(action: "dismissed")
     }
 
-    public func recordRecentWatchdogCrashFeedbackOpened() {
-        guard let report = recentWatchdogCrash else { return }
-        recordWatchdogCrashBannerAction("submit_bug_report_clicked", report: report)
+    public func recordRecentCrashReportFeedbackOpened() {
+        guard let report = recentCrashReport else { return }
+        recordCrashBannerAction("submit_bug_report_clicked", report: report)
     }
 
-    public func recordRecentWatchdogCrashDetailsOpened() {
-        guard let report = recentWatchdogCrash else { return }
-        recordWatchdogCrashBannerAction("details_opened", report: report)
+    public func recordRecentCrashReportDetailsOpened() {
+        guard let report = recentCrashReport else { return }
+        recordCrashBannerAction("details_opened", report: report)
     }
 
-    nonisolated static func makeWatchdogCrashFeedbackLaunchContext(
-        for report: WatchdogCrashReportSummary,
+    nonisolated static func makeCrashFeedbackLaunchContext(
+        for report: DashboardCrashReportSummary,
         now: Date = Date()
     ) -> FeedbackLaunchContext {
         FeedbackLaunchContext(
-            source: .watchdogCrashBanner,
+            source: .crashBanner,
             feedbackType: .bug,
-            prefilledDescription: makeWatchdogCrashFeedbackDescription(for: report, now: now),
+            prefilledDescription: makeCrashFeedbackDescription(for: report, now: now),
             preferredFocusField: .email
         )
     }
 
-    nonisolated static func loadRecentWatchdogCrash(
+    nonisolated static func loadRecentCrashReport(
         fileManager: FileManager = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
+        diagnosticReportDirectories: [String] = DashboardViewModel.diagnosticCrashReportDirectories,
         now: Date = Date(),
-        acknowledgedFileNames: Set<String> = []
-    ) -> WatchdogCrashReportSummary? {
-        let directoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
+        acknowledgedReportIdentifiers: Set<String> = [],
+        acknowledgedBeforeDate: Date? = nil
+    ) -> DashboardCrashReportSummary? {
         let resourceKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .contentModificationDateKey,
             .creationDateKey
         ]
 
+        let emergencyDirectoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
+        let emergencyReports = loadEmergencyCrashReports(
+            fileManager: fileManager,
+            directoryURL: emergencyDirectoryURL,
+            resourceKeys: resourceKeys,
+            now: now
+        )
+        let diagnosticReports = diagnosticReportDirectories.flatMap { directory in
+            loadDiagnosticCrashReports(
+                fileManager: fileManager,
+                directoryURL: URL(fileURLWithPath: directory, isDirectory: true),
+                resourceKeys: resourceKeys,
+                now: now
+            )
+        }
+
+        return (emergencyReports + diagnosticReports)
+            .sorted { $0.capturedAt > $1.capturedAt }
+            .first {
+                !isCrashReportAcknowledged(
+                    $0,
+                    acknowledgedIdentifiers: acknowledgedReportIdentifiers,
+                    acknowledgedBeforeDate: acknowledgedBeforeDate
+                )
+            }
+    }
+
+    nonisolated private static func loadEmergencyCrashReports(
+        fileManager: FileManager,
+        directoryURL: URL,
+        resourceKeys: Set<URLResourceKey>,
+        now: Date
+    ) -> [DashboardCrashReportSummary] {
         guard let fileURLs = try? fileManager.contentsOfDirectory(
             at: directoryURL,
             includingPropertiesForKeys: Array(resourceKeys),
             options: [.skipsHiddenFiles]
         ) else {
-            return nil
+            return []
         }
 
         let prefix = "retrace-emergency-watchdog_auto_quit-"
 
-        let reports = fileURLs.compactMap { fileURL -> WatchdogCrashReportSummary? in
+        return fileURLs.compactMap { fileURL -> DashboardCrashReportSummary? in
             let fileName = fileURL.lastPathComponent
             guard fileName.hasPrefix(prefix), fileURL.pathExtension == "txt" else {
                 return nil
@@ -338,27 +390,76 @@ public class DashboardViewModel: ObservableObject {
                 ?? parseWatchdogCrashTimestamp(from: fileName)
                 ?? .distantPast
 
-            guard now.timeIntervalSince(capturedAt) <= watchdogCrashRecentWindow else {
+            guard now.timeIntervalSince(capturedAt) <= recentCrashReportWindow else {
                 return nil
             }
 
-            return WatchdogCrashReportSummary(
+            return DashboardCrashReportSummary(
+                source: .watchdogAutoQuit,
                 fileName: fileName,
                 fileURL: fileURL,
                 capturedAt: capturedAt
             )
         }
-        .sorted { $0.capturedAt > $1.capturedAt }
-
-        return reports.first { !acknowledgedFileNames.contains($0.fileName) }
     }
 
-    nonisolated static func makeWatchdogCrashFeedbackDescription(
-        for _: WatchdogCrashReportSummary,
+    nonisolated private static func loadDiagnosticCrashReports(
+        fileManager: FileManager,
+        directoryURL: URL,
+        resourceKeys: Set<URLResourceKey>,
+        now: Date
+    ) -> [DashboardCrashReportSummary] {
+        guard let fileURLs = try? fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return fileURLs.compactMap { fileURL -> DashboardCrashReportSummary? in
+            let fileName = fileURL.lastPathComponent
+            guard isDiagnosticCrashReportFileName(fileName) else {
+                return nil
+            }
+
+            let resourceValues = try? fileURL.resourceValues(forKeys: resourceKeys)
+            if resourceValues?.isRegularFile == false {
+                return nil
+            }
+
+            let capturedAt = resourceValues?.contentModificationDate
+                ?? resourceValues?.creationDate
+                ?? parseDiagnosticCrashTimestamp(from: fileName)
+                ?? .distantPast
+
+            guard now.timeIntervalSince(capturedAt) <= recentCrashReportWindow else {
+                return nil
+            }
+
+            return DashboardCrashReportSummary(
+                source: .macOSDiagnosticReport,
+                fileName: fileName,
+                fileURL: fileURL,
+                capturedAt: capturedAt
+            )
+        }
+    }
+
+    nonisolated static func makeCrashFeedbackDescription(
+        for report: DashboardCrashReportSummary,
         now _: Date = Date()
     ) -> String {
+        let heading: String
+        switch report.source {
+        case .watchdogAutoQuit:
+            heading = "Retrace Auto Quit Crash Logging"
+        case .macOSDiagnosticReport:
+            heading = "Retrace macOS Crash Report"
+        }
+
         return """
-        Retrace Auto Quit Crash Logging
+        \(heading)
 
         Enter any other relevant context here:
         """
@@ -379,60 +480,130 @@ public class DashboardViewModel: ObservableObject {
         return formatter.date(from: timestamp)
     }
 
-    private func refreshRecentWatchdogCrashState(now: Date = Date()) {
-        let acknowledgedFileNames = loadAcknowledgedWatchdogCrashFileNames()
-        let report = Self.loadRecentWatchdogCrash(
+    nonisolated private static func isDiagnosticCrashReportFileName(_ fileName: String) -> Bool {
+        let normalized = fileName.lowercased()
+        let pathExtension = URL(fileURLWithPath: fileName).pathExtension.lowercased()
+        guard pathExtension == "ips" || pathExtension == "crash" else {
+            return false
+        }
+
+        return normalized.hasPrefix("retrace-") || normalized.hasPrefix("retrace_")
+    }
+
+    nonisolated private static func parseDiagnosticCrashTimestamp(from fileName: String) -> Date? {
+        let baseName = URL(fileURLWithPath: fileName).deletingPathExtension().lastPathComponent
+
+        let timestamp: String
+        if baseName.hasPrefix("Retrace-") {
+            timestamp = String(baseName.dropFirst("Retrace-".count))
+        } else if baseName.hasPrefix("Retrace_") {
+            let remainder = String(baseName.dropFirst("Retrace_".count))
+            guard let firstComponent = remainder.split(separator: "_").first else {
+                return nil
+            }
+            timestamp = String(firstComponent)
+        } else {
+            return nil
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter.date(from: timestamp)
+    }
+
+    nonisolated private static func isCrashReportAcknowledged(
+        _ report: DashboardCrashReportSummary,
+        acknowledgedIdentifiers: Set<String>,
+        acknowledgedBeforeDate: Date?
+    ) -> Bool {
+        if let acknowledgedBeforeDate, report.capturedAt <= acknowledgedBeforeDate {
+            return true
+        }
+
+        return acknowledgedIdentifiers.contains(report.acknowledgmentIdentifier)
+            || acknowledgedIdentifiers.contains(report.fileName)
+    }
+
+    private func refreshRecentCrashReportState(now: Date = Date()) {
+        let acknowledgedIdentifiers = loadAcknowledgedCrashReportIdentifiers()
+        let acknowledgedBeforeDate = loadAcknowledgedCrashReportCutoffDate()
+        let report = Self.loadRecentCrashReport(
             now: now,
-            acknowledgedFileNames: acknowledgedFileNames
+            acknowledgedReportIdentifiers: acknowledgedIdentifiers,
+            acknowledgedBeforeDate: acknowledgedBeforeDate
         )
 
-        recentWatchdogCrash = report
+        recentCrashReport = report
 
-        guard let report, report.fileName != lastTrackedWatchdogCrashBannerFileName else {
+        guard let report, report.acknowledgmentIdentifier != lastTrackedCrashBannerIdentifier else {
             return
         }
 
-        lastTrackedWatchdogCrashBannerFileName = report.fileName
-        recordWatchdogCrashBannerAction("banner_shown", report: report, now: now)
+        lastTrackedCrashBannerIdentifier = report.acknowledgmentIdentifier
+        recordCrashBannerAction("banner_shown", report: report, now: now)
     }
 
-    private func acknowledgeRecentWatchdogCrash(action: String) {
-        guard let report = recentWatchdogCrash else { return }
-        var acknowledgedFileNames = loadAcknowledgedWatchdogCrashFileNames()
-        acknowledgedFileNames.insert(report.fileName)
-        persistAcknowledgedWatchdogCrashFileNames(acknowledgedFileNames)
-        recordWatchdogCrashBannerAction(action, report: report)
-        recentWatchdogCrash = nil
+    private func acknowledgeRecentCrashReport(action: String) {
+        guard let report = recentCrashReport else { return }
+        var acknowledgedIdentifiers = loadAcknowledgedCrashReportIdentifiers()
+        acknowledgedIdentifiers.insert(report.acknowledgmentIdentifier)
+        let acknowledgedBeforeDate = max(loadAcknowledgedCrashReportCutoffDate() ?? .distantPast, report.capturedAt)
+        persistAcknowledgedCrashReportIdentifiers(acknowledgedIdentifiers)
+        persistAcknowledgedCrashReportCutoffDate(acknowledgedBeforeDate)
+        recordCrashBannerAction(action, report: report)
+        recentCrashReport = nil
     }
 
-    private func loadAcknowledgedWatchdogCrashFileNames() -> Set<String> {
-        var acknowledgedFileNames = Set(
-            settingsStore.stringArray(forKey: Self.acknowledgedWatchdogCrashReportKeysKey) ?? []
+    private func loadAcknowledgedCrashReportIdentifiers() -> Set<String> {
+        var acknowledgedIdentifiers = Set(
+            settingsStore.stringArray(forKey: Self.acknowledgedCrashReportIDsKey) ?? []
         )
+        let legacyAcknowledgedFileNames = settingsStore.stringArray(
+            forKey: Self.legacyAcknowledgedWatchdogCrashReportKeysKey
+        ) ?? []
+        acknowledgedIdentifiers.formUnion(legacyAcknowledgedFileNames)
 
         if let legacyAcknowledgedFileName = settingsStore.string(
-            forKey: Self.acknowledgedWatchdogCrashReportKey
+            forKey: Self.legacyAcknowledgedWatchdogCrashReportKey
         ) {
-            acknowledgedFileNames.insert(legacyAcknowledgedFileName)
+            acknowledgedIdentifiers.insert(legacyAcknowledgedFileName)
         }
 
-        return acknowledgedFileNames
+        return acknowledgedIdentifiers
     }
 
-    private func persistAcknowledgedWatchdogCrashFileNames(_ fileNames: Set<String>) {
-        settingsStore.set(fileNames.sorted(), forKey: Self.acknowledgedWatchdogCrashReportKeysKey)
-        settingsStore.removeObject(forKey: Self.acknowledgedWatchdogCrashReportKey)
+    private func loadAcknowledgedCrashReportCutoffDate() -> Date? {
+        let cutoffTimestampMs = (settingsStore.object(
+            forKey: Self.acknowledgedCrashReportCutoffTimestampMsKey
+        ) as? NSNumber)?.doubleValue
+
+        guard let cutoffTimestampMs else { return nil }
+        return Date(timeIntervalSince1970: cutoffTimestampMs / 1000)
+    }
+
+    private func persistAcknowledgedCrashReportIdentifiers(_ identifiers: Set<String>) {
+        settingsStore.set(identifiers.sorted(), forKey: Self.acknowledgedCrashReportIDsKey)
+        settingsStore.removeObject(forKey: Self.legacyAcknowledgedWatchdogCrashReportKey)
+        settingsStore.removeObject(forKey: Self.legacyAcknowledgedWatchdogCrashReportKeysKey)
         settingsStore.synchronize()
     }
 
-    private func recordWatchdogCrashBannerAction(
+    private func persistAcknowledgedCrashReportCutoffDate(_ date: Date) {
+        let timestampMs = Int64(date.timeIntervalSince1970 * 1000)
+        settingsStore.set(timestampMs, forKey: Self.acknowledgedCrashReportCutoffTimestampMsKey)
+        settingsStore.synchronize()
+    }
+
+    private func recordCrashBannerAction(
         _ action: String,
-        report: WatchdogCrashReportSummary,
+        report: DashboardCrashReportSummary,
         now: Date = Date()
     ) {
         let metadata = Self.jsonMetadata([
             "action": action,
             "fileName": report.fileName,
+            "source": report.source.rawValue,
             "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
         ])
         Self.recordMetric(
@@ -451,7 +622,7 @@ public class DashboardViewModel: ObservableObject {
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
-        refreshRecentWatchdogCrashState()
+        refreshRecentCrashReportState()
 
         do {
             // Calculate last 7 days date range
@@ -980,7 +1151,10 @@ public class DashboardViewModel: ObservableObject {
             metadata: metadata
         )
     }
-
+    /// Record a debug-only crash trigger from the dashboard.
+    public static func recordDebugCrashTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugCrashTriggered)
+    }
     public static func recordDateSearchSubmitted(
         coordinator: AppCoordinator,
         source: String,

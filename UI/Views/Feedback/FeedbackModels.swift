@@ -39,7 +39,7 @@ public enum FeedbackType: String, CaseIterable, Identifiable {
 public struct FeedbackLaunchContext {
     public enum Source: String {
         case manual
-        case watchdogCrashBanner
+        case crashBanner
     }
 
     public enum PreferredFocusField {

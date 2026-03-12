@@ -98,113 +98,257 @@ final class UpdaterManagerVersionResolutionTests: XCTestCase {
         XCTAssertEqual(UpdaterManager.resolveBundleVersionValue("", fallback: "0.0.0"), "0.0.0")
     }
 }
-final class WatchdogCrashSupportTests: XCTestCase {
-    func testLoadRecentWatchdogCrashReturnsNewestWatchdogReport() throws {
+final class CrashReportSupportTests: XCTestCase {
+    func testLoadRecentCrashReportReturnsNewestDiagnosticReportAcrossSources() throws {
         let fileManager = FileManager.default
-        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: directoryURL) }
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
 
-        let olderReport = try createCrashReport(
+        _ = try createCrashReport(
             named: "retrace-emergency-watchdog_auto_quit-2026-03-08_120000.txt",
             modifiedAt: Date(timeIntervalSince1970: 1_773_021_600),
-            in: directoryURL
+            in: emergencyDirectoryURL
         )
-        _ = olderReport
         _ = try createCrashReport(
             named: "retrace-emergency-hang_detected-2026-03-09_080000.txt",
             modifiedAt: Date(timeIntervalSince1970: 1_773_079_200),
-            in: directoryURL
+            in: emergencyDirectoryURL
         )
         let latestReport = try createCrashReport(
-            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt",
-            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
-            in: directoryURL
+            named: "Retrace-2026-03-09-121500.ips",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_095_700),
+            in: diagnosticDirectoryURL
+        )
+        _ = try createCrashReport(
+            named: "OtherApp-2026-03-09-130000.ips",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_098_000),
+            in: diagnosticDirectoryURL
         )
 
-        let result = DashboardViewModel.loadRecentWatchdogCrash(
+        let result = DashboardViewModel.loadRecentCrashReport(
             fileManager: fileManager,
-            crashReportDirectory: directoryURL.path,
-            now: Date(timeIntervalSince1970: 1_773_093_600)
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
+            now: Date(timeIntervalSince1970: 1_773_100_000)
         )
 
+        XCTAssertEqual(result?.source, .macOSDiagnosticReport)
         XCTAssertEqual(result?.fileName, latestReport.lastPathComponent)
     }
 
-    func testLoadRecentWatchdogCrashSkipsAcknowledgedLatestReport() throws {
+    func testLoadRecentCrashReportSkipsAcknowledgedLatestDiagnosticReport() throws {
         let fileManager = FileManager.default
-        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: directoryURL) }
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
 
         let fallbackReport = try createCrashReport(
             named: "retrace-emergency-watchdog_auto_quit-2026-03-08_120000.txt",
             modifiedAt: Date(timeIntervalSince1970: 1_773_021_600),
-            in: directoryURL
+            in: emergencyDirectoryURL
         )
         let acknowledgedReport = try createCrashReport(
-            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt",
+            named: "Retrace-2026-03-09-121500.ips",
             modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
-            in: directoryURL
+            in: diagnosticDirectoryURL
         )
 
-        let result = DashboardViewModel.loadRecentWatchdogCrash(
+        let acknowledgedIdentifier = DashboardCrashReportSummary(
+            source: .macOSDiagnosticReport,
+            fileName: acknowledgedReport.lastPathComponent,
+            fileURL: acknowledgedReport,
+            capturedAt: Date(timeIntervalSince1970: 1_773_090_000)
+        ).acknowledgmentIdentifier
+
+        let result = DashboardViewModel.loadRecentCrashReport(
             fileManager: fileManager,
-            crashReportDirectory: directoryURL.path,
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
             now: Date(timeIntervalSince1970: 1_773_093_600),
-            acknowledgedFileNames: [acknowledgedReport.lastPathComponent]
+            acknowledgedReportIdentifiers: [acknowledgedIdentifier]
         )
 
+        XCTAssertEqual(result?.source, .watchdogAutoQuit)
         XCTAssertEqual(result?.fileName, fallbackReport.lastPathComponent)
     }
 
-    func testLoadRecentWatchdogCrashSkipsEveryAcknowledgedRecentReport() throws {
+    func testLoadRecentCrashReportAcknowledgedNewestHidesOlderReports() throws {
         let fileManager = FileManager.default
-        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: directoryURL) }
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
 
-        let firstReport = try createCrashReport(
+        _ = try createCrashReport(
             named: "retrace-emergency-watchdog_auto_quit-2026-03-09_100000.txt",
             modifiedAt: Date(timeIntervalSince1970: 1_773_086_400),
-            in: directoryURL
+            in: emergencyDirectoryURL
         )
-        let secondReport = try createCrashReport(
-            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt",
+        let newestReport = try createCrashReport(
+            named: "Retrace-2026-03-09-121500.ips",
             modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
-            in: directoryURL
+            in: diagnosticDirectoryURL
         )
 
-        let result = DashboardViewModel.loadRecentWatchdogCrash(
+        let result = DashboardViewModel.loadRecentCrashReport(
             fileManager: fileManager,
-            crashReportDirectory: directoryURL.path,
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
             now: Date(timeIntervalSince1970: 1_773_093_600),
-            acknowledgedFileNames: [
-                firstReport.lastPathComponent,
-                secondReport.lastPathComponent
-            ]
+            acknowledgedBeforeDate: Date(timeIntervalSince1970: 1_773_090_000)
+        )
+
+        XCTAssertNil(result, newestReport.lastPathComponent)
+    }
+
+    func testLoadRecentCrashReportAcknowledgingSecondNewestAlsoHidesOlderReports() throws {
+        let fileManager = FileManager.default
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
+
+        let newestReport = try createCrashReport(
+            named: "Retrace-2026-03-09-131500.ips",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_093_600),
+            in: diagnosticDirectoryURL
+        )
+        let secondNewestReport = try createCrashReport(
+            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_120000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: emergencyDirectoryURL
+        )
+        _ = try createCrashReport(
+            named: "Retrace-2026-03-09-111500.ips",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_086_400),
+            in: diagnosticDirectoryURL
+        )
+
+        let newestAcknowledgedIdentifier = DashboardCrashReportSummary(
+            source: .macOSDiagnosticReport,
+            fileName: newestReport.lastPathComponent,
+            fileURL: newestReport,
+            capturedAt: Date(timeIntervalSince1970: 1_773_093_600)
+        ).acknowledgmentIdentifier
+
+        let result = DashboardViewModel.loadRecentCrashReport(
+            fileManager: fileManager,
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
+            now: Date(timeIntervalSince1970: 1_773_097_200),
+            acknowledgedReportIdentifiers: [newestAcknowledgedIdentifier],
+            acknowledgedBeforeDate: Date(timeIntervalSince1970: 1_773_090_000)
+        )
+
+        XCTAssertNil(result, secondNewestReport.lastPathComponent)
+    }
+
+    func testLoadRecentCrashReportIgnoresUnsupportedDiagnosticReportExtensions() throws {
+        let fileManager = FileManager.default
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
+
+        let emergencyReport = try createCrashReport(
+            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_100000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_086_400),
+            in: emergencyDirectoryURL
+        )
+        _ = try createCrashReport(
+            named: "Retrace_2026-03-09-121500_hasbook-bro.diag",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: diagnosticDirectoryURL
+        )
+
+        let result = DashboardViewModel.loadRecentCrashReport(
+            fileManager: fileManager,
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
+            now: Date(timeIntervalSince1970: 1_773_093_600),
+        )
+
+        XCTAssertEqual(result?.source, .watchdogAutoQuit)
+        XCTAssertEqual(result?.fileName, emergencyReport.lastPathComponent)
+    }
+
+    func testLoadRecentCrashReportSkipsEveryAcknowledgedRecentReport() throws {
+        let fileManager = FileManager.default
+        let (emergencyDirectoryURL, diagnosticDirectoryURL, cleanupURL) = try makeReportDirectories()
+        defer { try? fileManager.removeItem(at: cleanupURL) }
+
+        let emergencyReport = try createCrashReport(
+            named: "retrace-emergency-watchdog_auto_quit-2026-03-09_100000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_086_400),
+            in: emergencyDirectoryURL
+        )
+        let diagnosticReport = try createCrashReport(
+            named: "Retrace-2026-03-09-121500.ips",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: diagnosticDirectoryURL
+        )
+
+        let acknowledgedIdentifiers: Set<String> = [
+            DashboardCrashReportSummary(
+                source: .watchdogAutoQuit,
+                fileName: emergencyReport.lastPathComponent,
+                fileURL: emergencyReport,
+                capturedAt: Date(timeIntervalSince1970: 1_773_086_400)
+            ).acknowledgmentIdentifier,
+            DashboardCrashReportSummary(
+                source: .macOSDiagnosticReport,
+                fileName: diagnosticReport.lastPathComponent,
+                fileURL: diagnosticReport,
+                capturedAt: Date(timeIntervalSince1970: 1_773_090_000)
+            ).acknowledgmentIdentifier
+        ]
+
+        let result = DashboardViewModel.loadRecentCrashReport(
+            fileManager: fileManager,
+            crashReportDirectory: emergencyDirectoryURL.path,
+            diagnosticReportDirectories: [diagnosticDirectoryURL.path],
+            now: Date(timeIntervalSince1970: 1_773_093_600),
+            acknowledgedReportIdentifiers: acknowledgedIdentifiers
         )
 
         XCTAssertNil(result)
     }
 
-    func testWatchdogCrashLaunchContextPrefillsBugReportAndEmailFocus() {
-        let report = WatchdogCrashReportSummary(
+    func testCrashLaunchContextPrefillsBugReportAndEmailFocusForWatchdogAutoQuit() {
+        let report = DashboardCrashReportSummary(
+            source: .watchdogAutoQuit,
             fileName: "retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt",
             fileURL: URL(fileURLWithPath: "/tmp/retrace-emergency-watchdog_auto_quit-2026-03-09_110000.txt"),
             capturedAt: Date(timeIntervalSince1970: 1_773_090_000)
         )
 
-        let context = DashboardViewModel.makeWatchdogCrashFeedbackLaunchContext(
+        let context = DashboardViewModel.makeCrashFeedbackLaunchContext(
             for: report,
             now: Date(timeIntervalSince1970: 1_773_093_600)
         )
 
-        XCTAssertEqual(context.source, .watchdogCrashBanner)
+        XCTAssertEqual(context.source, .crashBanner)
         XCTAssertEqual(context.feedbackType, .bug)
         XCTAssertEqual(context.preferredFocusField, .email)
         XCTAssertTrue(context.prefilledDescription?.contains("Retrace Auto Quit Crash Logging") == true)
         XCTAssertTrue(context.prefilledDescription?.contains("Enter any other relevant context here:") == true)
+    }
+
+    func testCrashLaunchContextPrefillsDiagnosticCrashDescription() {
+        let report = DashboardCrashReportSummary(
+            source: .macOSDiagnosticReport,
+            fileName: "Retrace-2026-03-09-121500.ips",
+            fileURL: URL(fileURLWithPath: "/tmp/Retrace-2026-03-09-121500.ips"),
+            capturedAt: Date(timeIntervalSince1970: 1_773_090_000)
+        )
+
+        let context = DashboardViewModel.makeCrashFeedbackLaunchContext(for: report)
+
+        XCTAssertEqual(context.source, .crashBanner)
+        XCTAssertTrue(context.prefilledDescription?.contains("Retrace macOS Crash Report") == true)
+    }
+
+    private func makeReportDirectories() throws -> (URL, URL, URL) {
+        let fileManager = FileManager.default
+        let baseURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let emergencyDirectoryURL = baseURL.appendingPathComponent("emergency", isDirectory: true)
+        let diagnosticDirectoryURL = baseURL.appendingPathComponent("diagnostic", isDirectory: true)
+        try fileManager.createDirectory(at: emergencyDirectoryURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: diagnosticDirectoryURL, withIntermediateDirectories: true)
+        return (emergencyDirectoryURL, diagnosticDirectoryURL, baseURL)
     }
 
     private func createCrashReport(

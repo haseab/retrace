@@ -1,4 +1,5 @@
 import SwiftUI
+import Darwin
 import Shared
 import App
 
@@ -176,25 +177,25 @@ public struct DashboardView: View {
                 .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
             }
 
-            if let recentWatchdogCrash = viewModel.recentWatchdogCrash {
-                WatchdogCrashBanner(
-                    report: recentWatchdogCrash,
+            if let recentCrashReport = viewModel.recentCrashReport {
+                CrashReportBanner(
+                    report: recentCrashReport,
                     onSubmitBugReport: {
                         presentFeedbackSheet(
-                            launchContext: DashboardViewModel.makeWatchdogCrashFeedbackLaunchContext(
-                                for: recentWatchdogCrash
+                            launchContext: DashboardViewModel.makeCrashFeedbackLaunchContext(
+                                for: recentCrashReport
                             )
                         )
                     },
                     onDetails: {
-                        viewModel.recordRecentWatchdogCrashDetailsOpened()
+                        viewModel.recordRecentCrashReportDetailsOpened()
                         NSWorkspace.shared.selectFile(
-                            recentWatchdogCrash.fileURL.path,
-                            inFileViewerRootedAtPath: recentWatchdogCrash.fileURL.deletingLastPathComponent().path
+                            recentCrashReport.fileURL.path,
+                            inFileViewerRootedAtPath: recentCrashReport.fileURL.deletingLastPathComponent().path
                         )
                     },
                     onDismiss: {
-                        viewModel.dismissRecentWatchdogCrash()
+                        viewModel.dismissRecentCrashReport()
                     }
                 )
                 .frame(maxWidth: dashboardMaxWidth)
@@ -1471,6 +1472,9 @@ public struct DashboardView: View {
                     Button("Trigger Watchdog Hang (15s)") {
                         triggerDebugWatchdogHang()
                     }
+                    Button("Trigger Crash (SIGABRT)") {
+                        triggerDebugCrash()
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "ant.fill")
@@ -1528,11 +1532,20 @@ public struct DashboardView: View {
         }
     }
 
+    private func triggerDebugCrash() {
+        DashboardViewModel.recordDebugCrashTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional SIGABRT to exercise DiagnosticReports crash detection", category: .ui)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            Darwin.raise(SIGABRT)
+        }
+    }
+
     private func presentFeedbackSheet(launchContext: FeedbackLaunchContext? = nil) {
         feedbackLaunchContext = launchContext
         feedbackPresentationID = UUID()
-        if launchContext?.source == .watchdogCrashBanner {
-            viewModel.recordRecentWatchdogCrashFeedbackOpened()
+        if launchContext?.source == .crashBanner {
+            viewModel.recordRecentCrashReportFeedbackOpened()
         }
         showFeedbackSheet = true
     }
@@ -1541,8 +1554,8 @@ public struct DashboardView: View {
 
 // MARK: - Preview
 
-private struct WatchdogCrashBanner: View {
-    let report: WatchdogCrashReportSummary
+private struct CrashReportBanner: View {
+    let report: DashboardCrashReportSummary
     let onSubmitBugReport: () -> Void
     let onDetails: () -> Void
     let onDismiss: () -> Void
@@ -1551,7 +1564,13 @@ private struct WatchdogCrashBanner: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
-        return "Retrace crashed recently at \(formatter.string(from: report.capturedAt)). Please submit a bug report."
+        let timestamp = formatter.string(from: report.capturedAt)
+        switch report.source {
+        case .watchdogAutoQuit:
+            return "Retrace auto-quit after a recent freeze at \(timestamp). Please submit a bug report."
+        case .macOSDiagnosticReport:
+            return "macOS saved a recent Retrace crash report at \(timestamp). Please submit a bug report."
+        }
     }
 
     var body: some View {
