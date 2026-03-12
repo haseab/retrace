@@ -4,6 +4,8 @@ import Shared
 import App
 import UniformTypeIdentifiers
 
+private let timelineSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+
 /// Redesigned fullscreen timeline view with scrolling tape and fixed playhead
 /// The timeline tape moves left/right while the playhead stays fixed in center
 public struct SimpleTimelineView: View {
@@ -22,6 +24,7 @@ public struct SimpleTimelineView: View {
     @State private var isSearchHighlightControlsHintDismissed = false
     @State private var browserURLDebugWindowPosition = CGSize(width: 320, height: 16)
     @FocusState private var isInFrameSearchFieldFocused: Bool
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
 
     let coordinator: AppCoordinator
     let onClose: () -> Void
@@ -170,7 +173,7 @@ public struct SimpleTimelineView: View {
                 // Debug frame ID badge, OCR status indicator, and developer actions menu (top-left)
                 VStack {
                     HStack(spacing: 8) {
-                        if viewModel.showFrameIDs {
+                        if showFrameIDs {
                             DebugFrameIDBadge(viewModel: viewModel)
                         }
                         // OCR status indicator (only visible when OCR is in progress)
@@ -5233,6 +5236,7 @@ struct DeveloperActionsMenu: View {
     let onClose: () -> Void
     @State private var isHovering = false
     @State private var showReprocessFeedback = false
+    @AppStorage("showFrameIDs", store: timelineSettingsStore) private var showFrameIDs = SettingsDefaults.showFrameIDs
 
     /// Whether the current frame can be reprocessed (only Retrace frames)
     private var canReprocess: Bool {
@@ -5241,6 +5245,19 @@ struct DeveloperActionsMenu: View {
 
     var body: some View {
         Menu {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    viewModel.toggleFrameIDBadgeVisibilityFromDevMenu()
+                }
+            }) {
+                Label(
+                    showFrameIDs ? "Hide Frame ID" : "Show Frame ID",
+                    systemImage: "number.circle"
+                )
+            }
+
+            Divider()
+
             // Refresh OCR button
             Button(action: {
                 Task {

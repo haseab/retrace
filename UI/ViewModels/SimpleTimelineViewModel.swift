@@ -1017,6 +1017,18 @@ public class SimpleTimelineViewModel: ObservableObject {
         NSPasteboard.general.setString(frameIDString, forType: .string)
     }
 
+    public func toggleFrameIDBadgeVisibilityFromDevMenu() {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let isEnabled = !defaults.bool(forKey: "showFrameIDs")
+        defaults.set(isEnabled, forKey: "showFrameIDs")
+        DashboardViewModel.recordDeveloperSettingToggle(
+            coordinator: coordinator,
+            source: "timeline_dev_menu",
+            settingKey: "showFrameIDs",
+            isEnabled: isEnabled
+        )
+    }
+
     /// Reprocess OCR for the current frame (developer tool)
     /// Clears existing OCR data and re-enqueues the frame for processing
     public func reprocessCurrentFrameOCR() async throws {

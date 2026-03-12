@@ -67,6 +67,7 @@ public enum DailyMetricsQueries {
         case browserLinkOpened = "browser_link_opened"
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
+        case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}
         case rewindCutoffDateUpdated = "rewind_cutoff_date_updated"  // metadata: JSON {cutoffTimestampMs}
 
         // Delete actions

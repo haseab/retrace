@@ -963,6 +963,24 @@ public class DashboardViewModel: ObservableObject {
         recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)
     }
 
+    public static func recordDeveloperSettingToggle(
+        coordinator: AppCoordinator,
+        source: String,
+        settingKey: String,
+        isEnabled: Bool
+    ) {
+        let metadata = jsonMetadata([
+            "source": source,
+            "settingKey": settingKey,
+            "isEnabled": isEnabled
+        ])
+        recordMetric(
+            coordinator: coordinator,
+            type: .developerSettingToggle,
+            metadata: metadata
+        )
+    }
+
     public static func recordDateSearchSubmitted(
         coordinator: AppCoordinator,
         source: String,
