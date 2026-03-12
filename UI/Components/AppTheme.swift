@@ -132,21 +132,12 @@ public class AppNameResolver {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
     }
 
-    /// Get all currently installed apps from /Applications (instant, no DB query needed)
-    /// Returns array of AppInfo with bundleID and name
-    public func getInstalledApps() -> [AppInfo] {
+    nonisolated static func installedApps(in appFolders: [URL], fileManager: FileManager = .default) -> [AppInfo] {
         var apps: [AppInfo] = []
-        let fm = FileManager.default
-
-        let appFolders = [
-            URL(fileURLWithPath: "/Applications"),
-            URL(fileURLWithPath: "/System/Applications"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications"),
-            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
-        ]
+        var seenBundleIDs = Set<String>()
 
         for folder in appFolders {
-            guard let contents = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+            guard let contents = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
                 continue
             }
 
@@ -154,11 +145,11 @@ public class AppNameResolver {
                 let plistURL = appURL.appendingPathComponent("Contents/Info.plist")
                 guard let plist = NSDictionary(contentsOf: plistURL),
                       let bundleID = plist["CFBundleIdentifier"] as? String,
-                      !bundleID.isEmpty else {
+                      !bundleID.isEmpty,
+                      seenBundleIDs.insert(bundleID).inserted else {
                     continue
                 }
 
-                // Get display name
                 let name: String
                 if let displayName = plist["CFBundleDisplayName"] as? String, !displayName.isEmpty {
                     name = displayName
@@ -169,14 +160,31 @@ public class AppNameResolver {
                 }
 
                 apps.append(AppInfo(bundleID: bundleID, name: name))
-
-                // Also cache the name for later lookups
-                lock.lock()
-                cache[bundleID] = name
-                lock.unlock()
-
             }
         }
+
+        return apps
+    }
+
+    /// Get all currently installed apps from /Applications (instant, no DB query needed)
+    /// Returns array of AppInfo with bundleID and name
+    public func getInstalledApps() -> [AppInfo] {
+        let fm = FileManager.default
+
+        let appFolders = [
+            URL(fileURLWithPath: "/Applications"),
+            URL(fileURLWithPath: "/System/Applications"),
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications"),
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized")
+        ]
+
+        let apps = Self.installedApps(in: appFolders, fileManager: fm)
+
+        lock.lock()
+        for app in apps {
+            cache[app.bundleID] = app.name
+        }
+        lock.unlock()
 
         return apps
     }

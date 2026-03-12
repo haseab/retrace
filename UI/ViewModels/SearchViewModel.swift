@@ -274,7 +274,12 @@ public class SearchViewModel: ObservableObject {
 
     /// Combined list: installed apps + other apps (for backwards compatibility)
     public var availableApps: [AppInfo] {
-        installedApps + otherApps
+        Self.deduplicateAppsByBundleID(installedApps + otherApps)
+    }
+
+    nonisolated static func deduplicateAppsByBundleID(_ apps: [AppInfo]) -> [AppInfo] {
+        var seenBundleIDs = Set<String>()
+        return apps.filter { seenBundleIDs.insert($0.bundleID).inserted }
     }
 
     /// Effective date ranges for filtering. Falls back to legacy single-range fields.
@@ -1646,7 +1651,7 @@ public class SearchViewModel: ObservableObject {
         let startTime = CFAbsoluteTimeGetCurrent()
         let snapshot = await Task.detached(priority: .utility) {
             let installedStart = CFAbsoluteTimeGetCurrent()
-            let installed = AppNameResolver.shared.getInstalledApps()
+            let installed = Self.deduplicateAppsByBundleID(AppNameResolver.shared.getInstalledApps())
                 .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             let installedBundleIDs = Set(installed.map { $0.bundleID })
             let installedPhaseMs = Int((CFAbsoluteTimeGetCurrent() - installedStart) * 1000)

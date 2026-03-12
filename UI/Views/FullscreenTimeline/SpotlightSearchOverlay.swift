@@ -73,6 +73,14 @@ public struct SpotlightSearchOverlay: View {
         GridItem(.flexible(), spacing: 16)
     ]
 
+    static func recentEntryAppNameMap(from apps: [AppInfo]) -> [String: String] {
+        var appNamesByBundleID: [String: String] = [:]
+        for app in apps where appNamesByBundleID[app.bundleID] == nil {
+            appNamesByBundleID[app.bundleID] = app.name
+        }
+        return appNamesByBundleID
+    }
+
     // MARK: - Initialization
 
     public init(
@@ -503,7 +511,7 @@ public struct SpotlightSearchOverlay: View {
     }
 
     private func refreshRecentEntryAppNameMap() {
-        recentEntryAppNamesByBundleID = Dictionary(uniqueKeysWithValues: viewModel.availableApps.map { ($0.bundleID, $0.name) })
+        recentEntryAppNamesByBundleID = Self.recentEntryAppNameMap(from: viewModel.availableApps)
     }
 
     private var rankedRecentEntriesCount: Int {
