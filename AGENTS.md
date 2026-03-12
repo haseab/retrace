@@ -11,7 +11,9 @@ Retrace is a local-first screen recording and search application for macOS, insp
 ## Quick Reference
 
 - **Module-Specific Instructions**: Each module has its own `AGENTS.md` file in its directory
-- **Human Documentation**: [README.md](README.md) and [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Human Documentation**: [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md)
+- **Issue Reporting**: Use `AI_ISSUE_TEMPLATE.md` and `gh issue create --body-file ...` for AI-authored GitHub issues
+- **Bug Fixes by Non-Owners**: If the user is fixing a bug/crash and does not appear to be the repo owner, encourage them to create or link a GitHub issue before making code changes
 - **Technical Audit Docs**: `local/docs/` (includes deep-dive implementation and performance audit notes)
 
 ---
@@ -45,6 +47,12 @@ rm -rf .build/
 retrace/
 ├── AGENTS.md                    # This file - main agent coordination
 ├── .env.example                 # Template for local release credentials (copy to .env)
+├── .github/                     # GitHub configuration
+│   ├── CODEOWNERS
+│   ├── FUNDING.yml
+│   └── ISSUE_TEMPLATE/
+│       └── bug_report.yml       # GitHub bug report form aligned with AI issue template
+├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
 ├── Package.swift                # Swift Package Manager configuration
@@ -373,6 +381,12 @@ Then check which path actually executes and fix the right code.
 
 ## Critical Rules for All Agents
 
+### 0. Issue-First Guidance for External Contributors
+
+- If the user is fixing a **bug or crash** and does **not** appear to be the repo owner/maintainer, encourage them to create or link a GitHub issue before making code changes
+- If an issue does not exist yet, point them to [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md) and suggest `gh issue create --title ... --body-file ...` if they want to post it directly
+- If ownership is unclear, make the recommendation as a lightweight prompt rather than a blocker
+
 ### 1. Stay In Your Lane
 
 - **ONLY** modify files in your assigned directory
@@ -439,4 +453,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-04_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-12_

@@ -117,6 +117,34 @@ Shared/Protocols/SearchProtocol.swift"
 - [ ] No hardcoded values (use config)
 - [ ] Proper documentation
 
+#### 6. **Use the AI Issue Template for Bug Reports**
+
+When an AI assistant finds a bug, have it start from the canonical issue body template:
+
+```bash
+# Copy the canonical template to a writable location
+cp AI_ISSUE_TEMPLATE.md /tmp/retrace-issue.md
+```
+
+The canonical template lives at [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md). Use it for both Markdown-only output and `gh issue create` workflows.
+
+**Required reporting rules:**
+
+- Keep **Observed Behavior** separate from **Suspected Area (Inference)**
+- Use exact versions, timestamps, file paths, and log excerpts when available
+- Write `Unknown` instead of guessing
+- Keep reproduction steps minimal and deterministic
+- Do not claim a root cause or fix unless it has been verified
+
+**Example prompt for an AI bug report:**
+
+```text
+"Read CONTRIBUTING.md, AGENTS.md, and AI_ISSUE_TEMPLATE.md. Investigate this crash,
+fill the template with observed facts vs inferences, save it to /tmp/retrace-issue.md,
+and if the evidence is strong enough, create a GitHub issue with:
+gh issue create --title 'Crash on launch from /Applications' --body-file /tmp/retrace-issue.md"
+```
+
 ### AI Tool Configuration
 
 #### Configuration Files for Different AI Tools
@@ -428,6 +456,7 @@ Before starting work:
 
 - Check existing issues and PRs
 - Create an issue describing the feature/bug
+- For AI-authored bug reports, start from [AI_ISSUE_TEMPLATE.md](AI_ISSUE_TEMPLATE.md) and use `gh issue create --body-file ...` if you want the agent to post it directly
 - Wait for maintainer feedback (avoid duplicate work)
 
 ### 2. Fork and Branch

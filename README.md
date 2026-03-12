@@ -153,6 +153,16 @@ The app will create its database at the default location (`~/Library/Application
 ./scripts/hardreset_onboarding.sh
 ```
 
+**Draft or submit a bug issue**:
+
+```bash
+# Start from the canonical AI issue template
+cp AI_ISSUE_TEMPLATE.md /tmp/retrace-issue.md
+
+# After filling it in, create the issue with gh if needed
+gh issue create --title "Crash on launch" --body-file /tmp/retrace-issue.md
+```
+
 ## Development
 
 Retrace follows a Test-Driven Development (TDD) approach. See [CONTRIBUTING.md](CONTRIBUTING.md) for:
@@ -160,6 +170,7 @@ Retrace follows a Test-Driven Development (TDD) approach. See [CONTRIBUTING.md](
 - Development workflow and conventions
 - Testing requirements (TDD, mocking protocols)
 - AI-assisted development guidelines
+- AI bug issue template
 - Module boundaries and architecture decisions
 - Code style and Swift patterns
 
