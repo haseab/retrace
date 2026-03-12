@@ -362,9 +362,16 @@ public struct FeedbackFormView: View {
                 diagnosticChip(icon: "app.badge", text: "Version")
                 diagnosticChip(icon: "desktopcomputer", text: "Device")
                 diagnosticChip(icon: "cylinder", text: "Stats")
+                diagnosticChip(icon: "memorychip", text: "Memory")
                 if viewModel.includesLogsInDiagnostics {
                     diagnosticChip(icon: "doc.text", text: "Logs")
                 }
+            }
+
+            if viewModel.includesLogsInDiagnostics {
+                Text("Bug reports include recent logs plus a limited memory profile for Retrace and core media services.")
+                    .font(.system(size: 10))
+                    .foregroundColor(.retraceSecondary.opacity(0.72))
             }
 
             // Expanded details (lazy loaded)

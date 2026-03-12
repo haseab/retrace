@@ -19,6 +19,7 @@ struct VideoFrameView: NSViewRepresentable {
 
     func updateNSView(_ playerView: AVPlayerView, context: Context) {
         Log.debug("[VideoFrameView] updateNSView - path: \(videoInfo.videoPath), frame: \(videoInfo.frameIndex), time: \(videoInfo.timeInSeconds)s", category: .app)
+        context.coordinator.invalidateObserver()
 
         // Create or reuse player
         let player: AVPlayer
@@ -67,6 +68,7 @@ struct VideoFrameView: NSViewRepresentable {
             // Create symlink
             do {
                 try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                context.coordinator.symlinkPath = symlinkPath
                 Log.debug("[VideoFrameView] Created symlink: \(symlinkPath)", category: .app)
             } catch {
                 Log.error("[VideoFrameView] Failed to create symlink: \(error)", category: .app)
@@ -109,20 +111,51 @@ struct VideoFrameView: NSViewRepresentable {
         }
 
         // Store observer to prevent deallocation
-        context.coordinator.observers.append(observer)
-        Log.debug("[VideoFrameView] Observer added, total observers: \(context.coordinator.observers.count)", category: .app)
+        context.coordinator.statusObserver = observer
+        Log.debug("[VideoFrameView] Installed player item observer", category: .app)
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
+    static func dismantleNSView(_ playerView: AVPlayerView, coordinator: Coordinator) {
+        coordinator.cleanup()
+        cleanupPlayerView(playerView)
+    }
+
+    private static func cleanupPlayerView(_ playerView: AVPlayerView) {
+        guard let player = playerView.player else { return }
+        player.pause()
+        player.cancelPendingPrerolls()
+        if let item = player.currentItem {
+            item.cancelPendingSeeks()
+            item.asset.cancelLoading()
+        }
+        player.replaceCurrentItem(with: nil)
+        playerView.player = nil
+    }
+
     class Coordinator {
-        var observers: [NSKeyValueObservation] = []
+        var statusObserver: NSKeyValueObservation?
+        var symlinkPath: String?
+
+        func invalidateObserver() {
+            statusObserver?.invalidate()
+            statusObserver = nil
+        }
+
+        func cleanup() {
+            invalidateObserver()
+            if let symlinkPath {
+                try? FileManager.default.removeItem(atPath: symlinkPath)
+                self.symlinkPath = nil
+            }
+        }
 
         deinit {
-            observers.forEach { $0.invalidate() }
-            Log.debug("[VideoFrameView.Coordinator] Deinit, invalidating \(observers.count) observers", category: .app)
+            cleanup()
+            Log.debug("[VideoFrameView.Coordinator] Deinit and released decoder state", category: .app)
         }
     }
 }

@@ -1478,6 +1478,7 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
             do {
                 try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
+                context.coordinator.trackSymlink(symlinkPath)
             } catch {
                 Log.error("[SimpleVideoFrameView] Failed to create symlink: \(error)", category: .app)
                 return
@@ -1501,9 +1502,26 @@ struct SimpleVideoFrameView: NSViewRepresentable {
         Coordinator()
     }
 
+    static func dismantleNSView(_ nsView: DoubleBufferedVideoView, coordinator: Coordinator) {
+        nsView.releaseDecoderResources(reason: "SimpleVideoFrameView dismantled")
+        coordinator.cleanupSymlinks()
+    }
+
     class Coordinator {
         var currentVideoPath: String?
         var currentFrameIndex: Int?
+        private var symlinkPaths: Set<String> = []
+
+        func trackSymlink(_ path: String) {
+            symlinkPaths.insert(path)
+        }
+
+        func cleanupSymlinks() {
+            for path in symlinkPaths {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            symlinkPaths.removeAll()
+        }
     }
 }
 
@@ -1559,9 +1577,16 @@ class DoubleBufferedVideoView: NSView {
         setupPlayers()
     }
 
-	    private func setupPlayers() {
-	        wantsLayer = true
-	        layer?.backgroundColor = NSColor.black.cgColor
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            releaseDecoderResources(reason: "view removed from window")
+        }
+    }
+
+    private func setupPlayers() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
 
         // Create player A
         playerViewA = createPlayerView()
@@ -1588,14 +1613,14 @@ class DoubleBufferedVideoView: NSView {
         setupConstraints(for: playerViewB)
     }
 
-	    private func createPlayerView() -> AVPlayerView {
-	        let playerView = AVPlayerView()
+    private func createPlayerView() -> AVPlayerView {
+        let playerView = AVPlayerView()
         playerView.controlsStyle = .none
         playerView.showsFrameSteppingButtons = false
         playerView.showsSharingServiceButton = false
-	        playerView.showsFullScreenToggleButton = false
-	        playerView.wantsLayer = true
-	        playerView.layer?.backgroundColor = NSColor.black.cgColor
+        playerView.showsFullScreenToggleButton = false
+        playerView.wantsLayer = true
+        playerView.layer?.backgroundColor = NSColor.black.cgColor
 
         if #available(macOS 13.0, *) {
             playerView.allowsVideoFrameAnalysis = false
@@ -1614,6 +1639,34 @@ class DoubleBufferedVideoView: NSView {
         ])
     }
 
+    private func ensurePlayersReady() {
+        if playerViewA == nil || playerViewB == nil {
+            setupPlayers()
+            return
+        }
+
+        if playerA == nil {
+            let player = AVPlayer()
+            player.actionAtItemEnd = .pause
+            playerA = player
+            playerViewA.player = player
+        } else if playerViewA.player == nil {
+            playerViewA.player = playerA
+        }
+
+        if playerB == nil {
+            let player = AVPlayer()
+            player.actionAtItemEnd = .pause
+            playerB = player
+            playerViewB.player = player
+        } else if playerViewB.player == nil {
+            playerViewB.player = playerB
+        }
+
+        playerViewA.isHidden = !isPlayerAActive
+        playerViewB.isHidden = isPlayerAActive
+    }
+
     /// Seek the currently active player to a specific time.
     func seekActivePlayer(
         to time: CMTime,
@@ -1621,6 +1674,7 @@ class DoubleBufferedVideoView: NSView {
         frameRate: Double,
         debugContext: VideoSeekDebugContext?
     ) {
+        ensurePlayersReady()
         seekGeneration &+= 1
         let currentSeekGeneration = seekGeneration
         let tolerance = seekTolerance(for: frameRate)
@@ -1671,6 +1725,8 @@ class DoubleBufferedVideoView: NSView {
         frameRate: Double,
         debugContext: VideoSeekDebugContext?
     ) {
+        ensurePlayersReady()
+
         // Increment generation to invalidate any pending async callbacks
         loadGeneration &+= 1
         let currentGeneration = loadGeneration
@@ -1770,6 +1826,43 @@ class DoubleBufferedVideoView: NSView {
         }
     }
 
+    func releaseDecoderResources(reason: String) {
+        loadGeneration &+= 1
+        seekGeneration &+= 1
+
+        observerA?.invalidate()
+        observerA = nil
+        observerB?.invalidate()
+        observerB = nil
+
+        release(player: playerA, playerView: playerViewA)
+        release(player: playerB, playerView: playerViewB)
+        playerA = nil
+        playerB = nil
+
+        isPlayerAActive = true
+        playerViewA?.isHidden = false
+        playerViewB?.isHidden = true
+
+        Log.debug("[VideoView] Released decoder resources (\(reason))", category: .ui)
+    }
+
+    private func release(player: AVPlayer?, playerView: AVPlayerView?) {
+        guard let player else {
+            playerView?.player = nil
+            return
+        }
+
+        player.pause()
+        player.cancelPendingPrerolls()
+        if let item = player.currentItem {
+            item.cancelPendingSeeks()
+            item.asset.cancelLoading()
+        }
+        player.replaceCurrentItem(with: nil)
+        playerView?.player = nil
+    }
+
     private func configuredSeekToleranceFrames() -> Int {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         let value = defaults.integer(forKey: "retrace.debug.timelineSeekToleranceFrames")
@@ -1844,8 +1937,7 @@ class DoubleBufferedVideoView: NSView {
     }
 
     deinit {
-        observerA?.invalidate()
-        observerB?.invalidate()
+        releaseDecoderResources(reason: "DoubleBufferedVideoView deinit")
     }
 }
 

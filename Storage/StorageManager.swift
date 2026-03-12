@@ -924,6 +924,20 @@ public actor StorageManager: StorageProtocol {
         Log.info("[StorageManager] All caches invalidated", category: .storage)
     }
 
+    /// Purge cached AVFoundation decode state without dropping path lookups.
+    public func purgeFrameExtractionCaches(reason: String) {
+        frameCache.removeAll()
+
+        for (_, entry) in generatorCache {
+            if let symlinkURL = entry.symlinkURL {
+                try? FileManager.default.removeItem(at: symlinkURL)
+            }
+        }
+        generatorCache.removeAll()
+
+        Log.info("[StorageManager] Purged frame extraction caches (\(reason))", category: .storage)
+    }
+
     /// Validate cached paths still exist. Call after drive reconnection to clean stale entries.
     public func validateCaches() {
         var invalidSegmentIDs: [Int64] = []

@@ -18,6 +18,11 @@ public protocol ImageExtractor: Sendable {
     func extractFrameCGImage(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> CGImage
 }
 
+/// Optional cache-control interface for extractors that keep AVFoundation decode state alive.
+public protocol FrameExtractionCacheInvalidating: Sendable {
+    func purgeFrameExtractionCaches(reason: String)
+}
+
 // MARK: - Frame Generator Actor
 
 /// Actor that serializes access to AVAssetImageGenerator for a single video file
@@ -91,13 +96,19 @@ private final class GeneratorCache: @unchecked Sendable {
         defer { lock.unlock() }
         cache.removeObject(forKey: key as NSString)
     }
+
+    func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache.removeAllObjects()
+    }
 }
 
 // MARK: - HEVC Storage Extractor (Retrace)
 
 /// Image extractor for Retrace's custom HEVC storage
 /// Uses actor-based serialization for safe concurrent access
-public final class HEVCStorageExtractor: ImageExtractor {
+public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInvalidating {
     private let storageRoot: String
     private let imageCache = NSCache<NSString, NSData>()
     private let generatorCache: GeneratorCache
@@ -253,13 +264,19 @@ public final class HEVCStorageExtractor: ImageExtractor {
         }
         return jpegData
     }
+
+    public func purgeFrameExtractionCaches(reason: String) {
+        imageCache.removeAllObjects()
+        generatorCache.removeAll()
+        Log.info("[HEVCStorageExtractor] Purged frame extraction caches (\(reason))", category: .storage)
+    }
 }
 
 // MARK: - AVAsset Extractor (Rewind)
 
 /// Image extractor for Rewind's MP4 videos using AVFoundation
 /// Uses actor-based serialization for safe concurrent access
-public final class AVAssetExtractor: ImageExtractor {
+public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalidating {
     private let imageCache = NSCache<NSString, NSData>()
     private let generatorCache: GeneratorCache
     private let storageRoot: String
@@ -414,6 +431,12 @@ public final class AVAssetExtractor: ImageExtractor {
             throw ImageExtractionError.conversionFailed(path: path)
         }
         return jpegData
+    }
+
+    public func purgeFrameExtractionCaches(reason: String) {
+        imageCache.removeAllObjects()
+        generatorCache.removeAll()
+        Log.info("[AVAssetExtractor] Purged frame extraction caches (\(reason))", category: .storage)
     }
 }
 

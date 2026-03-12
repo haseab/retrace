@@ -74,10 +74,13 @@ public struct FeedbackLaunchContext {
 /// reproduce the issue. Each field was chosen because it has directly helped diagnose a real
 /// class of user-reported problem (e.g. display scaling bugs, MDM interference, memory pressure).
 ///
-/// **Privacy preserved:** Process info reports category counts only, never app names.
-/// No file paths, no user data. Settings snapshot uses a strict whitelist — no raw queries,
-/// app lists, or browsing data are ever included.
+/// **Privacy preserved:** Process info reports category counts only, never app names. Memory
+/// diagnostics add only a small allowlist of Retrace/media-system helper process names relevant
+/// to decoder debugging. No file paths, no user data. Settings snapshot uses a strict whitelist —
+/// no raw queries, app lists, or browsing data are ever included.
 public struct DiagnosticInfo: Codable {
+    private static let memoryProfileLogMarker = "[FeedbackMemoryProfile]"
+
     public let appVersion: String
     public let buildNumber: String
     public let macOSVersion: String
@@ -249,6 +252,27 @@ public struct DiagnosticInfo: Codable {
         self.timestamp = Date()
     }
 
+    private var memoryProfileEntries: [String] {
+        recentLogs
+            .filter(Self.isMemoryProfileLog)
+            .map(Self.memoryProfileMessage)
+    }
+
+    private var nonMemoryProfileLogs: [String] {
+        recentLogs.filter { !Self.isMemoryProfileLog($0) }
+    }
+
+    private static func isMemoryProfileLog(_ entry: String) -> Bool {
+        entry.contains(memoryProfileLogMarker)
+    }
+
+    private static func memoryProfileMessage(from entry: String) -> String {
+        guard let markerRange = entry.range(of: memoryProfileLogMarker) else {
+            return entry
+        }
+        return String(entry[markerRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+    }
+
     /// Format as readable text for display (summary without full logs).
     /// Each section explains *why* this data helps diagnose the issue.
     public func formattedText() -> String {
@@ -291,6 +315,14 @@ public struct DiagnosticInfo: Codable {
         }
         text += "\n- Low Power Mode: \(performanceInfo.isLowPowerModeEnabled)"
         text += "\n- Processors: \(performanceInfo.processorCount)"
+
+        if !memoryProfileEntries.isEmpty {
+            text += "\n\n=== MEMORY PROFILE ==="
+            text += "\n(Allow-listed Retrace/media system services only — helps diagnose decoder and swap spikes)"
+            for entry in memoryProfileEntries {
+                text += "\n- \(entry)"
+            }
+        }
 
         // -- Running Apps: category counts only (never app names) — detects interference
         text += "\n\n=== RUNNING APPS (category counts only, never app names) ==="
@@ -335,7 +367,7 @@ public struct DiagnosticInfo: Codable {
         }
 
         if !recentLogs.isEmpty {
-            text += "\nRecent Logs: \(recentLogs.count) entries from last hour"
+            text += "\nRecent Logs: \(recentLogs.count) entries (recent log tail + memory profile)"
         }
 
         return text
@@ -361,10 +393,10 @@ public struct DiagnosticInfo: Codable {
         }
 
         // -- Full logs: complete log output from the last hour for tracing event sequences
-        if !recentLogs.isEmpty {
+        if !nonMemoryProfileLogs.isEmpty {
             text += "\n\n--- FULL LOGS (last hour) ---\n"
             text += "(Complete log output for tracing event sequences leading to the issue)\n"
-            text += recentLogs.joined(separator: "\n")
+            text += nonMemoryProfileLogs.joined(separator: "\n")
         }
 
         return text

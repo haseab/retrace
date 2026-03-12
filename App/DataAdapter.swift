@@ -122,6 +122,14 @@ public actor DataAdapter {
         Log.info("[DataAdapter] Rewind source disconnected", category: .app)
     }
 
+    /// Release cached AVFoundation decode state held by frame extractors.
+    public func purgeFrameExtractionCaches(reason: String) {
+        (retraceImageExtractor as? FrameExtractionCacheInvalidating)?
+            .purgeFrameExtractionCaches(reason: reason)
+        (rewindImageExtractor as? FrameExtractionCacheInvalidating)?
+            .purgeFrameExtractionCaches(reason: reason)
+    }
+
     private func decodeStoredPoint(_ rawValue: String?) -> (x: Double, y: Double)? {
         guard let rawValue else {
             return nil

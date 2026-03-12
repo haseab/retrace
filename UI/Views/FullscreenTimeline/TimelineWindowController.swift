@@ -1031,6 +1031,9 @@ public class TimelineWindowController: NSObject {
                 // Use navigateToNewest: false so short hide/show cycles preserve position.
                 if let viewModel = self?.timelineViewModel {
                     self?.destroyMountedPresentation(keepPreparedState: true)
+                    if let coordinator = self?.coordinator {
+                        await coordinator.purgeVideoDecodingCaches(reason: "timeline hidden")
+                    }
                     self?.startBackgroundRefreshTimer(resetSchedule: true)
                     await viewModel.refreshFrameData(
                         navigateToNewest: false,
@@ -1258,6 +1261,11 @@ public class TimelineWindowController: NSObject {
         timelineViewModel?.saveState()
         timelineViewModel?.compactPresentationState(reason: "destroyPreparedWindow", purgeDiskFrameBuffer: true)
         destroyMountedPresentation(keepPreparedState: false)
+        if let coordinator {
+            Task {
+                await coordinator.purgeVideoDecodingCaches(reason: "destroyPreparedWindow")
+            }
+        }
         timelineViewModel = nil
         isPrepared = false
     }

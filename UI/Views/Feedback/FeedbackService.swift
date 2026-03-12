@@ -3,6 +3,7 @@ import AppKit
 import Shared
 import OSLog
 import IOKit.ps
+import Darwin
 
 // MARK: - Feedback Stats Provider
 
@@ -22,6 +23,8 @@ public protocol FeedbackStatsProvider {
 /// background or sent automatically.
 ///
 /// **Privacy preserved:** Process info reports category counts only, never app names.
+/// Memory-spike diagnostics add only a small allowlist of Retrace/media-system helper process
+/// names (for example `VTDecoderXPCService`) because those are directly relevant to decoder leaks.
 /// No file paths, no user data. Settings use a strict whitelist (see `collectSanitizedSettingsSnapshot`).
 public final class FeedbackService {
 
@@ -29,14 +32,43 @@ public final class FeedbackService {
 
     private init() {}
 
+    private typealias ProcPidRusageFunction = @convention(c) (pid_t, Int32, UnsafeMutableRawPointer?) -> Int32
+
+    private struct LiveMemoryProcessSample {
+        let name: String
+        let currentBytes: UInt64
+        let processCount: Int
+    }
+
+    private static let memoryProfileCategory = "FeedbackMemoryProfile"
+    private static let memoryProfileProcessNames: Set<String> = [
+        "AXUIServer",
+        "Retrace",
+        "VTDecoderXPCService",
+        "VTEncoderXPCService",
+        "WindowServer",
+        "mediaserverd"
+    ]
+    private static let memoryProfileProcessThresholdBytes: UInt64 = 128 * 1024 * 1024
+    private static let procPidRusageFunction: ProcPidRusageFunction? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "proc_pid_rusage") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: ProcPidRusageFunction.self)
+    }()
+
     // MARK: - Diagnostic Collection
 
     /// Collect current diagnostic information (with placeholder database stats)
     public func collectDiagnostics() -> DiagnosticInfo {
-        let logs = collectRecentLogs()
-        let errors = logs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
         let settingsSnapshot = collectSanitizedSettingsSnapshot()
         let enhanced = collectEnhancedDiagnostics()
+        let baseLogs = collectRecentLogs()
+        let errors = baseLogs.filter { $0.contains("[ERROR]") || $0.contains("[FAULT]") }
+        let logs = collectMemoryProfileLogs(
+            performanceInfo: enhanced.performanceInfo,
+            includeLiveProcessSample: true
+        ) + baseLogs
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -60,10 +92,14 @@ public final class FeedbackService {
     /// Collect current diagnostic information with real database stats from provider
     public func collectDiagnostics(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
         // Use file-based logs for submission (more complete, includes all logs)
-        let logs = Log.getRecentLogs(maxCount: 500)
-        let errors = Log.getRecentErrors(maxCount: 50)
         let settingsSnapshot = collectSanitizedSettingsSnapshot()
         let enhanced = collectEnhancedDiagnostics()
+        let baseLogs = Log.getRecentLogs(maxCount: 500)
+        let errors = Log.getRecentErrors(maxCount: 50)
+        let logs = collectMemoryProfileLogs(
+            performanceInfo: enhanced.performanceInfo,
+            includeLiveProcessSample: true
+        ) + baseLogs
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -88,10 +124,14 @@ public final class FeedbackService {
     /// This avoids the slow OSLogStore query entirely
     public func collectDiagnosticsQuick(with stats: DiagnosticInfo.DatabaseStats) -> DiagnosticInfo {
         // Use the fast file-based log buffer instead of OSLogStore
-        let logs = Log.getRecentLogs(maxCount: 100)
-        let errors = Log.getRecentErrors(maxCount: 20)
         let settingsSnapshot = collectSanitizedSettingsSnapshot()
         let enhanced = collectEnhancedDiagnostics()
+        let baseLogs = Log.getRecentLogs(maxCount: 100)
+        let errors = Log.getRecentErrors(maxCount: 20)
+        let logs = collectMemoryProfileLogs(
+            performanceInfo: enhanced.performanceInfo,
+            includeLiveProcessSample: false
+        ) + baseLogs
 
         return DiagnosticInfo(
             appVersion: appVersion,
@@ -645,6 +685,232 @@ public final class FeedbackService {
     private func collectEmergencyCrashReports() -> [String]? {
         let reports = EmergencyDiagnostics.loadReports(maxReports: 5)
         return reports.isEmpty ? nil : reports
+    }
+
+    // MARK: - Memory Spike Diagnostics
+
+    private func collectMemoryProfileLogs(
+        performanceInfo: DiagnosticInfo.PerformanceInfo,
+        includeLiveProcessSample: Bool
+    ) -> [String] {
+        var entries = collectHistoricalMemoryProfileLogs(performanceInfo: performanceInfo)
+        if includeLiveProcessSample {
+            entries.append(contentsOf: collectLiveMemoryProfileLogs())
+        }
+        return entries
+    }
+
+    private func collectHistoricalMemoryProfileLogs(
+        performanceInfo: DiagnosticInfo.PerformanceInfo
+    ) -> [String] {
+        guard Thread.isMainThread else {
+            return [memoryProfileLogEntry("Memory sampler unavailable off the main thread")]
+        }
+
+        let snapshot = MainActor.assumeIsolated { ProcessCPUMonitor.shared.snapshot }
+        guard snapshot.hasEnoughMemoryData else {
+            return [memoryProfileLogEntry(
+                "Memory sampler warming up (\(formattedDuration(snapshot.sampleDurationSeconds)) collected)"
+            )]
+        }
+
+        var entries: [String] = []
+        let latestSampleAgeText: String
+        if let latestSampleTimestamp = snapshot.latestSampleTimestamp {
+            latestSampleAgeText = formattedAge(Date().timeIntervalSince1970 - latestSampleTimestamp)
+        } else {
+            latestSampleAgeText = "unknown"
+        }
+
+        entries.append(memoryProfileLogEntry(
+            "Sampler window: \(formattedDuration(snapshot.sampleDurationSeconds))"
+                + " | latest sample age: \(latestSampleAgeText)"
+                + " | tracked current total: \(formattedMemory(snapshot.totalTrackedCurrentResidentBytes))"
+                + " | tracked avg total: \(formattedMemory(snapshot.totalTrackedAverageResidentBytes))"
+                + " | memory pressure: \(performanceInfo.memoryPressure)"
+                + " | swap: \(formattedGigabytes(performanceInfo.swapUsedGB))"
+        ))
+
+        let retraceGroupKey = snapshot.retraceGroupKey
+        let relevantRows = snapshot.topMemoryProcesses
+            .filter { row in
+                if row.id == retraceGroupKey {
+                    return true
+                }
+                guard Self.memoryProfileProcessNames.contains(row.name) else {
+                    return false
+                }
+                return max(row.currentBytes, row.averageBytes, row.peakBytes) >= Self.memoryProfileProcessThresholdBytes
+            }
+            .sorted { lhs, rhs in
+                if lhs.currentBytes != rhs.currentBytes {
+                    return lhs.currentBytes > rhs.currentBytes
+                }
+                return lhs.peakBytes > rhs.peakBytes
+            }
+
+        for row in relevantRows {
+            entries.append(memoryProfileLogEntry(
+                "\(row.name): now \(formattedMemory(row.currentBytes))"
+                    + " | avg \(formattedMemory(row.averageBytes))"
+                    + " | peak \(formattedMemory(row.peakBytes))"
+                    + " | tracked share now \(formattedPercent(row.currentSharePercent))"
+            ))
+        }
+
+        if relevantRows.contains(where: { $0.name == "VTDecoderXPCService" }) == false {
+            entries.append(memoryProfileLogEntry("VTDecoderXPCService not observed in sampled history"))
+        }
+
+        return entries
+    }
+
+    private func collectLiveMemoryProfileLogs() -> [String] {
+        let samples = collectLiveMemorySamples()
+        guard !samples.isEmpty else {
+            return [memoryProfileLogEntry("Live memory scan found no allow-listed media processes")]
+        }
+
+        let summary = samples
+            .sorted { lhs, rhs in
+                if lhs.currentBytes != rhs.currentBytes {
+                    return lhs.currentBytes > rhs.currentBytes
+                }
+                return lhs.name < rhs.name
+            }
+            .map { sample in
+                let countSuffix = sample.processCount > 1 ? " (\(sample.processCount)x)" : ""
+                return "\(sample.name) \(formattedMemory(sample.currentBytes))\(countSuffix)"
+            }
+            .joined(separator: " | ")
+
+        return [memoryProfileLogEntry("Live scan: \(summary)")]
+    }
+
+    private func collectLiveMemorySamples() -> [LiveMemoryProcessSample] {
+        var aggregated: [String: (bytes: UInt64, count: Int)] = [:]
+
+        for pid in Self.listAllProcessIDs() {
+            guard let name = Self.normalizedProcessName(for: pid),
+                  Self.memoryProfileProcessNames.contains(name),
+                  let memoryBytes = Self.processMemoryBytes(for: pid) else {
+                continue
+            }
+
+            let current = aggregated[name] ?? (bytes: 0, count: 0)
+            aggregated[name] = (
+                bytes: current.bytes &+ memoryBytes,
+                count: current.count + 1
+            )
+        }
+
+        return aggregated.map { name, value in
+            LiveMemoryProcessSample(
+                name: name,
+                currentBytes: value.bytes,
+                processCount: value.count
+            )
+        }
+    }
+
+    private func memoryProfileLogEntry(_ message: String, level: String = "NOTICE") -> String {
+        "[\(Log.timestamp())] [\(level)] [\(Self.memoryProfileCategory)] \(message)"
+    }
+
+    private func formattedMemory(_ bytes: UInt64) -> String {
+        let gigabytes = Double(bytes) / (1024 * 1024 * 1024)
+        if gigabytes >= 1 {
+            return String(format: "%.2f GB", gigabytes)
+        }
+
+        let megabytes = Double(bytes) / (1024 * 1024)
+        return String(format: "%.0f MB", megabytes)
+    }
+
+    private func formattedGigabytes(_ gigabytes: Double) -> String {
+        String(format: "%.2f GB", gigabytes)
+    }
+
+    private func formattedPercent(_ percent: Double) -> String {
+        String(format: "%.1f%%", percent)
+    }
+
+    private func formattedDuration(_ seconds: TimeInterval) -> String {
+        if seconds >= 3600 {
+            return String(format: "%.1f h", seconds / 3600)
+        }
+        if seconds >= 60 {
+            return String(format: "%.0f min", seconds / 60)
+        }
+        return String(format: "%.0f s", seconds)
+    }
+
+    private func formattedAge(_ seconds: TimeInterval) -> String {
+        let clampedSeconds = max(0, seconds)
+        if clampedSeconds >= 60 {
+            return String(format: "%.0f min", clampedSeconds / 60)
+        }
+        return String(format: "%.0f s", clampedSeconds)
+    }
+
+    private static func listAllProcessIDs() -> [pid_t] {
+        let maxProcessCount = 8192
+        var pids = [pid_t](repeating: 0, count: maxProcessCount)
+        let byteCount = Int32(maxProcessCount * MemoryLayout<pid_t>.size)
+        let processCount = Int(proc_listallpids(&pids, byteCount))
+        guard processCount > 0 else { return [] }
+        return pids.prefix(processCount).filter { $0 > 0 }
+    }
+
+    private static func normalizedProcessName(for pid: pid_t) -> String? {
+        if let processName = processName(for: pid)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !processName.isEmpty {
+            return processName
+        }
+
+        guard let processPath = processPath(for: pid) else {
+            return nil
+        }
+        let name = URL(fileURLWithPath: processPath).lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    private static func processMemoryBytes(for pid: pid_t) -> UInt64? {
+        var info = proc_taskinfo()
+        let size = Int32(MemoryLayout<proc_taskinfo>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            proc_pidinfo(pid, PROC_PIDTASKINFO, 0, pointer, size)
+        }
+
+        guard result == size else { return nil }
+        return processRusageCurrent(for: pid)?.ri_phys_footprint ?? info.pti_resident_size
+    }
+
+    private static func processRusageCurrent(for pid: pid_t) -> rusage_info_current? {
+        guard let procPidRusageFunction else { return nil }
+
+        var usage = rusage_info_current()
+        let result = withUnsafeMutablePointer(to: &usage) { pointer in
+            procPidRusageFunction(pid, RUSAGE_INFO_CURRENT, UnsafeMutableRawPointer(pointer))
+        }
+        guard result == 0 else { return nil }
+        return usage
+    }
+
+    private static func processPath(for pid: pid_t) -> String? {
+        let maxPathSize = Int(MAXPATHLEN * 4)
+        var buffer = [CChar](repeating: 0, count: maxPathSize)
+        let pathLength = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard pathLength > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private static func processName(for pid: pid_t) -> String? {
+        var nameBuffer = [CChar](repeating: 0, count: 1024)
+        let nameLength = proc_name(pid, &nameBuffer, UInt32(nameBuffer.count))
+        guard nameLength > 0 else { return nil }
+        return String(cString: nameBuffer)
     }
 
     // MARK: - Submission

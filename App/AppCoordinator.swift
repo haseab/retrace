@@ -293,6 +293,15 @@ public actor AppCoordinator {
         Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
     }
 
+    /// Release cached AVFoundation decode state after timeline/search teardown.
+    public func purgeVideoDecodingCaches(reason: String) async {
+        await services.storage.purgeFrameExtractionCaches(reason: reason)
+        if let adapter = await services.dataAdapter {
+            await adapter.purgeFrameExtractionCaches(reason: reason)
+        }
+        Log.info("[AppCoordinator] Purged video decoding caches (\(reason))", category: .app)
+    }
+
     // MARK: - Lifecycle
 
     /// Initialize all services
