@@ -3643,19 +3643,21 @@ public struct SettingsView: View {
                             }
 
                             cpuProfileGraph
-                                .frame(height: 32)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                .frame(height: cpuProfileGraphHeight)
 
-                            ForEach(processingLevelBullets, id: \.self) { bullet in
-                                HStack(alignment: .top, spacing: 6) {
-                                    Text("•")
-                                        .font(.retraceCaption2)
-                                        .foregroundColor(.retraceSecondary.opacity(0.6))
-                                    Text(bullet)
-                                        .font(.retraceCaption2)
-                                        .foregroundColor(.retraceSecondary)
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(processingLevelBullets, id: \.self) { bullet in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text("•")
+                                            .font(.retraceCaption2)
+                                            .foregroundColor(.retraceSecondary.opacity(0.6))
+                                        Text(bullet)
+                                            .font(.retraceCaption2)
+                                            .foregroundColor(.retraceSecondary)
+                                    }
                                 }
                             }
+                            .frame(minHeight: processingLevelBulletsMinHeight, alignment: .top)
                         }
 
                         if ocrProcessingLevel != SettingsDefaults.ocrProcessingLevel {
@@ -3837,6 +3839,10 @@ public struct SettingsView: View {
         }
     }
 
+    private var cpuProfileGraphHeight: CGFloat { 44 }
+
+    private var processingLevelBulletsMinHeight: CGFloat { 58 }
+
     /// CPU usage profile pattern for each level
     /// Values represent relative CPU intensity (0–1) over time slices
     private var cpuProfilePattern: [CGFloat] {
@@ -3860,15 +3866,51 @@ public struct SettingsView: View {
     private var cpuProfileGraph: some View {
         let pattern = cpuProfilePattern
         let color = processingLevelColor
-        GeometryReader { geo in
-            HStack(alignment: .bottom, spacing: 1.5) {
-                ForEach(0..<pattern.count, id: \.self) { i in
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(color.opacity(pattern[i] > 0.1 ? 0.6 : 0.15))
-                        .frame(height: max(2, geo.size.height * pattern[i]))
+        HStack(spacing: 8) {
+            VStack(alignment: .trailing, spacing: 0) {
+                Text("100")
+                Spacer()
+                Text("50")
+                Spacer()
+                Text("0")
+            }
+            .font(.system(size: 7, weight: .medium, design: .monospaced))
+            .foregroundColor(.retraceSecondary.opacity(0.45))
+            .padding(.vertical, 3)
+
+            GeometryReader { geo in
+                ZStack(alignment: .bottomLeading) {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.04))
+
+                    VStack(spacing: 0) {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.10))
+                            .frame(height: 1)
+                        Spacer()
+                        Rectangle()
+                            .fill(Color.white.opacity(0.08))
+                            .frame(height: 1)
+                        Spacer()
+                        Rectangle()
+                            .fill(Color.white.opacity(0.10))
+                            .frame(height: 1)
+                    }
+                    .padding(.vertical, 3)
+
+                    HStack(alignment: .bottom, spacing: 1.5) {
+                        ForEach(0..<pattern.count, id: \.self) { i in
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(color.opacity(pattern[i] > 0.1 ? 0.72 : 0.18))
+                                .frame(height: max(2, (geo.size.height - 6) * pattern[i]))
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 3)
                 }
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private var processingLevelBullets: [String] {
