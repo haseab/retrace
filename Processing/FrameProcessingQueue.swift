@@ -3,7 +3,7 @@ import Shared
 import Database
 import Storage
 import Search
-import AppKit
+import ImageIO
 
 /// Asynchronous frame processing queue with SQLite-backed durability
 ///
@@ -34,6 +34,7 @@ public actor FrameProcessingQueue {
     private var processingCount: Int = 0   // Frames with status 1
 
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
+    private var isPausedForMemoryPressure = false
 
     // MARK: - Power-Aware Processing Control
 
@@ -308,6 +309,15 @@ public actor FrameProcessingQueue {
                 continue
             }
 
+            if await applyMemoryBackpressureIfNeeded() {
+                try? await Task.sleep(
+                    for: .nanoseconds(Int64(OCRMemoryBackpressurePolicy.current().pollIntervalNs)),
+                    clock: .continuous
+                )
+                if Task.isCancelled { break }
+                continue
+            }
+
             // Wait for database to be ready before attempting any operations
             guard await databaseManager.isReady() else {
                 // Log.debug("[Queue-DIAG] Worker \(id) waiting for database to be ready", category: .processing)
@@ -416,77 +426,45 @@ public actor FrameProcessingQueue {
 
         // Resolve segment ID encoded in the video file path (WAL and storage use this ID).
         let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
-
-        // Source select:
-        // - finalized video -> decode frame from encoded segment file
-        // - non-finalized video -> read raw frame directly from WAL by frame index
-        let capturedFrame: CapturedFrame
-        let isVideoFinalized = frameWithInfo.videoInfo?.isVideoFinalized ?? true
-        if isVideoFinalized {
-            // Verify finalized video file exists before attempting extraction
-            let storageRoot = await storage.getStorageDirectory()
-            let videoFullPath = storageRoot.appendingPathComponent(videoSegment.relativePath).path
-            if !FileManager.default.fileExists(atPath: videoFullPath) {
-                Log.error("[Queue] Video file not found for frame \(frameID): \(videoFullPath)", category: .processing)
-                Log.error("[Queue] This suggests database/storage path mismatch. Check AppPaths.storageRoot setting.", category: .processing)
-
-                // Mark as failed permanently - don't retry endlessly for missing files
-                try await updateFrameProcessingStatus(frameID, status: .failed)
-                return .success // Return success to not re-queue (it's a permanent failure)
-            }
-
-            // Read from finalized video and convert JPEG payload for OCR.
-            let frameData = try await storage.readFrame(
-                segmentID: actualSegmentID,
-                frameIndex: frameRef.frameIndexInSegment
-            )
-
-            guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
-                Log.error("[Queue-DIAG] Frame \(frameID) image conversion failed!", category: .processing)
-                throw ProcessingError.imageConversionFailed
-            }
-            capturedFrame = convertedFrame
-        } else {
-            guard let walFrame = try await readFrameFromWAL(
-                frameID: frameID,
-                segmentID: actualSegmentID,
-                frameIndex: frameRef.frameIndexInSegment
-            ) else {
-                return .deferredSourceNotReady
-            }
-            capturedFrame = walFrame
+        let ocrStageResult = try await performOCRStage(
+            frameID: frameID,
+            frameRef: frameRef,
+            frameWithInfo: frameWithInfo,
+            videoSegment: videoSegment,
+            actualSegmentID: actualSegmentID
+        )
+        let ocrStage: OCRStageOutput
+        switch ocrStageResult {
+        case .deferred:
+            return .deferredSourceNotReady
+        case .failedPermanently:
+            return .success
+        case .ready(let stage):
+            ocrStage = stage
         }
-
-        // Mark as processing only after the frame payload source is available.
-        try await updateFrameProcessingStatus(frameID, status: .processing)
-
-        let tFrame = CFAbsoluteTimeGetCurrent()
-
-        // Run OCR
-        let extractedText = try await processing.extractText(from: capturedFrame)
-
+        let tFrame = ocrStage.ocrStartTime
         let tOCR = CFAbsoluteTimeGetCurrent()
 
         // Index in FTS
         let docid = try await search.index(
-            text: extractedText,
+            text: ocrStage.extractedText,
             segmentId: frameRef.segmentID.value,
             frameId: frameID
         )
 
         // Insert OCR nodes for both main and chrome regions so any FTS hit can be highlighted.
-        let hasAnyOCRRegions = !extractedText.regions.isEmpty || !extractedText.chromeRegions.isEmpty
+        let hasAnyOCRRegions = !ocrStage.extractedText.regions.isEmpty || !ocrStage.extractedText.chromeRegions.isEmpty
         if docid > 0 && hasAnyOCRRegions {
             // Delete any existing nodes first to prevent duplicates
             // (can happen if frame is reprocessed without going through reprocessOCR)
             try await databaseManager.deleteNodes(frameID: FrameID(value: frameID))
 
             var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
-            nodeData.reserveCapacity(extractedText.regions.count + extractedText.chromeRegions.count)
+            nodeData.reserveCapacity(ocrStage.extractedText.regions.count + ocrStage.extractedText.chromeRegions.count)
 
             // c0 offsets: main OCR text joined with single-space separators.
             var mainOffset = 0
-            for region in extractedText.regions {
+            for region in ocrStage.extractedText.regions {
                 let textLength = region.text.count
                 nodeData.append((
                     textOffset: mainOffset,
@@ -498,8 +476,8 @@ public actor FrameProcessingQueue {
             }
 
             // c1 offsets are relative to (c0 + c1) because node text is read using COALESCE(c0,'') || COALESCE(c1,'').
-            var chromeOffset = extractedText.fullText.count
-            for region in extractedText.chromeRegions {
+            var chromeOffset = ocrStage.extractedText.fullText.count
+            for region in ocrStage.extractedText.chromeRegions {
                 let textLength = region.text.count
                 nodeData.append((
                     textOffset: chromeOffset,
@@ -536,52 +514,125 @@ public actor FrameProcessingQueue {
         try await updateFrameProcessingStatus(frameID, status: .completed)
 
         let tDone = CFAbsoluteTimeGetCurrent()
-        Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(capturedFrame.width)x\(capturedFrame.height)", category: .processing)
+        Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(ocrStage.frameWidth)x\(ocrStage.frameHeight)", category: .processing)
 
         return .success
     }
 
-    /// Convert JPEG data back to CapturedFrame for OCR
-    private func convertJPEGToCapturedFrame(_ jpegData: Data, frameRef: FrameReference) throws -> CapturedFrame? {
-        guard let nsImage = NSImage(data: jpegData),
-              let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return nil
-        }
+    private func performOCRStage(
+        frameID: Int64,
+        frameRef: FrameReference,
+        frameWithInfo: FrameWithVideoInfo,
+        videoSegment: VideoSegment,
+        actualSegmentID: VideoSegmentID
+    ) async throws -> OCRStageResult {
+        // Source select:
+        // - finalized video -> decode frame from encoded segment file
+        // - non-finalized video -> read raw frame directly from WAL by frame index
+        let capturedFrame: CapturedFrame
+        let processedFrameWidth: Int
+        let processedFrameHeight: Int
+        let isVideoFinalized = frameWithInfo.videoInfo?.isVideoFinalized ?? true
 
-        let width = cgImage.width
-        let height = cgImage.height
-        let bytesPerRow = width * 4
+        if isVideoFinalized {
+            let storageRoot = await storage.getStorageDirectory()
+            let videoFullPath = storageRoot.appendingPathComponent(videoSegment.relativePath).path
+            if !FileManager.default.fileExists(atPath: videoFullPath) {
+                Log.error("[Queue] Video file not found for frame \(frameID): \(videoFullPath)", category: .processing)
+                Log.error("[Queue] This suggests database/storage path mismatch. Check AppPaths.storageRoot setting.", category: .processing)
 
-        // Create BGRA bitmap context
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
-
-        var pixelData = Data(count: bytesPerRow * height)
-
-        pixelData.withUnsafeMutableBytes { ptr in
-            guard let context = CGContext(
-                data: ptr.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: colorSpace,
-                bitmapInfo: bitmapInfo.rawValue
-            ) else {
-                return
+                try await updateFrameProcessingStatus(frameID, status: .failed)
+                return .failedPermanently
             }
 
-            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            let frameData = try await storage.readFrame(
+                segmentID: actualSegmentID,
+                frameIndex: frameRef.frameIndexInSegment
+            )
+
+            guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
+                Log.error("[Queue-DIAG] Frame \(frameID) image conversion failed!", category: .processing)
+                throw ProcessingError.imageConversionFailed
+            }
+            capturedFrame = convertedFrame
+            processedFrameWidth = convertedFrame.width
+            processedFrameHeight = convertedFrame.height
+        } else {
+            guard let walFrame = try await readFrameFromWAL(
+                frameID: frameID,
+                segmentID: actualSegmentID,
+                frameIndex: frameRef.frameIndexInSegment
+            ) else {
+                return .deferred
+            }
+            capturedFrame = walFrame
+            processedFrameWidth = walFrame.width
+            processedFrameHeight = walFrame.height
         }
 
-        return CapturedFrame(
-            timestamp: frameRef.timestamp,
-            imageData: pixelData,
-            width: width,
-            height: height,
-            bytesPerRow: bytesPerRow,
-            metadata: frameRef.metadata
-        )
+        try await updateFrameProcessingStatus(frameID, status: .processing)
+        let ocrStartTime = CFAbsoluteTimeGetCurrent()
+
+        let extractedText = try await processing.extractText(from: capturedFrame)
+
+        return .ready(OCRStageOutput(
+            extractedText: extractedText,
+            frameWidth: processedFrameWidth,
+            frameHeight: processedFrameHeight,
+            ocrStartTime: ocrStartTime
+        ))
+    }
+
+    /// Convert JPEG data back to CapturedFrame for OCR
+    private func convertJPEGToCapturedFrame(_ jpegData: Data, frameRef: FrameReference) throws -> CapturedFrame? {
+        autoreleasepool {
+            let sourceOptions = [
+                kCGImageSourceShouldCache: false,
+            ] as CFDictionary
+            let imageOptions = [
+                kCGImageSourceShouldCache: false,
+                kCGImageSourceShouldCacheImmediately: false,
+            ] as CFDictionary
+
+            guard let imageSource = CGImageSourceCreateWithData(jpegData as CFData, sourceOptions),
+                  let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, imageOptions) else {
+                return nil
+            }
+
+            let width = cgImage.width
+            let height = cgImage.height
+            let bytesPerRow = width * 4
+
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+
+            var pixelData = Data(count: bytesPerRow * height)
+
+            pixelData.withUnsafeMutableBytes { ptr in
+                guard let context = CGContext(
+                    data: ptr.baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: colorSpace,
+                    bitmapInfo: bitmapInfo.rawValue
+                ) else {
+                    return
+                }
+
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
+
+            return CapturedFrame(
+                timestamp: frameRef.timestamp,
+                imageData: pixelData,
+                width: width,
+                height: height,
+                bytesPerRow: bytesPerRow,
+                metadata: frameRef.metadata
+            )
+        }
     }
 
     private func parseActualSegmentID(from relativePath: String) throws -> VideoSegmentID {
@@ -1446,11 +1497,14 @@ public actor FrameProcessingQueue {
         }
     }
 
-    private func logMemorySnapshot() {
-        let queueDepth = pendingCount + processingCount
+    private func logMemorySnapshot() async {
+        let counts = await refreshLiveQueueCounts()
+        let processFields = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot().map {
+            "footprint=\(ProcessingMemoryDiagnostics.formatBytes($0.physFootprintBytes)) resident=\(ProcessingMemoryDiagnostics.formatBytes($0.residentBytes)) internal=\(ProcessingMemoryDiagnostics.formatBytes($0.internalBytes)) compressed=\(ProcessingMemoryDiagnostics.formatBytes($0.compressedBytes)) "
+        } ?? ""
 
         Log.info(
-            "[Queue-Memory] rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(queueDepth) pending=\(pendingCount) processing=\(processingCount) workers=\(workers.count)",
+            "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(counts.depth) pending=\(counts.pending) processing=\(counts.processing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
             category: .processing
         )
     }
@@ -1462,6 +1516,182 @@ public actor FrameProcessingQueue {
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: max(0, bytes))
+    }
+
+    private func refreshLiveQueueCounts() async -> (pending: Int, processing: Int, depth: Int) {
+        if let counts = try? await databaseManager.getFrameStatusCounts() {
+            pendingCount = counts.pending
+            processingCount = counts.processing
+            currentQueueDepth = counts.pending + counts.processing
+        }
+        return (pendingCount, processingCount, pendingCount + processingCount)
+    }
+
+    private func applyMemoryBackpressureIfNeeded() async -> Bool {
+        let policy = OCRMemoryBackpressurePolicy.current()
+        guard policy.enabled else {
+            if isPausedForMemoryPressure {
+                isPausedForMemoryPressure = false
+                let snapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
+                Log.info(
+                    "[Queue-Backpressure] disabled footprint=\(ProcessingMemoryDiagnostics.formatFootprint(snapshot))",
+                    category: .processing
+                )
+            }
+            return false
+        }
+
+        let snapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
+        let shouldPause = policy.shouldPause(
+            footprintBytes: snapshot?.physFootprintBytes ?? 0,
+            currentlyPaused: isPausedForMemoryPressure
+        )
+
+        guard shouldPause != isPausedForMemoryPressure else {
+            return shouldPause
+        }
+
+        isPausedForMemoryPressure = shouldPause
+        let counts = await refreshLiveQueueCounts()
+        let baseMessage = "footprint=\(ProcessingMemoryDiagnostics.formatFootprint(snapshot)) pauseAt=\(ProcessingMemoryDiagnostics.formatBytes(policy.pauseThresholdBytes)) resumeBelow=\(ProcessingMemoryDiagnostics.formatBytes(policy.resumeThresholdBytes)) queueDepth=\(counts.depth) pending=\(counts.pending) processing=\(counts.processing)"
+
+        if shouldPause {
+            Log.warning("[Queue-Backpressure] paused \(baseMessage)", category: .processing)
+        } else {
+            Log.info("[Queue-Backpressure] resumed \(baseMessage)", category: .processing)
+        }
+
+        return shouldPause
+    }
+}
+
+struct ProcessingProcessMemorySnapshot: Sendable {
+    let physFootprintBytes: UInt64
+    let residentBytes: UInt64
+    let internalBytes: UInt64
+    let compressedBytes: UInt64
+}
+
+struct OCRMemoryBackpressurePolicy: Sendable {
+    static let enabledDefaultsKey = "retrace.debug.ocrMemoryBackpressureEnabled"
+    static let pauseThresholdDefaultsKey = "retrace.debug.ocrMemoryPauseThresholdMB"
+    static let resumeThresholdDefaultsKey = "retrace.debug.ocrMemoryResumeThresholdMB"
+    static let pollIntervalDefaultsKey = "retrace.debug.ocrMemoryBackpressurePollMs"
+
+    static let defaultPauseThresholdBytes: UInt64 = 1_200 * 1024 * 1024
+    static let defaultResumeThresholdBytes: UInt64 = 1_024 * 1024 * 1024
+    static let defaultPollIntervalNs: UInt64 = 1_000_000_000
+
+    let enabled: Bool
+    let pauseThresholdBytes: UInt64
+    let resumeThresholdBytes: UInt64
+    let pollIntervalNs: UInt64
+
+    static func current(defaults: UserDefaults = .standard) -> OCRMemoryBackpressurePolicy {
+        let enabled = defaults.object(forKey: enabledDefaultsKey) == nil
+            ? true
+            : defaults.bool(forKey: enabledDefaultsKey)
+
+        let pauseThresholdMB = defaults.object(forKey: pauseThresholdDefaultsKey) == nil
+            ? Int(defaultPauseThresholdBytes / 1024 / 1024)
+            : defaults.integer(forKey: pauseThresholdDefaultsKey)
+
+        let resumeThresholdMB = defaults.object(forKey: resumeThresholdDefaultsKey) == nil
+            ? Int(defaultResumeThresholdBytes / 1024 / 1024)
+            : defaults.integer(forKey: resumeThresholdDefaultsKey)
+
+        let pollIntervalMs = defaults.object(forKey: pollIntervalDefaultsKey) == nil
+            ? Int(defaultPollIntervalNs / 1_000_000)
+            : max(defaults.integer(forKey: pollIntervalDefaultsKey), 100)
+
+        return OCRMemoryBackpressurePolicy(
+            enabled: enabled,
+            pauseThresholdBytes: UInt64(max(pauseThresholdMB, 1)) * 1024 * 1024,
+            resumeThresholdBytes: UInt64(max(min(resumeThresholdMB, pauseThresholdMB - 1), 1)) * 1024 * 1024,
+            pollIntervalNs: UInt64(pollIntervalMs) * 1_000_000
+        )
+    }
+
+    func shouldPause(footprintBytes: UInt64, currentlyPaused: Bool) -> Bool {
+        if !enabled {
+            return false
+        }
+        if currentlyPaused {
+            return footprintBytes >= resumeThresholdBytes
+        }
+        return footprintBytes >= pauseThresholdBytes
+    }
+}
+
+enum ProcessingMemoryDiagnostics {
+    private typealias ProcPidRusageFunction = @convention(c) (pid_t, Int32, UnsafeMutableRawPointer?) -> Int32
+
+    private static let procPidRusageFunction: ProcPidRusageFunction? = {
+        guard let symbol = dlsym(dlopen(nil, RTLD_NOW), "proc_pid_rusage") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: ProcPidRusageFunction.self)
+    }()
+
+    static func currentProcessMemorySnapshot() -> ProcessingProcessMemorySnapshot? {
+        let usage = currentRusageInfo()
+        let taskInfo = currentTaskVMInfo()
+        guard usage != nil || taskInfo != nil else { return nil }
+
+        return ProcessingProcessMemorySnapshot(
+            physFootprintBytes: usage?.ri_phys_footprint ?? taskInfo?.phys_footprint ?? 0,
+            residentBytes: taskInfo?.resident_size ?? 0,
+            internalBytes: taskInfo?.internal ?? 0,
+            compressedBytes: taskInfo?.compressed ?? 0
+        )
+    }
+
+    static func formatFootprint(_ snapshot: ProcessingProcessMemorySnapshot?) -> String {
+        guard let snapshot else { return "n/a" }
+        return formatBytes(snapshot.physFootprintBytes)
+    }
+
+    static func formatBytes(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    private static func currentRusageInfo() -> rusage_info_v4? {
+        guard let procPidRusageFunction else { return nil }
+        var info = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            procPidRusageFunction(
+                ProcessInfo.processInfo.processIdentifier,
+                Int32(RUSAGE_INFO_V4),
+                UnsafeMutableRawPointer(pointer)
+            )
+        }
+        return result == 0 ? info : nil
+    }
+
+    private static func currentTaskVMInfo() -> task_vm_info_data_t? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+
+        let kernResult = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    reboundPointer,
+                    &count
+                )
+            }
+        }
+
+        guard kernResult == KERN_SUCCESS else { return nil }
+        return info
     }
 }
 
@@ -1500,6 +1730,19 @@ private enum ProcessFrameResult {
     case success
     case skippedByAppFilter      // Frame skipped due to app filter, mark as completed (no OCR)
     case deferredSourceNotReady  // Source payload not readable yet (WAL write in progress), re-queue for later
+}
+
+private enum OCRStageResult {
+    case ready(OCRStageOutput)
+    case deferred
+    case failedPermanently
+}
+
+private struct OCRStageOutput {
+    let extractedText: ExtractedText
+    let frameWidth: Int
+    let frameHeight: Int
+    let ocrStartTime: CFAbsoluteTime
 }
 
 public struct QueueStatistics: Sendable {

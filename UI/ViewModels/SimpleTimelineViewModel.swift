@@ -1789,7 +1789,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var diskFrameBufferMemoryLogTask: Task<Void, Never>?
     private var diskFrameBufferTelemetry = DiskFrameBufferTelemetry()
     private var foregroundFrameLoadTask: Task<Void, Never>?
-    private var pendingForegroundFrameLoad: TimelineFrame?
+    private var pendingForegroundFrameLoad: PendingForegroundFrameLoad?
     private var isForegroundFrameLoadInFlight = false
     private var activeForegroundFrameID: FrameID?
     private var cacheExpansionTask: Task<Void, Never>?
@@ -1811,6 +1811,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         let frameID: FrameID
         let videoPath: String
         let frameIndex: Int
+    }
+
+    private struct PendingForegroundFrameLoad {
+        let timelineFrame: TimelineFrame
+        let presentationGeneration: UInt64
     }
 
     /// App quick-filter latency trace payload carried across async reload/boundary paths.
@@ -1840,6 +1845,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var loadingStateStartedAt: CFAbsoluteTime?
     /// Reason associated with the currently active loading state.
     private var activeLoadingReason: String = "idle"
+    /// Whether async image/OCR/URL presentation work is allowed to publish results.
+    private var presentationWorkEnabled = false
+    /// Monotonic generation used to invalidate stale presentation tasks across hide/show.
+    private var presentationWorkGeneration: UInt64 = 0
 
     /// Monotonic ID for timeline fetch traces.
     private var fetchTraceID: UInt64 = 0
@@ -1953,9 +1962,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         var getFramesWithVideoInfoAfter: ((Date, Int, FilterCriteria, String) async throws -> [FrameWithVideoInfo])?
     }
 
+    struct ForegroundFrameLoadTestHooks {
+        var loadFrameData: ((TimelineFrame) async throws -> Data)?
+    }
+
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
+    var test_foregroundFrameLoadHooks = ForegroundFrameLoadTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -2196,6 +2210,35 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
+    public func setPresentationWorkEnabled(_ enabled: Bool, reason: String) {
+        let didChange = presentationWorkEnabled != enabled
+        presentationWorkEnabled = enabled
+        if didChange {
+            presentationWorkGeneration &+= 1
+        }
+        if Self.isVerboseTimelineLoggingEnabled {
+            Log.debug(
+                "[TIMELINE-PRESENTATION] enabled=\(enabled) generation=\(presentationWorkGeneration) reason=\(reason)",
+                category: .ui
+            )
+        }
+    }
+
+    private func currentPresentationWorkGeneration() -> UInt64 {
+        presentationWorkGeneration
+    }
+
+    private func canPublishPresentationResult(
+        frameID: FrameID? = nil,
+        expectedGeneration: UInt64
+    ) -> Bool {
+        guard presentationWorkEnabled, expectedGeneration == presentationWorkGeneration else {
+            return false
+        }
+        guard let frameID else { return true }
+        return currentTimelineFrame?.frame.id == frameID
+    }
+
     private func cancelCacheExpansion(reason: String) {
         guard hasCacheExpansionActivity else { return }
         cacheExpansionTask?.cancel()
@@ -2238,11 +2281,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     public func handleTimelineOpened() {
+        setPresentationWorkEnabled(true, reason: "timeline opened")
         cancelDiskFrameBufferInactivityCleanup()
     }
 
     /// Call this when the timeline view disappears.
     public func handleTimelineClosed() {
+        setPresentationWorkEnabled(false, reason: "timeline closed")
         cancelForegroundFrameLoad(reason: "timeline closed")
         cancelCacheExpansion(reason: "timeline closed")
         if shouldClearDiskFrameBufferOnTimelineClose() {
@@ -2661,7 +2706,11 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Reload frames around a specific timestamp (used after data source changes and app quick filter)
-    private func reloadFramesAroundTimestamp(_ timestamp: Date, cmdFTrace: CmdFQuickFilterLatencyTrace? = nil) async {
+    private func reloadFramesAroundTimestamp(
+        _ timestamp: Date,
+        cmdFTrace: CmdFQuickFilterLatencyTrace? = nil,
+        refreshPresentation: Bool = true
+    ) async {
         let reloadStart = CFAbsoluteTimeGetCurrent()
         Log.debug("[DataSourceChange] reloadFramesAroundTimestamp() starting for timestamp: \(timestamp)", category: .ui)
         if let cmdFTrace {
@@ -2719,7 +2768,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // Load tag metadata/map lazily so the tape can render subtle tag indicators.
                 ensureTapeTagIndicatorDataLoadedIfNeeded()
 
-                loadImageIfNeeded()
+                if refreshPresentation {
+                    loadImageIfNeeded()
+                }
 
                 // Check if we need to pre-load more frames (near edge of loaded window)
                 let boundaryLoad = checkAndLoadMoreFrames(reason: "reloadFramesAroundTimestamp", cmdFTrace: cmdFTrace)
@@ -2761,7 +2812,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let fallbackStart = CFAbsoluteTimeGetCurrent()
                 // Hand off loading ownership so fallback can run loadMostRecentFrame instead of being skipped.
                 setLoadingState(false, reason: "reloadFramesAroundTimestamp.fallbackHandoff")
-                await loadMostRecentFrame()
+                await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                 logCmdFPlayheadState("reload.fallbackComplete", trace: cmdFTrace, targetTimestamp: timestamp)
                 if let cmdFTrace {
                     let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
@@ -6012,7 +6063,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Load the most recent frame on startup
     /// - Parameter clickStartTime: Optional start time from dashboard tab click for end-to-end timing
-    public func loadMostRecentFrame(clickStartTime: CFAbsoluteTime? = nil) async {
+    public func loadMostRecentFrame(
+        clickStartTime: CFAbsoluteTime? = nil,
+        refreshPresentation: Bool = true
+    ) async {
         // Coalesce concurrent startup loads (e.g., TimelineWindowController.prepareWindow + SimpleTimelineView.onAppear).
         // Joining avoids skipping a caller and makes the load semantics deterministic.
         if isInitialLoadInProgress {
@@ -6122,8 +6176,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Load tag metadata/map lazily so the tape can render subtle tag indicators.
             ensureTapeTagIndicatorDataLoadedIfNeeded()
 
-            // Load image if needed for current frame
-            loadImageIfNeeded()
+            if refreshPresentation {
+                // Skip presentation refresh for hidden metadata-only updates.
+                loadImageIfNeeded()
+            }
 
             setLoadingState(false, reason: "loadMostRecentFrame.success")
 
@@ -6197,9 +6253,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     ///                               If false, preserve the current position (useful for background refresh).
     /// - Parameter allowNearLiveAutoAdvance: When `navigateToNewest` is false, allows near-live (<50 frames away)
     ///                                       positions to auto-advance to newest. Callers can gate this by expiry.
+    /// - Parameter refreshPresentation: When false, updates frame/window metadata without decoding the current frame
+    ///                                  or touching presentation state. Use this for hidden timeline refreshes.
     public func refreshFrameData(
         navigateToNewest: Bool = true,
-        allowNearLiveAutoAdvance: Bool = true
+        allowNearLiveAutoAdvance: Bool = true,
+        refreshPresentation: Bool = true
     ) async {
         // If we have frames and a current position, just refresh the current image
         if !frames.isEmpty {
@@ -6215,7 +6274,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             if !navigateToNewest, currentIndex < frames.count, !hasActiveFilters {
                 let isNearLive = framesFromNewest < Self.nearLiveEdgeFrameThreshold
                 if !isNearLive || !allowNearLiveAutoAdvance {
-                    loadImageIfNeeded()
+                    if refreshPresentation {
+                        loadImageIfNeeded()
+                    }
                     return
                 }
                 // Near-live and caller-authorized: refresh AND navigate to newest.
@@ -6235,11 +6296,11 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
 
                 if shouldNavigateToNewest {
-                    await loadMostRecentFrame()
+                    await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                 } else if let timestamp = currentTimestamp {
-                    await reloadFramesAroundTimestamp(timestamp)
+                    await reloadFramesAroundTimestamp(timestamp, refreshPresentation: refreshPresentation)
                 } else {
-                    await loadMostRecentFrame()
+                    await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                 }
                 return
             }
@@ -6267,7 +6328,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                             // auto-advancing (timeline hide/reopen while scrubbing older frames).
                             // A full reload here would hard-reset to newest and break continuity.
                             if shouldNavigateToNewest {
-                                await loadMostRecentFrame()
+                                await loadMostRecentFrame(refreshPresentation: refreshPresentation)
                             }
                             return
                         }
@@ -6312,13 +6373,62 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             }
 
-            // Load the current image
-            loadImageIfNeeded()
+            if refreshPresentation {
+                loadImageIfNeeded()
+            }
             return
         }
 
         // No cached frames - do a full load
-        await loadMostRecentFrame()
+        await loadMostRecentFrame(refreshPresentation: refreshPresentation)
+    }
+
+    /// Refresh image-backed presentation state when the timeline becomes visible again.
+    /// Video-backed frames are refreshed by the AVPlayer path instead.
+    public func refreshStaticPresentationIfNeeded() {
+        guard presentationWorkEnabled, !isInLiveMode, currentVideoInfo == nil, currentImage == nil else { return }
+        loadImageIfNeeded()
+    }
+
+    /// Release image/video-adjacent state while preserving the warmed metadata window.
+    /// Use this when the timeline is hidden but we want fast reopen semantics without
+    /// retaining decoded images, live screenshots, or disk-backed frame payloads.
+    public func compactPresentationState(
+        reason: String,
+        purgeDiskFrameBuffer: Bool = true
+    ) {
+        setPresentationWorkEnabled(false, reason: "compactPresentationState.\(reason)")
+        stopPeriodicStatusRefresh()
+        stopPlayback()
+        cancelDiskFrameBufferInactivityCleanup()
+        cancelForegroundFrameLoad(reason: "compactPresentationState.\(reason)")
+        cancelCacheExpansion(reason: "compactPresentationState.\(reason)")
+
+        isInLiveMode = false
+        liveScreenshot = nil
+        currentImage = nil
+        shiftDragDisplaySnapshot = nil
+        shiftDragDisplaySnapshotFrameID = nil
+        shiftDragDisplayRequestID &+= 1
+        activeShiftDragSessionID = 0
+        shiftDragStartFrameID = nil
+        shiftDragStartVideoInfo = nil
+        frameNotReady = false
+        frameLoadError = false
+        forceVideoReload = false
+        urlBoundingBox = nil
+        isHoveringURL = false
+        clearHyperlinkMatches()
+        clearTextSelection()
+        setOCRNodes([])
+        previousOcrNodes = []
+        ocrStatus = .unknown
+        ocrStatusPollingTask?.cancel()
+        ocrStatusPollingTask = nil
+
+        if purgeDiskFrameBuffer {
+            clearDiskFrameBuffer(reason: "compactPresentationState.\(reason)")
+        }
     }
 
     /// Refresh processing status for all cached frames that aren't completed (status != 2)
@@ -7157,6 +7267,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             clearHyperlinkMatches()
             return
         }
+        guard presentationWorkEnabled else { return }
         cancelDiskFrameBufferInactivityCleanup()
 
         guard let timelineFrame = currentTimelineFrame else {
@@ -7171,10 +7282,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() START for frame \(timelineFrame.frame.id.value), currentFrameNotReady=\(frameNotReady), processingStatus=\(timelineFrame.processingStatus)", category: .ui)
         }
 
+        let presentationGeneration = currentPresentationWorkGeneration()
+
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {
-            loadURLBoundingBox()
-            loadOCRNodes()
+            loadURLBoundingBox(expectedGeneration: presentationGeneration)
+            loadOCRNodes(expectedGeneration: presentationGeneration)
         } else {
             // Clear stale OCR/URL data during scrolling so old bounding boxes don't persist
             setOCRNodes([])
@@ -7214,24 +7327,33 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Skip duplicate requests for the currently active/pending frame.
         guard activeForegroundFrameID != frame.id,
-              pendingForegroundFrameLoad?.frame.id != frame.id else {
+              pendingForegroundFrameLoad?.timelineFrame.frame.id != frame.id else {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.debug("[TIMELINE-LOAD] Frame \(frame.id.value) foreground load already in-flight/pending; skipping duplicate request", category: .ui)
             }
             ensureDiskHotWindowCoverage(reason: "duplicate foreground request")
             return
         }
-        enqueueForegroundFrameLoad(timelineFrame)
+        enqueueForegroundFrameLoad(
+            timelineFrame,
+            presentationGeneration: presentationGeneration
+        )
 
         ensureDiskHotWindowCoverage(reason: "foreground request")
     }
 
-    private func enqueueForegroundFrameLoad(_ timelineFrame: TimelineFrame) {
+    private func enqueueForegroundFrameLoad(
+        _ timelineFrame: TimelineFrame,
+        presentationGeneration: UInt64
+    ) {
         if pendingForegroundFrameLoad != nil {
             // Coalesce bursty scrub requests into latest-only foreground work.
             diskFrameBufferTelemetry.foregroundLoadCancels += 1
         }
-        pendingForegroundFrameLoad = timelineFrame
+        pendingForegroundFrameLoad = PendingForegroundFrameLoad(
+            timelineFrame: timelineFrame,
+            presentationGeneration: presentationGeneration
+        )
 
         guard foregroundFrameLoadTask == nil else { return }
 
@@ -7243,11 +7365,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func runForegroundFrameLoadLoop() async {
         while !Task.isCancelled {
-            guard let nextFrame = pendingForegroundFrameLoad else { break }
+            guard let request = pendingForegroundFrameLoad else { break }
             pendingForegroundFrameLoad = nil
             isForegroundFrameLoadInFlight = true
-            activeForegroundFrameID = nextFrame.frame.id
-            await performForegroundFrameLoad(nextFrame)
+            activeForegroundFrameID = request.timelineFrame.frame.id
+            await performForegroundFrameLoad(
+                request.timelineFrame,
+                expectedGeneration: request.presentationGeneration
+            )
             isForegroundFrameLoadInFlight = false
             activeForegroundFrameID = nil
         }
@@ -7255,88 +7380,101 @@ public class SimpleTimelineViewModel: ObservableObject {
         foregroundFrameLoadTask = nil
     }
 
-    private func performForegroundFrameLoad(_ timelineFrame: TimelineFrame) async {
+    private func loadFrameData(_ timelineFrame: TimelineFrame) async throws -> Data {
+#if DEBUG
+        if let override = test_foregroundFrameLoadHooks.loadFrameData {
+            return try await override(timelineFrame)
+        }
+#endif
+
         let frame = timelineFrame.frame
-        let frameID = frame.id
+        if let videoInfo = timelineFrame.videoInfo {
+            return try await coordinator.getFrameImageFromPath(
+                videoPath: videoInfo.videoPath,
+                frameIndex: videoInfo.frameIndex
+            )
+        }
+
+        return try await coordinator.getFrameImage(
+            segmentID: frame.videoID,
+            timestamp: frame.timestamp
+        )
+    }
+
+#if DEBUG
+    func test_loadForegroundPresentationImage(_ timelineFrame: TimelineFrame) async throws -> NSImage {
+        let (image, _) = try await loadForegroundPresentationImage(timelineFrame)
+        return image
+    }
+#endif
+
+    private func loadForegroundPresentationImage(_ timelineFrame: TimelineFrame) async throws -> (image: NSImage, loadedFromDiskBuffer: Bool) {
+        let frameID = timelineFrame.frame.id
+
+        if let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) {
+            diskFrameBufferTelemetry.diskHits += 1
+            guard let image = NSImage(data: bufferedData) else {
+                diskFrameBufferTelemetry.decodeFailures += 1
+                removeDiskFrameBufferEntries([frameID], reason: "decode failure")
+                throw NSError(
+                    domain: "SimpleTimelineViewModel",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to decode buffered frame image"]
+                )
+            }
+            diskFrameBufferTelemetry.decodeSuccesses += 1
+            return (image, true)
+        }
+
+        diskFrameBufferTelemetry.diskMisses += 1
+        diskFrameBufferTelemetry.storageReads += 1
+        let imageData = try await loadFrameData(timelineFrame)
+        await storeFrameDataInDiskFrameBuffer(frameID: frameID, data: imageData)
+        guard let image = NSImage(data: imageData) else {
+            diskFrameBufferTelemetry.decodeFailures += 1
+            removeDiskFrameBufferEntries([frameID], reason: "decode failure")
+            throw NSError(
+                domain: "SimpleTimelineViewModel",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to decode loaded frame image"]
+            )
+        }
+        diskFrameBufferTelemetry.decodeSuccesses += 1
+        return (image, false)
+    }
+
+    private func performForegroundFrameLoad(
+        _ timelineFrame: TimelineFrame,
+        expectedGeneration: UInt64
+    ) async {
+        let frame = timelineFrame.frame
+        guard canPublishPresentationResult(
+            frameID: frame.id,
+            expectedGeneration: expectedGeneration
+        ) else { return }
         // Hidden timeline refresh/pre-render loads are best-effort and should not page
         // attention with interactive-path slow-sample warnings/criticals.
         let shouldEmitInteractiveSlowSampleAlerts = TimelineWindowController.shared.isVisible
 
         do {
-            let imageData: Data
             let loadStart = CFAbsoluteTimeGetCurrent()
-            var loadedFromDiskBuffer = false
-
-            let diskReadStart = CFAbsoluteTimeGetCurrent()
-            if let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) {
-                imageData = bufferedData
-                loadedFromDiskBuffer = true
-                diskFrameBufferTelemetry.diskHits += 1
-                let diskReadMs = (CFAbsoluteTimeGetCurrent() - diskReadStart) * 1000
-                Log.recordLatency(
-                    "timeline.disk_buffer.read_ms",
-                    valueMs: diskReadMs,
-                    category: .ui,
-                    summaryEvery: 25,
-                    warningThresholdMs: 25,
-                    criticalThresholdMs: 80
-                )
-            } else {
-                diskFrameBufferTelemetry.diskMisses += 1
-                diskFrameBufferTelemetry.storageReads += 1
-                let storageReadStart = CFAbsoluteTimeGetCurrent()
-
-                if let videoInfo = timelineFrame.videoInfo {
-                    imageData = try await coordinator.getFrameImageFromPath(
-                        videoPath: videoInfo.videoPath,
-                        frameIndex: videoInfo.frameIndex
-                    )
-                } else {
-                    imageData = try await coordinator.getFrameImage(
-                        segmentID: frame.videoID,
-                        timestamp: frame.timestamp
-                    )
-                }
-
-                let storageReadMs = (CFAbsoluteTimeGetCurrent() - storageReadStart) * 1000
-                Log.recordLatency(
-                    "timeline.frame.storage_read_ms",
-                    valueMs: storageReadMs,
-                    category: .ui,
-                    summaryEvery: 25,
-                    warningThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 45 : nil,
-                    criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? 150 : nil
-                )
-                try Task.checkCancellation()
-                await storeFrameDataInDiskFrameBuffer(frameID: frameID, data: imageData)
-            }
-
-            try Task.checkCancellation()
-
-            let decodeStart = CFAbsoluteTimeGetCurrent()
-            guard let image = NSImage(data: imageData) else {
-                diskFrameBufferTelemetry.decodeFailures += 1
-                if loadedFromDiskBuffer {
-                    removeDiskFrameBufferEntries([frameID], reason: "decode failure")
-                }
-                if currentTimelineFrame?.frame.id == frame.id {
-                    currentImage = nil
-                    frameNotReady = false
-                    frameLoadError = true
-                }
-                return
-            }
-
-            diskFrameBufferTelemetry.decodeSuccesses += 1
-            let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
+            let storageReadStart = CFAbsoluteTimeGetCurrent()
+            let (image, loadedFromDiskBuffer) = try await loadForegroundPresentationImage(timelineFrame)
+            let storageReadMs = (CFAbsoluteTimeGetCurrent() - storageReadStart) * 1000
             Log.recordLatency(
-                "timeline.frame.decode_ms",
-                valueMs: decodeMs,
+                loadedFromDiskBuffer ? "timeline.disk_buffer.read_ms" : "timeline.frame.storage_read_ms",
+                valueMs: storageReadMs,
                 category: .ui,
                 summaryEvery: 25,
-                warningThresholdMs: 28,
-                criticalThresholdMs: 90
+                warningThresholdMs: loadedFromDiskBuffer ? 25 : (shouldEmitInteractiveSlowSampleAlerts ? 45 : nil),
+                criticalThresholdMs: loadedFromDiskBuffer ? 80 : (shouldEmitInteractiveSlowSampleAlerts ? 150 : nil)
             )
+
+            try Task.checkCancellation()
+            guard canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) else { return }
 
             let totalMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
             Log.recordLatency(
@@ -7358,7 +7496,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 criticalThresholdMs: shouldEmitInteractiveSlowSampleAlerts ? (loadedFromDiskBuffer ? 120 : 260) : nil
             )
 
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) {
                 currentImage = image
                 frameNotReady = false
                 frameLoadError = false
@@ -7373,7 +7514,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video still being written (processingStatus=\(timelineFrame.processingStatus))", category: .app)
             }
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) {
                 currentImage = nil
                 frameLoadError = false
                 if timelineFrame.processingStatus != 2 {
@@ -7385,7 +7529,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) not yet in video file (still encoding, processingStatus=\(timelineFrame.processingStatus))", category: .app)
             }
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) {
                 currentImage = nil
                 if timelineFrame.processingStatus != 2 {
                     frameNotReady = true
@@ -7400,7 +7547,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) video not ready yet (no fragments, processingStatus=\(timelineFrame.processingStatus))", category: .app)
             }
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) {
                 currentImage = nil
                 if timelineFrame.processingStatus != 2 {
                     frameNotReady = true
@@ -7413,7 +7563,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         } catch {
             diskFrameBufferTelemetry.storageReadFailures += 1
             Log.error("[SimpleTimelineViewModel] Failed to load image: \(error)", category: .app)
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: expectedGeneration
+            ) {
                 currentImage = nil
                 frameNotReady = false
                 frameLoadError = true
@@ -7675,13 +7828,20 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Load URL bounding box for the current frame (if it's a browser URL)
-    private func loadURLBoundingBox() {
+    private func loadURLBoundingBox(expectedGeneration: UInt64 = 0) {
         guard let timelineFrame = currentTimelineFrame else {
             urlBoundingBox = nil
             return
         }
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
 
         let frame = timelineFrame.frame
+        guard canPublishPresentationResult(
+            frameID: frame.id,
+            expectedGeneration: generation
+        ) else { return }
 
         // Reset hover state when frame changes
         isHoveringURL = false
@@ -7693,8 +7853,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                     timestamp: frame.timestamp,
                     source: frame.source
                 )
-                // Only update if we're still on the same frame
-                if currentTimelineFrame?.frame.id == frame.id {
+                if canPublishPresentationResult(
+                    frameID: frame.id,
+                    expectedGeneration: generation
+                ) {
                     urlBoundingBox = boundingBox
                     if let box = boundingBox {
                         Log.debug("[URLBoundingBox] Found URL '\(box.url)' at (\(box.x), \(box.y), \(box.width), \(box.height))", category: .ui)
@@ -7702,7 +7864,12 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load URL bounding box: \(error)", category: .app)
-                urlBoundingBox = nil
+                if canPublishPresentationResult(
+                    frameID: frame.id,
+                    expectedGeneration: generation
+                ) {
+                    urlBoundingBox = nil
+                }
             }
         }
     }
@@ -8275,11 +8442,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         hyperlinkMatches = []
     }
 
-    private func startHyperlinkMapping(frame: FrameReference, nodes: [OCRNodeWithText]) {
+    private func startHyperlinkMapping(
+        frame: FrameReference,
+        nodes: [OCRNodeWithText],
+        expectedGeneration: UInt64 = 0
+    ) {
         guard !isInLiveMode else {
             clearHyperlinkMatches()
             return
         }
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard canPublishPresentationResult(
+            frameID: frame.id,
+            expectedGeneration: generation
+        ) else { return }
 
         guard Self.isInPageURLCollectionEnabled() else {
             clearHyperlinkMatches()
@@ -8306,12 +8484,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 guard !Task.isCancelled else { return }
 
                 await MainActor.run {
-                    guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    guard self.canPublishPresentationResult(
+                        frameID: frame.id,
+                        expectedGeneration: generation
+                    ) else { return }
                     self.hyperlinkMatches = storedMatches
                 }
             } catch {
                 await MainActor.run {
-                    guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    guard self.canPublishPresentationResult(
+                        frameID: frame.id,
+                        expectedGeneration: generation
+                    ) else { return }
                     self.hyperlinkMatches = []
                 }
                 Log.warning("[HyperlinkMap] DOM extraction failed: \(error)", category: .ui)
@@ -8450,9 +8634,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Load all OCR nodes for the current frame
-    private func loadOCRNodes() {
+    private func loadOCRNodes(expectedGeneration: UInt64 = 0) {
         // Don't overwrite live OCR results with database results
         guard !isInLiveMode else { return }
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard canPublishPresentationResult(expectedGeneration: generation) else { return }
 
         guard currentTimelineFrame != nil else {
             setOCRNodes([])
@@ -8469,12 +8657,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load OCR nodes asynchronously
         Task {
-            await loadOCRNodesAsync()
+            await loadOCRNodesAsync(expectedGeneration: generation)
         }
     }
 
     /// Load OCR nodes and wait for completion (used when we need to await the result)
-    private func loadOCRNodesAsync() async {
+    private func loadOCRNodesAsync(expectedGeneration: UInt64 = 0) async {
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard canPublishPresentationResult(expectedGeneration: generation) else { return }
         // Cancel any existing polling task
         ocrStatusPollingTask?.cancel()
         ocrStatusPollingTask = nil
@@ -8498,14 +8690,16 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let (status, nodes) = try await (statusTask, nodesTask)
 
-            // Only update if we're still on the same frame
-            if currentTimelineFrame?.frame.id == frame.id {
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: generation
+            ) {
                 // Update OCR status
                 ocrStatus = status
 
                 // Start polling if OCR is in progress
                 if status.isInProgress {
-                    startOCRStatusPolling(for: frame.id)
+                    startOCRStatusPolling(for: frame.id, expectedGeneration: generation)
                 }
 
                 // Filter out nodes with invalid coordinates (multi-monitor captures)
@@ -8518,19 +8712,38 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
 
                 setOCRNodes(filteredNodes)
-                startHyperlinkMapping(frame: frame, nodes: filteredNodes)
+                startHyperlinkMapping(
+                    frame: frame,
+                    nodes: filteredNodes,
+                    expectedGeneration: generation
+                )
             }
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
-            setOCRNodes([])
-            ocrStatus = .unknown
-            clearHyperlinkMatches()
+            if canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: generation
+            ) {
+                setOCRNodes([])
+                ocrStatus = .unknown
+                clearHyperlinkMatches()
+            }
         }
     }
 
     /// Start polling for OCR status updates
     /// Polls every 500ms until OCR completes or frame changes
-    private func startOCRStatusPolling(for frameID: FrameID) {
+    private func startOCRStatusPolling(
+        for frameID: FrameID,
+        expectedGeneration: UInt64 = 0
+    ) {
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard canPublishPresentationResult(
+            frameID: frameID,
+            expectedGeneration: generation
+        ) else { return }
         ocrStatusPollingTask?.cancel()
 
         ocrStatusPollingTask = Task { [weak self] in
@@ -8542,8 +8755,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Check if we're still on the same frame
-                guard let currentFrame = await MainActor.run(body: { self.currentTimelineFrame?.frame }),
+                let canContinue = await MainActor.run {
+                    self.canPublishPresentationResult(
+                        frameID: frameID,
+                        expectedGeneration: generation
+                    )
+                }
+                guard canContinue,
+                      let currentFrame = await MainActor.run(body: { self.currentTimelineFrame?.frame }),
                       currentFrame.id == frameID else {
                     return
                 }
@@ -8554,14 +8773,20 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                     await MainActor.run {
                         // Only update if still on the same frame
-                        guard self.currentTimelineFrame?.frame.id == frameID else { return }
+                        guard self.canPublishPresentationResult(
+                            frameID: frameID,
+                            expectedGeneration: generation
+                        ) else { return }
 
                         self.ocrStatus = status
 
                         // If completed, also reload the OCR nodes
                         if !status.isInProgress {
                             Task {
-                                await self.reloadOCRNodesOnly(for: frameID)
+                                await self.reloadOCRNodesOnly(
+                                    for: frameID,
+                                    expectedGeneration: generation
+                                )
                             }
                         }
                     }
@@ -8578,8 +8803,19 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Reload only OCR nodes without fetching status (used after OCR completes)
-    private func reloadOCRNodesOnly(for frameID: FrameID) async {
-        guard let frame = currentTimelineFrame?.frame, frame.id == frameID else { return }
+    private func reloadOCRNodesOnly(
+        for frameID: FrameID,
+        expectedGeneration: UInt64 = 0
+    ) async {
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard let frame = currentTimelineFrame?.frame,
+              frame.id == frameID,
+              canPublishPresentationResult(
+                frameID: frameID,
+                expectedGeneration: generation
+              ) else { return }
 
         do {
             let nodes = try await coordinator.getAllOCRNodes(
@@ -8588,7 +8824,10 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
 
             // Only update if still on the same frame
-            guard currentTimelineFrame?.frame.id == frameID else { return }
+            guard canPublishPresentationResult(
+                frameID: frameID,
+                expectedGeneration: generation
+            ) else { return }
 
             let filteredNodes = nodes.filter { node in
                 node.x >= 0.0 && node.x <= 1.0 &&
@@ -8598,9 +8837,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
 
             setOCRNodes(filteredNodes)
-            startHyperlinkMapping(frame: frame, nodes: filteredNodes)
+            startHyperlinkMapping(
+                frame: frame,
+                nodes: filteredNodes,
+                expectedGeneration: generation
+            )
         } catch {
             Log.error("[OCR-POLL] Failed to reload OCR nodes: \(error)", category: .ui)
+            guard canPublishPresentationResult(
+                frameID: frameID,
+                expectedGeneration: generation
+            ) else { return }
             clearHyperlinkMatches()
         }
     }

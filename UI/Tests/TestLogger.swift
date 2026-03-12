@@ -1863,6 +1863,210 @@ final class TimelineProcessingStatusRefreshConcurrencyTests: XCTestCase {
 }
 
 @MainActor
+final class TimelineHeadlessPrerenderStateTests: XCTestCase {
+    func testSimpleTimelineViewOnAppearSkipsMostRecentReloadWhenFramesAlreadyExist() {
+        XCTAssertFalse(
+            SimpleTimelineView.shouldLoadMostRecentFrameOnAppear(
+                hasInitialized: false,
+                frameCount: 100
+            )
+        )
+        XCTAssertFalse(
+            SimpleTimelineView.shouldLoadMostRecentFrameOnAppear(
+                hasInitialized: true,
+                frameCount: 0
+            )
+        )
+        XCTAssertTrue(
+            SimpleTimelineView.shouldLoadMostRecentFrameOnAppear(
+                hasInitialized: false,
+                frameCount: 0
+            )
+        )
+    }
+
+    func testLoadMostRecentFrameMetadataOnlyLeavesCurrentImageUntouched() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let sentinel = makeSolidImage(size: NSSize(width: 8, height: 8), color: .systemRed)
+        viewModel.currentImage = sentinel
+
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { limit, _ in
+            XCTAssertEqual(limit, 100)
+            return [
+                self.makeFrameWithVideoInfo(
+                    id: 1,
+                    timestamp: Date(timeIntervalSince1970: 1_700_100_000),
+                    frameIndex: 0
+                ),
+            ]
+        }
+
+        await viewModel.loadMostRecentFrame(refreshPresentation: false)
+
+        XCTAssertTrue(viewModel.currentImage === sentinel)
+        XCTAssertEqual(viewModel.frames.count, 1)
+        XCTAssertEqual(viewModel.currentIndex, 0)
+    }
+
+    func testForegroundPresentationLoadCachesVideoBackedFramesInDiskBuffer() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        let timelineFrame = TimelineFrame(
+            frame: FrameReference(
+                id: FrameID(value: 42),
+                timestamp: Date(timeIntervalSince1970: 1_700_100_042),
+                segmentID: AppSegmentID(value: 42),
+                frameIndexInSegment: 12,
+                metadata: FrameMetadata(
+                    appBundleID: "test.app",
+                    appName: "Test App",
+                    displayID: 1
+                ),
+                source: .native
+            ),
+            videoInfo: FrameVideoInfo(
+                videoPath: "/tmp/test-video.mp4",
+                frameIndex: 12,
+                frameRate: 30,
+                width: 32,
+                height: 24
+            ),
+            processingStatus: 2
+        )
+
+        let expectedImage = makeSolidImage(size: NSSize(width: 32, height: 24), color: .systemPurple)
+        let expectedImageData = try XCTUnwrap(expectedImage.tiffRepresentation)
+        var dataLoads = 0
+
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { frame in
+            XCTAssertEqual(frame.frame.id, timelineFrame.frame.id)
+            dataLoads += 1
+            return expectedImageData
+        }
+
+        let firstImage = try await viewModel.test_loadForegroundPresentationImage(timelineFrame)
+        let secondImage = try await viewModel.test_loadForegroundPresentationImage(timelineFrame)
+
+        XCTAssertEqual(dataLoads, 1)
+        XCTAssertNotNil(firstImage.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        XCTAssertNotNil(secondImage.cgImage(forProposedRect: nil, context: nil, hints: nil))
+    }
+
+    func testCompactPresentationStateClearsPresentationPayloadsButPreservesTimelineState() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "test.app"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "test.app"),
+        ]
+        viewModel.currentIndex = 1
+        viewModel.searchViewModel.searchQuery = "test query"
+        viewModel.currentImage = makeSolidImage(size: NSSize(width: 12, height: 12), color: .systemBlue)
+        viewModel.liveScreenshot = makeSolidImage(size: NSSize(width: 10, height: 10), color: .systemGreen)
+        viewModel.shiftDragDisplaySnapshot = makeSolidImage(size: NSSize(width: 6, height: 6), color: .systemOrange)
+        viewModel.shiftDragDisplaySnapshotFrameID = 2
+        viewModel.forceVideoReload = true
+        viewModel.isInLiveMode = true
+        XCTAssertNotNil(viewModel.currentImage)
+        XCTAssertNotNil(viewModel.liveScreenshot)
+        XCTAssertNotNil(viewModel.shiftDragDisplaySnapshot)
+
+        viewModel.compactPresentationState(reason: "unit-test", purgeDiskFrameBuffer: false)
+
+        XCTAssertEqual(viewModel.frames.count, 2)
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertEqual(viewModel.searchViewModel.searchQuery, "test query")
+        XCTAssertNil(viewModel.currentImage)
+        XCTAssertNil(viewModel.liveScreenshot)
+        XCTAssertNil(viewModel.shiftDragDisplaySnapshot)
+        XCTAssertNil(viewModel.shiftDragDisplaySnapshotFrameID)
+        XCTAssertFalse(viewModel.forceVideoReload)
+        XCTAssertFalse(viewModel.isInLiveMode)
+    }
+
+    func testInFlightMostRecentLoadDoesNotRebuildPresentationAfterCompaction() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        let frameImageData = try XCTUnwrap(
+            makeSolidImage(size: NSSize(width: 16, height: 16), color: .systemTeal).tiffRepresentation
+        )
+        let fetchStarted = expectation(description: "most recent fetch started")
+        var releaseFetch: CheckedContinuation<Void, Never>?
+        var dataLoads = 0
+
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { _, _ in
+            fetchStarted.fulfill()
+            await withCheckedContinuation { continuation in
+                releaseFetch = continuation
+            }
+            return [
+                self.makeFrameWithVideoInfo(
+                    id: 77,
+                    timestamp: Date(timeIntervalSince1970: 1_700_100_077),
+                    frameIndex: 3
+                ),
+            ]
+        }
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in
+            dataLoads += 1
+            return frameImageData
+        }
+
+        let loadTask = Task {
+            await viewModel.loadMostRecentFrame()
+        }
+
+        await fulfillment(of: [fetchStarted], timeout: 1.0)
+        viewModel.compactPresentationState(reason: "unit-test", purgeDiskFrameBuffer: false)
+        releaseFetch?.resume()
+        await loadTask.value
+
+        XCTAssertEqual(viewModel.frames.count, 1)
+        XCTAssertNil(viewModel.currentImage)
+        XCTAssertEqual(dataLoads, 0)
+    }
+
+    private func makeTimelineFrame(id: Int64, frameIndex: Int, bundleID: String) -> TimelineFrame {
+        let frame = FrameReference(
+            id: FrameID(value: id),
+            timestamp: Date(timeIntervalSince1970: 1_700_100_000 + Double(frameIndex)),
+            segmentID: AppSegmentID(value: id),
+            frameIndexInSegment: frameIndex,
+            metadata: FrameMetadata(
+                appBundleID: bundleID,
+                appName: "Test App",
+                displayID: 1
+            )
+        )
+
+        return TimelineFrame(frame: frame, videoInfo: nil, processingStatus: 2)
+    }
+
+    private func makeFrameWithVideoInfo(id: Int64, timestamp: Date, frameIndex: Int) -> FrameWithVideoInfo {
+        let frame = FrameReference(
+            id: FrameID(value: id),
+            timestamp: timestamp,
+            segmentID: AppSegmentID(value: id),
+            frameIndexInSegment: frameIndex,
+            metadata: FrameMetadata(
+                appBundleID: "test.app",
+                appName: "Test App",
+                displayID: 1
+            )
+        )
+        return FrameWithVideoInfo(frame: frame, videoInfo: nil, processingStatus: 2)
+    }
+
+    private func makeSolidImage(size: NSSize, color: NSColor) -> NSImage {
+        let image = NSImage(size: size)
+        image.lockFocus()
+        color.setFill()
+        NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+        image.unlockFocus()
+        return image
+    }
+}
+
+@MainActor
 final class CommandDragTextSelectionTests: XCTestCase {
     func testCommandDragSelectsIntersectingNodesWithFullRanges() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())

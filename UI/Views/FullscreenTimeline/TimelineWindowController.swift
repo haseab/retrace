@@ -51,7 +51,7 @@ public class TimelineWindowController: NSObject {
     private nonisolated(unsafe) static var isInstallingEmergencyTap = false
     private nonisolated(unsafe) static var isTimelineVisible: Bool = false
 
-    /// Whether the window has been pre-rendered and is ready to show
+    /// Whether a prepared headless timeline state exists and is ready to mount on demand.
     private var isPrepared = false
 
     /// When the timeline was last hidden (for cache expiry check)
@@ -532,8 +532,8 @@ public class TimelineWindowController: NSObject {
 
     // MARK: - Pre-rendering
 
-    /// Pre-create the window and SwiftUI view hierarchy (hidden) for instant display on hotkey press
-    /// This should be called at app startup to eliminate the ~260ms delay when showing the timeline
+    /// Prepare a metadata-only timeline state at startup.
+    /// The hidden window/view hierarchy is no longer kept alive; we only warm the view model.
     public func prepareWindow() {
         let prepareStartTime = CFAbsoluteTimeGetCurrent()
         Log.info("[TIMELINE-PRERENDER] 🚀 prepareWindow() started", category: .ui)
@@ -543,68 +543,22 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        // Don't re-prepare if already prepared and window exists
-        if isPrepared && window != nil {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - already prepared", category: .ui)
+        if isPrepared, timelineViewModel != nil {
+            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - metadata already prepared", category: .ui)
+            startBackgroundRefreshTimer()
             return
         }
 
-        // Get the main screen for pre-rendering (will move to target screen on show)
-        guard let screen = NSScreen.main else {
-            Log.info("[TIMELINE-PRERENDER] ⚠️ prepareWindow() skipped - no main screen", category: .ui)
-            return
-        }
-        Log.info("[TIMELINE-PRERENDER] 📺 Using screen: \(screen.frame)", category: .ui)
-
-        // Create the window (hidden)
-        let window = createWindow(for: screen)
-        window.alphaValue = 0
-        // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
-        window.ignoresMouseEvents = true
-        window.orderOut(nil)
-        Log.info("[TIMELINE-PRERENDER] 🪟 Window created (hidden), elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Create the view model
-        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
-        // Pre-set tape as hidden so view renders with tape off-screen initially
+        let viewModel = ensurePreparedViewModel(coordinator: coordinator)
         viewModel.isTapeHidden = true
-        Log.info("[TIMELINE-PRERENDER] 📊 ViewModel created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Create the SwiftUI view
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE-PRERENDER] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        let timelineView = SimpleTimelineView(
-            coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
+        Log.info(
+            "[TIMELINE-PRERENDER] 📊 Headless view model prepared, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms",
+            category: .ui
         )
-        .environmentObject(coordinatorWrapper)
-        Log.info("[TIMELINE-PRERENDER] 📺 SwiftUI view created, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Host the SwiftUI view
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = window.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        window.contentView?.addSubview(hostingView)
-        Log.info("[TIMELINE-PRERENDER] 🎨 Hosting view added, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
-
-        // Store references
-        self.window = window
-        self.hostingView = hostingView
-        
-        // Trigger initial layout pass to pre-render the SwiftUI view hierarchy
-        hostingView.layoutSubtreeIfNeeded()
-        Log.info("[TIMELINE-PRERENDER] 🔄 Initial layout completed, elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
 
         // Load the most recent frame data in the background
         Task { @MainActor in
-            await viewModel.loadMostRecentFrame()
+            await viewModel.loadMostRecentFrame(refreshPresentation: false)
             Log.info("[TIMELINE-PRERENDER] 📊 Frame data loaded, total elapsed=\(String(format: "%.3f", (CFAbsoluteTimeGetCurrent() - prepareStartTime) * 1000))ms", category: .ui)
         }
 
@@ -722,70 +676,46 @@ public class TimelineWindowController: NSObject {
 	        // Don't stop the background refresh timer - let it keep running
 	        // The timer callback checks isVisible and skips refresh while timeline is open
 
-        // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, let viewModel = timelineViewModel {
+        // Check if we have a prepared metadata state ready
+        if isPrepared, let viewModel = timelineViewModel {
+            mountPresentationIfNeeded(
+                on: targetScreen,
+                coordinator: coordinator,
+                viewModel: viewModel
+            )
             prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             viewModel.isTapeHidden = true
             tapeShowAnimationTask?.cancel()
 
-            // Move window to target screen if needed (instant, no recreation)
-            if window.frame != targetScreen.frame {
-                window.setFrame(targetScreen.frame, display: false)
-            }
-
             // Log cache state
             if let lastHidden = lastHiddenAt {
                 let elapsed = Date().timeIntervalSince(lastHidden)
-                Log.info("[TIMELINE-SHOW] Using prerendered view (hidden \(Int(elapsed))s ago)", category: .ui)
+                Log.info("[TIMELINE-SHOW] Using headless prepared state (hidden \(Int(elapsed))s ago)", category: .ui)
             } else {
-                Log.info("[TIMELINE-SHOW] First show after prerender", category: .ui)
+                Log.info("[TIMELINE-SHOW] First show after headless prerender", category: .ui)
             }
 
-            // Show the pre-rendered window
             showPreparedWindow(
                 coordinator: coordinator,
-                openPath: "prerendered",
+                openPath: "prepared_headless",
                 showStartTime: showStartTime
             )
             startLiveModeCaptureIfNeeded(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
             return
         }
 
-        // Fallback: Create window from scratch (original behavior)
-	        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
-	        let newWindow = createWindow(for: targetScreen)
-
-	        // Create and store the view model so we can forward scroll events
+        // Fallback: Create presentation and view model from scratch (prerender disabled or unavailable).
+        Log.info("[TIMELINE-SHOW] ⚠️ Using FALLBACK path - creating new window and viewModel from scratch", category: .ui)
         let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
         self.timelineViewModel = viewModel
         prepareLiveModeState(shouldUseLiveMode: shouldUseLiveMode, viewModel: viewModel)
         viewModel.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
-
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        // Create the SwiftUI view (using new SimpleTimelineView)
-        let timelineView = SimpleTimelineView(
+        mountPresentationIfNeeded(
+            on: targetScreen,
             coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
+            viewModel: viewModel
         )
-        .environmentObject(coordinatorWrapper)
-
-        // Host the SwiftUI view (using custom hosting view that accepts first mouse for hover)
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = newWindow.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        newWindow.contentView?.addSubview(hostingView)
-
-        // Store references
-        self.window = newWindow
-        self.hostingView = hostingView
         self.isPrepared = true
 
         // Show the window
@@ -810,14 +740,6 @@ public class TimelineWindowController: NSObject {
     ) {
         guard let window = window else { return }
 
-        // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
-        if let hostingView = hostingView, hostingView.superview == nil {
-            hostingView.frame = window.contentView?.bounds ?? .zero
-            window.contentView?.addSubview(hostingView)
-            hostingView.needsLayout = true
-            window.contentView?.needsLayout = true
-        }
-
         timelineViewModel?.isTapeHidden = true
         tapeShowAnimationTask?.cancel()
 
@@ -836,6 +758,8 @@ public class TimelineWindowController: NSObject {
             viewModel.currentIndex = max(0, original - 1)
             viewModel.currentIndex = original
         }
+        timelineViewModel?.setPresentationWorkEnabled(true, reason: "showPreparedWindow")
+        timelineViewModel?.refreshStaticPresentationIfNeeded()
 
         let isLive = timelineViewModel?.isInLiveMode ?? false
         if isLive {
@@ -1047,30 +971,30 @@ public class TimelineWindowController: NSObject {
                     wasHidingToShowDashboard: wasHidingToShowDashboard,
                     hideRequestedAt: hideRequestStartedAt
                 )
-                // Detach is deferred so quick reopen avoids remount/layout hitch.
-                self?.scheduleDeferredHostingViewDetach()
-                self?.startBackgroundRefreshTimer(resetSchedule: true)
-
                 // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
                 if let coordinator = self?.coordinator {
                     await coordinator.setTimelineVisible(false)
                 }
 
-                // Clean up live mode state AFTER fade-out completes (prevents flicker)
                 if let viewModel = self?.timelineViewModel {
-                    viewModel.isInLiveMode = false
-                    viewModel.liveScreenshot = nil
                     viewModel.isTapeHidden = true
                     viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
                     viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
+                    viewModel.compactPresentationState(
+                        reason: "hide-keep-headless-state",
+                        purgeDiskFrameBuffer: true
+                    )
                 }
 
                 // Immediately refresh frame data so next open has fresh data.
                 // Use navigateToNewest: false so short hide/show cycles preserve position.
                 if let viewModel = self?.timelineViewModel {
+                    self?.destroyMountedPresentation(keepPreparedState: true)
+                    self?.startBackgroundRefreshTimer(resetSchedule: true)
                     await viewModel.refreshFrameData(
                         navigateToNewest: false,
-                        allowNearLiveAutoAdvance: false
+                        allowNearLiveAutoAdvance: false,
+                        refreshPresentation: false
                     )
                     // Reset zoom region state on hide
                     viewModel.exitZoomRegion()
@@ -1272,10 +1196,9 @@ public class TimelineWindowController: NSObject {
 
                 await viewModel.refreshFrameData(
                     navigateToNewest: shouldNavigateToNewest,
-                    allowNearLiveAutoAdvance: shouldAutoAdvanceNearLive || cacheExpired
+                    allowNearLiveAutoAdvance: shouldAutoAdvanceNearLive || cacheExpired,
+                    refreshPresentation: false
                 )
-                // Force video reload so AVPlayer picks up new frames appended to the video file
-                viewModel.forceVideoReload = true
             }
         }
     }
@@ -1292,16 +1215,15 @@ public class TimelineWindowController: NSObject {
         Log.info("[TIMELINE-PRERENDER] 🗑️ destroyPreparedWindow() called", category: .ui)
         // Save state before destroying for cross-session persistence
         timelineViewModel?.saveState()
-        cancelDeferredHostingViewDetach()
-        liveModeCaptureTask?.cancel()
-        liveModeCaptureTask = nil
-
-        window?.orderOut(nil)
-        hostingView?.removeFromSuperview()
-        window = nil
-        hostingView = nil
+        timelineViewModel?.compactPresentationState(reason: "destroyPreparedWindow", purgeDiskFrameBuffer: true)
+        destroyMountedPresentation(keepPreparedState: false)
         timelineViewModel = nil
         isPrepared = false
+    }
+
+    private func stopBackgroundRefreshTimer() {
+        backgroundRefreshTimer?.invalidate()
+        backgroundRefreshTimer = nil
     }
 
     private func scheduleDeferredHostingViewDetach() {
@@ -1316,6 +1238,77 @@ public class TimelineWindowController: NSObject {
     private func cancelDeferredHostingViewDetach() {
         deferredHostingViewDetachTask?.cancel()
         deferredHostingViewDetachTask = nil
+    }
+
+    private func ensurePreparedViewModel(coordinator: AppCoordinator) -> SimpleTimelineViewModel {
+        if let existing = timelineViewModel {
+            isPrepared = true
+            return existing
+        }
+
+        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
+        timelineViewModel = viewModel
+        isPrepared = true
+        return viewModel
+    }
+
+    private func mountPresentationIfNeeded(
+        on screen: NSScreen,
+        coordinator: AppCoordinator,
+        viewModel: SimpleTimelineViewModel
+    ) {
+        if let window {
+            if window.frame != screen.frame {
+                window.setFrame(screen.frame, display: false)
+            }
+
+            if let hostingView, hostingView.superview == nil {
+                hostingView.frame = window.contentView?.bounds ?? .zero
+                window.contentView?.addSubview(hostingView)
+                hostingView.needsLayout = true
+                window.contentView?.needsLayout = true
+            }
+            return
+        }
+
+        guard let coordinatorWrapper else {
+            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
+            return
+        }
+
+        let window = createWindow(for: screen)
+        let timelineView = SimpleTimelineView(
+            coordinator: coordinator,
+            viewModel: viewModel,
+            onClose: { [weak self] in
+                self?.hide()
+            }
+        )
+        .environmentObject(coordinatorWrapper)
+
+        let hostingView = FirstMouseHostingView(rootView: timelineView)
+        hostingView.frame = window.contentView?.bounds ?? .zero
+        hostingView.autoresizingMask = [.width, .height]
+        window.contentView?.addSubview(hostingView)
+
+        self.window = window
+        self.hostingView = hostingView
+    }
+
+    private func destroyMountedPresentation(keepPreparedState: Bool) {
+        cancelDeferredHostingViewDetach()
+        liveModeCaptureTask?.cancel()
+        liveModeCaptureTask = nil
+        timelineViewModel?.setPresentationWorkEnabled(false, reason: "destroyMountedPresentation")
+
+        window?.orderOut(nil)
+        hostingView?.removeFromSuperview()
+        hostingView = nil
+        window = nil
+
+        if !keepPreparedState {
+            stopBackgroundRefreshTimer()
+        }
     }
 
     /// Toggle timeline visibility
@@ -1680,54 +1673,17 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        // Check if we have a pre-rendered window ready
-        if isPrepared, let window = window, let viewModel = timelineViewModel {
-            // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
-            if let hostingView = hostingView, hostingView.superview == nil {
-                hostingView.frame = window.contentView?.bounds ?? .zero
-                window.contentView?.addSubview(hostingView)
-                hostingView.needsLayout = true
-                window.contentView?.needsLayout = true
-            }
-            // Move window to target screen if needed
-            if window.frame != targetScreen.frame {
-                window.setFrame(targetScreen.frame, display: false)
-            }
-            // Ensure tape starts hidden for slide-up animation
-            viewModel.isTapeHidden = true
-            return
-        }
+        let viewModel = ensurePreparedViewModel(coordinator: coordinator)
 
-        // Create window from scratch if needed
-        let newWindow = createWindow(for: targetScreen)
-        let viewModel = SimpleTimelineViewModel(coordinator: coordinator)
-        self.timelineViewModel = viewModel
-        // Pre-set tape as hidden so view renders with tape off-screen initially
-        viewModel.isTapeHidden = true
-
-        guard let coordinatorWrapper = coordinatorWrapper else {
-            Log.error("[TIMELINE] Coordinator wrapper not initialized", category: .ui)
-            return
-        }
-
-        let timelineView = SimpleTimelineView(
+        mountPresentationIfNeeded(
+            on: targetScreen,
             coordinator: coordinator,
-            viewModel: viewModel,
-            onClose: { [weak self] in
-                self?.hide()
-            }
+            viewModel: viewModel
         )
-        .environmentObject(coordinatorWrapper)
 
-        let hostingView = FirstMouseHostingView(rootView: timelineView)
-        hostingView.frame = newWindow.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        newWindow.contentView?.addSubview(hostingView)
-
-        self.window = newWindow
-        self.hostingView = hostingView
-        self.isPrepared = true
-            }
+        // Ensure tape starts hidden for slide-up animation
+        viewModel.isTapeHidden = true
+    }
 
     /// Fade in the prepared window (called after data is loaded)
     private func fadeInPreparedWindow() {

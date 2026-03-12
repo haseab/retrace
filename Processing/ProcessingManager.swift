@@ -55,11 +55,17 @@ public actor ProcessingManager: ProcessingProtocol {
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
         let startTime = Date()
-        return try await extractTextInternal(from: frame, startTime: startTime)
+        let ocrRegions = try await extractOCRRegions(from: frame)
+        return try await buildExtractedText(
+            timestamp: frame.timestamp,
+            frameHeight: frame.height,
+            metadata: frame.metadata,
+            ocrRegions: ocrRegions,
+            startTime: startTime
+        )
     }
 
-    private func extractTextInternal(from frame: CapturedFrame, startTime: Date) async throws -> ExtractedText {
-
+    private func extractOCRRegions(from frame: CapturedFrame) async throws -> [TextRegion] {
         // Ensure full-frame cache is initialized for region-based OCR
         if fullFrameCache == nil {
             fullFrameCache = FullFrameOCRCache()
@@ -100,13 +106,22 @@ public actor ProcessingManager: ProcessingProtocol {
 
         // Store frame for next comparison (region-based OCR)
         previousFrame = frame
+        return ocrRegions
+    }
 
+    private func buildExtractedText(
+        timestamp: Date,
+        frameHeight: Int,
+        metadata frameMetadata: FrameMetadata,
+        ocrRegions: [TextRegion],
+        startTime: Date
+    ) async throws -> ExtractedText {
         // Separate UI chrome from main content
         // Chrome = top 5% (menu bar/status bar) + bottom 5% (dock)
         // Coordinates are now in pixel space with Y flipped (0 = top)
-        let frameHeight = CGFloat(frame.height)
-        let topChromeThreshold = frameHeight * 0.05    // Top 5%
-        let bottomChromeThreshold = frameHeight * 0.95 // Bottom 5%
+        let normalizedFrameHeight = max(CGFloat(frameHeight), 1)
+        let topChromeThreshold = normalizedFrameHeight * 0.05    // Top 5%
+        let bottomChromeThreshold = normalizedFrameHeight * 0.95 // Bottom 5%
 
         var mainRegions: [TextRegion] = []
         var chromeRegions: [TextRegion] = []
@@ -151,15 +166,15 @@ public actor ProcessingManager: ProcessingProtocol {
 
         // Merge accessibility metadata with existing metadata
         // Preserve browserURL from capture phase if accessibility doesn't provide one
-        var metadata = frame.metadata
+        var metadata = frameMetadata
         if let axResult = axResult {
             metadata = FrameMetadata(
                 appBundleID: axResult.appInfo.bundleID,
                 appName: axResult.appInfo.name,
                 windowName: axResult.appInfo.windowName,
-                browserURL: axResult.appInfo.browserURL ?? frame.metadata.browserURL,
-                redactionReason: frame.metadata.redactionReason,
-                displayID: frame.metadata.displayID
+                browserURL: axResult.appInfo.browserURL ?? frameMetadata.browserURL,
+                redactionReason: frameMetadata.redactionReason,
+                displayID: frameMetadata.displayID
             )
         }
 
@@ -167,7 +182,7 @@ public actor ProcessingManager: ProcessingProtocol {
         // Note: CapturedFrame doesn't have an ID yet (assigned by database on insert)
         let extractedText = ExtractedText(
             frameID: FrameID(value: 0), // Placeholder - will be updated by caller after DB insert
-            timestamp: frame.timestamp,
+            timestamp: timestamp,
             regions: mainRegions,        // Main content regions (c0)
             chromeRegions: chromeRegions, // UI chrome regions (c1)
             fullText: fullText,          // Main content text

@@ -35,6 +35,10 @@ public struct SimpleTimelineView: View {
         self.onClose = onClose
     }
 
+    nonisolated static func shouldLoadMostRecentFrameOnAppear(hasInitialized: Bool, frameCount: Int) -> Bool {
+        !hasInitialized && frameCount == 0
+    }
+
     private var currentBrowserURLForDebugWindow: String? {
         guard let rawURL = viewModel.currentFrame?.metadata.browserURL?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -522,11 +526,16 @@ public struct SimpleTimelineView: View {
             .background(frameCanvasBackgroundColor)
             .ignoresSafeArea()
             .onAppear {
-                if !hasInitialized {
+                if Self.shouldLoadMostRecentFrameOnAppear(
+                    hasInitialized: hasInitialized,
+                    frameCount: viewModel.frames.count
+                ) {
                     hasInitialized = true
                     Task {
                         await viewModel.loadMostRecentFrame()
                     }
+                } else {
+                    hasInitialized = true
                 }
                 if viewModel.showCommentSubmenu {
                     isCommentSubmenuMounted = true
