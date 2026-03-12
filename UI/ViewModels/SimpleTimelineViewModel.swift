@@ -4140,17 +4140,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     newCommentAttachmentDrafts = []
                     incrementCommentCountsForSegments(Set(createResult.linkedSegmentIDs))
                     isAddingComment = false
-                    let requestedCount = segmentIds.count
-                    let linkedCount = createResult.linkedSegmentIDs.count
-
-                    if linkedCount == requestedCount {
-                        showToast("Comment added", icon: "checkmark.circle.fill")
-                    } else {
-                        showToast(
-                            "Comment added to \(linkedCount)/\(requestedCount) segments",
-                            icon: "exclamationmark.triangle.fill"
-                        )
-                    }
                 }
                 DashboardViewModel.recordCommentAdded(
                     coordinator: coordinator,
