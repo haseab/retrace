@@ -1260,6 +1260,8 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var isPausedForBattery: Bool = false
     @Published var powerSource: PowerStateMonitor.PowerSource = .unknown
     @Published var ocrProcessingLevel: Int = 3
+    @Published var pauseOnBatterySetting: Bool = false
+    @Published var pauseOnLowPowerModeSetting: Bool = false
     @Published var isRecordingActive: Bool = false
 
     // Chart data
@@ -1407,7 +1409,9 @@ class SystemMonitorViewModel: ObservableObject {
         ocrEnabled &&
         !isPausedForBattery &&
         queueDepth >= backlogNudgeThreshold &&
-        (1...3).contains(ocrProcessingLevel)
+        ocrProcessingLevel == 3 &&
+        !pauseOnBatterySetting &&
+        !pauseOnLowPowerModeSetting
     }
 
     func startMonitoring() async {
@@ -1490,11 +1494,14 @@ class SystemMonitorViewModel: ObservableObject {
         powerSource = powerState.source
         isPausedForBattery = powerState.isPaused
 
-        // Get OCR enabled state
-        ocrEnabled = defaults.object(forKey: "ocrEnabled") as? Bool ?? true
+        // Get OCR power settings snapshot from defaults to keep the nudge logic aligned
+        // with the power configuration shown in Settings.
+        let powerSettings = OCRPowerSettingsSnapshot.fromDefaults(defaults)
+        ocrEnabled = powerSettings.ocrEnabled
         isRecordingActive = coordinator.statusHolder.status.isRunning
-        let processingLevel = (defaults.object(forKey: "ocrProcessingLevel") as? NSNumber)?.intValue ?? 3
-        ocrProcessingLevel = min(max(processingLevel, 1), 5)
+        ocrProcessingLevel = min(max(powerSettings.processingLevel, 1), 5)
+        pauseOnBatterySetting = powerSettings.pauseOnBattery
+        pauseOnLowPowerModeSetting = powerSettings.pauseOnLowPowerMode
     }
 
     #if DEBUG
