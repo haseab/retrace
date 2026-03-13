@@ -1982,11 +1982,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     struct FrameLookupTestHooks {
         var getFrameWithVideoInfoByID: ((FrameID) async throws -> FrameWithVideoInfo?)?
     }
+    struct FrameOverlayLoadTestHooks {
+        var getURLBoundingBox: ((Date, FrameSource) async throws -> URLBoundingBox?)?
+        var getOCRStatus: ((FrameID) async throws -> OCRProcessingStatus)?
+        var getAllOCRNodes: ((FrameID, FrameSource) async throws -> [OCRNodeWithText])?
+    }
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
     var test_foregroundFrameLoadHooks = ForegroundFrameLoadTestHooks()
     var test_frameLookupHooks = FrameLookupTestHooks()
+    var test_frameOverlayLoadHooks = FrameOverlayLoadTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -6401,9 +6407,20 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Refresh image-backed presentation state when the timeline becomes visible again.
-    /// Video-backed frames are refreshed by the AVPlayer path instead.
+    /// Video-backed frames still need OCR/URL overlays reloaded even though AVPlayer
+    /// owns the visible frame pixels.
     public func refreshStaticPresentationIfNeeded() {
-        guard presentationWorkEnabled, !isInLiveMode, currentVideoInfo == nil, currentImage == nil else { return }
+        guard presentationWorkEnabled, !isInLiveMode else { return }
+
+        if currentVideoInfo != nil {
+            let generation = currentPresentationWorkGeneration()
+            guard canPublishPresentationResult(expectedGeneration: generation) else { return }
+            loadURLBoundingBox(expectedGeneration: generation)
+            loadOCRNodes(expectedGeneration: generation)
+            return
+        }
+
+        guard currentImage == nil else { return }
         loadImageIfNeeded()
     }
 
@@ -7866,7 +7883,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Load URL bounding box asynchronously
         Task {
             do {
-                let boundingBox = try await coordinator.getURLBoundingBox(
+                let boundingBox = try await fetchURLBoundingBoxForPresentation(
                     timestamp: frame.timestamp,
                     source: frame.source
                 )
@@ -8640,6 +8657,39 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     // MARK: - OCR Node Loading and Text Selection
 
+    private func fetchURLBoundingBoxForPresentation(
+        timestamp: Date,
+        source: FrameSource
+    ) async throws -> URLBoundingBox? {
+#if DEBUG
+        if let override = test_frameOverlayLoadHooks.getURLBoundingBox {
+            return try await override(timestamp, source)
+        }
+#endif
+        return try await coordinator.getURLBoundingBox(timestamp: timestamp, source: source)
+    }
+
+    private func fetchOCRStatusForPresentation(frameID: FrameID) async throws -> OCRProcessingStatus {
+#if DEBUG
+        if let override = test_frameOverlayLoadHooks.getOCRStatus {
+            return try await override(frameID)
+        }
+#endif
+        return try await coordinator.getOCRStatus(frameID: frameID)
+    }
+
+    private func fetchAllOCRNodesForPresentation(
+        frameID: FrameID,
+        source: FrameSource
+    ) async throws -> [OCRNodeWithText] {
+#if DEBUG
+        if let override = test_frameOverlayLoadHooks.getAllOCRNodes {
+            return try await override(frameID, source)
+        }
+#endif
+        return try await coordinator.getAllOCRNodes(frameID: frameID, source: source)
+    }
+
     /// Set OCR nodes and invalidate the selection cache
     private func setOCRNodes(_ nodes: [OCRNodeWithText]) {
         // Capture previous nodes for diff visualization (only when debug overlay is enabled)
@@ -8699,8 +8749,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             // Fetch OCR status and nodes concurrently
-            async let statusTask = coordinator.getOCRStatus(frameID: frame.id)
-            async let nodesTask = coordinator.getAllOCRNodes(
+            async let statusTask = fetchOCRStatusForPresentation(frameID: frame.id)
+            async let nodesTask = fetchAllOCRNodesForPresentation(
                 frameID: frame.id,
                 source: frame.source
             )
@@ -8786,7 +8836,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 // Fetch updated status
                 do {
-                    let status = try await self.coordinator.getOCRStatus(frameID: frameID)
+                    let status = try await self.fetchOCRStatusForPresentation(frameID: frameID)
 
                     await MainActor.run {
                         // Only update if still on the same frame
@@ -8835,7 +8885,7 @@ public class SimpleTimelineViewModel: ObservableObject {
               ) else { return }
 
         do {
-            let nodes = try await coordinator.getAllOCRNodes(
+            let nodes = try await fetchAllOCRNodesForPresentation(
                 frameID: frame.id,
                 source: frame.source
             )

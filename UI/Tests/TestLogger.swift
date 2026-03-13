@@ -2193,6 +2193,83 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertEqual(viewModel.currentIndex, 0)
     }
 
+    func testRefreshStaticPresentationIfNeededReloadsOCRForVideoBackedFrame() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+
+        let timelineFrame = TimelineFrame(
+            frame: FrameReference(
+                id: FrameID(value: 11),
+                timestamp: Date(timeIntervalSince1970: 1_700_100_011),
+                segmentID: AppSegmentID(value: 11),
+                frameIndexInSegment: 4,
+                metadata: FrameMetadata(
+                    appBundleID: "test.app",
+                    appName: "Test App",
+                    displayID: 1
+                ),
+                source: .native
+            ),
+            videoInfo: FrameVideoInfo(
+                videoPath: "/tmp/test-video-backed.mp4",
+                frameIndex: 4,
+                frameRate: 30,
+                width: 1920,
+                height: 1080,
+                isVideoFinalized: true
+            ),
+            processingStatus: 2
+        )
+
+        viewModel.frames = [timelineFrame]
+        viewModel.currentIndex = 0
+
+        var ocrStatusLoads = 0
+        var ocrNodeLoads = 0
+        var frameImageLoads = 0
+        let expectedNode = OCRNodeWithText(
+            id: 99,
+            frameId: timelineFrame.frame.id.value,
+            x: 0.10,
+            y: 0.20,
+            width: 0.30,
+            height: 0.08,
+            text: "Launch OCR"
+        )
+
+        viewModel.test_frameOverlayLoadHooks.getURLBoundingBox = { _, _ in nil }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { frameID in
+            XCTAssertEqual(frameID, timelineFrame.frame.id)
+            ocrStatusLoads += 1
+            return .completed
+        }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { frameID, source in
+            XCTAssertEqual(frameID, timelineFrame.frame.id)
+            XCTAssertEqual(source, .native)
+            ocrNodeLoads += 1
+            return [expectedNode]
+        }
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in
+            frameImageLoads += 1
+            return Data()
+        }
+
+        viewModel.refreshStaticPresentationIfNeeded()
+
+        for _ in 0..<20 {
+            if viewModel.ocrNodes.count == 1 {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10), clock: .continuous)
+        }
+
+        XCTAssertEqual(viewModel.ocrStatus, .completed)
+        XCTAssertEqual(viewModel.ocrNodes, [expectedNode])
+        XCTAssertEqual(ocrStatusLoads, 1)
+        XCTAssertEqual(ocrNodeLoads, 1)
+        XCTAssertEqual(frameImageLoads, 0)
+    }
+
     func testForegroundPresentationLoadCachesVideoBackedFramesInDiskBuffer() async throws {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
