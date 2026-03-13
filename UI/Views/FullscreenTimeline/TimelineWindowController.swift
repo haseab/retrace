@@ -970,30 +970,32 @@ public class TimelineWindowController: NSObject {
             context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             window.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            Task { @MainActor in
-                let wasHidingToShowDashboard = self?.isHidingToShowDashboard == true
-                self?.isHiding = false
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                let wasHidingToShowDashboard = self.isHidingToShowDashboard
+                self.isHiding = false
                 // Only hide dashboard if it wasn't the active window before timeline opened
                 // AND we're not hiding specifically to show the dashboard/settings
                 // This prevents hiding the dashboard when user had it focused and just opened/closed timeline
                 // Also don't hide if a modal sheet (feedback form, etc.) is attached
-                if self?.dashboardWasKeyWindow != true,
+                if self.dashboardWasKeyWindow != true,
                    !wasHidingToShowDashboard,
                    DashboardWindowController.shared.window?.attachedSheet == nil {
                     DashboardWindowController.shared.hide()
                 }
                 // Reset the flag after use
-                self?.isHidingToShowDashboard = false
+                self.isHidingToShowDashboard = false
 
                 // Hide window but keep it around for instant re-show
                 // This is the key optimization - we don't destroy the window or view model
                 // CRITICAL: Ignore mouse events while hidden to prevent blocking clicks on other windows
                 window.ignoresMouseEvents = true
                 window.orderOut(nil)
-                self?.isVisible = false
+                self.isVisible = false
                 Self.isTimelineVisible = false  // For emergency escape tap
-                self?.lastHiddenAt = Date()
-                self?.suppressLiveScrollUntil = 0
+                self.lastHiddenAt = Date()
+                self.suppressLiveScrollUntil = 0
                 let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestStartedAt) * 1000
                 Log.recordLatency(
                     "timeline.hide.window_hidden_ms",
@@ -1007,44 +1009,19 @@ public class TimelineWindowController: NSObject {
                     "[TimelineToggle] window hidden after \(String(format: "%.1f", hideElapsedMs))ms",
                     category: .ui
                 )
-                self?.restoreFocusIfNeeded(
+                self.restoreFocusIfNeeded(
                     requestedRestore: restorePreviousFocus,
                     wasHidingToShowDashboard: wasHidingToShowDashboard,
                     hideRequestedAt: hideRequestStartedAt
                 )
                 // Mark timeline hidden before post-hide refresh so frame reads can use relaxed timing.
-                if let coordinator = self?.coordinator {
+                if let coordinator = self.coordinator {
                     await coordinator.setTimelineVisible(false)
                 }
 
-                if let viewModel = self?.timelineViewModel {
-                    viewModel.isTapeHidden = true
-                    viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
-                    viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
-                    viewModel.compactPresentationState(
-                        reason: "hide-keep-headless-state",
-                        purgeDiskFrameBuffer: true
-                    )
-                }
+                await self.compactHiddenPresentationState()
 
-                // Immediately refresh frame data so next open has fresh data.
-                // Use navigateToNewest: false so short hide/show cycles preserve position.
-                if let viewModel = self?.timelineViewModel {
-                    self?.destroyMountedPresentation(keepPreparedState: true)
-                    if let coordinator = self?.coordinator {
-                        await coordinator.purgeVideoDecodingCaches(reason: "timeline hidden")
-                    }
-                    self?.startBackgroundRefreshTimer(resetSchedule: true)
-                    await viewModel.refreshFrameData(
-                        navigateToNewest: false,
-                        allowNearLiveAutoAdvance: false,
-                        refreshPresentation: false
-                    )
-                    // Reset zoom region state on hide
-                    viewModel.exitZoomRegion()
-                }
-
-                self?.onClose?()
+                self.onClose?()
 
                 // Reset the cached scale factor so it recalculates for next window
                 TimelineScaleFactor.resetCache()
@@ -1273,6 +1250,43 @@ public class TimelineWindowController: NSObject {
     private func stopBackgroundRefreshTimer() {
         backgroundRefreshTimer?.invalidate()
         backgroundRefreshTimer = nil
+    }
+
+    @MainActor
+    private func compactHiddenPresentationState() async {
+        let viewModel = timelineViewModel
+
+        if let viewModel {
+            viewModel.isTapeHidden = true
+            viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
+            viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
+            viewModel.compactPresentationState(
+                reason: "hide-keep-headless-state",
+                purgeDiskFrameBuffer: true
+            )
+        } else {
+            Log.warning("[TimelineToggle] Missing timeline view model during hide compaction", category: .ui)
+        }
+
+        // Always detach any mounted presentation and purge decode caches, even if the
+        // prepared view model vanished unexpectedly. Otherwise hidden decoder work can linger.
+        destroyMountedPresentation(keepPreparedState: true)
+        if let coordinator {
+            await coordinator.purgeVideoDecodingCaches(reason: "timeline hidden")
+        }
+        startBackgroundRefreshTimer(resetSchedule: true)
+
+        // Immediately refresh frame metadata so next open has fresh data.
+        // Use navigateToNewest: false so short hide/show cycles preserve position.
+        if let viewModel {
+            await viewModel.refreshFrameData(
+                navigateToNewest: false,
+                allowNearLiveAutoAdvance: false,
+                refreshPresentation: false
+            )
+            // Reset zoom region state on hide.
+            viewModel.exitZoomRegion()
+        }
     }
 
     private func scheduleDeferredHostingViewDetach() {

@@ -2213,6 +2213,46 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertEqual(dataLoads, 0)
     }
 
+    func testHiddenRefreshAfterCompactionStaysMetadataOnly() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "test.app"),
+        ]
+        viewModel.currentIndex = 0
+        viewModel.currentImage = makeSolidImage(size: NSSize(width: 12, height: 12), color: .systemPink)
+
+        let frameImageData = try XCTUnwrap(
+            makeSolidImage(size: NSSize(width: 16, height: 16), color: .systemIndigo).tiffRepresentation
+        )
+        var dataLoads = 0
+        viewModel.test_foregroundFrameLoadHooks.loadFrameData = { _ in
+            dataLoads += 1
+            return frameImageData
+        }
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { _, _ in
+            [
+                self.makeFrameWithVideoInfo(
+                    id: 2,
+                    timestamp: Date(timeIntervalSince1970: 1_700_100_100),
+                    frameIndex: 1
+                ),
+            ]
+        }
+
+        viewModel.compactPresentationState(reason: "unit-test", purgeDiskFrameBuffer: false)
+        await viewModel.refreshFrameData(
+            navigateToNewest: true,
+            allowNearLiveAutoAdvance: true,
+            refreshPresentation: false
+        )
+
+        XCTAssertEqual(viewModel.frames.count, 2)
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertNil(viewModel.currentImage)
+        XCTAssertEqual(dataLoads, 0)
+    }
+
     private func makeTimelineFrame(id: Int64, frameIndex: Int, bundleID: String) -> TimelineFrame {
         let frame = FrameReference(
             id: FrameID(value: id),
