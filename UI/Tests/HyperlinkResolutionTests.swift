@@ -1,5 +1,6 @@
 import XCTest
 @testable import Retrace
+import Shared
 
 final class HyperlinkResolutionTests: XCTestCase {
     @MainActor
@@ -99,6 +100,103 @@ final class HyperlinkResolutionTests: XCTestCase {
                 directive: ":~:text=hello%20world"
             ),
             "https://example.com/article#section-2:~:text=hello%20world"
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameMediaDisplayModePrefersExactDiskBufferStillForVideoFrames() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(
+                currentFrameID: FrameID(value: 42),
+                currentImageFrameID: FrameID(value: 42),
+                hasCurrentImage: true,
+                hasVideo: true
+            ),
+            .still
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameMediaDisplayModeRejectsMismatchedStillAndUsesDecodedVideo() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(
+                currentFrameID: FrameID(value: 77),
+                currentImageFrameID: FrameID(value: 76),
+                hasCurrentImage: true,
+                hasVideo: true
+            ),
+            .decodedVideo
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameMediaDisplayModePrefersAnyExactStillForVideoFrames() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(
+                currentFrameID: FrameID(value: 91),
+                currentImageFrameID: FrameID(value: 91),
+                hasCurrentImage: true,
+                hasVideo: true
+            ),
+            .still
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameMediaDisplayModeKeepsStillForNonVideoFrames() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(
+                currentFrameID: FrameID(value: 103),
+                currentImageFrameID: FrameID(value: 103),
+                hasCurrentImage: true,
+                hasVideo: false
+            ),
+            .still
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameMediaDisplayModeReturnsNoContentWithoutFrame() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameMediaDisplayMode(
+                currentFrameID: nil,
+                currentImageFrameID: FrameID(value: 1),
+                hasCurrentImage: true,
+                hasVideo: true
+            ),
+            .noContent
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameStillDisplayModeUsesWaitingFallbackUntilVideoReady() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameStillDisplayMode(
+                currentFrameID: FrameID(value: 55),
+                currentImageFrameID: FrameID(value: 54),
+                hasCurrentImage: false,
+                hasVideo: true,
+                hasWaitingFallbackImage: true,
+                pendingVideoPresentationFrameID: FrameID(value: 55),
+                isPendingVideoPresentationReady: false
+            ),
+            .waitingFallback
+        )
+    }
+
+    @MainActor
+    func testCurrentFrameStillDisplayModeStopsUsingWaitingFallbackOnceVideoIsReady() {
+        XCTAssertEqual(
+            SimpleTimelineViewModel.resolveCurrentFrameStillDisplayMode(
+                currentFrameID: FrameID(value: 55),
+                currentImageFrameID: FrameID(value: 54),
+                hasCurrentImage: false,
+                hasVideo: true,
+                hasWaitingFallbackImage: true,
+                pendingVideoPresentationFrameID: FrameID(value: 55),
+                isPendingVideoPresentationReady: true
+            ),
+            .none
         )
     }
 }

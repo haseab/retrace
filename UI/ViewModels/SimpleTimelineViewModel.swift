@@ -90,6 +90,18 @@ public struct TimelineFrame: Identifiable, Equatable {
     }
 }
 
+enum CurrentFrameMediaDisplayMode: Equatable {
+    case still
+    case decodedVideo
+    case noContent
+}
+
+enum CurrentFrameStillDisplayMode: Equatable {
+    case currentImage
+    case waitingFallback
+    case none
+}
+
 /// Represents a block of consecutive frames from the same app
 public struct AppBlock: Identifiable, Sendable {
     // Use stable ID based on content to prevent unnecessary view recreation during infinite scroll
@@ -426,9 +438,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     }
                 }
 
-                // CRITICAL: Clear previous frame state IMMEDIATELY to prevent old frame from showing
-                // This runs synchronously before SwiftUI re-renders
-                currentImage = nil
+                // CRITICAL: Clear previous frame state IMMEDIATELY to prevent old frame from showing.
+                // Preserve the last visible frame only as a temporary overlay while video catches up.
+                prepareCurrentFramePresentationState(for: currentTimelineFrame)
 
                 // Pre-check if frame will have loading issues (synchronous check)
                 // This prevents showing a fallback frame before the async error is detected
@@ -451,6 +463,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Static image for displaying the current frame (for image-based sources like Retrace)
     @Published public var currentImage: NSImage?
+    @Published private(set) var currentImageFrameID: FrameID?
+    @Published private(set) var waitingFallbackImage: NSImage?
+    @Published private(set) var pendingVideoPresentationFrameID: FrameID?
+    @Published private(set) var isPendingVideoPresentationReady = false
 
     /// Whether the timeline is in "live mode" showing a live screenshot
     /// When true, the liveScreenshot is displayed instead of historical frames
@@ -1489,6 +1505,81 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Current frame reference - derived from currentIndex
     public var currentFrame: FrameReference? {
         currentTimelineFrame?.frame
+    }
+
+    var displayableCurrentImage: NSImage? {
+        switch currentFrameStillDisplayMode {
+        case .currentImage:
+            return currentImage
+        case .waitingFallback, .none:
+            return nil
+        }
+    }
+
+    var waitingVideoFallbackImage: NSImage? {
+        guard currentFrameStillDisplayMode == .waitingFallback else { return nil }
+        return waitingFallbackImage
+    }
+
+    var currentFrameMediaDisplayMode: CurrentFrameMediaDisplayMode {
+        Self.resolveCurrentFrameMediaDisplayMode(
+            currentFrameID: currentTimelineFrame?.frame.id,
+            currentImageFrameID: currentImageFrameID,
+            hasCurrentImage: currentImage != nil,
+            hasVideo: currentTimelineFrame?.videoInfo != nil
+        )
+    }
+
+    static func resolveCurrentFrameMediaDisplayMode(
+        currentFrameID: FrameID?,
+        currentImageFrameID: FrameID?,
+        hasCurrentImage: Bool,
+        hasVideo: Bool
+    ) -> CurrentFrameMediaDisplayMode {
+        guard let currentFrameID else { return .noContent }
+
+        if hasCurrentImage && currentImageFrameID == currentFrameID {
+            return .still
+        }
+
+        return hasVideo ? .decodedVideo : .noContent
+    }
+
+    var currentFrameStillDisplayMode: CurrentFrameStillDisplayMode {
+        Self.resolveCurrentFrameStillDisplayMode(
+            currentFrameID: currentTimelineFrame?.frame.id,
+            currentImageFrameID: currentImageFrameID,
+            hasCurrentImage: currentImage != nil,
+            hasVideo: currentTimelineFrame?.videoInfo != nil,
+            hasWaitingFallbackImage: waitingFallbackImage != nil,
+            pendingVideoPresentationFrameID: pendingVideoPresentationFrameID,
+            isPendingVideoPresentationReady: isPendingVideoPresentationReady
+        )
+    }
+
+    static func resolveCurrentFrameStillDisplayMode(
+        currentFrameID: FrameID?,
+        currentImageFrameID: FrameID?,
+        hasCurrentImage: Bool,
+        hasVideo: Bool,
+        hasWaitingFallbackImage: Bool,
+        pendingVideoPresentationFrameID: FrameID?,
+        isPendingVideoPresentationReady: Bool
+    ) -> CurrentFrameStillDisplayMode {
+        guard let currentFrameID else { return .none }
+
+        if hasCurrentImage && currentImageFrameID == currentFrameID {
+            return .currentImage
+        }
+
+        if hasVideo,
+           hasWaitingFallbackImage,
+           pendingVideoPresentationFrameID == currentFrameID,
+           !isPendingVideoPresentationReady {
+            return .waitingFallback
+        }
+
+        return .none
     }
 
     /// Video info for displaying the current frame - derived from currentIndex
@@ -5523,6 +5614,62 @@ public class SimpleTimelineViewModel: ObservableObject {
         error = nil
     }
 
+    private func clearCurrentImagePresentation() {
+        currentImage = nil
+        currentImageFrameID = nil
+    }
+
+    private func clearWaitingFallbackImage() {
+        waitingFallbackImage = nil
+    }
+
+    private func clearPendingVideoPresentationState() {
+        pendingVideoPresentationFrameID = nil
+        isPendingVideoPresentationReady = false
+    }
+
+    private func preserveWaitingFallbackImage(for timelineFrame: TimelineFrame?) {
+        guard let timelineFrame, timelineFrame.videoInfo != nil else {
+            clearWaitingFallbackImage()
+            return
+        }
+
+        waitingFallbackImage = currentImage ?? waitingFallbackImage
+    }
+
+    private func configurePendingVideoPresentationState(for timelineFrame: TimelineFrame?) {
+        guard let timelineFrame, timelineFrame.videoInfo != nil else {
+            clearPendingVideoPresentationState()
+            clearWaitingFallbackImage()
+            return
+        }
+
+        pendingVideoPresentationFrameID = timelineFrame.frame.id
+        isPendingVideoPresentationReady = false
+    }
+
+    private func prepareCurrentFramePresentationState(for timelineFrame: TimelineFrame?) {
+        preserveWaitingFallbackImage(for: timelineFrame)
+        clearCurrentImagePresentation()
+        configurePendingVideoPresentationState(for: timelineFrame)
+    }
+
+    private func setCurrentImagePresentation(
+        _ image: NSImage,
+        frameID: FrameID
+    ) {
+        currentImage = image
+        currentImageFrameID = frameID
+        clearWaitingFallbackImage()
+    }
+
+    func markVideoPresentationReady(frameID: FrameID) {
+        guard pendingVideoPresentationFrameID == frameID else { return }
+        guard currentTimelineFrame?.frame.id == frameID else { return }
+        isPendingVideoPresentationReady = true
+        clearWaitingFallbackImage()
+    }
+
     /// Clear stale timeline content when active filters yield zero matches.
     private func applyFilteredEmptyTimelineState(context: String) {
         let clearedFrameCount = frames.count
@@ -5530,7 +5677,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         pendingCurrentIndexAfterFrameReplacement = nil
         selectedFrameIndex = nil
         frames = []
-        currentImage = nil
+        clearCurrentImagePresentation()
+        clearWaitingFallbackImage()
+        clearPendingVideoPresentationState()
         frameNotReady = false
         frameLoadError = false
         hasMoreOlder = false
@@ -7341,7 +7490,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             if Self.isVerboseTimelineLoggingEnabled {
                 Log.info("[TIMELINE-LOAD] Frame \(frame.id.value) has processingStatus=4 (NOT_YET_READABLE), setting frameNotReady=true", category: .ui)
             }
-            currentImage = nil
+            clearCurrentImagePresentation()
             frameNotReady = true
             frameLoadError = false
             ensureDiskHotWindowCoverage(reason: "frame-not-yet-readable")
@@ -7534,11 +7683,17 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameID: frame.id,
                 expectedGeneration: expectedGeneration
             ) {
-                currentImage = image
+                setCurrentImagePresentation(
+                    image,
+                    frameID: frame.id
+                )
                 frameNotReady = false
                 frameLoadError = false
                 if Self.isVerboseTimelineLoggingEnabled {
-                    Log.debug("[TIMELINE-LOAD] Successfully loaded image for frame \(frame.id.value)", category: .ui)
+                    Log.debug(
+                        "[TIMELINE-LOAD] Successfully loaded image for frame \(frame.id.value) source=\(loadedFromDiskBuffer ? "disk-buffer" : "storage-read")",
+                        category: .ui
+                    )
                 }
             }
         } catch is CancellationError {
@@ -7552,7 +7707,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameID: frame.id,
                 expectedGeneration: expectedGeneration
             ) {
-                currentImage = nil
+                clearCurrentImagePresentation()
                 frameLoadError = false
                 if timelineFrame.processingStatus != 2 {
                     frameNotReady = true
@@ -7567,7 +7722,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameID: frame.id,
                 expectedGeneration: expectedGeneration
             ) {
-                currentImage = nil
+                clearCurrentImagePresentation()
                 if timelineFrame.processingStatus != 2 {
                     frameNotReady = true
                     frameLoadError = false
@@ -7585,7 +7740,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameID: frame.id,
                 expectedGeneration: expectedGeneration
             ) {
-                currentImage = nil
+                clearCurrentImagePresentation()
                 if timelineFrame.processingStatus != 2 {
                     frameNotReady = true
                     frameLoadError = false
@@ -7601,9 +7756,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 frameID: frame.id,
                 expectedGeneration: expectedGeneration
             ) {
-                currentImage = nil
+                clearCurrentImagePresentation()
                 frameNotReady = false
-                frameLoadError = true
+                frameLoadError = timelineFrame.videoInfo == nil
             }
         }
     }
@@ -8087,7 +8242,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func estimatedViewportHeightForCurrentFrame() -> Double? {
-        if let imageHeight = currentImage?.size.height,
+        if let imageHeight = displayableCurrentImage?.size.height,
            imageHeight > 1 {
             return Double(imageHeight)
         }

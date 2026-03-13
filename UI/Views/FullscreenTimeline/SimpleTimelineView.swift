@@ -854,8 +854,30 @@ public struct SimpleTimelineView: View {
                     .foregroundColor(.white.opacity(0.3))
             }
         } else if let videoInfo = viewModel.currentVideoInfo {
-            videoFrameContent(videoInfo: videoInfo)
-        } else if let image = viewModel.currentImage {
+            let isDecodedVideoInteractable =
+                viewModel.currentFrameMediaDisplayMode == .decodedVideo &&
+                viewModel.currentFrameStillDisplayMode == .none
+
+            ZStack {
+                // Keep the video view mounted behind still overlays so AVPlayer can preload
+                // and preserve its last rendered frame across still -> video handoffs.
+                videoFrameContent(videoInfo: videoInfo)
+                    .opacity(viewModel.currentFrameMediaDisplayMode == .decodedVideo ? 1 : 0.001)
+                    .allowsHitTesting(isDecodedVideoInteractable)
+
+                if let image = viewModel.displayableCurrentImage {
+                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    }
+                } else if let fallbackImage = viewModel.waitingVideoFallbackImage {
+                    Image(nsImage: fallbackImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                }
+            }
+        } else if let image = viewModel.displayableCurrentImage {
             // Static image (Retrace) with URL overlay.
             FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
                 Image(nsImage: image)
@@ -939,29 +961,35 @@ public struct SimpleTimelineView: View {
 	            let minFragmentSize: Int64 = 200_000  // 200KB threshold (~2 fragments)
 	            let fileReady = videoInfo.isVideoFinalized || fileSize >= minFragmentSize
 
-	            // Don't render video if we already know it will fail to load
-	            if fileReady && !viewModel.frameLoadError {
-	                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-	                    SimpleVideoFrameView(videoInfo: videoInfo, debugContext: debugContext, forceReload: .init(
-	                        get: { viewModel.forceVideoReload },
-	                        set: { viewModel.forceVideoReload = $0 }
-	                    ), onLoadFailed: {
-	                        // Don't set frameNotReady=true for completed frames (processingStatus=2) or Rewind frames (-1)
-	                        // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
-	                        let status = viewModel.currentTimelineFrame?.processingStatus
-	                        if status != 2 && status != -1 {
-	                            viewModel.frameNotReady = true
-	                            viewModel.frameLoadError = false
-	                        } else {
-	                            // For completed frames or Rewind frames, this is a real error
-	                            viewModel.frameNotReady = false
-	                            viewModel.frameLoadError = true
-	                        }
-	                    }, onLoadSuccess: {
-	                        viewModel.frameNotReady = false
-	                        viewModel.frameLoadError = false
-	                    })
-	                }
+            let frameID = viewModel.currentTimelineFrame?.frame.id
+            let processingStatus = viewModel.currentTimelineFrame?.processingStatus
+
+            // Don't render video if we already know it will fail to load
+            if fileReady && !viewModel.frameLoadError {
+                FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                    SimpleVideoFrameView(videoInfo: videoInfo, debugContext: debugContext, forceReload: .init(
+                        get: { viewModel.forceVideoReload },
+                        set: { viewModel.forceVideoReload = $0 }
+                    ), onLoadFailed: {
+                        guard viewModel.currentTimelineFrame?.frame.id == frameID else { return }
+                        // Don't set frameNotReady=true for completed frames (processingStatus=2) or Rewind frames (-1)
+                        // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
+                        if processingStatus != 2 && processingStatus != -1 {
+                            viewModel.frameNotReady = true
+                            viewModel.frameLoadError = false
+                        } else {
+                            // For completed frames or Rewind frames, this is a real error
+                            viewModel.frameNotReady = false
+                            viewModel.frameLoadError = true
+                        }
+                    }, onLoadSuccess: {
+                        guard let frameID else { return }
+                        viewModel.markVideoPresentationReady(frameID: frameID)
+                        guard viewModel.currentTimelineFrame?.frame.id == frameID else { return }
+                        viewModel.frameNotReady = false
+                        viewModel.frameLoadError = false
+                    })
+                }
 	            } else {
 	                let _ = Log.warning("[FrameDisplay] Video file too small (no fragments yet) and not finalized, showing placeholder. Size=\(fileSize), isFinalized=\(videoInfo.isVideoFinalized)", category: .ui)
 	                // Video file not ready - show friendly message
@@ -1431,6 +1459,9 @@ struct SimpleVideoFrameView: NSViewRepresentable {
 
         // If same video and same frame, nothing to do
         if effectivePath == videoInfo.videoPath && effectiveFrameIdx == videoInfo.frameIndex {
+            DispatchQueue.main.async {
+                self.onLoadSuccess?()
+            }
             return
         }
 
@@ -1714,6 +1745,10 @@ class DoubleBufferedVideoView: NSView {
                 toleranceFrames: toleranceFrames,
                 debugContext: debugContext
             )
+
+            DispatchQueue.main.async {
+                self.onLoadSuccess?()
+            }
         }
     }
 
@@ -2872,7 +2907,7 @@ struct ZoomActionMenu: View {
     }
 
     private func getZoomedImage(completion: @escaping (NSImage?) -> Void) {
-        guard let fullImage = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.currentImage else {
+        guard let fullImage = (viewModel.isInLiveMode ? viewModel.liveScreenshot : nil) ?? viewModel.displayableCurrentImage else {
             completion(nil)
             return
         }
