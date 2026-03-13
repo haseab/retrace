@@ -62,6 +62,7 @@ public enum StorageError: RetraceError {
     case driveDisconnected(path: String)
     case driveSlowIO(latencyMs: Double)
     case walCheckpointFailed(retries: Int)
+    case walUnavailable(reason: String)
 
     public var errorCode: String {
         switch self {
@@ -77,6 +78,7 @@ public enum StorageError: RetraceError {
         case .driveDisconnected: return "STORAGE_010"
         case .driveSlowIO: return "STORAGE_011"
         case .walCheckpointFailed: return "STORAGE_012"
+        case .walUnavailable: return "STORAGE_013"
         }
     }
 
@@ -106,6 +108,8 @@ public enum StorageError: RetraceError {
             return "Storage I/O too slow: \(Int(latencyMs))ms write latency"
         case .walCheckpointFailed(let retries):
             return "Database checkpoint failed after \(retries) retries"
+        case .walUnavailable(let reason):
+            return "WAL unavailable: \(reason)"
         }
     }
 }

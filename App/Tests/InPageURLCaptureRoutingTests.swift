@@ -175,7 +175,7 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         let rewindConnection = SQLiteConnection(db: rewindPointer)
         let adapter = DataAdapter(
             retraceConnection: retraceConnection,
-            retraceConfig: .retrace,
+            retraceConfig: .retrace(),
             retraceImageExtractor: StubImageExtractor(),
             database: retraceDatabase
         )
@@ -451,5 +451,588 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertFalse(bundleIDs.contains("com.retrace.old"))
         XCTAssertTrue(bundleIDs.contains("com.retrace.new"))
         XCTAssertTrue(bundleIDs.contains("com.rewind.old"))
+    }
+}
+
+final class CrashRecoveryStartupTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        ServiceContainer(
+            databasePath: "file:app_crash_recovery_\(UUID().uuidString)?mode=memory&cache=shared",
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            )
+        )
+    }
+
+    private func makeCapturedFrame(timestamp: Date) -> CapturedFrame {
+        CapturedFrame(
+            timestamp: timestamp,
+            imageData: Data(repeating: 0xAB, count: 32 * 8),
+            width: 8,
+            height: 8,
+            bytesPerRow: 32,
+            metadata: FrameMetadata(
+                appBundleID: "com.apple.Safari",
+                appName: "Safari",
+                windowName: "Window",
+                browserURL: "https://example.com",
+                displayID: 1
+            )
+        )
+    }
+
+    func testPrepareForPipelineStartFailsWhenWALUnavailable() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryBlockedWAL_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: storageRoot.appendingPathComponent("chunks", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: storageRoot.appendingPathComponent("temp", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        FileManager.default.createFile(
+            atPath: storageRoot.appendingPathComponent("wal", isDirectory: false).path,
+            contents: Data("blocking-file".utf8)
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: storageRoot.path)
+
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: storageRoot.path)
+            try? FileManager.default.removeItem(at: storageRoot)
+        }
+
+        do {
+            try await services.initialize()
+
+            do {
+                try await coordinator.prepareForPipelineStart()
+                XCTFail("Expected WAL-unavailable preflight failure")
+            } catch let error as StorageError {
+                guard case .walUnavailable = error else {
+                    XCTFail("Expected walUnavailable, got \(error)")
+                    return
+                }
+            }
+
+            let walIssue = await services.storage.currentWALAvailabilityIssue()
+            XCTAssertNotNil(walIssue)
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testScheduleCrashRecoveryIfNeededCoalescesInFlightTask() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryCoalesce_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let walManager = await storageManager.getWALManager()
+            let database = await services.database
+            let timestamp = Date(timeIntervalSince1970: 1_740_100_000)
+
+            let sessionVideoID = VideoSegmentID(value: 707)
+            var session = try await walManager.createSession(videoID: sessionVideoID)
+            try await walManager.appendFrame(makeCapturedFrame(timestamp: timestamp), to: &session)
+
+            _ = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: sessionVideoID,
+                    startTime: timestamp,
+                    endTime: timestamp,
+                    frameCount: 1,
+                    fileSizeBytes: 123,
+                    relativePath: "chunks/202603/12/\(sessionVideoID.value)",
+                    width: 8,
+                    height: 8
+                )
+            )
+
+            let firstStarted = await coordinator.scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: true,
+                logFailures: false
+            )
+            let secondStarted = await coordinator.scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: true,
+                logFailures: false
+            )
+
+            XCTAssertTrue(firstStarted)
+            XCTAssertFalse(secondStarted)
+            let didRunRecovery = try await coordinator.awaitCrashRecoveryIfNeeded()
+            XCTAssertTrue(didRunRecovery)
+            let activeSessions = try await walManager.listActiveSessions()
+            XCTAssertTrue(activeSessions.isEmpty)
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            XCTAssertTrue(unfinalisedVideos.isEmpty)
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testFinalizeUnfinalisedVideoBeforeResumingUsesActualFrameCountAndCorrectWALRoot() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryResumeFinalize_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let database = await services.database
+            let walManager = await storageManager.getWALManager()
+            let timestamp = Date(timeIntervalSince1970: 1_740_200_000)
+
+            let writer = try await storageManager.createSegmentWriter()
+            try await writer.appendFrame(makeCapturedFrame(timestamp: timestamp))
+            let segment = try await writer.finalize()
+
+            let databaseVideoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: segment.id,
+                    startTime: segment.startTime,
+                    endTime: segment.endTime,
+                    frameCount: 99,
+                    fileSizeBytes: segment.fileSizeBytes,
+                    relativePath: segment.relativePath,
+                    width: segment.width,
+                    height: segment.height
+                )
+            )
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            let unfinalised = try XCTUnwrap(unfinalisedVideos.first(where: { $0.id == databaseVideoID }))
+
+            _ = try await walManager.createSession(videoID: segment.id)
+            let staleWALDir = storageRoot
+                .appendingPathComponent("wal", isDirectory: true)
+                .appendingPathComponent("active_segment_\(segment.id.value)", isDirectory: true)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: staleWALDir.path))
+
+            try await coordinator.finalizeUnfinalisedVideoBeforeResuming(unfinalised)
+
+            let finalizedVideoRecord = try await database.getVideoSegment(
+                id: VideoSegmentID(value: databaseVideoID)
+            )
+            let finalizedVideo = try XCTUnwrap(finalizedVideoRecord)
+            XCTAssertEqual(finalizedVideo.frameCount, segment.frameCount)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: staleWALDir.path))
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testShouldResumeUnfinalisedVideoReturnsFalseWhenActiveWALSessionStillExists() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoverySkipResume_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let database = await services.database
+            let timestamp = Date(timeIntervalSince1970: 1_740_250_000)
+
+            let writer = try await storageManager.createSegmentWriter()
+            let incrementalWriter = try XCTUnwrap(writer as? IncrementalSegmentWriter)
+            let pathVideoID = await writer.segmentID
+            let relativePath = await writer.relativePath
+            try await writer.appendFrame(makeCapturedFrame(timestamp: timestamp))
+            try await incrementalWriter.cancelPreservingRecoveryData()
+
+            let databaseVideoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: pathVideoID,
+                    startTime: timestamp,
+                    endTime: timestamp,
+                    frameCount: 1,
+                    fileSizeBytes: 123,
+                    relativePath: relativePath,
+                    width: 8,
+                    height: 8
+                )
+            )
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            let unfinalised = try XCTUnwrap(unfinalisedVideos.first(where: { $0.id == databaseVideoID }))
+
+            let segmentExists = try await storageManager.segmentExists(id: pathVideoID)
+            XCTAssertFalse(segmentExists)
+            let shouldResume = try await coordinator.shouldResumeUnfinalisedVideo(unfinalised)
+            XCTAssertFalse(shouldResume)
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testPrepareForPipelineStartRunsRecoveryAfterValidateRepairsWAL() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryRepairBeforePrepare_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+                try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: storageRoot.path)
+            }
+
+            try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: storageRoot.appendingPathComponent("chunks", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: storageRoot.appendingPathComponent("temp", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(
+                atPath: storageRoot.appendingPathComponent("wal", isDirectory: false).path,
+                contents: Data("blocking-file".utf8)
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: storageRoot.path)
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let initialWALIssue = await storageManager.currentWALAvailabilityIssue()
+            XCTAssertNotNil(initialWALIssue)
+
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: storageRoot.path)
+            try FileManager.default.removeItem(at: storageRoot.appendingPathComponent("wal", isDirectory: false))
+            try FileManager.default.createDirectory(
+                at: storageRoot.appendingPathComponent("wal", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+
+            let walManager = await storageManager.getWALManager()
+            let database = await services.database
+            let timestamp = Date(timeIntervalSince1970: 1_740_300_000)
+            let sessionVideoID = VideoSegmentID(value: 808)
+            var session = try await walManager.createSession(videoID: sessionVideoID)
+            try await walManager.appendFrame(makeCapturedFrame(timestamp: timestamp), to: &session)
+
+            _ = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: sessionVideoID,
+                    startTime: timestamp,
+                    endTime: timestamp,
+                    frameCount: 1,
+                    fileSizeBytes: 123,
+                    relativePath: "chunks/202603/12/\(sessionVideoID.value)",
+                    width: 8,
+                    height: 8
+                )
+            )
+
+            await services.onboardingManager.markOnboardingCompleted()
+            try await coordinator.prepareForPipelineStart()
+
+            let repairedWALIssue = await storageManager.currentWALAvailabilityIssue()
+            XCTAssertNil(repairedWALIssue)
+            let activeSessions = try await walManager.listActiveSessions()
+            XCTAssertTrue(activeSessions.isEmpty)
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            XCTAssertTrue(unfinalisedVideos.isEmpty)
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testCrashRecoveryStartupDoesNotFinalizeQuarantinedUnrecoverableVideo() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryStartupTests_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let walManager = await storageManager.getWALManager()
+            let database = await services.database
+            let configuredStorageRoot = await storageManager.getStorageDirectory()
+
+            XCTAssertEqual(
+                configuredStorageRoot.standardizedFileURL.path,
+                storageRoot.standardizedFileURL.path
+            )
+            let initialActiveSessions = try await walManager.listActiveSessions()
+            XCTAssertTrue(initialActiveSessions.isEmpty)
+
+            let sessionVideoID = VideoSegmentID(value: 606)
+            var session = try await walManager.createSession(videoID: sessionVideoID)
+            let timestamp = Date(timeIntervalSince1970: 1_740_000_200)
+            try await walManager.appendFrame(makeCapturedFrame(timestamp: timestamp), to: &session)
+
+            let fileHandle = try XCTUnwrap(FileHandle(forWritingAtPath: session.framesURL.path))
+            defer { try? fileHandle.close() }
+            try fileHandle.truncate(atOffset: 0)
+
+            let placeholderVideo = VideoSegment(
+                id: sessionVideoID,
+                startTime: timestamp,
+                endTime: timestamp,
+                frameCount: 1,
+                fileSizeBytes: 123,
+                relativePath: "chunks/202603/12/\(sessionVideoID.value)",
+                width: 8,
+                height: 8
+            )
+            let databaseVideoID = try await database.insertVideoSegment(placeholderVideo)
+
+            try await coordinator.runCrashRecoveryForTesting()
+
+            let recoveredVideo = try await database.getVideoSegment(id: VideoSegmentID(value: databaseVideoID))
+            XCTAssertNil(recoveredVideo)
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            XCTAssertTrue(unfinalisedVideos.isEmpty)
+            let activeSessions = try await walManager.listActiveSessions()
+            XCTAssertTrue(activeSessions.isEmpty)
+
+            try await coordinator.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await coordinator.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testResolveActiveDatabaseVideoIDsMatchesMP4RelativePaths() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryActiveWALPathMP4_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let database = await services.database
+            let timestamp = Date(timeIntervalSince1970: 1_740_400_000)
+            let pathVideoID = VideoSegmentID(value: 9_876)
+            let databaseVideoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: pathVideoID,
+                    startTime: timestamp,
+                    endTime: timestamp,
+                    frameCount: 0,
+                    fileSizeBytes: 0,
+                    relativePath: "chunks/202603/12/\(pathVideoID.value).mp4",
+                    width: 8,
+                    height: 8
+                )
+            )
+
+            let activeVideoIDs = try await coordinator.resolveActiveDatabaseVideoIDs(
+                from: [
+                    WALSession(
+                        videoID: pathVideoID,
+                        sessionDir: storageRoot.appendingPathComponent("wal/active_segment_\(pathVideoID.value)", isDirectory: true),
+                        framesURL: storageRoot.appendingPathComponent("wal/active_segment_\(pathVideoID.value)/frames.bin"),
+                        metadata: WALMetadata(
+                            videoID: pathVideoID,
+                            startTime: timestamp,
+                            frameCount: 0,
+                            width: 8,
+                            height: 8,
+                            durableReadableFrameCount: 0,
+                            durableVideoFileSizeBytes: 0
+                        )
+                    )
+                ]
+            )
+
+            XCTAssertEqual(activeVideoIDs, Set([databaseVideoID]))
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
+    func testServiceContainerDataAdapterUsesConfiguredStorageRootForVideoPaths() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ServiceContainerStorageRootTests_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let database = await services.database
+            let adapterReference = await services.dataAdapter
+            let adapter = try XCTUnwrap(adapterReference)
+            let timestamp = Date(timeIntervalSince1970: 1_741_700_123)
+            let insertedVideoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: VideoSegmentID(value: 0),
+                    startTime: timestamp,
+                    endTime: timestamp.addingTimeInterval(60),
+                    frameCount: 1,
+                    fileSizeBytes: 1024,
+                    relativePath: "chunks/202603/12/9876.mp4",
+                    width: 1920,
+                    height: 1080,
+                    source: .native
+                )
+            )
+            let segmentID = try await database.insertSegment(
+                bundleID: "com.apple.Safari",
+                startDate: timestamp,
+                endDate: timestamp.addingTimeInterval(60),
+                windowName: "Window",
+                browserUrl: "https://example.com",
+                type: 0
+            )
+            let frameID = try await database.insertFrame(
+                FrameReference(
+                    id: FrameID(value: 0),
+                    timestamp: timestamp,
+                    segmentID: AppSegmentID(value: segmentID),
+                    videoID: VideoSegmentID(value: insertedVideoID),
+                    frameIndexInSegment: 0,
+                    encodingStatus: .success,
+                    metadata: .empty,
+                    source: .native
+                )
+            )
+
+            let frameWithVideoInfo = try await adapter.getFrameWithVideoInfoByID(
+                id: FrameID(value: frameID)
+            )
+            let frame = try XCTUnwrap(frameWithVideoInfo)
+            let videoInfo = try XCTUnwrap(frame.videoInfo)
+
+            XCTAssertEqual(
+                videoInfo.videoPath,
+                storageRoot.appendingPathComponent("chunks/202603/12/9876.mp4").path
+            )
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
     }
 }

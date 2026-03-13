@@ -177,6 +177,57 @@ public struct DashboardView: View {
                 .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
             }
 
+            if let storageHealthBanner = viewModel.storageHealthBanner {
+                StorageHealthBanner(
+                    state: storageHealthBanner,
+                    onDismiss: {
+                        viewModel.dismissStorageHealthBanner()
+                    }
+                )
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(
+                    .top,
+                    (viewModel.showAccessibilityWarning
+                        || viewModel.showScreenRecordingWarning
+                        || launchOnLoginReminderManager.shouldShowReminder) ? 12 : 20
+                )
+            }
+
+            if let recentWALFailureCrash = viewModel.recentWALFailureCrash {
+                WALFailureCrashBanner(
+                    report: recentWALFailureCrash,
+                    onSubmitBugReport: {
+                        presentFeedbackSheet(
+                            launchContext: DashboardViewModel.makeWALFailureFeedbackLaunchContext(
+                                for: recentWALFailureCrash
+                            )
+                        )
+                    },
+                    onDetails: {
+                        viewModel.recordRecentWALFailureCrashDetailsOpened()
+                        NSWorkspace.shared.selectFile(
+                            recentWALFailureCrash.fileURL.path,
+                            inFileViewerRootedAtPath: recentWALFailureCrash.fileURL.deletingLastPathComponent().path
+                        )
+                    },
+                    onDismiss: {
+                        viewModel.dismissRecentWALFailureCrash()
+                    }
+                )
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(
+                    .top,
+                    (viewModel.showAccessibilityWarning
+                        || viewModel.showScreenRecordingWarning
+                        || launchOnLoginReminderManager.shouldShowReminder
+                        || viewModel.storageHealthBanner != nil) ? 12 : 20
+                )
+            }
+
             if let recentCrashReport = viewModel.recentCrashReport {
                 CrashReportBanner(
                     report: recentCrashReport,
@@ -205,7 +256,9 @@ public struct DashboardView: View {
                     .top,
                     (viewModel.showAccessibilityWarning
                         || viewModel.showScreenRecordingWarning
-                        || launchOnLoginReminderManager.shouldShowReminder) ? 12 : 20
+                        || launchOnLoginReminderManager.shouldShowReminder
+                        || viewModel.storageHealthBanner != nil
+                        || viewModel.recentWALFailureCrash != nil) ? 12 : 20
                 )
             }
 
@@ -1452,6 +1505,27 @@ public struct DashboardView: View {
                     Button("Show Launch on Login Banner") {
                         launchOnLoginReminderManager.shouldShowReminder = true
                     }
+                    Button("Show Low Storage Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .warning,
+                            availableGB: 4.25,
+                            shouldStop: false
+                        )
+                    }
+                    Button("Show Critical Storage Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .critical,
+                            availableGB: 1.10,
+                            shouldStop: false
+                        )
+                    }
+                    Button("Show Storage Stop Banner") {
+                        viewModel.showDebugStorageHealthBanner(
+                            severity: .critical,
+                            availableGB: 0.28,
+                            shouldStop: true
+                        )
+                    }
                     Divider()
                     Menu("Set Color Theme") {
                         Button("Blue") {
@@ -1546,6 +1620,8 @@ public struct DashboardView: View {
         feedbackPresentationID = UUID()
         if launchContext?.source == .crashBanner {
             viewModel.recordRecentCrashReportFeedbackOpened()
+        } else if launchContext?.source == .walFailureCrashBanner {
+            viewModel.recordRecentWALFailureCrashFeedbackOpened()
         }
         showFeedbackSheet = true
     }
@@ -1627,6 +1703,119 @@ private struct CrashReportBanner: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct WALFailureCrashBanner: View {
+    let report: WALFailureCrashReportSummary
+    let onSubmitBugReport: () -> Void
+    let onDetails: () -> Void
+    let onDismiss: () -> Void
+
+    private var messageText: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return "Retrace could not initialize the WAL at \(formatter.string(from: report.capturedAt)). Startup recovery was skipped, and new WAL sessions may fail until storage is repaired."
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                Button("Details", action: onDetails)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white.opacity(0.92))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .buttonStyle(.plain)
+
+                Button("Submit Bug Report", action: onSubmitBugReport)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct StorageHealthBanner: View {
+    let state: StorageHealthBannerState
+    let onDismiss: () -> Void
+
+    private var accentColor: Color {
+        state.shouldStop ? .red : .orange
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: state.shouldStop ? "externaldrive.fill.badge.xmark" : "externaldrive.badge.exclamationmark")
+                .foregroundColor(accentColor)
+                .font(.retraceTitle3)
+
+            Text(state.messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            (state.shouldStop ? Color.red : Color.orange).opacity(0.16)
+        )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(accentColor.opacity(0.28), lineWidth: 1)
         )
     }
 }

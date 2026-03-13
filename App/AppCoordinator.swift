@@ -244,6 +244,11 @@ public actor AppCoordinator {
     // Storage health notifications (volume mount, used to trigger cache validation)
     private var storageHealthObserverTokens: [NSObjectProtocol] = []
 
+    // Crash recovery can start in the background during launch, but capture start
+    // must join the same task so recovery and live writes never overlap.
+    private var crashRecoveryTask: Task<Bool, Error>?
+    private var hasCompletedCrashRecoverySinceLaunch = false
+
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
     private static let pipelineMemoryLogInterval: TimeInterval = 5.0
@@ -309,13 +314,16 @@ public actor AppCoordinator {
         Log.info("Initializing AppCoordinator...", category: .app)
         try await services.initialize()
 
-        // Run crash recovery from WAL in background (non-blocking)
-        Task {
-            do {
-                try await recoverFromCrash()
-            } catch {
-                Log.error("[AppCoordinator] Background crash recovery failed", category: .app, error: error)
-            }
+        if await services.storage.isWALReady() {
+            _ = scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: false,
+                logFailures: true
+            )
+        } else {
+            Log.warning(
+                "[AppCoordinator] Skipping crash recovery because WAL storage is currently unavailable",
+                category: .app
+            )
         }
 
         Log.info("AppCoordinator initialized successfully", category: .app)
@@ -331,13 +339,92 @@ public actor AppCoordinator {
         Log.info("Auto-start recording check: shouldAutoStartRecording=\(shouldAutoStart)", category: .app)
     }
 
-    /// Recover frames from write-ahead log (WAL) after a crash
-    private func recoverFromCrash() async throws {
+    func runCrashRecoveryForTesting() async throws {
+        _ = scheduleCrashRecoveryIfNeeded(
+            skipOnboardingCheck: true,
+            logFailures: false
+        )
+        _ = try await awaitCrashRecoveryIfNeeded()
+    }
+
+    @discardableResult
+    func scheduleCrashRecoveryIfNeeded(
+        skipOnboardingCheck: Bool,
+        logFailures: Bool
+    ) -> Bool {
+        guard crashRecoveryTask == nil else {
+            return false
+        }
+
+        let task = Task { [self] in
+            try await performCrashRecovery(skipOnboardingCheck: skipOnboardingCheck)
+        }
+        crashRecoveryTask = task
+
+        if logFailures {
+            Task {
+                do {
+                    _ = try await task.value
+                } catch {
+                    Log.error("[AppCoordinator] Background crash recovery failed", category: .app, error: error)
+                }
+            }
+        }
+
+        return true
+    }
+
+    @discardableResult
+    func awaitCrashRecoveryIfNeeded() async throws -> Bool {
+        guard let task = crashRecoveryTask else {
+            return hasCompletedCrashRecoverySinceLaunch
+        }
+
+        defer {
+            crashRecoveryTask = nil
+        }
+
+        let didRun = try await task.value
+        if didRun {
+            hasCompletedCrashRecoverySinceLaunch = true
+        }
+        return didRun
+    }
+
+    func prepareForPipelineStart() async throws {
+        try await services.storage.validateCaptureReadiness()
+        try await runCrashRecoveryBeforePipelineStartIfNeeded()
+    }
+
+    private func runCrashRecoveryBeforePipelineStartIfNeeded() async throws {
+        guard !hasCompletedCrashRecoverySinceLaunch, await services.storage.isWALReady() else {
+            return
+        }
+
+        _ = scheduleCrashRecoveryIfNeeded(
+            skipOnboardingCheck: false,
+            logFailures: true
+        )
+        let didRunRecovery = try await awaitCrashRecoveryIfNeeded()
+
+        if !didRunRecovery, !hasCompletedCrashRecoverySinceLaunch, await services.storage.isWALReady() {
+            _ = scheduleCrashRecoveryIfNeeded(
+                skipOnboardingCheck: false,
+                logFailures: true
+            )
+            _ = try await awaitCrashRecoveryIfNeeded()
+        }
+    }
+
+    private func performCrashRecovery(skipOnboardingCheck: Bool) async throws -> Bool {
         // Skip crash recovery during first launch (onboarding) - there's nothing to recover
         // and the database may not be fully ready yet
-        guard await services.onboardingManager.hasCompletedOnboarding else {
-            Log.info("Skipping crash recovery during onboarding (first launch)", category: .app)
-            return
+        if !skipOnboardingCheck {
+            let hasCompletedOnboarding = await services.onboardingManager.hasCompletedOnboarding
+            guard hasCompletedOnboarding else {
+                Log.info("Skipping crash recovery during onboarding (first launch)", category: .app)
+                return false
+            }
         }
 
         Log.info("Checking for crash recovery...", category: .app)
@@ -345,7 +432,7 @@ public actor AppCoordinator {
         // Cast to concrete StorageManager to access WAL
         guard let storageManager = services.storage as? StorageManager else {
             Log.warning("Storage not using WAL-enabled StorageManager, skipping recovery", category: .app)
-            return
+            return false
         }
 
         let walManager = await storageManager.getWALManager()
@@ -396,6 +483,7 @@ public actor AppCoordinator {
         // Re-enqueue orphaned frames (processingStatus=0 but not in queue)
         // These are frames that were captured but never enqueued due to app restart
         await reEnqueueOrphanedFrames()
+        return true
     }
 
     /// Re-enqueue frames that have processingStatus=0 but are not in the processing queue
@@ -494,7 +582,11 @@ public actor AppCoordinator {
 
         Log.info("Starting capture pipeline...", category: .app)
 
-        // Check permissions first
+        // Join any in-flight crash recovery and ensure WAL writes are available
+        // before we start capture.
+        try await prepareForPipelineStart()
+
+        // Check permissions before starting capture
         guard await services.capture.hasPermission() else {
             Log.error("Screen recording permission not granted", category: .app)
             throw AppError.permissionDenied(permission: "screen recording")
@@ -535,8 +627,9 @@ public actor AppCoordinator {
 
         // Start unified storage health monitoring (disk space, I/O latency, volume events, keep-alive)
         startStorageHealthNotifications()
+        let storageRoot = await services.storage.getStorageDirectory().path
         StorageHealthMonitor.shared.startMonitoring(
-            storagePath: AppPaths.expandedStorageRoot,
+            storagePath: storageRoot,
             onCriticalError: { [weak self] in
                 await self?.handleStorageCriticalError()
             }
@@ -886,7 +979,7 @@ public actor AppCoordinator {
 
     /// Map active WAL session path IDs to active DB video IDs.
     /// WAL sessions are keyed by timestamp-based path IDs, while `video.id` is DB autoincrement.
-    private func resolveActiveDatabaseVideoIDs(from activeWALSessions: [WALSession]) async throws -> Set<Int64> {
+    func resolveActiveDatabaseVideoIDs(from activeWALSessions: [WALSession]) async throws -> Set<Int64> {
         guard !activeWALSessions.isEmpty else { return [] }
 
         let activeWALPathIDs = Set(activeWALSessions.map { $0.videoID.value })
@@ -896,8 +989,7 @@ public actor AppCoordinator {
         var matchedWALPathIDs: Set<Int64> = []
 
         for video in unfinalisedVideos {
-            let pathIDString = URL(fileURLWithPath: video.relativePath).lastPathComponent
-            guard let pathID = Int64(pathIDString) else { continue }
+            guard let pathID = pathVideoID(for: video.relativePath)?.value else { continue }
             if activeWALPathIDs.contains(pathID) {
                 activeDBVideoIDs.insert(video.id)
                 matchedWALPathIDs.insert(pathID)
@@ -935,6 +1027,7 @@ public actor AppCoordinator {
         var videoDBID: Int64
         var frameCount: Int
         var isReadable: Bool
+        var persistedReadableFrameCount: Int
         /// Buffer for frames waiting to be confirmed flushed to disk before marking readable
         var pendingFrames: [BufferedFrame]
         var width: Int
@@ -1011,7 +1104,7 @@ public actor AppCoordinator {
                     if let unfinalised = try await services.database.getUnfinalisedVideoByResolution(
                         width: frame.width,
                         height: frame.height
-                    ) {
+                    ), try await shouldResumeUnfinalisedVideo(unfinalised) {
                         Log.info("Resuming unfinalised video \(unfinalised.id) for resolution \(resolutionKey)", category: .app)
                         writerState = try await resumeWriterState(from: unfinalised)
                     } else {
@@ -1027,7 +1120,7 @@ public actor AppCoordinator {
                 let actualEncoderFrameCount = await writerState.writer.frameCount
                 if actualEncoderFrameCount != writerState.frameCount + 1 {
                     Log.error("[ENCODER-MISMATCH] Encoder frame count (\(actualEncoderFrameCount)) != expected (\(writerState.frameCount + 1)) - encoder may have failed/finalized. Removing broken writer for videoDBID=\(writerState.videoDBID), resolution=\(resolutionKey)", category: .app)
-                    try? await writerState.writer.cancel()
+                    await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
                     writersByResolution.removeValue(forKey: resolutionKey)
                     continue
                 }
@@ -1129,6 +1222,32 @@ public actor AppCoordinator {
                     try await processingQueue.enqueue(frameID: frameToEnqueue.frameID)
                 }
 
+                if flushedCount > writerState.persistedReadableFrameCount {
+                    let storageManager = services.storage
+                    let walVideoID = await writerState.writer.segmentID
+                    let walManager = await storageManager.getWALManager()
+                    let durableFileSizeBytes: Int64
+                    if let incrementalWriter = writerState.writer as? IncrementalSegmentWriter {
+                        durableFileSizeBytes = await incrementalWriter.durableFileSizeBytes
+                    } else {
+                        durableFileSizeBytes = await writerState.writer.currentFileSize
+                    }
+
+                    do {
+                        try await walManager.updateDurableVideoState(
+                            videoID: walVideoID,
+                            readableFrameCount: flushedCount,
+                            durableVideoFileSizeBytes: durableFileSizeBytes
+                        )
+                        writerState.persistedReadableFrameCount = flushedCount
+                    } catch {
+                        Log.warning(
+                            "[WAL] Failed to persist durable video frontier for video \(walVideoID.value) at flushedCount=\(flushedCount): \(error)",
+                            category: .app
+                        )
+                    }
+                }
+
                 writersByResolution[resolutionKey] = writerState
                 maybeLogPipelineMemory(reason: "steady-state")
                 totalFramesProcessed += 1
@@ -1143,12 +1262,25 @@ public actor AppCoordinator {
                 statusHolder.incrementErrors()
                 Log.error("[Pipeline] Error processing frame", category: .app, error: error)
 
+                if case .insufficientDiskSpace = error {
+                    Task { @MainActor in
+                        NotificationCenter.default.post(
+                            name: .storageCriticalLow,
+                            object: ["availableGB": 0.0, "shouldStop": true]
+                        )
+                    }
+                    Task { [weak self] in
+                        await self?.handleStorageCriticalError()
+                    }
+                    continue
+                }
+
                 // If it's a file write failure, the writer is broken - remove it so a fresh one is created
                 if case .fileWriteFailed = error {
                     let resolutionKey = "\(frame.width)x\(frame.height)"
                     if let brokenWriter = writersByResolution[resolutionKey] {
                         Log.warning("Removing broken writer for \(resolutionKey) due to write failure - will create fresh writer", category: .app)
-                        try? await brokenWriter.writer.cancel()
+                        await cancelBrokenWriterPreservingRecoveryData(brokenWriter.writer)
                         writersByResolution.removeValue(forKey: resolutionKey)
                     }
                 }
@@ -1237,42 +1369,24 @@ public actor AppCoordinator {
             videoDBID: videoDBID,
             frameCount: 0,
             isReadable: false,
+            persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: width,
             height: height
         )
     }
 
+    private func cancelBrokenWriterPreservingRecoveryData(_ writer: SegmentWriter) async {
+        if let incrementalWriter = writer as? IncrementalSegmentWriter {
+            try? await incrementalWriter.cancelPreservingRecoveryData()
+        } else {
+            try? await writer.cancel()
+        }
+    }
+
     private func resumeWriterState(from unfinalised: UnfinalisedVideo) async throws -> VideoWriterState {
         let writer = try await services.storage.createSegmentWriter()
-
-        // Get file size from filesystem for the old video
-        let storageDir = await services.storage.getStorageDirectory()
-        let oldVideoPath = storageDir.appendingPathComponent(unfinalised.relativePath).appendingPathExtension("mp4")
-        let fileSize: Int64
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path),
-           let size = attrs[.size] as? Int64 {
-            fileSize = size
-        } else {
-            fileSize = 0
-        }
-
-        // Clean up WAL session for the old unfinalised video (frames are already in the video file)
-        // The WAL directory is named with the segment timestampID (from relativePath), not the database ID
-        // relativePath format: "chunks/YYYYMM/DD/{timestampID}" - extract the timestampID from the last component
-        let timestampID = URL(fileURLWithPath: unfinalised.relativePath).lastPathComponent
-        let walDir = storageDir.deletingLastPathComponent().appendingPathComponent("wal")
-            .appendingPathComponent("active_segment_\(timestampID)")
-        if FileManager.default.fileExists(atPath: walDir.path) {
-            try? FileManager.default.removeItem(at: walDir)
-            Log.info("Cleaned up WAL session for unfinalised video \(unfinalised.id) (timestampID: \(timestampID))", category: .app)
-        }
-
-        // Mark old video as finalized and start fresh
-        // WARNING: This uses the frameCount from the database, which may differ from actual video file frames
-        // if the app crashed before database was updated
-        try await services.database.markVideoFinalized(id: unfinalised.id, frameCount: unfinalised.frameCount, fileSize: fileSize)
-        Log.warning("[RESUME-DEBUG] Marked unfinalised video \(unfinalised.id) as finalized with DB frameCount=\(unfinalised.frameCount), fileSize=\(fileSize) bytes - NOTE: actual video frames may differ if app crashed!", category: .app)
+        try await finalizeUnfinalisedVideoBeforeResuming(unfinalised)
 
         let relativePath = await writer.relativePath
         let placeholderSegment = VideoSegment(
@@ -1292,9 +1406,143 @@ public actor AppCoordinator {
             videoDBID: videoDBID,
             frameCount: 0,
             isReadable: false,
+            persistedReadableFrameCount: 0,
             pendingFrames: [],
             width: unfinalised.width,
             height: unfinalised.height
+        )
+    }
+
+    func shouldResumeUnfinalisedVideo(_ unfinalised: UnfinalisedVideo) async throws -> Bool {
+        if let pathVideoID = pathVideoID(for: unfinalised.relativePath) {
+            let walManager = await services.storage.getWALManager()
+            let activeSessions = try await walManager.listActiveSessions()
+            if activeSessions.contains(where: { $0.videoID == pathVideoID }) {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because an active WAL session still exists",
+                    category: .app
+                )
+                return false
+            }
+
+            if !(try await services.storage.segmentExists(id: pathVideoID)) {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) because segment file \(pathVideoID.value) is missing",
+                    category: .app
+                )
+                return false
+            }
+
+            return true
+        }
+
+        let resolvedPath = try await resolvedPathForUnfinalisedVideo(
+            unfinalised,
+            pathVideoID: nil
+        )
+        let exists = FileManager.default.fileExists(atPath: resolvedPath.path)
+        if !exists {
+            Log.warning(
+                "[WAL] Skipping resume of unfinalised video \(unfinalised.id) because backing file is missing at \(resolvedPath.path)",
+                category: .app
+            )
+        }
+        return exists
+    }
+
+    func finalizeUnfinalisedVideoBeforeResuming(_ unfinalised: UnfinalisedVideo) async throws {
+        let pathVideoID = pathVideoID(for: unfinalised.relativePath)
+        let oldVideoPath = try await resolvedPathForUnfinalisedVideo(
+            unfinalised,
+            pathVideoID: pathVideoID
+        )
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path)[.size] as? Int64) ?? 0
+
+        if let pathVideoID {
+            try await finalizeStaleWALSessionIfPresent(pathVideoID: pathVideoID)
+        }
+
+        let finalizedFrameCount: Int
+        if let pathVideoID {
+            finalizedFrameCount = try await services.storage.countFramesInSegment(id: pathVideoID)
+        } else {
+            finalizedFrameCount = unfinalised.frameCount
+        }
+
+        if let pathVideoID, finalizedFrameCount != unfinalised.frameCount {
+            Log.warning(
+                "[RESUME-DEBUG] Finalizing unfinalised video \(unfinalised.id) using actual readable frameCount=\(finalizedFrameCount) from path video \(pathVideoID.value) instead of stale DB frameCount=\(unfinalised.frameCount)",
+                category: .app
+            )
+        }
+
+        try await services.database.markVideoFinalized(
+            id: unfinalised.id,
+            frameCount: finalizedFrameCount,
+            fileSize: fileSize
+        )
+    }
+
+    private func pathVideoID(for relativePath: String) -> VideoSegmentID? {
+        let stem = URL(fileURLWithPath: relativePath)
+            .deletingPathExtension()
+            .lastPathComponent
+        guard let value = Int64(stem) else {
+            return nil
+        }
+        return VideoSegmentID(value: value)
+    }
+
+    private func resolvedPathForUnfinalisedVideo(
+        _ unfinalised: UnfinalisedVideo,
+        pathVideoID: VideoSegmentID?
+    ) async throws -> URL {
+        if let pathVideoID {
+            return try await services.storage.getSegmentPath(id: pathVideoID)
+        }
+
+        let storageDir = await services.storage.getStorageDirectory()
+        let directPath = storageDir.appendingPathComponent(unfinalised.relativePath)
+        if FileManager.default.fileExists(atPath: directPath.path) {
+            return directPath
+        }
+
+        return directPath.appendingPathExtension("mp4")
+    }
+
+    private func finalizeStaleWALSessionIfPresent(pathVideoID: VideoSegmentID) async throws {
+        guard let storageManager = services.storage as? StorageManager else {
+            return
+        }
+
+        let walManager = await storageManager.getWALManager()
+        let storageDir = await services.storage.getStorageDirectory()
+        let walDir = storageDir
+            .appendingPathComponent("wal", isDirectory: true)
+            .appendingPathComponent("active_segment_\(pathVideoID.value)", isDirectory: true)
+
+        guard FileManager.default.fileExists(atPath: walDir.path) else {
+            return
+        }
+
+        let session = WALSession(
+            videoID: pathVideoID,
+            sessionDir: walDir,
+            framesURL: walDir.appendingPathComponent("frames.bin"),
+            metadata: WALMetadata(
+                videoID: pathVideoID,
+                startTime: .distantPast,
+                frameCount: 0,
+                width: 0,
+                height: 0,
+                durableReadableFrameCount: 0,
+                durableVideoFileSizeBytes: 0
+            )
+        )
+        try await walManager.finalizeSession(session)
+        Log.info(
+            "Cleaned up WAL session for unfinalised video \(pathVideoID.value)",
+            category: .app
         )
     }
 
@@ -3599,10 +3847,30 @@ public struct OCRProcessingStatus: Sendable, Equatable {
 
 public enum AppError: Error {
     case permissionDenied(permission: String)
+    case storageUnavailable(reason: String)
     case notInitialized
     case alreadyRunning
     case notRunning
     case processingQueueNotAvailable
+}
+
+extension AppError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .permissionDenied(let permission):
+            return "Missing required permission: \(permission)."
+        case .storageUnavailable(let reason):
+            return "Storage is unavailable: \(reason)"
+        case .notInitialized:
+            return "Retrace is not initialized yet."
+        case .alreadyRunning:
+            return "Recording is already running."
+        case .notRunning:
+            return "Recording is not running."
+        case .processingQueueNotAvailable:
+            return "The processing queue is not available."
+        }
+    }
 }
 
 // MARK: - Migration Delegate

@@ -30,6 +30,7 @@ public actor HEVCEncoder {
     // Track how many frames have been confirmed flushed to disk
     // This is updated when a fragment write is detected (file size increase > 1KB)
     private var flushedFrameCount: Int = 0
+    private var lastDurableFileSizeBytes: Int64 = 0
 
     public init() {}
 
@@ -179,6 +180,7 @@ public actor HEVCEncoder {
         self.fragmentCount = 0
         self.lastLoggedFileSize = 0
         self.flushedFrameCount = 0
+        self.lastDurableFileSizeBytes = 0
 
         Log.info("Video encoder initialized with movieFragmentInterval=0.1s (frames readable after ~3 captures)", category: .storage)
     }
@@ -249,6 +251,7 @@ public actor HEVCEncoder {
                 // To be safe, only mark frames up to frameCount-2 as flushed
                 // This means indices 0 to frameCount-3 are readable (< frameCount-2)
                 flushedFrameCount = max(0, frameCount - 2)
+                lastDurableFileSizeBytes = max(lastDurableFileSizeBytes, currentSize)
                 Log.info("📦 Fragment \(fragmentCount) written: +\(sizeIncrease / 1024)KB (total: \(currentSize / 1024)KB, \(flushedFrameCount) frames flushed, video time: \(String(format: "%.1f", timestamp.seconds))s) - frames now readable!", category: .storage)
                 lastLoggedFileSize = currentSize
             } else if lastLoggedFileSize == 0 && currentSize > 0 {
@@ -304,6 +307,8 @@ public actor HEVCEncoder {
         isFinalized = false
         fragmentCount = 0
         lastLoggedFileSize = 0
+        flushedFrameCount = 0
+        lastDurableFileSizeBytes = 0
 
         // Reinitialize with same parameters
         try initialize(width: initWidth, height: initHeight, config: config, outputURL: url, segmentStartTime: startTime)
@@ -324,6 +329,11 @@ public actor HEVCEncoder {
         adaptor = nil
         isFinalized = false
         isUsingHardwareAcceleration = false
+        frameCount = 0
+        fragmentCount = 0
+        lastLoggedFileSize = 0
+        flushedFrameCount = 0
+        lastDurableFileSizeBytes = 0
         if let url = outputURL {
             try? FileManager.default.removeItem(at: url)
         }
@@ -346,5 +356,10 @@ public actor HEVCEncoder {
     /// Frames with index < this value are guaranteed to be readable from the video file
     public func framesFlushedToDisk() -> Int {
         return flushedFrameCount
+    }
+
+    /// Returns the on-disk file size at the last known durable fragment boundary.
+    public func durableFileSizeBytes() -> Int64 {
+        return lastDurableFileSizeBytes
     }
 }

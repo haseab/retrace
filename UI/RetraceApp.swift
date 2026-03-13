@@ -733,6 +733,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Let them pick again
             return await browseForDatabaseFolder(startingAt: directory)
 
+        case .unwritableFolder(let error):
+            let alert = NSAlert()
+            alert.messageText = "Folder Not Writable"
+            alert.informativeText = error
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+
+            // Let them pick again
+            return await browseForDatabaseFolder(startingAt: directory)
+
         case .invalidDatabase(let error):
             let alert = NSAlert()
             alert.messageText = "Invalid Retrace Database"
@@ -750,6 +761,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case valid
         case missingChunks
         case invalidFolder
+        case unwritableFolder(error: String)
         case invalidDatabase(error: String)
     }
 
@@ -771,12 +783,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard verification.isValid else {
                 return .invalidDatabase(error: verification.error ?? "The selected folder contains a retrace.db file that is not a valid Retrace database.")
             }
+
+            if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+                return .unwritableFolder(error: writeProbeFailure)
+            }
             return hasChunks ? .valid : .missingChunks
         }
 
         let contents = (try? fm.contentsOfDirectory(atPath: selectedPath)) ?? []
         let visibleContents = contents.filter { !$0.hasPrefix(".") }
-        return visibleContents.isEmpty ? .valid : .invalidFolder
+        guard visibleContents.isEmpty else {
+            return .invalidFolder
+        }
+
+        if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+            return .unwritableFolder(error: writeProbeFailure)
+        }
+
+        return .valid
+    }
+
+    nonisolated private static func probeRetraceFolderWriteAccess(at selectedPath: String) -> String? {
+        let probeURL = URL(fileURLWithPath: selectedPath, isDirectory: true)
+            .appendingPathComponent(".retrace-write-probe-\(UUID().uuidString)")
+        let probeData = Data("retrace-write-probe".utf8)
+
+        do {
+            try probeData.write(to: probeURL, options: .atomic)
+            try FileManager.default.removeItem(at: probeURL)
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: probeURL)
+            return "The selected folder is not writable by Retrace.\n\nChoose a folder where Retrace can create and remove files.\n\nUnderlying error: \(error.localizedDescription)"
+        }
     }
 
     /// Verifies that a file is a valid Retrace database (unencrypted SQLite with expected tables)

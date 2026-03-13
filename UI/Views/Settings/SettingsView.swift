@@ -6324,6 +6324,13 @@ extension SettingsView {
                 )
             }
 
+            if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+                return .invalid(
+                    title: "Folder Not Writable",
+                    message: writeProbeFailure
+                )
+            }
+
             return hasChunks ? .valid : .missingChunks
         }
 
@@ -6336,7 +6343,29 @@ extension SettingsView {
             )
         }
 
+        if let writeProbeFailure = probeRetraceFolderWriteAccess(at: selectedPath) {
+            return .invalid(
+                title: "Folder Not Writable",
+                message: writeProbeFailure
+            )
+        }
+
         return .valid
+    }
+
+    nonisolated private static func probeRetraceFolderWriteAccess(at selectedPath: String) -> String? {
+        let probeURL = URL(fileURLWithPath: selectedPath, isDirectory: true)
+            .appendingPathComponent(".retrace-write-probe-\(UUID().uuidString)")
+        let probeData = Data("retrace-write-probe".utf8)
+
+        do {
+            try probeData.write(to: probeURL, options: .atomic)
+            try FileManager.default.removeItem(at: probeURL)
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: probeURL)
+            return "The selected folder is not writable by Retrace.\n\nChoose a folder where Retrace can create and remove files.\n\nUnderlying error: \(error.localizedDescription)"
+        }
     }
 
     private func validateRewindFolderSelection(at selectedPath: String) async -> RewindFolderValidationOutcome {

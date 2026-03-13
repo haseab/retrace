@@ -1398,7 +1398,13 @@ enum FrameQueries {
     // MARK: - Optimized Queries with Video Info (Rewind-inspired)
 
     /// Get frames with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getByTimeRangeWithVideoInfo(db: OpaquePointer, from startDate: Date, to endDate: Date, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getByTimeRangeWithVideoInfo(
+        db: OpaquePointer,
+        from startDate: Date,
+        to endDate: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT
                 f.id,
@@ -1444,7 +1450,10 @@ enum FrameQueries {
 
         var results: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -1452,7 +1461,11 @@ enum FrameQueries {
     }
 
     /// Get most recent frames with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getMostRecentWithVideoInfo(db: OpaquePointer, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getMostRecentWithVideoInfo(
+        db: OpaquePointer,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
@@ -1485,7 +1498,10 @@ enum FrameQueries {
 
         var results: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -1493,7 +1509,12 @@ enum FrameQueries {
     }
 
     /// Get frames before timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getBeforeWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getBeforeWithVideoInfo(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
@@ -1525,7 +1546,10 @@ enum FrameQueries {
 
         var results: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -1533,7 +1557,12 @@ enum FrameQueries {
     }
 
     /// Get frames after timestamp with video info in a single JOIN query (optimized, inspired by Rewind)
-    static func getAfterWithVideoInfo(db: OpaquePointer, timestamp: Date, limit: Int) throws -> [FrameWithVideoInfo] {
+    static func getAfterWithVideoInfo(
+        db: OpaquePointer,
+        timestamp: Date,
+        limit: Int,
+        storageRoot: String
+    ) throws -> [FrameWithVideoInfo] {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
@@ -1565,7 +1594,10 @@ enum FrameQueries {
 
         var results: [FrameWithVideoInfo] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(statement: statement!)
+            let frameWithVideoInfo = try parseFrameWithVideoInfoRow(
+                statement: statement!,
+                storageRoot: storageRoot
+            )
             results.append(frameWithVideoInfo)
         }
 
@@ -1573,7 +1605,11 @@ enum FrameQueries {
     }
 
     /// Get a single frame by ID with video info (optimized - single query with JOINs)
-    static func getByIDWithVideoInfo(db: OpaquePointer, id: FrameID) throws -> FrameWithVideoInfo? {
+    static func getByIDWithVideoInfo(
+        db: OpaquePointer,
+        id: FrameID,
+        storageRoot: String
+    ) throws -> FrameWithVideoInfo? {
         let sql = """
             SELECT f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus, f.redactionReason,
                    s.bundleID, s.windowName,
@@ -1600,13 +1636,16 @@ enum FrameQueries {
             return nil
         }
 
-        return try parseFrameWithVideoInfoRow(statement: statement!)
+        return try parseFrameWithVideoInfoRow(statement: statement!, storageRoot: storageRoot)
     }
 
     /// Parse a row from a query that JOINs frame with segment and video tables
     /// Columns: f.id, f.createdAt, f.segmentId, f.videoId, f.videoFrameIndex, f.encodingStatus, f.processingStatus,
     ///          f.redactionReason, s.bundleID, s.windowName, v.path, v.frameRate, v.width, v.height, v.processingState
-    private static func parseFrameWithVideoInfoRow(statement: OpaquePointer) throws -> FrameWithVideoInfo {
+    private static func parseFrameWithVideoInfoRow(
+        statement: OpaquePointer,
+        storageRoot: String
+    ) throws -> FrameWithVideoInfo {
         // Parse frame data
         let id = FrameID(value: sqlite3_column_int64(statement, 0))
         let timestamp = Schema.timestampToDate(sqlite3_column_int64(statement, 1))
@@ -1660,8 +1699,6 @@ enum FrameQueries {
             let videoProcessingState = Int(sqlite3_column_int(statement, 14))
             let isVideoFinalized = videoProcessingState == 0
 
-            // Convert relative path to full path (must use expandedStorageRoot to resolve ~)
-            let storageRoot = AppPaths.expandedStorageRoot
             let fullPath = (storageRoot as NSString).appendingPathComponent(videoPath)
 
             videoInfo = FrameVideoInfo(

@@ -351,6 +351,73 @@ final class CrashReportSupportTests: XCTestCase {
         return (emergencyDirectoryURL, diagnosticDirectoryURL, baseURL)
     }
 
+    func testLoadRecentWALFailureCrashReturnsNewestReport() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        _ = try createCrashReport(
+            named: "retrace-emergency-wal_unavailable-2026-03-08_120000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_021_600),
+            in: directoryURL
+        )
+        let latestReport = try createCrashReport(
+            named: "retrace-emergency-wal_unavailable-2026-03-09_110000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: directoryURL
+        )
+
+        let result = DashboardViewModel.loadRecentWALFailureCrash(
+            fileManager: fileManager,
+            crashReportDirectory: directoryURL.path,
+            now: Date(timeIntervalSince1970: 1_773_093_600)
+        )
+
+        XCTAssertEqual(result?.fileName, latestReport.lastPathComponent)
+    }
+
+    func testWALFailureLaunchContextPrefillsBugReportAndEmailFocus() {
+        let report = WALFailureCrashReportSummary(
+            fileName: "retrace-emergency-wal_unavailable-2026-03-09_110000.txt",
+            fileURL: URL(fileURLWithPath: "/tmp/retrace-emergency-wal_unavailable-2026-03-09_110000.txt"),
+            capturedAt: Date(timeIntervalSince1970: 1_773_090_000)
+        )
+
+        let context = DashboardViewModel.makeWALFailureFeedbackLaunchContext(
+            for: report,
+            now: Date(timeIntervalSince1970: 1_773_093_600)
+        )
+
+        XCTAssertEqual(context.source, .walFailureCrashBanner)
+        XCTAssertEqual(context.feedbackType, .bug)
+        XCTAssertEqual(context.preferredFocusField, .email)
+        XCTAssertTrue(context.prefilledDescription?.contains("Retrace WAL Startup Failure") == true)
+        XCTAssertTrue(context.prefilledDescription?.contains("Crash recovery was skipped") == true)
+    }
+
+    func testStorageHealthBannerMessageWarnsBeforeStop() {
+        let state = StorageHealthBannerState(
+            severity: .warning,
+            availableGB: 1.25,
+            shouldStop: false
+        )
+
+        XCTAssertTrue(state.messageText.contains("1.25 GB free"))
+        XCTAssertTrue(state.messageText.contains("running low"))
+    }
+
+    func testStorageHealthBannerMessageExplainsForcedStop() {
+        let state = StorageHealthBannerState(
+            severity: .critical,
+            availableGB: 0.42,
+            shouldStop: true
+        )
+
+        XCTAssertTrue(state.messageText.contains("Recording stopped"))
+        XCTAssertTrue(state.messageText.contains("0.42 GB free"))
+    }
+
     private func createCrashReport(
         named fileName: String,
         modifiedAt date: Date,

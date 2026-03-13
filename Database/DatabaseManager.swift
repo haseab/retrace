@@ -47,6 +47,7 @@ public actor DatabaseManager: DatabaseProtocol {
 
     private var db: OpaquePointer?
     private let databasePath: String
+    private let storageRootPath: String
     private var isInitialized = false
 
     /// Public accessor for the database connection (needed for query classes)
@@ -61,13 +62,15 @@ public actor DatabaseManager: DatabaseProtocol {
 
     // MARK: - Initialization
 
-    public init(databasePath: String) {
+    public init(databasePath: String, storageRootPath: String = AppPaths.expandedStorageRoot) {
         self.databasePath = databasePath
+        self.storageRootPath = NSString(string: storageRootPath).expandingTildeInPath
     }
 
     /// Convenience initializer for in-memory database (testing)
     public init() {
         self.databasePath = ":memory:"
+        self.storageRootPath = AppPaths.expandedStorageRoot
     }
 
     // MARK: - Lifecycle
@@ -299,35 +302,59 @@ public actor DatabaseManager: DatabaseProtocol {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.getByTimeRangeWithVideoInfo(db: db, from: startDate, to: endDate, limit: limit)
+        return try FrameQueries.getByTimeRangeWithVideoInfo(
+            db: db,
+            from: startDate,
+            to: endDate,
+            limit: limit,
+            storageRoot: storageRootPath
+        )
     }
 
     public func getMostRecentFramesWithVideoInfo(limit: Int) async throws -> [FrameWithVideoInfo] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.getMostRecentWithVideoInfo(db: db, limit: limit)
+        return try FrameQueries.getMostRecentWithVideoInfo(
+            db: db,
+            limit: limit,
+            storageRoot: storageRootPath
+        )
     }
 
     public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.getBeforeWithVideoInfo(db: db, timestamp: timestamp, limit: limit)
+        return try FrameQueries.getBeforeWithVideoInfo(
+            db: db,
+            timestamp: timestamp,
+            limit: limit,
+            storageRoot: storageRootPath
+        )
     }
 
     public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.getAfterWithVideoInfo(db: db, timestamp: timestamp, limit: limit)
+        return try FrameQueries.getAfterWithVideoInfo(
+            db: db,
+            timestamp: timestamp,
+            limit: limit,
+            storageRoot: storageRootPath
+        )
     }
 
     public func getFrameWithVideoInfoByID(id: FrameID) async throws -> FrameWithVideoInfo? {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
-        return try FrameQueries.getByIDWithVideoInfo(db: db, id: id)
+        return try FrameQueries.getByIDWithVideoInfo(
+            db: db,
+            id: id,
+            storageRoot: storageRootPath
+        )
     }
 
     public func getFrames(appBundleID: String, limit: Int, offset: Int) async throws -> [FrameReference] {
@@ -556,6 +583,13 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return try SegmentQueries.getByID(db: db, id: id)
+    }
+
+    public func findVideoSegment(relativePathStem: String) async throws -> VideoSegment? {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+        return try SegmentQueries.findByRelativePathStem(db: db, stem: relativePathStem)
     }
 
     public func getVideoSegment(containingTimestamp date: Date) async throws -> VideoSegment? {
@@ -1849,7 +1883,7 @@ public actor DatabaseManager: DatabaseProtocol {
             if rawPath.hasPrefix("/") || rawPath.hasPrefix("~") {
                 resolvedPath = NSString(string: rawPath).expandingTildeInPath
             } else {
-                resolvedPath = (AppPaths.expandedStorageRoot as NSString).appendingPathComponent(rawPath)
+                resolvedPath = (storageRootPath as NSString).appendingPathComponent(rawPath)
             }
 
             guard FileManager.default.fileExists(atPath: resolvedPath) else {

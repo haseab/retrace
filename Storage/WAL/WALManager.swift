@@ -1,6 +1,20 @@
 import Foundation
 import Shared
 
+public enum WALQuarantineDisposition: Sendable {
+    case discardable
+    case retained
+
+    var logLabel: String {
+        switch self {
+        case .discardable:
+            return "Quarantined"
+        case .retained:
+            return "Retained quarantined"
+        }
+    }
+}
+
 /// Write-Ahead Log Manager for crash-safe frame persistence
 ///
 /// Writes raw captured frames to disk before video encoding, ensuring:
@@ -17,38 +31,74 @@ public actor WALManager {
     private let walRootURL: URL
     private var frameOffsetIndexCache: [Int64: WALFrameOffsetIndex] = [:]
     private var frameIDOffsetIndexCache: [Int64: WALFrameIDOffsetIndex] = [:]
+    private var debugRawReadOffsetsByVideoID: [Int64: [UInt64]] = [:]
+    private static let eagerReadSafetyLimitBytes: Int64 = 512 * 1024 * 1024
+    private static let discardableQuarantinePrefix = "quarantined_segment_"
+    private static let retainedQuarantinePrefix = "retained_segment_"
 
     public init(walRoot: URL) {
         self.walRootURL = walRoot
     }
 
     public func initialize() async throws {
-        // Create WAL root directory if needed
-        if !FileManager.default.fileExists(atPath: walRootURL.path) {
-            try FileManager.default.createDirectory(
-                at: walRootURL,
-                withIntermediateDirectories: true
+        var isDirectory: ObjCBool = false
+        let walRootExists = FileManager.default.fileExists(
+            atPath: walRootURL.path,
+            isDirectory: &isDirectory
+        )
+
+        if walRootExists && !isDirectory.boolValue {
+            let relocatedURL = try relocateInvalidWALRoot()
+            Log.warning(
+                "[WAL] Moved invalid WAL root aside to \(relocatedURL.lastPathComponent)",
+                category: .storage
             )
         }
+
+        if !FileManager.default.fileExists(atPath: walRootURL.path) {
+            do {
+                try FileManager.default.createDirectory(
+                    at: walRootURL,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                throw StorageError.walUnavailable(
+                    reason: "Failed to create WAL directory at \(walRootURL.path): \(error.localizedDescription)"
+                )
+            }
+        }
+
+        try verifyWriteAccess()
+
     }
 
     // MARK: - Write Operations
 
     /// Create a new WAL session for a video segment
     public func createSession(videoID: VideoSegmentID) async throws -> WALSession {
+        try await initialize()
+
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
 
         // Create session directory
-        try FileManager.default.createDirectory(
-            at: sessionDir,
-            withIntermediateDirectories: true
-        )
+        do {
+            try FileManager.default.createDirectory(
+                at: sessionDir,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw makeStorageWriteError(
+                path: sessionDir.path,
+                error: error,
+                fallback: "Failed to create WAL session directory"
+            )
+        }
 
         // Create empty frames.bin file
         let framesURL = sessionDir.appendingPathComponent("frames.bin")
-        FileManager.default.createFile(atPath: framesURL.path, contents: nil)
+        try createEmptyFile(at: framesURL)
         let frameMapURL = sessionDir.appendingPathComponent("frame_id_map.bin")
-        FileManager.default.createFile(atPath: frameMapURL.path, contents: nil)
+        try createEmptyFile(at: frameMapURL)
 
         // Create metadata file
         let metadata = WALMetadata(
@@ -56,9 +106,18 @@ public actor WALManager {
             startTime: Date(),
             frameCount: 0,
             width: 0,
-            height: 0
+            height: 0,
+            durableReadableFrameCount: 0,
+            durableVideoFileSizeBytes: 0
         )
-        try saveMetadata(metadata, to: sessionDir)
+        do {
+            try saveMetadata(metadata, to: sessionDir)
+        } catch {
+            Log.warning(
+                "[WAL] Failed to persist initial metadata sidecar for session \(videoID.value): \(error.localizedDescription)",
+                category: .storage
+            )
+        }
 
         return WALSession(
             videoID: videoID,
@@ -79,81 +138,89 @@ public actor WALManager {
         }
         defer { try? fileHandle.close() }
 
-        // Seek to end
-        if #available(macOS 10.15.4, *) {
-            try fileHandle.seekToEnd()
-        } else {
-            fileHandle.seekToEndOfFile()
-        }
-
-        // Write frame header + pixel data
-        let header = WALFrameHeader(
-            timestamp: frame.timestamp.timeIntervalSince1970,
-            width: UInt32(frame.width),
-            height: UInt32(frame.height),
-            bytesPerRow: UInt32(frame.bytesPerRow),
-            dataSize: UInt32(frame.imageData.count),
-            displayID: frame.metadata.displayID,
-            appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
-            appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
-            windowNameLength: UInt16(frame.metadata.windowName?.utf8.count ?? 0),
-            browserURLLength: UInt16(frame.metadata.browserURL?.utf8.count ?? 0)
-        )
-
-        // Write header
-        var headerData = Data()
-        withUnsafeBytes(of: header.timestamp) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.width) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.height) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.bytesPerRow) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.dataSize) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.displayID) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.appBundleIDLength) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.appNameLength) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.windowNameLength) { headerData.append(contentsOf: $0) }
-        withUnsafeBytes(of: header.browserURLLength) { headerData.append(contentsOf: $0) }
-
-        if #available(macOS 10.15.4, *) {
-            try fileHandle.write(contentsOf: headerData)
-        } else {
-            fileHandle.write(headerData)
-        }
-
-        // Write metadata strings
-        if let appBundleID = frame.metadata.appBundleID?.data(using: .utf8) {
+        do {
+            // Seek to end
             if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: appBundleID)
+                try fileHandle.seekToEnd()
             } else {
-                fileHandle.write(appBundleID)
+                fileHandle.seekToEndOfFile()
             }
-        }
-        if let appName = frame.metadata.appName?.data(using: .utf8) {
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: appName)
-            } else {
-                fileHandle.write(appName)
-            }
-        }
-        if let windowName = frame.metadata.windowName?.data(using: .utf8) {
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: windowName)
-            } else {
-                fileHandle.write(windowName)
-            }
-        }
-        if let browserURL = frame.metadata.browserURL?.data(using: .utf8) {
-            if #available(macOS 10.15.4, *) {
-                try fileHandle.write(contentsOf: browserURL)
-            } else {
-                fileHandle.write(browserURL)
-            }
-        }
 
-        // Write pixel data
-        if #available(macOS 10.15.4, *) {
-            try fileHandle.write(contentsOf: frame.imageData)
-        } else {
-            fileHandle.write(frame.imageData)
+            // Write frame header + pixel data
+            let header = WALFrameHeader(
+                timestamp: frame.timestamp.timeIntervalSince1970,
+                width: UInt32(frame.width),
+                height: UInt32(frame.height),
+                bytesPerRow: UInt32(frame.bytesPerRow),
+                dataSize: UInt32(frame.imageData.count),
+                displayID: frame.metadata.displayID,
+                appBundleIDLength: UInt16(frame.metadata.appBundleID?.utf8.count ?? 0),
+                appNameLength: UInt16(frame.metadata.appName?.utf8.count ?? 0),
+                windowNameLength: UInt16(frame.metadata.windowName?.utf8.count ?? 0),
+                browserURLLength: UInt16(frame.metadata.browserURL?.utf8.count ?? 0)
+            )
+
+            // Write header
+            var headerData = Data()
+            withUnsafeBytes(of: header.timestamp) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.width) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.height) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.bytesPerRow) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.dataSize) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.displayID) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.appBundleIDLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.appNameLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.windowNameLength) { headerData.append(contentsOf: $0) }
+            withUnsafeBytes(of: header.browserURLLength) { headerData.append(contentsOf: $0) }
+
+            if #available(macOS 10.15.4, *) {
+                try fileHandle.write(contentsOf: headerData)
+            } else {
+                fileHandle.write(headerData)
+            }
+
+            // Write metadata strings
+            if let appBundleID = frame.metadata.appBundleID?.data(using: .utf8) {
+                if #available(macOS 10.15.4, *) {
+                    try fileHandle.write(contentsOf: appBundleID)
+                } else {
+                    fileHandle.write(appBundleID)
+                }
+            }
+            if let appName = frame.metadata.appName?.data(using: .utf8) {
+                if #available(macOS 10.15.4, *) {
+                    try fileHandle.write(contentsOf: appName)
+                } else {
+                    fileHandle.write(appName)
+                }
+            }
+            if let windowName = frame.metadata.windowName?.data(using: .utf8) {
+                if #available(macOS 10.15.4, *) {
+                    try fileHandle.write(contentsOf: windowName)
+                } else {
+                    fileHandle.write(windowName)
+                }
+            }
+            if let browserURL = frame.metadata.browserURL?.data(using: .utf8) {
+                if #available(macOS 10.15.4, *) {
+                    try fileHandle.write(contentsOf: browserURL)
+                } else {
+                    fileHandle.write(browserURL)
+                }
+            }
+
+            // Write pixel data
+            if #available(macOS 10.15.4, *) {
+                try fileHandle.write(contentsOf: frame.imageData)
+            } else {
+                fileHandle.write(frame.imageData)
+            }
+        } catch {
+            throw makeStorageWriteError(
+                path: session.framesURL.path,
+                error: error,
+                fallback: "Failed to append frame to WAL"
+            )
         }
 
         // Update session metadata
@@ -163,11 +230,44 @@ public actor WALManager {
             session.metadata.height = frame.height
         }
 
-        try saveMetadata(session.metadata, to: session.sessionDir)
+        do {
+            try saveMetadata(session.metadata, to: session.sessionDir)
+        } catch {
+            Log.warning(
+                "[WAL] Failed to update metadata sidecar for session \(session.videoID.value): \(error.localizedDescription)",
+                category: .storage
+            )
+        }
 
         // Invalidate frame offset index cache so the next random-access read
         // can rebuild with the newly appended frame.
         frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+    }
+
+    /// Persist the readable frontier of the fragmented MP4 so recovery can
+    /// trust the flushed prefix even if generic timestamp validation fails later.
+    public func updateDurableVideoState(
+        videoID: VideoSegmentID,
+        readableFrameCount: Int,
+        durableVideoFileSizeBytes: Int64
+    ) async throws {
+        let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
+        guard FileManager.default.fileExists(atPath: sessionDir.path) else {
+            throw StorageError.fileNotFound(path: sessionDir.path)
+        }
+
+        var metadata = try loadMetadata(from: sessionDir)
+        let nextReadableFrameCount = max(metadata.durableReadableFrameCount, readableFrameCount)
+        let nextDurableVideoFileSizeBytes = max(metadata.durableVideoFileSizeBytes, durableVideoFileSizeBytes)
+
+        guard nextReadableFrameCount != metadata.durableReadableFrameCount
+            || nextDurableVideoFileSizeBytes != metadata.durableVideoFileSizeBytes else {
+            return
+        }
+
+        metadata.durableReadableFrameCount = nextReadableFrameCount
+        metadata.durableVideoFileSizeBytes = nextDurableVideoFileSizeBytes
+        try saveMetadata(metadata, to: sessionDir)
     }
 
     /// Persist a stable mapping from database frameID -> WAL frame offset.
@@ -188,7 +288,15 @@ public actor WALManager {
             throw StorageError.fileNotFound(path: framesURL.path)
         }
         if !FileManager.default.fileExists(atPath: mapURL.path) {
-            FileManager.default.createFile(atPath: mapURL.path, contents: nil)
+            do {
+                try createEmptyFile(at: mapURL)
+            } catch {
+                Log.warning(
+                    "[WAL] Failed to create frameID map sidecar for session \(videoID.value): \(error.localizedDescription)",
+                    category: .storage
+                )
+                return
+            }
         }
 
         let currentFramesSize = (try? FileManager.default.attributesOfItem(atPath: framesURL.path)[.size] as? Int64) ?? 0
@@ -209,12 +317,27 @@ public actor WALManager {
         }
 
         let record = WALFrameIDMapRecord(frameID: frameID, frameOffset: offsets[frameIndex])
-        try appendFrameIDMapRecord(record, to: mapURL)
+        do {
+            try appendFrameIDMapRecord(record, to: mapURL)
+            cacheFrameIDMapRecord(videoIDValue: videoID.value, record: record)
+        } catch {
+            Log.warning(
+                "[WAL] Failed to append frameID map entry for session \(videoID.value); recreating sidecar: \(error.localizedDescription)",
+                category: .storage
+            )
 
-        if var cached = frameIDOffsetIndexCache[videoID.value] {
-            cached.fileSize += Int64(Self.frameIDMapRecordSize)
-            cached.offsetByFrameID[frameID] = offsets[frameIndex]
-            frameIDOffsetIndexCache[videoID.value] = cached
+            do {
+                try rebuildFrameIDMap(videoIDValue: videoID.value, mapURL: mapURL, appending: record)
+                Log.warning(
+                    "[WAL] Recreated frameID map sidecar for session \(videoID.value) after write failure",
+                    category: .storage
+                )
+            } catch {
+                Log.warning(
+                    "[WAL] Failed to recreate frameID map sidecar for session \(videoID.value): \(error.localizedDescription)",
+                    category: .storage
+                )
+            }
         }
     }
 
@@ -243,7 +366,9 @@ public actor WALManager {
 
         var clearedCount = 0
         for dir in contents where dir.hasDirectoryPath {
-            if dir.lastPathComponent.hasPrefix("active_segment_") {
+            if dir.lastPathComponent.hasPrefix("active_segment_")
+                || isQuarantineDirectory(dir)
+            {
                 try FileManager.default.removeItem(at: dir)
                 clearedCount += 1
             }
@@ -255,6 +380,60 @@ public actor WALManager {
 
         frameOffsetIndexCache.removeAll()
         frameIDOffsetIndexCache.removeAll()
+    }
+
+    /// Delete discardable quarantined WAL sessions older than the provided cutoff date.
+    @discardableResult
+    public func cleanupQuarantinedSessions(olderThan cutoffDate: Date) async -> Int {
+        guard FileManager.default.fileExists(atPath: walRootURL.path) else {
+            return 0
+        }
+
+        let contents: [URL]
+        do {
+            contents = try FileManager.default.contentsOfDirectory(
+                at: walRootURL,
+                includingPropertiesForKeys: nil
+            )
+        } catch {
+            Log.warning(
+                "[WAL] Failed to enumerate quarantined WAL sessions during cleanup: \(error.localizedDescription)",
+                category: .storage
+            )
+            return 0
+        }
+
+        var removedCount = 0
+        for dir in contents where dir.hasDirectoryPath {
+            guard isDiscardableQuarantineDirectory(dir) else {
+                continue
+            }
+
+            guard let quarantinedAt = quarantineDate(for: dir), quarantinedAt <= cutoffDate else {
+                continue
+            }
+
+            do {
+                try FileManager.default.removeItem(at: dir)
+                removedCount += 1
+
+                if let videoIDValue = quarantinedVideoID(for: dir) {
+                    frameOffsetIndexCache.removeValue(forKey: videoIDValue)
+                    frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
+                }
+            } catch {
+                Log.warning(
+                    "[WAL] Failed to remove quarantined WAL session \(dir.lastPathComponent): \(error.localizedDescription)",
+                    category: .storage
+                )
+            }
+        }
+
+        if removedCount > 0 {
+            Log.info("[WAL] Removed \(removedCount) expired quarantined WAL sessions", category: .storage)
+        }
+
+        return removedCount
     }
 
     // MARK: - Recovery Operations
@@ -285,11 +464,63 @@ public actor WALManager {
                 continue
             }
 
-            // Load metadata
-            let metadata = try loadMetadata(from: dir)
+            let videoID = VideoSegmentID(value: videoIDValue)
+            let metadata: WALMetadata
+            do {
+                let loadedMetadata = try loadMetadata(from: dir)
+                metadata = try repairMetadataIfNeeded(
+                    loadedMetadata,
+                    videoID: videoID,
+                    sessionDir: dir,
+                    framesURL: framesURL
+                )
+            } catch {
+                Log.warning(
+                    "[WAL] Failed to load metadata for session \(videoID.value); attempting rebuild from frames.bin: \(error.localizedDescription)",
+                    category: .storage
+                )
+
+                if let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) {
+                    do {
+                        try saveMetadata(rebuiltMetadata, to: dir)
+                    } catch {
+                        Log.warning(
+                            "[WAL] Rebuilt metadata for session \(videoID.value) but failed to persist repaired sidecar: \(error.localizedDescription)",
+                            category: .storage
+                        )
+                    }
+
+                    Log.warning(
+                        "[WAL] Rebuilt metadata for session \(videoID.value) from recoverable WAL frames",
+                        category: .storage
+                    )
+                    metadata = rebuiltMetadata
+                } else {
+                    let placeholderSession = WALSession(
+                        videoID: videoID,
+                        sessionDir: dir,
+                        framesURL: framesURL,
+                        metadata: placeholderMetadata(for: videoID)
+                    )
+                    do {
+                        _ = try await quarantineSession(
+                            placeholderSession,
+                            reason: "Corrupted metadata and no recoverable WAL frames",
+                            disposition: .retained
+                        )
+                    } catch {
+                        Log.error(
+                            "[WAL] Failed to quarantine session \(videoID.value) after metadata rebuild failure",
+                            category: .storage,
+                            error: error
+                        )
+                    }
+                    continue
+                }
+            }
 
             sessions.append(WALSession(
-                videoID: VideoSegmentID(value: videoIDValue),
+                videoID: videoID,
                 sessionDir: dir,
                 framesURL: framesURL,
                 metadata: metadata
@@ -299,74 +530,173 @@ public actor WALManager {
         return sessions
     }
 
+    /// Returns the current size of a WAL session's raw frames file.
+    public func framesFileSize(for session: WALSession) async throws -> Int64 {
+        guard FileManager.default.fileExists(atPath: session.framesURL.path) else {
+            throw StorageError.fileNotFound(path: session.framesURL.path)
+        }
+
+        return (try FileManager.default.attributesOfItem(atPath: session.framesURL.path)[.size] as? Int64) ?? 0
+    }
+
+    /// Count recoverable frames without materializing the whole WAL into memory.
+    /// Truncated tail frames are ignored so recovery can salvage the valid prefix.
+    public func recoverableFrameCount(for session: WALSession) async throws -> Int {
+        let fileSize = try await framesFileSize(for: session)
+        guard fileSize > 0 else { return 0 }
+
+        return try frameOffsets(
+            for: session.videoID.value,
+            framesURL: session.framesURL,
+            currentFileSize: fileSize
+        ).count
+    }
+
+    func recoveryIndex(for session: WALSession) async throws -> WALRecoveryIndex {
+        let fileSize = try await framesFileSize(for: session)
+        guard fileSize > 0 else {
+            return WALRecoveryIndex(recoverableOffsets: [], mappedFrames: [])
+        }
+
+        let recoverableOffsets = try frameOffsets(
+            for: session.videoID.value,
+            framesURL: session.framesURL,
+            currentFileSize: fileSize
+        )
+        let offsetToFrameIndex = Dictionary(uniqueKeysWithValues: recoverableOffsets.enumerated().map { ($0.element, $0.offset) })
+
+        let mapURL = session.sessionDir.appendingPathComponent("frame_id_map.bin")
+        guard FileManager.default.fileExists(atPath: mapURL.path) else {
+            return WALRecoveryIndex(recoverableOffsets: recoverableOffsets, mappedFrames: [])
+        }
+
+        let mapFileSize = (try? FileManager.default.attributesOfItem(atPath: mapURL.path)[.size] as? Int64) ?? 0
+        guard mapFileSize > 0 else {
+            return WALRecoveryIndex(recoverableOffsets: recoverableOffsets, mappedFrames: [])
+        }
+
+        let records = try buildFrameIDMapRecords(
+            mapURL: mapURL,
+            tolerateTruncatedTail: true
+        )
+        var mappedFrames: [WALRecoveryMappedFrame] = []
+        mappedFrames.reserveCapacity(records.count)
+
+        var seenOffsets: Set<UInt64> = []
+        var seenFrameIDs: Set<Int64> = []
+
+        for record in records {
+            guard let frameIndex = offsetToFrameIndex[record.frameOffset] else {
+                Log.warning(
+                    "[WAL] Ignoring frameID map entry for frame \(record.frameID) with unrecoverable offset \(record.frameOffset)",
+                    category: .storage
+                )
+                continue
+            }
+            guard seenOffsets.insert(record.frameOffset).inserted else {
+                Log.warning(
+                    "[WAL] Ignoring duplicate frameID map offset \(record.frameOffset) while building recovery index",
+                    category: .storage
+                )
+                continue
+            }
+            guard seenFrameIDs.insert(record.frameID).inserted else {
+                Log.warning(
+                    "[WAL] Ignoring duplicate frameID map entry for frame \(record.frameID) while building recovery index",
+                    category: .storage
+                )
+                continue
+            }
+
+            mappedFrames.append(
+                WALRecoveryMappedFrame(
+                    frameID: record.frameID,
+                    frameOffset: record.frameOffset,
+                    frameIndex: frameIndex
+                )
+            )
+        }
+
+        mappedFrames.sort { $0.frameIndex < $1.frameIndex }
+        return WALRecoveryIndex(recoverableOffsets: recoverableOffsets, mappedFrames: mappedFrames)
+    }
+
+    func debugRawReadOffsets(for videoID: VideoSegmentID) -> [UInt64] {
+        debugRawReadOffsetsByVideoID[videoID.value] ?? []
+    }
+
+    func resetDebugRawReadOffsets(for videoID: VideoSegmentID? = nil) {
+        if let videoID {
+            debugRawReadOffsetsByVideoID.removeValue(forKey: videoID.value)
+        } else {
+            debugRawReadOffsetsByVideoID.removeAll()
+        }
+    }
+
+    /// Rename an active WAL session out of the recovery path so launch can continue.
+    /// Retained quarantines are preserved for manual inspection instead of timed cleanup.
+    @discardableResult
+    public func quarantineSession(
+        _ session: WALSession,
+        reason: String,
+        disposition: WALQuarantineDisposition = .discardable
+    ) async throws -> URL {
+        guard FileManager.default.fileExists(atPath: session.sessionDir.path) else {
+            return session.sessionDir
+        }
+
+        let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+        var destinationURL = walRootURL.appendingPathComponent(
+            "\(quarantinePrefix(for: disposition))\(session.videoID.value)_\(timestamp)",
+            isDirectory: true
+        )
+        var suffix = 1
+        while FileManager.default.fileExists(atPath: destinationURL.path) {
+            destinationURL = walRootURL.appendingPathComponent(
+                "\(quarantinePrefix(for: disposition))\(session.videoID.value)_\(timestamp)_\(suffix)",
+                isDirectory: true
+            )
+            suffix += 1
+        }
+
+        try FileManager.default.moveItem(at: session.sessionDir, to: destinationURL)
+        frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
+
+        Log.warning(
+            "[WAL] \(disposition.logLabel) session \(session.videoID.value) to \(destinationURL.lastPathComponent): \(reason)",
+            category: .storage
+        )
+
+        return destinationURL
+    }
+
     /// Read all frames from a WAL session
     public func readFrames(from session: WALSession) async throws -> [CapturedFrame] {
-        guard let fileHandle = FileHandle(forReadingAtPath: session.framesURL.path) else {
+        let fileSize = try await framesFileSize(for: session)
+        if fileSize > Self.eagerReadSafetyLimitBytes {
             throw StorageError.fileReadFailed(
                 path: session.framesURL.path,
-                underlying: "Cannot open file for reading"
+                underlying: "WAL session too large for eager read (\(fileSize) bytes)"
             )
         }
-        defer { try? fileHandle.close() }
 
+        let offsets = try frameOffsets(
+            for: session.videoID.value,
+            framesURL: session.framesURL,
+            currentFileSize: fileSize
+        )
         var frames: [CapturedFrame] = []
-
-        while true {
-            // Read header: 8+4+4+4+4+4+2+2+2+2 = 36 bytes
-            let headerSize = 36
-            guard let headerData = try? fileHandle.read(upToCount: headerSize),
-                  headerData.count == headerSize else {
-                break // End of file
-            }
-
-            let header = try parseFrameHeader(from: headerData)
-
-            // Read metadata strings
-            let appBundleID = try header.appBundleIDLength > 0
-                ? String(data: fileHandle.read(upToCount: Int(header.appBundleIDLength))!, encoding: .utf8)
-                : nil
-            let appName = try header.appNameLength > 0
-                ? String(data: fileHandle.read(upToCount: Int(header.appNameLength))!, encoding: .utf8)
-                : nil
-            let windowName = try header.windowNameLength > 0
-                ? String(data: fileHandle.read(upToCount: Int(header.windowNameLength))!, encoding: .utf8)
-                : nil
-            let browserURL = try header.browserURLLength > 0
-                ? String(data: fileHandle.read(upToCount: Int(header.browserURLLength))!, encoding: .utf8)
-                : nil
-
-            // Read pixel data
-            guard let pixelData = try? fileHandle.read(upToCount: Int(header.dataSize)),
-                  pixelData.count == Int(header.dataSize) else {
-                throw StorageError.fileReadFailed(
-                    path: session.framesURL.path,
-                    underlying: "Incomplete frame data"
-                )
-            }
-
-            let frame = CapturedFrame(
-                timestamp: Date(timeIntervalSince1970: header.timestamp),
-                imageData: pixelData,
-                width: Int(header.width),
-                height: Int(header.height),
-                bytesPerRow: Int(header.bytesPerRow),
-                metadata: FrameMetadata(
-                    appBundleID: appBundleID,
-                    appName: appName,
-                    windowName: windowName,
-                    browserURL: browserURL,
-                    displayID: header.displayID
-                )
-            )
-
-            frames.append(frame)
+        frames.reserveCapacity(offsets.count)
+        for offset in offsets {
+            frames.append(try readFrame(videoID: session.videoID, atOffset: offset))
         }
-
         return frames
     }
 
     /// Read a single frame from an active WAL session by database frame ID.
-    /// Falls back to frame index when map entry is missing (e.g. crash before mapping persisted).
+    /// Active-session reads require a persisted frameID map entry so OCR never
+    /// silently falls back to a drifted capture index.
     public func readFrame(videoID: VideoSegmentID, frameID: Int64, fallbackFrameIndex: Int) async throws -> CapturedFrame {
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
         let framesURL = sessionDir.appendingPathComponent("frames.bin")
@@ -390,7 +720,10 @@ public actor WALManager {
             }
         }
 
-        return try await readFrame(videoID: videoID, frameIndex: fallbackFrameIndex)
+        throw StorageError.fileReadFailed(
+            path: mapURL.path,
+            underlying: "Incomplete WAL frameID map for frameID \(frameID); refusing fallback to frame index \(fallbackFrameIndex)"
+        )
     }
 
     /// Read a single frame from an active WAL session by capture index.
@@ -434,12 +767,40 @@ public actor WALManager {
     private static let headerSize = 36
     private static let frameIDMapRecordSize = MemoryLayout<Int64>.size + MemoryLayout<UInt64>.size
 
+    private func metadataNeedsRepair(_ metadata: WALMetadata) -> Bool {
+        guard metadata.width > 0, metadata.height > 0, metadata.frameCount > 0 else {
+            return true
+        }
+
+        return approximateFrameByteCount(width: metadata.width, height: metadata.height) == nil
+    }
+
+    private func approximateFrameByteCount(width: Int, height: Int) -> Int64? {
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        let width64 = Int64(width)
+        let height64 = Int64(height)
+        let (pixelCount, pixelOverflow) = width64.multipliedReportingOverflow(by: height64)
+        guard !pixelOverflow else {
+            return nil
+        }
+
+        let (byteCount, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        guard !byteOverflow, byteCount > 0 else {
+            return nil
+        }
+
+        return byteCount
+    }
+
     private func frameOffsets(for videoIDValue: Int64, framesURL: URL, currentFileSize: Int64) throws -> [UInt64] {
         if let cached = frameOffsetIndexCache[videoIDValue], cached.fileSize == currentFileSize {
             return cached.offsets
         }
 
-        let offsets = try buildFrameOffsetIndex(framesURL: framesURL)
+        let offsets = try buildFrameOffsetIndex(framesURL: framesURL, currentFileSize: currentFileSize)
         frameOffsetIndexCache[videoIDValue] = WALFrameOffsetIndex(fileSize: currentFileSize, offsets: offsets)
         return offsets
     }
@@ -458,6 +819,19 @@ public actor WALManager {
     }
 
     private func buildFrameIDOffsetIndex(mapURL: URL) throws -> [Int64: UInt64] {
+        var offsetByFrameID: [Int64: UInt64] = [:]
+
+        for record in try buildFrameIDMapRecords(mapURL: mapURL, tolerateTruncatedTail: false) {
+            offsetByFrameID[record.frameID] = record.frameOffset
+        }
+
+        return offsetByFrameID
+    }
+
+    private func buildFrameIDMapRecords(
+        mapURL: URL,
+        tolerateTruncatedTail: Bool
+    ) throws -> [WALFrameIDMapRecord] {
         guard let fileHandle = FileHandle(forReadingAtPath: mapURL.path) else {
             throw StorageError.fileReadFailed(
                 path: mapURL.path,
@@ -466,24 +840,31 @@ public actor WALManager {
         }
         defer { try? fileHandle.close() }
 
-        var offsetByFrameID: [Int64: UInt64] = [:]
+        var records: [WALFrameIDMapRecord] = []
 
         while true {
             guard let recordData = try? fileHandle.read(upToCount: Self.frameIDMapRecordSize), !recordData.isEmpty else {
                 break
             }
             guard recordData.count == Self.frameIDMapRecordSize else {
+                if tolerateTruncatedTail {
+                    Log.warning(
+                        "[WAL] Ignoring truncated frameID map tail in \(mapURL.lastPathComponent) (got \(recordData.count) bytes)",
+                        category: .storage
+                    )
+                    break
+                }
+
                 throw StorageError.fileReadFailed(
                     path: mapURL.path,
                     underlying: "Incomplete frame map record (got \(recordData.count) bytes)"
                 )
             }
 
-            let record = try parseFrameIDMapRecord(recordData, path: mapURL.path)
-            offsetByFrameID[record.frameID] = record.frameOffset
+            records.append(try parseFrameIDMapRecord(recordData, path: mapURL.path))
         }
 
-        return offsetByFrameID
+        return records
     }
 
     private func appendFrameIDMapRecord(_ record: WALFrameIDMapRecord, to mapURL: URL) throws {
@@ -514,7 +895,148 @@ public actor WALManager {
         }
     }
 
-    private func buildFrameOffsetIndex(framesURL: URL) throws -> [UInt64] {
+    private func cacheFrameIDMapRecord(videoIDValue: Int64, record: WALFrameIDMapRecord) {
+        var cached = frameIDOffsetIndexCache[videoIDValue] ?? WALFrameIDOffsetIndex(
+            fileSize: 0,
+            offsetByFrameID: [:]
+        )
+
+        cached.offsetByFrameID[record.frameID] = record.frameOffset
+        cached.fileSize = max(
+            cached.fileSize + Int64(Self.frameIDMapRecordSize),
+            Int64(cached.offsetByFrameID.count * Self.frameIDMapRecordSize)
+        )
+        frameIDOffsetIndexCache[videoIDValue] = cached
+    }
+
+    private func rebuildFrameIDMap(
+        videoIDValue: Int64,
+        mapURL: URL,
+        appending newRecord: WALFrameIDMapRecord
+    ) throws {
+        var mergedRecords = existingFrameIDMapRecords(videoIDValue: videoIDValue, mapURL: mapURL)
+        if let existingIndex = mergedRecords.firstIndex(where: { $0.frameID == newRecord.frameID }) {
+            mergedRecords[existingIndex] = newRecord
+        } else {
+            mergedRecords.append(newRecord)
+        }
+
+        try replaceFrameIDMapFile(at: mapURL, with: mergedRecords)
+        frameIDOffsetIndexCache[videoIDValue] = WALFrameIDOffsetIndex(
+            fileSize: Int64(mergedRecords.count * Self.frameIDMapRecordSize),
+            offsetByFrameID: Dictionary(uniqueKeysWithValues: mergedRecords.map { ($0.frameID, $0.frameOffset) })
+        )
+    }
+
+    private func existingFrameIDMapRecords(videoIDValue: Int64, mapURL: URL) -> [WALFrameIDMapRecord] {
+        if let cached = frameIDOffsetIndexCache[videoIDValue] {
+            return cached.offsetByFrameID
+                .map { WALFrameIDMapRecord(frameID: $0.key, frameOffset: $0.value) }
+                .sorted { $0.frameOffset < $1.frameOffset }
+        }
+
+        return (try? buildFrameIDMapRecords(mapURL: mapURL, tolerateTruncatedTail: true)) ?? []
+    }
+
+    private func replaceFrameIDMapFile(at mapURL: URL, with records: [WALFrameIDMapRecord]) throws {
+        if FileManager.default.fileExists(atPath: mapURL.path) {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: mapURL.path)
+            if let fileType = attributes?[.type] as? FileAttributeType, fileType != .typeRegular {
+                try? FileManager.default.removeItem(at: mapURL)
+            }
+        }
+
+        var data = Data()
+        data.reserveCapacity(records.count * Self.frameIDMapRecordSize)
+        for record in records {
+            var frameID = record.frameID
+            var frameOffset = record.frameOffset
+            withUnsafeBytes(of: &frameID) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &frameOffset) { data.append(contentsOf: $0) }
+        }
+
+        do {
+            try data.write(to: mapURL, options: .atomic)
+        } catch {
+            throw makeStorageWriteError(
+                path: mapURL.path,
+                error: error,
+                fallback: "Failed to recreate WAL frame map"
+            )
+        }
+    }
+
+    private func createEmptyFile(at url: URL) throws {
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw StorageError.fileWriteFailed(
+                path: url.path,
+                underlying: "Cannot create file"
+            )
+        }
+    }
+
+    private func verifyWriteAccess() throws {
+        let probeDirectoryURL = walRootURL.appendingPathComponent(
+            ".wal_probe_\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let probeFileURL = probeDirectoryURL.appendingPathComponent("probe")
+
+        do {
+            try FileManager.default.createDirectory(
+                at: probeDirectoryURL,
+                withIntermediateDirectories: false
+            )
+            try createEmptyFile(at: probeFileURL)
+            try FileManager.default.removeItem(at: probeDirectoryURL)
+        } catch {
+            if FileManager.default.fileExists(atPath: probeFileURL.path) {
+                try? FileManager.default.removeItem(at: probeFileURL)
+            }
+            if FileManager.default.fileExists(atPath: probeDirectoryURL.path) {
+                try? FileManager.default.removeItem(at: probeDirectoryURL)
+            }
+
+            let reason: String
+            if isOutOfSpaceError(error) {
+                reason = "Insufficient disk space while verifying WAL write access at \(walRootURL.path)"
+            } else {
+                reason = "Failed to verify WAL write access at \(walRootURL.path): \(error.localizedDescription)"
+            }
+
+            throw StorageError.walUnavailable(reason: reason)
+        }
+    }
+
+    private func makeStorageWriteError(path: String, error: Error, fallback: String) -> StorageError {
+        if isOutOfSpaceError(error) {
+            return .insufficientDiskSpace
+        }
+
+        return .fileWriteFailed(path: path, underlying: "\(fallback): \(error.localizedDescription)")
+    }
+
+    private func isOutOfSpaceError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileWriteOutOfSpaceError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == ENOSPC {
+            return true
+        }
+        if let underlyingError = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            if underlyingError.domain == NSCocoaErrorDomain, underlyingError.code == NSFileWriteOutOfSpaceError {
+                return true
+            }
+            if underlyingError.domain == NSPOSIXErrorDomain, underlyingError.code == ENOSPC {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func buildFrameOffsetIndex(framesURL: URL, currentFileSize: Int64) throws -> [UInt64] {
         guard let fileHandle = FileHandle(forReadingAtPath: framesURL.path) else {
             throw StorageError.fileReadFailed(
                 path: framesURL.path,
@@ -524,6 +1046,7 @@ public actor WALManager {
         defer { try? fileHandle.close() }
 
         var offsets: [UInt64] = []
+        let fileSize = UInt64(max(0, currentFileSize))
 
         while true {
             let frameOffset = currentOffset(fileHandle: fileHandle)
@@ -531,28 +1054,95 @@ public actor WALManager {
                 break
             }
             guard headerData.count == Self.headerSize else {
-                throw StorageError.fileReadFailed(
-                    path: framesURL.path,
-                    underlying: "Incomplete frame header while indexing (got \(headerData.count) bytes)"
+                Log.warning(
+                    "[WAL] Ignoring truncated frame header while indexing \(framesURL.lastPathComponent) at offset \(frameOffset)",
+                    category: .storage
                 )
+                break
             }
 
-            offsets.append(frameOffset)
             let header = try parseFrameHeader(from: headerData)
-
             let metadataBytes = Int(header.appBundleIDLength)
                 + Int(header.appNameLength)
                 + Int(header.windowNameLength)
                 + Int(header.browserURLLength)
             let payloadBytes = metadataBytes + Int(header.dataSize)
             let nextOffset = frameOffset + UInt64(Self.headerSize + payloadBytes)
+            guard nextOffset <= fileSize else {
+                Log.warning(
+                    "[WAL] Ignoring truncated frame payload while indexing \(framesURL.lastPathComponent) at offset \(frameOffset)",
+                    category: .storage
+                )
+                break
+            }
+
+            offsets.append(frameOffset)
             try seek(fileHandle: fileHandle, toOffset: nextOffset)
         }
 
         return offsets
     }
 
-    private func readFrame(videoID: VideoSegmentID, atOffset frameOffset: UInt64) throws -> CapturedFrame {
+    private func quarantinePrefix(for disposition: WALQuarantineDisposition) -> String {
+        switch disposition {
+        case .discardable:
+            Self.discardableQuarantinePrefix
+        case .retained:
+            Self.retainedQuarantinePrefix
+        }
+    }
+
+    private func isDiscardableQuarantineDirectory(_ directoryURL: URL) -> Bool {
+        directoryURL.lastPathComponent.hasPrefix(Self.discardableQuarantinePrefix)
+    }
+
+    private func isQuarantineDirectory(_ directoryURL: URL) -> Bool {
+        isDiscardableQuarantineDirectory(directoryURL)
+            || directoryURL.lastPathComponent.hasPrefix(Self.retainedQuarantinePrefix)
+    }
+
+    private func quarantinedVideoID(for directoryURL: URL) -> Int64? {
+        let components = directoryURL.lastPathComponent.split(separator: "_")
+        guard components.count >= 4 else { return nil }
+        return Int64(components[2])
+    }
+
+    private func quarantineDate(for directoryURL: URL) -> Date? {
+        let components = directoryURL.lastPathComponent.split(separator: "_")
+        guard components.count >= 4, let timestampMillis = Int64(components[3]) else {
+            return nil
+        }
+
+        return Date(timeIntervalSince1970: TimeInterval(timestampMillis) / 1000.0)
+    }
+
+    private func relocateInvalidWALRoot() throws -> URL {
+        let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+        var destinationURL = walRootURL.deletingLastPathComponent().appendingPathComponent(
+            "wal.invalid.\(timestamp)",
+            isDirectory: false
+        )
+        var suffix = 1
+        while FileManager.default.fileExists(atPath: destinationURL.path) {
+            destinationURL = walRootURL.deletingLastPathComponent().appendingPathComponent(
+                "wal.invalid.\(timestamp).\(suffix)",
+                isDirectory: false
+            )
+            suffix += 1
+        }
+
+        do {
+            try FileManager.default.moveItem(at: walRootURL, to: destinationURL)
+        } catch {
+            throw StorageError.walUnavailable(
+                reason: "WAL path \(walRootURL.path) is not a directory and could not be repaired: \(error.localizedDescription)"
+            )
+        }
+
+        return destinationURL
+    }
+
+    func readFrame(videoID: VideoSegmentID, atOffset frameOffset: UInt64) throws -> CapturedFrame {
         let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
         let framesURL = sessionDir.appendingPathComponent("frames.bin")
         guard let fileHandle = FileHandle(forReadingAtPath: framesURL.path) else {
@@ -562,6 +1152,8 @@ public actor WALManager {
             )
         }
         defer { try? fileHandle.close() }
+
+        debugRawReadOffsetsByVideoID[videoID.value, default: []].append(frameOffset)
 
         try seek(fileHandle: fileHandle, toOffset: frameOffset)
 
@@ -673,7 +1265,7 @@ public actor WALManager {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(metadata)
-        try data.write(to: metadataURL)
+        try data.write(to: metadataURL, options: .atomic)
     }
 
     private func loadMetadata(from dir: URL) throws -> WALMetadata {
@@ -682,6 +1274,97 @@ public actor WALManager {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(WALMetadata.self, from: data)
+    }
+
+    private func rebuildMetadata(videoID: VideoSegmentID, framesURL: URL) throws -> WALMetadata? {
+        let currentFileSize = (try FileManager.default.attributesOfItem(atPath: framesURL.path)[.size] as? Int64) ?? 0
+        guard currentFileSize > 0 else {
+            return nil
+        }
+
+        let offsets = try frameOffsets(
+            for: videoID.value,
+            framesURL: framesURL,
+            currentFileSize: currentFileSize
+        )
+        guard let firstOffset = offsets.first else {
+            return nil
+        }
+
+        guard let fileHandle = FileHandle(forReadingAtPath: framesURL.path) else {
+            throw StorageError.fileReadFailed(
+                path: framesURL.path,
+                underlying: "Cannot open WAL for metadata rebuild"
+            )
+        }
+        defer { try? fileHandle.close() }
+
+        try seek(fileHandle: fileHandle, toOffset: firstOffset)
+        let headerData = try readExact(
+            fileHandle: fileHandle,
+            count: Self.headerSize,
+            path: framesURL.path,
+            label: "frame header during metadata rebuild"
+        )
+        let header = try parseFrameHeader(from: headerData)
+
+        return WALMetadata(
+            videoID: videoID,
+            startTime: Date(timeIntervalSince1970: header.timestamp),
+            frameCount: offsets.count,
+            width: Int(header.width),
+            height: Int(header.height),
+            durableReadableFrameCount: 0,
+            durableVideoFileSizeBytes: 0
+        )
+    }
+
+    private func placeholderMetadata(for videoID: VideoSegmentID) -> WALMetadata {
+        WALMetadata(
+            videoID: videoID,
+            startTime: Date(timeIntervalSince1970: 0),
+            frameCount: 0,
+            width: 0,
+            height: 0,
+            durableReadableFrameCount: 0,
+            durableVideoFileSizeBytes: 0
+        )
+    }
+
+    private func repairMetadataIfNeeded(
+        _ metadata: WALMetadata,
+        videoID: VideoSegmentID,
+        sessionDir: URL,
+        framesURL: URL
+    ) throws -> WALMetadata {
+        let framesFileSize = (try FileManager.default.attributesOfItem(atPath: framesURL.path)[.size] as? Int64) ?? 0
+        guard framesFileSize > 0 else {
+            return metadata
+        }
+
+        let needsRepair = metadataNeedsRepair(metadata)
+        guard needsRepair, let rebuiltMetadata = try rebuildMetadata(videoID: videoID, framesURL: framesURL) else {
+            return metadata
+        }
+
+        var repairedMetadata = rebuiltMetadata
+        repairedMetadata.durableReadableFrameCount = metadata.durableReadableFrameCount
+        repairedMetadata.durableVideoFileSizeBytes = metadata.durableVideoFileSizeBytes
+
+        do {
+            try saveMetadata(repairedMetadata, to: sessionDir)
+        } catch {
+            Log.warning(
+                "[WAL] Repaired stale metadata for session \(videoID.value) but failed to persist rebuilt sidecar: \(error.localizedDescription)",
+                category: .storage
+            )
+        }
+
+        Log.warning(
+            "[WAL] Repaired stale metadata for session \(videoID.value) from recoverable WAL frames",
+            category: .storage
+        )
+        return repairedMetadata
     }
 
     private func parseFrameHeader(from data: Data) throws -> WALFrameHeader {
@@ -757,18 +1440,51 @@ public struct WALSession: Sendable {
 
 /// Metadata for a WAL session
 public struct WALMetadata: Codable, Sendable {
+    private enum CodingKeys: String, CodingKey {
+        case videoID
+        case startTime
+        case frameCount
+        case width
+        case height
+        case durableReadableFrameCount
+        case durableVideoFileSizeBytes
+    }
+
     public let videoID: VideoSegmentID
     public let startTime: Date
     public var frameCount: Int
     public var width: Int
     public var height: Int
+    public var durableReadableFrameCount: Int
+    public var durableVideoFileSizeBytes: Int64
 
-    public init(videoID: VideoSegmentID, startTime: Date, frameCount: Int, width: Int, height: Int) {
+    public init(
+        videoID: VideoSegmentID,
+        startTime: Date,
+        frameCount: Int,
+        width: Int,
+        height: Int,
+        durableReadableFrameCount: Int,
+        durableVideoFileSizeBytes: Int64
+    ) {
         self.videoID = videoID
         self.startTime = startTime
         self.frameCount = frameCount
         self.width = width
         self.height = height
+        self.durableReadableFrameCount = durableReadableFrameCount
+        self.durableVideoFileSizeBytes = durableVideoFileSizeBytes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.videoID = try container.decode(VideoSegmentID.self, forKey: .videoID)
+        self.startTime = try container.decode(Date.self, forKey: .startTime)
+        self.frameCount = try container.decode(Int.self, forKey: .frameCount)
+        self.width = try container.decode(Int.self, forKey: .width)
+        self.height = try container.decode(Int.self, forKey: .height)
+        self.durableReadableFrameCount = try container.decodeIfPresent(Int.self, forKey: .durableReadableFrameCount) ?? 0
+        self.durableVideoFileSizeBytes = try container.decodeIfPresent(Int64.self, forKey: .durableVideoFileSizeBytes) ?? 0
     }
 }
 
@@ -792,6 +1508,17 @@ private struct WALFrameHeader {
 private struct WALFrameOffsetIndex {
     let fileSize: Int64
     let offsets: [UInt64]
+}
+
+struct WALRecoveryIndex: Sendable {
+    let recoverableOffsets: [UInt64]
+    let mappedFrames: [WALRecoveryMappedFrame]
+}
+
+struct WALRecoveryMappedFrame: Sendable {
+    let frameID: Int64
+    let frameOffset: UInt64
+    let frameIndex: Int
 }
 
 private struct WALFrameIDOffsetIndex {

@@ -1477,6 +1477,132 @@ final class DatabaseManagerTests: XCTestCase {
         }
     }
 
+    func testGetFrameWithVideoInfoByID_UsesConfiguredStorageRootForRelativeVideoPath() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceFrameVideoPathTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let dbPath = tempDir.appendingPathComponent("retrace.db").path
+        let customDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: tempDir.path
+        )
+        do {
+            try await customDatabase.initialize()
+
+            let timestamp = Date(timeIntervalSince1970: 1_741_700_000)
+            let videoID = try await customDatabase.insertVideoSegment(
+                VideoSegment(
+                    id: VideoSegmentID(value: 0),
+                    startTime: timestamp,
+                    endTime: timestamp.addingTimeInterval(60),
+                    frameCount: 1,
+                    fileSizeBytes: 1024,
+                    relativePath: "chunks/202603/12/1234.mp4",
+                    width: 1920,
+                    height: 1080,
+                    source: .native
+                )
+            )
+            let segmentID = try await customDatabase.insertSegment(
+                bundleID: "com.test.video-path",
+                startDate: timestamp,
+                endDate: timestamp.addingTimeInterval(60),
+                windowName: "Window",
+                browserUrl: nil,
+                type: 0
+            )
+            let frameID = try await customDatabase.insertFrame(
+                FrameReference(
+                    id: FrameID(value: 0),
+                    timestamp: timestamp,
+                    segmentID: AppSegmentID(value: segmentID),
+                    videoID: VideoSegmentID(value: videoID),
+                    frameIndexInSegment: 0,
+                    encodingStatus: .success,
+                    metadata: .empty,
+                    source: .native
+                )
+            )
+
+            let frameWithVideoInfo = try await customDatabase.getFrameWithVideoInfoByID(
+                id: FrameID(value: frameID)
+            )
+            let frame = try XCTUnwrap(frameWithVideoInfo)
+            let videoInfo = try XCTUnwrap(frame.videoInfo)
+
+            XCTAssertEqual(
+                videoInfo.videoPath,
+                tempDir.appendingPathComponent("chunks/202603/12/1234.mp4").path
+            )
+
+            try await customDatabase.close()
+        } catch {
+            try? await customDatabase.close()
+            throw error
+        }
+    }
+
+    func testDeleteSegment_DeletesRelativeCommentAttachmentsUsingConfiguredStorageRoot() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceRelativeAttachmentTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let attachmentsDir = tempDir.appendingPathComponent("attachments", isDirectory: true)
+        try FileManager.default.createDirectory(at: attachmentsDir, withIntermediateDirectories: true)
+
+        let relativeAttachmentPath = "attachments/note.txt"
+        let attachmentURL = tempDir.appendingPathComponent(relativeAttachmentPath)
+        try Data("attachment-body".utf8).write(to: attachmentURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentURL.path))
+
+        let dbPath = tempDir.appendingPathComponent("retrace.db").path
+        let customDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: tempDir.path
+        )
+        do {
+            try await customDatabase.initialize()
+
+            let segment = try await customDatabase.insertSegment(
+                bundleID: "com.test.relative-attachment",
+                startDate: Date(),
+                endDate: Date().addingTimeInterval(30),
+                windowName: "Test Window",
+                browserUrl: nil,
+                type: 0
+            )
+            let comment = try await customDatabase.createSegmentComment(
+                body: "Has relative file",
+                author: "Test User",
+                attachments: [
+                    SegmentCommentAttachment(
+                        filePath: relativeAttachmentPath,
+                        fileName: "note.txt",
+                        mimeType: "text/plain",
+                        sizeBytes: 15
+                    )
+                ]
+            )
+            try await customDatabase.addCommentToSegment(segmentId: SegmentID(value: segment), commentId: comment.id)
+
+            try await customDatabase.deleteSegment(id: segment)
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentURL.path))
+
+            try await customDatabase.close()
+        } catch {
+            try? await customDatabase.close()
+            throw error
+        }
+    }
+
     func testSegmentComment_GetSegmentCommentCountsMap() async throws {
         let segmentA = try await insertTestAppSegment(bundleID: "com.test.counts.a")
         let segmentB = try await insertTestAppSegment(bundleID: "com.test.counts.b")

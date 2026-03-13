@@ -58,7 +58,10 @@ final class OCRPipelineTests: XCTestCase {
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
 
         // Initialize managers with isolated test database path
-        database = DatabaseManager(databasePath: testDatabasePath)
+        database = DatabaseManager(
+            databasePath: testDatabasePath,
+            storageRootPath: storageRoot.path
+        )
         ftsManager = FTSManager(databasePath: testDatabasePath)
         storage = StorageManager(storageRoot: storageRoot)
         processing = ProcessingManager(config: .default)

@@ -22,6 +22,47 @@ struct DashboardCrashReportSummary: Equatable {
     }
 }
 
+struct WALFailureCrashReportSummary: Equatable {
+    let fileName: String
+    let fileURL: URL
+    let capturedAt: Date
+}
+
+struct StorageHealthBannerState: Equatable {
+    enum Severity: String {
+        case warning
+        case critical
+    }
+
+    let severity: Severity
+    let availableGB: Double
+    let shouldStop: Bool
+
+    var signature: String {
+        "\(severity.rawValue)|\(shouldStop)|\(String(format: "%.2f", availableGB))"
+    }
+
+    var messageText: String {
+        let availableText = String(format: "%.2f", availableGB)
+
+        if shouldStop {
+            return "Recording stopped because storage is critically low (\(availableText) GB free). Free up disk space before restarting capture."
+        }
+
+        switch severity {
+        case .warning:
+            return "Storage is running low (\(availableText) GB free). Free space soon to avoid interrupted recording."
+        case .critical:
+            return "Storage is critically low (\(availableText) GB free). Recording may stop soon if space is not freed."
+        }
+    }
+}
+
+private enum StorageHealthNotificationNames {
+    static let low = Notification.Name("StorageLow")
+    static let criticalLow = Notification.Name("StorageCriticalLow")
+}
+
 /// ViewModel for the Dashboard view
 /// Manages weekly app usage statistics from the database
 @MainActor
@@ -71,7 +112,9 @@ public class DashboardViewModel: ObservableObject {
     // Permission warnings
     @Published public var showAccessibilityWarning = false
     @Published public var showScreenRecordingWarning = false
+    @Published var storageHealthBanner: StorageHealthBannerState?
     @Published var recentCrashReport: DashboardCrashReportSummary?
+    @Published var recentWALFailureCrash: WALFailureCrashReportSummary?
 
     // Track user dismissals — re-nag after 30 minutes
     private var accessibilityDismissedUntil: Date?
@@ -80,6 +123,7 @@ public class DashboardViewModel: ObservableObject {
     /// How long to suppress a permission warning after the user dismisses it
     private static let dismissSnoozeInterval: TimeInterval = 30 * 60 // 30 minutes
     nonisolated private static let recentCrashReportWindow: TimeInterval = 7 * 24 * 60 * 60
+    nonisolated private static let walFailureCrashRecentWindow: TimeInterval = 7 * 24 * 60 * 60
     nonisolated private static var diagnosticCrashReportDirectories: [String] {
         [
             NSString(string: "~/Library/Logs/DiagnosticReports").expandingTildeInPath,
@@ -90,6 +134,8 @@ public class DashboardViewModel: ObservableObject {
     private static let acknowledgedCrashReportCutoffTimestampMsKey = "acknowledgedCrashReportCutoffTimestampMs"
     private static let legacyAcknowledgedWatchdogCrashReportKey = "acknowledgedWatchdogCrashReportFileName"
     private static let legacyAcknowledgedWatchdogCrashReportKeysKey = "acknowledgedWatchdogCrashReportFileNames"
+    private static let acknowledgedWALFailureCrashReportKey = "acknowledgedWALFailureCrashReportFileName"
+    private static let acknowledgedWALFailureCrashReportKeysKey = "acknowledgedWALFailureCrashReportFileNames"
 
     // MARK: - Dependencies
 
@@ -100,6 +146,8 @@ public class DashboardViewModel: ObservableObject {
     /// Prevents the 2s poll from clobbering optimistic toggle UI while start/stop is in flight.
     private var isRecordingToggleInFlight = false
     private var lastTrackedCrashBannerIdentifier: String?
+    private var lastTrackedWALFailureBannerFileName: String?
+    private var lastTrackedStorageHealthBannerSignature: String?
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -111,6 +159,7 @@ public class DashboardViewModel: ObservableObject {
         self.coordinator = coordinator
         setupAutoRefresh()
         setupDataSourceObserver()
+        setupStorageHealthObserver()
         // Check permissions immediately on init
         checkPermissions()
     }
@@ -129,6 +178,26 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    private func setupStorageHealthObserver() {
+        let center = NotificationCenter.default
+
+        center.publisher(for: StorageHealthNotificationNames.low)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    self?.handleStorageHealthNotification(notification, severity: .warning)
+                }
+            }
+            .store(in: &cancellables)
+
+        center.publisher(for: StorageHealthNotificationNames.criticalLow)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    self?.handleStorageHealthNotification(notification, severity: .critical)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     private func setupAutoRefresh() {
         // Refresh recording status and permissions every 1 second with leeway for power efficiency
         let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -142,6 +211,8 @@ public class DashboardViewModel: ObservableObject {
                 self.updatePauseStatus()
                 await self.updateQueueStatus()
                 self.checkPermissions()
+                self.refreshRecentCrashReportState()
+                self.refreshRecentWALFailureCrashState()
             }
         }
         timer.resume()
@@ -291,6 +362,13 @@ public class DashboardViewModel: ObservableObject {
         screenRecordingDismissedUntil = Date().addingTimeInterval(Self.dismissSnoozeInterval)
     }
 
+    public func dismissStorageHealthBanner() {
+        guard let state = storageHealthBanner else { return }
+        recordStorageHealthBannerAction("dismissed", state: state)
+        storageHealthBanner = nil
+        lastTrackedStorageHealthBannerSignature = nil
+    }
+
     public func dismissRecentCrashReport() {
         acknowledgeRecentCrashReport(action: "dismissed")
     }
@@ -305,6 +383,60 @@ public class DashboardViewModel: ObservableObject {
         recordCrashBannerAction("details_opened", report: report)
     }
 
+    public func dismissRecentWALFailureCrash() {
+        acknowledgeRecentWALFailureCrash(action: "dismissed")
+    }
+
+    public func recordRecentWALFailureCrashFeedbackOpened() {
+        guard let report = recentWALFailureCrash else { return }
+        recordWALFailureBannerAction("submit_bug_report_clicked", report: report)
+    }
+
+    public func recordRecentWALFailureCrashDetailsOpened() {
+        guard let report = recentWALFailureCrash else { return }
+        recordWALFailureBannerAction("details_opened", report: report)
+    }
+
+    private func handleStorageHealthNotification(
+        _ notification: Notification,
+        severity: StorageHealthBannerState.Severity
+    ) {
+        let payload = notification.object as? [String: Any]
+        let availableGB = payload?["availableGB"] as? Double ?? 0
+        let shouldStop = payload?["shouldStop"] as? Bool ?? false
+        let state = StorageHealthBannerState(
+            severity: severity,
+            availableGB: availableGB,
+            shouldStop: shouldStop
+        )
+
+        presentStorageHealthBanner(state)
+    }
+
+    func showDebugStorageHealthBanner(
+        severity: StorageHealthBannerState.Severity,
+        availableGB: Double,
+        shouldStop: Bool
+    ) {
+        let state = StorageHealthBannerState(
+            severity: severity,
+            availableGB: availableGB,
+            shouldStop: shouldStop
+        )
+        recordStorageHealthBannerAction("debug_triggered", state: state)
+        presentStorageHealthBanner(state)
+    }
+
+    private func presentStorageHealthBanner(_ state: StorageHealthBannerState) {
+        storageHealthBanner = state
+        guard state.signature != lastTrackedStorageHealthBannerSignature else {
+            return
+        }
+
+        lastTrackedStorageHealthBannerSignature = state.signature
+        recordStorageHealthBannerAction("banner_shown", state: state)
+    }
+
     nonisolated static func makeCrashFeedbackLaunchContext(
         for report: DashboardCrashReportSummary,
         now: Date = Date()
@@ -313,6 +445,18 @@ public class DashboardViewModel: ObservableObject {
             source: .crashBanner,
             feedbackType: .bug,
             prefilledDescription: makeCrashFeedbackDescription(for: report, now: now),
+            preferredFocusField: .email
+        )
+    }
+
+    nonisolated static func makeWALFailureFeedbackLaunchContext(
+        for report: WALFailureCrashReportSummary,
+        now: Date = Date()
+    ) -> FeedbackLaunchContext {
+        FeedbackLaunchContext(
+            source: .walFailureCrashBanner,
+            feedbackType: .bug,
+            prefilledDescription: makeWALFailureFeedbackDescription(for: report, now: now),
             preferredFocusField: .email
         )
     }
@@ -446,6 +590,60 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    nonisolated static func loadRecentWALFailureCrash(
+        fileManager: FileManager = .default,
+        crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
+        now: Date = Date(),
+        acknowledgedFileNames: Set<String> = []
+    ) -> WALFailureCrashReportSummary? {
+        let directoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .contentModificationDateKey,
+            .creationDateKey
+        ]
+
+        guard let fileURLs = try? fileManager.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let prefix = "retrace-emergency-wal_unavailable-"
+
+        let reports = fileURLs.compactMap { fileURL -> WALFailureCrashReportSummary? in
+            let fileName = fileURL.lastPathComponent
+            guard fileName.hasPrefix(prefix), fileURL.pathExtension == "txt" else {
+                return nil
+            }
+
+            let resourceValues = try? fileURL.resourceValues(forKeys: resourceKeys)
+            if resourceValues?.isRegularFile == false {
+                return nil
+            }
+
+            let capturedAt = resourceValues?.contentModificationDate
+                ?? resourceValues?.creationDate
+                ?? parseWALFailureTimestamp(from: fileName)
+                ?? .distantPast
+
+            guard now.timeIntervalSince(capturedAt) <= walFailureCrashRecentWindow else {
+                return nil
+            }
+
+            return WALFailureCrashReportSummary(
+                fileName: fileName,
+                fileURL: fileURL,
+                capturedAt: capturedAt
+            )
+        }
+        .sorted { $0.capturedAt > $1.capturedAt }
+
+        return reports.first { !acknowledgedFileNames.contains($0.fileName) }
+    }
+
     nonisolated static func makeCrashFeedbackDescription(
         for report: DashboardCrashReportSummary,
         now _: Date = Date()
@@ -461,6 +659,19 @@ public class DashboardViewModel: ObservableObject {
         return """
         \(heading)
 
+        Enter any other relevant context here:
+        """
+    }
+
+    nonisolated static func makeWALFailureFeedbackDescription(
+        for _: WALFailureCrashReportSummary,
+        now _: Date = Date()
+    ) -> String {
+        return """
+        Retrace WAL Startup Failure
+
+        Retrace could not initialize the WAL during startup recovery.
+        Crash recovery was skipped, and new WAL sessions may fail until storage is repaired.
         Enter any other relevant context here:
         """
     }
@@ -544,6 +755,21 @@ public class DashboardViewModel: ObservableObject {
         recordCrashBannerAction("banner_shown", report: report, now: now)
     }
 
+    nonisolated private static func parseWALFailureTimestamp(from fileName: String) -> Date? {
+        let prefix = "retrace-emergency-wal_unavailable-"
+        let suffix = ".txt"
+
+        guard fileName.hasPrefix(prefix), fileName.hasSuffix(suffix) else {
+            return nil
+        }
+
+        let timestamp = String(fileName.dropFirst(prefix.count).dropLast(suffix.count))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd_HHmmss"
+        return formatter.date(from: timestamp)
+    }
+
     private func acknowledgeRecentCrashReport(action: String) {
         guard let report = recentCrashReport else { return }
         var acknowledgedIdentifiers = loadAcknowledgedCrashReportIdentifiers()
@@ -553,6 +779,32 @@ public class DashboardViewModel: ObservableObject {
         persistAcknowledgedCrashReportCutoffDate(acknowledgedBeforeDate)
         recordCrashBannerAction(action, report: report)
         recentCrashReport = nil
+    }
+
+    private func refreshRecentWALFailureCrashState(now: Date = Date()) {
+        let acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
+        let report = Self.loadRecentWALFailureCrash(
+            now: now,
+            acknowledgedFileNames: acknowledgedFileNames
+        )
+
+        recentWALFailureCrash = report
+
+        guard let report, report.fileName != lastTrackedWALFailureBannerFileName else {
+            return
+        }
+
+        lastTrackedWALFailureBannerFileName = report.fileName
+        recordWALFailureBannerAction("banner_shown", report: report, now: now)
+    }
+
+    private func acknowledgeRecentWALFailureCrash(action: String) {
+        guard let report = recentWALFailureCrash else { return }
+        var acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
+        acknowledgedFileNames.insert(report.fileName)
+        persistAcknowledgedWALFailureCrashFileNames(acknowledgedFileNames)
+        recordWALFailureBannerAction(action, report: report)
+        recentWALFailureCrash = nil
     }
 
     private func loadAcknowledgedCrashReportIdentifiers() -> Set<String> {
@@ -589,6 +841,26 @@ public class DashboardViewModel: ObservableObject {
         settingsStore.synchronize()
     }
 
+    private func loadAcknowledgedWALFailureCrashFileNames() -> Set<String> {
+        var acknowledgedFileNames = Set(
+            settingsStore.stringArray(forKey: Self.acknowledgedWALFailureCrashReportKeysKey) ?? []
+        )
+
+        if let legacyAcknowledgedFileName = settingsStore.string(
+            forKey: Self.acknowledgedWALFailureCrashReportKey
+        ) {
+            acknowledgedFileNames.insert(legacyAcknowledgedFileName)
+        }
+
+        return acknowledgedFileNames
+    }
+
+    private func persistAcknowledgedWALFailureCrashFileNames(_ fileNames: Set<String>) {
+        settingsStore.set(fileNames.sorted(), forKey: Self.acknowledgedWALFailureCrashReportKeysKey)
+        settingsStore.removeObject(forKey: Self.acknowledgedWALFailureCrashReportKey)
+        settingsStore.synchronize()
+    }
+
     private func persistAcknowledgedCrashReportCutoffDate(_ date: Date) {
         let timestampMs = Int64(date.timeIntervalSince1970 * 1000)
         settingsStore.set(timestampMs, forKey: Self.acknowledgedCrashReportCutoffTimestampMsKey)
@@ -613,6 +885,40 @@ public class DashboardViewModel: ObservableObject {
         )
     }
 
+    private func recordWALFailureBannerAction(
+        _ action: String,
+        report: WALFailureCrashReportSummary,
+        now: Date = Date()
+    ) {
+        let metadata = Self.jsonMetadata([
+            "action": action,
+            "fileName": report.fileName,
+            "reportAgeSeconds": max(0, Int(now.timeIntervalSince(report.capturedAt)))
+        ])
+        Self.recordMetric(
+            coordinator: coordinator,
+            type: .walFailureBannerAction,
+            metadata: metadata
+        )
+    }
+
+    private func recordStorageHealthBannerAction(
+        _ action: String,
+        state: StorageHealthBannerState
+    ) {
+        let metadata = Self.jsonMetadata([
+            "action": action,
+            "severity": state.severity.rawValue,
+            "availableGB": state.availableGB,
+            "shouldStop": state.shouldStop
+        ])
+        Self.recordMetric(
+            coordinator: coordinator,
+            type: .storageHealthBannerAction,
+            metadata: metadata
+        )
+    }
+
     // MARK: - Data Loading
 
     public func loadStatistics() async {
@@ -623,6 +929,7 @@ public class DashboardViewModel: ObservableObject {
         updateRecordingStatus()
         updatePauseStatus()
         refreshRecentCrashReportState()
+        refreshRecentWALFailureCrashState()
 
         do {
             // Calculate last 7 days date range

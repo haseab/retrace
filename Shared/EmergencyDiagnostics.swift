@@ -39,7 +39,6 @@ public enum EmergencyDiagnostics {
     @discardableResult
     public static func capture(trigger: String) -> String? {
         let timestamp = currentTimestamp()
-        let fileName = "retrace-emergency-\(trigger)-\(timestamp).txt"
 
         var report = ""
         report += "=== RETRACE EMERGENCY DIAGNOSTIC ===\n"
@@ -70,8 +69,14 @@ public enum EmergencyDiagnostics {
         report += Thread.callStackSymbols.joined(separator: "\n")
         report += "\n"
 
-        // Write to disk
-        return writeToDisk(report, fileName: fileName)
+        return writeReport(trigger: trigger, body: report, timestamp: timestamp)
+    }
+
+    /// Write a caller-provided emergency report into the shared crash report directory.
+    /// Intended for startup/storage failures where we have precise failure context already.
+    @discardableResult
+    public static func writeReport(trigger: String, body: String, directory: String? = nil) -> String? {
+        writeReport(trigger: trigger, body: body, timestamp: currentTimestamp(), directory: directory)
     }
 
     // MARK: - System Info (thread-safe)
@@ -243,8 +248,8 @@ public enum EmergencyDiagnostics {
 
     // MARK: - Disk I/O
 
-    private static func writeToDisk(_ report: String, fileName: String) -> String? {
-        let dir = crashReportDirectory
+    private static func writeToDisk(_ report: String, fileName: String, directory: String? = nil) -> String? {
+        let dir = directory ?? crashReportDirectory
         let filePath = (dir as NSString).appendingPathComponent(fileName)
 
         // Create directory if needed
@@ -318,6 +323,16 @@ public enum EmergencyDiagnostics {
         formatter.dateFormat = "yyyy-MM-dd_HHmmss"
         formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter.string(from: now)
+    }
+
+    private static func writeReport(
+        trigger: String,
+        body: String,
+        timestamp: String,
+        directory: String? = nil
+    ) -> String? {
+        let fileName = "retrace-emergency-\(trigger)-\(timestamp).txt"
+        return writeToDisk(body, fileName: fileName, directory: directory)
     }
 }
 

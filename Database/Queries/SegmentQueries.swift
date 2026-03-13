@@ -274,7 +274,7 @@ enum SegmentQueries {
 
     static func getByID(db: OpaquePointer, id: VideoSegmentID) throws -> VideoSegment? {
         let sql = """
-            SELECT id, height, width, path, fileSize, frameRate
+            SELECT id, height, width, path, fileSize, frameCount, frameRate
             FROM video
             WHERE id = ?;
             """
@@ -300,13 +300,49 @@ enum SegmentQueries {
         return try parseVideoRow(statement: statement!)
     }
 
+    static func findByRelativePathStem(db: OpaquePointer, stem: String) throws -> VideoSegment? {
+        let sql = """
+            SELECT id, height, width, path, fileSize, frameCount, frameRate
+            FROM video
+            WHERE path = ?
+               OR path = ?
+               OR path GLOB ?
+               OR path GLOB ?
+            ORDER BY CASE WHEN processingState = 1 THEN 0 ELSE 1 END, id DESC
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, stem, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 2, "\(stem).mp4", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 3, "*/\(stem)", -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 4, "*/\(stem).mp4", -1, SQLITE_TRANSIENT)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        return try parseVideoRow(statement: statement!)
+    }
+
     // MARK: - Select by Timestamp
 
     /// Find video containing a frame at the given timestamp
     static func getByTimestamp(db: OpaquePointer, timestamp: Date) throws -> VideoSegment? {
         // Query through frames to find the video
         let sql = """
-            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameCount, v.frameRate
             FROM video v
             INNER JOIN frame f ON f.videoId = v.id
             WHERE f.createdAt = ?
@@ -344,7 +380,7 @@ enum SegmentQueries {
         to endDate: Date
     ) throws -> [VideoSegment] {
         let sql = """
-            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameRate
+            SELECT DISTINCT v.id, v.height, v.width, v.path, v.fileSize, v.frameCount, v.frameRate
             FROM video v
             INNER JOIN frame f ON f.videoId = v.id
             WHERE f.createdAt >= ? AND f.createdAt <= ?
@@ -451,7 +487,7 @@ enum SegmentQueries {
     // MARK: - Helpers
 
     /// Parse a video row from the video table
-    /// Expected columns: id, height, width, path, fileSize, frameRate
+    /// Expected columns: id, height, width, path, fileSize, frameCount, frameRate
     private static func parseVideoRow(statement: OpaquePointer) throws -> VideoSegment {
         // Column 0: id (INTEGER)
         let videoId = sqlite3_column_int64(statement, 0)
@@ -472,15 +508,16 @@ enum SegmentQueries {
         // Column 4: fileSize (nullable)
         let fileSizeBytes = sqlite3_column_int64(statement, 4)
 
-        // Column 5: frameRate
-        let frameRate = sqlite3_column_double(statement, 5)
+        // Column 5: frameCount
+        let frameCount = Int(sqlite3_column_int(statement, 5))
 
-        // Note: The video table doesn't have startTime/endTime/frameCount
-        // Those need to be queried from the frames table if needed
-        // For now, use placeholder values (will be computed from frames when needed)
+        // Column 6: frameRate (currently unused by VideoSegment)
+        _ = sqlite3_column_double(statement, 6)
+
+        // Note: The video table doesn't have startTime/endTime.
+        // Those need to be queried from the frames table if needed.
         let startTime = Date(timeIntervalSince1970: 0)
         let endTime = Date(timeIntervalSince1970: 0)
-        let frameCount = 150 // Standard 150 frames per video (5 seconds @ 30 FPS)
 
         return VideoSegment(
             id: id,

@@ -40,6 +40,7 @@ public struct FeedbackLaunchContext {
     public enum Source: String {
         case manual
         case crashBanner
+        case walFailureCrashBanner
     }
 
     public enum PreferredFocusField {

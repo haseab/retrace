@@ -70,10 +70,12 @@ public actor ServiceContainer {
         self.searchConfig = searchConfig
 
         // Initialize all managers
-        self.database = DatabaseManager(databasePath: databasePath)
+        self.database = DatabaseManager(
+            databasePath: databasePath,
+            storageRootPath: storageConfig.expandedStorageRootPath
+        )
         self.ftsEngine = FTSManager(databasePath: databasePath)
-        // Use the correct storage root (respects custom path setting)
-        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let storageRootURL = URL(fileURLWithPath: storageConfig.expandedStorageRootPath, isDirectory: true)
         self.storage = StorageManager(storageRoot: storageRootURL)
         self.capture = CaptureManager(config: captureConfig)
         // ⚠️ RELEASE 2 ONLY - Audio initialization commented out
@@ -151,10 +153,15 @@ public actor ServiceContainer {
         // self.audioProcessingConfig = .default
         self.searchConfig = .default
 
-        self.database = DatabaseManager(databasePath: sharedMemoryPath)
+        self.database = DatabaseManager(
+            databasePath: sharedMemoryPath,
+            storageRootPath: StorageConfig.default.expandedStorageRootPath
+        )
         self.ftsEngine = FTSManager(databasePath: sharedMemoryPath)
-        // Use the correct storage root (respects custom path setting)
-        let storageRootURL = URL(fileURLWithPath: AppPaths.expandedStorageRoot, isDirectory: true)
+        let storageRootURL = URL(
+            fileURLWithPath: StorageConfig.default.expandedStorageRootPath,
+            isDirectory: true
+        )
         self.storage = StorageManager(storageRoot: storageRootURL)
         self.capture = CaptureManager()
         // ⚠️ RELEASE 2 ONLY
@@ -230,22 +237,35 @@ public actor ServiceContainer {
 
         // 3. Initialize storage (creates directories, loads encryption key)
         try await storage.initialize(config: storageConfig)
-        Log.info("✓ Storage initialized", category: .app)
+        if let walIssue = await storage.currentWALAvailabilityIssue() {
+            Log.error(
+                "⚠️ Storage initialized in degraded mode - startup WAL initialization failed at \(walIssue.walRootPath): \(walIssue.reason)",
+                category: .app
+            )
+        } else {
+            Log.info("✓ Storage initialized", category: .app)
+        }
 
         // DIAGNOSTIC: Log critical paths for troubleshooting database/storage mismatches
         Log.info("=== Storage Configuration ===", category: .app)
-        Log.info("Storage Root: \(AppPaths.storageRoot)", category: .app)
-        Log.info("Expanded Root: \(AppPaths.expandedStorageRoot)", category: .app)
-        Log.info("Database Path: \(AppPaths.databasePath)", category: .app)
+        Log.info("Storage Root: \(storageConfig.storageRootPath)", category: .app)
+        Log.info("Expanded Root: \(storageConfig.expandedStorageRootPath)", category: .app)
+        Log.info("Database Path: \(databasePath)", category: .app)
         let fm = FileManager.default
-        let chunksPath = "\(AppPaths.expandedStorageRoot)/chunks"
-        let dbPath = NSString(string: AppPaths.databasePath).expandingTildeInPath
-        Log.info("Database exists: \(fm.fileExists(atPath: dbPath))", category: .app)
+        let chunksPath = "\(storageConfig.expandedStorageRootPath)/chunks"
+        let dbPath = databasePath.hasPrefix("file:")
+            ? nil
+            : NSString(string: databasePath).expandingTildeInPath
+        if let dbPath {
+            Log.info("Database exists: \(fm.fileExists(atPath: dbPath))", category: .app)
+        } else {
+            Log.info("Database exists: n/a (URI database path)", category: .app)
+        }
         Log.info("Chunks folder exists: \(fm.fileExists(atPath: chunksPath))", category: .app)
 
         // SAFETY: If database exists but chunks folder is missing, clear processing queue
         // This prevents infinite retry loops from orphaned frame records
-        if fm.fileExists(atPath: dbPath) && !fm.fileExists(atPath: chunksPath) {
+        if let dbPath, fm.fileExists(atPath: dbPath), !fm.fileExists(atPath: chunksPath) {
             Log.error("⚠️ CRITICAL: Database exists but chunks folder missing!", category: .app)
             Log.warning("Clearing processing queue to prevent failures...", category: .app)
 
@@ -300,7 +320,7 @@ public actor ServiceContainer {
 
         // Create connections and config for Retrace
         let retraceConnection = SQLiteConnection(db: dbPointer)
-        let retraceConfig = DatabaseConfig.retrace
+        let retraceConfig = DatabaseConfig.retrace(storageRoot: storageConfig.expandedStorageRootPath)
         let retraceImageExtractor = HEVCStorageExtractor(storageManager: storage)
 
         let adapter = DataAdapter(

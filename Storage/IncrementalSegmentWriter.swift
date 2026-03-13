@@ -23,6 +23,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
     public private(set) var hasFragmentWritten: Bool = false
     public private(set) var framesFlushedToDisk: Int = 0
+    public private(set) var durableFileSizeBytes: Int64 = 0
 
     private let encoder: HEVCEncoder
     private let encoderConfig: VideoEncoderConfig
@@ -115,6 +116,7 @@ public actor IncrementalSegmentWriter: SegmentWriter {
 
         // Update the count of frames confirmed flushed to disk
         framesFlushedToDisk = await encoder.framesFlushedToDisk()
+        durableFileSizeBytes = await encoder.durableFileSizeBytes()
     }
 
     public func finalize() async throws -> VideoSegment {
@@ -144,13 +146,32 @@ public actor IncrementalSegmentWriter: SegmentWriter {
     }
 
     public func cancel() async throws {
+        try await cancelInternal(preserveWALForRecovery: false)
+    }
+
+    public func cancelPreservingRecoveryData() async throws {
+        try await cancelInternal(preserveWALForRecovery: true)
+    }
+
+    private func cancelInternal(preserveWALForRecovery: Bool) async throws {
         cancelled = true
         await encoder.reset()
         try? FileManager.default.removeItem(at: fileURL)
 
-        // Clean up WAL
-        if let session = walSession {
-            try? await walManager.finalizeSession(session)
+        guard let session = walSession else {
+            return
         }
+        walSession = nil
+
+        if preserveWALForRecovery {
+            // Preserve the WAL so startup recovery can salvage frames after writer/encoder failures.
+            Log.warning(
+                "[IncrementalWriter] Cancelled writer for segment \(segmentID.value); preserved WAL session for recovery",
+                category: .storage
+            )
+            return
+        }
+
+        try await walManager.finalizeSession(session)
     }
 }

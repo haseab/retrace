@@ -50,12 +50,12 @@ extension DatabaseConfig {
     /// Configuration for native Retrace data source
     /// - INTEGER timestamps (milliseconds since epoch)
     /// - No cutoff date (current/future data)
-    /// - Storage in AppPaths.expandedStorageRoot (respects custom location)
+    /// - Storage under the caller-provided root (defaults to AppPaths.expandedStorageRoot)
     /// Note: DB stores paths like "chunks/202601/17/...", so storageRoot should NOT include "chunks"
-    public static var retrace: DatabaseConfig {
-        return DatabaseConfig(
+    public static func retrace(storageRoot: String = AppPaths.expandedStorageRoot) -> DatabaseConfig {
+        DatabaseConfig(
             dateFormatter: nil, // Use INTEGER milliseconds
-            storageRoot: AppPaths.expandedStorageRoot,
+            storageRoot: NSString(string: storageRoot).expandingTildeInPath,
             source: .native,
             cutoffDate: nil, // No cutoff
             minimumDate: nil

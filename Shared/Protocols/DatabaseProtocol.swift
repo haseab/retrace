@@ -42,6 +42,9 @@ public protocol DatabaseProtocol: Actor {
     /// Delete frames older than a date
     func deleteFrames(olderThan date: Date) async throws -> Int
 
+    /// Delete a single frame by ID
+    func deleteFrame(id: FrameID) async throws
+
     /// Get total frame count
     func getFrameCount() async throws -> Int
 
@@ -81,6 +84,9 @@ public protocol DatabaseProtocol: Actor {
 
     /// Get video segment by ID
     func getVideoSegment(id: VideoSegmentID) async throws -> VideoSegment?
+
+    /// Find a video segment by the final path component of its relative path.
+    func findVideoSegment(relativePathStem: String) async throws -> VideoSegment?
 
     /// Get video segment containing a specific timestamp
     func getVideoSegment(containingTimestamp date: Date) async throws -> VideoSegment?

@@ -4,13 +4,25 @@ import Foundation
 import Shared
 import CoreMedia
 
+public struct WALAvailabilityIssue: Sendable, Equatable {
+    public let walRootPath: String
+    public let operation: String
+    public let reason: String
+    public let detectedAt: Date
+    public let reportPath: String?
+}
+
 /// Main StorageProtocol implementation.
 public actor StorageManager: StorageProtocol {
+    private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     private var config: StorageConfig?
     private var storageRootURL: URL
     private let directoryManager: DirectoryManager
     private let encoderConfig: VideoEncoderConfig
+    private let walRootURL: URL
     private let walManager: WALManager
+    private let crashReportDirectory: String
+    private var walAvailabilityIssue: WALAvailabilityIssue?
 
     /// Counter to ensure unique segment IDs even if created within same millisecond
     private var segmentCounter: Int = 0
@@ -43,14 +55,17 @@ public actor StorageManager: StorageProtocol {
 
     public init(
         storageRoot: URL = URL(fileURLWithPath: StorageConfig.default.expandedStorageRootPath, isDirectory: true),
-        encoderConfig: VideoEncoderConfig = .default
+        encoderConfig: VideoEncoderConfig = .default,
+        crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory
     ) {
         self.storageRootURL = storageRoot
         self.directoryManager = DirectoryManager(storageRoot: storageRoot)
         self.encoderConfig = encoderConfig
+        self.crashReportDirectory = crashReportDirectory
 
         // Initialize WAL manager in wal/ subdirectory
         let walRoot = storageRoot.appendingPathComponent("wal", isDirectory: true)
+        self.walRootURL = walRoot
         self.walManager = WALManager(walRoot: walRoot)
     }
 
@@ -77,12 +92,20 @@ public actor StorageManager: StorageProtocol {
         try await directoryManager.ensureBaseDirectories()
 
         // Initialize WAL
-        try await walManager.initialize()
+        if await ensureWALReady(operation: "startup_initialization") {
+            _ = await walManager.cleanupQuarantinedSessions(
+                olderThan: Date().addingTimeInterval(-Self.discardableQuarantinedWALRetentionInterval)
+            )
+        }
     }
 
     public func createSegmentWriter() async throws -> SegmentWriter {
         guard config != nil else {
             throw StorageError.directoryCreationFailed(path: "Storage not initialized")
+        }
+        guard await ensureWALReady(operation: "capture_writer_prepare") else {
+            let reason = walAvailabilityIssue?.reason ?? "unknown WAL initialization failure"
+            throw StorageError.walUnavailable(reason: reason)
         }
 
         // Generate a unique ID based on current time (milliseconds since epoch)
@@ -108,6 +131,25 @@ public actor StorageManager: StorageProtocol {
     /// Get WAL manager for recovery operations
     public func getWALManager() -> WALManager {
         return walManager
+    }
+
+    public func validateCaptureReadiness() async throws {
+        guard config != nil else {
+            throw StorageError.directoryCreationFailed(path: "Storage not initialized")
+        }
+
+        guard await ensureWALReady(operation: "capture_start") else {
+            let reason = walAvailabilityIssue?.reason ?? "unknown WAL initialization failure"
+            throw StorageError.walUnavailable(reason: reason)
+        }
+    }
+
+    public func currentWALAvailabilityIssue() -> WALAvailabilityIssue? {
+        walAvailabilityIssue
+    }
+
+    public func isWALReady() -> Bool {
+        walAvailabilityIssue == nil
     }
 
     /// Clear all WAL sessions (used when changing database location)
@@ -904,6 +946,139 @@ public actor StorageManager: StorageProtocol {
 
     public func getStorageDirectory() -> URL {
         storageRootURL
+    }
+
+    @discardableResult
+    private func ensureWALReady(operation: String) async -> Bool {
+        do {
+            try await walManager.initialize()
+
+            if walAvailabilityIssue != nil {
+                Log.info("[WAL] WAL storage repaired during \(operation)", category: .storage)
+            }
+
+            walAvailabilityIssue = nil
+            return true
+        } catch {
+            let reason = error.localizedDescription
+            let detectedAt = Date()
+            let reportPath: String?
+            if walAvailabilityIssue?.reason == reason {
+                reportPath = walAvailabilityIssue?.reportPath
+            } else {
+                reportPath = writeWALUnavailableReport(
+                    operation: operation,
+                    error: error,
+                    detectedAt: detectedAt
+                )
+            }
+
+            walAvailabilityIssue = WALAvailabilityIssue(
+                walRootPath: walRootURL.path,
+                operation: operation,
+                reason: reason,
+                detectedAt: detectedAt,
+                reportPath: reportPath
+            )
+
+            Log.error(
+                "[WAL] WAL unavailable during \(operation): \(reason). Crash recovery was skipped and new WAL session creation may fail until the storage path is repaired.",
+                category: .storage
+            )
+            return false
+        }
+    }
+
+    private func writeWALUnavailableReport(
+        operation: String,
+        error: Error,
+        detectedAt: Date
+    ) -> String? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        let nsError = error as NSError
+        var report = ""
+        report += "=== RETRACE EMERGENCY DIAGNOSTIC ===\n"
+        report += "Trigger: wal_unavailable\n"
+        report += "Timestamp: \(formatter.string(from: detectedAt))\n"
+        report += "Operation: \(operation)\n\n"
+
+        report += "--- SUMMARY ---\n"
+        report += "Retrace could not initialize the write-ahead log (WAL).\n"
+        report += "Startup recovery was skipped, and Retrace will retry WAL setup the next time it needs a new session.\n\n"
+
+        report += "--- FAILURE ---\n"
+        report += "Storage Root: \(storageRootURL.path)\n"
+        report += "WAL Root: \(walRootURL.path)\n"
+        report += "Error Type: \(String(reflecting: type(of: error)))\n"
+        report += "Error Description: \(error.localizedDescription)\n"
+        report += "NSError Domain: \(nsError.domain)\n"
+        report += "NSError Code: \(nsError.code)\n"
+        if let failureReason = nsError.localizedFailureReason {
+            report += "Failure Reason: \(failureReason)\n"
+        }
+        if let recoverySuggestion = nsError.localizedRecoverySuggestion {
+            report += "Recovery Suggestion: \(recoverySuggestion)\n"
+        }
+        report += "\n"
+
+        report += "--- WAL ROOT STATE ---\n"
+        report += describeFilesystemItem(at: walRootURL)
+        report += "\n--- WAL PARENT STATE ---\n"
+        report += describeFilesystemItem(at: walRootURL.deletingLastPathComponent())
+
+        report += "\n--- IMPACT ---\n"
+        report += "Skipped: WAL crash recovery for active sessions during startup.\n"
+        report += "May fail later: creating a new WAL session if the storage path is still broken.\n"
+        report += "Should still work: existing timeline/search data and reads from finalized video files.\n\n"
+
+        report += "--- SELF-HEALING ---\n"
+        report += "Retrace will retry WAL initialization the next time recording is started.\n"
+        report += "If the filesystem issue is fixed, recording can recover without deleting existing data.\n\n"
+
+        report += "--- REPAIR ACTIONS ---\n"
+        report += "1. Reconnect the configured storage volume if it is unavailable.\n"
+        report += "2. Ensure Retrace can create and write files under the storage root.\n"
+        report += "3. Remove or rename any non-directory item occupying the WAL path if one still exists.\n"
+
+        return EmergencyDiagnostics.writeReport(
+            trigger: "wal_unavailable",
+            body: report,
+            directory: crashReportDirectory
+        )
+    }
+
+    private func describeFilesystemItem(at url: URL) -> String {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+
+        var lines = [
+            "Path: \(url.path)",
+            "Exists: \(exists)"
+        ]
+
+        guard exists else {
+            return lines.joined(separator: "\n") + "\n"
+        }
+
+        lines.append("Kind: \(isDirectory.boolValue ? "directory" : "file")")
+        lines.append("Readable: \(FileManager.default.isReadableFile(atPath: url.path))")
+        lines.append("Writable: \(FileManager.default.isWritableFile(atPath: url.path))")
+
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) {
+            if let fileType = attributes[.type] as? FileAttributeType {
+                lines.append("File Type: \(fileType.rawValue)")
+            }
+            if let permissions = attributes[.posixPermissions] as? NSNumber {
+                lines.append(String(format: "POSIX Permissions: %03o", permissions.intValue))
+            }
+            if let size = attributes[.size] as? NSNumber {
+                lines.append("Size Bytes: \(size.int64Value)")
+            }
+        }
+
+        return lines.joined(separator: "\n") + "\n"
     }
 
     // MARK: - Cache Management
