@@ -375,9 +375,9 @@ struct BrowserURLExtractor: Sendable {
         "com.operasoftware.Opera",
         "com.nickvision.browser",      // GNOME Web
         "com.openai.chat",             // ChatGPT desktop app
-        "com.cometbrowser.Comet",      // Comet Browser
+        "ai.perplexity.comet",         // Comet Browser
         "org.chromium.Chromium",       // Chromium
-        "com.sigmaos.sigmaos",         // SigmaOS
+        "com.sigmaos.sigmaos.macos",   // SigmaOS
         "com.nicklockwood.Duckduckgo", // DuckDuckGo
         "com.duckduckgo.macos.browser", // DuckDuckGo (alternate)
         "com.nicklockwood.iCab",       // iCab
@@ -404,9 +404,9 @@ struct BrowserURLExtractor: Sendable {
         "com.vivaldi.Vivaldi.app.",
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
-        "com.cometbrowser.Comet.app.",
+        "ai.perplexity.comet.app.",
         "company.thebrowser.dia.app.",
-        "com.sigmaos.sigmaos.app.",
+        "com.sigmaos.sigmaos.macos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
     ]
@@ -420,8 +420,8 @@ struct BrowserURLExtractor: Sendable {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "org.chromium.Chromium",
-        "com.sigmaos.sigmaos",
-        "com.cometbrowser.Comet",
+        "com.sigmaos.sigmaos.macos",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
@@ -530,12 +530,15 @@ struct BrowserURLExtractor: Sendable {
             url = nil
         }
 
-        if let url = url, !url.isEmpty {
+        if let url = sanitizedBrowserURLCandidate(url, for: bundleID) {
             return url
         }
 
         // Fallback: Try generic AX-based URL extraction for any browser.
-        return getURLViaWebArea(bundleID: bundleID, pid: pid)
+        return sanitizedBrowserURLCandidate(
+            getURLViaWebArea(bundleID: bundleID, pid: pid),
+            for: bundleID
+        )
     }
 
     // MARK: - Safari
@@ -586,8 +589,26 @@ struct BrowserURLExtractor: Sendable {
         pid: pid_t,
         windowCacheKey: String?
     ) async -> String? {
-        if let url = getChromiumURLViaAX(pid: pid) {
+        let axURL = getChromiumURLViaAX(pid: pid)
+        if let url = sanitizedBrowserURLCandidate(axURL, for: bundleID) {
             return url
+        }
+
+        if bundleID == "com.vivaldi.Vivaldi" {
+            if let rawAXURL = axURL,
+               isBrowserInternalURL(rawAXURL, for: bundleID) {
+                Log.debug(
+                    "[BrowserURL] [\(bundleID)] AX returned browser-internal URL; trying AppleScript active-tab fallback",
+                    category: .capture
+                )
+            }
+
+            if let url = await getVivaldiURLViaAppleScript(
+                pid: pid,
+                windowCacheKey: windowCacheKey
+            ) {
+                return url
+            }
         }
 
         // Chromium app shims (PWAs) often hide URL attributes in AX.
@@ -599,6 +620,69 @@ struct BrowserURLExtractor: Sendable {
             ) {
                 return url
             }
+        }
+
+        return nil
+    }
+
+    private static func getVivaldiURLViaAppleScript(
+        pid: pid_t,
+        windowCacheKey: String?
+    ) async -> String? {
+        let vivaldiBundleID = "com.vivaldi.Vivaldi"
+        let outputValidator: @Sendable (String) -> Bool = { output in
+            sanitizedBrowserURLCandidate(output, for: vivaldiBundleID) != nil
+        }
+
+        let method1Result = await appleScriptCoordinator.execute(
+            source:
+            """
+            tell application id "\(vivaldiBundleID)"
+                if (count of windows) > 0 then
+                    get URL of active tab of front window
+                end if
+            end tell
+            """,
+            browserBundleID: vivaldiBundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey,
+            scriptLabel: "vivaldi-active-tab-front-window",
+            outputValidator: outputValidator
+        )
+        if let url = extractValidatedURL(from: method1Result) {
+            let source = method1Result.returnedFromCache ? "cache" : "AppleScript method 1"
+            Log.info("[BrowserURL] [\(vivaldiBundleID)] ✅ URL extracted via \(source)", category: .capture)
+            return url
+        }
+
+        if method1Result.skippedByCooldown {
+            Log.debug("[BrowserURL] [\(vivaldiBundleID)] AppleScript in cooldown; skipping additional fallback", category: .capture)
+            return nil
+        }
+        if method1Result.didTimeOut {
+            Log.warning("[BrowserURL] [\(vivaldiBundleID)] AppleScript timed out; skipping additional fallback", category: .capture)
+            return nil
+        }
+
+        let method2Result = await appleScriptCoordinator.execute(
+            source:
+            """
+            tell application id "\(vivaldiBundleID)"
+                if (count of windows) > 0 then
+                    get URL of active tab of window 1
+                end if
+            end tell
+            """,
+            browserBundleID: vivaldiBundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey,
+            scriptLabel: "vivaldi-active-tab-window-1",
+            outputValidator: outputValidator
+        )
+        if let url = extractValidatedURL(from: method2Result) {
+            let source = method2Result.returnedFromCache ? "cache" : "AppleScript method 2"
+            Log.info("[BrowserURL] [\(vivaldiBundleID)] ✅ URL extracted via \(source)", category: .capture)
+            return url
         }
 
         return nil
@@ -1138,6 +1222,34 @@ struct BrowserURLExtractor: Sendable {
 
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func sanitizedBrowserURLCandidate(_ url: String?, for bundleID: String) -> String? {
+        guard let url = normalizedAXURLValue(from: url),
+              looksLikeURL(url),
+              !isBrowserInternalURL(url, for: bundleID) else {
+            return nil
+        }
+        return url
+    }
+
+    private static func isBrowserInternalURL(_ url: String, for bundleID: String) -> Bool {
+        let normalizedURL = url.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalizedURL.isEmpty else {
+            return false
+        }
+
+        if normalizedURL.hasPrefix("chrome-extension://") ||
+            normalizedURL.hasPrefix("chrome://") ||
+            normalizedURL.hasPrefix("devtools://") {
+            return true
+        }
+
+        if bundleID == "com.vivaldi.Vivaldi", normalizedURL.hasPrefix("vivaldi://") {
+            return true
+        }
+
+        return false
     }
 
     private static func getAXURLString(_ element: AXUIElement, _ attribute: CFString) -> String? {

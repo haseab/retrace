@@ -103,6 +103,7 @@ private struct InPageURLBrowserTarget: Identifiable, Hashable {
 private struct UnsupportedInPageURLTarget: Identifiable, Hashable {
     let bundleID: String
     let displayName: String
+    let reason: String
     let appURL: URL?
 
     var id: String { bundleID }
@@ -524,16 +525,18 @@ public struct SettingsView: View {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
-        "com.cometbrowser.Comet",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
-        "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]
-    private static let inPageURLUnsupportedFirefoxBundleIDs: [String] = [
+    private static let inPageURLUnsupportedBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
         "org.mozilla.firefoxdeveloperedition",
         "org.mozilla.nightly",
+        "com.duckduckgo.macos.browser",
+        "com.sigmaos.sigmaos.macos",
+        "com.openai.atlas",
     ]
     private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
         "com.google.Chrome",
@@ -544,9 +547,8 @@ public struct SettingsView: View {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
-        "com.cometbrowser.Comet",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
-        "com.sigmaos.sigmaos",
         "com.nicklockwood.Thorium",
     ]
     private static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
@@ -2302,7 +2304,13 @@ public struct SettingsView: View {
                                 isExpanded: $isChromeInPageInstructionsExpanded
                             ) {
                                 VStack(alignment: .leading, spacing: 10) {
-                                    Text("Open your Chromium-based browser, then go to View > Developer > Allow JavaScript from Apple Events.")
+                                    if inPageURLTargets.contains(where: { $0.bundleID == "com.vivaldi.Vivaldi" }) {
+                                        Text("In Vivaldi, enable Settings > Privacy and Security > Apple Events > Allow JavaScript from Apple Events.")
+                                            .font(.retraceCaption2)
+                                            .foregroundColor(.retraceSecondary)
+                                    }
+
+                                    Text("For Chrome, Arc, Edge, Brave, Chromium, Opera, Comet, Dia, and Thorium, open View > Developer > Allow JavaScript from Apple Events.")
                                         .font(.retraceCaption2)
                                         .foregroundColor(.retraceSecondary)
 
@@ -2585,7 +2593,7 @@ public struct SettingsView: View {
                 Text(target.displayName)
                     .font(.retraceCalloutMedium)
                     .foregroundColor(.retracePrimary.opacity(0.7))
-                Text("Firefox does not support in-page URL extraction in Retrace.")
+                Text(target.reason)
                     .font(.retraceCaption2)
                     .foregroundColor(.retraceSecondary)
             }
@@ -7386,11 +7394,15 @@ extension SettingsView {
             return "Opera"
         case "company.thebrowser.Browser":
             return "Arc"
-        case "com.cometbrowser.Comet":
+        case "ai.perplexity.comet":
             return "Comet"
         case "company.thebrowser.dia":
             return "Dia"
-        case "com.sigmaos.sigmaos":
+        case "com.duckduckgo.macos.browser":
+            return "DuckDuckGo"
+        case "com.openai.atlas":
+            return "ChatGPT Atlas"
+        case "com.sigmaos.sigmaos.macos":
             return "SigmaOS"
         case "com.nicklockwood.Thorium":
             return "Thorium"
@@ -7401,7 +7413,7 @@ extension SettingsView {
 
     @MainActor
     private func refreshUnsupportedInPageURLTargets() async {
-        unsupportedInPageURLTargets = Self.inPageURLUnsupportedFirefoxBundleIDs.compactMap { bundleID in
+        unsupportedInPageURLTargets = Self.inPageURLUnsupportedBundleIDs.compactMap { bundleID in
             guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
                 return nil
             }
@@ -7419,11 +7431,35 @@ extension SettingsView {
             return UnsupportedInPageURLTarget(
                 bundleID: bundleID,
                 displayName: displayName,
+                reason: Self.inPageURLUnsupportedReason(for: bundleID),
                 appURL: appURL
             )
+        }.sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
     }
 
+    static func inPageURLUnsupportedReason(for bundleID: String) -> String {
+        switch bundleID {
+        case "org.mozilla.firefox",
+            "org.mozilla.firefoxbeta",
+            "org.mozilla.firefoxdeveloperedition",
+            "org.mozilla.nightly":
+            return "Firefox does not support in-page URL extraction in Retrace."
+        case "com.duckduckgo.macos.browser":
+            return "DuckDuckGo does not support in-page URL extraction in Retrace."
+        case "com.sigmaos.sigmaos.macos":
+            return "SigmaOS does not support in-page URL extraction in Retrace."
+        case "com.openai.atlas":
+            return "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+        default:
+            return "This browser does not support in-page URL extraction in Retrace."
+        }
+    }
+
+    static func isSupportedDirectInPageURLBrowserBundleID(_ bundleID: String) -> Bool {
+        inPageURLKnownBrowserBundleIDs.contains(bundleID)
+    }
     private func inPageURLJavaScriptFromAppleEventsReminder(for bundleID: String) -> String {
         let automationBundleID = Self.resolvedInPageURLAutomationBundleID(for: bundleID)
         guard automationBundleID != bundleID else {

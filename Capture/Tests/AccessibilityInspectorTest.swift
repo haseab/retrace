@@ -2,6 +2,7 @@ import XCTest
 import AppKit
 import ApplicationServices
 import Shared
+@testable import Capture
 
 /// Interactive test to inspect accessibility data from the active window
 /// Shows what metadata Retrace can capture for segments and FTS indexing
@@ -17,12 +18,21 @@ final class AccessibilityInspectorTest: XCTestCase {
     // File handle for logging - make it an instance variable so other methods can access it
     private var logFileHandle: FileHandle?
     private let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+    private let appInfoProvider = AppInfoProvider()
 
     // Interactive inspector should only run when explicitly opted in.
     private let interactiveInspectorEnabled = ProcessInfo.processInfo.environment["RUN_INTERACTIVE_ACCESSIBILITY_INSPECTOR"] == "1"
 
     // Set AX_VERBOSE=1 to see detailed extraction attempts (noisy)
     private let verboseLogging = ProcessInfo.processInfo.environment["AX_VERBOSE"] == "1"
+
+    func testIsBrowserAppDelegatesToProductionBrowserRecognizer() {
+        XCTAssertTrue(isBrowserApp("com.duckduckgo.macos.browser"))
+        XCTAssertTrue(isBrowserApp("ai.perplexity.comet"))
+        XCTAssertTrue(isBrowserApp("com.google.Chrome.app.cadlkienfkclaiaibeoongdcgmdikeeg"))
+        XCTAssertFalse(isBrowserApp("com.apple.finder"))
+        XCTAssertFalse(isBrowserApp("com.example.notabrowser"))
+    }
 
     private let chromiumBundleIDs: Set<String> = [
         "com.google.Chrome",
@@ -32,8 +42,8 @@ final class AccessibilityInspectorTest: XCTestCase {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "org.chromium.Chromium",
-        "com.sigmaos.sigmaos",
-        "com.cometbrowser.Comet",
+        "com.sigmaos.sigmaos.macos",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
         "com.openai.chat",
         "com.nicklockwood.Thorium",
@@ -47,9 +57,9 @@ final class AccessibilityInspectorTest: XCTestCase {
         "com.vivaldi.Vivaldi.app.",
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
-        "com.cometbrowser.Comet.app.",
+        "ai.perplexity.comet.app.",
         "company.thebrowser.dia.app.",
-        "com.sigmaos.sigmaos.app.",
+        "com.sigmaos.sigmaos.macos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
     ]
@@ -190,15 +200,20 @@ final class AccessibilityInspectorTest: XCTestCase {
             return nil
         }
 
-        let appBundleID = frontApp.bundleIdentifier ?? "unknown"
-        let appName = frontApp.localizedName ?? "Unknown App"
+        // Mirror production capture so inspector output reflects the same title and URL logic.
+        let frontmostAppInfo = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: true)
+        let appBundleID = frontmostAppInfo.appBundleID ?? frontApp.bundleIdentifier ?? "unknown"
+        let appName = frontmostAppInfo.appName ?? frontApp.localizedName ?? "Unknown App"
 
         // Get accessibility element for the app
         let appElement = AXUIElementCreateApplication(frontApp.processIdentifier)
 
-        var windowTitle: String?
-        var browserURL: String?
+        var windowTitle = frontmostAppInfo.windowName
+        var browserURL = frontmostAppInfo.browserURL
         var urlMethod: String?
+        if browserURL != nil {
+            urlMethod = productionURLExtractionMethodDescription(for: appBundleID)
+        }
         var chromeText: String?
         var focusedWindowAXDocument: String?
         var bodyLinkObservations: [AXLinkObservation] = []
@@ -211,17 +226,20 @@ final class AccessibilityInspectorTest: XCTestCase {
                 focusedWindowAXDocument = nil
             }
 
-            // Get window title
-            windowTitle = getAttributeValue(focusedWindow, attribute: kAXTitleAttribute as CFString)
+            // Mirror production capture for title + browser URL.
+            windowTitle = frontmostAppInfo.windowName
+            browserURL = frontmostAppInfo.browserURL
+            if browserURL != nil {
+                urlMethod = productionURLExtractionMethodDescription(for: appBundleID)
+            }
+
+            // Keep raw AX probes as a fallback diagnostic only.
+            if windowTitle == nil {
+                windowTitle = getAttributeValue(focusedWindow, attribute: kAXTitleAttribute as CFString)
+            }
             if windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
                 windowTitle = getWindowTitleFromWindowList(for: frontApp.processIdentifier) ?? appName
             }
-
-            // Try to get URL context for any app (browser-specific + generic fallback)
-            let result = getBrowserURL(appElement: appElement, window: focusedWindow, bundleID: appBundleID)
-            browserURL = result.url
-            urlMethod = result.method
-
             // Chrome text is only meaningful for browser chrome areas
             if isBrowserApp(appBundleID) {
                 // Try to get status bar / menu bar text (chrome text)
@@ -257,22 +275,17 @@ final class AccessibilityInspectorTest: XCTestCase {
     }
 
     private func isBrowserApp(_ bundleID: String) -> Bool {
-        let browsers = [
-            "com.google.Chrome",
-            "com.apple.Safari",
-            "org.mozilla.firefox",
-            "com.microsoft.edgemac",
-            "com.brave.Browser",
-            "com.vivaldi.Vivaldi",
-            "com.operasoftware.Opera",
-            "company.thebrowser.dia",
-            "company.thebrowser.Browser"  // Arc
-        ]
-        if browsers.contains(bundleID) {
-            return true
-        }
+        BrowserURLExtractor.isBrowser(bundleID)
+    }
 
-        return chromiumAppShimPrefixes.contains(where: { bundleID.hasPrefix($0) })
+    private func productionURLExtractionMethodDescription(for bundleID: String) -> String? {
+        if bundleID == "com.apple.finder" {
+            return "AppInfoProvider -> BrowserURLExtractor.getURL (production Finder path)"
+        }
+        guard BrowserURLExtractor.isBrowser(bundleID) else {
+            return nil
+        }
+        return "AppInfoProvider -> BrowserURLExtractor.getURL (production capture path)"
     }
 
     private func isChromiumBundleID(_ bundleID: String) -> Bool {

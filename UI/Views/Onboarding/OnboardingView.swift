@@ -21,6 +21,7 @@ private struct AutomationPreflightTarget: Identifiable, Hashable, Sendable {
 private struct UnsupportedAutomationTarget: Identifiable, Hashable, Sendable {
     let bundleID: String
     let displayName: String
+    let reason: String
     let appURL: URL?
 
     var id: String { bundleID }
@@ -87,9 +88,9 @@ public struct OnboardingView: View {
         "com.vivaldi.Vivaldi.app.",
         "com.operasoftware.Opera.app.",
         "org.chromium.Chromium.app.",
-        "com.cometbrowser.Comet.app.",
+        "ai.perplexity.comet.app.",
         "company.thebrowser.dia.app.",
-        "com.sigmaos.sigmaos.app.",
+        "com.sigmaos.sigmaos.macos.app.",
         "com.openai.chat.app.",
         "com.nicklockwood.Thorium.app.",
     ]
@@ -99,18 +100,38 @@ public struct OnboardingView: View {
             return String(prefix.dropLast(5))
         }
     )
-    private static let unsupportedFirefoxBundleIDs: [String] = [
+    private static let unsupportedAutomationBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
         "org.mozilla.firefoxdeveloperedition",
         "org.mozilla.nightly",
+        "com.openai.atlas",
     ]
     // Exact apps where Retrace uses AppleScript-based URL extraction.
     private static let automationPreflightBaseTargets: [AutomationPreflightTarget] = [
         AutomationPreflightTarget(bundleID: "com.apple.finder", displayName: "Finder", appURL: nil),
         AutomationPreflightTarget(bundleID: "company.thebrowser.Browser", displayName: "Arc", appURL: nil),
+        AutomationPreflightTarget(bundleID: "com.vivaldi.Vivaldi", displayName: "Vivaldi", appURL: nil),
+        AutomationPreflightTarget(bundleID: "com.openai.chat", displayName: "ChatGPT", appURL: nil),
     ]
 
+    static var automationDirectPreflightTargetBundleIDs: [String] {
+        automationPreflightBaseTargets.map(\.bundleID)
+    }
+
+    static func unsupportedAutomationReason(for bundleID: String) -> String {
+        switch bundleID {
+        case "org.mozilla.firefox",
+            "org.mozilla.firefoxbeta",
+            "org.mozilla.firefoxdeveloperedition",
+            "org.mozilla.nightly":
+            return "Firefox does not support in-page URL extraction in Retrace."
+        case "com.openai.atlas":
+            return "ChatGPT Atlas does not support in-page URL extraction in Retrace."
+        default:
+            return "This app does not support in-page URL extraction in Retrace."
+        }
+    }
     // Load saved shortcuts or use defaults
     private static func loadTimelineShortcut() -> ShortcutConfig {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -976,7 +997,7 @@ public struct OnboardingView: View {
 
     @MainActor
     private func refreshUnsupportedAutomationTargets() async {
-        unsupportedAutomationTargets = Self.unsupportedFirefoxBundleIDs.compactMap { bundleID in
+        unsupportedAutomationTargets = Self.unsupportedAutomationBundleIDs.compactMap { bundleID in
             guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
                 return nil
             }
@@ -994,8 +1015,11 @@ public struct OnboardingView: View {
             return UnsupportedAutomationTarget(
                 bundleID: bundleID,
                 displayName: displayName,
+                reason: Self.unsupportedAutomationReason(for: bundleID),
                 appURL: appURL
             )
+        }.sorted { lhs, rhs in
+            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
     }
 
@@ -1019,7 +1043,7 @@ public struct OnboardingView: View {
                     .font(.retraceBody)
                     .foregroundColor(.retracePrimary.opacity(0.7))
 
-                Text("Firefox is not supported for in-page URL extraction.")
+                Text(target.reason)
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
             }

@@ -49,9 +49,10 @@ UI/
 │   ├── DashboardViewModel.swift
 │   └── SettingsViewModel.swift
 └── Tests/
-    ├── TestLogger.swift                  # UI behavior + deeplink parsing tests
+    ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
-    └── ManualShowSearchSimulationTests.swift # Manual dev harness for showSearch deeplink simulation
+    ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
+    └── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
 ```
 
 ## Feature Requirements

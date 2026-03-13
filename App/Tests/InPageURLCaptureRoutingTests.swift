@@ -12,12 +12,20 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
             "com.google.Chrome"
         )
         XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "ai.perplexity.comet"),
+            "ai.perplexity.comet"
+        )
+        XCTAssertEqual(
             AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.Browser"),
             "company.thebrowser.Browser"
         )
         XCTAssertEqual(
             AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.dia"),
             "company.thebrowser.dia"
+        )
+        XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "com.sigmaos.sigmaos.macos"),
+            "com.sigmaos.sigmaos.macos"
         )
     }
 
@@ -31,8 +39,16 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
             "com.brave.Browser"
         )
         XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "ai.perplexity.comet.app.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            "ai.perplexity.comet"
+        )
+        XCTAssertEqual(
             AppCoordinator.inPageURLHostBrowserBundleID(for: "company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"),
             "company.thebrowser.dia"
+        )
+        XCTAssertEqual(
+            AppCoordinator.inPageURLHostBrowserBundleID(for: "com.sigmaos.sigmaos.macos.app.gggggggggggggggggggggggggggggggg"),
+            "com.sigmaos.sigmaos.macos"
         )
     }
 

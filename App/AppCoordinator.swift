@@ -2760,9 +2760,9 @@ public actor AppCoordinator {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
-        "com.cometbrowser.Comet",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
-        "com.sigmaos.sigmaos",
+        "com.sigmaos.sigmaos.macos",
         "com.nicklockwood.Thorium",
     ]
     private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
@@ -2774,9 +2774,9 @@ public actor AppCoordinator {
         "com.vivaldi.Vivaldi",
         "com.operasoftware.Opera",
         "company.thebrowser.Browser",
-        "com.cometbrowser.Comet",
+        "ai.perplexity.comet",
         "company.thebrowser.dia",
-        "com.sigmaos.sigmaos",
+        "com.sigmaos.sigmaos.macos",
         "com.nicklockwood.Thorium",
     ]
     private static let inPageURLRawLinkLimit = 100

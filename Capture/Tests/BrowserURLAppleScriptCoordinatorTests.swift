@@ -294,11 +294,18 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.microsoft.edgemac.app.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.brave.Browser.app.cccccccccccccccccccccccccccccccc"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("org.chromium.Chromium.app.dddddddddddddddddddddddddddddddd"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("ai.perplexity.comet.app.eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia.app.ffffffffffffffffffffffffffffffff"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.sigmaos.sigmaos.macos.app.gggggggggggggggggggggggggggggggg"))
     }
 
     func testIsBrowserRecognizesDiaBundleIDs() {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia"))
+    }
+
+    func testIsBrowserRecognizesInstalledCometAndSigmaOSBundleIDs() {
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("ai.perplexity.comet"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("com.sigmaos.sigmaos.macos"))
     }
 
     func testIsBrowserRejectsSafariWebApps() {
@@ -328,5 +335,33 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
     func testNormalizedAXURLValueRejectsEmptyAndUnsupportedValues() {
         XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: "   "))
         XCTAssertNil(BrowserURLExtractor.normalizedAXURLValue(from: 42))
+    }
+
+    func testSanitizedBrowserURLCandidateRejectsChromiumInternalPages() {
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "chrome-extension://mpognobbkildjkofajifpdfhcoklimli/window.html",
+                for: "com.vivaldi.Vivaldi"
+            )
+        )
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "chrome://settings",
+                for: "com.google.Chrome"
+            )
+        )
+        XCTAssertNil(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "vivaldi://settings",
+                for: "com.vivaldi.Vivaldi"
+            )
+        )
+        XCTAssertEqual(
+            BrowserURLExtractor.sanitizedBrowserURLCandidate(
+                "https://www.youtube.com/watch?v=abc123",
+                for: "com.vivaldi.Vivaldi"
+            ),
+            "https://www.youtube.com/watch?v=abc123"
+        )
     }
 }
