@@ -1457,14 +1457,16 @@ struct IncludeExcludeModeToggle: View {
         HStack(spacing: 6) {
             TogglePillButton(
                 title: "Include",
-                isSelected: mode == .include
+                isSelected: mode == .include,
+                selectedTint: RetraceMenuStyle.actionBlue
             ) {
                 mode = .include
             }
 
             TogglePillButton(
                 title: "Exclude",
-                isSelected: mode == .exclude
+                isSelected: mode == .exclude,
+                selectedTint: .orange.opacity(0.9)
             ) {
                 mode = .exclude
             }
@@ -1480,6 +1482,7 @@ struct IncludeExcludeModeToggle: View {
 private struct TogglePillButton: View {
     let title: String
     let isSelected: Bool
+    let selectedTint: Color
     let action: () -> Void
 
     @State private var isHovered = false
@@ -1496,7 +1499,7 @@ private struct TogglePillButton: View {
                     RoundedRectangle(cornerRadius: 5)
                         .fill(
                             isSelected
-                                ? RetraceMenuStyle.actionBlue
+                                ? selectedTint
                                 : (isHovered ? Color.white.opacity(0.08) : Color.clear)
                         )
                 )
