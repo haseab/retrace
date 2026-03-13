@@ -1,6 +1,7 @@
 import XCTest
 @testable import Retrace
 import Shared
+import App
 
 final class HyperlinkResolutionTests: XCTestCase {
     @MainActor
@@ -22,6 +23,76 @@ final class HyperlinkResolutionTests: XCTestCase {
                 baseURL: "https://retrace.to/docs/current"
             ),
             "https://retrace.to/pricing?ref=timeline"
+        )
+    }
+
+    @MainActor
+    func testInPageURLLinkMetricMetadataIncludesURLLinkTextAndNodeID() throws {
+        let metadata = try XCTUnwrap(
+            SimpleTimelineViewModel.inPageURLLinkMetricMetadata(
+                url: "https://retrace.to/pricing?ref=timeline",
+                linkText: "Pricing",
+                nodeID: 7
+            )
+        )
+
+        let data = try XCTUnwrap(metadata.data(using: .utf8))
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        )
+
+        XCTAssertEqual(payload["url"] as? String, "https://retrace.to/pricing?ref=timeline")
+        XCTAssertEqual(payload["linkText"] as? String, "Pricing")
+        XCTAssertEqual(payload["nodeID"] as? Int, 7)
+    }
+
+    @MainActor
+    func testBeginInPageURLHoverTrackingSuppressesDuplicateContinuousHover() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+
+        XCTAssertTrue(
+            viewModel.beginInPageURLHoverTracking(
+                url: "https://retrace.to/pricing?ref=timeline",
+                nodeID: 7,
+                frameID: FrameID(value: 42)
+            )
+        )
+        XCTAssertFalse(
+            viewModel.beginInPageURLHoverTracking(
+                url: "https://retrace.to/pricing?ref=timeline",
+                nodeID: 7,
+                frameID: FrameID(value: 42)
+            )
+        )
+
+        viewModel.endInPageURLHoverTracking()
+
+        XCTAssertTrue(
+            viewModel.beginInPageURLHoverTracking(
+                url: "https://retrace.to/pricing?ref=timeline",
+                nodeID: 7,
+                frameID: FrameID(value: 42)
+            )
+        )
+    }
+
+    @MainActor
+    func testBeginInPageURLHoverTrackingTreatsFrameChangesAsDistinctHovers() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+
+        XCTAssertTrue(
+            viewModel.beginInPageURLHoverTracking(
+                url: "https://retrace.to/pricing?ref=timeline",
+                nodeID: 7,
+                frameID: FrameID(value: 42)
+            )
+        )
+        XCTAssertTrue(
+            viewModel.beginInPageURLHoverTracking(
+                url: "https://retrace.to/pricing?ref=timeline",
+                nodeID: 7,
+                frameID: FrameID(value: 43)
+            )
         )
     }
 

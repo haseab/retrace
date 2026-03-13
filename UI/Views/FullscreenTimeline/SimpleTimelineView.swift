@@ -2141,6 +2141,9 @@ struct FrameWithURLOverlay<Content: View>: View {
                         OCRHyperlinkOverlay(
                             matches: viewModel.hyperlinkMatches,
                             actualFrameRect: actualFrameRect,
+                            onHoverChanged: { match in
+                                viewModel.updateInPageURLHoverState(match)
+                            },
                             onOpen: openHyperlink
                         )
                         .scaleEffect(viewModel.frameZoomScale)
@@ -2151,6 +2154,9 @@ struct FrameWithURLOverlay<Content: View>: View {
             }
             .onRightClick(
                 hyperlinkEntries: hyperlinkContextMenuEntries,
+                onHyperlinkRightClick: { match in
+                    viewModel.recordInPageURLRightClick(for: match)
+                },
                 onHyperlinkCopy: { match in
                     _ = viewModel.copyHyperlinkMatch(match)
                 }
@@ -3720,15 +3726,18 @@ class URLOverlayView: NSView {
 struct OCRHyperlinkOverlay: NSViewRepresentable {
     let matches: [OCRHyperlinkMatch]
     let actualFrameRect: CGRect
+    let onHoverChanged: (OCRHyperlinkMatch?) -> Void
     let onOpen: (OCRHyperlinkMatch) -> Void
 
     func makeNSView(context: Context) -> OCRHyperlinkOverlayView {
         let view = OCRHyperlinkOverlayView()
+        view.onHoverChanged = onHoverChanged
         view.onOpen = onOpen
         return view
     }
 
     func updateNSView(_ nsView: OCRHyperlinkOverlayView, context: Context) {
+        nsView.onHoverChanged = onHoverChanged
         nsView.onOpen = onOpen
         nsView.entries = matches.compactMap { match in
             let rect = CGRect(
@@ -3747,12 +3756,17 @@ final class OCRHyperlinkOverlayView: NSView {
     struct Entry {
         let match: OCRHyperlinkMatch
         let rect: CGRect
+
+        // Ignore transient row order so the same logical link stays hovered across remaps.
+        var hoverKey: String {
+            "\(match.nodeID)|\(match.url)"
+        }
     }
 
     var entries: [Entry] = [] {
         didSet {
-            if hoveredMatchID.flatMap({ id in entries.first(where: { $0.match.id == id }) }) == nil {
-                hoveredMatchID = nil
+            if hoveredMatchKey.flatMap({ key in entries.first(where: { $0.hoverKey == key }) }) == nil {
+                hoveredMatchKey = nil
             }
             needsDisplay = true
             needsLayout = true
@@ -3760,10 +3774,11 @@ final class OCRHyperlinkOverlayView: NSView {
         }
     }
 
+    var onHoverChanged: ((OCRHyperlinkMatch?) -> Void)?
     var onOpen: ((OCRHyperlinkMatch) -> Void)?
 
     private var trackingArea: NSTrackingArea?
-    private var hoveredMatchID: String?
+    private var hoveredMatchKey: String?
     private let idleBorderOffset: CGFloat = 2.5
     private let idleBorderThickness: CGFloat = 1.25
     private let borderCornerRadius: CGFloat = 6
@@ -3824,7 +3839,7 @@ final class OCRHyperlinkOverlayView: NSView {
         super.draw(dirtyRect)
 
         for entry in entries {
-            guard entry.match.id != hoveredMatchID else { continue }
+            guard entry.hoverKey != hoveredMatchKey else { continue }
             drawIdleBorder(for: entry)
         }
 
@@ -3851,18 +3866,21 @@ final class OCRHyperlinkOverlayView: NSView {
     }
 
     private func updateHoverState(at point: CGPoint) {
-        setHoveredMatch(match(at: point)?.id)
+        setHoveredMatch(
+            entries.first(where: { interactionRect(for: $0).contains(point) })?.hoverKey
+        )
     }
 
-    private func setHoveredMatch(_ matchID: String?) {
-        guard hoveredMatchID != matchID else { return }
-        hoveredMatchID = matchID
+    private func setHoveredMatch(_ hoverKey: String?) {
+        guard hoveredMatchKey != hoverKey else { return }
+        hoveredMatchKey = hoverKey
+        onHoverChanged?(hoveredEntry?.match)
         needsDisplay = true
     }
 
     private var hoveredEntry: Entry? {
-        guard let hoveredMatchID else { return nil }
-        return entries.first(where: { $0.match.id == hoveredMatchID })
+        guard let hoveredMatchKey else { return nil }
+        return entries.first(where: { $0.hoverKey == hoveredMatchKey })
     }
 
     private func drawIdleBorder(for entry: Entry) {
@@ -5930,6 +5948,7 @@ struct RightClickOverlay: ViewModifier {
 
     final class MonitorState: ObservableObject {
         var hyperlinkEntries: [HyperlinkContextMenuEntry] = []
+        var onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void = { _ in }
         var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
         var onRightClick: (CGPoint) -> Void = { _ in }
         var viewBounds: CGRect = .zero
@@ -5939,6 +5958,7 @@ struct RightClickOverlay: ViewModifier {
     struct MonitorStateSyncView: NSViewRepresentable {
         let monitorState: MonitorState
         let hyperlinkEntries: [HyperlinkContextMenuEntry]
+        let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
         let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
         let onRightClick: (CGPoint) -> Void
         let viewBounds: CGRect
@@ -5949,6 +5969,7 @@ struct RightClickOverlay: ViewModifier {
 
         func updateNSView(_ nsView: NSView, context: Context) {
             monitorState.hyperlinkEntries = hyperlinkEntries
+            monitorState.onHyperlinkRightClick = onHyperlinkRightClick
             monitorState.onCopyHyperlink = onHyperlinkCopy
             monitorState.onRightClick = onRightClick
             monitorState.viewBounds = viewBounds
@@ -5956,6 +5977,7 @@ struct RightClickOverlay: ViewModifier {
     }
 
     let hyperlinkEntries: [HyperlinkContextMenuEntry]
+    let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
     let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
     let onRightClick: (CGPoint) -> Void
     @State private var eventMonitor: Any?
@@ -5974,6 +5996,7 @@ struct RightClickOverlay: ViewModifier {
                 MonitorStateSyncView(
                     monitorState: monitorState,
                     hyperlinkEntries: hyperlinkEntries,
+                    onHyperlinkRightClick: onHyperlinkRightClick,
                     onHyperlinkCopy: onHyperlinkCopy,
                     onRightClick: onRightClick,
                     viewBounds: viewBounds
@@ -6015,6 +6038,7 @@ struct RightClickOverlay: ViewModifier {
 
     private func syncMonitorState() {
         monitorState.hyperlinkEntries = hyperlinkEntries
+        monitorState.onHyperlinkRightClick = onHyperlinkRightClick
         monitorState.onCopyHyperlink = onHyperlinkCopy
         monitorState.onRightClick = onRightClick
         monitorState.viewBounds = viewBounds
@@ -6051,6 +6075,7 @@ struct RightClickOverlay: ViewModifier {
                 if let matchedHyperlink, let contentView = window.contentView {
                     let target = monitorState.hyperlinkMenuTarget
                     target.match = matchedHyperlink.match
+                    monitorState.onHyperlinkRightClick(matchedHyperlink.match)
                     target.onCopyHyperlink = monitorState.onCopyHyperlink
 
                     let menu = NSMenu()
@@ -6086,12 +6111,14 @@ struct RightClickOverlay: ViewModifier {
 extension View {
     func onRightClick(
         hyperlinkEntries: [HyperlinkContextMenuEntry] = [],
+        onHyperlinkRightClick: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
         onHyperlinkCopy: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
         perform action: @escaping (CGPoint) -> Void
     ) -> some View {
         modifier(
             RightClickOverlay(
                 hyperlinkEntries: hyperlinkEntries,
+                onHyperlinkRightClick: onHyperlinkRightClick,
                 onHyperlinkCopy: onHyperlinkCopy,
                 onRightClick: action
             )

@@ -64,6 +64,10 @@ public enum DailyMetricsQueries {
         case inPageURLCollectionToggle = "in_page_url_collection_toggle"
         case inPageURLPermissionProbe = "in_page_url_permission_probe"
         case inPageURLVerification = "in_page_url_verification"
+        case inPageURLHover = "in_page_url_hover"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLClick = "in_page_url_click"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLRightClick = "in_page_url_right_click"  // metadata: JSON {url, linkText, nodeID}
+        case inPageURLCopyLink = "in_page_url_copy_link"  // metadata: JSON {url, linkText, nodeID}
         case browserLinkOpened = "browser_link_opened"
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}

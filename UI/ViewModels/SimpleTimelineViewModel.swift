@@ -4,6 +4,7 @@ import AVFoundation
 import AppKit
 import Shared
 import App
+import Database
 import Processing
 import SwiftyChrono
 import UniformTypeIdentifiers
@@ -431,6 +432,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentIndex: Int = 0 {
         didSet {
             if currentIndex != oldValue {
+                endInPageURLHoverTracking()
                 if Self.isVerboseTimelineLoggingEnabled {
                     Log.debug("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)", category: .ui)
                     if let frame = currentTimelineFrame {
@@ -647,6 +649,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Current in-flight task for stored hyperlink row loading.
     private var hyperlinkMappingTask: Task<Void, Never>?
+
+    /// Deduplicates a single continuous hover even if AppKit/SwiftUI replays hover callbacks.
+    private var activeInPageURLHoverMetricKey: String?
 
     // MARK: - Zoom Region State (Shift+Drag focus rectangle)
 
@@ -8647,17 +8652,143 @@ public class SimpleTimelineViewModel: ObservableObject {
         return components.queryItems?.contains(where: { $0.name.caseInsensitiveCompare("t") == .orderedSame }) == true
     }
 
+    static func inPageURLLinkMetricMetadata(
+        url: String,
+        linkText: String,
+        nodeID: Int
+    ) -> String? {
+        let payload: [String: Any] = [
+            "url": url,
+            "linkText": linkText,
+            "nodeID": nodeID
+        ]
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    private static func inPageURLLinkText(for match: OCRHyperlinkMatch) -> String {
+        let domText = match.domText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !domText.isEmpty {
+            return domText
+        }
+        return match.nodeText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func recordInPageURLLinkMetric(
+        metricType: DailyMetricsQueries.MetricType,
+        url: String,
+        linkText: String,
+        nodeID: Int
+    ) {
+        let metadata = Self.inPageURLLinkMetricMetadata(
+            url: url,
+            linkText: linkText,
+            nodeID: nodeID
+        )
+
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: metricType,
+                metadata: metadata
+            )
+        }
+    }
+
+    static func inPageURLHoverMetricKey(
+        frameID: FrameID?,
+        url: String,
+        nodeID: Int
+    ) -> String {
+        let frameToken = frameID.map { String($0.value) } ?? "none"
+        return "\(frameToken)|\(nodeID)|\(url)"
+    }
+
+    @discardableResult
+    func beginInPageURLHoverTracking(
+        url: String,
+        nodeID: Int,
+        frameID: FrameID?
+    ) -> Bool {
+        let key = Self.inPageURLHoverMetricKey(
+            frameID: frameID,
+            url: url,
+            nodeID: nodeID
+        )
+        guard activeInPageURLHoverMetricKey != key else {
+            return false
+        }
+        activeInPageURLHoverMetricKey = key
+        return true
+    }
+
+    func endInPageURLHoverTracking() {
+        activeInPageURLHoverMetricKey = nil
+    }
+
+    func updateInPageURLHoverState(_ match: OCRHyperlinkMatch?) {
+        guard let match else {
+            endInPageURLHoverTracking()
+            return
+        }
+
+        let resolvedURLString = resolvedHyperlinkURLString(for: match) ?? match.url
+        guard beginInPageURLHoverTracking(
+            url: resolvedURLString,
+            nodeID: match.nodeID,
+            frameID: currentFrame?.id
+        ) else {
+            return
+        }
+
+        recordInPageURLLinkMetric(
+            metricType: .inPageURLHover,
+            url: resolvedURLString,
+            linkText: Self.inPageURLLinkText(for: match),
+            nodeID: match.nodeID
+        )
+    }
+
+    func recordInPageURLRightClick(for match: OCRHyperlinkMatch) {
+        let resolvedURLString = resolvedHyperlinkURLString(for: match) ?? match.url
+        recordInPageURLLinkMetric(
+            metricType: .inPageURLRightClick,
+            url: resolvedURLString,
+            linkText: Self.inPageURLLinkText(for: match),
+            nodeID: match.nodeID
+        )
+    }
+
     @discardableResult
     public func openHyperlinkMatch(_ match: OCRHyperlinkMatch) -> Bool {
         guard let resolvedURLString = resolvedHyperlinkURLString(for: match),
               let url = URL(string: resolvedURLString) else {
             return false
         }
+        let coordinator = self.coordinator
+
+        recordInPageURLLinkMetric(
+            metricType: .inPageURLClick,
+            url: resolvedURLString,
+            linkText: Self.inPageURLLinkText(for: match),
+            nodeID: match.nodeID
+        )
 
         guard let browserApplicationURL = Self.hyperlinkBrowserApplicationURL(for: url) else {
             let opened = NSWorkspace.shared.open(url)
             if opened {
                 Log.info("[HyperlinkMap] Opened mapped hyperlink via fallback dispatch: \(resolvedURLString)", category: .ui)
+                DashboardViewModel.recordBrowserLinkOpened(
+                    coordinator: coordinator,
+                    source: "in_page_url_hyperlink",
+                    url: resolvedURLString,
+                    usedTextFragment: false,
+                    usedYouTubeTimestamp: false
+                )
             } else {
                 Log.warning("[HyperlinkMap] Failed to open mapped hyperlink: \(resolvedURLString)", category: .ui)
             }
@@ -8679,6 +8810,15 @@ public class SimpleTimelineViewModel: ObservableObject {
                     "[HyperlinkMap] Opened mapped hyperlink in explicit browser \(browserApplicationURL.path): \(resolvedURLString)",
                     category: .ui
                 )
+                Task { @MainActor in
+                    DashboardViewModel.recordBrowserLinkOpened(
+                        coordinator: coordinator,
+                        source: "in_page_url_hyperlink",
+                        url: resolvedURLString,
+                        usedTextFragment: false,
+                        usedYouTubeTimestamp: false
+                    )
+                }
             }
         }
         return true
@@ -8705,6 +8845,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(resolvedURLString, forType: .string)
+        recordInPageURLLinkMetric(
+            metricType: .inPageURLCopyLink,
+            url: resolvedURLString,
+            linkText: Self.inPageURLLinkText(for: match),
+            nodeID: match.nodeID
+        )
         showToast("Link copied")
         Log.info("[HyperlinkMap] Copied mapped hyperlink: \(resolvedURLString)", category: .ui)
         return true
@@ -8713,6 +8859,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func clearHyperlinkMatches() {
         hyperlinkMappingTask?.cancel()
         hyperlinkMappingTask = nil
+        endInPageURLHoverTracking()
         hyperlinkMatches = []
     }
 
