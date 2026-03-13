@@ -668,10 +668,10 @@ public class DashboardViewModel: ObservableObject {
         now _: Date = Date()
     ) -> String {
         return """
-        Retrace WAL Startup Failure
+        Retrace Recovery Failure
 
-        Retrace could not initialize the WAL during startup recovery.
-        Crash recovery was skipped, and new WAL sessions may fail until storage is repaired.
+        Retrace couldn't complete recovery during startup.
+        New recordings may fail until storage is repaired.
         Enter any other relevant context here:
         """
     }
@@ -782,6 +782,7 @@ public class DashboardViewModel: ObservableObject {
     }
 
     private func refreshRecentWALFailureCrashState(now: Date = Date()) {
+        let previousFileName = recentWALFailureCrash?.fileName
         let acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
         let report = Self.loadRecentWALFailureCrash(
             now: now,
@@ -789,6 +790,14 @@ public class DashboardViewModel: ObservableObject {
         )
 
         recentWALFailureCrash = report
+
+        if report?.fileName != previousFileName {
+            let acknowledgedList = acknowledgedFileNames.sorted().joined(separator: ", ")
+            Log.info(
+                "[RECOVERY BANNER] Refresh previous=\(previousFileName ?? "none") next=\(report?.fileName ?? "none") acknowledgedCount=\(acknowledgedFileNames.count) acknowledgedFiles=[\(acknowledgedList)]",
+                category: .ui
+            )
+        }
 
         guard let report, report.fileName != lastTrackedWALFailureBannerFileName else {
             return
@@ -801,8 +810,14 @@ public class DashboardViewModel: ObservableObject {
     private func acknowledgeRecentWALFailureCrash(action: String) {
         guard let report = recentWALFailureCrash else { return }
         var acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
+        let alreadyAcknowledged = acknowledgedFileNames.contains(report.fileName)
         acknowledgedFileNames.insert(report.fileName)
         persistAcknowledgedWALFailureCrashFileNames(acknowledgedFileNames)
+        let acknowledgedList = acknowledgedFileNames.sorted().joined(separator: ", ")
+        Log.info(
+            "[RECOVERY BANNER] Acknowledge action=\(action) file=\(report.fileName) alreadyAcknowledged=\(alreadyAcknowledged) acknowledgedCount=\(acknowledgedFileNames.count) acknowledgedFiles=[\(acknowledgedList)]",
+            category: .ui
+        )
         recordWALFailureBannerAction(action, report: report)
         recentWALFailureCrash = nil
     }

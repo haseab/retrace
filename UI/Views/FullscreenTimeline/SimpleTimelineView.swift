@@ -4495,6 +4495,8 @@ struct SearchHighlightOverlay: View {
     private let tooltipGap: CGFloat = 8
     private let highlightHorizontalPaddingFraction: CGFloat = 0.12
     private let highlightVerticalPaddingFraction: CGFloat = 0.14
+    private let tooltipHideDelay: TimeInterval = 0.18
+    private let tooltipHoverExitDelay: TimeInterval = 0.12
 
     private var liveMatches: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
         viewModel.searchHighlightNodes
@@ -4507,13 +4509,15 @@ struct SearchHighlightOverlay: View {
 
             SearchHighlightHoverTracker(
                 highlightedRects: highlightedRects,
-                onHoverLocationChanged: handleHoverLocationChanged
+                onHoverLocationChanged: handleHoverLocationChanged,
+                onInteractionLocationChanged: handleInteractionLocationChanged
             )
             .frame(width: containerSize.width, height: containerSize.height)
 
             if let tooltipPosition = tooltipPosition {
                 Button {
                     viewModel.copySearchHighlightedTextByLine(from: liveMatches)
+                    dismissTooltip()
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "doc.on.doc.fill")
@@ -4544,7 +4548,7 @@ struct SearchHighlightOverlay: View {
                     if isHovering {
                         cancelTooltipHide()
                     } else if !isHoveringHighlightedNode {
-                        scheduleTooltipHide(after: 0.20)
+                        scheduleTooltipHide(after: tooltipHoverExitDelay)
                     }
                 }
             }
@@ -4650,33 +4654,17 @@ struct SearchHighlightOverlay: View {
 
     private var tooltipInteractionSafeZone: CGRect? {
         guard let tooltipFrame else { return nil }
-
-        var safeZone = tooltipFrame.insetBy(dx: -20, dy: -16)
-
-        if let sourceRect = tooltipSourceRect {
-            safeZone = safeZone.union(sourceRect.insetBy(dx: -20, dy: -20))
-
-            let bridgeCenterX = (sourceRect.midX + tooltipFrame.midX) / 2
-            let bridgeWidth = abs(sourceRect.midX - tooltipFrame.midX) + 44
-            let bridgeMinY = min(sourceRect.minY, tooltipFrame.minY) - 16
-            let bridgeMaxY = max(sourceRect.maxY, tooltipFrame.maxY) + 16
-            let bridgeRect = CGRect(
-                x: bridgeCenterX - (bridgeWidth / 2),
-                y: bridgeMinY,
-                width: bridgeWidth,
-                height: max(bridgeMaxY - bridgeMinY, 1)
-            )
-            safeZone = safeZone.union(bridgeRect)
-        }
-
-        return safeZone
+        return Self.tooltipInteractionSafeZone(
+            tooltipFrame: tooltipFrame,
+            sourceRect: tooltipSourceRect
+        )
     }
 
     private func handleHoverLocationChanged(_ location: CGPoint?) {
         guard let location else {
             isHoveringHighlightedNode = false
             if !isHoveringTooltipButton {
-                scheduleTooltipHide(after: 0.55)
+                scheduleTooltipHide(after: tooltipHideDelay)
             }
             return
         }
@@ -4698,15 +4686,26 @@ struct SearchHighlightOverlay: View {
         }
 
         if !isHoveringTooltipButton {
-            scheduleTooltipHide(after: 0.55)
+            scheduleTooltipHide(after: tooltipHideDelay)
         }
+    }
+
+    private func handleInteractionLocationChanged(_ location: CGPoint) {
+        guard Self.shouldDismissTooltip(
+            for: location,
+            highlightedRects: highlightedRects,
+            tooltipFrame: tooltipFrame
+        ) else {
+            return
+        }
+
+        dismissTooltip()
     }
 
     private func scheduleTooltipHide(after delay: TimeInterval) {
         cancelTooltipHide()
         let workItem = DispatchWorkItem {
-            tooltipAnchorPoint = nil
-            tooltipSourceRect = nil
+            dismissTooltip()
         }
         tooltipHideWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
@@ -4715,6 +4714,15 @@ struct SearchHighlightOverlay: View {
     private func cancelTooltipHide() {
         tooltipHideWorkItem?.cancel()
         tooltipHideWorkItem = nil
+    }
+
+    private func dismissTooltip() {
+        cancelTooltipHide()
+        tooltipAnchorPoint = nil
+        tooltipSourceRect = nil
+        isHoveringHighlightedNode = false
+        isHoveringTooltipButton = false
+        updateTooltipCursor(isHovering: false)
     }
 
     private func updateTooltipCursor(isHovering: Bool) {
@@ -4727,6 +4735,50 @@ struct SearchHighlightOverlay: View {
             NSCursor.pop()
             hasPushedTooltipCursor = false
         }
+    }
+
+    static func tooltipInteractionSafeZone(
+        tooltipFrame: CGRect,
+        sourceRect: CGRect?
+    ) -> CGRect {
+        var safeZone = tooltipFrame.insetBy(dx: -10, dy: -8)
+        guard let sourceRect else { return safeZone }
+
+        let sourceConnectionY = tooltipFrame.midY < sourceRect.midY ? sourceRect.minY : sourceRect.maxY
+        let sourceAnchorRect = CGRect(
+            x: sourceRect.midX - 12,
+            y: sourceConnectionY - 12,
+            width: 24,
+            height: 24
+        )
+        let bridgeCenterX = (sourceRect.midX + tooltipFrame.midX) / 2
+        let bridgeWidth = abs(sourceRect.midX - tooltipFrame.midX) + 24
+        let bridgeMinY = min(sourceConnectionY, tooltipFrame.minY) - 8
+        let bridgeMaxY = max(sourceConnectionY, tooltipFrame.maxY) + 8
+        let bridgeRect = CGRect(
+            x: bridgeCenterX - (bridgeWidth / 2),
+            y: bridgeMinY,
+            width: max(bridgeWidth, 1),
+            height: max(bridgeMaxY - bridgeMinY, 1)
+        )
+
+        safeZone = safeZone.union(sourceAnchorRect)
+        safeZone = safeZone.union(bridgeRect)
+        return safeZone
+    }
+
+    static func shouldDismissTooltip(
+        for location: CGPoint,
+        highlightedRects: [CGRect],
+        tooltipFrame: CGRect?
+    ) -> Bool {
+        if highlightedRects.contains(where: { $0.contains(location) }) {
+            return false
+        }
+        if let tooltipFrame, tooltipFrame.contains(location) {
+            return false
+        }
+        return true
     }
 
     private func screenRect(for node: OCRNodeWithText) -> CGRect {
@@ -4780,10 +4832,12 @@ struct SearchHighlightOverlay: View {
 private struct SearchHighlightHoverTracker: NSViewRepresentable {
     let highlightedRects: [CGRect]
     let onHoverLocationChanged: (CGPoint?) -> Void
+    let onInteractionLocationChanged: (CGPoint) -> Void
 
     func makeNSView(context: Context) -> SearchHighlightHoverTrackingView {
         let view = SearchHighlightHoverTrackingView()
         view.onHoverLocationChanged = onHoverLocationChanged
+        view.onInteractionLocationChanged = onInteractionLocationChanged
         return view
     }
 
@@ -4791,6 +4845,7 @@ private struct SearchHighlightHoverTracker: NSViewRepresentable {
         let didRectsChange = nsView.highlightedRects != highlightedRects
         nsView.highlightedRects = highlightedRects
         nsView.onHoverLocationChanged = onHoverLocationChanged
+        nsView.onInteractionLocationChanged = onInteractionLocationChanged
         if didRectsChange || !nsView.hasPerformedInitialHoverSync {
             nsView.refreshHoverStateForCurrentMouseLocation()
             nsView.hasPerformedInitialHoverSync = true
@@ -4801,9 +4856,11 @@ private struct SearchHighlightHoverTracker: NSViewRepresentable {
 private final class SearchHighlightHoverTrackingView: NSView {
     var highlightedRects: [CGRect] = []
     var onHoverLocationChanged: ((CGPoint?) -> Void)?
+    var onInteractionLocationChanged: ((CGPoint) -> Void)?
     var hasPerformedInitialHoverSync = false
 
     private var trackingArea: NSTrackingArea?
+    private var localMouseDownMonitor: Any?
 
     override var isFlipped: Bool {
         true
@@ -4812,6 +4869,22 @@ private final class SearchHighlightHoverTrackingView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         hasPerformedInitialHoverSync = false
+        if window == nil {
+            removeLocalMouseDownMonitor()
+        } else {
+            installLocalMouseDownMonitorIfNeeded()
+        }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            removeLocalMouseDownMonitor()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    deinit {
+        removeLocalMouseDownMonitor()
     }
 
     override func updateTrackingAreas() {
@@ -4853,6 +4926,29 @@ private final class SearchHighlightHoverTrackingView: NSView {
         guard let window else { return }
         let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         onHoverLocationChanged?(location)
+    }
+
+    private func installLocalMouseDownMonitorIfNeeded() {
+        guard localMouseDownMonitor == nil else { return }
+
+        localMouseDownMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self, let eventWindow = event.window, eventWindow == self.window else {
+                return event
+            }
+
+            let location = self.convert(event.locationInWindow, from: nil)
+            self.onInteractionLocationChanged?(location)
+            return event
+        }
+    }
+
+    private func removeLocalMouseDownMonitor() {
+        if let localMouseDownMonitor {
+            NSEvent.removeMonitor(localMouseDownMonitor)
+            self.localMouseDownMonitor = nil
+        }
     }
 }
 

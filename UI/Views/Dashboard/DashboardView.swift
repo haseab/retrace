@@ -1717,7 +1717,7 @@ private struct WALFailureCrashBanner: View {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
-        return "Retrace could not initialize the WAL at \(formatter.string(from: report.capturedAt)). Startup recovery was skipped, and new WAL sessions may fail until storage is repaired."
+        return "Retrace couldn't complete recovery at \(formatter.string(from: report.capturedAt)). New recordings may fail until storage is repaired."
     }
 
     var body: some View {
@@ -1729,7 +1729,8 @@ private struct WALFailureCrashBanner: View {
             Text(messageText)
                 .font(.retraceCaption)
                 .foregroundColor(.primary)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .multilineTextAlignment(.leading)
 
             Spacer(minLength: 12)

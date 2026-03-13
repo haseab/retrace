@@ -1060,6 +1060,15 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// The search query to highlight on the current frame (set when navigating from search)
     @Published public var searchHighlightQuery: String?
 
+    /// Controls whether search highlights draw matched substrings or whole OCR nodes.
+    enum SearchHighlightMode: Equatable {
+        case matchedTextRanges
+        case matchedNodes
+    }
+
+    /// The current highlight mode for the active search highlight.
+    @Published private(set) var searchHighlightMode: SearchHighlightMode = .matchedTextRanges
+
     /// Whether search highlight is currently being displayed
     @Published public var isShowingSearchHighlight: Bool = false
 
@@ -6059,6 +6068,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         searchHighlightTimer?.invalidate()
         searchHighlightTimer = nil
+        searchHighlightMode = .matchedTextRanges
         searchHighlightQuery = normalizedQuery
         isShowingSearchHighlight = true
     }
@@ -7076,7 +7086,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 reason: "navigateToSearchResult.destination",
                 highlightQueryOverride: highlightQuery
             )
-            showSearchHighlight(query: highlightQuery)
+            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
             return
         }
 
@@ -7154,7 +7164,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Wait for OCR nodes to load before showing highlight
             // (loadImageIfNeeded calls loadOCRNodes but doesn't await it)
             await loadOCRNodesAsync()
-            showSearchHighlight(query: highlightQuery)
+            showSearchHighlight(query: highlightQuery, mode: .matchedNodes)
             setLoadingState(false, reason: "navigateToSearchResult.success")
             Log.info("[SearchNavigation] Navigation complete, now at index \(currentIndex)", category: .ui)
 
@@ -7166,16 +7176,24 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Show search highlight for the given query after a 0.5-second delay
     public func showSearchHighlight(query: String) {
+        showSearchHighlight(query: query, mode: .matchedTextRanges)
+    }
+
+    func showSearchHighlight(
+        query: String,
+        mode: SearchHighlightMode
+    ) {
 
         // Clear any existing highlight first (so the view is removed and onAppear will fire again)
         isShowingSearchHighlight = false
         searchHighlightQuery = query
+        searchHighlightMode = mode
 
         // Show highlight after 0.5 second delay
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self = self else { return }
-            // Only show if the query hasn't changed
-            if self.searchHighlightQuery == query {
+            // Only show if the query and highlight mode haven't changed
+            if self.searchHighlightQuery == query && self.searchHighlightMode == mode {
                 self.isShowingSearchHighlight = true
             }
         }
@@ -7187,6 +7205,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         searchHighlightTimer = nil
 
         let previousQuery = searchHighlightQuery
+        let previousMode = searchHighlightMode
         withAnimation(.easeOut(duration: 0.3)) {
             isShowingSearchHighlight = false
         }
@@ -7196,7 +7215,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             guard let self else { return }
             guard !self.isShowingSearchHighlight else { return }
             guard self.searchHighlightQuery == previousQuery else { return }
+            guard self.searchHighlightMode == previousMode else { return }
             self.searchHighlightQuery = nil
+            self.searchHighlightMode = .matchedTextRanges
         }
     }
 
@@ -7210,6 +7231,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         searchHighlightTimer = nil
         isShowingSearchHighlight = false
         searchHighlightQuery = nil
+        searchHighlightMode = .matchedTextRanges
     }
 
     /// Toggle visibility of timeline controls (tape, playhead, buttons)
@@ -7230,25 +7252,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             return []
         }
 
-        let queryTokens = tokenizeSearchHighlightQuery(query)
-        guard !queryTokens.isEmpty else { return [] }
-
-        var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
-
-        for node in ocrNodes {
-            let nodeText = node.text.lowercased()
-            var ranges: [Range<String.Index>] = []
-
-            for token in queryTokens {
-                ranges.append(contentsOf: rangesForSearchHighlightToken(token, in: nodeText))
-            }
-
-            if !ranges.isEmpty {
-                matchingNodes.append((node: node, ranges: ranges))
-            }
-        }
-
-        return matchingNodes
+        return Self.searchHighlightMatches(
+            in: ocrNodes,
+            query: query,
+            mode: searchHighlightMode
+        )
     }
 
     private static let searchHighlightLineTolerance: CGFloat = 0.02
@@ -7331,7 +7339,36 @@ public class SimpleTimelineViewModel: ObservableObject {
         case phrase(String)
     }
 
-    private func tokenizeSearchHighlightQuery(_ query: String) -> [SearchHighlightToken] {
+    static func searchHighlightMatches(
+        in nodes: [OCRNodeWithText],
+        query: String,
+        mode: SearchHighlightMode
+    ) -> [(node: OCRNodeWithText, ranges: [Range<String.Index>])] {
+        let queryTokens = tokenizeSearchHighlightQuery(query)
+        guard !queryTokens.isEmpty else { return [] }
+
+        var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
+
+        for node in nodes {
+            let nodeText = node.text.lowercased()
+            var ranges: [Range<String.Index>] = []
+
+            for token in queryTokens {
+                ranges.append(contentsOf: rangesForSearchHighlightToken(token, in: nodeText))
+            }
+
+            if !ranges.isEmpty {
+                matchingNodes.append((
+                    node: node,
+                    ranges: mode == .matchedNodes ? [] : ranges
+                ))
+            }
+        }
+
+        return matchingNodes
+    }
+
+    private static func tokenizeSearchHighlightQuery(_ query: String) -> [SearchHighlightToken] {
         let normalizedQuery = query
             .lowercased()
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7348,7 +7385,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
     }
 
-    private func rangesForSearchHighlightToken(
+    private static func rangesForSearchHighlightToken(
         _ token: SearchHighlightToken,
         in text: String
     ) -> [Range<String.Index>] {
@@ -7358,7 +7395,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private func allRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
+    private static func allRanges(of needle: String, in haystack: String) -> [Range<String.Index>] {
         guard !needle.isEmpty else { return [] }
 
         var ranges: [Range<String.Index>] = []

@@ -52,7 +52,9 @@ UI/
     ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    └── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
+    ├── InPageURLSettingsTests.swift      # In-page URL browser support coverage
+    ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
+    └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
 ```
 
 ## Feature Requirements
