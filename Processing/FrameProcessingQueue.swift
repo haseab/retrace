@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Shared
 import Database
@@ -1573,31 +1574,52 @@ struct ProcessingProcessMemorySnapshot: Sendable {
 }
 
 struct OCRMemoryBackpressurePolicy: Sendable {
+    private static let oneMiB: UInt64 = 1024 * 1024
+
     static let enabledDefaultsKey = "retrace.debug.ocrMemoryBackpressureEnabled"
     static let pauseThresholdDefaultsKey = "retrace.debug.ocrMemoryPauseThresholdMB"
     static let resumeThresholdDefaultsKey = "retrace.debug.ocrMemoryResumeThresholdMB"
     static let pollIntervalDefaultsKey = "retrace.debug.ocrMemoryBackpressurePollMs"
 
-    static let defaultPauseThresholdBytes: UInt64 = 1_200 * 1024 * 1024
-    static let defaultResumeThresholdBytes: UInt64 = 1_024 * 1024 * 1024
+    static let defaultPauseThresholdMB = 1_536
+    static let defaultResumeThresholdMB = 1_434
+    static let defaultPauseThresholdBytes: UInt64 = UInt64(defaultPauseThresholdMB) * oneMiB
+    static let defaultResumeThresholdBytes: UInt64 = UInt64(defaultResumeThresholdMB) * oneMiB
     static let defaultPollIntervalNs: UInt64 = 1_000_000_000
+    static let referenceDisplayPixelCount: UInt64 = 2_560 * 1_440
+    static let maximumAutoScaleFactor: Double = 2.0
 
     let enabled: Bool
     let pauseThresholdBytes: UInt64
     let resumeThresholdBytes: UInt64
     let pollIntervalNs: UInt64
 
-    static func current(defaults: UserDefaults = .standard) -> OCRMemoryBackpressurePolicy {
+    static func current(
+        defaults: UserDefaults = .standard,
+        largestDisplayPixelCount: UInt64? = nil
+    ) -> OCRMemoryBackpressurePolicy {
         let enabled = defaults.object(forKey: enabledDefaultsKey) == nil
             ? true
             : defaults.bool(forKey: enabledDefaultsKey)
 
+        let detectedLargestDisplayPixelCount = largestDisplayPixelCount
+            ?? OCRDisplayGeometry.currentLargestActiveDisplayPixelCount()
+
+        let scaledDefaultPauseThresholdMB = scaledDefaultThresholdMB(
+            baseThresholdMB: defaultPauseThresholdMB,
+            largestDisplayPixelCount: detectedLargestDisplayPixelCount
+        )
+        let scaledDefaultResumeThresholdMB = scaledDefaultThresholdMB(
+            baseThresholdMB: defaultResumeThresholdMB,
+            largestDisplayPixelCount: detectedLargestDisplayPixelCount
+        )
+
         let pauseThresholdMB = defaults.object(forKey: pauseThresholdDefaultsKey) == nil
-            ? Int(defaultPauseThresholdBytes / 1024 / 1024)
+            ? scaledDefaultPauseThresholdMB
             : defaults.integer(forKey: pauseThresholdDefaultsKey)
 
         let resumeThresholdMB = defaults.object(forKey: resumeThresholdDefaultsKey) == nil
-            ? Int(defaultResumeThresholdBytes / 1024 / 1024)
+            ? scaledDefaultResumeThresholdMB
             : defaults.integer(forKey: resumeThresholdDefaultsKey)
 
         let pollIntervalMs = defaults.object(forKey: pollIntervalDefaultsKey) == nil
@@ -1606,10 +1628,24 @@ struct OCRMemoryBackpressurePolicy: Sendable {
 
         return OCRMemoryBackpressurePolicy(
             enabled: enabled,
-            pauseThresholdBytes: UInt64(max(pauseThresholdMB, 1)) * 1024 * 1024,
-            resumeThresholdBytes: UInt64(max(min(resumeThresholdMB, pauseThresholdMB - 1), 1)) * 1024 * 1024,
+            pauseThresholdBytes: UInt64(max(pauseThresholdMB, 1)) * oneMiB,
+            resumeThresholdBytes: UInt64(max(min(resumeThresholdMB, pauseThresholdMB - 1), 1)) * oneMiB,
             pollIntervalNs: UInt64(pollIntervalMs) * 1_000_000
         )
+    }
+
+    private static func scaledDefaultThresholdMB(
+        baseThresholdMB: Int,
+        largestDisplayPixelCount: UInt64?
+    ) -> Int {
+        guard let largestDisplayPixelCount,
+              largestDisplayPixelCount > referenceDisplayPixelCount else {
+            return baseThresholdMB
+        }
+
+        let displayRatio = Double(largestDisplayPixelCount) / Double(referenceDisplayPixelCount)
+        let scaleFactor = min(sqrt(displayRatio), maximumAutoScaleFactor)
+        return max(Int((Double(baseThresholdMB) * scaleFactor).rounded()), 1)
     }
 
     func shouldPause(footprintBytes: UInt64, currentlyPaused: Bool) -> Bool {
@@ -1620,6 +1656,30 @@ struct OCRMemoryBackpressurePolicy: Sendable {
             return footprintBytes >= resumeThresholdBytes
         }
         return footprintBytes >= pauseThresholdBytes
+    }
+}
+
+enum OCRDisplayGeometry {
+    static func currentLargestActiveDisplayPixelCount() -> UInt64? {
+        var displayCount: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &displayCount) == .success,
+              displayCount > 0 else {
+            return nil
+        }
+
+        var displayIDs = Array(repeating: CGDirectDisplayID(), count: Int(displayCount))
+        let result = displayIDs.withUnsafeMutableBufferPointer { buffer in
+            CGGetActiveDisplayList(displayCount, buffer.baseAddress, &displayCount)
+        }
+
+        guard result == .success else {
+            return nil
+        }
+
+        return displayIDs.prefix(Int(displayCount)).reduce(0) { currentMax, displayID in
+            let pixelCount = UInt64(CGDisplayPixelsWide(displayID)) * UInt64(CGDisplayPixelsHigh(displayID))
+            return max(currentMax, pixelCount)
+        }
     }
 }
 

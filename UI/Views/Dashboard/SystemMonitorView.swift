@@ -597,7 +597,8 @@ public struct SystemMonitorView: View {
             onRowsHoverChanged: { hovering in
                 scrollLatch.updateHover(memory: hovering)
             },
-            isRowsScrollEnabled: isMemoryScrollEnabled
+            isRowsScrollEnabled: isMemoryScrollEnabled,
+            showsOCRBacklogAttribution: viewModel.shouldShowOCRMemoryAttribution
         )
     }
 
@@ -1412,6 +1413,12 @@ class SystemMonitorViewModel: ObservableObject {
         ocrProcessingLevel == 3 &&
         !pauseOnBatterySetting &&
         !pauseOnLowPowerModeSetting
+    }
+
+    var shouldShowOCRMemoryAttribution: Bool {
+        ocrEnabled &&
+        !isPausedForBattery &&
+        processingCount > 0
     }
 
     func startMonitoring() async {

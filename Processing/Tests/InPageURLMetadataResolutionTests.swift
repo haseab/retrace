@@ -242,6 +242,38 @@ final class OCRMemoryBackpressurePolicyTests: XCTestCase {
         XCTAssertFalse(policy.shouldPause(footprintBytes: 59, currentlyPaused: true))
     }
 
+    func testDefaultsUseBaseThresholdsForReferenceDisplaySize() {
+        let suiteName = "OCRMemoryBackpressurePolicyTests.reference.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+
+        let policy = OCRMemoryBackpressurePolicy.current(
+            defaults: defaults,
+            largestDisplayPixelCount: OCRMemoryBackpressurePolicy.referenceDisplayPixelCount
+        )
+
+        XCTAssertTrue(policy.enabled)
+        XCTAssertEqual(policy.pauseThresholdBytes, OCRMemoryBackpressurePolicy.defaultPauseThresholdBytes)
+        XCTAssertEqual(policy.resumeThresholdBytes, OCRMemoryBackpressurePolicy.defaultResumeThresholdBytes)
+        XCTAssertEqual(policy.pollIntervalNs, 1_000_000_000)
+
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    func testDefaultsScaleUpForUltraWideDisplays() {
+        let suiteName = "OCRMemoryBackpressurePolicyTests.ultrawide.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+
+        let policy = OCRMemoryBackpressurePolicy.current(
+            defaults: defaults,
+            largestDisplayPixelCount: 5_120 * 1_440
+        )
+
+        XCTAssertEqual(policy.pauseThresholdBytes, 2_172 * 1024 * 1024)
+        XCTAssertEqual(policy.resumeThresholdBytes, 2_028 * 1024 * 1024)
+
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
     func testDefaultsClampResumeBelowPauseThreshold() {
         let suiteName = "OCRMemoryBackpressurePolicyTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -250,7 +282,10 @@ final class OCRMemoryBackpressurePolicyTests: XCTestCase {
         defaults.set(false, forKey: OCRMemoryBackpressurePolicy.enabledDefaultsKey)
         defaults.set(250, forKey: OCRMemoryBackpressurePolicy.pollIntervalDefaultsKey)
 
-        let policy = OCRMemoryBackpressurePolicy.current(defaults: defaults)
+        let policy = OCRMemoryBackpressurePolicy.current(
+            defaults: defaults,
+            largestDisplayPixelCount: 5_120 * 1_440
+        )
 
         XCTAssertFalse(policy.enabled)
         XCTAssertEqual(policy.pauseThresholdBytes, 900 * 1024 * 1024)

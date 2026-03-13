@@ -8,6 +8,7 @@ struct ProcessMemorySummaryCard: View {
 
     private let onRowsHoverChanged: ((Bool) -> Void)?
     private let isRowsScrollEnabled: Bool
+    private let showsOCRBacklogAttribution: Bool
 
     private struct DisplayedMemoryRow: Identifiable {
         let row: ProcessMemoryRow
@@ -22,9 +23,14 @@ struct ProcessMemorySummaryCard: View {
     @State private var memoryProcessRowsVisible = Self.memoryRowsPageSize
     @State private var memoryProcessScrollTargetID: String?
 
-    init(onRowsHoverChanged: ((Bool) -> Void)? = nil, isRowsScrollEnabled: Bool = true) {
+    init(
+        onRowsHoverChanged: ((Bool) -> Void)? = nil,
+        isRowsScrollEnabled: Bool = true,
+        showsOCRBacklogAttribution: Bool = false
+    ) {
         self.onRowsHoverChanged = onRowsHoverChanged
         self.isRowsScrollEnabled = isRowsScrollEnabled
+        self.showsOCRBacklogAttribution = showsOCRBacklogAttribution
     }
 
     var body: some View {
@@ -114,6 +120,20 @@ struct ProcessMemorySummaryCard: View {
                                                 .font(.system(size: 12, weight: .regular))
                                                 .foregroundColor(.retracePrimary)
                                                 .lineLimit(1)
+
+                                            if displayedRow.isPinnedRetrace && showsOCRBacklogAttribution {
+                                                Text("OCR backlog")
+                                                    .font(.system(size: 9, weight: .semibold))
+                                                    .foregroundColor(.retraceAccent.opacity(0.98))
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 2)
+                                                    .background(Color.retraceAccent.opacity(0.14))
+                                                    .overlay(
+                                                        Capsule()
+                                                            .stroke(Color.retraceAccent.opacity(0.32), lineWidth: 1)
+                                                    )
+                                                    .clipShape(Capsule())
+                                            }
 
                                             Spacer(minLength: 2)
 

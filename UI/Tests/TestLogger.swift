@@ -1907,6 +1907,39 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
     }
 }
 
+@MainActor
+final class SystemMonitorOCRMemoryAttributionTests: XCTestCase {
+    func testOCRMemoryAttributionShowsWhenOCRIsActivelyProcessing() {
+        let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
+        viewModel.ocrEnabled = true
+        viewModel.isPausedForBattery = false
+        viewModel.queueDepth = 1
+        viewModel.processingCount = 2
+
+        XCTAssertTrue(viewModel.shouldShowOCRMemoryAttribution)
+    }
+
+    func testOCRMemoryAttributionShowsEvenWithNoBacklogWhenOCRIsActivelyProcessing() {
+        let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
+        viewModel.ocrEnabled = true
+        viewModel.isPausedForBattery = false
+        viewModel.queueDepth = 0
+        viewModel.processingCount = 1
+
+        XCTAssertTrue(viewModel.shouldShowOCRMemoryAttribution)
+    }
+
+    func testOCRMemoryAttributionHiddenWhenOCRIsNotActivelyProcessing() {
+        let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
+        viewModel.ocrEnabled = true
+        viewModel.isPausedForBattery = false
+        viewModel.queueDepth = 24
+        viewModel.processingCount = 0
+
+        XCTAssertFalse(viewModel.shouldShowOCRMemoryAttribution)
+    }
+}
+
 private actor AsyncTestGate {
     private var didEnter = false
     private var enterContinuation: CheckedContinuation<Void, Never>?
