@@ -1919,6 +1919,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     // MARK: - Background Refresh Throttling
 
     /// Threshold: if user is within this many frames of newest, near-live reopen policy can apply.
+    /// This is only considered when the newest loaded frame is still recent.
     private static let nearLiveEdgeFrameThreshold: Int = 50
 
     // MARK: - Playhead Position History (for Cmd+Z undo / Cmd+Shift+Z redo)
@@ -1965,6 +1966,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     // Test-only hooks for deterministic refreshFrameData coverage.
     struct RefreshFrameDataTestHooks {
         var getMostRecentFramesWithVideoInfo: ((Int, FilterCriteria) async throws -> [FrameWithVideoInfo])?
+        var now: (() -> Date)?
     }
 
     // Test-only hooks for deterministic time-window fetch behavior.
@@ -2669,6 +2671,15 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
             throw error
         }
+    }
+
+    private func refreshFrameDataCurrentDate() -> Date {
+#if DEBUG
+        if let override = test_refreshFrameDataHooks.now {
+            return override()
+        }
+#endif
+        return Date()
     }
 
     /// Invalidate all caches and reload frames from the current position
@@ -6274,9 +6285,11 @@ public class SimpleTimelineViewModel: ObservableObject {
             let framesFromNewest = frames.count - 1 - currentIndex
             let shouldNavigateToNewest: Bool
             let hasActiveFilters = filterCriteria.hasActiveFilters
+            let newestLoadedFrameIsRecent = isNewestLoadedFrameRecent(now: refreshFrameDataCurrentDate())
 
             if !navigateToNewest, currentIndex < frames.count, !hasActiveFilters {
-                let isNearLive = framesFromNewest < Self.nearLiveEdgeFrameThreshold
+                let isNearLive = newestLoadedFrameIsRecent &&
+                    framesFromNewest < Self.nearLiveEdgeFrameThreshold
                 if !isNearLive || !allowNearLiveAutoAdvance {
                     if refreshPresentation {
                         loadImageIfNeeded()
@@ -10319,6 +10332,19 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func isNearMostRecentFrame(within count: Int) -> Bool {
         guard !frames.isEmpty else { return true }
         return currentIndex >= frames.count - count && !hasMoreNewer
+    }
+
+    nonisolated static func isNewestLoadedTimestampRecent(
+        _ newestLoadedTimestamp: Date?,
+        now: Date,
+        threshold: TimeInterval = 5 * 60
+    ) -> Bool {
+        guard let newestLoadedTimestamp else { return true }
+        return abs(now.timeIntervalSince(newestLoadedTimestamp)) <= threshold
+    }
+
+    func isNewestLoadedFrameRecent(now: Date = Date()) -> Bool {
+        Self.isNewestLoadedTimestampRecent(frames.last?.frame.timestamp, now: now)
     }
 
     /// Whether the timeline is within N frames of the latest loaded frame.

@@ -278,6 +278,44 @@ final class TimelineRefreshTrimRegressionTests: XCTestCase {
         XCTAssertEqual(viewModel.frames.last?.frame.timestamp, originalNewestTimestamp)
     }
 
+    func testRefreshFrameDataTreatsStaleLoadedTapeAsHistoricalEvenNearLoadedEdge() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_200_000)
+
+        viewModel.frames = (0..<100).map { offset in
+            makeTimelineFrame(
+                id: Int64(offset + 1),
+                timestamp: baseDate.addingTimeInterval(TimeInterval(offset)),
+                frameIndex: offset,
+                processingStatus: 2
+            )
+        }
+        viewModel.currentIndex = 95
+
+        let originalFrameIDs = viewModel.frames.map(\.frame.id.value)
+        let originalNewestTimestamp = viewModel.frames.last?.frame.timestamp
+        var fetchInvocationCount = 0
+
+        viewModel.test_refreshFrameDataHooks.now = {
+            baseDate.addingTimeInterval(10 * 24 * 60 * 60)
+        }
+        viewModel.test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo = { _, _ in
+            fetchInvocationCount += 1
+            return []
+        }
+
+        await viewModel.refreshFrameData(
+            navigateToNewest: false,
+            allowNearLiveAutoAdvance: true,
+            refreshPresentation: false
+        )
+
+        XCTAssertEqual(fetchInvocationCount, 0)
+        XCTAssertEqual(viewModel.currentIndex, 95)
+        XCTAssertEqual(viewModel.frames.map(\.frame.id.value), originalFrameIDs)
+        XCTAssertEqual(viewModel.frames.last?.frame.timestamp, originalNewestTimestamp)
+    }
+
     private func makeTimelineFrame(
         id: Int64,
         timestamp: Date,
@@ -493,6 +531,32 @@ final class TimelineFocusRestoreDecisionTests: XCTestCase {
                 isHidingToShowDashboard: false,
                 targetProcessID: 111,
                 currentProcessID: 111
+            )
+        )
+    }
+}
+
+final class TimelineRecentTapeDecisionTests: XCTestCase {
+    func testNewestLoadedTimestampIsRecentWithinFiveMinutes() {
+        let now = Date(timeIntervalSince1970: 1_700_500_000)
+        let newestTimestamp = now.addingTimeInterval(-299)
+
+        XCTAssertTrue(
+            SimpleTimelineViewModel.isNewestLoadedTimestampRecent(
+                newestTimestamp,
+                now: now
+            )
+        )
+    }
+
+    func testNewestLoadedTimestampIsNotRecentBeyondFiveMinutes() {
+        let now = Date(timeIntervalSince1970: 1_700_500_000)
+        let newestTimestamp = now.addingTimeInterval(-301)
+
+        XCTAssertFalse(
+            SimpleTimelineViewModel.isNewestLoadedTimestampRecent(
+                newestTimestamp,
+                now: now
             )
         )
     }
