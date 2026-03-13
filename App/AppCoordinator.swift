@@ -3292,18 +3292,33 @@ public actor AppCoordinator {
         ]
     }
 
-    private static func preferredURLNeedle(from rawURL: String?) -> String? {
+    static func preferredURLNeedle(from rawURL: String?) -> String? {
         guard let rawURL,
               let parsed = URL(string: rawURL),
-              let host = parsed.host?.lowercased() else {
+              let host = parsed.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
             return nil
         }
+
         let normalizedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-        let path = parsed.path.trimmingCharacters(in: .whitespacesAndNewlines)
-        if path.isEmpty || path == "/" {
+        guard let components = URLComponents(url: parsed, resolvingAgainstBaseURL: false) else {
             return normalizedHost
         }
-        return normalizedHost + path.lowercased()
+
+        let path = components.percentEncodedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = components.percentEncodedQuery?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var needle = normalizedHost
+        if !path.isEmpty, path != "/" {
+            needle += path
+        } else if let query, !query.isEmpty {
+            needle += "/"
+        }
+
+        if let query, !query.isEmpty {
+            needle += "?\(query)"
+        }
+
+        return needle
     }
 
     private static func runInPageURLAppleScript(lines: [String]) async throws -> String {

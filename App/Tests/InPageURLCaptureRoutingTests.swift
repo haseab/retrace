@@ -40,6 +40,33 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
         XCTAssertNil(AppCoordinator.inPageURLHostBrowserBundleID(for: "com.apple.Safari"))
         XCTAssertNil(AppCoordinator.inPageURLHostBrowserBundleID(for: "com.example.notabrowser"))
     }
+
+    func testPreferredURLNeedleIncludesQueryForYouTubeWatchURL() {
+        XCTAssertEqual(
+            AppCoordinator.preferredURLNeedle(
+                from: "https://www.youtube.com/watch?v=CA73grSSk8E&t=388"
+            ),
+            "youtube.com/watch?v=CA73grSSk8E&t=388"
+        )
+    }
+
+    func testPreferredURLNeedleKeepsExactPathWithoutQuery() {
+        XCTAssertEqual(
+            AppCoordinator.preferredURLNeedle(
+                from: "https://www.youtube.com/shorts/2AhT7suEBRw"
+            ),
+            "youtube.com/shorts/2AhT7suEBRw"
+        )
+    }
+
+    func testPreferredURLNeedleRetainsSlashWhenRootURLHasQuery() {
+        XCTAssertEqual(
+            AppCoordinator.preferredURLNeedle(
+                from: "https://www.youtube.com/?persist_gl=1"
+            ),
+            "youtube.com/?persist_gl=1"
+        )
+    }
 }
 
 final class ServiceContainerRewindCutoffTests: XCTestCase {
