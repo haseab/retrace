@@ -174,6 +174,20 @@ public class TimelineWindowController: NSObject {
         !isActivelyScrolling
     }
 
+    nonisolated static func shouldDismissTimelineWithCommandW(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifiers: NSEvent.ModifierFlags
+    ) -> Bool {
+        let normalizedModifiers = modifiers.intersection([.command, .shift, .option, .control])
+        guard normalizedModifiers == [.command] else {
+            return false
+        }
+
+        let key = charactersIgnoringModifiers?.lowercased()
+        return keyCode == 13 || key == "w"
+    }
+
     nonisolated static func shouldNavigateTimelineBackward(
         keyCode: UInt16,
         charactersIgnoringModifiers: String?,
@@ -2082,6 +2096,18 @@ public class TimelineWindowController: NSObject {
                     return nil // Always consume the event to prevent propagation
                 }
 
+                // Cmd+W dismisses the timeline even when a timeline text field is focused.
+                if Self.shouldDismissTimelineWithCommandW(
+                    keyCode: event.keyCode,
+                    charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                    modifiers: modifiers
+                ) {
+                    if self?.handleKeyEvent(event) == true {
+                        return nil
+                    }
+                    return event
+                }
+
                 // When in-frame search text field is focused, let AppKit own other key handling
                 // (selection, clipboard, caret movement, etc.) so timeline shortcuts don't fire.
                 let isInFrameSearchFieldActive: Bool = {
@@ -2460,6 +2486,16 @@ public class TimelineWindowController: NSObject {
                 }
             }
             // Otherwise close the timeline
+            hide()
+            return true
+        }
+
+        if Self.shouldDismissTimelineWithCommandW(
+            keyCode: event.keyCode,
+            charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+            modifiers: modifiers
+        ) {
+            recordShortcut("cmd+w")
             hide()
             return true
         }

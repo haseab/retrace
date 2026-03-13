@@ -2019,9 +2019,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     private struct StoppedPosition {
         let frameID: FrameID
         let timestamp: Date
+        let searchHighlightQuery: String?
     }
 
-    /// Stack of positions where the playhead was stopped for 1+ second
+    /// Stack of positions where the playhead was stopped for at least 350 ms
     /// Most recent position is at the end of the array
     /// Stores frame ID (unique identifier) and timestamp (for reloading frames if needed)
     private var stoppedPositionHistory: [StoppedPosition] = []
@@ -2033,7 +2034,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Maximum number of stopped positions to remember
     private static let maxStoppedPositionHistory = 50
 
-    /// Work item for detecting when playhead has been stationary for 1+ second
+    /// Work item for detecting when playhead has been stationary for at least 350 ms
     /// Using DispatchWorkItem instead of Task for lower overhead during rapid navigation
     private var playheadStoppedDetectionWorkItem: DispatchWorkItem?
 
@@ -2041,7 +2042,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var lastRecordedStoppedFrameID: FrameID?
 
     /// Time threshold (in seconds) for considering playhead as "stopped"
-    private static let stoppedThresholdSeconds: TimeInterval = 1.0
+    private static let stoppedThresholdSeconds: TimeInterval = 0.35
 
     // MARK: - Dependencies
 
@@ -6815,7 +6816,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         scheduleStoppedPositionRecording()
     }
 
-    /// Schedule recording the current position as a "stopped" position after 1 second of inactivity
+    /// Schedule recording the current position as a "stopped" position after 350 ms of inactivity
     private func scheduleStoppedPositionRecording() {
         // Cancel any previous work item
         cancelPendingStoppedPositionRecording()
@@ -6838,9 +6839,12 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func recordCurrentPositionImmediatelyForUndo(reason: String) -> Bool {
+    private func recordCurrentPositionImmediatelyForUndo(
+        reason: String,
+        highlightQueryOverride: String? = nil
+    ) -> Bool {
         let historyCountBefore = stoppedPositionHistory.count
-        recordStoppedPosition(currentIndex)
+        recordStoppedPosition(currentIndex, highlightQueryOverride: highlightQueryOverride)
         let didRecord = stoppedPositionHistory.count != historyCountBefore
         if didRecord {
             Log.debug(
@@ -6852,13 +6856,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Record a position as a "stopped" position for undo history
-    private func recordStoppedPosition(_ index: Int) {
+    private func recordStoppedPosition(_ index: Int, highlightQueryOverride: String? = nil) {
         // Don't record invalid indices
         guard index >= 0 && index < frames.count else { return }
 
         let frame = frames[index].frame
         let frameID = frame.id
         let timestamp = frame.timestamp
+        let preservedHighlightQuery = normalizedRestorableSearchHighlightQuery(
+            highlightQueryOverride ?? currentRestorableSearchHighlightQuery()
+        )
 
         // Don't record if it's the same as the last recorded frame
         guard frameID != lastRecordedStoppedFrameID else { return }
@@ -6869,7 +6876,13 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Add to history
-        stoppedPositionHistory.append(StoppedPosition(frameID: frameID, timestamp: timestamp))
+        stoppedPositionHistory.append(
+            StoppedPosition(
+                frameID: frameID,
+                timestamp: timestamp,
+                searchHighlightQuery: preservedHighlightQuery
+            )
+        )
         lastRecordedStoppedFrameID = frameID
 
         // Trim history if it exceeds max size
@@ -6878,6 +6891,26 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         Log.debug("[PlayheadUndo] Recorded stopped position: frameID=\(frameID.stringValue), timestamp=\(timestamp), history size=\(stoppedPositionHistory.count)", category: .ui)
+    }
+
+    private func normalizedRestorableSearchHighlightQuery(_ query: String?) -> String? {
+        guard let normalizedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedQuery.isEmpty else {
+            return nil
+        }
+        return normalizedQuery
+    }
+
+    private func currentRestorableSearchHighlightQuery() -> String? {
+        guard !hasActiveInFrameSearchQuery, isShowingSearchHighlight else {
+            return nil
+        }
+        return normalizedRestorableSearchHighlightQuery(searchHighlightQuery)
+    }
+
+    private func restoreSearchHighlightIfNeeded(from position: StoppedPosition) {
+        guard let query = position.searchHighlightQuery else { return }
+        showSearchHighlight(query: query)
     }
 
     /// Undo to the last stopped playhead position (Cmd+Z)
@@ -6919,6 +6952,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 loadImageIfNeeded()
                 checkAndLoadMoreFrames()
             }
+            restoreSearchHighlightIfNeeded(from: previousPosition)
             return true
         }
 
@@ -6962,6 +6996,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 loadImageIfNeeded()
                 checkAndLoadMoreFrames()
             }
+            restoreSearchHighlightIfNeeded(from: nextPosition)
             return true
         }
 
@@ -7001,12 +7036,17 @@ public class SimpleTimelineViewModel: ObservableObject {
             Log.warning("[PlayheadUndo] Frame ID not found after reload, keeping closest timestamp frame", category: .ui)
         }
 
+        restoreSearchHighlightIfNeeded(from: position)
+
         Log.info("[PlayheadUndo] Navigation complete, now at index \(currentIndex)", category: .ui)
     }
 
     /// Navigate to a specific frame by ID and highlight the search query
     /// Used when selecting a search result
     public func navigateToSearchResult(frameID: FrameID, timestamp: Date, highlightQuery: String) async {
+        cancelPendingStoppedPositionRecording()
+        _ = recordCurrentPositionImmediatelyForUndo(reason: "navigateToSearchResult.source")
+
         // Exit live mode immediately - we're navigating to a specific historical frame
         if isInLiveMode {
             exitLiveMode()
@@ -7032,6 +7072,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         // First, try to find a frame with this ID in our current data
         if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
             navigateToFrame(index)
+            _ = recordCurrentPositionImmediatelyForUndo(
+                reason: "navigateToSearchResult.destination",
+                highlightQueryOverride: highlightQuery
+            )
             showSearchHighlight(query: highlightQuery)
             return
         }
@@ -7097,6 +7141,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                     Log.warning("[SearchNavigation] Frame ID not found in loaded frames, using closest by timestamp at index \(closestFrame.offset), \(diff)s from target", category: .ui)
                 }
             }
+            _ = recordCurrentPositionImmediatelyForUndo(
+                reason: "navigateToSearchResult.destination",
+                highlightQueryOverride: highlightQuery
+            )
 
             loadImageIfNeeded()
 

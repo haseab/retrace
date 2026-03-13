@@ -614,6 +614,33 @@ final class TimelineKeyboardShortcutDecisionTests: XCTestCase {
             TimelineWindowController.shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: true)
         )
     }
+
+    func testShouldDismissTimelineWithCommandW() {
+        XCTAssertTrue(
+            TimelineWindowController.shouldDismissTimelineWithCommandW(
+                keyCode: 13,
+                charactersIgnoringModifiers: "w",
+                modifiers: [.command]
+            )
+        )
+    }
+
+    func testShouldNotDismissTimelineWithExtraModifierOrWrongKey() {
+        XCTAssertFalse(
+            TimelineWindowController.shouldDismissTimelineWithCommandW(
+                keyCode: 13,
+                charactersIgnoringModifiers: "w",
+                modifiers: [.command, .shift]
+            )
+        )
+        XCTAssertFalse(
+            TimelineWindowController.shouldDismissTimelineWithCommandW(
+                keyCode: 14,
+                charactersIgnoringModifiers: "e",
+                modifiers: [.command]
+            )
+        )
+    }
 }
 
 final class TimelineNavigationShortcutDecisionTests: XCTestCase {
@@ -1367,9 +1394,9 @@ final class InFrameSearchTests: XCTestCase {
 
         // Build undo history through real navigation/stopped-position recording.
         viewModel.navigateToFrame(1)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(2)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
 
         viewModel.showSearchHighlight(query: "error")
         try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
@@ -1395,13 +1422,13 @@ final class InFrameSearchTests: XCTestCase {
 
         // Build stop-history entries at indices 1,2,3,4.
         viewModel.navigateToFrame(1)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(2)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(3)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(4)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
 
         XCTAssertEqual(viewModel.currentIndex, 4)
 
@@ -1431,11 +1458,11 @@ final class InFrameSearchTests: XCTestCase {
         viewModel.currentIndex = 0
 
         viewModel.navigateToFrame(1)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(2)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(3)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
 
         XCTAssertTrue(viewModel.undoToLastStoppedPosition())
         XCTAssertEqual(viewModel.currentIndex, 2)
@@ -1466,9 +1493,9 @@ final class InFrameSearchTests: XCTestCase {
         }
         viewModel.currentIndex = 24
         viewModel.navigateToFrame(25)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
         viewModel.navigateToFrame(26)
-        try? await Task.sleep(for: .milliseconds(1100), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(500), clock: .continuous)
 
         // Replace the in-memory window so undo must take slow path (frame ID #26 no longer loaded).
         viewModel.frames = (0..<10).map { offset in
@@ -1521,6 +1548,144 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertEqual(tracker.reloadWindowFetches, 1)
         XCTAssertGreaterThanOrEqual(tracker.postReloadNewerLoadAttempts, 1)
         XCTAssertTrue(viewModel.frames.contains(where: { $0.frame.id.value == 26 }))
+    }
+
+    func testNavigateToSearchResultAddsEachClickedResultToUndoHistory() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 4, frameIndex: 3, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 2),
+            timestamp: viewModel.frames[1].frame.timestamp,
+            highlightQuery: "error"
+        )
+        XCTAssertEqual(viewModel.currentIndex, 1)
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 3),
+            timestamp: viewModel.frames[2].frame.timestamp,
+            highlightQuery: "error"
+        )
+        XCTAssertEqual(viewModel.currentIndex, 2)
+
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 0)
+    }
+
+    func testNavigateToSearchResultSlowPathRecordsUndoHistory() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 1
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { _, _, _, _, reason in
+            switch reason {
+            case "navigateToSearchResult":
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 49,
+                        timestamp: baseDate.addingTimeInterval(119),
+                        frameIndex: 49,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 50,
+                        timestamp: baseDate.addingTimeInterval(120),
+                        frameIndex: 50,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 51,
+                        timestamp: baseDate.addingTimeInterval(121),
+                        frameIndex: 51,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            case "reloadFramesAroundTimestamp":
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 1,
+                        timestamp: baseDate,
+                        frameIndex: 0,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 2,
+                        timestamp: baseDate.addingTimeInterval(1),
+                        frameIndex: 1,
+                        bundleID: "com.apple.Safari"
+                    ),
+                    self.makeFrameWithVideoInfo(
+                        id: 3,
+                        timestamp: baseDate.addingTimeInterval(2),
+                        frameIndex: 2,
+                        bundleID: "com.apple.Safari"
+                    )
+                ]
+            default:
+                return []
+            }
+        }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoBefore = { _, _, _, _ in [] }
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoAfter = { _, _, _, _ in [] }
+        viewModel.test_frameOverlayLoadHooks.getOCRStatus = { _ in .completed }
+        viewModel.test_frameOverlayLoadHooks.getAllOCRNodes = { _, _ in [] }
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 50),
+            timestamp: baseDate.addingTimeInterval(120),
+            highlightQuery: "error"
+        )
+
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 50)
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        try? await Task.sleep(for: .milliseconds(50), clock: .continuous)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 2)
+    }
+
+    func testUndoAndRedoRestoreSearchResultHighlightQuery() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.frames = [
+            makeTimelineFrame(id: 1, frameIndex: 0, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 2, frameIndex: 1, bundleID: "com.apple.Safari"),
+            makeTimelineFrame(id: 3, frameIndex: 2, bundleID: "com.apple.Safari")
+        ]
+        viewModel.currentIndex = 0
+
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 2),
+            timestamp: viewModel.frames[1].frame.timestamp,
+            highlightQuery: "alpha"
+        )
+        await viewModel.navigateToSearchResult(
+            frameID: FrameID(value: 3),
+            timestamp: viewModel.frames[2].frame.timestamp,
+            highlightQuery: "beta"
+        )
+
+        XCTAssertTrue(viewModel.undoToLastStoppedPosition())
+        XCTAssertEqual(viewModel.currentIndex, 1)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "alpha")
+        try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
+
+        XCTAssertTrue(viewModel.redoLastUndonePosition())
+        XCTAssertEqual(viewModel.currentIndex, 2)
+        XCTAssertEqual(viewModel.searchHighlightQuery, "beta")
+        try? await Task.sleep(for: .milliseconds(650), clock: .continuous)
+        XCTAssertTrue(viewModel.isShowingSearchHighlight)
     }
 
     private func makeTimelineFrame(id: Int64, frameIndex: Int, bundleID: String) -> TimelineFrame {
