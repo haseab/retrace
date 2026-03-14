@@ -1,13 +1,7 @@
 import Foundation
 import Vision
 import CoreGraphics
-import Accelerate
 import Shared
-
-private struct PreparedOCRImage: Sendable {
-    let image: CGImage
-    let scaleFactor: CGFloat
-}
 
 // MARK: - VisionOCR
 
@@ -16,13 +10,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
 
     /// Recognition languages for OCR
     private let recognitionLanguages: [String]
-
-    /// OCR scale settings for adaptive downscaling.
-    /// Frames above the target megapixel budget are downscaled to cap OCR cost.
-    private static let maxOCRScaleFactor: CGFloat = 1.0
-    private static let minOCRScaleFactor: CGFloat = 0.55
-    private static let targetMegapixelsAccurate: CGFloat = 3.0
-    private static let targetMegapixelsFast: CGFloat = 4.0
 
     public init(recognitionLanguages: [String] = ["en-US"]) {
         self.recognitionLanguages = recognitionLanguages
@@ -99,44 +86,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
     }
 
     // MARK: - Image Processing
-
-    /// Downscale a CGImage using vImage (hardware-accelerated, high quality)
-    /// Returns nil if downscaling fails, caller should fall back to original image
-    private func downscaleImage(_ image: CGImage, scale: CGFloat) -> CGImage? {
-        let newWidth = Int(CGFloat(image.width) * scale)
-        let newHeight = Int(CGFloat(image.height) * scale)
-
-        guard newWidth > 0, newHeight > 0 else { return nil }
-
-        // Create source vImage buffer from CGImage
-        var format = vImage_CGImageFormat(
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            colorSpace: nil,  // Uses image's color space
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue),
-            version: 0,
-            decode: nil,
-            renderingIntent: .defaultIntent
-        )
-
-        var sourceBuffer = vImage_Buffer()
-        var error = vImageBuffer_InitWithCGImage(&sourceBuffer, &format, nil, image, vImage_Flags(kvImageNoFlags))
-        guard error == kvImageNoError else { return nil }
-        defer { free(sourceBuffer.data) }
-
-        // Create destination buffer
-        var destBuffer = vImage_Buffer()
-        error = vImageBuffer_Init(&destBuffer, vImagePixelCount(newHeight), vImagePixelCount(newWidth), 32, vImage_Flags(kvImageNoFlags))
-        guard error == kvImageNoError else { return nil }
-        defer { free(destBuffer.data) }
-
-        // Scale using high-quality Lanczos resampling
-        error = vImageScale_ARGB8888(&sourceBuffer, &destBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
-        guard error == kvImageNoError else { return nil }
-
-        // Create CGImage from scaled buffer
-        return vImageCreateCGImageFromBuffer(&destBuffer, &format, nil, nil, vImage_Flags(kvImageNoFlags), &error)?.takeRetainedValue()
-    }
 
     // MARK: - Region-Based OCR
 
@@ -436,27 +385,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         }
     }
 
-    /// Compute an adaptive OCR scale based on frame size.
-    /// This caps OCR pixel workload on large/ultrawide displays to reduce CPU spikes.
-    private static func calculateOCRScaleFactor(
-        width: Int,
-        height: Int,
-        config: ProcessingConfig
-    ) -> CGFloat {
-        guard width > 0, height > 0 else { return maxOCRScaleFactor }
-
-        let frameMegapixels = (CGFloat(width) * CGFloat(height)) / 1_000_000.0
-        let targetMegapixels: CGFloat = (config.ocrAccuracyLevel == .fast) ? targetMegapixelsFast : targetMegapixelsAccurate
-
-        guard frameMegapixels > targetMegapixels else {
-            return maxOCRScaleFactor
-        }
-
-        // Keep OCR near the target megapixel budget: scale^2 * frameMP ~= targetMP.
-        let scale = sqrt(targetMegapixels / frameMegapixels)
-        return min(maxOCRScaleFactor, max(minOCRScaleFactor, scale))
-    }
-
     /// Create a CapturedFrame-like structure from a CGImage for change detection
     private func createScaledFrame(from cgImage: CGImage, originalFrame: CapturedFrame) -> CapturedFrame {
         // Extract pixel data from CGImage
@@ -537,13 +465,6 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
         usesLanguageCorrection: Bool
     ) throws -> [TextRegion] {
         try autoreleasepool {
-            let preparedImage = makeOCRImage(
-                from: image,
-                width: outputWidth,
-                height: outputHeight,
-                config: config
-            )
-
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = Self.recognitionLevel(for: config)
             request.recognitionLanguages = recognitionLanguages
@@ -551,7 +472,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
             request.preferBackgroundProcessing = config.preferBackgroundProcessing
             request.regionOfInterest = regionOfInterest ?? CGRect(x: 0, y: 0, width: 1, height: 1)
 
-            let handler = VNImageRequestHandler(cgImage: preparedImage.image, options: [:])
+            let handler = VNImageRequestHandler(cgImage: image, options: [:])
 
             do {
                 try handler.perform([request])
@@ -601,20 +522,5 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
                 )
             }
         }
-    }
-
-    private func makeOCRImage(
-        from image: CGImage,
-        width: Int,
-        height: Int,
-        config: ProcessingConfig
-    ) -> PreparedOCRImage {
-        let ocrScaleFactor = Self.calculateOCRScaleFactor(width: width, height: height, config: config)
-        if ocrScaleFactor < Self.maxOCRScaleFactor {
-            if let downscaled = downscaleImage(image, scale: ocrScaleFactor) {
-                return PreparedOCRImage(image: downscaled, scaleFactor: ocrScaleFactor)
-            }
-        }
-        return PreparedOCRImage(image: image, scaleFactor: 1.0)
     }
 }
