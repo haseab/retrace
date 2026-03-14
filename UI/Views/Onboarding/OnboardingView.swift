@@ -80,7 +80,7 @@ public struct OnboardingView: View {
         "com.apple.systempreferences",
         "com.apple.systemsettings",
     ]
-    private static let automationChromiumAppShimPrefixes: [String] = [
+    nonisolated private static let automationChromiumAppShimPrefixes: [String] = [
         "com.google.Chrome.app.",
         "com.google.Chrome.canary.app.",
         "com.microsoft.edgemac.app.",
@@ -100,7 +100,7 @@ public struct OnboardingView: View {
             return String(prefix.dropLast(5))
         }
     )
-    private static let unsupportedAutomationBundleIDs: [String] = [
+    nonisolated private static let unsupportedAutomationBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
         "org.mozilla.firefoxdeveloperedition",
@@ -108,18 +108,18 @@ public struct OnboardingView: View {
         "com.openai.atlas",
     ]
     // Exact apps where Retrace uses AppleScript-based URL extraction.
-    private static let automationPreflightBaseTargets: [AutomationPreflightTarget] = [
+    nonisolated private static let automationPreflightBaseTargets: [AutomationPreflightTarget] = [
         AutomationPreflightTarget(bundleID: "com.apple.finder", displayName: "Finder", appURL: nil),
         AutomationPreflightTarget(bundleID: "company.thebrowser.Browser", displayName: "Arc", appURL: nil),
         AutomationPreflightTarget(bundleID: "com.vivaldi.Vivaldi", displayName: "Vivaldi", appURL: nil),
         AutomationPreflightTarget(bundleID: "com.openai.chat", displayName: "ChatGPT", appURL: nil),
     ]
 
-    static var automationDirectPreflightTargetBundleIDs: [String] {
+    nonisolated static var automationDirectPreflightTargetBundleIDs: [String] {
         automationPreflightBaseTargets.map(\.bundleID)
     }
 
-    static func unsupportedAutomationReason(for bundleID: String) -> String {
+    nonisolated static func unsupportedAutomationReason(for bundleID: String) -> String {
         switch bundleID {
         case "org.mozilla.firefox",
             "org.mozilla.firefoxbeta",
@@ -165,6 +165,7 @@ public struct OnboardingView: View {
     @State private var automationPreflightRunningBundleIDs: Set<String> = []
     @State private var automationPreflightBusyBundleIDs: Set<String> = []
     @State private var automationPreflightIconByBundleID: [String: NSImage] = [:]
+    @State private var automationPreflightIconLoadTasksByBundleID: [String: Task<Void, Never>] = [:]
     @State private var automationPreflightLaunchedByOnboardingBundleIDs: Set<String> = []
     @State private var hasLoadedAutomationPreflightTargets = false
     @State private var lastAutomationPreflightRecheckAt = Date.distantPast
@@ -678,6 +679,7 @@ public struct OnboardingView: View {
         .onDisappear {
             stopPermissionMonitoring()
             stopAutomationWorkspaceObservation()
+            cancelAllAutomationPreflightIconLoads()
         }
         .alert("Allow All Apps?", isPresented: $showBulkAllowAllConfirmation) {
             Button("Cancel", role: .cancel) {}
@@ -995,39 +997,11 @@ public struct OnboardingView: View {
         .cornerRadius(.cornerRadiusL)
     }
 
-    @MainActor
-    private func refreshUnsupportedAutomationTargets() async {
-        unsupportedAutomationTargets = Self.unsupportedAutomationBundleIDs.compactMap { bundleID in
-            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-                return nil
-            }
-
-            let displayName: String
-            if let bundle = Bundle(url: appURL) {
-                displayName =
-                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
-                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
-                    appURL.deletingPathExtension().lastPathComponent
-            } else {
-                displayName = appURL.deletingPathExtension().lastPathComponent
-            }
-
-            return UnsupportedAutomationTarget(
-                bundleID: bundleID,
-                displayName: displayName,
-                reason: Self.unsupportedAutomationReason(for: bundleID),
-                appURL: appURL
-            )
-        }.sorted { lhs, rhs in
-            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-        }
-    }
-
     private func unsupportedAutomationTargetRow(target: UnsupportedAutomationTarget) -> some View {
         HStack(spacing: .spacingL) {
             Group {
-                if let appURL = target.appURL {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                if let icon = automationPreflightIconByBundleID[target.bundleID] {
+                    Image(nsImage: icon)
                         .resizable()
                         .frame(width: 30, height: 30)
                 } else {
@@ -1061,6 +1035,9 @@ public struct OnboardingView: View {
         .padding(.horizontal, .spacingL)
         .padding(.vertical, .spacingM)
         .opacity(0.85)
+        .onAppear {
+            scheduleAutomationPreflightIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     private func automationPreflightTargetRow(target: AutomationPreflightTarget) -> some View {
@@ -1194,6 +1171,9 @@ public struct OnboardingView: View {
         }
         .padding(.horizontal, .spacingL)
         .padding(.vertical, .spacingM)
+        .onAppear {
+            scheduleAutomationPreflightIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     private func automationInlineStatusBadge(for target: AutomationPreflightTarget) -> some View {
@@ -2968,8 +2948,13 @@ public struct OnboardingView: View {
     private func refreshAutomationPreflightTargets() async {
         let previousTargetCount = automationPreflightTargets.count
         let previousStatusCount = automationPreflightStatusByBundleID.count
-        await refreshUnsupportedAutomationTargets()
-        let targets = await buildAutomationPreflightTargets()
+        let runningChromiumShims = automationRunningChromiumShimSnapshots()
+        let discoverySnapshot = await Task.detached(priority: .userInitiated) {
+            Self.automationPreflightDiscoverySnapshotSync(runningChromiumShims: runningChromiumShims)
+        }.value
+
+        let targets = discoverySnapshot.supportedTargets
+        unsupportedAutomationTargets = discoverySnapshot.unsupportedTargets
         automationPreflightTargets = targets
         hasLoadedAutomationPreflightTargets = true
 
@@ -2994,7 +2979,9 @@ public struct OnboardingView: View {
         automationPreflightLaunchedByOnboardingBundleIDs = Set(
             automationPreflightLaunchedByOnboardingBundleIDs.filter { validBundleIDs.contains($0) }
         )
-        automationPreflightIconByBundleID = loadAutomationPreflightIcons(for: targets)
+        pruneAutomationPreflightIconCaches(
+            validBundleIDs: validBundleIDs.union(unsupportedAutomationTargets.map(\.bundleID))
+        )
         let persistedStatuses = loadPersistedAutomationPreflightStatuses()
         for target in targets {
             guard automationPreflightStatusByBundleID[target.bundleID] == nil,
@@ -3608,19 +3595,198 @@ public struct OnboardingView: View {
     }
 
     @MainActor
-    private func loadAutomationPreflightIcons(for targets: [AutomationPreflightTarget]) -> [String: NSImage] {
-        var iconsByBundleID: [String: NSImage] = [:]
+    private func automationRunningChromiumShimSnapshots() -> [AutomationPreflightRunningChromiumShim] {
+        NSWorkspace.shared.runningApplications.compactMap { runningApp in
+            guard let bundleID = runningApp.bundleIdentifier else { return nil }
+            let isChromiumAppShim = Self.automationChromiumAppShimPrefixes.contains {
+                bundleID.hasPrefix($0)
+            }
+            guard isChromiumAppShim else { return nil }
+            return AutomationPreflightRunningChromiumShim(
+                bundleID: bundleID,
+                displayName: runningApp.localizedName ?? bundleID,
+                appURL: runningApp.bundleURL
+            )
+        }
+    }
 
-        for target in targets {
-            let appURL = target.appURL ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: target.bundleID)
-            if let appURL {
-                let icon = NSWorkspace.shared.icon(forFile: appURL.path)
+    @MainActor
+    private func pruneAutomationPreflightIconCaches(validBundleIDs: Set<String>) {
+        automationPreflightIconByBundleID = automationPreflightIconByBundleID.filter { validBundleIDs.contains($0.key) }
+        automationPreflightIconLoadTasksByBundleID = automationPreflightIconLoadTasksByBundleID.filter { bundleID, task in
+            guard validBundleIDs.contains(bundleID) else {
+                task.cancel()
+                return false
+            }
+            return true
+        }
+    }
+
+    @MainActor
+    private func cancelAllAutomationPreflightIconLoads() {
+        automationPreflightIconLoadTasksByBundleID.values.forEach { $0.cancel() }
+        automationPreflightIconLoadTasksByBundleID = [:]
+    }
+
+    @MainActor
+    private func scheduleAutomationPreflightIconLoad(bundleID: String, appURL: URL?) {
+        guard automationPreflightIconByBundleID[bundleID] == nil else { return }
+        guard automationPreflightIconLoadTasksByBundleID[bundleID] == nil else { return }
+        guard let iconPath = appURL?.path else { return }
+
+        automationPreflightIconLoadTasksByBundleID[bundleID] = Task(priority: .utility) { [bundleID, iconPath] in
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                defer { automationPreflightIconLoadTasksByBundleID[bundleID] = nil }
+                guard !Task.isCancelled else { return }
+                guard automationPreflightIconByBundleID[bundleID] == nil else { return }
+
+                let icon = NSWorkspace.shared.icon(forFile: iconPath)
                 icon.size = NSSize(width: 20, height: 20)
-                iconsByBundleID[target.bundleID] = icon
+                automationPreflightIconByBundleID[bundleID] = icon
+            }
+        }
+    }
+
+    private struct AutomationPreflightRunningChromiumShim: Sendable {
+        let bundleID: String
+        let displayName: String
+        let appURL: URL?
+    }
+
+    private struct AutomationInstalledApplication: Sendable {
+        let bundleID: String
+        let displayName: String
+        let appURL: URL
+    }
+
+    private struct AutomationPreflightDiscoverySnapshot: Sendable {
+        let supportedTargets: [AutomationPreflightTarget]
+        let unsupportedTargets: [UnsupportedAutomationTarget]
+    }
+
+    nonisolated private static func automationPreflightDiscoverySnapshotSync(
+        runningChromiumShims: [AutomationPreflightRunningChromiumShim]
+    ) -> AutomationPreflightDiscoverySnapshot {
+        let installedApplications = installedAutomationApplicationsByBundleIDSync()
+
+        var targetsByBundleID: [String: AutomationPreflightTarget] = [:]
+        for target in automationPreflightBaseTargets {
+            guard let installedApp = installedApplications[target.bundleID] else { continue }
+            targetsByBundleID[installedApp.bundleID] = AutomationPreflightTarget(
+                bundleID: installedApp.bundleID,
+                displayName: installedApp.displayName,
+                appURL: installedApp.appURL
+            )
+        }
+
+        for target in discoverInstalledWebAppAutomationTargetsSync() {
+            targetsByBundleID[target.bundleID] = target
+            includeInstalledAutomationHostTargetIfNeeded(
+                for: target.bundleID,
+                targetsByBundleID: &targetsByBundleID,
+                installedApplications: installedApplications
+            )
+        }
+
+        for runningShim in runningChromiumShims {
+            targetsByBundleID[runningShim.bundleID] = AutomationPreflightTarget(
+                bundleID: runningShim.bundleID,
+                displayName: runningShim.displayName,
+                appURL: runningShim.appURL
+            )
+            includeInstalledAutomationHostTargetIfNeeded(
+                for: runningShim.bundleID,
+                targetsByBundleID: &targetsByBundleID,
+                installedApplications: installedApplications
+            )
+        }
+
+        let supportedTargets = targetsByBundleID.values.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        let unsupportedTargets = unsupportedAutomationBundleIDs.compactMap { bundleID -> UnsupportedAutomationTarget? in
+            guard let installedApp = installedApplications[bundleID] else { return nil }
+            return UnsupportedAutomationTarget(
+                bundleID: installedApp.bundleID,
+                displayName: installedApp.displayName,
+                reason: unsupportedAutomationReason(for: bundleID),
+                appURL: installedApp.appURL
+            )
+        }.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        return AutomationPreflightDiscoverySnapshot(
+            supportedTargets: Array(supportedTargets),
+            unsupportedTargets: unsupportedTargets
+        )
+    }
+
+    nonisolated private static func includeInstalledAutomationHostTargetIfNeeded(
+        for bundleID: String,
+        targetsByBundleID: inout [String: AutomationPreflightTarget],
+        installedApplications: [String: AutomationInstalledApplication]
+    ) {
+        guard let hostBundleID = hostBrowserBundleID(forChromiumAppShim: bundleID),
+              let installedHost = installedApplications[hostBundleID] else {
+            return
+        }
+
+        targetsByBundleID[installedHost.bundleID] = AutomationPreflightTarget(
+            bundleID: installedHost.bundleID,
+            displayName: installedHost.displayName,
+            appURL: installedHost.appURL
+        )
+    }
+
+    nonisolated private static func installedAutomationApplicationsByBundleIDSync(
+        fileManager: FileManager = .default
+    ) -> [String: AutomationInstalledApplication] {
+        let applicationFolders: [URL] = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true),
+            URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Chrome Apps.localized", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized", isDirectory: true),
+        ]
+
+        var installedApplications: [String: AutomationInstalledApplication] = [:]
+
+        for folder in applicationFolders {
+            guard let contents = try? fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for appURL in contents where appURL.pathExtension == "app" {
+                guard let bundle = Bundle(url: appURL),
+                      let bundleID = bundle.bundleIdentifier,
+                      !bundleID.isEmpty else {
+                    continue
+                }
+                guard installedApplications[bundleID] == nil else { continue }
+
+                let displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+
+                installedApplications[bundleID] = AutomationInstalledApplication(
+                    bundleID: bundleID,
+                    displayName: displayName,
+                    appURL: appURL
+                )
             }
         }
 
-        return iconsByBundleID
+        return installedApplications
     }
 
     private func automationStatusDescription(for target: AutomationPreflightTarget) -> String {
@@ -3868,10 +4034,12 @@ public struct OnboardingView: View {
                     category: .ui
                 )
                 await launchAutomationTarget(requiredTarget)
-            } else if let requiredTarget = await installedAutomationTarget(
-                bundleID: requiredBundleID,
-                fallbackDisplayName: requiredBundleID
-            ) {
+            } else if let requiredTarget = await Task.detached(priority: .utility, operation: {
+                Self.installedAutomationTargetSync(
+                    bundleID: requiredBundleID,
+                    fallbackDisplayName: requiredBundleID
+                )
+            }).value {
                 Log.info(
                     "[OnboardingView] Launching discovered required host target \(requiredBundleID) before allow flow for \(target.bundleID)",
                     category: .ui
@@ -4007,62 +4175,6 @@ public struct OnboardingView: View {
             }
         }
         defaults.set(persistableStatuses, forKey: Self.automationPreflightStatusesKey)
-    }
-
-    private func buildAutomationPreflightTargets() async -> [AutomationPreflightTarget] {
-        let runningApps = await MainActor.run {
-            NSWorkspace.shared.runningApplications
-        }
-
-        var targetsByBundleID: [String: AutomationPreflightTarget] = [:]
-        for target in Self.automationPreflightBaseTargets {
-            if let installedTarget = await installedAutomationTarget(
-                bundleID: target.bundleID,
-                fallbackDisplayName: target.displayName
-            ) {
-                targetsByBundleID[installedTarget.bundleID] = installedTarget
-            }
-        }
-
-        // Include all installed Chromium web apps from known app folders.
-        for target in discoverInstalledWebAppAutomationTargets() {
-            targetsByBundleID[target.bundleID] = target
-
-            if let hostBundleID = Self.hostBrowserBundleID(forChromiumAppShim: target.bundleID),
-               let hostTarget = await installedAutomationTarget(
-                bundleID: hostBundleID,
-                fallbackDisplayName: hostBundleID
-               ) {
-                targetsByBundleID[hostTarget.bundleID] = hostTarget
-            }
-        }
-
-        // Also include currently running Chromium web-app shims (covers non-standard install paths).
-        for runningApp in runningApps {
-            guard let bundleID = runningApp.bundleIdentifier else { continue }
-
-            let isChromiumAppShim = Self.automationChromiumAppShimPrefixes.contains {
-                bundleID.hasPrefix($0)
-            }
-            guard isChromiumAppShim else { continue }
-
-            let displayName = runningApp.localizedName ?? bundleID
-            targetsByBundleID[bundleID] = AutomationPreflightTarget(
-                bundleID: bundleID,
-                displayName: displayName,
-                appURL: runningApp.bundleURL
-            )
-
-            if let hostBundleID = Self.hostBrowserBundleID(forChromiumAppShim: bundleID),
-               let hostTarget = await installedAutomationTarget(
-                bundleID: hostBundleID,
-                fallbackDisplayName: hostBundleID
-               ) {
-                targetsByBundleID[hostTarget.bundleID] = hostTarget
-            }
-        }
-
-        return targetsByBundleID.values.sorted(by: { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending })
     }
 
     private func requestAutomationPermission(
@@ -4211,30 +4323,24 @@ public struct OnboardingView: View {
         )
     }
 
-    private func installedAutomationTarget(
+    nonisolated private static func installedAutomationTargetSync(
         bundleID: String,
         fallbackDisplayName: String
-    ) async -> AutomationPreflightTarget? {
-        await MainActor.run {
-            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-                return nil
-            }
-
-            let displayName: String
-            if let bundle = Bundle(url: appURL) {
-                displayName =
-                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
-                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
-                    appURL.deletingPathExtension().lastPathComponent
-            } else {
-                displayName = fallbackDisplayName
-            }
-
-            return AutomationPreflightTarget(bundleID: bundleID, displayName: displayName, appURL: appURL)
+    ) -> AutomationPreflightTarget? {
+        guard let installedApp = installedAutomationApplicationsByBundleIDSync()[bundleID] else {
+            return nil
         }
+
+        let displayName = installedApp.displayName.isEmpty ? fallbackDisplayName : installedApp.displayName
+
+        return AutomationPreflightTarget(
+            bundleID: bundleID,
+            displayName: displayName,
+            appURL: installedApp.appURL
+        )
     }
 
-    private static func hostBrowserBundleID(forChromiumAppShim bundleID: String) -> String? {
+    nonisolated private static func hostBrowserBundleID(forChromiumAppShim bundleID: String) -> String? {
         for prefix in automationChromiumAppShimPrefixes where bundleID.hasPrefix(prefix) {
             guard prefix.hasSuffix(".app.") else { continue }
             return String(prefix.dropLast(5))
@@ -4242,7 +4348,7 @@ public struct OnboardingView: View {
         return nil
     }
 
-    private static func automationPermissionRequiredBundleIDs(forTargetBundleID targetBundleID: String) -> [String] {
+    nonisolated private static func automationPermissionRequiredBundleIDs(forTargetBundleID targetBundleID: String) -> [String] {
         if let hostBundleID = hostBrowserBundleID(forChromiumAppShim: targetBundleID),
            hostBundleID != targetBundleID {
             return [targetBundleID, hostBundleID]
@@ -4250,7 +4356,7 @@ public struct OnboardingView: View {
         return [targetBundleID]
     }
 
-    private func discoverInstalledWebAppAutomationTargets() -> [AutomationPreflightTarget] {
+    nonisolated private static func discoverInstalledWebAppAutomationTargetsSync() -> [AutomationPreflightTarget] {
         let fileManager = FileManager.default
         let appFolders = [
             URL(fileURLWithPath: "/Applications"),

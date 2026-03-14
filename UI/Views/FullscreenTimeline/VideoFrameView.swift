@@ -52,17 +52,20 @@ struct VideoFrameView: NSViewRepresentable {
         // Otherwise create symlink with .mp4 extension for AVFoundation
         let url: URL
         if actualVideoPath.hasSuffix(".mp4") {
+            if let oldSymlinkPath = context.coordinator.symlinkPath {
+                try? FileManager.default.removeItem(atPath: oldSymlinkPath)
+                context.coordinator.symlinkPath = nil
+            }
             url = URL(fileURLWithPath: actualVideoPath)
         } else {
             // Rewind stores video files without extensions - AVPlayer requires .mp4 extension
-            // Create a symlink with .mp4 extension in temp directory
+            // Create a unique symlink to avoid collisions with similarly named videos.
             let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4").path
 
-            // Remove old symlink if it exists
-            if FileManager.default.fileExists(atPath: symlinkPath) {
-                try? FileManager.default.removeItem(atPath: symlinkPath)
+            if let oldSymlinkPath = context.coordinator.symlinkPath {
+                try? FileManager.default.removeItem(atPath: oldSymlinkPath)
+                context.coordinator.symlinkPath = nil
             }
 
             // Create symlink

@@ -94,7 +94,7 @@ struct SettingsSearchEntry: Identifiable {
     var breadcrumb: String { "\(tab.rawValue) > \(cardTitle)" }
 }
 
-private struct InPageURLBrowserTarget: Identifiable, Hashable {
+private struct InPageURLBrowserTarget: Identifiable, Hashable, Sendable {
     let bundleID: String
     let displayName: String
     let appURL: URL?
@@ -102,7 +102,7 @@ private struct InPageURLBrowserTarget: Identifiable, Hashable {
     var id: String { bundleID }
 }
 
-private struct UnsupportedInPageURLTarget: Identifiable, Hashable {
+private struct UnsupportedInPageURLTarget: Identifiable, Hashable, Sendable {
     let bundleID: String
     let displayName: String
     let reason: String
@@ -111,7 +111,7 @@ private struct UnsupportedInPageURLTarget: Identifiable, Hashable {
     var id: String { bundleID }
 }
 
-private enum InPageURLPermissionState: Equatable {
+private enum InPageURLPermissionState: Equatable, Sendable {
     case granted
     case denied
     case needsConsent
@@ -394,6 +394,7 @@ public struct SettingsView: View {
     @State private var inPageURLBusyBundleIDs: Set<String> = []
     @State private var inPageURLRunningBundleIDs: Set<String> = []
     @State private var inPageURLIconByBundleID: [String: NSImage] = [:]
+    @State private var inPageURLIconLoadTasksByBundleID: [String: Task<Void, Never>] = [:]
     @State private var inPageURLVerificationByBundleID: [String: InPageURLVerificationState] = [:]
     @State private var inPageURLVerificationBusyBundleIDs: Set<String> = []
     @State private var isRefreshingInPageURLTargets = false
@@ -519,7 +520,7 @@ public struct SettingsView: View {
         qos: .utility,
         attributes: .concurrent
     )
-    private static let inPageURLKnownBrowserBundleIDs: [String] = [
+    nonisolated private static let inPageURLKnownBrowserBundleIDs: [String] = [
         "com.apple.Safari",
         "com.google.Chrome",
         "com.google.Chrome.canary",
@@ -533,7 +534,7 @@ public struct SettingsView: View {
         "company.thebrowser.dia",
         "com.nicklockwood.Thorium",
     ]
-    private static let inPageURLUnsupportedBundleIDs: [String] = [
+    nonisolated private static let inPageURLUnsupportedBundleIDs: [String] = [
         "org.mozilla.firefox",
         "org.mozilla.firefoxbeta",
         "org.mozilla.firefoxdeveloperedition",
@@ -542,7 +543,7 @@ public struct SettingsView: View {
         "com.sigmaos.sigmaos.macos",
         "com.openai.atlas",
     ]
-    private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
+    nonisolated private static let inPageURLChromiumHostBundleIDPrefixes: [String] = [
         "com.google.Chrome",
         "com.google.Chrome.canary",
         "org.chromium.Chromium",
@@ -671,6 +672,7 @@ public struct SettingsView: View {
             settingsToastDismissTask = nil
             rewindCutoffRefreshTask?.cancel()
             rewindCutoffRefreshTask = nil
+            cancelAllInPageURLIconLoads()
         }
         .overlay {
             settingsSearchOverlay
@@ -2430,7 +2432,6 @@ public struct SettingsView: View {
         .task(id: collectInPageURLsExperimental) {
             guard collectInPageURLsExperimental else { return }
             await checkPermissions()
-            await refreshUnsupportedInPageURLTargets()
             await refreshInPageURLTargets()
         }
     }
@@ -2543,6 +2544,9 @@ public struct SettingsView: View {
         .padding(.vertical, 8)
         .background(Color.white.opacity(0.04))
         .cornerRadius(8)
+        .onAppear {
+            scheduleInPageURLIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     @ViewBuilder
@@ -2620,14 +2624,17 @@ public struct SettingsView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+        .onAppear {
+            scheduleInPageURLIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     @ViewBuilder
     private func unsupportedInPageURLTargetRow(target: UnsupportedInPageURLTarget) -> some View {
         HStack(spacing: 12) {
             Group {
-                if let appURL = target.appURL {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                if let icon = inPageURLIconByBundleID[target.bundleID] {
+                    Image(nsImage: icon)
                         .resizable()
                         .frame(width: 20, height: 20)
                 } else {
@@ -2660,6 +2667,9 @@ public struct SettingsView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .opacity(0.85)
+        .onAppear {
+            scheduleInPageURLIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     @ViewBuilder
@@ -4017,10 +4027,18 @@ public struct SettingsView: View {
         Task {
             do {
                 let bundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
-                let apps: [(bundleID: String, name: String)] = bundleIDs.map { bundleID in
-                    let name = AppNameResolver.shared.displayName(for: bundleID)
-                    return (bundleID: bundleID, name: name)
-                }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                let apps: [(bundleID: String, name: String)] = await Task.detached(
+                    priority: .utility
+                ) { () -> [(bundleID: String, name: String)] in
+                    let resolvedApps = bundleIDs
+                        .map { bundleID in
+                            let name = AppNameResolver.shared.displayName(for: bundleID)
+                            return (bundleID: bundleID, name: name)
+                        }
+                    return resolvedApps.sorted {
+                        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                }.value
 
                 await MainActor.run {
                     installedAppsForOCR = apps
@@ -5281,13 +5299,13 @@ private struct ExcludedAppChip: View {
     let onRemove: () -> Void
 
     @State private var isHovered = false
+    @State private var resolvedIcon: NSImage?
 
     var body: some View {
         HStack(spacing: 6) {
             // App icon
-            if let iconPath = app.iconPath {
-                let icon = NSWorkspace.shared.icon(forFile: iconPath)
-                Image(nsImage: icon)
+            if let resolvedIcon {
+                Image(nsImage: resolvedIcon)
                     .resizable()
                     .frame(width: 16, height: 16)
             } else {
@@ -5318,6 +5336,20 @@ private struct ExcludedAppChip: View {
                 isHovered = hovering
             }
         }
+        .task(id: app.iconPath) {
+            resolvedIcon = nil
+            guard let iconPath = app.iconPath else { return }
+            guard !Task.isCancelled else { return }
+            resolvedIcon = Self.resolveIconOnMainActor(forPath: iconPath)
+        }
+    }
+
+    @MainActor
+    private static func resolveIconOnMainActor(forPath iconPath: String) -> NSImage? {
+        guard FileManager.default.fileExists(atPath: iconPath) else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: iconPath)
+        icon.size = NSSize(width: 16, height: 16)
+        return icon
     }
 }
 
@@ -5708,6 +5740,9 @@ private struct RetentionAppsChip<PopoverContent: View>: View {
     @ViewBuilder var popoverContent: () -> PopoverContent
 
     @State private var isHovered = false
+    @State private var cachedAppIcons: [String: NSImage] = [:]
+    @State private var cachedAppNames: [String: String] = [:]
+    @State private var cachedAppPaths: [String: String] = [:]
 
     private let maxVisibleIcons = 5
     private let iconSize: CGFloat = 18
@@ -5783,6 +5818,9 @@ private struct RetentionAppsChip<PopoverContent: View>: View {
             if hovering { NSCursor.pointingHand.push() }
             else { NSCursor.pop() }
         }
+        .task(id: sortedApps.joined(separator: "|")) {
+            await preloadAppPresentation(for: sortedApps)
+        }
         .popover(isPresented: $isPopoverShown, arrowEdge: .bottom) {
             popoverContent()
         }
@@ -5790,8 +5828,8 @@ private struct RetentionAppsChip<PopoverContent: View>: View {
 
     @ViewBuilder
     private func appIcon(for bundleID: String) -> some View {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+        if let icon = cachedAppIcons[bundleID] {
+            Image(nsImage: icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
         } else {
@@ -5803,10 +5841,121 @@ private struct RetentionAppsChip<PopoverContent: View>: View {
     }
 
     private func appName(for bundleID: String) -> String {
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            return FileManager.default.displayName(atPath: appURL.path)
+        if let cachedName = cachedAppNames[bundleID] {
+            return cachedName
         }
         return bundleID.components(separatedBy: ".").last ?? bundleID
+    }
+
+    @MainActor
+    private func preloadAppPresentation(for bundleIDs: [String]) async {
+        let validBundleIDs = Set(bundleIDs)
+        cachedAppIcons = cachedAppIcons.filter { validBundleIDs.contains($0.key) }
+        cachedAppNames = cachedAppNames.filter { validBundleIDs.contains($0.key) }
+        cachedAppPaths = cachedAppPaths.filter { validBundleIDs.contains($0.key) }
+
+        let iconBundleIDs = iconBundleIDsForCurrentPresentation(from: bundleIDs)
+        let nameBundleIDs = bundleIDs.count == 1 ? bundleIDs : []
+        let requiredBundleIDs = Set(iconBundleIDs + nameBundleIDs)
+        guard !requiredBundleIDs.isEmpty else { return }
+
+        let missingBundleIDs = requiredBundleIDs.filter {
+            cachedAppPaths[$0] == nil || (nameBundleIDs.contains($0) && cachedAppNames[$0] == nil)
+        }
+        if !missingBundleIDs.isEmpty {
+            let resolved = await Task.detached(priority: .utility) {
+                Self.discoverInstalledAppsByBundleID(bundleIDs: Array(missingBundleIDs))
+            }.value
+
+            for (bundleID, app) in resolved {
+                if cachedAppPaths[bundleID] == nil {
+                    cachedAppPaths[bundleID] = app.appPath
+                }
+
+                if cachedAppNames[bundleID] == nil,
+                   !app.displayName.isEmpty {
+                    cachedAppNames[bundleID] = app.displayName
+                }
+            }
+        }
+
+        for (index, bundleID) in iconBundleIDs.enumerated() {
+            guard cachedAppIcons[bundleID] == nil,
+                  let appPath = cachedAppPaths[bundleID] else {
+                continue
+            }
+
+            let icon = NSWorkspace.shared.icon(forFile: appPath)
+            icon.size = NSSize(width: iconSize, height: iconSize)
+            cachedAppIcons[bundleID] = icon
+
+            if (index + 1).isMultiple(of: 3) {
+                await Task.yield()
+            }
+        }
+    }
+
+    private func iconBundleIDsForCurrentPresentation(from bundleIDs: [String]) -> [String] {
+        if bundleIDs.count <= 1 {
+            return bundleIDs
+        }
+        return Array(bundleIDs.prefix(maxVisibleIcons))
+    }
+
+    private struct InstalledAppPresentation {
+        let displayName: String
+        let appPath: String
+    }
+
+    nonisolated private static func discoverInstalledAppsByBundleID(
+        bundleIDs: [String],
+        fileManager: FileManager = .default
+    ) -> [String: InstalledAppPresentation] {
+        let requiredBundleIDs = Set(bundleIDs.filter { !$0.isEmpty })
+        guard !requiredBundleIDs.isEmpty else { return [:] }
+
+        let applicationFolders: [URL] = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Chrome Apps.localized", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized", isDirectory: true),
+        ]
+
+        var remainingBundleIDs = requiredBundleIDs
+        var resolvedApps: [String: InstalledAppPresentation] = [:]
+
+        for folder in applicationFolders {
+            guard !remainingBundleIDs.isEmpty else { break }
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for appURL in entries where appURL.pathExtension.lowercased() == "app" {
+                guard let bundle = Bundle(url: appURL),
+                      let bundleID = bundle.bundleIdentifier,
+                      remainingBundleIDs.contains(bundleID) else {
+                    continue
+                }
+
+                let displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+
+                resolvedApps[bundleID] = InstalledAppPresentation(
+                    displayName: displayName,
+                    appPath: appURL.path
+                )
+                remainingBundleIDs.remove(bundleID)
+            }
+        }
+
+        return resolvedApps
     }
 }
 
@@ -7296,7 +7445,7 @@ extension SettingsView {
                 for: bundleID,
                 askUserIfNeeded: false
             )
-            let resolvedState = resolvedInPageURLPermissionState(
+            let resolvedState = await resolvedInPageURLPermissionState(
                 from: status,
                 bundleID: bundleID,
                 previousState: nil,
@@ -7454,7 +7603,7 @@ extension SettingsView {
         NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps, .activateAllWindows])
     }
 
-    private func inPageURLDisplayName(for bundleID: String) -> String {
+    nonisolated private static func inPageURLDisplayName(for bundleID: String) -> String {
         switch bundleID {
         case "com.apple.Safari":
             return "Safari"
@@ -7491,35 +7640,7 @@ extension SettingsView {
         }
     }
 
-    @MainActor
-    private func refreshUnsupportedInPageURLTargets() async {
-        unsupportedInPageURLTargets = Self.inPageURLUnsupportedBundleIDs.compactMap { bundleID in
-            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-                return nil
-            }
-
-            let displayName: String
-            if let bundle = Bundle(url: appURL) {
-                displayName =
-                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
-                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
-                    appURL.deletingPathExtension().lastPathComponent
-            } else {
-                displayName = appURL.deletingPathExtension().lastPathComponent
-            }
-
-            return UnsupportedInPageURLTarget(
-                bundleID: bundleID,
-                displayName: displayName,
-                reason: Self.inPageURLUnsupportedReason(for: bundleID),
-                appURL: appURL
-            )
-        }.sorted { lhs, rhs in
-            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-        }
-    }
-
-    static func inPageURLUnsupportedReason(for bundleID: String) -> String {
+    nonisolated static func inPageURLUnsupportedReason(for bundleID: String) -> String {
         switch bundleID {
         case "org.mozilla.firefox",
             "org.mozilla.firefoxbeta",
@@ -7546,7 +7667,7 @@ extension SettingsView {
             return "Enable 'Allow JavaScript from Apple Events' (see Step 2)"
         }
 
-        let hostDisplayName = inPageURLDisplayName(for: automationBundleID)
+        let hostDisplayName = Self.inPageURLDisplayName(for: automationBundleID)
         return "Enable 'Allow JavaScript from Apple Events' for \(hostDisplayName) (see Step 2)"
     }
 
@@ -7558,14 +7679,18 @@ extension SettingsView {
         isRefreshingInPageURLTargets = true
         defer { isRefreshingInPageURLTargets = false }
 
-        await refreshUnsupportedInPageURLTargets()
-        let targets = await buildInPageURLTargets()
+        let discoverySnapshot = await Task.detached(priority: .userInitiated) {
+            Self.inPageURLDiscoverySnapshotSync()
+        }.value
+
+        let targets = discoverySnapshot.supportedTargets
+        unsupportedInPageURLTargets = discoverySnapshot.unsupportedTargets
         inPageURLTargets = targets
         refreshInPageURLRunningBundleIDs()
-        inPageURLIconByBundleID = Dictionary(uniqueKeysWithValues: targets.compactMap { target in
-            guard let appURL = target.appURL else { return nil }
-            return (target.bundleID, NSWorkspace.shared.icon(forFile: appURL.path))
-        })
+
+        pruneInPageURLIconCaches(
+            validBundleIDs: Set(targets.map(\.bundleID)).union(unsupportedInPageURLTargets.map(\.bundleID))
+        )
 
         var cachedStates = inPageURLCachedPermissionStates()
         var nextPermissionStates: [String: InPageURLPermissionState] = [:]
@@ -7574,7 +7699,7 @@ extension SettingsView {
                 for: target.bundleID,
                 askUserIfNeeded: false
             )
-            let state = resolvedInPageURLPermissionState(
+            let state = await resolvedInPageURLPermissionState(
                 from: status,
                 bundleID: target.bundleID,
                 previousState: inPageURLPermissionStateByBundleID[target.bundleID],
@@ -7591,6 +7716,139 @@ extension SettingsView {
     }
 
     @MainActor
+    private func pruneInPageURLIconCaches(validBundleIDs: Set<String>) {
+        inPageURLIconByBundleID = inPageURLIconByBundleID.filter { validBundleIDs.contains($0.key) }
+        inPageURLIconLoadTasksByBundleID = inPageURLIconLoadTasksByBundleID.filter { bundleID, task in
+            guard validBundleIDs.contains(bundleID) else {
+                task.cancel()
+                return false
+            }
+            return true
+        }
+    }
+
+    @MainActor
+    private func cancelAllInPageURLIconLoads() {
+        inPageURLIconLoadTasksByBundleID.values.forEach { $0.cancel() }
+        inPageURLIconLoadTasksByBundleID = [:]
+    }
+
+    @MainActor
+    private func scheduleInPageURLIconLoad(bundleID: String, appURL: URL?) {
+        guard inPageURLIconByBundleID[bundleID] == nil else { return }
+        guard inPageURLIconLoadTasksByBundleID[bundleID] == nil else { return }
+        guard let iconPath = appURL?.path else { return }
+
+        inPageURLIconLoadTasksByBundleID[bundleID] = Task(priority: .utility) { [bundleID, iconPath] in
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                defer { inPageURLIconLoadTasksByBundleID[bundleID] = nil }
+                guard !Task.isCancelled else { return }
+                guard inPageURLIconByBundleID[bundleID] == nil else { return }
+
+                let icon = NSWorkspace.shared.icon(forFile: iconPath)
+                icon.size = NSSize(width: 20, height: 20)
+                inPageURLIconByBundleID[bundleID] = icon
+            }
+        }
+    }
+
+    private struct InPageURLInstalledApplication: Sendable {
+        let bundleID: String
+        let displayName: String
+        let appURL: URL
+    }
+
+    private struct InPageURLDiscoverySnapshot: Sendable {
+        let supportedTargets: [InPageURLBrowserTarget]
+        let unsupportedTargets: [UnsupportedInPageURLTarget]
+    }
+
+    nonisolated private static func inPageURLDiscoverySnapshotSync() -> InPageURLDiscoverySnapshot {
+        let installedApplications = installedInPageURLApplicationsByBundleIDSync()
+
+        var supportedTargetsByBundleID: [String: InPageURLBrowserTarget] = [:]
+        for bundleID in inPageURLKnownBrowserBundleIDs {
+            guard let installedApp = installedApplications[bundleID] else { continue }
+            supportedTargetsByBundleID[bundleID] = InPageURLBrowserTarget(
+                bundleID: installedApp.bundleID,
+                displayName: installedApp.displayName,
+                appURL: installedApp.appURL
+            )
+        }
+
+        for target in discoveredInPageURLWebAppTargetsSync() {
+            supportedTargetsByBundleID[target.bundleID] = target
+        }
+
+        let supportedTargets = supportedTargetsByBundleID.values.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        let unsupportedTargets = inPageURLUnsupportedBundleIDs.compactMap { bundleID -> UnsupportedInPageURLTarget? in
+            guard let installedApp = installedApplications[bundleID] else { return nil }
+            return UnsupportedInPageURLTarget(
+                bundleID: installedApp.bundleID,
+                displayName: installedApp.displayName,
+                reason: inPageURLUnsupportedReason(for: bundleID),
+                appURL: installedApp.appURL
+            )
+        }.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        return InPageURLDiscoverySnapshot(
+            supportedTargets: Array(supportedTargets),
+            unsupportedTargets: unsupportedTargets
+        )
+    }
+
+    nonisolated private static func installedInPageURLApplicationsByBundleIDSync(
+        fileManager: FileManager = .default
+    ) -> [String: InPageURLInstalledApplication] {
+        let applicationFolders: [URL] = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Chrome Apps.localized", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized", isDirectory: true),
+        ]
+
+        var applicationsByBundleID: [String: InPageURLInstalledApplication] = [:]
+        for folder in applicationFolders {
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for appURL in entries where appURL.pathExtension.lowercased() == "app" {
+                guard let bundle = Bundle(url: appURL),
+                      let bundleID = bundle.bundleIdentifier,
+                      !bundleID.isEmpty,
+                      applicationsByBundleID[bundleID] == nil else {
+                    continue
+                }
+
+                let displayName =
+                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
+                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
+                    appURL.deletingPathExtension().lastPathComponent
+
+                applicationsByBundleID[bundleID] = InPageURLInstalledApplication(
+                    bundleID: bundleID,
+                    displayName: displayName,
+                    appURL: appURL
+                )
+            }
+        }
+
+        return applicationsByBundleID
+    }
+
+    @MainActor
     private func refreshInPageURLRunningBundleIDs() {
         let runningBundleIDs = Set(
             NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
@@ -7600,42 +7858,25 @@ extension SettingsView {
         )
     }
 
-    private func buildInPageURLTargets() async -> [InPageURLBrowserTarget] {
-        var targetsByBundleID: [String: InPageURLBrowserTarget] = [:]
-        for bundleID in Self.inPageURLKnownBrowserBundleIDs {
-            if let target = await installedInPageURLTarget(bundleID: bundleID) {
-                targetsByBundleID[target.bundleID] = target
-            }
-        }
-
-        for target in discoveredInPageURLWebAppTargets() {
-            targetsByBundleID[target.bundleID] = target
-        }
-
-        return Array(targetsByBundleID.values).sorted { lhs, rhs in
-            lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
-        }
-    }
-
-    private func discoveredInPageURLWebAppTargets() -> [InPageURLBrowserTarget] {
+    nonisolated private static func discoveredInPageURLWebAppTargetsSync() -> [InPageURLBrowserTarget] {
         let fileManager = FileManager.default
         let homeApplications = fileManager.homeDirectoryForCurrentUser
             .appendingPathComponent("Applications", isDirectory: true)
         let systemApplications = URL(fileURLWithPath: "/Applications", isDirectory: true)
 
         var searchDirectories: Set<URL> = [homeApplications, systemApplications]
-        inPageURLWebAppContainerDirectories(in: homeApplications).forEach { searchDirectories.insert($0) }
-        inPageURLWebAppContainerDirectories(in: systemApplications).forEach { searchDirectories.insert($0) }
+        Self.inPageURLWebAppContainerDirectories(in: homeApplications).forEach { searchDirectories.insert($0) }
+        Self.inPageURLWebAppContainerDirectories(in: systemApplications).forEach { searchDirectories.insert($0) }
 
         var webAppTargets: [InPageURLBrowserTarget] = []
         var seenBundleIDs: Set<String> = []
 
         for directoryURL in searchDirectories {
-            let appURLs = inPageURLAppBundleURLs(in: directoryURL)
+            let appURLs = Self.inPageURLAppBundleURLs(in: directoryURL)
             for appURL in appURLs {
                 guard let bundle = Bundle(url: appURL),
                       let bundleID = bundle.bundleIdentifier,
-                      isInPageURLChromiumWebApp(bundle: bundle, bundleID: bundleID),
+                      Self.isInPageURLChromiumWebApp(bundle: bundle, bundleID: bundleID),
                       !seenBundleIDs.contains(bundleID) else {
                     continue
                 }
@@ -7659,7 +7900,7 @@ extension SettingsView {
         return webAppTargets
     }
 
-    private func inPageURLWebAppContainerDirectories(in rootDirectory: URL) -> [URL] {
+    nonisolated private static func inPageURLWebAppContainerDirectories(in rootDirectory: URL) -> [URL] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: rootDirectory,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -7674,7 +7915,7 @@ extension SettingsView {
         }
     }
 
-    private func inPageURLAppBundleURLs(in directoryURL: URL) -> [URL] {
+    nonisolated private static func inPageURLAppBundleURLs(in directoryURL: URL) -> [URL] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: directoryURL,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -7686,38 +7927,13 @@ extension SettingsView {
         return entries.filter { $0.pathExtension.lowercased() == "app" }
     }
 
-    private func isInPageURLChromiumWebApp(bundle: Bundle, bundleID: String) -> Bool {
+    nonisolated private static func isInPageURLChromiumWebApp(bundle: Bundle, bundleID: String) -> Bool {
         if bundle.object(forInfoDictionaryKey: "CrAppModeShortcutID") != nil {
             return true
         }
 
         return Self.inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
             bundleID.hasPrefix(prefix + ".app.")
-        }
-    }
-
-    private func installedInPageURLTarget(bundleID: String) async -> InPageURLBrowserTarget? {
-        let fallbackDisplayName = inPageURLDisplayName(for: bundleID)
-        return await MainActor.run { () -> InPageURLBrowserTarget? in
-            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
-                return nil
-            }
-
-            let displayName: String
-            if let bundle = Bundle(url: appURL) {
-                displayName =
-                    (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ??
-                    (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ??
-                    appURL.deletingPathExtension().lastPathComponent
-            } else {
-                displayName = fallbackDisplayName
-            }
-
-            return InPageURLBrowserTarget(
-                bundleID: bundleID,
-                displayName: displayName,
-                appURL: appURL
-            )
         }
     }
 
@@ -7732,7 +7948,7 @@ extension SettingsView {
             askUserIfNeeded: true
         )
         var cachedStates = inPageURLCachedPermissionStates()
-        let state = resolvedInPageURLPermissionState(
+        let state = await resolvedInPageURLPermissionState(
             from: status,
             bundleID: target.bundleID,
             previousState: inPageURLPermissionStateByBundleID[target.bundleID],
@@ -7776,7 +7992,7 @@ extension SettingsView {
             askUserIfNeeded: false
         )
         var cachedStates = inPageURLCachedPermissionStates()
-        let state = resolvedInPageURLPermissionState(
+        let state = await resolvedInPageURLPermissionState(
             from: status,
             bundleID: target.bundleID,
             previousState: inPageURLPermissionStateByBundleID[target.bundleID],
@@ -7860,9 +8076,9 @@ extension SettingsView {
         bundleID: String,
         previousState: InPageURLPermissionState?,
         cachedState: InPageURLPermissionState?
-    ) -> InPageURLPermissionState {
+    ) async -> InPageURLPermissionState {
         if status == OSStatus(procNotFound) {
-            if let settingsState = inPageURLPermissionStateFromSystemSettings(for: bundleID) {
+            if let settingsState = await inPageURLPermissionStateFromSystemSettingsAsync(for: bundleID) {
                 return settingsState
             }
             if let previousState, isStableInPageURLPermissionState(previousState) {
@@ -7877,7 +8093,15 @@ extension SettingsView {
         return inPageURLPermissionState(from: status)
     }
 
-    private func inPageURLPermissionStateFromSystemSettings(for targetBundleID: String) -> InPageURLPermissionState? {
+    private func inPageURLPermissionStateFromSystemSettingsAsync(for targetBundleID: String) async -> InPageURLPermissionState? {
+        await Task.detached(priority: .utility) {
+            Self.inPageURLPermissionStateFromSystemSettingsSync(for: targetBundleID)
+        }.value
+    }
+
+    nonisolated private static func inPageURLPermissionStateFromSystemSettingsSync(
+        for targetBundleID: String
+    ) -> InPageURLPermissionState? {
         guard let clientBundleID = Bundle.main.bundleIdentifier else {
             return nil
         }
@@ -8798,7 +9022,7 @@ extension SettingsView {
         ]
     }
 
-    private static func chromiumHostBrowserBundleID(for bundleID: String) -> String? {
+    nonisolated private static func chromiumHostBrowserBundleID(for bundleID: String) -> String? {
         if inPageURLChromiumHostBundleIDPrefixes.contains(bundleID) {
             return bundleID
         }
@@ -8810,11 +9034,11 @@ extension SettingsView {
         return nil
     }
 
-    private static func resolvedInPageURLAutomationBundleID(for bundleID: String) -> String {
+    nonisolated private static func resolvedInPageURLAutomationBundleID(for bundleID: String) -> String {
         chromiumHostBrowserBundleID(for: bundleID) ?? bundleID
     }
 
-    private static func isInPageURLChromiumWebAppBundleID(_ bundleID: String) -> Bool {
+    nonisolated private static func isInPageURLChromiumWebAppBundleID(_ bundleID: String) -> Bool {
         inPageURLChromiumHostBundleIDPrefixes.contains { prefix in
             bundleID.hasPrefix(prefix + ".app.")
         }

@@ -149,6 +149,7 @@ public class DashboardViewModel: ObservableObject {
     private var lastTrackedCrashBannerIdentifier: String?
     private var lastTrackedWALFailureBannerFileName: String?
     private var lastTrackedStorageHealthBannerSignature: String?
+    private var isAutoRefreshInFlight = false
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -208,12 +209,15 @@ public class DashboardViewModel: ObservableObject {
                 guard let self = self else { return }
                 // Skip UI updates when window is hidden to avoid SwiftUI diffing
                 guard self.isWindowVisible else { return }
+                guard !self.isAutoRefreshInFlight else { return }
+                self.isAutoRefreshInFlight = true
+                defer { self.isAutoRefreshInFlight = false }
                 self.updateRecordingStatus()
                 self.updatePauseStatus()
                 await self.updateQueueStatus()
                 self.checkPermissions()
-                self.refreshRecentCrashReportState()
-                self.refreshRecentWALFailureCrashState()
+                await self.refreshRecentCrashReportState()
+                await self.refreshRecentWALFailureCrashState()
             }
         }
         timer.resume()
@@ -756,14 +760,16 @@ public class DashboardViewModel: ObservableObject {
             || acknowledgedIdentifiers.contains(report.fileName)
     }
 
-    private func refreshRecentCrashReportState(now: Date = Date()) {
+    private func refreshRecentCrashReportState(now: Date = Date()) async {
         let acknowledgedIdentifiers = loadAcknowledgedCrashReportIdentifiers()
         let acknowledgedBeforeDate = loadAcknowledgedCrashReportCutoffDate()
-        let report = Self.loadRecentCrashReport(
-            now: now,
-            acknowledgedReportIdentifiers: acknowledgedIdentifiers,
-            acknowledgedBeforeDate: acknowledgedBeforeDate
-        )
+        let report = await Task.detached(priority: .utility) {
+            Self.loadRecentCrashReport(
+                now: now,
+                acknowledgedReportIdentifiers: acknowledgedIdentifiers,
+                acknowledgedBeforeDate: acknowledgedBeforeDate
+            )
+        }.value
 
         recentCrashReport = report
 
@@ -801,19 +807,22 @@ public class DashboardViewModel: ObservableObject {
         recentCrashReport = nil
     }
 
-    private func refreshRecentWALFailureCrashState(now: Date = Date()) {
+    private func refreshRecentWALFailureCrashState(now: Date = Date()) async {
         let previousFileName = recentWALFailureCrash?.fileName
         let acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
         let acknowledgedBeforeDate = loadAcknowledgedWALFailureCrashReportCutoffDate()
-        let reports = Self.loadRecentWALFailureCrashReports(
-            now: now
-        )
-        let unacknowledgedReports = reports.filter { report in
-            if let acknowledgedBeforeDate, report.capturedAt <= acknowledgedBeforeDate {
-                return false
+        let (reports, unacknowledgedReports) = await Task.detached(priority: .utility) {
+            let reports = Self.loadRecentWALFailureCrashReports(
+                now: now
+            )
+            let unacknowledgedReports = reports.filter { report in
+                if let acknowledgedBeforeDate, report.capturedAt <= acknowledgedBeforeDate {
+                    return false
+                }
+                return !acknowledgedFileNames.contains(report.fileName)
             }
-            return !acknowledgedFileNames.contains(report.fileName)
-        }
+            return (reports, unacknowledgedReports)
+        }.value
         let report = unacknowledgedReports.first
 
         recentWALFailureCrash = report
@@ -1010,8 +1019,8 @@ public class DashboardViewModel: ObservableObject {
         // Update recording status
         updateRecordingStatus()
         updatePauseStatus()
-        refreshRecentCrashReportState()
-        refreshRecentWALFailureCrashState()
+        await refreshRecentCrashReportState()
+        await refreshRecentWALFailureCrashState()
 
         do {
             // Calculate last 7 days date range
@@ -1054,11 +1063,13 @@ public class DashboardViewModel: ObservableObject {
             totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
             totalDailyTime = todayStats.reduce(0) { $0 + $1.duration }
 
+            let appNamesByBundleID = await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
+
             // Convert to AppUsageData and sort by duration
             weeklyAppUsage = appStats.map { stat in
                 AppUsageData(
                     appBundleID: stat.bundleID,
-                    appName: AppNameResolver.shared.displayName(for: stat.bundleID),
+                    appName: appNamesByBundleID[stat.bundleID] ?? Self.fallbackAppName(for: stat.bundleID),
                     duration: stat.duration,
                     uniqueItemCount: stat.uniqueItemCount,
                     percentage: totalWeeklyTime > 0 ? stat.duration / totalWeeklyTime : 0
@@ -1205,12 +1216,13 @@ public class DashboardViewModel: ObservableObject {
                 limit: limit,
                 offset: offset
             )
+            let appNamesByBundleID = await resolveAppNames(bundleIDs: segments.map(\.bundleID))
 
             return segments.map { segment in
                 AppSessionDetail(
                     id: segment.id.value,
                     appBundleID: segment.bundleID,
-                    appName: AppNameResolver.shared.displayName(for: segment.bundleID),
+                    appName: appNamesByBundleID[segment.bundleID] ?? Self.fallbackAppName(for: segment.bundleID),
                     startDate: segment.startDate,
                     endDate: segment.endDate,
                     windowName: segment.windowName
@@ -1346,12 +1358,13 @@ public class DashboardViewModel: ObservableObject {
                 limit: limit,
                 offset: offset
             )
+            let appNamesByBundleID = await resolveAppNames(bundleIDs: segments.map(\.bundleID))
 
             return segments.map { segment in
                 AppSessionDetail(
                     id: segment.id.value,
                     appBundleID: segment.bundleID,
-                    appName: AppNameResolver.shared.displayName(for: segment.bundleID),
+                    appName: appNamesByBundleID[segment.bundleID] ?? Self.fallbackAppName(for: segment.bundleID),
                     startDate: segment.startDate,
                     endDate: segment.endDate,
                     windowName: segment.windowName
@@ -1361,6 +1374,25 @@ public class DashboardViewModel: ObservableObject {
             Log.error("[DashboardViewModel] Failed to fetch sessions for app window: \(error)", category: .ui)
             return []
         }
+    }
+
+    private func resolveAppNames(bundleIDs: [String]) async -> [String: String] {
+        let uniqueBundleIDs = Array(Set(bundleIDs.filter { !$0.isEmpty }))
+        guard !uniqueBundleIDs.isEmpty else { return [:] }
+
+        return await Task.detached(priority: .utility) {
+            var resolved: [String: String] = [:]
+            resolved.reserveCapacity(uniqueBundleIDs.count)
+            for bundleID in uniqueBundleIDs {
+                resolved[bundleID] = AppNameResolver.shared.displayName(for: bundleID)
+            }
+            return resolved
+        }.value
+    }
+
+    nonisolated private static func fallbackAppName(for bundleID: String) -> String {
+        let candidate = bundleID.components(separatedBy: ".").last ?? bundleID
+        return candidate.isEmpty ? bundleID : candidate
     }
 
     // MARK: - Metric Event Recording

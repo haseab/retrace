@@ -878,6 +878,74 @@ final class CrashRecoveryStartupTests: XCTestCase {
         }
     }
 
+    func testFinalizeUnfinalisedVideoBeforeResumingPreservesRecoverableStaleWALData() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashRecoveryResumePreserveRecoverableWAL_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        let previousUseRewindData = defaults.object(forKey: "useRewindData")
+
+        defaults.set(false, forKey: "useRewindData")
+
+        do {
+            defer {
+                if let previousUseRewindData {
+                    defaults.set(previousUseRewindData, forKey: "useRewindData")
+                } else {
+                    defaults.removeObject(forKey: "useRewindData")
+                }
+            }
+
+            try await services.initialize()
+
+            let storageManager = await services.storage
+            let database = await services.database
+            let walManager = await storageManager.getWALManager()
+            let timestamp = Date(timeIntervalSince1970: 1_740_205_000)
+
+            let writer = try await storageManager.createSegmentWriter()
+            try await writer.appendFrame(makeCapturedFrame(timestamp: timestamp))
+            let segment = try await writer.finalize()
+
+            let databaseVideoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: segment.id,
+                    startTime: segment.startTime,
+                    endTime: segment.endTime,
+                    frameCount: 99,
+                    fileSizeBytes: segment.fileSizeBytes,
+                    relativePath: segment.relativePath,
+                    width: segment.width,
+                    height: segment.height
+                )
+            )
+            let unfinalisedVideos = try await database.getAllUnfinalisedVideos()
+            let unfinalised = try XCTUnwrap(unfinalisedVideos.first(where: { $0.id == databaseVideoID }))
+
+            var staleSession = try await walManager.createSession(videoID: segment.id)
+            try await walManager.appendFrame(makeCapturedFrame(timestamp: timestamp.addingTimeInterval(2)), to: &staleSession)
+
+            let staleWALDir = storageRoot
+                .appendingPathComponent("wal", isDirectory: true)
+                .appendingPathComponent("active_segment_\(segment.id.value)", isDirectory: true)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: staleWALDir.path))
+
+            try await coordinator.finalizeUnfinalisedVideoBeforeResuming(unfinalised)
+
+            let recoverableFrameCount = try await walManager.recoverableFrameCountIfPresent(videoID: segment.id)
+            XCTAssertEqual(recoverableFrameCount, 1)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: staleWALDir.path))
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+
     func testShouldResumeUnfinalisedVideoReturnsFalseWhenActiveWALSessionStillExists() async throws {
         let storageRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("CrashRecoverySkipResume_\(UUID().uuidString)", isDirectory: true)

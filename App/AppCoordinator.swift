@@ -1474,6 +1474,23 @@ public actor AppCoordinator {
                 return false
             }
 
+            do {
+                if let recoverableFrameCount = try await walManager.recoverableFrameCountIfPresent(videoID: pathVideoID),
+                   recoverableFrameCount > 0 {
+                    Log.warning(
+                        "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because stale WAL directory still contains \(recoverableFrameCount) recoverable frame(s); deferring cleanup until crash recovery processes WAL",
+                        category: .app
+                    )
+                    return false
+                }
+            } catch {
+                Log.warning(
+                    "[WAL] Skipping resume of unfinalised video \(unfinalised.id) for path video \(pathVideoID.value) because stale WAL validation failed: \(error.localizedDescription)",
+                    category: .app
+                )
+                return false
+            }
+
             if !(try await services.storage.segmentExists(id: pathVideoID)) {
                 Log.warning(
                     "[WAL] Skipping resume of unfinalised video \(unfinalised.id) because segment file \(pathVideoID.value) is missing",
@@ -1508,7 +1525,7 @@ public actor AppCoordinator {
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: oldVideoPath.path)[.size] as? Int64) ?? 0
 
         if let pathVideoID {
-            try await finalizeStaleWALSessionIfPresent(pathVideoID: pathVideoID)
+            await finalizeStaleWALSessionIfPresent(pathVideoID: pathVideoID)
         }
 
         let finalizedFrameCount: Int
@@ -1559,40 +1576,49 @@ public actor AppCoordinator {
         return directPath.appendingPathExtension("mp4")
     }
 
-    private func finalizeStaleWALSessionIfPresent(pathVideoID: VideoSegmentID) async throws {
+    private func finalizeStaleWALSessionIfPresent(pathVideoID: VideoSegmentID) async {
         guard let storageManager = services.storage as? StorageManager else {
             return
         }
 
         let walManager = await storageManager.getWALManager()
-        let storageDir = await services.storage.getStorageDirectory()
-        let walDir = storageDir
-            .appendingPathComponent("wal", isDirectory: true)
-            .appendingPathComponent("active_segment_\(pathVideoID.value)", isDirectory: true)
-
-        guard FileManager.default.fileExists(atPath: walDir.path) else {
+        let recoverableFrameCount: Int?
+        do {
+            recoverableFrameCount = try await walManager.recoverableFrameCountIfPresent(videoID: pathVideoID)
+        } catch {
+            Log.warning(
+                "[WAL] Skipping stale WAL cleanup for unfinalised video \(pathVideoID.value) because recoverability validation failed: \(error.localizedDescription)",
+                category: .app
+            )
             return
         }
 
-        let session = WALSession(
-            videoID: pathVideoID,
-            sessionDir: walDir,
-            framesURL: walDir.appendingPathComponent("frames.bin"),
-            metadata: WALMetadata(
-                videoID: pathVideoID,
-                startTime: .distantPast,
-                frameCount: 0,
-                width: 0,
-                height: 0,
-                durableReadableFrameCount: 0,
-                durableVideoFileSizeBytes: 0
+        guard let recoverableFrameCount else {
+            return
+        }
+
+        guard recoverableFrameCount == 0 else {
+            Log.warning(
+                "[WAL] Preserving stale WAL directory for unfinalised video \(pathVideoID.value): contains \(recoverableFrameCount) recoverable frame(s). Cleanup deferred to crash recovery.",
+                category: .app
             )
-        )
-        try await walManager.finalizeSession(session)
-        Log.info(
-            "Cleaned up WAL session for unfinalised video \(pathVideoID.value)",
-            category: .app
-        )
+            return
+        }
+
+        do {
+            let removed = try await walManager.finalizeSessionDirectoryIfPresent(videoID: pathVideoID)
+            if removed {
+                Log.info(
+                    "Cleaned up WAL session for unfinalised video \(pathVideoID.value)",
+                    category: .app
+                )
+            }
+        } catch {
+            Log.warning(
+                "[WAL] Failed to clean up stale WAL directory for unfinalised video \(pathVideoID.value): \(error.localizedDescription)",
+                category: .app
+            )
+        }
     }
 
     private func finalizeWriter(_ writerState: inout VideoWriterState, processingQueue: FrameProcessingQueue?) async throws {

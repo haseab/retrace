@@ -43,6 +43,7 @@ public struct SpotlightSearchOverlay: View {
     @State private var isDismissing = false
     @State private var overlaySessionID = "unknown"
     @State private var isSearchFieldFocused = false
+    @State private var appIconPrefetchTask: Task<Void, Never>?
 
     private let panelWidth: CGFloat = 1000
     private let collapsedWidth: CGFloat = 450
@@ -213,6 +214,9 @@ public struct SpotlightSearchOverlay: View {
             scheduleRecentEntriesMetadataWarmupIfNeeded()
             refreshRecentEntriesPopoverVisibility()
             logRecentEntriesState(context: "onAppear:afterRefresh")
+            if !viewModel.visibleResults.isEmpty {
+                scheduleAppIconPrefetch(for: viewModel.visibleResults)
+            }
         }
         .onDisappear {
             recentEntriesRevealTask?.cancel()
@@ -233,6 +237,8 @@ public struct SpotlightSearchOverlay: View {
             rankedRecentEntries = []
             recentEntryTagByID = [:]
             recentEntryAppNamesByBundleID = [:]
+            appIconPrefetchTask?.cancel()
+            appIconPrefetchTask = nil
             recentEntriesRevealBlockedUntil = nil
             didScheduleRecentEntriesMetadataWarmup = false
             viewModel.isRecentEntriesPopoverVisible = false
@@ -281,6 +287,7 @@ public struct SpotlightSearchOverlay: View {
                 reserveExpandedResultsHeight()
             }
             syncKeyboardSelectionWithCurrentResults()
+            scheduleAppIconPrefetch(for: viewModel.visibleResults)
         }
         .onChange(of: viewModel.searchGeneration) { generation in
             Log.info(
@@ -1116,7 +1123,6 @@ public struct SpotlightSearchOverlay: View {
                         )
                         .onAppear {
                             loadThumbnail(for: result)
-                            loadAppIcon(for: result)
 
                             // Infinite scroll: load more when near the end
                             if index >= visibleResults.count - 3 && viewModel.canLoadMore {
@@ -1580,15 +1586,96 @@ public struct SpotlightSearchOverlay: View {
 
     // MARK: - App Icon Loading
 
-    private func loadAppIcon(for result: SearchResult) {
-        guard let bundleID = result.appBundleID else { return }
-        guard viewModel.appIconCache[bundleID] == nil else { return }
+    @MainActor
+    private func scheduleAppIconPrefetch(for results: [SearchResult]) {
+        appIconPrefetchTask?.cancel()
 
-        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            let icon = NSWorkspace.shared.icon(forFile: appURL.path)
-            icon.size = NSSize(width: 20, height: 20)
-            viewModel.appIconCache[bundleID] = icon
+        let bundleIDs = orderedUniqueAppBundleIDs(from: results)
+        guard !bundleIDs.isEmpty else {
+            appIconPrefetchTask = nil
+            return
         }
+
+        appIconPrefetchTask = Task { @MainActor in
+            let appPathsByBundleID = await Task.detached(priority: .utility) {
+                Self.resolveInstalledAppPaths(bundleIDs: bundleIDs)
+            }.value
+
+            guard !Task.isCancelled else { return }
+
+            for (index, bundleID) in bundleIDs.enumerated() {
+                guard !Task.isCancelled else { return }
+                guard viewModel.appIconCache[bundleID] == nil,
+                      let appPath = appPathsByBundleID[bundleID] else {
+                    continue
+                }
+
+                let icon = NSWorkspace.shared.icon(forFile: appPath)
+                icon.size = NSSize(width: 20, height: 20)
+                viewModel.appIconCache[bundleID] = icon
+
+                if (index + 1).isMultiple(of: 3) {
+                    await Task.yield()
+                }
+            }
+        }
+    }
+
+    private func orderedUniqueAppBundleIDs(from results: [SearchResult]) -> [String] {
+        var orderedBundleIDs: [String] = []
+        var seenBundleIDs: Set<String> = []
+        for result in results {
+            guard let bundleID = result.appBundleID,
+                  !bundleID.isEmpty,
+                  seenBundleIDs.insert(bundleID).inserted else {
+                continue
+            }
+            orderedBundleIDs.append(bundleID)
+        }
+        return orderedBundleIDs
+    }
+
+    nonisolated private static func resolveInstalledAppPaths(
+        bundleIDs: [String],
+        fileManager: FileManager = .default
+    ) -> [String: String] {
+        let requiredBundleIDs = Set(bundleIDs.filter { !$0.isEmpty })
+        guard !requiredBundleIDs.isEmpty else { return [:] }
+
+        let applicationFolders: [URL] = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Chrome Apps.localized", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications/Chrome Apps.localized", isDirectory: true),
+        ]
+
+        var remainingBundleIDs = requiredBundleIDs
+        var appPathsByBundleID: [String: String] = [:]
+
+        for folder in applicationFolders {
+            guard !remainingBundleIDs.isEmpty else { break }
+            guard let entries = try? fileManager.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+
+            for appURL in entries where appURL.pathExtension.lowercased() == "app" {
+                guard let bundle = Bundle(url: appURL),
+                      let bundleID = bundle.bundleIdentifier,
+                      remainingBundleIDs.contains(bundleID) else {
+                    continue
+                }
+
+                appPathsByBundleID[bundleID] = appURL.path
+                remainingBundleIDs.remove(bundleID)
+            }
+        }
+
+        return appPathsByBundleID
     }
 
     // MARK: - Actions

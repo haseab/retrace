@@ -348,8 +348,29 @@ public actor WALManager {
         if FileManager.default.fileExists(atPath: session.sessionDir.path) {
             try FileManager.default.removeItem(at: session.sessionDir)
         }
-        frameOffsetIndexCache.removeValue(forKey: session.videoID.value)
-        frameIDOffsetIndexCache.removeValue(forKey: session.videoID.value)
+        clearSessionCaches(videoIDValue: session.videoID.value)
+    }
+
+    /// Finalize an active-segment WAL directory by videoID.
+    /// Safety: refuses to remove directories that still contain recoverable WAL frames.
+    @discardableResult
+    public func finalizeSessionDirectoryIfPresent(videoID: VideoSegmentID) async throws -> Bool {
+        let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
+        guard FileManager.default.fileExists(atPath: sessionDir.path) else {
+            return false
+        }
+
+        if let recoverableFrameCount = try await recoverableFrameCountIfPresent(videoID: videoID),
+           recoverableFrameCount > 0 {
+            throw StorageError.fileWriteFailed(
+                path: sessionDir.path,
+                underlying: "Refusing to finalize WAL directory with \(recoverableFrameCount) recoverable frames"
+            )
+        }
+
+        try FileManager.default.removeItem(at: sessionDir)
+        clearSessionCaches(videoIDValue: videoID.value)
+        return true
     }
 
     /// Clear ALL WAL sessions (used when changing database location)
@@ -550,6 +571,28 @@ public actor WALManager {
             framesURL: session.framesURL,
             currentFileSize: fileSize
         ).count
+    }
+
+    /// Returns recoverable frame count for an active WAL directory if present.
+    /// - Returns: `nil` when no active WAL directory exists for `videoID`.
+    public func recoverableFrameCountIfPresent(videoID: VideoSegmentID) async throws -> Int? {
+        let sessionDir = walRootURL.appendingPathComponent("active_segment_\(videoID.value)")
+        guard FileManager.default.fileExists(atPath: sessionDir.path) else {
+            return nil
+        }
+
+        let framesURL = sessionDir.appendingPathComponent("frames.bin")
+        guard FileManager.default.fileExists(atPath: framesURL.path) else {
+            return 0
+        }
+
+        let probeSession = WALSession(
+            videoID: videoID,
+            sessionDir: sessionDir,
+            framesURL: framesURL,
+            metadata: placeholderMetadata(for: videoID)
+        )
+        return try await recoverableFrameCount(for: probeSession)
     }
 
     func recoveryIndex(for session: WALSession) async throws -> WALRecoveryIndex {
@@ -1244,6 +1287,11 @@ public actor WALManager {
             )
         }
         return data
+    }
+
+    private func clearSessionCaches(videoIDValue: Int64) {
+        frameOffsetIndexCache.removeValue(forKey: videoIDValue)
+        frameIDOffsetIndexCache.removeValue(forKey: videoIDValue)
     }
 
     private func readOptionalString(

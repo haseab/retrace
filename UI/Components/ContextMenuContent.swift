@@ -203,23 +203,9 @@ struct ContextMenuContent: View {
             }
         }
 
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
+        guard let url = MP4SymlinkResolver.resolveURL(for: actualVideoPath) else {
+            completion(nil)
+            return
         }
 
         let asset = AVURLAsset(url: url)

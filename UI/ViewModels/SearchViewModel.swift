@@ -2138,7 +2138,7 @@ public class SearchViewModel: ObservableObject {
     /// Restore cached search results if they exist and haven't expired
     /// Returns true if cache was restored, false otherwise
     @discardableResult
-    public func restoreCachedSearchResults() -> Bool {
+    public func restoreCachedSearchResults() async -> Bool {
 
         // Check cache version first - invalidate if version mismatch
         let cachedVersion = UserDefaults.standard.integer(forKey: Self.searchCacheVersionKey)
@@ -2197,10 +2197,13 @@ public class SearchViewModel: ObservableObject {
         let cachedSearchModeRaw = UserDefaults.standard.string(forKey: Self.cachedSearchModeKey)
         let cachedSearchSortOrderRaw = UserDefaults.standard.string(forKey: Self.cachedSearchSortOrderKey)
 
-        // Load cached results from disk
+        // Load cached results from disk (off-main)
+        let cachedResults: SearchResults
         do {
-            let data = try Data(contentsOf: Self.cachedSearchResultsPath)
-            let cachedResults = try JSONDecoder().decode(SearchResults.self, from: data)
+            cachedResults = try await Task.detached(priority: .utility) {
+                let data = try Data(contentsOf: Self.cachedSearchResultsPath)
+                return try JSONDecoder().decode(SearchResults.self, from: data)
+            }.value
 
             guard !cachedResults.isEmpty else { return false }
 

@@ -1918,9 +1918,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let hardSeekResetThreshold = 200
     private static let closeClearThreshold = 10
     private static let diskFrameBufferInactivityTTLSeconds: TimeInterval = 60
-    private static let diskFrameBufferFilenameExtension = "jpg"
+    nonisolated private static let diskFrameBufferFilenameExtension = "jpg"
     private static let diskFrameBufferMemoryLogIntervalNs: UInt64 = 5_000_000_000
 
+    private var diskFrameBufferInitializationTask: Task<Void, Never>?
     private var diskFrameBufferMemoryLogTask: Task<Void, Never>?
     private var diskFrameBufferTelemetry = DiskFrameBufferTelemetry()
     private var foregroundFrameLoadTask: Task<Void, Never>?
@@ -2231,7 +2232,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
     }
 
-    private static func frameID(fromDiskFrameFileURL url: URL) -> FrameID? {
+    nonisolated private static func frameID(fromDiskFrameFileURL url: URL) -> FrameID? {
         guard url.pathExtension.lowercased() == Self.diskFrameBufferFilenameExtension else { return nil }
         let frameIDString = url.deletingPathExtension().lastPathComponent
         guard let rawValue = Int64(frameIDString) else { return nil }
@@ -2245,22 +2246,54 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func initializeDiskFrameBuffer() {
+        diskFrameBufferAccessSequence = 0
+        diskFrameBufferIndex = [:]
+        diskFrameBufferInitializationTask?.cancel()
+
+        let directoryURL = diskFrameBufferDirectoryURL
+        diskFrameBufferInitializationTask = Task { [directoryURL] in
+            let outcome = await Task.detached(priority: .utility) {
+                Self.initializeDiskFrameBufferSync(directoryURL: directoryURL)
+            }.value
+
+            guard !Task.isCancelled else { return }
+
+            if let errorMessage = outcome.errorMessage {
+                Log.warning(errorMessage, category: .ui)
+                return
+            }
+
+            if outcome.removedCount > 0 {
+                Log.info(
+                    "[Timeline-DiskBuffer] Cleared \(outcome.removedCount) stale disk-buffer files from previous session",
+                    category: .ui
+                )
+            }
+        }
+    }
+
+    private func awaitDiskFrameBufferInitializationIfNeeded() async {
+        guard let initializationTask = diskFrameBufferInitializationTask else { return }
+        await initializationTask.value
+        diskFrameBufferInitializationTask = nil
+    }
+
+    nonisolated private static func initializeDiskFrameBufferSync(
+        directoryURL: URL
+    ) -> (removedCount: Int, errorMessage: String?) {
         do {
             try FileManager.default.createDirectory(
-                at: diskFrameBufferDirectoryURL,
+                at: directoryURL,
                 withIntermediateDirectories: true
             )
         } catch {
-            Log.warning("[Timeline-DiskBuffer] Failed to create disk frame buffer directory: \(error)", category: .ui)
-            return
+            return (0, "[Timeline-DiskBuffer] Failed to create disk frame buffer directory: \(error)")
         }
 
         do {
-            let resourceKeys: Set<URLResourceKey> = [
-                .isRegularFileKey
-            ]
+            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey]
             let files = try FileManager.default.contentsOfDirectory(
-                at: diskFrameBufferDirectoryURL,
+                at: directoryURL,
                 includingPropertiesForKeys: Array(resourceKeys),
                 options: [.skipsHiddenFiles]
             )
@@ -2275,16 +2308,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 removedCount += 1
             }
 
-            if removedCount > 0 {
-                Log.info(
-                    "[Timeline-DiskBuffer] Cleared \(removedCount) stale disk-buffer files from previous session",
-                    category: .ui
-                )
-            }
-            diskFrameBufferAccessSequence = 0
-            diskFrameBufferIndex = [:]
+            return (removedCount, nil)
         } catch {
-            Log.warning("[Timeline-DiskBuffer] Failed to initialize disk frame buffer index: \(error)", category: .ui)
+            return (0, "[Timeline-DiskBuffer] Failed to initialize disk frame buffer index: \(error)")
         }
     }
 
@@ -2445,6 +2471,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func readFrameDataFromDiskFrameBuffer(frameID: FrameID) async -> Data? {
+        await awaitDiskFrameBufferInitializationIfNeeded()
         guard let entry = diskFrameBufferIndex[frameID] else { return nil }
 
         do {
@@ -2461,6 +2488,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func storeFrameDataInDiskFrameBuffer(frameID: FrameID, data: Data) async {
+        await awaitDiskFrameBufferInitializationIfNeeded()
         let fileURL = diskFrameBufferURL(for: frameID)
         do {
             try await Task.detached(priority: .utility) {
@@ -6362,7 +6390,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             checkAndLoadMoreFrames()
 
             // Restore cached search results if any
-            searchViewModel.restoreCachedSearchResults()
+            _ = await searchViewModel.restoreCachedSearchResults()
 
             // NOTE: We skip loading hiddenSegmentIds here because:
             // 1. Hidden segments are already EXCLUDED from the query (via NOT EXISTS clause)
@@ -6431,7 +6459,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         checkAndLoadMoreFrames()
 
         // Restore cached search results if any
-        searchViewModel.restoreCachedSearchResults()
+        _ = await searchViewModel.restoreCachedSearchResults()
 
         // Load tag metadata/map lazily so the tape can render subtle tag indicators.
         ensureTapeTagIndicatorDataLoadedIfNeeded()
@@ -9816,23 +9844,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        if actualVideoPath.hasSuffix(".mp4") {
-            return URL(fileURLWithPath: actualVideoPath)
-        }
-
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileName = (actualVideoPath as NSString).lastPathComponent
-        let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-        if !FileManager.default.fileExists(atPath: symlinkPath) {
-            do {
-                try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-            } catch {
-                return nil
-            }
-        }
-
-        return URL(fileURLWithPath: symlinkPath)
+        return MP4SymlinkResolver.resolveURL(for: actualVideoPath)
     }
 
     /// Exit zoom region mode with reverse animation
@@ -10594,24 +10606,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Determine the URL to use - if file already has .mp4 extension, use directly
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    Log.warning("[ZoomCopy] Failed to create symlink at \(symlinkPath): \(error)", category: .ui)
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
+        guard let url = MP4SymlinkResolver.resolveURL(for: actualVideoPath) else {
+            Log.warning("[ZoomCopy] Failed to resolve mp4-compatible URL for video path: \(actualVideoPath)", category: .ui)
+            completion(nil)
+            return
         }
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)

@@ -1,11 +1,93 @@
 import SwiftUI
 import AppKit
+import CryptoKit
 import Shared
 
 /// Retrace design system
 /// Provides consistent colors, typography, and spacing across the UI
 public struct AppTheme {
     private init() {}
+}
+
+// MARK: - Video URL Symlink Resolver
+
+/// Resolves extensionless video paths to stable, collision-safe `.mp4` symlink URLs.
+/// Symlink file names are derived from the full normalized destination path to avoid
+/// basename collisions across different sources.
+enum MP4SymlinkResolver {
+    static func resolveURL(for videoPath: String) -> URL? {
+        if videoPath.hasSuffix(".mp4") {
+            return URL(fileURLWithPath: videoPath)
+        }
+
+        let destinationPath = URL(fileURLWithPath: videoPath).standardizedFileURL.path
+        let symlinkURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retrace_video_\(pathDigest(destinationPath)).mp4")
+
+        do {
+            try ensureSymlink(at: symlinkURL, destinationPath: destinationPath)
+            return symlinkURL
+        } catch {
+            return nil
+        }
+    }
+
+    private static func ensureSymlink(at symlinkURL: URL, destinationPath: String) throws {
+        let fileManager = FileManager.default
+        var lastError: Error?
+
+        // Retry a small number of times to tolerate concurrent resolvers racing to create/remove the same symlink.
+        for _ in 0..<3 {
+            do {
+                try fileManager.createSymbolicLink(
+                    atPath: symlinkURL.path,
+                    withDestinationPath: destinationPath
+                )
+                return
+            } catch {
+                lastError = error
+
+                if let existingDestination = try? fileManager.destinationOfSymbolicLink(atPath: symlinkURL.path),
+                   normalizedSymlinkDestination(existingDestination, symlinkURL: symlinkURL) == destinationPath {
+                    return
+                }
+
+                guard fileManager.fileExists(atPath: symlinkURL.path) else {
+                    continue
+                }
+
+                do {
+                    try fileManager.removeItem(at: symlinkURL)
+                } catch {
+                    lastError = error
+                    if !fileManager.fileExists(atPath: symlinkURL.path) {
+                        continue
+                    }
+                    break
+                }
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+    }
+
+    private static func normalizedSymlinkDestination(_ destination: String, symlinkURL: URL) -> String {
+        if destination.hasPrefix("/") {
+            return URL(fileURLWithPath: destination).standardizedFileURL.path
+        }
+
+        return URL(
+            fileURLWithPath: destination,
+            relativeTo: symlinkURL.deletingLastPathComponent()
+        ).standardizedFileURL.path
+    }
+
+    private static func pathDigest(_ path: String) -> String {
+        let digest = SHA256.hash(data: Data(path.utf8))
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 // MARK: - App Name Resolution

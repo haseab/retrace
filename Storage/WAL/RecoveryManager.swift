@@ -168,12 +168,12 @@ public actor RecoveryManager {
                         )
                     }
                 } else {
+                    let shouldDeleteInvalidExistingSegmentAfterRecovery = frontier.actualExistingFrameCount > 0
                     if frontier.actualExistingFrameCount > 0 {
                         Log.warning(
                             "[Recovery] Video \(session.videoID.value) has invalid timestamps; ignoring video frontier and rebuilding from WAL/map",
                             category: .storage
                         )
-                        try? await storage.deleteSegment(id: session.videoID)
                     } else {
                         Log.info(
                             "[Recovery] Video \(session.videoID.value) has no readable prefix; recovering from WAL/map only",
@@ -201,6 +201,20 @@ public actor RecoveryManager {
                         for: session,
                         reason: discardReason
                     )
+                    if shouldDeleteInvalidExistingSegmentAfterRecovery {
+                        do {
+                            try await storage.deleteSegment(id: session.videoID)
+                            Log.info(
+                                "[Recovery] Removed invalid-timestamp segment file \(session.videoID.value) after successful WAL recovery",
+                                category: .storage
+                            )
+                        } catch {
+                            Log.warning(
+                                "[Recovery] Failed to remove invalid-timestamp segment file \(session.videoID.value) after successful WAL recovery: \(error.localizedDescription)",
+                                category: .storage
+                            )
+                        }
+                    }
                 }
             } catch {
                 await handleRecoveryFailure(for: session, error: error, rollbacks: sessionRollbacks)

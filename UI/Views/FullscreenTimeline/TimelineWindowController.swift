@@ -45,13 +45,18 @@ public class TimelineWindowController: NSObject {
 
     /// CGEvent tap for emergency escape - runs on a dedicated background thread
     /// This allows closing the timeline even when the main thread is frozen
-    private nonisolated(unsafe) static var emergencyEventTap: CFMachPort?
-    private nonisolated(unsafe) static var emergencyRunLoopSource: CFRunLoopSource?
-    private nonisolated(unsafe) static var emergencyRunLoop: CFRunLoop?
-    private nonisolated(unsafe) static var emergencyTapThread: Thread?
-    private nonisolated(unsafe) static var isInstallingEmergencyTap = false
-    private nonisolated(unsafe) static var emergencyTapSetupToken: UInt64 = 0
-    private nonisolated(unsafe) static var isTimelineVisible: Bool = false
+    private struct EmergencyTapState {
+        var eventTap: CFMachPort?
+        var runLoopSource: CFRunLoopSource?
+        var runLoop: CFRunLoop?
+        var tapThread: Thread?
+        var isInstallingTap = false
+        var setupToken: UInt64 = 0
+        var isTimelineVisible = false
+    }
+
+    private nonisolated(unsafe) static var emergencyTapState = EmergencyTapState()
+    private nonisolated(unsafe) static var emergencyTapStateLock = NSLock()
 
     /// Whether a prepared headless timeline state exists and is ready to mount on demand.
     private var isPrepared = false
@@ -172,6 +177,41 @@ public class TimelineWindowController: NSObject {
 
     nonisolated static func shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: Bool) -> Bool {
         !isActivelyScrolling
+    }
+
+    nonisolated private static func withEmergencyTapState<T>(
+        _ body: (inout EmergencyTapState) -> T
+    ) -> T {
+        emergencyTapStateLock.lock()
+        defer { emergencyTapStateLock.unlock() }
+        return body(&emergencyTapState)
+    }
+
+    nonisolated private static func readEmergencyTapState<T>(
+        _ body: (EmergencyTapState) -> T
+    ) -> T {
+        emergencyTapStateLock.lock()
+        defer { emergencyTapStateLock.unlock() }
+        return body(emergencyTapState)
+    }
+
+    nonisolated private static func emergencyEventTapIfValid() -> CFMachPort? {
+        readEmergencyTapState { state in
+            guard let eventTap = state.eventTap, CFMachPortIsValid(eventTap) else {
+                return nil
+            }
+            return eventTap
+        }
+    }
+
+    nonisolated private static func setEmergencyTimelineVisible(_ visible: Bool) {
+        withEmergencyTapState { state in
+            state.isTimelineVisible = visible
+        }
+    }
+
+    nonisolated private static func isEmergencyTimelineVisible() -> Bool {
+        readEmergencyTapState(\.isTimelineVisible)
     }
 
     nonisolated static func shouldDismissTimelineWithCommandW(
@@ -359,27 +399,32 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+        if let eventTap = Self.emergencyEventTapIfValid() {
             CGEvent.tapEnable(tap: eventTap, enable: true)
             return
         }
 
-        guard !Self.isInstallingEmergencyTap else { return }
-        Self.isInstallingEmergencyTap = true
-        Self.emergencyTapSetupToken &+= 1
-        let setupToken = Self.emergencyTapSetupToken
+        let setupToken: UInt64? = Self.withEmergencyTapState { state in
+            guard !state.isInstallingTap else { return nil }
+            state.isInstallingTap = true
+            state.setupToken &+= 1
+            return state.setupToken
+        }
+        guard let setupToken else { return }
 
         let thread = Thread {
             Self.installEmergencyEscapeTap(expectedSetupToken: setupToken)
         }
         thread.name = "RetraceTimelineEmergencyTap"
         thread.qualityOfService = .userInteractive
-        Self.emergencyTapThread = thread
+        Self.withEmergencyTapState { state in
+            state.tapThread = thread
+        }
         thread.start()
     }
 
     private func suspendEmergencyEscapeTapForPermissionLoss() {
-        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+        if let eventTap = Self.emergencyEventTapIfValid() {
             CGEvent.tapEnable(tap: eventTap, enable: false)
             Log.warning("[TIMELINE] Suspended emergency escape event tap after permission revoke", category: .ui)
         }
@@ -388,7 +433,7 @@ public class TimelineWindowController: NSObject {
     private func resumeEmergencyEscapeTapIfNeeded() {
         guard Self.hasEmergencyTapPermission() else { return }
 
-        if let eventTap = Self.emergencyEventTap, CFMachPortIsValid(eventTap) {
+        if let eventTap = Self.emergencyEventTapIfValid() {
             CGEvent.tapEnable(tap: eventTap, enable: true)
             return
         }
@@ -416,7 +461,7 @@ public class TimelineWindowController: NSObject {
                         return Unmanaged.passUnretained(event)
                     }
 
-                    if let tap = TimelineWindowController.emergencyEventTap, CFMachPortIsValid(tap) {
+                    if let tap = TimelineWindowController.emergencyEventTapIfValid() {
                         CGEvent.tapEnable(tap: tap, enable: true)
                     }
                     return Unmanaged.passUnretained(event)
@@ -427,7 +472,7 @@ public class TimelineWindowController: NSObject {
                 }
 
                 // Only process if timeline is visible
-                guard TimelineWindowController.isTimelineVisible else {
+                guard TimelineWindowController.isEmergencyTimelineVisible() else {
                     return Unmanaged.passUnretained(event)
                 }
 
@@ -442,7 +487,7 @@ public class TimelineWindowController: NSObject {
                 // Cmd+Option+Escape: EMERGENCY - capture diagnostics then terminate
                 if isCmdOptEscape {
                     EmergencyDiagnostics.capture(trigger: "cmd_opt_escape")
-                    TimelineWindowController.isTimelineVisible = false
+                    TimelineWindowController.setEmergencyTimelineVisible(false)
                     exit(0)
                 }
 
@@ -453,9 +498,10 @@ public class TimelineWindowController: NSObject {
             },
             userInfo: nil
         ) else {
-            if emergencyTapSetupToken == expectedSetupToken {
-                isInstallingEmergencyTap = false
-                emergencyTapThread = nil
+            Self.withEmergencyTapState { state in
+                guard state.setupToken == expectedSetupToken else { return }
+                state.isInstallingTap = false
+                state.tapThread = nil
             }
             Log.error("[TIMELINE] Failed to create emergency escape event tap - check accessibility permissions", category: .ui)
             return
@@ -472,37 +518,47 @@ public class TimelineWindowController: NSObject {
             return
         }
 
-        emergencyEventTap = eventTap
-        emergencyRunLoopSource = runLoopSource
-        emergencyRunLoop = runLoop
-        emergencyTapThread = thread
+        Self.withEmergencyTapState { state in
+            state.eventTap = eventTap
+            state.runLoopSource = runLoopSource
+            state.runLoop = runLoop
+            state.tapThread = thread
+        }
 
         if let runLoopSource {
             CFRunLoopAddSource(runLoop, runLoopSource, .commonModes)
         }
 
         CGEvent.tapEnable(tap: eventTap, enable: true)
-        isInstallingEmergencyTap = false
+        Self.withEmergencyTapState { state in
+            state.isInstallingTap = false
+        }
 
         Log.info("[TIMELINE] Emergency escape event tap installed on dedicated thread", category: .ui)
 
         CFRunLoopRun()
 
-        if emergencyTapThread === thread {
-            emergencyTapThread = nil
+        Self.withEmergencyTapState { state in
+            if state.tapThread === thread {
+                state.tapThread = nil
+            }
+            state.isInstallingTap = false
         }
-        isInstallingEmergencyTap = false
     }
 
     private nonisolated static func shouldContinueInstallingEmergencyTap(expectedSetupToken: UInt64) -> Bool {
-        emergencyTapSetupToken == expectedSetupToken
+        readEmergencyTapState { state in
+            state.setupToken == expectedSetupToken
+        }
     }
 
     private nonisolated static func clearEmergencyTapInstallStateIfCurrent(expectedSetupToken: UInt64) {
-        guard emergencyTapSetupToken == expectedSetupToken else { return }
-        isInstallingEmergencyTap = false
-        if emergencyTapThread === Thread.current {
-            emergencyTapThread = nil
+        withEmergencyTapState { state in
+            guard state.setupToken == expectedSetupToken else { return }
+            state.isInstallingTap = false
+            if state.tapThread === Thread.current {
+                state.tapThread = nil
+            }
         }
     }
 
@@ -641,7 +697,7 @@ public class TimelineWindowController: NSObject {
                 window.animator().alphaValue = 1
             })
             isVisible = true
-            Self.isTimelineVisible = true
+            Self.setEmergencyTimelineVisible(true)
             return
         }
 
@@ -847,7 +903,7 @@ public class TimelineWindowController: NSObject {
         // Mark visible before activation to avoid activation-time dashboard reveal
         // races that can switch Spaces on some machines.
         isVisible = true
-        Self.isTimelineVisible = true  // For emergency escape tap
+        Self.setEmergencyTimelineVisible(true)  // For emergency escape tap
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         if let hostingView = hostingView {
@@ -1013,7 +1069,7 @@ public class TimelineWindowController: NSObject {
                 window.ignoresMouseEvents = true
                 window.orderOut(nil)
                 self.isVisible = false
-                Self.isTimelineVisible = false  // For emergency escape tap
+                Self.setEmergencyTimelineVisible(false)  // For emergency escape tap
                 self.lastHiddenAt = Date()
                 self.suppressLiveScrollUntil = 0
                 let hideElapsedMs = (CFAbsoluteTimeGetCurrent() - hideRequestStartedAt) * 1000
@@ -1809,7 +1865,7 @@ public class TimelineWindowController: NSObject {
         // Mark visible before activation to avoid activation-time dashboard reveal
         // races that can switch Spaces on some machines.
         isVisible = true
-        Self.isTimelineVisible = true
+        Self.setEmergencyTimelineVisible(true)
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         if let hostingView = hostingView {
@@ -3302,23 +3358,9 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        let url: URL
-        if actualVideoPath.hasSuffix(".mp4") {
-            url = URL(fileURLWithPath: actualVideoPath)
-        } else {
-            let tempDir = FileManager.default.temporaryDirectory
-            let fileName = (actualVideoPath as NSString).lastPathComponent
-            let symlinkPath = tempDir.appendingPathComponent("\(fileName).mp4").path
-
-            if !FileManager.default.fileExists(atPath: symlinkPath) {
-                do {
-                    try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: actualVideoPath)
-                } catch {
-                    completion(nil)
-                    return
-                }
-            }
-            url = URL(fileURLWithPath: symlinkPath)
+        guard let url = MP4SymlinkResolver.resolveURL(for: actualVideoPath) else {
+            completion(nil)
+            return
         }
 
         let asset = AVURLAsset(url: url)
