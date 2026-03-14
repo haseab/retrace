@@ -135,14 +135,16 @@ final class ServiceContainerRewindCutoffTests: XCTestCase {
 
 final class DBStorageSnapshotEstimateTests: XCTestCase {
     private func makeServices(storageRoot: URL) -> ServiceContainer {
-        ServiceContainer(
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
             databasePath: storageRoot.appendingPathComponent("retrace.db").path,
             storageConfig: StorageConfig(
                 storageRootPath: storageRoot.path,
                 retentionDays: nil,
                 maxStorageGB: nil,
                 segmentDurationSeconds: 300
-            )
+            ),
+            storageCrashReportDirectory: crashReportDirectory
         )
     }
 
@@ -596,14 +598,16 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
 
 final class CrashRecoveryStartupTests: XCTestCase {
     private func makeServices(storageRoot: URL) -> ServiceContainer {
-        ServiceContainer(
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
             databasePath: "file:app_crash_recovery_\(UUID().uuidString)?mode=memory&cache=shared",
             storageConfig: StorageConfig(
                 storageRootPath: storageRoot.path,
                 retentionDays: nil,
                 maxStorageGB: nil,
                 segmentDurationSeconds: 300
-            )
+            ),
+            storageCrashReportDirectory: crashReportDirectory
         )
     }
 

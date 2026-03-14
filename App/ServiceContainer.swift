@@ -51,6 +51,7 @@ public actor ServiceContainer {
     public init(
         databasePath: String = AppPaths.databasePath,
         storageConfig: StorageConfig = .default,
+        storageCrashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
         captureConfig: CaptureConfig = .default,
         // ⚠️ RELEASE 2 ONLY
         // audioCaptureConfig: AudioCaptureConfig = .default,
@@ -76,7 +77,10 @@ public actor ServiceContainer {
         )
         self.ftsEngine = FTSManager(databasePath: databasePath)
         let storageRootURL = URL(fileURLWithPath: storageConfig.expandedStorageRootPath, isDirectory: true)
-        self.storage = StorageManager(storageRoot: storageRootURL)
+        self.storage = StorageManager(
+            storageRoot: storageRootURL,
+            crashReportDirectory: storageCrashReportDirectory
+        )
         self.capture = CaptureManager(config: captureConfig)
         // ⚠️ RELEASE 2 ONLY - Audio initialization commented out
         // self.audioCapture = AudioCaptureManager(config: audioCaptureConfig)
