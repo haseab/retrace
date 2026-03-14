@@ -37,11 +37,18 @@ public actor CGWindowListCapture {
         let appName: String?
     }
 
+    private struct VisibleWindowContext: Sendable {
+        let appBundleID: String?
+        let appName: String?
+        let windowName: String?
+    }
+
     private struct ExclusionComputationResult: Sendable {
         let excludedWindowIDs: Set<CGWindowID>
         let redactedWindowIDs: Set<CGWindowID>
         let redactionContextByWindowID: [CGWindowID: RedactionWindowContext]
         let redactionWindowOrder: [CGWindowID]
+        let visibleWindowContext: VisibleWindowContext?
     }
 
     private struct FilteredCaptureResult {
@@ -195,6 +202,10 @@ public actor CGWindowListCapture {
             contextByWindowID: exclusionResult.redactionContextByWindowID,
             redactionOrder: exclusionResult.redactionWindowOrder
         )
+        let visibleWindowContext = exclusionResult.visibleWindowContext
+        let resolvedAppBundleID = redactionSummary?.appBundleID ?? visibleWindowContext?.appBundleID
+        let resolvedAppName = redactionSummary?.appName ?? visibleWindowContext?.appName
+        let resolvedWindowName = redactionSummary == nil ? visibleWindowContext?.windowName : nil
 
         // Create captured frame
         let frame = CapturedFrame(
@@ -204,8 +215,9 @@ public actor CGWindowListCapture {
             height: height,
             bytesPerRow: bytesPerRow,
             metadata: FrameMetadata(
-                appBundleID: redactionSummary?.appBundleID,
-                appName: redactionSummary?.appName,
+                appBundleID: resolvedAppBundleID,
+                appName: resolvedAppName,
+                windowName: resolvedWindowName,
                 redactionReason: redactionSummary?.reason,
                 displayID: UInt32(displayID)
             )
@@ -225,6 +237,7 @@ public actor CGWindowListCapture {
         var redactedWindowIDs = Set<CGWindowID>()
         var redactionContextByWindowID: [CGWindowID: RedactionWindowContext] = [:]
         var redactionWindowOrder: [CGWindowID] = []
+        var visibleWindowContext: VisibleWindowContext?
 
         enum BrowserURLLookupResult {
             case found(String)
@@ -240,7 +253,8 @@ public actor CGWindowListCapture {
                 excludedWindowIDs: excludedIDs,
                 redactedWindowIDs: redactedWindowIDs,
                 redactionContextByWindowID: redactionContextByWindowID,
-                redactionWindowOrder: redactionWindowOrder
+                redactionWindowOrder: redactionWindowOrder,
+                visibleWindowContext: visibleWindowContext
             )
         }
 
@@ -274,6 +288,14 @@ public actor CGWindowListCapture {
                 } else {
                     pidsWithoutBundleID.insert(pid)
                 }
+            }
+
+            if visibleWindowContext == nil {
+                visibleWindowContext = VisibleWindowContext(
+                    appBundleID: bundleID,
+                    appName: appDisplayName(ownerName: ownerName, bundleID: bundleID),
+                    windowName: normalizedWindowTitle(windowName)
+                )
             }
 
             // Check 1: Excluded app bundle IDs (check by bundle ID from PID)
@@ -398,7 +420,8 @@ public actor CGWindowListCapture {
             excludedWindowIDs: excludedIDs,
             redactedWindowIDs: redactedWindowIDs,
             redactionContextByWindowID: redactionContextByWindowID,
-            redactionWindowOrder: redactionWindowOrder
+            redactionWindowOrder: redactionWindowOrder,
+            visibleWindowContext: visibleWindowContext
         )
     }
 
@@ -471,6 +494,14 @@ public actor CGWindowListCapture {
             return trimmedWindowName
         }
         return ownerName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizedWindowTitle(_ title: String?) -> String? {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty else {
+            return nil
+        }
+        return title
     }
 
     private func appDisplayName(ownerName: String, bundleID: String?) -> String {

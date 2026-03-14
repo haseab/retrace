@@ -432,20 +432,41 @@ public actor CaptureManager: CaptureProtocol {
 
     /// Enrich frame with app metadata
     private func enrichFrameMetadata(_ frame: CapturedFrame) async -> CapturedFrame {
-        let frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(includeBrowserURL: true)
+        let preferredDisplayID = frame.metadata.displayID == 0 ? nil : frame.metadata.displayID
+        let shouldLookupBrowserURL: Bool = {
+            guard frame.metadata.redactionReason == nil else { return false }
+            guard let capturedBundleID = frame.metadata.appBundleID else { return true }
+            return BrowserURLExtractor.isBrowser(capturedBundleID) || capturedBundleID == "com.apple.finder"
+        }()
+        let frontmostMetadata = await appInfoProvider.getFrontmostAppInfo(
+            includeBrowserURL: shouldLookupBrowserURL,
+            preferredDisplayID: preferredDisplayID
+        )
         let redactionReason = frame.metadata.redactionReason
         let preservedDisplayID = frame.metadata.displayID != 0 ? frame.metadata.displayID : frontmostMetadata.displayID
-        let redactedAppBundleID = frame.metadata.appBundleID
-        let redactedAppName = frame.metadata.appName
 
-        let enrichedMetadata = FrameMetadata(
-            appBundleID: redactionReason == nil ? frontmostMetadata.appBundleID : (redactedAppBundleID ?? frontmostMetadata.appBundleID),
-            appName: redactionReason == nil ? frontmostMetadata.appName : (redactedAppName ?? frontmostMetadata.appName),
-            windowName: redactionReason == nil ? frontmostMetadata.windowName : nil,
-            browserURL: redactionReason == nil ? frontmostMetadata.browserURL : nil,
-            redactionReason: redactionReason,
-            displayID: preservedDisplayID
-        )
+        let enrichedMetadata: FrameMetadata
+        if redactionReason == nil {
+            // Preserve capture-time app/window context whenever available to keep
+            // segment assignment aligned with the captured pixels.
+            enrichedMetadata = FrameMetadata(
+                appBundleID: frame.metadata.appBundleID ?? frontmostMetadata.appBundleID,
+                appName: frame.metadata.appName ?? frontmostMetadata.appName,
+                windowName: frame.metadata.windowName ?? frontmostMetadata.windowName,
+                browserURL: frame.metadata.browserURL ?? frontmostMetadata.browserURL,
+                redactionReason: redactionReason,
+                displayID: preservedDisplayID
+            )
+        } else {
+            enrichedMetadata = FrameMetadata(
+                appBundleID: frame.metadata.appBundleID ?? frontmostMetadata.appBundleID,
+                appName: frame.metadata.appName ?? frontmostMetadata.appName,
+                windowName: nil,
+                browserURL: nil,
+                redactionReason: redactionReason,
+                displayID: preservedDisplayID
+            )
+        }
 
         // Create new frame with enriched metadata
         return CapturedFrame(

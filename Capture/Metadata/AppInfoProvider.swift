@@ -6,71 +6,95 @@ import Shared
 /// Provides information about the currently active application
 struct AppInfoProvider: Sendable {
 
+    private struct VisibleWindowContext: Sendable {
+        let pid: pid_t
+        let bundleID: String?
+        let appName: String?
+        let windowName: String?
+    }
+
     // MARK: - App Info Retrieval
 
     /// Get information about the frontmost application
     /// - Returns: FrameMetadata with app info, or minimal metadata if unavailable
-    /// - Parameter includeBrowserURL: Whether browser URL extraction should run (can be expensive)
-    func getFrontmostAppInfo(includeBrowserURL: Bool = true) async -> FrameMetadata {
-        // Read NSWorkspace state on main actor, then do expensive work off-main.
+    /// - Parameters:
+    ///   - includeBrowserURL: Whether browser URL extraction should run (can be expensive)
+    ///   - preferredDisplayID: Optional display ID used to pick the topmost visible window on that display first
+    func getFrontmostAppInfo(
+        includeBrowserURL: Bool = true,
+        preferredDisplayID: CGDirectDisplayID? = nil
+    ) async -> FrameMetadata {
+        let displayID = preferredDisplayID ?? CGMainDisplayID()
+
+        // Prefer top-most visible window metadata from CGWindowList to keep app/window
+        // context aligned with the captured pixels, especially during rapid app switches.
+        if let visibleWindow = getTopVisibleWindowContext(preferredDisplayID: preferredDisplayID) {
+            var bundleID = visibleWindow.bundleID
+            var appName = visibleWindow.appName
+
+            if bundleID == nil && visibleWindow.pid == ProcessInfo.processInfo.processIdentifier {
+                bundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
+                appName = appName ?? "Retrace"
+            }
+
+            let windowName = visibleWindow.windowName ?? getWindowTitle(
+                for: visibleWindow.pid,
+                bundleID: bundleID,
+                appName: appName
+            )
+
+            let browserURL = await resolveBrowserURL(
+                includeBrowserURL: includeBrowserURL,
+                pid: visibleWindow.pid,
+                bundleID: bundleID,
+                appName: appName,
+                windowName: windowName
+            )
+
+            return FrameMetadata(
+                appBundleID: bundleID,
+                appName: appName,
+                windowName: windowName,
+                browserURL: browserURL,
+                displayID: displayID
+            )
+        }
+
+        // Fallback to NSWorkspace frontmost app if no qualifying on-screen window was found.
         guard let frontApp = await MainActor.run(body: {
             NSWorkspace.shared.frontmostApplication
         }) else {
-            return FrameMetadata(displayID: CGMainDisplayID())
+            return FrameMetadata(displayID: displayID)
         }
 
-        // Use bundleIdentifier if available, otherwise check if it's the current app (dev build)
         var bundleID = frontApp.bundleIdentifier
         var appName = frontApp.localizedName
 
-        // Dev build fix: if bundleID is nil but this is Retrace (same PID), use known bundle ID
         if bundleID == nil && frontApp.processIdentifier == ProcessInfo.processInfo.processIdentifier {
             bundleID = Bundle.main.bundleIdentifier ?? "io.retrace.app"
             appName = appName ?? "Retrace"
         }
 
-        let isCurrentProcess = frontApp.processIdentifier == ProcessInfo.processInfo.processIdentifier
-
-        // Get window title via Accessibility API
         let windowName = getWindowTitle(
             for: frontApp.processIdentifier,
             bundleID: bundleID,
             appName: appName
         )
 
-        // Get URL metadata from the active app window if available.
-        // Limit extraction to known browsers/web apps plus Finder path context.
-        var browserURL: String? = nil
-        if includeBrowserURL,
-           !isCurrentProcess,
-           let bundleID,
-           (BrowserURLExtractor.isBrowser(bundleID) || bundleID == "com.apple.finder") {
-            let urlExtractionStart = CFAbsoluteTimeGetCurrent()
-            browserURL = await BrowserURLExtractor.getURL(
-                bundleID: bundleID,
-                pid: frontApp.processIdentifier,
-                windowCacheKey: windowName ?? appName
-            )
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - urlExtractionStart) * 1000
-            if elapsedMs >= 250 {
-                Log.warning(
-                    "[AppInfoProvider] Slow browser URL extraction bundle=\(bundleID), pid=\(frontApp.processIdentifier), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
-                    category: .capture
-                )
-            } else if elapsedMs >= 120 {
-                Log.debug(
-                    "[AppInfoProvider] Browser URL extraction bundle=\(bundleID), pid=\(frontApp.processIdentifier), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
-                    category: .capture
-                )
-            }
-        }
+        let browserURL = await resolveBrowserURL(
+            includeBrowserURL: includeBrowserURL,
+            pid: frontApp.processIdentifier,
+            bundleID: bundleID,
+            appName: appName,
+            windowName: windowName
+        )
 
         return FrameMetadata(
             appBundleID: bundleID,
             appName: appName,
             windowName: windowName,
             browserURL: browserURL,
-            displayID: CGMainDisplayID()
+            displayID: displayID
         )
     }
 
@@ -119,6 +143,111 @@ struct AppInfoProvider: Sendable {
             return nil
         }
         return title
+    }
+
+    /// Find the top-most visible layer-0 window context from CGWindowList.
+    /// The returned window order is front-to-back.
+    private func getTopVisibleWindowContext(preferredDisplayID: CGDirectDisplayID?) -> VisibleWindowContext? {
+        guard let windowList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        let preferredDisplayBounds = preferredDisplayID.map(CGDisplayBounds)
+
+        for windowInfo in windowList {
+            guard isCandidateTopWindow(windowInfo, preferredDisplayBounds: preferredDisplayBounds),
+                  let pid = windowInfo[kCGWindowOwnerPID as String] as? pid_t else {
+                continue
+            }
+
+            let ownerName = normalizedWindowTitle(windowInfo[kCGWindowOwnerName as String] as? String)
+            let windowName = normalizedWindowTitle(windowInfo[kCGWindowName as String] as? String)
+            let runningApp = NSRunningApplication(processIdentifier: pid)
+            let appName = normalizedWindowTitle(runningApp?.localizedName) ?? ownerName
+            let bundleID = runningApp?.bundleIdentifier
+
+            return VisibleWindowContext(
+                pid: pid,
+                bundleID: bundleID,
+                appName: appName,
+                windowName: windowName
+            )
+        }
+
+        return nil
+    }
+
+    private func isCandidateTopWindow(_ windowInfo: [String: Any], preferredDisplayBounds: CGRect?) -> Bool {
+        let layer = windowInfo[kCGWindowLayer as String] as? Int ?? 0
+        guard layer == 0 else { return false }
+
+        let alpha = windowInfo[kCGWindowAlpha as String] as? Double ?? 0
+        guard alpha > 0 else { return false }
+
+        let isOnScreen = windowInfo[kCGWindowIsOnscreen as String] as? Bool ?? false
+        guard isOnScreen else { return false }
+
+        guard let bounds = windowBounds(from: windowInfo) else {
+            return false
+        }
+
+        if let preferredDisplayBounds, !bounds.intersects(preferredDisplayBounds) {
+            return false
+        }
+
+        return true
+    }
+
+    private func windowBounds(from windowInfo: [String: Any]) -> CGRect? {
+        guard let boundsDict = windowInfo[kCGWindowBounds as String] as? [String: Any],
+              let x = boundsDict["X"] as? CGFloat,
+              let y = boundsDict["Y"] as? CGFloat,
+              let width = boundsDict["Width"] as? CGFloat,
+              let height = boundsDict["Height"] as? CGFloat,
+              width > 1,
+              height > 1 else {
+            return nil
+        }
+
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func resolveBrowserURL(
+        includeBrowserURL: Bool,
+        pid: pid_t,
+        bundleID: String?,
+        appName: String?,
+        windowName: String?
+    ) async -> String? {
+        guard includeBrowserURL,
+              pid != ProcessInfo.processInfo.processIdentifier,
+              let bundleID,
+              (BrowserURLExtractor.isBrowser(bundleID) || bundleID == "com.apple.finder") else {
+            return nil
+        }
+
+        let urlExtractionStart = CFAbsoluteTimeGetCurrent()
+        let browserURL = await BrowserURLExtractor.getURL(
+            bundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowName ?? appName
+        )
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - urlExtractionStart) * 1000
+        if elapsedMs >= 250 {
+            Log.warning(
+                "[AppInfoProvider] Slow browser URL extraction bundle=\(bundleID), pid=\(pid), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
+                category: .capture
+            )
+        } else if elapsedMs >= 120 {
+            Log.debug(
+                "[AppInfoProvider] Browser URL extraction bundle=\(bundleID), pid=\(pid), elapsed=\(String(format: "%.1f", elapsedMs))ms, foundURL=\(browserURL != nil)",
+                category: .capture
+            )
+        }
+        return browserURL
     }
 
     /// Fallback title extraction via CoreGraphics window list.
