@@ -33,6 +33,7 @@ enum SettingsDefaults {
     static let scrubbingAnimationDuration: Double = 0.10  // 0 = no animation, max 0.20
     static let scrollSensitivity: Double = 0.50  // 0.0 = slowest, 1.0 = fastest
     static let timelineScrollOrientation: TimelineScrollOrientation = .horizontal
+    static let dashboardAppUsageViewMode = "list"
 
     // MARK: Capture
     static let pauseReminderDelayMinutes: Double = 30  // 0 = never remind again
@@ -77,6 +78,29 @@ enum SettingsDefaults {
     static let ocrProcessingLevel: Int = 3  // Default: Balanced (utility priority, 1 worker)
     static let ocrAppFilterMode: OCRAppFilterMode = .allApps
     static let ocrFilteredApps = ""  // JSON array of bundle IDs
+}
+
+enum DashboardAppUsageViewModeSetting: String, CaseIterable {
+    case list = "list"
+    case hardDrive = "squares"
+
+    var shortLabel: String {
+        switch self {
+        case .list:
+            return "List"
+        case .hardDrive:
+            return "Tiles"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .list:
+            return "List view"
+        case .hardDrive:
+            return "Tiles view"
+        }
+    }
 }
 
 // OCRAppFilterMode is defined in Shared/PowerStateMonitor.swift
@@ -191,6 +215,7 @@ public struct SettingsView: View {
     @AppStorage("scrubbingAnimationDuration", store: settingsStore) private var scrubbingAnimationDuration: Double = SettingsDefaults.scrubbingAnimationDuration
     @AppStorage("scrollSensitivity", store: settingsStore) private var scrollSensitivity: Double = SettingsDefaults.scrollSensitivity
     @AppStorage("timelineScrollOrientation", store: settingsStore) private var timelineScrollOrientation: TimelineScrollOrientation = SettingsDefaults.timelineScrollOrientation
+    @AppStorage("dashboardAppUsageViewMode", store: settingsStore) private var dashboardAppUsageViewMode: String = SettingsDefaults.dashboardAppUsageViewMode
 
     // Font style - tracked as @State to trigger view refresh on change
     @State private var fontStyle: RetraceFontStyle = RetraceFont.currentStyle
@@ -1519,6 +1544,61 @@ public struct SettingsView: View {
                     subtitle: "Show accent-colored borders on timeline control buttons",
                     isOn: $timelineColoredBorders
                 )
+
+                Divider()
+                    .background(Color.retraceBorder)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack {
+                        Text("Dashboard app usage layout")
+                            .font(.retraceCalloutMedium)
+                            .foregroundColor(.retracePrimary)
+                        Spacer()
+                        Text(dashboardAppUsageViewModeSelection.displayName)
+                            .font(.retraceCalloutBold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.retraceAccent.opacity(0.3))
+                            .cornerRadius(8)
+                    }
+
+                    ModernSegmentedPicker(
+                        selection: dashboardAppUsageViewModeBinding,
+                        options: DashboardAppUsageViewModeSetting.allCases
+                    ) { option in
+                        Text(option.shortLabel)
+                    }
+
+                    HStack {
+                        Text("Choose how App Usage appears in Dashboard.")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+
+                        Spacer()
+
+                        if dashboardAppUsageViewMode != SettingsDefaults.dashboardAppUsageViewMode {
+                            Button(action: {
+                                dashboardAppUsageViewMode = SettingsDefaults.dashboardAppUsageViewMode
+                                DashboardViewModel.recordDeveloperSettingToggle(
+                                    coordinator: coordinatorWrapper.coordinator,
+                                    source: "settings.appearance",
+                                    settingKey: "dashboardAppUsageViewMode",
+                                    isEnabled: false
+                                )
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.counterclockwise")
+                                        .font(.system(size: 10))
+                                    Text("Reset to Default")
+                                        .font(.retraceCaption2)
+                                }
+                                .foregroundColor(.white.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
 
                 Divider()
                     .background(Color.retraceBorder)
@@ -6030,6 +6110,27 @@ private struct RetentionTagsChip<PopoverContent: View>: View {
 }
 
 extension SettingsView {
+    var dashboardAppUsageViewModeSelection: DashboardAppUsageViewModeSetting {
+        DashboardAppUsageViewModeSetting(rawValue: dashboardAppUsageViewMode) ?? .list
+    }
+
+    var dashboardAppUsageViewModeBinding: Binding<DashboardAppUsageViewModeSetting> {
+        Binding(
+            get: {
+                dashboardAppUsageViewModeSelection
+            },
+            set: { newValue in
+                dashboardAppUsageViewMode = newValue.rawValue
+                DashboardViewModel.recordDeveloperSettingToggle(
+                    coordinator: coordinatorWrapper.coordinator,
+                    source: "settings.appearance",
+                    settingKey: "dashboardAppUsageViewMode",
+                    isEnabled: newValue == .hardDrive
+                )
+            }
+        )
+    }
+
     var pauseReminderDisplayText: String {
         if pauseReminderDelayMinutes == 0 {
             return "Never"
@@ -9423,6 +9524,7 @@ extension SettingsView {
         scrubbingAnimationDuration = SettingsDefaults.scrubbingAnimationDuration
         scrollSensitivity = SettingsDefaults.scrollSensitivity
         timelineScrollOrientation = SettingsDefaults.timelineScrollOrientation
+        dashboardAppUsageViewMode = SettingsDefaults.dashboardAppUsageViewMode
     }
 
     /// Reset all Capture settings to defaults

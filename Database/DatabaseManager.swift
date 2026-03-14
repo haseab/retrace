@@ -37,6 +37,13 @@ public struct FrameInPageURLState: Sendable, Equatable {
     }
 }
 
+/// Task-local diagnostics propagated across actor hops so callers can stamp enqueue time.
+public enum DatabaseActorTraceContext {
+    @TaskLocal public static var requestEnqueuedAt: CFAbsoluteTime?
+    @TaskLocal public static var operationName: String?
+    @TaskLocal public static var traceID: String?
+}
+
 /// Main database manager implementing DatabaseProtocol
 /// Owner: DATABASE agent
 ///
@@ -49,6 +56,9 @@ public actor DatabaseManager: DatabaseProtocol {
     private let databasePath: String
     private let storageRootPath: String
     private var isInitialized = false
+    private var dbActorOperationSequence: UInt64 = 0
+    private var dbActorOperationStack: [(id: UInt64, name: String, startedAt: CFAbsoluteTime)] = []
+    private static let dbActorSlowHoldWarningMs: Double = 200
 
     /// Public accessor for the database connection (needed for query classes)
     public func getConnection() -> OpaquePointer? {
@@ -58,6 +68,70 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Check if the database has been fully initialized
     public func isReady() -> Bool {
         isInitialized && db != nil
+    }
+
+    // MARK: - DB Actor Occupancy Tracing
+
+    private func withTracedDatabaseOperation<T>(
+        _ operation: String,
+        warningMs: Double = DatabaseManager.dbActorSlowHoldWarningMs,
+        _ block: (OpaquePointer) throws -> T
+    ) throws -> T {
+        guard let db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        dbActorOperationSequence &+= 1
+        let operationID = dbActorOperationSequence
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let queueWaitMs = DatabaseActorTraceContext.requestEnqueuedAt.map {
+            max(0, (startedAt - $0) * 1000)
+        }
+        let upstreamTraceID = DatabaseActorTraceContext.traceID ?? "none"
+        let upstreamOperation = DatabaseActorTraceContext.operationName ?? operation
+
+        if let queueWaitMs {
+            Log.recordLatency(
+                "dashboard.db_actor.queue_wait_ms",
+                valueMs: queueWaitMs,
+                category: .database,
+                summaryEvery: 10,
+                warningThresholdMs: 400,
+                criticalThresholdMs: 2000
+            )
+            if queueWaitMs >= warningMs {
+                Log.warning(
+                    "[DB-ACTOR][\(operationID)] QUEUE op='\(operation)' trace=\(upstreamTraceID) upstream='\(upstreamOperation)' waited=\(String(format: "%.1f", queueWaitMs))ms",
+                    category: .database
+                )
+            }
+        }
+
+        if let active = dbActorOperationStack.last {
+            let activeElapsedMs = (startedAt - active.startedAt) * 1000
+            Log.warning(
+                "[DB-ACTOR][\(operationID)] ENTER op='\(operation)' while active='\(active.name)' activeID=\(active.id) activeElapsed=\(String(format: "%.1f", activeElapsedMs))ms",
+                category: .database
+            )
+        }
+
+        dbActorOperationStack.append((id: operationID, name: operation, startedAt: startedAt))
+        defer {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            if let index = dbActorOperationStack.lastIndex(where: { $0.id == operationID }) {
+                dbActorOperationStack.remove(at: index)
+            }
+
+            if elapsedMs >= warningMs {
+                let activeAfter = dbActorOperationStack.last.map { "\($0.name)#\($0.id)" } ?? "none"
+                Log.warning(
+                    "[DB-ACTOR][\(operationID)] HOLD op='\(operation)' trace=\(upstreamTraceID) upstream='\(upstreamOperation)' elapsed=\(String(format: "%.1f", elapsedMs))ms activeAfter=\(activeAfter)",
+                    category: .database
+                )
+            }
+        }
+
+        return try block(db)
     }
 
     // MARK: - Initialization
@@ -255,10 +329,9 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Frame Operations
 
     public func insertFrame(_ frame: FrameReference) async throws -> Int64 {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("insert_frame") { db in
+            try FrameQueries.insert(db: db, frame: frame)
         }
-        return try FrameQueries.insert(db: db, frame: frame)
     }
 
     public func getFrame(id: FrameID) async throws -> FrameReference? {
@@ -269,92 +342,83 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     public func getFrames(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameReference] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_time_range") { db in
+            try FrameQueries.getByTimeRange(db: db, from: startDate, to: endDate, limit: limit)
         }
-        return try FrameQueries.getByTimeRange(db: db, from: startDate, to: endDate, limit: limit)
     }
 
     public func getFramesBefore(timestamp: Date, limit: Int) async throws -> [FrameReference] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_before") { db in
+            try FrameQueries.getFramesBefore(db: db, timestamp: timestamp, limit: limit)
         }
-        return try FrameQueries.getFramesBefore(db: db, timestamp: timestamp, limit: limit)
     }
 
     public func getFramesAfter(timestamp: Date, limit: Int) async throws -> [FrameReference] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_after") { db in
+            try FrameQueries.getFramesAfter(db: db, timestamp: timestamp, limit: limit)
         }
-        return try FrameQueries.getFramesAfter(db: db, timestamp: timestamp, limit: limit)
     }
 
     public func getMostRecentFrames(limit: Int) async throws -> [FrameReference] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_most_recent_frames") { db in
+            try FrameQueries.getMostRecent(db: db, limit: limit)
         }
-        return try FrameQueries.getMostRecent(db: db, limit: limit)
     }
 
     // MARK: - Optimized Frame Queries with Video Info (Rewind-inspired)
 
     public func getFramesWithVideoInfo(from startDate: Date, to endDate: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_with_video_info") { db in
+            try FrameQueries.getByTimeRangeWithVideoInfo(
+                db: db,
+                from: startDate,
+                to: endDate,
+                limit: limit,
+                storageRoot: storageRootPath
+            )
         }
-        return try FrameQueries.getByTimeRangeWithVideoInfo(
-            db: db,
-            from: startDate,
-            to: endDate,
-            limit: limit,
-            storageRoot: storageRootPath
-        )
     }
 
     public func getMostRecentFramesWithVideoInfo(limit: Int) async throws -> [FrameWithVideoInfo] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_most_recent_frames_with_video_info") { db in
+            try FrameQueries.getMostRecentWithVideoInfo(
+                db: db,
+                limit: limit,
+                storageRoot: storageRootPath
+            )
         }
-        return try FrameQueries.getMostRecentWithVideoInfo(
-            db: db,
-            limit: limit,
-            storageRoot: storageRootPath
-        )
     }
 
     public func getFramesWithVideoInfoBefore(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_with_video_info_before") { db in
+            try FrameQueries.getBeforeWithVideoInfo(
+                db: db,
+                timestamp: timestamp,
+                limit: limit,
+                storageRoot: storageRootPath
+            )
         }
-        return try FrameQueries.getBeforeWithVideoInfo(
-            db: db,
-            timestamp: timestamp,
-            limit: limit,
-            storageRoot: storageRootPath
-        )
     }
 
     public func getFramesWithVideoInfoAfter(timestamp: Date, limit: Int) async throws -> [FrameWithVideoInfo] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frames_with_video_info_after") { db in
+            try FrameQueries.getAfterWithVideoInfo(
+                db: db,
+                timestamp: timestamp,
+                limit: limit,
+                storageRoot: storageRootPath
+            )
         }
-        return try FrameQueries.getAfterWithVideoInfo(
-            db: db,
-            timestamp: timestamp,
-            limit: limit,
-            storageRoot: storageRootPath
-        )
     }
 
     public func getFrameWithVideoInfoByID(id: FrameID) async throws -> FrameWithVideoInfo? {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_frame_with_video_info_by_id") { db in
+            try FrameQueries.getByIDWithVideoInfo(
+                db: db,
+                id: id,
+                storageRoot: storageRootPath
+            )
         }
-        return try FrameQueries.getByIDWithVideoInfo(
-            db: db,
-            id: id,
-            storageRoot: storageRootPath
-        )
     }
 
     public func getFrames(appBundleID: String, limit: Int, offset: Int) async throws -> [FrameReference] {
@@ -395,10 +459,9 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Get all distinct dates that have frames (for calendar display)
     public func getDistinctDates() async throws -> [Date] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_distinct_dates") { db in
+            try FrameQueries.getDistinctDates(db: db)
         }
-        return try FrameQueries.getDistinctDates(db: db)
     }
 
     /// Get distinct hours for a specific date that have frames
@@ -614,10 +677,9 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     public func getTotalStorageBytes() async throws -> Int64 {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_total_storage_bytes") { db in
+            try SegmentQueries.getTotalStorageBytes(db: db)
         }
-        return try SegmentQueries.getTotalStorageBytes(db: db)
     }
 
     // MARK: - Unfinalised Video Operations (Multi-Resolution Support)
@@ -660,10 +722,9 @@ public actor DatabaseManager: DatabaseProtocol {
     // MARK: - Document Operations
 
     public func insertDocument(_ document: IndexedDocument) async throws -> Int64 {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("insert_document") { db in
+            try DocumentQueries.insert(db: db, document: document)
         }
-        return try DocumentQueries.insert(db: db, document: document)
     }
 
     public func updateDocument(id: Int64, content: String) async throws {
@@ -813,10 +874,29 @@ public actor DatabaseManager: DatabaseProtocol {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        do {
+            let results = try withTracedDatabaseOperation("get_app_usage_stats") { db in
+                try AppSegmentQueries.getAppUsageStats(db: db, from: startDate, to: endDate)
+            }
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.recordLatency(
+                "dashboard.path.database_manager.get_app_usage_stats_ms",
+                valueMs: elapsedMs,
+                category: .database,
+                summaryEvery: 10,
+                warningThresholdMs: 800,
+                criticalThresholdMs: 2500
+            )
+            return results
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.error(
+                "[DASHBOARD-PATH][DatabaseManager] getAppUsageStats failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .database
+            )
+            throw error
         }
-        return try AppSegmentQueries.getAppUsageStats(db: db, from: startDate, to: endDate)
     }
 
     public func getWindowUsageForApp(
@@ -1906,16 +1986,15 @@ public actor DatabaseManager: DatabaseProtocol {
         frameWidth: Int,
         frameHeight: Int
     ) async throws {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("insert_nodes_batch") { db in
+            try NodeQueries.insertBatch(
+                db: db,
+                frameID: frameID,
+                nodes: nodes,
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
         }
-        try NodeQueries.insertBatch(
-            db: db,
-            frameID: frameID,
-            nodes: nodes,
-            frameWidth: frameWidth,
-            frameHeight: frameHeight
-        )
     }
 
     public func getNodes(frameID: FrameID, frameWidth: Int, frameHeight: Int) async throws -> [OCRNode] {
@@ -2018,15 +2097,14 @@ public actor DatabaseManager: DatabaseProtocol {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("get_daily_metrics") { db in
+            try DailyMetricsQueries.getDailyCounts(
+                db: db,
+                metricType: metricType,
+                from: startDate,
+                to: endDate
+            )
         }
-        return try DailyMetricsQueries.getDailyCounts(
-            db: db,
-            metricType: metricType,
-            from: startDate,
-            to: endDate
-        )
     }
 
     /// Get total count of a metric over a date range
@@ -2052,14 +2130,33 @@ public actor DatabaseManager: DatabaseProtocol {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        do {
+            let results = try withTracedDatabaseOperation("get_daily_screen_time") { db in
+                try AppSegmentQueries.getDailyScreenTime(
+                    db: db,
+                    from: startDate,
+                    to: endDate
+                )
+            }
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.recordLatency(
+                "dashboard.path.database_manager.get_daily_screen_time_ms",
+                valueMs: elapsedMs,
+                category: .database,
+                summaryEvery: 10,
+                warningThresholdMs: 1200,
+                criticalThresholdMs: 5000
+            )
+            return results
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.error(
+                "[DASHBOARD-PATH][DatabaseManager] getDailyScreenTime failed range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .database
+            )
+            throw error
         }
-        return try AppSegmentQueries.getDailyScreenTime(
-            db: db,
-            from: startDate,
-            to: endDate
-        )
     }
 
     // MARK: - DB Storage Snapshot Operations
@@ -2979,31 +3076,29 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Update frame processing status
     /// When status is 2 (completed), also sets processedAt timestamp
     public func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
+        try withTracedDatabaseOperation("update_frame_processing_status") { db in
+            // If status is 2 (completed), also set processedAt timestamp
+            let sql: String
+            if status == 2 {
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+            } else {
+                sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+            }
 
-        // If status is 2 (completed), also set processedAt timestamp
-        let sql: String
-        if status == 2 {
-            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-            sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
-        } else {
-            sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
-        }
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
 
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
+            sqlite3_bind_int(stmt, 1, Int32(status))
+            sqlite3_bind_int64(stmt, 2, frameID)
 
-        sqlite3_bind_int(stmt, 1, Int32(status))
-        sqlite3_bind_int64(stmt, 2, frameID)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
         }
     }
 
@@ -3034,61 +3129,57 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Mark frame as readable from video file (processingStatus 4 -> 0)
     /// Called when frame is confirmed to be written to video file
     public func markFrameReadable(frameID: Int64) async throws {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
+        try withTracedDatabaseOperation("mark_frame_readable") { db in
+            // Only update if status is 4 (not yet readable)
+            let sql = "UPDATE frame SET processingStatus = 0 WHERE id = ? AND processingStatus = 4;"
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
 
-        // Only update if status is 4 (not yet readable)
-        let sql = "UPDATE frame SET processingStatus = 0 WHERE id = ? AND processingStatus = 4;"
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
+            sqlite3_bind_int64(stmt, 1, frameID)
 
-        sqlite3_bind_int64(stmt, 1, frameID)
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
         }
     }
 
     /// Get processing status for multiple frames in a single query
     /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
     public func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
-        }
-
         guard !frameIDs.isEmpty else {
             return [:]
         }
 
-        // Build parameterized query for batch lookup
-        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
-        let sql = "SELECT id, processingStatus FROM frame WHERE id IN (\(placeholders));"
+        return try withTracedDatabaseOperation("get_frame_processing_statuses_batch") { db in
+            // Build parameterized query for batch lookup
+            let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+            let sql = "SELECT id, processingStatus FROM frame WHERE id IN (\(placeholders));"
 
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            // Bind all frame IDs
+            for (index, frameID) in frameIDs.enumerated() {
+                sqlite3_bind_int64(stmt, Int32(index + 1), frameID)
+            }
+
+            var results: [Int64: Int] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let frameID = sqlite3_column_int64(stmt, 0)
+                let status = Int(sqlite3_column_int(stmt, 1))
+                results[frameID] = status
+            }
+
+            return results
         }
-
-        // Bind all frame IDs
-        for (index, frameID) in frameIDs.enumerated() {
-            sqlite3_bind_int64(stmt, Int32(index + 1), frameID)
-        }
-
-        var results: [Int64: Int] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let frameID = sqlite3_column_int64(stmt, 0)
-            let status = Int(sqlite3_column_int(stmt, 1))
-            results[frameID] = status
-        }
-
-        return results
     }
 
     /// Check if a frame is currently in the processing queue
@@ -3162,32 +3253,30 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Get all frame IDs with pending status (processingStatus=0) that are NOT in the processing queue
     /// Used to find frames that need to be re-enqueued for OCR processing
     public func getPendingFrameIDsNotInQueue(limit: Int = 1000) async throws -> [Int64] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        return try withTracedDatabaseOperation("get_pending_frame_ids_not_in_queue") { db in
+            let sql = """
+                SELECT f.id FROM frame f
+                LEFT JOIN processing_queue pq ON f.id = pq.frameId
+                WHERE f.processingStatus = 0 AND pq.frameId IS NULL
+                ORDER BY f.id DESC
+                LIMIT ?;
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+            }
+
+            sqlite3_bind_int(stmt, 1, Int32(limit))
+
+            var frameIDs: [Int64] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                frameIDs.append(sqlite3_column_int64(stmt, 0))
+            }
+
+            return frameIDs
         }
-
-        let sql = """
-            SELECT f.id FROM frame f
-            LEFT JOIN processing_queue pq ON f.id = pq.frameId
-            WHERE f.processingStatus = 0 AND pq.frameId IS NULL
-            ORDER BY f.id DESC
-            LIMIT ?;
-        """
-        var stmt: OpaquePointer?
-        defer { sqlite3_finalize(stmt) }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        sqlite3_bind_int(stmt, 1, Int32(limit))
-
-        var frameIDs: [Int64] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            frameIDs.append(sqlite3_column_int64(stmt, 0))
-        }
-
-        return frameIDs
     }
 
     /// Count frames with pending status (processingStatus=0) that are NOT in the processing queue

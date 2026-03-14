@@ -36,7 +36,7 @@ enum AppUsageLayoutSize {
     var rankWidth: CGFloat { 20 }
     var progressBarWidth: CGFloat { 120 }
     var progressBarHeight: CGFloat { 6 }
-    var durationWidth: CGFloat { 70 }
+    var durationWidth: CGFloat { 75 }
     var horizontalPadding: CGFloat { 12 }
     var verticalPadding: CGFloat { 10 }
     var windowRowIndent: CGFloat { 52 }
@@ -386,12 +386,14 @@ struct AppUsageListView: View {
                 Text(formatDuration(window.duration))
                     .font(layoutSize.windowDurationFont)
                     .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
 
                 Text(String(format: "%.1f%%", window.percentage * 100))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.7))
             }
-            .frame(width: layoutSize.durationWidth * 0.8, alignment: .trailing)
+            .frame(width: layoutSize.durationWidth, alignment: .trailing)
         }
         .padding(.horizontal, layoutSize.horizontalPadding)
         .padding(.vertical, layoutSize.verticalPadding * (showAsTab ? 0.7 : 0.6))
@@ -496,12 +498,14 @@ struct AppUsageListView: View {
                 Text(formatDuration(window.duration))
                     .font(layoutSize.windowDurationFont)
                     .foregroundColor(.retracePrimary.opacity(0.85))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.9)
 
                 Text(String(format: "%.1f%%", window.percentage * 100))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.7))
             }
-            .frame(width: layoutSize.durationWidth * 0.8, alignment: .trailing)
+            .frame(width: layoutSize.durationWidth, alignment: .trailing)
         }
         .padding(.horizontal, layoutSize.horizontalPadding)
         .padding(.vertical, layoutSize.verticalPadding * 0.6)
@@ -913,7 +917,7 @@ struct AppUsageListView: View {
                     .foregroundColor(.retracePrimary)
                     .lineLimit(1)
 
-                Text("This week")
+                Text("Selected range")
                     .font(.retraceCaption2)
                     .foregroundColor(.retraceSecondary)
             }

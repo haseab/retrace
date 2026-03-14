@@ -43,6 +43,7 @@ private enum LayoutSize {
 private let dashboardMaxWidth: CGFloat = 1100
 /// Shared breakpoint for compact dashboard-style layouts.
 let dashboardCompactLayoutThreshold: CGFloat = 850
+private let dashboardSettingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
 private struct RecordingIndicatorAnchorPreferenceKey: PreferenceKey {
     static var defaultValue: Anchor<CGRect>? = nil
@@ -67,40 +68,26 @@ public struct DashboardView: View {
     @State private var showFeedbackSheet = false
     @State private var feedbackLaunchContext: FeedbackLaunchContext?
     @State private var feedbackPresentationID = UUID()
-    @State private var usageViewMode: AppUsageViewMode = Self.loadSavedViewMode()
+    @AppStorage("dashboardAppUsageViewMode", store: dashboardSettingsStore)
+    private var usageViewModeRawValue: String = AppUsageViewMode.list.rawValue
     @State private var selectedApp: AppUsageData? = nil
     @State private var selectedWindow: WindowUsageData? = nil
     @State private var showSessionsSheet = false
     @State private var showSystemMonitor = false
+    @State private var showAppUsageDatePopover = false
     @State private var showDiscordFollowup = false
     @State private var currentTheme: MilestoneCelebrationManager.ColorTheme = MilestoneCelebrationManager.getCurrentTheme()
     @Binding var hasLoadedInitialData: Bool
 
-    enum AppUsageViewMode: String, CaseIterable {
+    enum AppUsageViewMode: String {
         case list = "list"
         case hardDrive = "squares"
-
-        var icon: String {
-            switch self {
-            case .list: return "list.bullet"
-            case .hardDrive: return "square.grid.2x2"
-            }
-        }
     }
 
-    private static let viewModeDefaultsKey = "dashboardAppUsageViewMode"
     private static let pauseMenuWidth: CGFloat = 100
 
-    private static func loadSavedViewMode() -> AppUsageViewMode {
-        guard let raw = UserDefaults.standard.string(forKey: viewModeDefaultsKey),
-              let mode = AppUsageViewMode(rawValue: raw) else {
-            return .list
-        }
-        return mode
-    }
-
-    private func saveViewMode(_ mode: AppUsageViewMode) {
-        UserDefaults.standard.set(mode.rawValue, forKey: Self.viewModeDefaultsKey)
+    private var usageViewMode: AppUsageViewMode {
+        AppUsageViewMode(rawValue: usageViewModeRawValue) ?? .list
     }
 
     // MARK: - Initialization
@@ -552,20 +539,15 @@ public struct DashboardView: View {
 
     private func handleWindowTapped(_ app: AppUsageData, _ window: WindowUsageData) {
         let clickStartTime = CFAbsoluteTimeGetCurrent()
-
-        // Calculate week date range (same as dashboard uses)
-        let calendar = Calendar.current
-        let now = Date()
-        let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
-        let weekEnd = now
+        let selectedRange = viewModel.appUsageQueryRange
 
         // Launch filtered timeline instantly instead of showing sessions dialog
         TimelineWindowController.shared.showWithFilter(
             bundleID: app.appBundleID,
             windowName: window.windowName,
             browserUrl: window.browserUrl,
-            startDate: weekStart,
-            endDate: weekEnd,
+            startDate: selectedRange.start,
+            endDate: selectedRange.end,
             clickStartTime: clickStartTime
         )
     }
@@ -944,18 +926,27 @@ public struct DashboardView: View {
     }
 
     private var statsCards: [StatCardData] {
-        [
+        let selectedRangeLabel = viewModel.appUsageRangeLabel
+        let isDefaultLastSevenDays = viewModel.isDefaultAppUsageRangeSelected
+        let activitySubtitle = isDefaultLastSevenDays ? "Last 7 days" : selectedRangeLabel
+        let daysRecordedTitle = isDefaultLastSevenDays ? "Total Days Recorded" : "Days Recorded"
+        let storageTitle = isDefaultLastSevenDays ? "Total Storage Used" : "Storage Used"
+        let storageValue = formatStorageSize(isDefaultLastSevenDays ? viewModel.totalStorageBytes : viewModel.weeklyStorageBytes)
+        let storageSubtitle = isDefaultLastSevenDays ? formatStoragePerMonth() : selectedRangeLabel
+        let totalDaysValue = isDefaultLastSevenDays ? viewModel.daysRecorded : viewModel.appUsageRangeDaySpan
+
+        return [
             StatCardData(
                 icon: "calendar",
-                title: "Total Days Recorded",
-                value: "\(viewModel.daysRecorded) days",
-                subtitle: formatOldestDateSubtitle(viewModel.oldestRecordedDate)
+                title: daysRecordedTitle,
+                value: "\(totalDaysValue) days",
+                subtitle: selectedRangeLabel
             ),
             StatCardData(
                 icon: "clock.fill",
                 title: "Screen Time",
                 value: formatScreenTimeFromDaily(viewModel.dailyScreenTimeData),
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyScreenTimeData.isEmpty ? nil : viewModel.dailyScreenTimeData,
                 graphColor: .blue,
                 valueFormatter: { milliseconds in
@@ -965,9 +956,9 @@ public struct DashboardView: View {
             ),
             StatCardData(
                 icon: "externaldrive.fill",
-                title: "Total Storage Used",
-                value: formatStorageSize(viewModel.totalStorageBytes),
-                subtitle: formatStoragePerMonth(),
+                title: storageTitle,
+                value: storageValue,
+                subtitle: storageSubtitle,
                 graphData: viewModel.dailyStorageData.isEmpty ? nil : viewModel.dailyStorageData,
                 graphColor: .cyan
             ),
@@ -975,7 +966,7 @@ public struct DashboardView: View {
                 icon: "timelapse",
                 title: "Timeline Opens",
                 value: "\(viewModel.timelineOpensThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyTimelineOpensData.isEmpty ? nil : viewModel.dailyTimelineOpensData,
                 graphColor: .purple
             ),
@@ -983,7 +974,7 @@ public struct DashboardView: View {
                 icon: "magnifyingglass",
                 title: "Searches",
                 value: "\(viewModel.searchesThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailySearchesData.isEmpty ? nil : viewModel.dailySearchesData,
                 graphColor: .orange
             ),
@@ -991,7 +982,7 @@ public struct DashboardView: View {
                 icon: "doc.on.doc",
                 title: "Text Copies",
                 value: "\(viewModel.textCopiesThisWeek)",
-                subtitle: "Last 7 days",
+                subtitle: activitySubtitle,
                 graphData: viewModel.dailyTextCopiesData.isEmpty ? nil : viewModel.dailyTextCopiesData,
                 graphColor: .green
             ),
@@ -1080,22 +1071,13 @@ public struct DashboardView: View {
         let dailyData = viewModel.dailyStorageData
         guard !dailyData.isEmpty else { return "est. 0 GB/month" }
 
-        // NOTE: This estimate uses dailyStorageData, which includes DB growth estimates in addition to chunks.
-        // In practice this can read ~20% higher than a chunks-only monthly projection.
-        // Sum all daily values and extrapolate to 30 days
+        // Estimate based on current loaded daily storage series.
         let totalBytes = dailyData.reduce(0) { $0 + $1.value }
         let daysWithData = dailyData.count
         let bytesPerDay = Double(totalBytes) / Double(daysWithData)
         let bytesPerMonth = bytesPerDay * 30.0
         let gbPerMonth = bytesPerMonth / 1_000_000_000
         return String(format: "est. %.1f GB/month", gbPerMonth)
-    }
-
-    private func formatOldestDateSubtitle(_ date: Date?) -> String {
-        guard let date = date else { return "" }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM yyyy"
-        return "since \(formatter.string(from: date))"
     }
 
     // MARK: - App Usage Section
@@ -1110,7 +1092,7 @@ public struct DashboardView: View {
                 emptyStateView
             } else {
                 VStack(spacing: 0) {
-                    // Header row with view mode toggle
+                    // Header row
                     HStack {
                         Text("App Usage")
                             .font(.retraceHeadline)
@@ -1118,18 +1100,15 @@ public struct DashboardView: View {
 
                         Spacer()
 
-                        Text("\(formatTotalTime(viewModel.weeklyAppUsage.reduce(0) { $0 + $1.duration }))  ·  Last 7 days")
-                            .font(.retraceCaptionMedium)
-                            .foregroundColor(.retraceSecondary)
-
-                        // View mode toggle
-                        viewModeToggle
+                        appUsageRangeControls
                     }
                     .padding(.horizontal, 20)
                     .padding(.vertical, 16)
+                    .zIndex(showAppUsageDatePopover ? 10 : 1)
 
                     Divider()
                         .background(Color.white.opacity(0.06))
+                        .zIndex(showAppUsageDatePopover ? 9 : 0)
 
                     // Content based on view mode
                     switch usageViewMode {
@@ -1148,6 +1127,10 @@ public struct DashboardView: View {
                                 handleWindowTapped(app, window)
                             }
                         )
+                        .id(
+                            "app-usage-list-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                        )
+                        .zIndex(0)
                     case .hardDrive:
                         AppUsageHardDriveView(
                             apps: viewModel.weeklyAppUsage,
@@ -1156,6 +1139,10 @@ public struct DashboardView: View {
                                 handleAppTapped(app)
                             }
                         )
+                        .id(
+                            "app-usage-hard-drive-\(Int(viewModel.appUsageRangeStart.timeIntervalSince1970))-\(Int(viewModel.appUsageRangeEnd.timeIntervalSince1970))"
+                        )
+                        .zIndex(0)
                     }
                 }
                 .background(Color.white.opacity(0.03))
@@ -1289,24 +1276,41 @@ public struct DashboardView: View {
         }
     }
 
-    private var viewModeToggle: some View {
-        HStack(spacing: 4) {
-            ForEach(AppUsageViewMode.allCases, id: \.self) { mode in
-                Button(action: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        usageViewMode = mode
-                    }
-                    saveViewMode(mode)
-                }) {
-                    Image(systemName: mode.icon)
-                        .font(.retraceCaption2Medium)
-                        .foregroundColor(usageViewMode == mode ? .retracePrimary : .retraceSecondary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                        .background(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(usageViewMode == mode ? Color.white.opacity(0.1) : Color.clear)
+    private var appUsageRangeControls: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 0) {
+                rangeShiftButton(
+                    icon: "chevron.left",
+                    position: .leading,
+                    isEnabled: viewModel.canShiftAppUsageRangeBackward
+                ) {
+                    Task {
+                        await viewModel.shiftAppUsageDateRange(
+                            by: -1,
+                            source: "dashboard_app_usage_previous_range"
                         )
+                    }
+                }
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 1, height: 30)
+
+                Button(action: {
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        showAppUsageDatePopover.toggle()
+                    }
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "calendar")
+                            .font(.retraceCaption2Medium)
+                        Text(viewModel.appUsageRangeLabel)
+                            .font(.retraceCaptionMedium)
+                    }
+                    .foregroundColor(.retraceSecondary)
+                    .padding(.horizontal, 12)
+                    .frame(height: 30)
+                    .background(showAppUsageDatePopover ? Color.white.opacity(0.06) : Color.clear)
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering in
@@ -1316,13 +1320,134 @@ public struct DashboardView: View {
                         NSCursor.pop()
                     }
                 }
+                .dropdownOverlay(
+                    isPresented: $showAppUsageDatePopover,
+                    yOffset: 38,
+                    horizontalAnchor: .trailing
+                ) {
+                    DateRangeFilterPopover(
+                        dateRanges: [viewModel.appUsageDateRange],
+                        onApply: { ranges in
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                showAppUsageDatePopover = false
+                            }
+                            guard let selectedRange = ranges.first else { return }
+                            Task {
+                                await viewModel.setAppUsageDateRange(
+                                    from: selectedRange,
+                                    source: "dashboard_app_usage_calendar_apply"
+                                )
+                            }
+                        },
+                        onClear: {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                showAppUsageDatePopover = false
+                            }
+                            Task {
+                                await viewModel.resetAppUsageDateRangeToDefault(
+                                    source: "dashboard_app_usage_calendar_clear"
+                                )
+                            }
+                        },
+                        width: 300,
+                        enableKeyboardNavigation: true,
+                        allowMultipleRanges: false,
+                        maxRangeDays: DashboardViewModel.maxAppUsageRangeDays,
+                        onDismiss: {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                showAppUsageDatePopover = false
+                            }
+                        }
+                    )
+                }
+
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: 1, height: 30)
+
+                rangeShiftButton(
+                    icon: "chevron.right",
+                    position: .trailing,
+                    isEnabled: viewModel.canShiftAppUsageRangeForward
+                ) {
+                    Task {
+                        await viewModel.shiftAppUsageDateRange(
+                            by: 1,
+                            source: "dashboard_app_usage_next_range"
+                        )
+                    }
+                }
+            }
+            .background(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 8,
+                    bottomLeadingRadius: 8,
+                    bottomTrailingRadius: 8,
+                    topTrailingRadius: 8
+                )
+                .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 8,
+                    bottomLeadingRadius: 8,
+                    bottomTrailingRadius: 8,
+                    topTrailingRadius: 8
+                )
+                .stroke(Color.white.opacity(showAppUsageDatePopover ? 0.22 : 0.1), lineWidth: 1)
+            )
+        }
+    }
+
+    private enum RangeShiftButtonPosition {
+        case leading
+        case trailing
+    }
+
+    private func rangeShiftButton(
+        icon: String,
+        position: RangeShiftButtonPosition,
+        isEnabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(.retraceSecondary.opacity(isEnabled ? 0.9 : 0.35))
+                .frame(width: 30, height: 30)
+                .background(
+                    Group {
+                        if position == .leading {
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 8,
+                                bottomLeadingRadius: 8,
+                                bottomTrailingRadius: 0,
+                                topTrailingRadius: 0
+                            )
+                            .fill(Color.white.opacity(isEnabled ? 0.03 : 0.01))
+                        } else {
+                            UnevenRoundedRectangle(
+                                topLeadingRadius: 0,
+                                bottomLeadingRadius: 0,
+                                bottomTrailingRadius: 8,
+                                topTrailingRadius: 8
+                            )
+                            .fill(Color.white.opacity(isEnabled ? 0.03 : 0.01))
+                        }
+                    }
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+        .onHover { hovering in
+            guard isEnabled else { return }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
             }
         }
-        .padding(4)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.05))
-        )
     }
 
     private var loadingStateView: some View {

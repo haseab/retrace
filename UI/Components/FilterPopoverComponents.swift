@@ -1798,21 +1798,42 @@ public struct CommentFilterPopover: View {
 /// A view modifier that displays content as a dropdown overlay above or below the modified view.
 /// Opens instantly without NSPopover window creation overhead.
 public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
+    public enum HorizontalAnchor {
+        case leading
+        case trailing
+    }
+
     @Binding var isPresented: Bool
     let yOffset: CGFloat
     let opensUpward: Bool
+    let horizontalAnchor: HorizontalAnchor
     let dropdownContent: () -> DropdownContent
 
     public init(
         isPresented: Binding<Bool>,
         yOffset: CGFloat = 44,
         opensUpward: Bool = false,
+        horizontalAnchor: HorizontalAnchor = .leading,
         @ViewBuilder dropdownContent: @escaping () -> DropdownContent
     ) {
         self._isPresented = isPresented
         self.yOffset = yOffset
         self.opensUpward = opensUpward
+        self.horizontalAnchor = horizontalAnchor
         self.dropdownContent = dropdownContent
+    }
+
+    private var overlayAlignment: Alignment {
+        switch (opensUpward, horizontalAnchor) {
+        case (false, .leading):
+            return .topLeading
+        case (false, .trailing):
+            return .topTrailing
+        case (true, .leading):
+            return .bottomLeading
+        case (true, .trailing):
+            return .bottomTrailing
+        }
     }
 
     public func body(content: Content) -> some View {
@@ -1822,7 +1843,7 @@ public struct DropdownOverlayModifier<DropdownContent: View>: ViewModifier {
                 }.onChange(of: isPresented) { _ in
                 }
             })
-            .overlay(alignment: opensUpward ? .bottomLeading : .topLeading) {
+            .overlay(alignment: overlayAlignment) {
                 if isPresented {
                     // Wrap content in a background container to ensure solid background
                     ZStack {
@@ -1859,21 +1880,32 @@ public extension View {
         isPresented: Binding<Bool>,
         yOffset: CGFloat = 44,
         opensUpward: Bool = false,
+        horizontalAnchor: DropdownOverlayModifier<Content>.HorizontalAnchor = .leading,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        modifier(DropdownOverlayModifier(isPresented: isPresented, yOffset: yOffset, opensUpward: opensUpward, dropdownContent: content))
+        modifier(
+            DropdownOverlayModifier(
+                isPresented: isPresented,
+                yOffset: yOffset,
+                opensUpward: opensUpward,
+                horizontalAnchor: horizontalAnchor,
+                dropdownContent: content
+            )
+        )
     }
 }
 
 // MARK: - Date Range Filter Popover
 
-/// Popover for selecting up to five date ranges with natural-language input and calendar support.
+/// Popover for selecting one or more date ranges with natural-language input and calendar support.
 public struct DateRangeFilterPopover: View {
     let dateRanges: [DateRangeCriterion]
     let onApply: ([DateRangeCriterion]) -> Void
     let onClear: () -> Void
     let width: CGFloat
     let enableKeyboardNavigation: Bool
+    let allowMultipleRanges: Bool
+    let maxRangeDays: Int?
     let onMoveToNextFilter: (() -> Void)?
     let onCalendarEditingChange: ((Bool) -> Void)?
     var onDismiss: (() -> Void)?
@@ -1920,6 +1952,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private var canAddAnotherRange: Bool {
+        guard allowMultipleRanges else { return false }
         let additionalCommittedCount = additionalParsedRanges.compactMap { range in
             range?.hasBounds == true ? range : nil
         }.count
@@ -1944,15 +1977,20 @@ public struct DateRangeFilterPopover: View {
         onClear: @escaping () -> Void,
         width: CGFloat = 300,
         enableKeyboardNavigation: Bool = false,
+        allowMultipleRanges: Bool = true,
+        maxRangeDays: Int? = nil,
         onMoveToNextFilter: (() -> Void)? = nil,
         onCalendarEditingChange: ((Bool) -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) {
-        self.dateRanges = Array(dateRanges.filter(\.hasBounds).prefix(5))
+        let maxRangeCount = allowMultipleRanges ? 5 : 1
+        self.dateRanges = Array(dateRanges.filter(\.hasBounds).prefix(maxRangeCount))
         self.onApply = onApply
         self.onClear = onClear
         self.width = width
         self.enableKeyboardNavigation = enableKeyboardNavigation
+        self.allowMultipleRanges = allowMultipleRanges
+        self.maxRangeDays = maxRangeDays.map { max(1, $0) }
         self.onMoveToNextFilter = onMoveToNextFilter
         self.onCalendarEditingChange = onCalendarEditingChange
         self.onDismiss = onDismiss
@@ -2070,86 +2108,88 @@ public struct DateRangeFilterPopover: View {
                         .padding(.horizontal, 2)
                 }
 
-                ForEach(additionalRangeIDs, id: \.self) { rangeID in
-                    HStack(spacing: 8) {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white.opacity(0.3))
+                if allowMultipleRanges {
+                    ForEach(additionalRangeIDs, id: \.self) { rangeID in
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(.white.opacity(0.3))
 
-                        TextField(
-                            additionalRangePlaceholder(for: rangeID),
-                            text: additionalRangeBinding(for: rangeID)
-                        )
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundColor(.white)
-                        .focused($focusedAdditionalRangeID, equals: rangeID)
-                        .modifier(FocusEffectDisabledModifier())
-                        .onSubmit {
-                            applyAdditionalRangeInput(for: rangeID)
-                        }
-
-                        Button(action: {
-                            removeAdditionalRange(id: rangeID)
-                        }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white.opacity(0.35))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.white.opacity(0.06))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .stroke(
-                                focusedAdditionalRangeID == rangeID ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
-                                lineWidth: 1
+                            TextField(
+                                additionalRangePlaceholder(for: rangeID),
+                                text: additionalRangeBinding(for: rangeID)
                             )
-                    )
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        isRangeInputFocused = false
-                        focusedAdditionalRangeID = rangeID
-                    }
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12, weight: .regular))
+                            .foregroundColor(.white)
+                            .focused($focusedAdditionalRangeID, equals: rangeID)
+                            .modifier(FocusEffectDisabledModifier())
+                            .onSubmit {
+                                applyAdditionalRangeInput(for: rangeID)
+                            }
 
-                    if let additionalError = additionalParseErrorMessage(for: rangeID) {
-                        Text(additionalError)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(.orange.opacity(0.9))
-                            .padding(.horizontal, 2)
-                    }
-                }
-
-                if canAddAnotherRange {
-                    Button(action: {
-                        addAdditionalRangeInput()
-                    }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus.circle")
-                                .font(.system(size: 11, weight: .semibold))
-                            Text("Add another date range")
-                                .font(.system(size: 11, weight: .semibold))
+                            Button(action: {
+                                removeAdditionalRange(id: rangeID)
+                            }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.35))
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .foregroundColor(.white.opacity(0.78))
                         .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        .padding(.vertical, 8)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
-                                .fill(Color.white.opacity(0.09))
+                                .fill(Color.white.opacity(0.06))
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                                .stroke(
+                                    focusedAdditionalRangeID == rangeID ? RetraceMenuStyle.filterStrokeMedium : Color.clear,
+                                    lineWidth: 1
+                                )
                         )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            isRangeInputFocused = false
+                            focusedAdditionalRangeID = rangeID
+                        }
+
+                        if let additionalError = additionalParseErrorMessage(for: rangeID) {
+                            Text(additionalError)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(.orange.opacity(0.9))
+                                .padding(.horizontal, 2)
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .onHover { hovering in
-                        if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+
+                    if canAddAnotherRange {
+                        Button(action: {
+                            addAdditionalRangeInput()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "plus.circle")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text("Add another date range")
+                                    .font(.system(size: 11, weight: .semibold))
+                            }
+                            .foregroundColor(.white.opacity(0.78))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(Color.white.opacity(0.09))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { hovering in
+                            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                        }
                     }
                 }
             }
@@ -2429,17 +2469,15 @@ public struct DateRangeFilterPopover: View {
     private func configureInitialState() {
         let now = Date()
         let fallbackStart = calendar.date(byAdding: .day, value: -7, to: now) ?? now
-        let normalizedRanges = Array(dateRanges.filter(\.hasBounds).prefix(5))
+        let maxRangeCount = allowMultipleRanges ? 5 : 1
+        let normalizedRanges = Array(dateRanges.filter(\.hasBounds).prefix(maxRangeCount))
         let primaryRange = normalizedRanges.first
         let primaryStart = primaryRange?.start ?? primaryRange?.end ?? fallbackStart
         let primaryEnd = primaryRange?.end ?? primaryRange?.start ?? now
 
-        localStartDate = calendar.startOfDay(for: primaryStart)
-        localEndDate = calendar.startOfDay(for: primaryEnd)
-
-        if localEndDate < localStartDate {
-            swap(&localStartDate, &localEndDate)
-        }
+        let normalizedPrimary = normalizeRange(primaryStart, primaryEnd)
+        localStartDate = normalizedPrimary.start
+        localEndDate = normalizedPrimary.end
 
         displayedMonth = localEndDate
         activeCalendarBoundary = .start
@@ -2454,7 +2492,7 @@ public struct DateRangeFilterPopover: View {
             hasCommittedPrimaryRange = false
         }
 
-        let extras = normalizedRanges.dropFirst()
+        let extras = allowMultipleRanges ? normalizedRanges.dropFirst() : []
         additionalRangeInputTexts = extras.map { formatRangeInputText(for: $0) }
         additionalRangeIDs = extras.map { _ in UUID() }
         additionalParseErrors = Array(repeating: nil, count: extras.count)
@@ -2555,10 +2593,21 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func applyCalendarSelectionToActiveTarget(applyImmediately: Bool, moveToNextDropdown: Bool = false) {
-        let startDay = calendar.startOfDay(for: localStartDate)
-        let endDay = calendar.startOfDay(for: localEndDate)
-        localStartDate = min(startDay, endDay)
-        localEndDate = max(startDay, endDay)
+        let normalizedRange = normalizeRange(localStartDate, localEndDate)
+        localStartDate = normalizedRange.start
+        localEndDate = normalizedRange.end
+        if let validationError = rangeValidationError(start: localStartDate, end: localEndDate) {
+            switch resolvedCalendarTarget(activeCalendarTarget) {
+            case .primary:
+                parseError = validationError
+            case .additional(let id):
+                if let index = additionalRangeIndex(for: id),
+                   additionalParseErrors.indices.contains(index) {
+                    additionalParseErrors[index] = validationError
+                }
+            }
+            return
+        }
         let formatted = formatRangeInput(start: localStartDate, end: localEndDate)
 
         switch resolvedCalendarTarget(activeCalendarTarget) {
@@ -2622,6 +2671,10 @@ public struct DateRangeFilterPopover: View {
             parseError = "Couldn’t parse that date range."
             return false
         }
+        if let validationError = rangeValidationError(start: parsedRange.start, end: parsedRange.end) {
+            parseError = validationError
+            return false
+        }
 
         localStartDate = parsedRange.start
         localEndDate = parsedRange.end
@@ -2649,6 +2702,13 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func applyCustomRange(moveToNextDropdown: Bool = false) {
+        let normalizedRange = normalizeRange(localStartDate, localEndDate)
+        localStartDate = normalizedRange.start
+        localEndDate = normalizedRange.end
+        if let validationError = rangeValidationError(start: localStartDate, end: localEndDate) {
+            parseError = validationError
+            return
+        }
         let start = calendar.startOfDay(for: localStartDate)
 
         // Set end date to 23:59:59.999 to include the entire day
@@ -2663,6 +2723,7 @@ public struct DateRangeFilterPopover: View {
 
     private func applyPreset(_ preset: DatePreset) {
         let now = Date()
+        let today = calendar.startOfDay(for: now)
         switch preset {
         case .anytime:
             rangeInputText = ""
@@ -2676,7 +2737,6 @@ public struct DateRangeFilterPopover: View {
             onClear()
 
         case .today:
-            let today = calendar.startOfDay(for: now)
             localStartDate = today
             localEndDate = today
             rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
@@ -2684,18 +2744,20 @@ public struct DateRangeFilterPopover: View {
             applyCustomRange()
 
         case .lastWeek:
-            if let weekAgo = calendar.date(byAdding: .day, value: -7, to: now) {
-                localStartDate = calendar.startOfDay(for: weekAgo)
-                localEndDate = calendar.startOfDay(for: now)
+            // Exactly 7 inclusive days: today + previous 6 days.
+            if let weekStart = calendar.date(byAdding: .day, value: -6, to: today) {
+                localStartDate = weekStart
+                localEndDate = today
                 rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
                 parseError = nil
                 applyCustomRange()
             }
 
         case .lastMonth:
-            if let monthAgo = calendar.date(byAdding: .month, value: -1, to: now) {
-                localStartDate = calendar.startOfDay(for: monthAgo)
-                localEndDate = calendar.startOfDay(for: now)
+            // Exactly 30 inclusive days: today + previous 29 days.
+            if let monthStart = calendar.date(byAdding: .day, value: -29, to: today) {
+                localStartDate = monthStart
+                localEndDate = today
                 rangeInputText = formatRangeInput(start: localStartDate, end: localEndDate)
                 parseError = nil
                 applyCustomRange()
@@ -2704,6 +2766,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func addAdditionalRangeInput() {
+        guard allowMultipleRanges else { return }
         guard additionalRangeInputTexts.count < 4 else { return }
         let newID = UUID()
         additionalRangeInputTexts.append("")
@@ -2718,6 +2781,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func removeAdditionalRange(id: UUID) {
+        guard allowMultipleRanges else { return }
         guard let index = additionalRangeIndex(for: id),
               additionalRangeInputTexts.indices.contains(index),
               additionalParseErrors.indices.contains(index),
@@ -2737,6 +2801,7 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func applyAdditionalRangeInput(for id: UUID) {
+        guard allowMultipleRanges else { return }
         guard let index = additionalRangeIndex(for: id),
               additionalRangeInputTexts.indices.contains(index),
               additionalParseErrors.indices.contains(index),
@@ -2756,6 +2821,10 @@ public struct DateRangeFilterPopover: View {
             additionalParseErrors[index] = "Couldn’t parse that date range."
             return
         }
+        if let validationError = rangeValidationError(start: parsedRange.start, end: parsedRange.end) {
+            additionalParseErrors[index] = validationError
+            return
+        }
 
         let normalizedRange = normalizedFilterRange(start: parsedRange.start, end: parsedRange.end)
         additionalParsedRanges[index] = normalizedRange
@@ -2772,6 +2841,12 @@ public struct DateRangeFilterPopover: View {
         var collected: [DateRangeCriterion] = []
 
         if let primaryOverride {
+            if let start = primaryOverride.start,
+               let end = primaryOverride.end,
+               let validationError = rangeValidationError(start: start, end: end) {
+                parseError = validationError
+                return
+            }
             collected.append(primaryOverride)
             hasCommittedPrimaryRange = true
             if let start = primaryOverride.start, let end = primaryOverride.end {
@@ -2785,6 +2860,10 @@ public struct DateRangeFilterPopover: View {
                     parseError = "Couldn’t parse that date range."
                     return
                 }
+                if let validationError = rangeValidationError(start: parsedRange.start, end: parsedRange.end) {
+                    parseError = validationError
+                    return
+                }
                 rangeInputText = formatRangeInput(start: parsedRange.start, end: parsedRange.end)
                 parseError = nil
                 hasCommittedPrimaryRange = true
@@ -2795,34 +2874,41 @@ public struct DateRangeFilterPopover: View {
             }
         }
 
-        for index in additionalRangeInputTexts.indices {
-            guard additionalParseErrors.indices.contains(index),
-                  additionalParsedRanges.indices.contains(index) else {
-                continue
-            }
+        if allowMultipleRanges {
+            for index in additionalRangeInputTexts.indices {
+                guard additionalParseErrors.indices.contains(index),
+                      additionalParsedRanges.indices.contains(index) else {
+                    continue
+                }
 
-            let trimmed = additionalRangeInputTexts[index].trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                additionalParsedRanges[index] = nil
-                additionalParseErrors[index] = nil
-                continue
-            }
+                let trimmed = additionalRangeInputTexts[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty {
+                    additionalParsedRanges[index] = nil
+                    additionalParseErrors[index] = nil
+                    continue
+                }
 
-            if let parsedRange = parseDateRangeInput(trimmed) {
-                let normalizedRange = normalizedFilterRange(start: parsedRange.start, end: parsedRange.end)
-                additionalParsedRanges[index] = normalizedRange
-                additionalParseErrors[index] = nil
-                additionalRangeInputTexts[index] = formatRangeInput(start: parsedRange.start, end: parsedRange.end)
-                collected.append(normalizedRange)
-            } else if let parsed = additionalParsedRanges[index], parsed.hasBounds {
-                collected.append(parsed)
-            } else {
-                additionalParseErrors[index] = "Couldn’t parse that date range."
-                return
+                if let parsedRange = parseDateRangeInput(trimmed) {
+                    if let validationError = rangeValidationError(start: parsedRange.start, end: parsedRange.end) {
+                        additionalParseErrors[index] = validationError
+                        return
+                    }
+                    let normalizedRange = normalizedFilterRange(start: parsedRange.start, end: parsedRange.end)
+                    additionalParsedRanges[index] = normalizedRange
+                    additionalParseErrors[index] = nil
+                    additionalRangeInputTexts[index] = formatRangeInput(start: parsedRange.start, end: parsedRange.end)
+                    collected.append(normalizedRange)
+                } else if let parsed = additionalParsedRanges[index], parsed.hasBounds {
+                    collected.append(parsed)
+                } else {
+                    additionalParseErrors[index] = "Couldn’t parse that date range."
+                    return
+                }
             }
         }
 
-        let limited = Array(collected.prefix(5))
+        let maxRangeCount = allowMultipleRanges ? 5 : 1
+        let limited = Array(collected.prefix(maxRangeCount))
         if limited.isEmpty {
             onClear()
         } else {
@@ -3227,9 +3313,21 @@ public struct DateRangeFilterPopover: View {
     }
 
     private func normalizeRange(_ start: Date, _ end: Date) -> (start: Date, end: Date) {
-        let startDay = calendar.startOfDay(for: start)
-        let endDay = calendar.startOfDay(for: end)
-        return startDay <= endDay ? (startDay, endDay) : (endDay, startDay)
+        var startDay = calendar.startOfDay(for: start)
+        var endDay = calendar.startOfDay(for: end)
+        if endDay < startDay {
+            swap(&startDay, &endDay)
+        }
+
+        return (startDay, endDay)
+    }
+
+    private func rangeValidationError(start: Date, end: Date) -> String? {
+        guard let maxRangeDays else { return nil }
+        let normalized = normalizeRange(start, end)
+        let daySpan = (calendar.dateComponents([.day], from: normalized.start, to: normalized.end).day ?? 0) + 1
+        guard daySpan > maxRangeDays else { return nil }
+        return "Date range must be \(maxRangeDays) days or less."
     }
 
     // MARK: - Keyboard Navigation

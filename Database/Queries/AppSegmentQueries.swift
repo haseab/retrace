@@ -528,6 +528,12 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
+        let traceID = String(UUID().uuidString.prefix(8))
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
+        Log.debug(
+            "[DASHBOARD-SQL][\(traceID)] getAppUsageStats START range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))]",
+            category: .database
+        )
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
         // Browser bundle IDs as SQL list for CASE expression
@@ -594,15 +600,30 @@ enum AppSegmentQueries {
             GROUP BY fg.prev_bundleID
             """
 
+        let prepareStartedAt = CFAbsoluteTimeGetCurrent()
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getAppUsageStats PREPARE FAIL after \(String(format: "%.1f", elapsedMs))ms",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
+        let prepareElapsedMs = (CFAbsoluteTimeGetCurrent() - prepareStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.prepare_ms",
+            valueMs: prepareElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 150,
+            criticalThresholdMs: 600
+        )
 
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
@@ -611,18 +632,64 @@ enum AppSegmentQueries {
         sqlite3_bind_int64(statement, 5, maxGapMs)
         sqlite3_bind_int64(statement, 6, maxGapMs)
 
+        let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var totalDurationMs: Int64 = 0
+        var stepResult = sqlite3_step(statement)
+        while stepResult == SQLITE_ROW {
             let bundleID = String(cString: sqlite3_column_text(statement, 0))
             let durationMs = sqlite3_column_int64(statement, 1)
             let uniqueCount = Int(sqlite3_column_int(statement, 2))
+            totalDurationMs += durationMs
 
             results.append((
                 bundleID: bundleID,
                 duration: TimeInterval(durationMs) / 1000.0,
                 uniqueItemCount: uniqueCount
             ))
+
+            stepResult = sqlite3_step(statement)
         }
+
+        guard stepResult == SQLITE_DONE else {
+            let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+            let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getAppUsageStats EXECUTE FAIL rows=\(results.count) stepCode=\(stepResult) execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms",
+                category: .database
+            )
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.execute_ms",
+            valueMs: executeElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 800,
+            criticalThresholdMs: 2500
+        )
+
+        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_app_usage_stats.total_ms",
+            valueMs: totalElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 800,
+            criticalThresholdMs: 2500
+        )
+        let completionMessage = "[DASHBOARD-SQL][\(traceID)] getAppUsageStats END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
+        if totalElapsedMs >= 2500 {
+            Log.warning(completionMessage, category: .database)
+        } else {
+            Log.info(completionMessage, category: .database)
+        }
+
         return results
     }
 
@@ -1139,6 +1206,12 @@ enum AppSegmentQueries {
         from startDate: Date,
         to endDate: Date
     ) throws -> [(date: Date, value: Int64)] {
+        let traceID = String(UUID().uuidString.prefix(8))
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
+        Log.debug(
+            "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime START range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))]",
+            category: .database
+        )
         let maxGapMs: Int64 = 120_000  // 2 minutes - gaps larger than this are considered idle
 
         // Calculate screen time from frame gaps, grouped by local day
@@ -1164,29 +1237,90 @@ enum AppSegmentQueries {
             ORDER BY local_day ASC
             """
 
+        let prepareStartedAt = CFAbsoluteTimeGetCurrent()
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime PREPARE FAIL after \(String(format: "%.1f", elapsedMs))ms",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
+        let prepareElapsedMs = (CFAbsoluteTimeGetCurrent() - prepareStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.prepare_ms",
+            valueMs: prepareElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 150,
+            criticalThresholdMs: 600
+        )
 
         sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(startDate))
         sqlite3_bind_int64(statement, 2, Schema.dateToTimestamp(endDate))
         sqlite3_bind_int64(statement, 3, maxGapMs)
         sqlite3_bind_int64(statement, 4, maxGapMs)
 
+        let executeStartedAt = CFAbsoluteTimeGetCurrent()
         var results: [(date: Date, value: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        var totalDurationMs: Int64 = 0
+        var stepResult = sqlite3_step(statement)
+        while stepResult == SQLITE_ROW {
             guard let localDay = parseLocalDay(sqlite3_column_text(statement, 0)) else {
+                stepResult = sqlite3_step(statement)
                 continue
             }
             let durationMs = sqlite3_column_int64(statement, 1)
+            totalDurationMs += durationMs
             // Return raw milliseconds - conversion happens in UI layer to preserve precision
             results.append((date: localDay, value: durationMs))
+
+            stepResult = sqlite3_step(statement)
+        }
+
+        guard stepResult == SQLITE_DONE else {
+            let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+            let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+            Log.error(
+                "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime EXECUTE FAIL rows=\(results.count) stepCode=\(stepResult) execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms",
+                category: .database
+            )
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let executeElapsedMs = (CFAbsoluteTimeGetCurrent() - executeStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.execute_ms",
+            valueMs: executeElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
+
+        let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.sql.get_daily_screen_time.total_ms",
+            valueMs: totalElapsedMs,
+            category: .database,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
+        let completionMessage = "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
+        if totalElapsedMs >= 5000 {
+            Log.warning(completionMessage, category: .database)
+        } else {
+            Log.info(completionMessage, category: .database)
         }
 
         return results

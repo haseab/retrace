@@ -80,6 +80,10 @@ public class DashboardViewModel: ObservableObject {
     @Published public var totalWeeklyTime: TimeInterval = 0
     @Published public var totalDailyTime: TimeInterval = 0
     @Published public var weekDateRange: String = ""
+    @Published public var appUsageRangeStart: Date
+    @Published public var appUsageRangeEnd: Date
+    @Published public var appUsageRangeLabel: String = ""
+    @Published public var appUsageRangeErrorText: String?
 
     // Overall statistics
     @Published public var totalStorageBytes: Int64 = 0
@@ -92,7 +96,7 @@ public class DashboardViewModel: ObservableObject {
     @Published public var searchesThisWeek: Int64 = 0
     @Published public var textCopiesThisWeek: Int64 = 0
 
-    // Daily graph data (7 days, Monday through Sunday)
+    // Daily graph data for the currently selected dashboard range
     @Published public var dailyScreenTimeData: [DailyDataPoint] = []
     @Published public var dailyStorageData: [DailyDataPoint] = []
     @Published public var dailyTimelineOpensData: [DailyDataPoint] = []
@@ -150,6 +154,15 @@ public class DashboardViewModel: ObservableObject {
     private var lastTrackedWALFailureBannerFileName: String?
     private var lastTrackedStorageHealthBannerSignature: String?
     private var isAutoRefreshInFlight = false
+    private var dashboardLoadTraceID: UInt64 = 0
+    private static let defaultAppUsageRangeDays = 7
+    public nonisolated static let maxAppUsageRangeDays = 31
+    private static let dashboardPerfDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
 
     /// Whether the dashboard window is currently visible
     /// Set by DashboardWindowController on show/hide to gate UI updates
@@ -158,7 +171,12 @@ public class DashboardViewModel: ObservableObject {
     // MARK: - Initialization
 
     public init(coordinator: AppCoordinator) {
+        let defaultRange = Self.defaultAppUsageDateRange()
         self.coordinator = coordinator
+        self.appUsageRangeStart = defaultRange.start
+        self.appUsageRangeEnd = defaultRange.end
+        self.appUsageRangeLabel = Self.formatAppUsageRangeLabel(start: defaultRange.start, end: defaultRange.end)
+        self.weekDateRange = self.appUsageRangeLabel
         setupAutoRefresh()
         setupDataSourceObserver()
         setupStorageHealthObserver()
@@ -1012,60 +1030,334 @@ public class DashboardViewModel: ObservableObject {
 
     // MARK: - Data Loading
 
-    public func loadStatistics() async {
-        isLoading = true
-        error = nil
+    private static func defaultAppUsageDateRange(
+        calendar: Calendar = .current,
+        now: Date = Date()
+    ) -> (start: Date, end: Date) {
+        let today = calendar.startOfDay(for: now)
+        let offset = -(defaultAppUsageRangeDays - 1)
+        let start = calendar.date(byAdding: .day, value: offset, to: today) ?? today
+        return (start: start, end: today)
+    }
+    private static func normalizedUnboundedAppUsageDateRange(
+        start: Date,
+        end: Date,
+        calendar: Calendar = .current,
+        now: Date = Date()
+    ) -> (start: Date, end: Date) {
+        let today = calendar.startOfDay(for: now)
+        var startDay = calendar.startOfDay(for: start)
+        var endDay = calendar.startOfDay(for: end)
 
-        // Update recording status
-        updateRecordingStatus()
-        updatePauseStatus()
-        await refreshRecentCrashReportState()
-        await refreshRecentWALFailureCrashState()
+        if endDay < startDay {
+            swap(&startDay, &endDay)
+        }
+
+        if startDay > today {
+            startDay = today
+        }
+        if endDay > today {
+            endDay = today
+        }
+        if endDay < startDay {
+            startDay = endDay
+        }
+
+        return (start: startDay, end: endDay)
+    }
+
+    static func normalizedAppUsageDateRange(
+        start: Date,
+        end: Date,
+        maxDays: Int = DashboardViewModel.maxAppUsageRangeDays,
+        calendar: Calendar = .current,
+        now: Date = Date()
+    ) -> (start: Date, end: Date) {
+        let unbounded = normalizedUnboundedAppUsageDateRange(
+            start: start,
+            end: end,
+            calendar: calendar,
+            now: now
+        )
+        let startDay = unbounded.start
+        var endDay = unbounded.end
+
+        let boundedMaxDays = max(1, maxDays)
+        let maxOffset = boundedMaxDays - 1
+        if let maxEnd = calendar.date(byAdding: .day, value: maxOffset, to: startDay),
+           endDay > maxEnd {
+            endDay = maxEnd
+        }
+
+        return (start: startDay, end: endDay)
+    }
+
+    public var appUsageDateRange: DateRangeCriterion {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: appUsageRangeStart)
+        let endDay = calendar.startOfDay(for: appUsageRangeEnd)
+        let end = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDay) ?? endDay
+        return DateRangeCriterion(start: start, end: end)
+    }
+
+    public var appUsageRangeDaySpan: Int {
+        let calendar = Calendar.current
+        let startDay = calendar.startOfDay(for: appUsageRangeStart)
+        let endDay = calendar.startOfDay(for: appUsageRangeEnd)
+        let rawSpan = (calendar.dateComponents([.day], from: startDay, to: endDay).day ?? 0) + 1
+        return max(1, rawSpan)
+    }
+
+    public var isDefaultAppUsageRangeSelected: Bool {
+        let calendar = Calendar.current
+        let defaultRange = Self.defaultAppUsageDateRange(calendar: calendar, now: Date())
+        return calendar.isDate(appUsageRangeStart, inSameDayAs: defaultRange.start)
+            && calendar.isDate(appUsageRangeEnd, inSameDayAs: defaultRange.end)
+    }
+
+    public var canShiftAppUsageRangeBackward: Bool {
+        true
+    }
+
+    public var canShiftAppUsageRangeForward: Bool {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let spanDays = appUsageRangeDaySpan
+        guard let shiftedEnd = calendar.date(byAdding: .day, value: spanDays, to: appUsageRangeEnd) else {
+            return false
+        }
+        return calendar.startOfDay(for: shiftedEnd) <= today
+    }
+
+    public var appUsageQueryRange: (start: Date, end: Date) {
+        resolvedAppUsageQueryRange()
+    }
+
+    public func setAppUsageDateRange(
+        from range: DateRangeCriterion,
+        source: String = "dashboard_app_usage_calendar"
+    ) async {
+        guard range.hasBounds else {
+            await resetAppUsageDateRangeToDefault(source: source)
+            return
+        }
+
+        guard let start = range.start ?? range.end,
+              let end = range.end ?? range.start else {
+            return
+        }
+
+        let requestedRange = Self.normalizedUnboundedAppUsageDateRange(start: start, end: end)
+        let calendar = Calendar.current
+        let requestedDays = max(
+            1,
+            (calendar.dateComponents([.day], from: requestedRange.start, to: requestedRange.end).day ?? 0) + 1
+        )
+        guard requestedDays <= Self.maxAppUsageRangeDays else {
+            appUsageRangeErrorText = "Date range must be 31 days or less."
+            recordAppUsageDateRangeAction(
+                action: "range_too_large",
+                source: source,
+                start: requestedRange.start,
+                end: requestedRange.end,
+                rangeDays: requestedDays
+            )
+            return
+        }
+
+        await applyAppUsageDateRange(
+            start: requestedRange.start,
+            end: requestedRange.end,
+            source: source,
+            action: "set_range",
+            shouldRecordMetric: true
+        )
+    }
+
+    public func resetAppUsageDateRangeToDefault(
+        source: String = "dashboard_app_usage_default"
+    ) async {
+        let defaultRange = Self.defaultAppUsageDateRange()
+        await applyAppUsageDateRange(
+            start: defaultRange.start,
+            end: defaultRange.end,
+            source: source,
+            action: "reset_default",
+            shouldRecordMetric: true
+        )
+    }
+
+    public func shiftAppUsageDateRange(
+        by direction: Int,
+        source: String
+    ) async {
+        guard direction == -1 || direction == 1 else { return }
+
+        let calendar = Calendar.current
+        let spanDays = appUsageRangeDaySpan
+        guard let shiftedStart = calendar.date(byAdding: .day, value: direction * spanDays, to: appUsageRangeStart),
+              let shiftedEnd = calendar.date(byAdding: .day, value: direction * spanDays, to: appUsageRangeEnd) else {
+            return
+        }
+
+        await applyAppUsageDateRange(
+            start: shiftedStart,
+            end: shiftedEnd,
+            source: source,
+            action: direction < 0 ? "shift_previous" : "shift_next",
+            shouldRecordMetric: true
+        )
+    }
+
+    private func applyAppUsageDateRange(
+        start: Date,
+        end: Date,
+        source: String,
+        action: String,
+        shouldRecordMetric: Bool
+    ) async {
+        let applyStartedAt = CFAbsoluteTimeGetCurrent()
+        let normalized = Self.normalizedAppUsageDateRange(start: start, end: end)
+        let calendar = Calendar.current
+        let startChanged = !calendar.isDate(normalized.start, inSameDayAs: appUsageRangeStart)
+        let endChanged = !calendar.isDate(normalized.end, inSameDayAs: appUsageRangeEnd)
+        let normalizedRangeLabel = dashboardPerfRangeLabel(start: normalized.start, end: normalized.end)
+
+        Log.info(
+            "[DASHBOARD-RANGE] APPLY action='\(action)' source='\(source)' requested=\(dashboardPerfRangeLabel(start: start, end: end)) normalized=\(normalizedRangeLabel)",
+            category: .ui
+        )
+
+        appUsageRangeStart = normalized.start
+        appUsageRangeEnd = normalized.end
+        appUsageRangeLabel = Self.formatAppUsageRangeLabel(start: normalized.start, end: normalized.end)
+        weekDateRange = appUsageRangeLabel
+        appUsageRangeErrorText = nil
+
+        guard startChanged || endChanged else {
+            Log.debug(
+                "[DASHBOARD-RANGE] SKIP action='\(action)' source='\(source)' (range unchanged)",
+                category: .ui
+            )
+            return
+        }
+
+        if shouldRecordMetric {
+            recordAppUsageDateRangeAction(
+                action: action,
+                source: source,
+                start: normalized.start,
+                end: normalized.end
+            )
+        }
+
+        await loadStatistics(reason: "range_\(action):\(source)")
+
+        let applyElapsedMs = elapsedMs(since: applyStartedAt)
+        Log.recordLatency(
+            "dashboard.range.apply_ms",
+            valueMs: applyElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 1500,
+            criticalThresholdMs: 5000
+        )
+        let applyMessage = "[DASHBOARD-RANGE] COMPLETE action='\(action)' source='\(source)' spanDays=\(appUsageRangeDaySpan) range=\(normalizedRangeLabel) elapsed=\(formattedMs(applyElapsedMs))ms"
+        if applyElapsedMs >= 5000 {
+            Log.warning(applyMessage, category: .ui)
+        } else {
+            Log.info(applyMessage, category: .ui)
+        }
+    }
+
+    private func resolvedAppUsageQueryRange(now: Date = Date()) -> (start: Date, end: Date) {
+        let calendar = Calendar.current
+        let startDay = calendar.startOfDay(for: appUsageRangeStart)
+        let endDay = calendar.startOfDay(for: appUsageRangeEnd)
+        let endOfDay = calendar.date(bySettingHour: 23, minute: 59, second: 59, of: endDay) ?? endDay
+        let queryEnd = min(endOfDay, now)
+        return (start: startDay, end: max(startDay, queryEnd))
+    }
+
+    private static func formatAppUsageRangeLabel(
+        start: Date,
+        end: Date,
+        calendar: Calendar = .current
+    ) -> String {
+        let startDay = calendar.startOfDay(for: start)
+        let endDay = calendar.startOfDay(for: end)
+        let sameDay = calendar.isDate(startDay, inSameDayAs: endDay)
+        let sameYear = calendar.isDate(startDay, equalTo: endDay, toGranularity: .year)
+        let currentYear = calendar.component(.year, from: Date())
+        let includeYear = !sameYear || calendar.component(.year, from: startDay) != currentYear
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = includeYear ? "MMM d, yyyy" : "MMM d"
+
+        if sameDay {
+            return formatter.string(from: startDay)
+        }
+
+        return "\(formatter.string(from: startDay)) - \(formatter.string(from: endDay))"
+    }
+
+    private func dashboardPerfDayLabel(_ date: Date) -> String {
+        Self.dashboardPerfDateFormatter.string(from: Calendar.current.startOfDay(for: date))
+    }
+
+    private func dashboardPerfRangeLabel(start: Date, end: Date) -> String {
+        "\(dashboardPerfDayLabel(start))...\(dashboardPerfDayLabel(end))"
+    }
+
+    private func elapsedMs(since start: CFAbsoluteTime) -> Double {
+        (CFAbsoluteTimeGetCurrent() - start) * 1000
+    }
+
+    private func formattedMs(_ valueMs: Double) -> String {
+        String(format: "%.1f", valueMs)
+    }
+
+    private func nextDashboardLoadTraceID(prefix: String = "load") -> String {
+        dashboardLoadTraceID &+= 1
+        return "\(prefix)-\(dashboardLoadTraceID)"
+    }
+
+    private func recordAppUsageDateRangeAction(
+        action: String,
+        source: String,
+        start: Date,
+        end: Date,
+        rangeDays: Int? = nil
+    ) {
+        let metadata = Self.jsonMetadata([
+            "action": action,
+            "source": source,
+            "startDate": Int64(start.timeIntervalSince1970 * 1000),
+            "endDate": Int64(end.timeIntervalSince1970 * 1000),
+            "rangeDays": rangeDays ?? appUsageRangeDaySpan
+        ])
+        Self.recordMetric(
+            coordinator: coordinator,
+            type: .timelineFilterQuery,
+            metadata: metadata
+        )
+    }
+
+    private func loadAppUsageStatsForSelectedRange(traceID: String) async throws {
+        let stageStartedAt = CFAbsoluteTimeGetCurrent()
+        let queryRange = resolvedAppUsageQueryRange()
+        let queryRangeLabel = dashboardPerfRangeLabel(start: queryRange.start, end: queryRange.end)
+
+        Log.debug(
+            "[DASHBOARD-LOAD][\(traceID)] APP_USAGE START range=\(queryRangeLabel)",
+            category: .ui
+        )
 
         do {
-            // Calculate last 7 days date range
-            let calendar = Calendar.current
-            let now = Date()
-            let sevenDaysAgo = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
-            let weekStart = sevenDaysAgo
-            let weekEnd = now
+            let appStats = try await coordinator.getAppUsageStats(from: queryRange.start, to: queryRange.end)
 
-            // Format the date range string
-            let formatter = DateFormatter()
-            formatter.dateFormat = "MMM d"
-            weekDateRange = "\(formatter.string(from: weekStart)) - \(formatter.string(from: weekEnd))"
-
-            // Fire slow queries (storage + dates) in background - don't block
-            Task {
-                if let storage = try? await coordinator.getTotalStorageUsed() {
-                    await MainActor.run { self.totalStorageBytes = storage }
-                }
-
-                if let allDates = try? await coordinator.getDistinctDates() {
-                    await MainActor.run {
-                        self.daysRecorded = allDates.count
-                        self.oldestRecordedDate = allDates.last // sorted descending, so last is oldest
-                    }
-                }
-            }
-
-            // Fire all queries in parallel - but log each one individually
-            let todayStart = calendar.startOfDay(for: now)
-
-            let appStats = try await coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
-
-            let todayStats = try await coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
-
-            await loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
-
-
-            weeklyStorageBytes = dailyStorageData.reduce(0) { $0 + $1.value }
             totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
-            totalDailyTime = todayStats.reduce(0) { $0 + $1.duration }
-
             let appNamesByBundleID = await resolveAppNames(bundleIDs: appStats.map(\.bundleID))
-
-            // Convert to AppUsageData and sort by duration
             weeklyAppUsage = appStats.map { stat in
                 AppUsageData(
                     appBundleID: stat.bundleID,
@@ -1077,73 +1369,395 @@ public class DashboardViewModel: ObservableObject {
             }
             .sorted { $0.duration > $1.duration }
 
-            isLoading = false
+            let stageElapsedMs = elapsedMs(since: stageStartedAt)
+            Log.recordLatency(
+                "dashboard.query.app_usage_stats_ms",
+                valueMs: stageElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 800,
+                criticalThresholdMs: 2500
+            )
+            let stageMessage = "[DASHBOARD-LOAD][\(traceID)] APP_USAGE END apps=\(weeklyAppUsage.count) totalSeconds=\(Int(totalWeeklyTime)) elapsed=\(formattedMs(stageElapsedMs))ms"
+            if stageElapsedMs >= 2500 {
+                Log.warning(stageMessage, category: .ui)
+            } else {
+                Log.info(stageMessage, category: .ui)
+            }
         } catch {
+            let stageElapsedMs = elapsedMs(since: stageStartedAt)
+            Log.error(
+                "[DASHBOARD-LOAD][\(traceID)] APP_USAGE FAIL range=\(queryRangeLabel) after \(formattedMs(stageElapsedMs))ms: \(error)",
+                category: .ui
+            )
+            throw error
+        }
+    }
+
+    private func loadBackgroundMeta(traceID: String) async {
+        let backgroundStartedAt = CFAbsoluteTimeGetCurrent()
+        Log.debug(
+            "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META START",
+            category: .ui
+        )
+
+        let totalStorageStartedAt = CFAbsoluteTimeGetCurrent()
+        if let storage = try? await coordinator.getTotalStorageUsed() {
+            let totalStorageElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStorageStartedAt) * 1000
+            Log.recordLatency(
+                "dashboard.query.total_storage_ms",
+                valueMs: totalStorageElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 2000
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META total_storage bytes=\(storage) elapsed=\(String(format: "%.1f", totalStorageElapsedMs))ms",
+                category: .ui
+            )
+            totalStorageBytes = storage
+        } else {
+            let totalStorageElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStorageStartedAt) * 1000
+            Log.warning(
+                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META total_storage unavailable after \(String(format: "%.1f", totalStorageElapsedMs))ms",
+                category: .ui
+            )
+        }
+
+        let distinctDatesStartedAt = CFAbsoluteTimeGetCurrent()
+        if let allDates = try? await coordinator.getDistinctDates() {
+            let distinctDatesElapsedMs = (CFAbsoluteTimeGetCurrent() - distinctDatesStartedAt) * 1000
+            Log.recordLatency(
+                "dashboard.query.distinct_dates_ms",
+                valueMs: distinctDatesElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 2000
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META distinct_dates count=\(allDates.count) elapsed=\(String(format: "%.1f", distinctDatesElapsedMs))ms",
+                category: .ui
+            )
+            daysRecorded = allDates.count
+            oldestRecordedDate = allDates.last // sorted descending, so last is oldest
+        } else {
+            let distinctDatesElapsedMs = (CFAbsoluteTimeGetCurrent() - distinctDatesStartedAt) * 1000
+            Log.warning(
+                "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META distinct_dates unavailable after \(String(format: "%.1f", distinctDatesElapsedMs))ms",
+                category: .ui
+            )
+        }
+
+        let backgroundElapsedMs = (CFAbsoluteTimeGetCurrent() - backgroundStartedAt) * 1000
+        Log.recordLatency(
+            "dashboard.query.background_meta_ms",
+            valueMs: backgroundElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 1000,
+            criticalThresholdMs: 4000
+        )
+        Log.debug(
+            "[DASHBOARD-LOAD][\(traceID)] BACKGROUND_META END elapsed=\(String(format: "%.1f", backgroundElapsedMs))ms",
+            category: .ui
+        )
+    }
+
+    public func loadStatistics(reason: String = "dashboard_refresh") async {
+        let traceID = nextDashboardLoadTraceID()
+        let loadStartedAt = CFAbsoluteTimeGetCurrent()
+        Log.info(
+            "[DASHBOARD-LOAD][\(traceID)] START reason='\(reason)' selectedRange=\(dashboardPerfRangeLabel(start: appUsageRangeStart, end: appUsageRangeEnd)) spanDays=\(appUsageRangeDaySpan)",
+            category: .ui
+        )
+        isLoading = true
+        error = nil
+        defer { isLoading = false }
+
+        // Update recording status
+        updateRecordingStatus()
+        updatePauseStatus()
+        await refreshRecentCrashReportState()
+        await refreshRecentWALFailureCrashState()
+
+        do {
+            let now = Date()
+
+            // Keep selected app-usage range valid (day-boundary, <= today, <= max range).
+            let normalizedAppUsageRange = Self.normalizedAppUsageDateRange(
+                start: appUsageRangeStart,
+                end: appUsageRangeEnd,
+                now: now
+            )
+            appUsageRangeStart = normalizedAppUsageRange.start
+            appUsageRangeEnd = normalizedAppUsageRange.end
+            appUsageRangeLabel = Self.formatAppUsageRangeLabel(
+                start: normalizedAppUsageRange.start,
+                end: normalizedAppUsageRange.end
+            )
+            weekDateRange = appUsageRangeLabel
+            let selectedRange = resolvedAppUsageQueryRange(now: now)
+            let rangeStart = selectedRange.start
+            let rangeEnd = selectedRange.end
+            let selectedRangeLabel = dashboardPerfRangeLabel(start: rangeStart, end: rangeEnd)
+
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] NORMALIZED_RANGE range=\(selectedRangeLabel) spanDays=\(appUsageRangeDaySpan)",
+                category: .ui
+            )
+
+            let appUsageStartedAt = CFAbsoluteTimeGetCurrent()
+            let dailyGraphStartedAt = CFAbsoluteTimeGetCurrent()
+            async let backgroundMetaTask: Void = loadBackgroundMeta(traceID: traceID)
+            async let appUsageTask: Void = loadAppUsageStatsForSelectedRange(traceID: traceID)
+            async let dailyGraphTask: Void = loadDailyGraphData(rangeStart: rangeStart, rangeEnd: rangeEnd, traceID: traceID)
+
+            // Await critical UI data first.
+            try await appUsageTask
+            let appUsageElapsedMs = elapsedMs(since: appUsageStartedAt)
+            Log.recordLatency(
+                "dashboard.load.app_usage_stage_ms",
+                valueMs: appUsageElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 800,
+                criticalThresholdMs: 2500
+            )
+
+            await dailyGraphTask
+            let dailyGraphElapsedMs = elapsedMs(since: dailyGraphStartedAt)
+            Log.recordLatency(
+                "dashboard.load.daily_graph_stage_ms",
+                valueMs: dailyGraphElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1200,
+                criticalThresholdMs: 5000
+            )
+
+            // Keep metadata updates in-flight with chart/query work.
+            await backgroundMetaTask
+
+            weeklyStorageBytes = dailyStorageData.reduce(0) { $0 + $1.value }
+            totalDailyTime = totalWeeklyTime
+
+            let loadElapsedMs = elapsedMs(since: loadStartedAt)
+            Log.recordLatency(
+                "dashboard.load.total_ms",
+                valueMs: loadElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1800,
+                criticalThresholdMs: 7000
+            )
+            let completionMessage = "[DASHBOARD-LOAD][\(traceID)] END reason='\(reason)' range=\(selectedRangeLabel) apps=\(weeklyAppUsage.count) days=\(dailyScreenTimeData.count) elapsed=\(formattedMs(loadElapsedMs))ms"
+            if loadElapsedMs >= 7000 {
+                Log.warning(completionMessage, category: .ui)
+            } else {
+                Log.info(completionMessage, category: .ui)
+            }
+        } catch {
+            let loadElapsedMs = elapsedMs(since: loadStartedAt)
+            Log.recordLatency(
+                "dashboard.load.total_ms",
+                valueMs: loadElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1800,
+                criticalThresholdMs: 7000
+            )
+            Log.error(
+                "[DASHBOARD-LOAD][\(traceID)] FAIL reason='\(reason)' after \(formattedMs(loadElapsedMs))ms: \(error)",
+                category: .ui
+            )
             self.error = "Failed to load statistics: \(error.localizedDescription)"
-            isLoading = false
         }
     }
 
     // MARK: - Daily Graph Data
 
-    /// Load 7-day daily data for all metric graphs
-    private func loadDailyGraphData(weekStart: Date, weekEnd: Date) async {
+    /// Load daily data for all metric graphs using the selected dashboard date range.
+    private func loadDailyGraphData(rangeStart: Date, rangeEnd: Date, traceID: String) async {
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
 
-        // Generate all 7 days of the week (Monday through Sunday)
-        var allDays: [Date] = []
-        var currentDay = weekStart
-        while currentDay <= weekEnd {
-            allDays.append(currentDay)
+        // Generate all days in the selected range.
+        var allDaysAccumulator: [Date] = []
+        let firstDay = calendar.startOfDay(for: rangeStart)
+        let lastDay = calendar.startOfDay(for: rangeEnd)
+        var currentDay = firstDay
+        while currentDay <= lastDay {
+            allDaysAccumulator.append(currentDay)
             currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
         }
+        let allDays = allDaysAccumulator
+        Log.info(
+            "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH START range=\(dashboardPerfRangeLabel(start: firstDay, end: lastDay)) days=\(allDays.count)",
+            category: .ui
+        )
 
-        // Fill in any remaining days up to 7
-        while allDays.count < 7 {
-            if let nextDay = calendar.date(byAdding: .day, value: 1, to: allDays.last ?? weekStart) {
-                allDays.append(nextDay)
-            }
-        }
-
+        var stage = "daily_screen_time"
         do {
-            // Load daily screen time data
-            let screenTimeData = try await coordinator.getDailyScreenTime(
-                from: weekStart,
-                to: weekEnd
+            async let screenTimeResult: ([(date: Date, value: Int64)], Double) = {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let data = try await coordinator.getDailyScreenTime(
+                    from: rangeStart,
+                    to: rangeEnd
+                )
+                return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+            }()
+
+            async let dailyStorageResult: ([DailyDataPoint], Double) = {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let data = try await loadDailyStorageData(for: allDays, traceID: traceID)
+                return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+            }()
+
+            async let timelineResult: ([(date: Date, value: Int64)], Double) = {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let data = try await coordinator.getDailyMetrics(
+                    metricType: .timelineOpens,
+                    from: rangeStart,
+                    to: rangeEnd
+                )
+                return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+            }()
+
+            async let searchesResult: ([(date: Date, value: Int64)], Double) = {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let data = try await coordinator.getDailyMetrics(
+                    metricType: .searches,
+                    from: rangeStart,
+                    to: rangeEnd
+                )
+                return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+            }()
+
+            async let textCopiesResult: ([(date: Date, value: Int64)], Double) = {
+                let startedAt = CFAbsoluteTimeGetCurrent()
+                let data = try await coordinator.getDailyMetrics(
+                    metricType: .textCopies,
+                    from: rangeStart,
+                    to: rangeEnd
+                )
+                return (data, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+            }()
+
+            stage = "daily_screen_time"
+            let (screenTimeData, screenTimeElapsedMs) = try await screenTimeResult
+            Log.recordLatency(
+                "dashboard.query.daily_screen_time_ms",
+                valueMs: screenTimeElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 700,
+                criticalThresholdMs: 2000
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH daily_screen_time points=\(screenTimeData.count) elapsed=\(formattedMs(screenTimeElapsedMs))ms",
+                category: .ui
             )
             dailyScreenTimeData = fillMissingDays(data: screenTimeData, allDays: allDays)
 
-            // Load storage data for each day (just that day's folder size)
-            dailyStorageData = try await loadDailyStorageData(for: allDays)
+            stage = "daily_storage"
+            let (storageData, dailyStorageElapsedMs) = try await dailyStorageResult
+            dailyStorageData = storageData
+            Log.recordLatency(
+                "dashboard.query.daily_storage_ms",
+                valueMs: dailyStorageElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1200,
+                criticalThresholdMs: 5000
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH daily_storage points=\(dailyStorageData.count) elapsed=\(formattedMs(dailyStorageElapsedMs))ms",
+                category: .ui
+            )
 
-            // Load timeline opens data
-            let timelineData = try await coordinator.getDailyMetrics(
-                metricType: .timelineOpens,
-                from: weekStart,
-                to: weekEnd
+            stage = "daily_timeline_opens"
+            let (timelineData, timelineElapsedMs) = try await timelineResult
+            Log.recordLatency(
+                "dashboard.query.daily_timeline_opens_ms",
+                valueMs: timelineElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 1500
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH daily_timeline_opens points=\(timelineData.count) elapsed=\(formattedMs(timelineElapsedMs))ms",
+                category: .ui
             )
             dailyTimelineOpensData = fillMissingDays(data: timelineData, allDays: allDays)
             timelineOpensThisWeek = dailyTimelineOpensData.reduce(0) { $0 + $1.value }
 
-            // Load searches data
-            let searchesData = try await coordinator.getDailyMetrics(
-                metricType: .searches,
-                from: weekStart,
-                to: weekEnd
+            stage = "daily_searches"
+            let (searchesData, searchesElapsedMs) = try await searchesResult
+            Log.recordLatency(
+                "dashboard.query.daily_searches_ms",
+                valueMs: searchesElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 1500
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH daily_searches points=\(searchesData.count) elapsed=\(formattedMs(searchesElapsedMs))ms",
+                category: .ui
             )
             dailySearchesData = fillMissingDays(data: searchesData, allDays: allDays)
             searchesThisWeek = dailySearchesData.reduce(0) { $0 + $1.value }
 
-            // Load text copies data
-            let textCopiesData = try await coordinator.getDailyMetrics(
-                metricType: .textCopies,
-                from: weekStart,
-                to: weekEnd
+            stage = "daily_text_copies"
+            let (textCopiesData, textCopiesElapsedMs) = try await textCopiesResult
+            Log.recordLatency(
+                "dashboard.query.daily_text_copies_ms",
+                valueMs: textCopiesElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 500,
+                criticalThresholdMs: 1500
+            )
+            Log.debug(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH daily_text_copies points=\(textCopiesData.count) elapsed=\(formattedMs(textCopiesElapsedMs))ms",
+                category: .ui
             )
             dailyTextCopiesData = fillMissingDays(data: textCopiesData, allDays: allDays)
             textCopiesThisWeek = dailyTextCopiesData.reduce(0) { $0 + $1.value }
 
+            let totalElapsedMs = elapsedMs(since: totalStartedAt)
+            Log.recordLatency(
+                "dashboard.load.daily_graph_ms",
+                valueMs: totalElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1400,
+                criticalThresholdMs: 6000
+            )
+            let completionMessage = "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH END days=\(allDays.count) elapsed=\(formattedMs(totalElapsedMs))ms"
+            if totalElapsedMs >= 6000 {
+                Log.warning(completionMessage, category: .ui)
+            } else {
+                Log.info(completionMessage, category: .ui)
+            }
+
         } catch {
+            let totalElapsedMs = elapsedMs(since: totalStartedAt)
+            Log.recordLatency(
+                "dashboard.load.daily_graph_ms",
+                valueMs: totalElapsedMs,
+                category: .ui,
+                summaryEvery: 10,
+                warningThresholdMs: 1400,
+                criticalThresholdMs: 6000
+            )
+            Log.error(
+                "[DASHBOARD-LOAD][\(traceID)] DAILY_GRAPH FAIL stage=\(stage) after \(formattedMs(totalElapsedMs))ms: \(error)",
+                category: .ui
+            )
             // Initialize with empty data on error
             dailyScreenTimeData = allDays.map { DailyDataPoint(date: $0, value: 0) }
             dailyStorageData = allDays.map { DailyDataPoint(date: $0, value: 0) }
@@ -1157,8 +1771,21 @@ public class DashboardViewModel: ObservableObject {
     }
 
     /// Load storage for each day's folder
-    private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
+    private func loadDailyStorageData(for days: [Date], traceID: String) async throws -> [DailyDataPoint] {
+        let totalStartedAt = CFAbsoluteTimeGetCurrent()
         let calendar = Calendar.current
+        let rangeLabel: String
+        if let firstDay = days.first, let lastDay = days.last {
+            rangeLabel = dashboardPerfRangeLabel(start: firstDay, end: lastDay)
+        } else {
+            rangeLabel = "empty"
+        }
+        Log.debug(
+            "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE START days=\(days.count) range=\(rangeLabel)",
+            category: .ui
+        )
+
+        let dbEstimateStartedAt = CFAbsoluteTimeGetCurrent()
         let dbEstimates: [(date: Date, value: Int64)]
         if let firstDay = days.first, let lastDay = days.last {
             dbEstimates = try await coordinator.getDailyDBStorageEstimatedBytes(
@@ -1168,20 +1795,75 @@ public class DashboardViewModel: ObservableObject {
         } else {
             dbEstimates = []
         }
+        let dbEstimateElapsedMs = elapsedMs(since: dbEstimateStartedAt)
+        Log.recordLatency(
+            "dashboard.query.daily_db_estimates_ms",
+            valueMs: dbEstimateElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 500,
+            criticalThresholdMs: 2000
+        )
+        Log.debug(
+            "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE db_estimates count=\(dbEstimates.count) elapsed=\(formattedMs(dbEstimateElapsedMs))ms",
+            category: .ui
+        )
         let dbEstimateByDay = Dictionary(
             uniqueKeysWithValues: dbEstimates.map { (calendar.startOfDay(for: $0.date), $0.value) }
         )
 
         var dataPoints: [DailyDataPoint] = []
+        var dayQueryTotalMs = 0.0
+        var slowestDay: Date?
+        var slowestDayMs = 0.0
         for day in days {
+            let dayQueryStartedAt = CFAbsoluteTimeGetCurrent()
             let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
+            let dayQueryElapsedMs = elapsedMs(since: dayQueryStartedAt)
+            dayQueryTotalMs += dayQueryElapsedMs
+            if dayQueryElapsedMs > slowestDayMs {
+                slowestDayMs = dayQueryElapsedMs
+                slowestDay = day
+            }
+            Log.recordLatency(
+                "dashboard.query.storage_single_day_ms",
+                valueMs: dayQueryElapsedMs,
+                category: .ui,
+                summaryEvery: 20,
+                warningThresholdMs: 250,
+                criticalThresholdMs: 1000
+            )
+            if dayQueryElapsedMs >= 1000 {
+                Log.warning(
+                    "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE slow_day date=\(dashboardPerfDayLabel(day)) elapsed=\(formattedMs(dayQueryElapsedMs))ms",
+                    category: .ui
+                )
+            }
             let dbEstimate = dbEstimateByDay[calendar.startOfDay(for: day)] ?? 0
             dataPoints.append(DailyDataPoint(date: day, value: dayStorage + dbEstimate))
+        }
+
+        let totalElapsedMs = elapsedMs(since: totalStartedAt)
+        let averageDayMs = days.isEmpty ? 0 : dayQueryTotalMs / Double(days.count)
+        let slowestDayLabel = slowestDay.map(dashboardPerfDayLabel) ?? "none"
+        Log.recordLatency(
+            "dashboard.load.daily_storage_ms",
+            valueMs: totalElapsedMs,
+            category: .ui,
+            summaryEvery: 10,
+            warningThresholdMs: 1200,
+            criticalThresholdMs: 5000
+        )
+        let completionMessage = "[DASHBOARD-LOAD][\(traceID)] DAILY_STORAGE END days=\(days.count) elapsed=\(formattedMs(totalElapsedMs))ms avgDay=\(formattedMs(averageDayMs))ms slowestDay=\(slowestDayLabel) slowestDayMs=\(formattedMs(slowestDayMs))ms"
+        if totalElapsedMs >= 5000 {
+            Log.warning(completionMessage, category: .ui)
+        } else {
+            Log.info(completionMessage, category: .ui)
         }
         return dataPoints
     }
 
-    /// Fill missing days with zero values to ensure we always have 7 data points
+    /// Fill missing days with zero values so the graph has a point for every day in-range.
     private func fillMissingDays(data: [(date: Date, value: Int64)], allDays: [Date]) -> [DailyDataPoint] {
         let calendar = Calendar.current
         let dataByDay = Dictionary(uniqueKeysWithValues: data.map { (calendar.startOfDay(for: $0.date), $0.value) })
@@ -1203,16 +1885,13 @@ public class DashboardViewModel: ObservableObject {
     /// - Returns: Array of sessions sorted by most recent first
     public func getSessionsForApp(bundleID: String, offset: Int, limit: Int) async -> [AppSessionDetail] {
         do {
-            let calendar = Calendar.current
-            let now = Date()
-            // Use rolling 7-day window (same as main dashboard app usage)
-            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+            let queryRange = resolvedAppUsageQueryRange()
 
             // Use efficient SQL query with bundleID filter, time range, and pagination
             let segments = try await coordinator.getSegments(
                 bundleID: bundleID,
-                from: weekStart,
-                to: now,
+                from: queryRange.start,
+                to: queryRange.end,
                 limit: limit,
                 offset: offset
             )
@@ -1240,15 +1919,12 @@ public class DashboardViewModel: ObservableObject {
     /// - Returns: Array of window usage sorted by type (websites first) then duration descending
     public func getWindowUsageForApp(bundleID: String) async -> [WindowUsageData] {
         do {
-            let calendar = Calendar.current
-            let now = Date()
-            // Use rolling 7-day window (same as main dashboard app usage)
-            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+            let queryRange = resolvedAppUsageQueryRange()
 
             let windowStats = try await coordinator.getWindowUsageForApp(
                 bundleID: bundleID,
-                from: weekStart,
-                to: now
+                from: queryRange.start,
+                to: queryRange.end
             )
 
             // Calculate total duration for percentage calculation
@@ -1274,15 +1950,12 @@ public class DashboardViewModel: ObservableObject {
     /// - Returns: Array of tab usage sorted by duration descending, with full URLs for subtitle display
     public func getBrowserTabUsage(bundleID: String) async -> [WindowUsageData] {
         do {
-            let calendar = Calendar.current
-            let now = Date()
-            // Use rolling 7-day window (same as main dashboard app usage)
-            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+            let queryRange = resolvedAppUsageQueryRange()
 
             let tabStats = try await coordinator.getBrowserTabUsage(
                 bundleID: bundleID,
-                from: weekStart,
-                to: now
+                from: queryRange.start,
+                to: queryRange.end
             )
 
             // Calculate total duration for percentage calculation
@@ -1306,15 +1979,13 @@ public class DashboardViewModel: ObservableObject {
     /// Fetch browser tabs filtered by a specific domain (for nested website breakdown)
     public func getBrowserTabsForDomain(bundleID: String, domain: String) async -> [WindowUsageData] {
         do {
-            let calendar = Calendar.current
-            let now = Date()
-            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+            let queryRange = resolvedAppUsageQueryRange()
 
             let tabStats = try await coordinator.getBrowserTabUsageForDomain(
                 bundleID: bundleID,
                 domain: domain,
-                from: weekStart,
-                to: now
+                from: queryRange.start,
+                to: queryRange.end
             )
 
             // Calculate total duration for percentage calculation
@@ -1344,17 +2015,14 @@ public class DashboardViewModel: ObservableObject {
     /// - Returns: Array of sessions sorted by most recent first
     public func getSessionsForAppWindow(bundleID: String, windowNameOrDomain: String, offset: Int, limit: Int) async -> [AppSessionDetail] {
         do {
-            let calendar = Calendar.current
-            let now = Date()
-            // Use rolling 7-day window (same as main dashboard app usage)
-            let weekStart = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now))!
+            let queryRange = resolvedAppUsageQueryRange()
 
             // Use efficient SQL query with bundleID and window/domain filter, time range, and pagination
             let segments = try await coordinator.getSegments(
                 bundleID: bundleID,
                 windowNameOrDomain: windowNameOrDomain,
-                from: weekStart,
-                to: now,
+                from: queryRange.start,
+                to: queryRange.end,
                 limit: limit,
                 offset: offset
             )

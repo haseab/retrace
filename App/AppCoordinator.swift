@@ -2191,7 +2191,35 @@ public actor AppCoordinator {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
-        try await services.database.getAppUsageStats(from: startDate, to: endDate)
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let traceID = String(UUID().uuidString.prefix(8))
+        do {
+            let enqueuedAt = CFAbsoluteTimeGetCurrent()
+            let results = try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
+                try await DatabaseActorTraceContext.$operationName.withValue("get_app_usage_stats") {
+                    try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
+                        try await services.database.getAppUsageStats(from: startDate, to: endDate)
+                    }
+                }
+            }
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.recordLatency(
+                "dashboard.path.app_coordinator.get_app_usage_stats_ms",
+                valueMs: elapsedMs,
+                category: .app,
+                summaryEvery: 10,
+                warningThresholdMs: 800,
+                criticalThresholdMs: 2500
+            )
+            return results
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.error(
+                "[DASHBOARD-PATH][AppCoordinator] getAppUsageStats failed trace=\(traceID) range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .app
+            )
+            throw error
+        }
     }
 
     /// Get window usage aggregated by windowName or domain for a specific app
@@ -2954,10 +2982,38 @@ public actor AppCoordinator {
         from startDate: Date,
         to endDate: Date
     ) async throws -> [(date: Date, value: Int64)] {
-        try await services.database.getDailyScreenTime(
-            from: startDate,
-            to: endDate
-        )
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let traceID = String(UUID().uuidString.prefix(8))
+        do {
+            let enqueuedAt = CFAbsoluteTimeGetCurrent()
+            let results = try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
+                try await DatabaseActorTraceContext.$operationName.withValue("get_daily_screen_time") {
+                    try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
+                        try await services.database.getDailyScreenTime(
+                            from: startDate,
+                            to: endDate
+                        )
+                    }
+                }
+            }
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.recordLatency(
+                "dashboard.path.app_coordinator.get_daily_screen_time_ms",
+                valueMs: elapsedMs,
+                category: .app,
+                summaryEvery: 10,
+                warningThresholdMs: 1200,
+                criticalThresholdMs: 5000
+            )
+            return results
+        } catch {
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startedAt) * 1000
+            Log.error(
+                "[DASHBOARD-PATH][AppCoordinator] getDailyScreenTime failed trace=\(traceID) range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))] after \(String(format: "%.1f", elapsedMs))ms: \(error)",
+                category: .app
+            )
+            throw error
+        }
     }
 
     /// Get local-day DB/WAL size snapshots for the requested date range.

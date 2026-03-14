@@ -833,10 +833,40 @@ public actor StorageManager: StorageProtocol {
                 .appendingPathComponent(dayStr, isDirectory: true)
 
             if fileManager.fileExists(atPath: dayFolderURL.path) {
-                totalSize += calculateFolderSize(at: dayFolderURL)
+                totalSize += calculateImmediateChildrenAllocatedSize(at: dayFolderURL)
             }
 
             currentDate = calendar.date(byAdding: .day, value: 1, to: currentDate)!
+        }
+
+        return totalSize
+    }
+
+    /// Sum allocated sizes of immediate files in a day folder (non-recursive).
+    /// Ignores nested directories and their contents.
+    private func calculateImmediateChildrenAllocatedSize(at url: URL) -> Int64 {
+        let fileManager = FileManager.default
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        var totalSize: Int64 = 0
+        for entry in entries {
+            guard let values = try? entry.resourceValues(
+                forKeys: [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+            ) else {
+                continue
+            }
+            guard values.isRegularFile == true else {
+                continue
+            }
+            if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
+                totalSize += Int64(allocated)
+            }
         }
 
         return totalSize

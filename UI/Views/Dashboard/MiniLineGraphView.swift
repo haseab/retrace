@@ -1,9 +1,9 @@
 import SwiftUI
 import Shared
 
-/// A compact line graph for displaying 7-day metrics within dashboard stat cards
+/// A compact line graph for displaying range-based metrics within dashboard stat cards
 /// Features:
-/// - 7 data points connected by a line
+/// - Variable data points connected by a line
 /// - Date labels (MM/DD) on x-axis
 /// - Y-axis labels with min/mid/max values
 /// - Optional gradient fill under the line
