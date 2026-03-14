@@ -976,9 +976,6 @@ public class DashboardViewModel: ObservableObject {
             // Fire all queries in parallel - but log each one individually
             let todayStart = calendar.startOfDay(for: now)
 
-            // Run queries sequentially to identify which one hangs
-            let weeklyStorage = try await coordinator.getStorageUsedForDateRange(from: weekStart, to: weekEnd)
-
             let appStats = try await coordinator.getAppUsageStats(from: weekStart, to: weekEnd)
 
             let todayStats = try await coordinator.getAppUsageStats(from: todayStart, to: weekEnd)
@@ -986,7 +983,7 @@ public class DashboardViewModel: ObservableObject {
             await loadDailyGraphData(weekStart: weekStart, weekEnd: weekEnd)
 
 
-            weeklyStorageBytes = weeklyStorage
+            weeklyStorageBytes = dailyStorageData.reduce(0) { $0 + $1.value }
             totalWeeklyTime = appStats.reduce(0) { $0 + $1.duration }
             totalDailyTime = todayStats.reduce(0) { $0 + $1.duration }
 
@@ -1083,10 +1080,25 @@ public class DashboardViewModel: ObservableObject {
 
     /// Load storage for each day's folder
     private func loadDailyStorageData(for days: [Date]) async throws -> [DailyDataPoint] {
+        let calendar = Calendar.current
+        let dbEstimates: [(date: Date, value: Int64)]
+        if let firstDay = days.first, let lastDay = days.last {
+            dbEstimates = try await coordinator.getDailyDBStorageEstimatedBytes(
+                from: firstDay,
+                to: lastDay
+            )
+        } else {
+            dbEstimates = []
+        }
+        let dbEstimateByDay = Dictionary(
+            uniqueKeysWithValues: dbEstimates.map { (calendar.startOfDay(for: $0.date), $0.value) }
+        )
+
         var dataPoints: [DailyDataPoint] = []
         for day in days {
             let dayStorage = try await coordinator.getStorageUsedForDateRange(from: day, to: day)
-            dataPoints.append(DailyDataPoint(date: day, value: dayStorage))
+            let dbEstimate = dbEstimateByDay[calendar.startOfDay(for: day)] ?? 0
+            dataPoints.append(DailyDataPoint(date: day, value: dayStorage + dbEstimate))
         }
         return dataPoints
     }

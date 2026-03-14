@@ -251,7 +251,10 @@ public actor AppCoordinator {
 
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
+    private var dbStorageSnapshotTask: Task<Void, Never>?
     private static let pipelineMemoryLogInterval: TimeInterval = 5.0
+    private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
+    private static let minimumDBSnapshotDiffInterval: TimeInterval = 23 * 60 * 60
 
     // MARK: - Initialization
 
@@ -333,6 +336,8 @@ public actor AppCoordinator {
 
         // Start periodic orphaned video cleanup (runs every 60s)
         startOrphanedVideoCleanup()
+        await recordDBStorageSnapshot(reason: "initialize")
+        startDBStorageSnapshotTask()
 
         // Log auto-start state for debugging
         let shouldAutoStart = Self.shouldAutoStartRecording()
@@ -726,6 +731,8 @@ public actor AppCoordinator {
 
         // Stop periodic cleanup tasks
         stopOrphanedVideoCleanup()
+        stopDBStorageSnapshotTask()
+        await recordDBStorageSnapshot(reason: "shutdown")
 
         Log.info("Shutting down AppCoordinator...", category: .app)
         try await services.shutdown()
@@ -946,6 +953,40 @@ public actor AppCoordinator {
     private func stopOrphanedVideoCleanup() {
         orphanedVideoCleanupTask?.cancel()
         orphanedVideoCleanupTask = nil
+    }
+
+    // MARK: - DB Storage Snapshot Sampling
+
+    private func startDBStorageSnapshotTask() {
+        dbStorageSnapshotTask?.cancel()
+
+        dbStorageSnapshotTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    for: .nanoseconds(Self.dbStorageSnapshotIntervalNanoseconds),
+                    clock: .continuous
+                )
+                guard !Task.isCancelled else { break }
+
+                await self?.recordDBStorageSnapshot(reason: "periodic")
+            }
+        }
+
+        Log.info("[AppCoordinator] DB storage snapshot task started (60s interval)", category: .app)
+    }
+
+    private func stopDBStorageSnapshotTask() {
+        dbStorageSnapshotTask?.cancel()
+        dbStorageSnapshotTask = nil
+    }
+
+    private func recordDBStorageSnapshot(reason: String) async {
+        do {
+            try await services.database.recordDBStorageSnapshot()
+            Log.debug("[AppCoordinator] Recorded DB storage snapshot (\(reason))", category: .app)
+        } catch {
+            Log.warning("[AppCoordinator] Failed to record DB storage snapshot (\(reason)): \(error)", category: .app)
+        }
     }
 
     /// Finalize any orphaned videos that have processingState=1 but no active WAL session
@@ -2862,6 +2903,69 @@ public actor AppCoordinator {
             from: startDate,
             to: endDate
         )
+    }
+
+    /// Get local-day DB/WAL size snapshots for the requested date range.
+    public func getDBStorageSnapshots(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
+        try await services.database.getDBStorageSnapshots(
+            from: startDate,
+            to: endDate
+        )
+    }
+
+    /// Estimate per-day DB growth from daily DB/WAL snapshots.
+    /// Returns only days that have a previous-day snapshot at least ~1 day older.
+    public func getDailyDBStorageEstimatedBytes(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, value: Int64)] {
+        let calendar = Calendar.current
+        let startDay = calendar.startOfDay(for: startDate)
+        let endDay = calendar.startOfDay(for: endDate)
+        guard let snapshotStart = calendar.date(byAdding: .day, value: -1, to: startDay) else {
+            return []
+        }
+
+        let snapshots = try await services.database.getDBStorageSnapshots(
+            from: snapshotStart,
+            to: endDay
+        )
+        guard snapshots.count >= 2 else {
+            return []
+        }
+
+        let snapshotsByDay = Dictionary(
+            uniqueKeysWithValues: snapshots.map { (calendar.startOfDay(for: $0.date), $0) }
+        )
+
+        var results: [(date: Date, value: Int64)] = []
+        var currentDay = startDay
+        while currentDay <= endDay {
+            guard let previousDay = calendar.date(byAdding: .day, value: -1, to: currentDay),
+                  let currentSnapshot = snapshotsByDay[currentDay],
+                  let previousSnapshot = snapshotsByDay[previousDay] else {
+                currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
+                continue
+            }
+
+            let sampleSpan = currentSnapshot.sampledAt.timeIntervalSince(previousSnapshot.sampledAt)
+            guard sampleSpan >= Self.minimumDBSnapshotDiffInterval else {
+                currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
+                continue
+            }
+
+            let currentTotal = currentSnapshot.dbBytes + currentSnapshot.walBytes
+            let previousTotal = previousSnapshot.dbBytes + previousSnapshot.walBytes
+            let estimatedGrowth = max(0, currentTotal - previousTotal)
+            results.append((date: currentDay, value: estimatedGrowth))
+
+            currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
+        }
+
+        return results
     }
 
     // MARK: - Statistics & Monitoring

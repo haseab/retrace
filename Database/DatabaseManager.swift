@@ -2062,6 +2062,110 @@ public actor DatabaseManager: DatabaseProtocol {
         )
     }
 
+    // MARK: - DB Storage Snapshot Operations
+
+    /// Record the current physical DB and WAL sizes for the local calendar day.
+    /// Reuses the same row within a day and overwrites it with the latest sample.
+    public func recordDBStorageSnapshot(timestamp: Date = Date()) async throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let isInMemory = databasePath == ":memory:" || databasePath.contains("mode=memory")
+        guard !isInMemory else {
+            return
+        }
+
+        let databaseURL = URL(
+            fileURLWithPath: NSString(string: databasePath).expandingTildeInPath
+        )
+        let walURL = URL(fileURLWithPath: databaseURL.path + "-wal")
+        let localDay = Self.localDayText(for: timestamp)
+        let sampledAt = Int64(timestamp.timeIntervalSince1970 * 1000)
+        let dbBytes = try allocatedFileSize(at: databaseURL)
+        let walBytes = try allocatedFileSizeIfPresent(at: walURL)
+
+        let sql = """
+            INSERT INTO db_storage_snapshot (local_day, db_bytes, wal_bytes, sampled_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(local_day) DO UPDATE SET
+                db_bytes = excluded.db_bytes,
+                wal_bytes = excluded.wal_bytes,
+                sampled_at = excluded.sampled_at
+            WHERE excluded.sampled_at >= db_storage_snapshot.sampled_at;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_text(statement, 1, localDay, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int64(statement, 2, dbBytes)
+        sqlite3_bind_int64(statement, 3, walBytes)
+        sqlite3_bind_int64(statement, 4, sampledAt)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+    }
+
+    /// Read daily DB/WAL size snapshots for the requested local-date range.
+    public func getDBStorageSnapshots(
+        from startDate: Date,
+        to endDate: Date
+    ) async throws -> [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT local_day, db_bytes, wal_bytes, sampled_at
+            FROM db_storage_snapshot
+            WHERE local_day >= ? AND local_day <= ?
+            ORDER BY local_day ASC
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let startLocalDay = Self.localDayText(for: startDate)
+        let endLocalDay = Self.localDayText(for: endDate)
+        sqlite3_bind_text(statement, 1, startLocalDay, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(statement, 2, endLocalDay, -1, SQLITE_TRANSIENT)
+
+        var snapshots: [(date: Date, dbBytes: Int64, walBytes: Int64, sampledAt: Date)] = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let localDayTextPointer = sqlite3_column_text(statement, 0),
+                  let snapshotDate = Self.parseLocalDay(String(cString: localDayTextPointer)) else {
+                continue
+            }
+
+            let dbBytes = sqlite3_column_int64(statement, 1)
+            let walBytes = sqlite3_column_int64(statement, 2)
+            let sampledAt = Date(timeIntervalSince1970: Double(sqlite3_column_int64(statement, 3)) / 1000)
+            snapshots.append((date: snapshotDate, dbBytes: dbBytes, walBytes: walBytes, sampledAt: sampledAt))
+        }
+
+        return snapshots
+    }
+
     // MARK: - Statistics
 
     public func getStatistics() async throws -> DatabaseStatistics {
@@ -3182,5 +3286,58 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         return result
+    }
+
+    private static func localDayText(for date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        let year = components.year ?? 1970
+        let month = components.month ?? 1
+        let day = components.day ?? 1
+        return String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
+    private static func parseLocalDay(_ localDay: String) -> Date? {
+        let parts = localDay.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]),
+              let month = Int(parts[1]),
+              let day = Int(parts[2]) else {
+            return nil
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(from: DateComponents(year: year, month: month, day: day))
+    }
+
+    private func allocatedFileSize(at url: URL) throws -> Int64 {
+        let values = try url.resourceValues(forKeys: [
+            .totalFileAllocatedSizeKey,
+            .fileAllocatedSizeKey,
+            .fileSizeKey
+        ])
+        if let totalAllocatedSize = values.totalFileAllocatedSize {
+            return Int64(totalAllocatedSize)
+        }
+        if let allocatedSize = values.fileAllocatedSize {
+            return Int64(allocatedSize)
+        }
+        if let fileSize = values.fileSize {
+            return Int64(fileSize)
+        }
+
+        throw DatabaseError.queryFailed(
+            query: "stat \(url.path)",
+            underlying: "Unable to resolve allocated file size"
+        )
+    }
+
+    private func allocatedFileSizeIfPresent(at url: URL) throws -> Int64 {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return 0
+        }
+        return try allocatedFileSize(at: url)
     }
 }

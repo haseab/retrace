@@ -133,6 +133,146 @@ final class ServiceContainerRewindCutoffTests: XCTestCase {
     }
 }
 
+final class DBStorageSnapshotEstimateTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        ServiceContainer(
+            databasePath: storageRoot.appendingPathComponent("retrace.db").path,
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            )
+        )
+    }
+
+    private func makeLocalDate(year: Int, month: Int, day: Int, hour: Int, minute: Int) -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        return calendar.date(
+            from: DateComponents(
+                year: year,
+                month: month,
+                day: day,
+                hour: hour,
+                minute: minute,
+                second: 0
+            )
+        )!
+    }
+
+    private func growDatabase(_ database: DatabaseManager, timestamp: Date, seed: Int) async throws {
+        let videoID = try await database.insertVideoSegment(
+            VideoSegment(
+                id: VideoSegmentID(value: 0),
+                startTime: timestamp,
+                endTime: timestamp.addingTimeInterval(60),
+                frameCount: 1,
+                fileSizeBytes: 1024,
+                relativePath: "chunks/202603/13/\(seed).mp4",
+                width: 1920,
+                height: 1080,
+                source: .native
+            )
+        )
+        let segmentID = try await database.insertSegment(
+            bundleID: "com.test.snapshot.\(seed)",
+            startDate: timestamp,
+            endDate: timestamp.addingTimeInterval(60),
+            windowName: "Window \(seed)",
+            browserUrl: nil,
+            type: 0
+        )
+        let frameID = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp,
+                segmentID: AppSegmentID(value: segmentID),
+                videoID: VideoSegmentID(value: videoID),
+                frameIndexInSegment: 0,
+                encodingStatus: .success,
+                metadata: .empty,
+                source: .native
+            )
+        )
+        _ = try await database.indexFrameText(
+            mainText: String(repeating: "x", count: 250_000),
+            chromeText: nil,
+            windowTitle: "Title \(seed)",
+            segmentId: segmentID,
+            frameId: frameID
+        )
+    }
+
+    func testDailyDBStorageEstimatedBytesRequiresAboutOneDayOfHistory() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DBStorageSnapshotRequiresDay_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+
+            let firstSnapshot = makeLocalDate(year: 2026, month: 3, day: 13, hour: 23, minute: 50)
+            let secondSnapshot = makeLocalDate(year: 2026, month: 3, day: 14, hour: 0, minute: 10)
+
+            try await services.database.recordDBStorageSnapshot(timestamp: firstSnapshot)
+            try await growDatabase(services.database, timestamp: firstSnapshot.addingTimeInterval(60), seed: 1)
+            try await services.database.recordDBStorageSnapshot(timestamp: secondSnapshot)
+
+            let estimates = try await coordinator.getDailyDBStorageEstimatedBytes(
+                from: firstSnapshot,
+                to: secondSnapshot
+            )
+
+            XCTAssertTrue(estimates.isEmpty)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+
+    func testDailyDBStorageEstimatedBytesReturnsPositiveDiffAfterAboutOneDay() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DBStorageSnapshotHasDay_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+
+            let firstSnapshot = makeLocalDate(year: 2026, month: 3, day: 13, hour: 12, minute: 0)
+            let secondSnapshot = makeLocalDate(year: 2026, month: 3, day: 14, hour: 12, minute: 5)
+
+            try await services.database.recordDBStorageSnapshot(timestamp: firstSnapshot)
+            try await growDatabase(services.database, timestamp: firstSnapshot.addingTimeInterval(120), seed: 2)
+            try await services.database.recordDBStorageSnapshot(timestamp: secondSnapshot)
+
+            let estimates = try await coordinator.getDailyDBStorageEstimatedBytes(
+                from: firstSnapshot,
+                to: secondSnapshot
+            )
+
+            XCTAssertEqual(estimates.count, 1)
+            XCTAssertEqual(Calendar.current.startOfDay(for: estimates[0].date), Calendar.current.startOfDay(for: secondSnapshot))
+            XCTAssertGreaterThan(estimates[0].value, 0)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+}
+
 final class DataAdapterRewindBoundaryTests: XCTestCase {
     private struct StubImageExtractor: ImageExtractor {
         enum StubError: Error {

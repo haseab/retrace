@@ -100,7 +100,8 @@ actor MigrationRunner {
             V10_SegmentCommentSearchIndex(),
             V11_SegmentCommentLinkCompositeIndex(),
             V12_FrameMetadata(),
-            V13_RemoveInPageURLRects()
+            V13_RemoveInPageURLRects(),
+            V14_DBStorageSnapshot()
         ]
     }
 

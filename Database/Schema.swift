@@ -75,6 +75,7 @@ enum Schema {
         static let videoFileState = "videoFileState"
         static let frameProcessing = "frame_processing"
         static let purge = "purge"
+        static let dbStorageSnapshot = "db_storage_snapshot"
 
         // Meta
         static let schemaMigrations = "schema_migrations"

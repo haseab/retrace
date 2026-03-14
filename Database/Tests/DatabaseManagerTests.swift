@@ -63,6 +63,106 @@ final class DatabaseManagerTests: XCTestCase {
         try await db.close()
     }
 
+    func testDBStorageSnapshotMigrationCreatesExpectedColumns() async throws {
+        let columnNames = try await tableColumnNames("db_storage_snapshot")
+
+        XCTAssertEqual(
+            columnNames,
+            ["local_day", "db_bytes", "wal_bytes", "sampled_at"]
+        )
+    }
+
+    func testRecordDBStorageSnapshotUpsertsSingleRowWithinSameDay() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDBStorageSnapshotSameDay_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let dbPath = tempDir.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: tempDir.path
+        )
+
+        do {
+            try await fileDatabase.initialize()
+
+            let morning = Date(timeIntervalSince1970: 1_773_420_000)
+            let laterSameDay = morning.addingTimeInterval(600)
+
+            try await fileDatabase.recordDBStorageSnapshot(timestamp: morning)
+            try await fileDatabase.recordDBStorageSnapshot(timestamp: laterSameDay)
+
+            guard let db = await fileDatabase.getConnection() else {
+                XCTFail("Expected active database connection")
+                return
+            }
+
+            let rowCount = try fetchInt64(
+                "SELECT COUNT(*) FROM db_storage_snapshot;",
+                db: db
+            )
+            XCTAssertEqual(rowCount, 1)
+
+            let sampledAt = try fetchInt64(
+                "SELECT sampled_at FROM db_storage_snapshot LIMIT 1;",
+                db: db
+            )
+            XCTAssertEqual(sampledAt, Int64(laterSameDay.timeIntervalSince1970 * 1000))
+
+            let dbBytes = try fetchInt64(
+                "SELECT db_bytes FROM db_storage_snapshot LIMIT 1;",
+                db: db
+            )
+            XCTAssertGreaterThan(dbBytes, 0)
+
+            try await fileDatabase.close()
+        } catch {
+            try? await fileDatabase.close()
+            throw error
+        }
+    }
+
+    func testRecordDBStorageSnapshotCreatesDistinctRowsAcrossDays() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDBStorageSnapshotMultiDay_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let dbPath = tempDir.appendingPathComponent("retrace.db").path
+        let fileDatabase = DatabaseManager(
+            databasePath: dbPath,
+            storageRootPath: tempDir.path
+        )
+
+        do {
+            try await fileDatabase.initialize()
+
+            let firstDay = Date(timeIntervalSince1970: 1_773_420_000)
+            let secondDay = firstDay.addingTimeInterval(24 * 60 * 60)
+
+            try await fileDatabase.recordDBStorageSnapshot(timestamp: firstDay)
+            try await fileDatabase.recordDBStorageSnapshot(timestamp: secondDay)
+
+            let snapshots = try await fileDatabase.getDBStorageSnapshots(
+                from: firstDay,
+                to: secondDay
+            )
+
+            XCTAssertEqual(snapshots.count, 2)
+            XCTAssertLessThan(snapshots[0].date, snapshots[1].date)
+
+            try await fileDatabase.close()
+        } catch {
+            try? await fileDatabase.close()
+            throw error
+        }
+    }
+
     // ┌─────────────────────────────────────────────────────────────────────────┐
     // │ SEGMENT TESTS                                                           │
     // └─────────────────────────────────────────────────────────────────────────┘
@@ -1706,6 +1806,14 @@ final class DatabaseManagerTests: XCTestCase {
         bind: ((OpaquePointer?) -> Void)? = nil
     ) async throws -> Int64 {
         let db = try await databaseConnection()
+        return try fetchInt64(sql, db: db, bind: bind)
+    }
+
+    private func fetchInt64(
+        _ sql: String,
+        db: OpaquePointer,
+        bind: ((OpaquePointer?) -> Void)? = nil
+    ) throws -> Int64 {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }
 
