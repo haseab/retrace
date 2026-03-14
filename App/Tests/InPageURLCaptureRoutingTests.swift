@@ -85,6 +85,69 @@ final class InPageURLCaptureRoutingTests: XCTestCase {
     }
 }
 
+final class SegmentUsageAlignmentTests: XCTestCase {
+    func testSegmentEndDateForSessionTransitionUsesTransitionTimestampWhenNotIdle() {
+        let lastFrame = Date(timeIntervalSince1970: 1_700_000_000)
+        let transition = lastFrame.addingTimeInterval(45)
+
+        let result = AppCoordinator.segmentEndDateForSessionTransition(
+            lastFrameTimestamp: lastFrame,
+            transitionTimestamp: transition,
+            idleDetected: false
+        )
+
+        XCTAssertEqual(result, transition)
+    }
+
+    func testSegmentEndDateForSessionTransitionUsesLastFrameWhenIdleDetected() {
+        let lastFrame = Date(timeIntervalSince1970: 1_700_000_000)
+        let transition = lastFrame.addingTimeInterval(600)
+
+        let result = AppCoordinator.segmentEndDateForSessionTransition(
+            lastFrameTimestamp: lastFrame,
+            transitionTimestamp: transition,
+            idleDetected: true
+        )
+
+        XCTAssertEqual(result, lastFrame)
+    }
+
+    func testSegmentEndDateForSessionTransitionFallsBackWhenLastFrameMissing() {
+        let transition = Date(timeIntervalSince1970: 1_700_000_600)
+
+        let result = AppCoordinator.segmentEndDateForSessionTransition(
+            lastFrameTimestamp: nil,
+            transitionTimestamp: transition,
+            idleDetected: true
+        )
+
+        XCTAssertEqual(result, transition)
+    }
+
+    func testSegmentEndDateForShutdownUsesLastFrameWhenAvailable() {
+        let lastFrame = Date(timeIntervalSince1970: 1_700_000_000)
+        let shutdown = lastFrame.addingTimeInterval(600)
+
+        let result = AppCoordinator.segmentEndDateForShutdown(
+            lastFrameTimestamp: lastFrame,
+            shutdownTimestamp: shutdown
+        )
+
+        XCTAssertEqual(result, lastFrame)
+    }
+
+    func testSegmentEndDateForShutdownFallsBackWhenLastFrameMissing() {
+        let shutdown = Date(timeIntervalSince1970: 1_700_000_600)
+
+        let result = AppCoordinator.segmentEndDateForShutdown(
+            lastFrameTimestamp: nil,
+            shutdownTimestamp: shutdown
+        )
+
+        XCTAssertEqual(result, shutdown)
+    }
+}
+
 final class ServiceContainerRewindCutoffTests: XCTestCase {
     func testStoredRewindCutoffDateReturnsPersistedValue() {
         let suiteName = "io.retrace.app.tests.rewindCutoff.\(UUID().uuidString)"

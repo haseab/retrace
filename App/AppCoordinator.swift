@@ -1353,7 +1353,11 @@ public actor AppCoordinator {
         }
 
         if let segmentID = currentSegmentID {
-            try? await services.database.updateSegmentEndDate(id: segmentID, endDate: Date())
+            let shutdownEndDate = Self.segmentEndDateForShutdown(
+                lastFrameTimestamp: lastFrameTimestamp,
+                shutdownTimestamp: Date()
+            )
+            try? await services.database.updateSegmentEndDate(id: segmentID, endDate: shutdownEndDate)
             currentSegmentID = nil
         }
 
@@ -1660,14 +1664,13 @@ public actor AppCoordinator {
         if appChanged || windowChanged || currentSegment == nil || idleDetected {
             // Close previous segment
             if let segID = currentSegmentID {
-                // For idle detection, set end date to last frame timestamp + a small buffer
-                // This prevents the segment from appearing to span the idle period
-                let segmentEndDate: Date
-                if idleDetected, let lastTimestamp = lastFrameTimestamp {
-                    segmentEndDate = lastTimestamp
-                } else {
-                    segmentEndDate = frame.timestamp
-                }
+                // If we crossed an idle boundary, close at the last observed frame.
+                // Otherwise close at the current transition frame timestamp.
+                let segmentEndDate = Self.segmentEndDateForSessionTransition(
+                    lastFrameTimestamp: lastFrameTimestamp,
+                    transitionTimestamp: frame.timestamp,
+                    idleDetected: idleDetected
+                )
                 try await services.database.updateSegmentEndDate(id: segID, endDate: segmentEndDate)
                 Log.debug("Closed segment: \(currentSegment?.bundleID ?? "unknown") - \(currentSegment?.windowName ?? "nil")", category: .app)
 
@@ -1753,6 +1756,28 @@ public actor AppCoordinator {
 
         // Update last frame timestamp for idle detection
         lastFrameTimestamp = frame.timestamp
+    }
+
+    /// Computes segment end time when transitioning between sessions.
+    /// Idle transitions close at the last observed frame (no idle credit).
+    nonisolated static func segmentEndDateForSessionTransition(
+        lastFrameTimestamp: Date?,
+        transitionTimestamp: Date,
+        idleDetected: Bool
+    ) -> Date {
+        if idleDetected, let lastFrameTimestamp {
+            return lastFrameTimestamp
+        }
+        return transitionTimestamp
+    }
+
+    /// Computes segment end time when capture pipeline shuts down.
+    /// Prefer the last observed frame to avoid synthetic tail time.
+    nonisolated static func segmentEndDateForShutdown(
+        lastFrameTimestamp: Date?,
+        shutdownTimestamp: Date
+    ) -> Date {
+        lastFrameTimestamp ?? shutdownTimestamp
     }
 
     private func normalizedWindowNameForStrictBackfill(_ windowName: String?) -> String? {
