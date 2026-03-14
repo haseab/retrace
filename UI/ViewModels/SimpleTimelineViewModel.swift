@@ -5483,14 +5483,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         saveFilterCriteria()
     }
 
-    /// Clear active filters before a date/frame jump so the jump operates on full timeline data.
-    private func clearActiveFiltersBeforeJumpIfNeeded(trigger: String) {
-        guard activeFilterCount > 0 else { return }
-        Log.info("[DateJump] Clearing \(activeFilterCount) active filters before \(trigger)", category: .ui)
-        clearFilterState()
-    }
-
-
     /// Build JSON representation of active timeline filters for metrics
     private func buildTimelineFilterJson() -> String {
         var components: [String] = []
@@ -10956,7 +10948,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Navigate to a specific hour from the calendar picker
     public func navigateToHour(_ hour: Date) async {
-        clearActiveFiltersBeforeJumpIfNeeded(trigger: "calendar jump")
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             isCalendarPickerVisible = false
             isDateSearchActive = false
@@ -11185,8 +11176,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                 targetDate = parsedDate
             }
 
-            clearActiveFiltersBeforeJumpIfNeeded(trigger: "date input jump")
-
             let anchoredTargetDate = try await resolveDateSearchAnchorDate(
                 parsedDate: targetDate,
                 input: trimmedSearchText
@@ -11305,8 +11294,6 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             let targetFrame = frameWithVideo.frame
             let targetDate = targetFrame.timestamp
-
-            clearActiveFiltersBeforeJumpIfNeeded(trigger: "frame ID jump")
 
             // Load frames around the target frame's timestamp (±10 minutes window)
             let calendar = Calendar.current

@@ -1048,6 +1048,106 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
         XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
     }
 
+    func testDaysAgoPreservesAndAppliesActiveFilters() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let expectedFilters = FilterCriteria(selectedApps: ["com.apple.Safari"])
+        viewModel.filterCriteria = expectedFilters
+        viewModel.pendingFilterCriteria = expectedFilters
+
+        var anchorFilters: [FilterCriteria] = []
+        var windowFilters: [FilterCriteria] = []
+        var anchoredTimestamp: Date?
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, filters, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInDay":
+                anchorFilters.append(filters)
+                XCTAssertEqual(limit, 1)
+                let firstFrameInDay = start.addingTimeInterval(90)
+                anchoredTimestamp = firstFrameInDay
+                return [self.makeFrameWithVideoInfo(id: 7101, timestamp: firstFrameInDay, processingStatus: 4)]
+
+            case "searchForDate":
+                windowFilters.append(filters)
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected day anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7101, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("1 day ago")
+
+        XCTAssertEqual(anchorFilters.count, 1)
+        XCTAssertEqual(windowFilters.count, 1)
+        XCTAssertEqual(anchorFilters.first?.selectedApps, expectedFilters.selectedApps)
+        XCTAssertEqual(windowFilters.first?.selectedApps, expectedFilters.selectedApps)
+        XCTAssertEqual(viewModel.filterCriteria.selectedApps, expectedFilters.selectedApps)
+        XCTAssertEqual(viewModel.pendingFilterCriteria.selectedApps, expectedFilters.selectedApps)
+    }
+
+    func testHoursAgoUsesFirstFrameInResolvedHourWithinActiveFilters() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let expectedFilters = FilterCriteria(selectedApps: ["com.apple.Safari"])
+        viewModel.filterCriteria = expectedFilters
+        viewModel.pendingFilterCriteria = expectedFilters
+
+        var sawHourAnchorFetch = false
+        var sawWindowFetch = false
+        var anchoredTimestamp: Date?
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfo = { start, end, limit, filters, reason in
+            switch reason {
+            case "searchForDate.anchor.firstFrameInHour":
+                sawHourAnchorFetch = true
+                XCTAssertEqual(limit, 1)
+                XCTAssertEqual(filters.selectedApps, expectedFilters.selectedApps)
+                XCTAssertGreaterThan(end.timeIntervalSince(start), (60 * 60) - 1)
+                let firstFrameInHour = start.addingTimeInterval(45)
+                anchoredTimestamp = firstFrameInHour
+                return [self.makeFrameWithVideoInfo(id: 7201, timestamp: firstFrameInHour, processingStatus: 4)]
+
+            case "searchForDate":
+                sawWindowFetch = true
+                guard let anchoredTimestamp else {
+                    XCTFail("Expected hour anchor to resolve before window fetch")
+                    return []
+                }
+                XCTAssertEqual(filters.selectedApps, expectedFilters.selectedApps)
+                XCTAssertEqual(start.timeIntervalSince(anchoredTimestamp), -600, accuracy: 0.01)
+                XCTAssertEqual(end.timeIntervalSince(anchoredTimestamp), 600, accuracy: 0.01)
+                return [self.makeFrameWithVideoInfo(id: 7201, timestamp: anchoredTimestamp, processingStatus: 4)]
+
+            case "loadNewerFrames.reason=searchForDate",
+                 "loadOlderFrames.reason=searchForDate":
+                return []
+
+            default:
+                XCTFail("Unexpected fetch reason: \(reason)")
+                return []
+            }
+        }
+
+        await viewModel.searchForDate("1 hour ago")
+
+        XCTAssertTrue(sawHourAnchorFetch)
+        XCTAssertTrue(sawWindowFetch)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.id.value, 7201)
+        XCTAssertEqual(viewModel.currentTimelineFrame?.frame.timestamp, anchoredTimestamp)
+        XCTAssertEqual(viewModel.filterCriteria.selectedApps, expectedFilters.selectedApps)
+    }
+
     private func makeFrameWithVideoInfo(id: Int64, timestamp: Date, processingStatus: Int) -> FrameWithVideoInfo {
         let frame = FrameReference(
             id: FrameID(value: id),
