@@ -907,7 +907,6 @@ public actor FrameProcessingQueue {
 
         let hasInPagePayload =
             payload.pageurl != nil ||
-            payload.mouseposition != nil ||
             payload.scrollposition != nil ||
             payload.videoposition != nil ||
             !payload.rawlinks.isEmpty ||
@@ -941,17 +940,13 @@ public actor FrameProcessingQueue {
             resolvedURLs = []
         }
 
-        var mouseX = payload.mouseposition?.x
-        var mouseY = payload.mouseposition?.y
-        if mouseX == nil, mouseY == nil,
-           let existingState = try await databaseManager.getFrameInPageURLState(frameID: frameID) {
-            mouseX = existingState.mouseX
-            mouseY = existingState.mouseY
-        }
+        // Browser-provided mouse coordinates are viewport-relative and can be stale across captures.
+        // Preserve only capture-derived mouse position already stored on the frame.
+        let existingState = try await databaseManager.getFrameInPageURLState(frameID: frameID)
 
         let state = FrameInPageURLState(
-            mouseX: mouseX,
-            mouseY: mouseY,
+            mouseX: existingState?.mouseX,
+            mouseY: existingState?.mouseY,
             scrollX: payload.scrollposition?.x,
             scrollY: payload.scrollposition?.y,
             videoCurrentTime: payload.videoposition?.currenttime

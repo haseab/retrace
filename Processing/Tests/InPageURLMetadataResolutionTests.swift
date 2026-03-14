@@ -136,6 +136,95 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         XCTAssertTrue(unresolvedRows.isEmpty)
     }
 
+    func testResolveInPageURLMetadataKeepsExistingCapturedMousePosition() async throws {
+        let fixture = try await insertFrameFixture()
+
+        try await database.replaceFrameInPageURLData(
+            frameID: fixture.frameID,
+            state: FrameInPageURLState(
+                mouseX: 321.25,
+                mouseY: 654.75,
+                scrollX: nil,
+                scrollY: nil,
+                videoCurrentTime: nil
+            ),
+            rows: []
+        )
+
+        let metadataJSON = try makeRawLinkMetadataJSONWithState(
+            pageURL: "https://example.com/articles/current",
+            linkURL: "https://example.com/docs/install",
+            linkText: "Install guide",
+            left: 0.10,
+            top: 0.20,
+            width: 0.30,
+            height: 0.05,
+            mouseX: 900.5,
+            mouseY: 500.25,
+            scrollX: 12.0,
+            scrollY: 34.0
+        )
+
+        try await database.updateFrameMetadata(frameID: fixture.frameID, metadataJSON: metadataJSON)
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "Install guide",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50)
+        )
+
+        try await queue.resolveInPageURLMetadataIfPossible(frameID: fixture.frameID.value)
+
+        let state = try await database.getFrameInPageURLState(frameID: fixture.frameID)
+        let rows = try await database.getFrameInPageURLRows(frameID: fixture.frameID)
+        let clearedMetadata = try await database.getFrameMetadata(frameID: fixture.frameID)
+
+        let resolvedState = try XCTUnwrap(state)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.mouseX), 321.25, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.mouseY), 654.75, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.scrollX), 12.0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.scrollY), 34.0, accuracy: 0.0001)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertNil(clearedMetadata)
+    }
+
+    func testResolveInPageURLMetadataDoesNotPersistBrowserMousePosition() async throws {
+        let fixture = try await insertFrameFixture()
+        let metadataJSON = try makeRawLinkMetadataJSONWithState(
+            pageURL: "https://example.com/articles/current",
+            linkURL: "https://example.com/docs/install",
+            linkText: "Install guide",
+            left: 0.10,
+            top: 0.20,
+            width: 0.30,
+            height: 0.05,
+            mouseX: 900.5,
+            mouseY: 500.25,
+            scrollX: 12.0,
+            scrollY: 34.0
+        )
+
+        try await database.updateFrameMetadata(frameID: fixture.frameID, metadataJSON: metadataJSON)
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "Install guide",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50)
+        )
+
+        try await queue.resolveInPageURLMetadataIfPossible(frameID: fixture.frameID.value)
+
+        let state = try await database.getFrameInPageURLState(frameID: fixture.frameID)
+        let clearedMetadata = try await database.getFrameMetadata(frameID: fixture.frameID)
+
+        let resolvedState = try XCTUnwrap(state)
+        XCTAssertNil(resolvedState.mouseX)
+        XCTAssertNil(resolvedState.mouseY)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.scrollX), 12.0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(resolvedState.scrollY), 34.0, accuracy: 0.0001)
+        XCTAssertNil(clearedMetadata)
+    }
+
     private func insertFrameFixture(
         frameWidth: Int = 1_000,
         frameHeight: Int = 1_000
@@ -224,6 +313,44 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         height: Double
     ) -> String {
         "{\"pageurl\":\"\(pageURL)\",\"rawlinks\":[{\"url\":\"\(linkURL)\",\"text\":\"\(linkText)\",\"left\":\(left),\"top\":\(top),\"width\":\(width),\"height\":\(height)}],\"urls\":[]}"
+    }
+
+    private func makeRawLinkMetadataJSONWithState(
+        pageURL: String,
+        linkURL: String,
+        linkText: String,
+        left: Double,
+        top: Double,
+        width: Double,
+        height: Double,
+        mouseX: Double,
+        mouseY: Double,
+        scrollX: Double,
+        scrollY: Double
+    ) throws -> String {
+        let payload: [String: Any] = [
+            "pageurl": pageURL,
+            "rawlinks": [[
+                "url": linkURL,
+                "text": linkText,
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height
+            ]],
+            "urls": [],
+            "mouseposition": [
+                "x": mouseX,
+                "y": mouseY
+            ],
+            "scrollposition": [
+                "x": scrollX,
+                "y": scrollY
+            ]
+        ]
+
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+        return String(decoding: data, as: UTF8.self)
     }
 }
 

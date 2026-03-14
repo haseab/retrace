@@ -3606,12 +3606,7 @@ public actor AppCoordinator {
             pageurl: payload.pageUrl,
             rawlinks: dedupedRawLinks,
             urls: [],
-            mouseposition: payload.mousePosition.map {
-                PendingInPageURLMetadataPoint(
-                    x: roundedMetadataCoordinate($0.x),
-                    y: roundedMetadataCoordinate($0.y)
-                )
-            },
+            mouseposition: nil,
             scrollposition: payload.scrollPosition.map {
                 PendingInPageURLMetadataPoint(
                     x: roundedMetadataCoordinate($0.x),
@@ -3918,13 +3913,6 @@ public actor AppCoordinator {
     private static var inPageURLCaptureJavaScript: String {
         """
         (function() {
-            if (!window.__retraceMouseTrackingInstalled) {
-                window.__retraceMouseTrackingInstalled = true;
-                window.addEventListener('mousemove', function(event) {
-                    window.__retraceLastMousePosition = { x: event.clientX, y: event.clientY };
-                }, { passive: true });
-            }
-
             const links = document.links;
             const maxLinks = \(inPageURLRawLinkLimit);
             const maxScannedLinks = 800;
@@ -3972,16 +3960,6 @@ public actor AppCoordinator {
                 });
             }
 
-            let mousePosition = null;
-            if (window.__retraceLastMousePosition &&
-                typeof window.__retraceLastMousePosition.x === 'number' &&
-                typeof window.__retraceLastMousePosition.y === 'number') {
-                mousePosition = {
-                    x: window.__retraceLastMousePosition.x,
-                    y: window.__retraceLastMousePosition.y
-                };
-            }
-
             let scrollPosition = (() => {
                 const rawX = Number(window.scrollX);
                 const fallbackX = Number(window.pageXOffset);
@@ -4019,7 +3997,6 @@ public actor AppCoordinator {
             return JSON.stringify({
                 pageUrl: location.href,
                 links: out,
-                mousePosition: mousePosition,
                 scrollPosition: scrollPosition,
                 videoPosition: videoPosition
             });
