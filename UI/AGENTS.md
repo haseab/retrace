@@ -30,6 +30,10 @@ UI/
 │   │   ├── AnalyticsCard.swift          # Stats widgets
 │   │   ├── MigrationPanel.swift         # Import UI
 │   │   └── SupportLink.swift            # Twitter/support
+│   ├── Feedback/
+│   │   ├── FeedbackFormView.swift       # Feedback sheet with form, sending, and success states
+│   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
+│   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
 │       ├── SettingsView.swift           # Settings root
 │       ├── CaptureSettings.swift        # Capture config
@@ -47,12 +51,16 @@ UI/
 │   ├── TimelineViewModel.swift
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
+│   ├── FeedbackSubmissionProgress.swift # Feedback submission stage copy/progress metadata
 │   └── SettingsViewModel.swift
 └── Tests/
     ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
+    ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
+    ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
-    ├── InPageURLSettingsTests.swift      # In-page URL browser support coverage
+    ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
     ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
     └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
 ```

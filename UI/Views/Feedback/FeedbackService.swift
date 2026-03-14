@@ -26,7 +26,7 @@ public protocol FeedbackStatsProvider {
 /// Memory-spike diagnostics add only a small allowlist of Retrace/media-system helper process
 /// names (for example `VTDecoderXPCService`) because those are directly relevant to decoder leaks.
 /// No file paths, no user data. Settings use a strict whitelist (see `collectSanitizedSettingsSnapshot`).
-public final class FeedbackService {
+public final class FeedbackService: @unchecked Sendable {
 
     public static let shared = FeedbackService()
 
@@ -999,6 +999,34 @@ public final class FeedbackService {
         } catch {
             return nil
         }
+    }
+
+    public func exportFeedbackReport(
+        _ submission: FeedbackSubmission,
+        to textURL: URL,
+        launchSource: FeedbackLaunchContext.Source? = nil
+    ) async throws -> [URL] {
+        let screenshotURL = submission.includeScreenshot
+            ? textURL.deletingPathExtension().appendingPathExtension("screenshot.png")
+            : nil
+        let screenshotFileName = screenshotURL?.lastPathComponent
+        let exportText = submission.exportText(
+            generatedAt: Date(),
+            launchSource: launchSource,
+            screenshotFileName: screenshotFileName
+        )
+
+        return try await Task.detached(priority: .userInitiated) {
+            try exportText.write(to: textURL, atomically: true, encoding: .utf8)
+
+            var exportedURLs = [textURL]
+            if let screenshotURL,
+               let screenshotData = submission.screenshotData {
+                try screenshotData.write(to: screenshotURL, options: .atomic)
+                exportedURLs.append(screenshotURL)
+            }
+            return exportedURLs
+        }.value
     }
 }
 

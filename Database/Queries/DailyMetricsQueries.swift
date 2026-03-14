@@ -69,6 +69,7 @@ public enum DailyMetricsQueries {
         case inPageURLRightClick = "in_page_url_right_click"  // metadata: JSON {url, linkText, nodeID}
         case inPageURLCopyLink = "in_page_url_copy_link"  // metadata: JSON {url, linkText, nodeID}
         case browserLinkOpened = "browser_link_opened"
+        case feedbackReportExport = "feedback_report_export"  // metadata: JSON {outcome, source, feedbackType, includeLogs, includeScreenshot, exportedFileCount}
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}

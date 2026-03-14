@@ -104,7 +104,7 @@ public struct DiagnosticInfo: Codable {
     public let performanceInfo: PerformanceInfo
     public let emergencyCrashReports: [String]?
 
-    public struct DatabaseStats: Codable {
+    public struct DatabaseStats: Codable, Sendable {
         public let sessionCount: Int
         public let frameCount: Int
         public let segmentCount: Int
@@ -233,7 +233,8 @@ public struct DiagnosticInfo: Codable {
         processInfo: ProcessInfo = ProcessInfo(totalRunning: 0, eventMonitoringApps: 0, windowManagementApps: 0, securityApps: 0, hasJamf: false, hasKandji: false, axuiServerCPU: 0, windowServerCPU: 0),
         accessibilityInfo: AccessibilityInfo = AccessibilityInfo(voiceOverEnabled: false, switchControlEnabled: false, reduceMotionEnabled: false, increaseContrastEnabled: false, reduceTransparencyEnabled: false, differentiateWithoutColorEnabled: false, displayHasInvertedColors: false),
         performanceInfo: PerformanceInfo = PerformanceInfo(cpuUsagePercent: 0, memoryUsedGB: 0, memoryTotalGB: 0, memoryPressure: "unknown", swapUsedGB: 0, thermalState: "unknown", processorCount: 0, isLowPowerModeEnabled: false, powerSource: "unknown", batteryLevel: nil),
-        emergencyCrashReports: [String]? = nil
+        emergencyCrashReports: [String]? = nil,
+        timestamp: Date = Date()
     ) {
         self.appVersion = appVersion
         self.buildNumber = buildNumber
@@ -250,7 +251,7 @@ public struct DiagnosticInfo: Codable {
         self.accessibilityInfo = accessibilityInfo
         self.performanceInfo = performanceInfo
         self.emergencyCrashReports = emergencyCrashReports
-        self.timestamp = Date()
+        self.timestamp = timestamp
     }
 
     private var memoryProfileEntries: [String] {
@@ -429,5 +430,147 @@ public struct FeedbackSubmission: Codable {
         self.diagnostics = diagnostics
         self.includeScreenshot = includeScreenshot
         self.screenshotData = screenshotData
+    }
+}
+
+extension FeedbackSubmission {
+    fileprivate static let exportTimestampFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    public var exportSuggestedBaseName: String {
+        Self.suggestedBaseName(forType: type, timestamp: diagnostics.timestamp)
+    }
+
+    public static func suggestedBaseName(forType type: String, timestamp: Date = Date()) -> String {
+        let typeSlug = type
+            .lowercased()
+            .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        let formattedTimestamp = exportFileTimestampFormatter.string(from: timestamp)
+        return "retrace-feedback-\(typeSlug.isEmpty ? "report" : typeSlug)-\(formattedTimestamp)"
+    }
+
+    public func exportText(
+        generatedAt: Date = Date(),
+        launchSource: FeedbackLaunchContext.Source? = nil,
+        screenshotFileName: String? = nil
+    ) -> String {
+        let generatedAtString = Self.exportTimestampFormatter.string(from: generatedAt)
+        let diagnosticsTimestamp = Self.exportTimestampFormatter.string(from: diagnostics.timestamp)
+        let screenshotLabel = includeScreenshot ? (screenshotFileName ?? "(attached separately)") : "(none)"
+        let trimmedDescription = description.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let structureGuide = [
+            "summary header: export metadata, report type, and attachment state",
+            "structure guide: quick map of the sections that follow",
+            "feedback section: user-entered email and description",
+            "diagnostics section: full environment snapshot included with the report",
+            "attachment section: exported screenshot filename when present",
+            "JSON footer markers: BEGIN/END SUBMISSION JSON delimit the machine-readable payload"
+        ]
+
+        let summaryLines = [
+            "RETRACE FEEDBACK EXPORT (USER REPORT)",
+            "generated_at: \(generatedAtString)",
+            "export_format_version: 1",
+            "submission_endpoint: https://retrace.to/api/feedback",
+            "feedback_type: \(type)",
+            "launch_source: \(launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue)",
+            "report_email: \(email ?? "(none)")",
+            "description_length: \(description.count)",
+            "diagnostics_timestamp: \(diagnosticsTimestamp)",
+            "recent_errors_count: \(diagnostics.recentErrors.count)",
+            "recent_logs_count: \(diagnostics.recentLogs.count)",
+            "includes_screenshot: \(includeScreenshot ? "yes" : "no")",
+            "screenshot_file: \(screenshotLabel)",
+            "",
+            "STRUCTURE GUIDE",
+        ] + structureGuide.enumerated().map { index, line in
+            "\(String(format: "%02d", index + 1)). \(line)"
+        }
+
+        let payload = FeedbackExportEnvelope(
+            metadata: FeedbackExportEnvelope.Metadata(
+                description: "LLM-oriented export of the feedback report prepared by Retrace.",
+                exportFormatVersion: 1,
+                generatedAt: generatedAt,
+                submissionEndpoint: "https://retrace.to/api/feedback",
+                launchSource: launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue,
+                screenshotFileName: screenshotFileName,
+                screenshotByteCount: screenshotData?.count
+            ),
+            report: FeedbackExportEnvelope.Report(
+                type: type,
+                email: email,
+                description: description,
+                includeScreenshot: includeScreenshot,
+                diagnostics: diagnostics
+            )
+        )
+
+        return [
+            summaryLines.joined(separator: "\n"),
+            "",
+            "=== FEEDBACK ===",
+            "Type: \(type)",
+            "Email: \(email ?? "(none)")",
+            "",
+            "Description:",
+            trimmedDescription.isEmpty ? "(empty)" : trimmedDescription,
+            "",
+            "=== DIAGNOSTICS ===",
+            diagnostics.fullFormattedText(),
+            "",
+            "=== ATTACHMENTS ===",
+            includeScreenshot ? "Screenshot: \(screenshotLabel)" : "Screenshot: none",
+            "",
+            "=== BEGIN SUBMISSION JSON ===",
+            payload.prettyPrintedJSON() ?? "{}",
+            "=== END SUBMISSION JSON ==="
+        ].joined(separator: "\n")
+    }
+
+    private static let exportFileTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return formatter
+    }()
+}
+
+private struct FeedbackExportEnvelope: Encodable {
+    struct Metadata: Encodable {
+        let description: String
+        let exportFormatVersion: Int
+        let generatedAt: Date
+        let submissionEndpoint: String
+        let launchSource: String
+        let screenshotFileName: String?
+        let screenshotByteCount: Int?
+    }
+
+    struct Report: Encodable {
+        let type: String
+        let email: String?
+        let description: String
+        let includeScreenshot: Bool
+        let diagnostics: DiagnosticInfo
+    }
+
+    let metadata: Metadata
+    let report: Report
+
+    func prettyPrintedJSON() -> String? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(self) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
     }
 }

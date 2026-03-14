@@ -1,9 +1,18 @@
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
+import Dispatch
+import Database
 import Shared
 
 // MARK: - Feedback View Model
+
+struct FeedbackSubmissionFailureState: Equatable {
+    let title: String
+    let detail: String
+    let symbolName: String
+    let isNetworkRelated: Bool
+}
 
 @MainActor
 public final class FeedbackViewModel: ObservableObject {
@@ -24,20 +33,83 @@ public final class FeedbackViewModel: ObservableObject {
     // MARK: - Submission State
 
     @Published public var isSubmitting: Bool = false
+    @Published public var isExporting: Bool = false
     @Published public var isSubmitted: Bool = false
     @Published public var error: String?
+    @Published private(set) var submissionStage: FeedbackSubmissionStage?
+    @Published private(set) var submissionProgress: Double = 0
+    @Published private(set) var submissionFailure: FeedbackSubmissionFailureState?
 
     // MARK: - Services
 
     private let feedbackService = FeedbackService.shared
     private weak var coordinatorWrapper: AppCoordinatorWrapper?
+    private let launchSource: FeedbackLaunchContext.Source?
+    private var submissionProgressTask: Task<Void, Never>?
+    private var submissionStageTask: Task<Void, Never>?
+    private var uploadStageStartedAt: Date?
+    private var uploadStageInitialProgress: Double = 0
+
+    private let minimumUploadDisplaySeconds: TimeInterval = 8.0
+    private let uploadProgressRampSeconds: TimeInterval = 8.0
 
     // MARK: - Computed Properties
 
     public var canSubmit: Bool {
         !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !isSubmitting &&
+        !isExporting &&
         isEmailValid
+    }
+
+    public var canExport: Bool {
+        !isSubmitting &&
+        !isExporting
+    }
+
+    var submissionTitle: String {
+        FeedbackSubmissionProgress.copy(
+            for: feedbackType,
+            stage: submissionStage
+        ).title
+    }
+
+    var submissionDetail: String {
+        FeedbackSubmissionProgress.copy(
+            for: feedbackType,
+            stage: submissionStage
+        ).detail
+    }
+
+    var submissionSteps: [FeedbackSubmissionStep] {
+        FeedbackSubmissionProgress.steps(
+            for: feedbackType,
+            currentStage: submissionStage
+        )
+    }
+
+    var submissionPercentText: String {
+        "\(max(1, Int((submissionProgress * 100).rounded())))%"
+    }
+
+    var hasSubmissionFailure: Bool {
+        submissionFailure != nil
+    }
+
+    var submissionFailureTitle: String {
+        submissionFailure?.title ?? "Feedback wasn't sent"
+    }
+
+    var submissionFailureDetail: String {
+        submissionFailure?.detail ?? "Something went wrong while sending feedback."
+    }
+
+    var submissionFailureSymbolName: String {
+        submissionFailure?.symbolName ?? "exclamationmark.triangle.fill"
+    }
+
+    var submissionFailureIsNetworkRelated: Bool {
+        submissionFailure?.isNetworkRelated ?? false
     }
 
     /// Email is valid if empty or matches email format
@@ -84,6 +156,7 @@ public final class FeedbackViewModel: ObservableObject {
     // MARK: - Initialization
 
     public init(launchContext: FeedbackLaunchContext? = nil) {
+        self.launchSource = launchContext?.source
         if let launchContext {
             feedbackType = launchContext.feedbackType
             description = launchContext.prefilledDescription ?? ""
@@ -120,9 +193,12 @@ public final class FeedbackViewModel: ObservableObject {
     public func loadDiagnostics() {
         let includeLogs = includesLogsInDiagnostics
         let stats = fallbackDatabaseStats
-        diagnostics = includeLogs
-            ? feedbackService.collectDiagnostics()
-            : feedbackService.collectDiagnosticsNoLogs(with: stats)
+        Task {
+            diagnostics = await collectFullDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: includeLogs ? nil : stats
+            )
+        }
     }
 
     /// Load diagnostics quickly for preview (5-minute log window, optimized query)
@@ -138,9 +214,10 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            diagnostics = includeLogs
-                ? feedbackService.collectDiagnosticsQuick(with: stats)
-                : feedbackService.collectDiagnosticsNoLogs(with: stats)
+            diagnostics = await collectQuickDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: stats
+            )
             return
         }
 
@@ -163,10 +240,10 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            // Use quick diagnostics with file-based log buffer (instant)
-            self.diagnostics = includeLogs
-                ? feedbackService.collectDiagnosticsQuick(with: stats)
-                : feedbackService.collectDiagnosticsNoLogs(with: stats)
+            self.diagnostics = await collectQuickDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: stats
+            )
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load quick stats: \(error)", category: .ui)
             let stats = DiagnosticInfo.DatabaseStats(
@@ -175,21 +252,20 @@ public final class FeedbackViewModel: ObservableObject {
                 segmentCount: 0,
                 databaseSizeMB: 0
             )
-            // Still use quick diagnostics - it uses file-based buffer now
-            diagnostics = includeLogs
-                ? feedbackService.collectDiagnosticsQuick(with: stats)
-                : feedbackService.collectDiagnosticsNoLogs(with: stats)
+            diagnostics = await collectQuickDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: stats
+            )
         }
     }
 
     /// Load full diagnostic information with complete stats.
     private func loadDiagnosticsWithRealStats(includeLogs: Bool) async {
         guard let wrapper = coordinatorWrapper else {
-            if includeLogs {
-                diagnostics = feedbackService.collectDiagnostics()
-            } else {
-                diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackDatabaseStats)
-            }
+            diagnostics = await collectFullDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: includeLogs ? nil : fallbackDatabaseStats
+            )
             return
         }
 
@@ -211,16 +287,16 @@ public final class FeedbackViewModel: ObservableObject {
                 databaseSizeMB: dbSizeMB
             )
 
-            self.diagnostics = includeLogs
-                ? feedbackService.collectDiagnostics(with: stats)
-                : feedbackService.collectDiagnosticsNoLogs(with: stats)
+            self.diagnostics = await collectFullDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: stats
+            )
         } catch {
             Log.warning("[FeedbackViewModel] Failed to load real stats: \(error)", category: .ui)
-            if includeLogs {
-                diagnostics = feedbackService.collectDiagnostics()
-            } else {
-                diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackDatabaseStats)
-            }
+            diagnostics = await collectFullDiagnosticsInBackground(
+                includeLogs: includeLogs,
+                stats: includeLogs ? nil : fallbackDatabaseStats
+            )
         }
     }
 
@@ -228,22 +304,20 @@ public final class FeedbackViewModel: ObservableObject {
     public func submit() async {
         guard canSubmit else { return }
 
+        let submissionType = feedbackType
         isSubmitting = true
         error = nil
-
-        let submissionType = feedbackType
-        let includeLogs = submissionType == .bug
-
-        // Collect full diagnostics, but only include logs for bug reports.
-        await loadDiagnosticsWithRealStats(includeLogs: includeLogs)
-
-        guard let diagnostics = diagnostics else {
-            self.error = "Failed to collect diagnostics"
-            isSubmitting = false
-            return
-        }
+        submissionFailure = nil
+        beginSubmissionExperience(for: submissionType)
 
         do {
+            await loadDiagnosticsWithRealStats(includeLogs: submissionType == .bug)
+
+            guard let diagnostics else {
+                throw FeedbackError.invalidData
+            }
+
+            transitionSubmission(to: .packaging, cancelAutomaticStages: true)
             let submission = FeedbackSubmission(
                 type: submissionType,
                 email: email.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -253,13 +327,51 @@ public final class FeedbackViewModel: ObservableObject {
                 screenshotData: attachedImageData
             )
 
+            transitionSubmission(to: .upload, cancelAutomaticStages: true)
             _ = try await feedbackService.submitFeedback(submission)
+            await waitForMinimumUploadDisplay()
+            transitionSubmission(to: .confirmation, cancelAutomaticStages: true)
+            await completeSubmissionExperience()
             isSubmitted = true
         } catch {
+            if uploadStageStartedAt != nil {
+                await waitForMinimumUploadDisplay()
+            }
             self.error = error.localizedDescription
+            submissionFailure = Self.makeSubmissionFailure(from: error)
+            resetSubmissionExperience()
         }
 
         isSubmitting = false
+    }
+
+    public func exportFeedbackReport() async {
+        guard canExport else { return }
+
+        error = nil
+
+        let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).txt"
+        guard let exportURL = await chooseExportURL(defaultFileName: suggestedFileName) else {
+            recordFeedbackExportMetric(outcome: "cancelled", exportedFileCount: 0)
+            return
+        }
+
+        isExporting = true
+        defer { isExporting = false }
+
+        do {
+            let submission = try await buildSubmission()
+            let exportedURLs = try await feedbackService.exportFeedbackReport(
+                submission,
+                to: exportURL,
+                launchSource: launchSource
+            )
+            NSWorkspace.shared.activateFileViewerSelecting(exportedURLs)
+            recordFeedbackExportMetric(outcome: "exported", exportedFileCount: exportedURLs.count)
+        } catch {
+            self.error = "Failed to save feedback report: \(error.localizedDescription)"
+            recordFeedbackExportMetric(outcome: "failed", exportedFileCount: 0)
+        }
     }
 
     /// Copy diagnostics to clipboard
@@ -277,15 +389,199 @@ public final class FeedbackViewModel: ObservableObject {
 
     /// Reset form for new submission
     public func reset() {
+        cancelTransientTasks()
         feedbackType = .bug
         email = ""
         description = ""
         attachedImage = nil
         attachedImageData = nil
+        isSubmitting = false
+        isExporting = false
         isSubmitted = false
         error = nil
+        submissionStage = nil
+        submissionProgress = 0
+        submissionFailure = nil
         Task {
             await loadDiagnosticsWithRealStats(includeLogs: true)
+        }
+    }
+
+    public func teardown() {
+        cancelTransientTasks()
+    }
+
+    func clearSubmissionFailure() {
+        submissionFailure = nil
+    }
+
+    private func beginSubmissionExperience(for type: FeedbackType) {
+        cancelTransientTasks()
+
+        let initialStage = FeedbackSubmissionProgress.initialStage(for: type)
+        uploadStageStartedAt = nil
+        uploadStageInitialProgress = 0
+        withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
+            submissionStage = initialStage
+            submissionProgress = initialStage.minimumVisibleProgress
+        }
+
+        startSubmissionProgressTask()
+        startSubmissionStageTask(for: type)
+    }
+
+    private func transitionSubmission(
+        to stage: FeedbackSubmissionStage,
+        cancelAutomaticStages: Bool = false
+    ) {
+        if cancelAutomaticStages {
+            submissionStageTask?.cancel()
+            submissionStageTask = nil
+        }
+
+        let minimumVisibleProgress = stage == .upload
+            ? submissionProgress
+            : stage.minimumVisibleProgress
+
+        withAnimation(.easeInOut(duration: 0.28)) {
+            submissionStage = stage
+            submissionProgress = max(
+                submissionProgress,
+                minimumVisibleProgress
+            )
+        }
+
+        if stage == .upload {
+            uploadStageStartedAt = Date()
+            uploadStageInitialProgress = submissionProgress
+        } else if stage == .confirmation {
+            uploadStageStartedAt = nil
+        }
+    }
+
+    private func completeSubmissionExperience() async {
+        cancelTransientTasks()
+
+        withAnimation(.easeOut(duration: 0.24)) {
+            submissionProgress = 1
+        }
+
+        try? await Task.sleep(for: .milliseconds(260))
+    }
+
+    private func resetSubmissionExperience() {
+        cancelTransientTasks()
+        submissionStage = nil
+        submissionProgress = 0
+        uploadStageStartedAt = nil
+        uploadStageInitialProgress = 0
+    }
+
+    private func cancelTransientTasks() {
+        submissionProgressTask?.cancel()
+        submissionProgressTask = nil
+        submissionStageTask?.cancel()
+        submissionStageTask = nil
+    }
+
+    private func startSubmissionProgressTask() {
+        submissionProgressTask?.cancel()
+        submissionProgressTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                let stage = self.submissionStage ?? FeedbackSubmissionProgress.initialStage(for: self.feedbackType)
+                if stage == .upload {
+                    if let uploadStageStartedAt = self.uploadStageStartedAt {
+                        let elapsed = Date().timeIntervalSince(uploadStageStartedAt)
+                        let progressFraction = min(max(elapsed / self.uploadProgressRampSeconds, 0), 1)
+                        let target = self.uploadStageInitialProgress +
+                            ((stage.targetProgress - self.uploadStageInitialProgress) * progressFraction)
+
+                        if target > self.submissionProgress {
+                            withAnimation(.linear(duration: 0.1)) {
+                                self.submissionProgress = min(stage.targetProgress, target)
+                            }
+                        }
+                    }
+                } else {
+                    let target = stage.targetProgress
+
+                    if self.submissionProgress < target {
+                        let increment = max(0.008, (target - self.submissionProgress) * 0.2)
+                        withAnimation(.linear(duration: 0.12)) {
+                            self.submissionProgress = min(
+                                target,
+                                self.submissionProgress + increment
+                            )
+                        }
+                    }
+                }
+
+                try? await Task.sleep(for: .milliseconds(90))
+            }
+        }
+    }
+
+    private func startSubmissionStageTask(for type: FeedbackType) {
+        let stages = FeedbackSubmissionProgress.automaticStages(for: type)
+        guard !stages.isEmpty else { return }
+
+        submissionStageTask?.cancel()
+        submissionStageTask = Task { [weak self] in
+            for stage in stages {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, self.isSubmitting else { return }
+                if self.submissionStage == .upload || self.submissionStage == .confirmation {
+                    return
+                }
+                self.transitionSubmission(to: stage)
+            }
+        }
+    }
+
+    private func waitForMinimumUploadDisplay() async {
+        guard let uploadStageStartedAt else { return }
+
+        let elapsed = Date().timeIntervalSince(uploadStageStartedAt)
+        let remainingMs = Int(max(0, (minimumUploadDisplaySeconds - elapsed) * 1000).rounded())
+        guard remainingMs > 0 else { return }
+
+        try? await Task.sleep(for: .milliseconds(remainingMs))
+    }
+
+    private func collectQuickDiagnosticsInBackground(
+        includeLogs: Bool,
+        stats: DiagnosticInfo.DatabaseStats
+    ) async -> DiagnosticInfo {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
+                let diagnostics = includeLogs
+                    ? feedbackService.collectDiagnosticsQuick(with: stats)
+                    : feedbackService.collectDiagnosticsNoLogs(with: stats)
+                continuation.resume(returning: diagnostics)
+            }
+        }
+    }
+
+    private func collectFullDiagnosticsInBackground(
+        includeLogs: Bool,
+        stats: DiagnosticInfo.DatabaseStats?
+    ) async -> DiagnosticInfo {
+        let fallbackStats = fallbackDatabaseStats
+
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
+                let diagnostics: DiagnosticInfo
+                if let stats {
+                    diagnostics = includeLogs
+                        ? feedbackService.collectDiagnostics(with: stats)
+                        : feedbackService.collectDiagnosticsNoLogs(with: stats)
+                } else if includeLogs {
+                    diagnostics = feedbackService.collectDiagnostics()
+                } else {
+                    diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
+                }
+                continuation.resume(returning: diagnostics)
+            }
         }
     }
 
@@ -334,5 +630,84 @@ public final class FeedbackViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             attachImage(from: url)
         }
+    }
+
+    private func buildSubmission() async throws -> FeedbackSubmission {
+        await loadDiagnosticsWithRealStats(includeLogs: feedbackType == .bug)
+
+        guard let diagnostics else {
+            throw FeedbackError.invalidData
+        }
+
+        return FeedbackSubmission(
+            type: feedbackType,
+            email: email.trimmingCharacters(in: .whitespacesAndNewlines),
+            description: description,
+            diagnostics: diagnostics,
+            includeScreenshot: attachedImageData != nil,
+            screenshotData: attachedImageData
+        )
+    }
+
+    private func chooseExportURL(defaultFileName: String) async -> URL? {
+        await withCheckedContinuation { continuation in
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.plainText]
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = defaultFileName
+            panel.message = "Save the feedback report as a text file"
+            panel.prompt = "Download"
+
+            panel.begin { response in
+                continuation.resume(returning: response == .OK ? panel.url : nil)
+            }
+        }
+    }
+
+    private func recordFeedbackExportMetric(outcome: String, exportedFileCount: Int) {
+        guard let coordinator = coordinatorWrapper?.coordinator else { return }
+
+        let metadata = Self.metricMetadata([
+            "outcome": outcome,
+            "source": launchSource?.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue,
+            "feedbackType": feedbackType.rawValue,
+            "includeLogs": includesLogsInDiagnostics,
+            "includeScreenshot": attachedImageData != nil,
+            "exportedFileCount": exportedFileCount
+        ])
+
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: .feedbackReportExport,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func metricMetadata(_ payload: [String: Any]) -> String? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
+    }
+
+    static func makeSubmissionFailure(from error: Error) -> FeedbackSubmissionFailureState {
+        if case FeedbackError.networkError = error {
+            return FeedbackSubmissionFailureState(
+                title: "No network connection",
+                detail: "Retrace couldn't reach the internet from this Mac. If network access is blocked, go back and use Download .txt instead.",
+                symbolName: "wifi.slash",
+                isNetworkRelated: true
+            )
+        }
+
+        return FeedbackSubmissionFailureState(
+            title: "Feedback wasn't sent",
+            detail: error.localizedDescription,
+            symbolName: "exclamationmark.triangle.fill",
+            isNetworkRelated: false
+        )
     }
 }
