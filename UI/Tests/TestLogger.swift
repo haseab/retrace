@@ -1968,6 +1968,81 @@ final class TimelineBoundaryOlderFallbackTests: XCTestCase {
         XCTAssertFalse(paginationState.hasReachedAbsoluteStart)
     }
 
+    func testLoadOlderFramesFallsBackToNearestQueryAfterSparseWindowedProbe() async {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let baseDate = Date(timeIntervalSince1970: 1_700_401_000)
+        var recordedCalls: [(limit: Int, startDate: Date?, endDate: Date?, reason: String)] = []
+
+        viewModel.frames = [
+            makeTimelineFrame(
+                id: 10,
+                timestamp: baseDate,
+                frameIndex: 0,
+                bundleID: "com.apple.Safari"
+            ),
+            makeTimelineFrame(
+                id: 11,
+                timestamp: baseDate.addingTimeInterval(1),
+                frameIndex: 1,
+                bundleID: "com.apple.Safari"
+            )
+        ]
+        viewModel.currentIndex = 1
+        viewModel.filterCriteria = FilterCriteria()
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: true, hasMoreNewer: false)
+        viewModel.test_updateWindowBoundaries()
+
+        viewModel.test_windowFetchHooks.getFramesWithVideoInfoBefore = { timestamp, limit, filters, reason in
+            recordedCalls.append((limit, filters.startDate, filters.endDate, reason))
+            if limit == 25 {
+                XCTAssertEqual(timestamp, baseDate)
+                XCTAssertNotNil(filters.startDate)
+                XCTAssertNotNil(filters.endDate)
+                return [
+                    self.makeFrameWithVideoInfo(
+                        id: 9,
+                        timestamp: baseDate.addingTimeInterval(-10),
+                        frameIndex: 9,
+                        bundleID: "com.apple.Rewind"
+                    )
+                ]
+            }
+
+            XCTAssertEqual(limit, 50)
+            XCTAssertNil(filters.startDate)
+            XCTAssertNil(filters.endDate)
+            XCTAssertTrue(reason.contains("nearestFallback"))
+
+            return [
+                self.makeFrameWithVideoInfo(
+                    id: 8,
+                    timestamp: baseDate.addingTimeInterval(-120),
+                    frameIndex: 8,
+                    bundleID: "com.apple.Rewind"
+                ),
+                self.makeFrameWithVideoInfo(
+                    id: 7,
+                    timestamp: baseDate.addingTimeInterval(-240),
+                    frameIndex: 7,
+                    bundleID: "com.apple.Rewind"
+                )
+            ]
+        }
+
+        await viewModel.test_loadOlderFrames()
+
+        XCTAssertEqual(recordedCalls.count, 2)
+        XCTAssertEqual(recordedCalls.map(\.limit), [25, 50])
+        XCTAssertEqual(viewModel.frames.count, 4)
+        XCTAssertEqual(viewModel.frames.first?.frame.id.value, 7)
+        XCTAssertEqual(viewModel.frames[1].frame.id.value, 8)
+        XCTAssertEqual(viewModel.currentIndex, 3)
+
+        let paginationState = viewModel.test_boundaryPaginationState()
+        XCTAssertTrue(paginationState.hasMoreOlder)
+        XCTAssertFalse(paginationState.hasReachedAbsoluteStart)
+    }
+
     private func makeTimelineFrame(
         id: Int64,
         timestamp: Date,

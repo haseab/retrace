@@ -26,6 +26,7 @@ private enum WindowConfig {
     static let loadBatchSize = 25        // Frames to load per batch
     static let loadWindowSpanSeconds: TimeInterval = 24 * 60 * 60 // Bounded window for load-more queries
     static let nearestFallbackBatchSize = 50 // Frames to fetch when a bounded older probe comes back empty
+    static let olderSparseRetryThreshold = loadBatchSize // Retry with nearest fallback when bounded probe under-fills the batch
 }
 
 /// Memory tracking for debugging frame accumulation issues
@@ -12273,13 +12274,18 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
 
-            if framesWithVideoInfoDescending.isEmpty, !hasMetadataFilter {
+            let shouldRetryNearestFallback = !hasMetadataFilter
+                && framesWithVideoInfoDescending.count < WindowConfig.olderSparseRetryThreshold
+
+            if shouldRetryNearestFallback {
+                let boundedCount = framesWithVideoInfoDescending.count
+                let fallbackTrigger = boundedCount == 0 ? "empty" : "sparse"
                 Log.info(
-                    "[BoundaryOlder] FALLBACK_START reason=\(reason) strategy=nearest before=\(Log.timestamp(from: oldestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
+                    "[BoundaryOlder] FALLBACK_START reason=\(reason) strategy=nearest trigger=\(fallbackTrigger) boundedCount=\(boundedCount) threshold=\(WindowConfig.olderSparseRetryThreshold) before=\(Log.timestamp(from: oldestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
                     category: .ui
                 )
                 let fallbackStart = CFAbsoluteTimeGetCurrent()
-                framesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
+                let fallbackFramesWithVideoInfoDescending = try await fetchFramesWithVideoInfoBeforeLogged(
                     timestamp: oldestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
                     filters: filterCriteria,
@@ -12287,9 +12293,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
 
-                if let nearest = framesWithVideoInfoDescending.first, let farthest = framesWithVideoInfoDescending.last {
+                if let nearest = fallbackFramesWithVideoInfoDescending.first, let farthest = fallbackFramesWithVideoInfoDescending.last {
                     Log.info(
-                        "[BoundaryOlder] FALLBACK_RESULT reason=\(reason) count=\(framesWithVideoInfoDescending.count) nearest=\(Log.timestamp(from: nearest.frame.timestamp)) farthest=\(Log.timestamp(from: farthest.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        "[BoundaryOlder] FALLBACK_RESULT reason=\(reason) count=\(fallbackFramesWithVideoInfoDescending.count) nearest=\(Log.timestamp(from: nearest.frame.timestamp)) farthest=\(Log.timestamp(from: farthest.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
                         category: .ui
                     )
                 } else {
@@ -12297,6 +12303,21 @@ public class SimpleTimelineViewModel: ObservableObject {
                         "[BoundaryOlder] FALLBACK_RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", fallbackElapsedMs))ms",
                         category: .ui
                     )
+                }
+
+                if fallbackFramesWithVideoInfoDescending.count > boundedCount {
+                    Log.info(
+                        "[BoundaryOlder] FALLBACK_APPLY reason=\(reason) boundedCount=\(boundedCount) replacementCount=\(fallbackFramesWithVideoInfoDescending.count)",
+                        category: .ui
+                    )
+                    framesWithVideoInfoDescending = fallbackFramesWithVideoInfoDescending
+                } else if boundedCount > 0 {
+                    Log.info(
+                        "[BoundaryOlder] FALLBACK_KEEP reason=\(reason) boundedCount=\(boundedCount) fallbackCount=\(fallbackFramesWithVideoInfoDescending.count)",
+                        category: .ui
+                    )
+                } else {
+                    framesWithVideoInfoDescending = fallbackFramesWithVideoInfoDescending
                 }
             }
 
