@@ -1080,6 +1080,8 @@ public struct DashboardView: View {
         let dailyData = viewModel.dailyStorageData
         guard !dailyData.isEmpty else { return "est. 0 GB/month" }
 
+        // NOTE: This estimate uses dailyStorageData, which includes DB growth estimates in addition to chunks.
+        // In practice this can read ~20% higher than a chunks-only monthly projection.
         // Sum all daily values and extrapolate to 30 days
         let totalBytes = dailyData.reduce(0) { $0 + $1.value }
         let daysWithData = dailyData.count
