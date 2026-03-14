@@ -404,6 +404,33 @@ final class CrashReportSupportTests: XCTestCase {
         XCTAssertEqual(result?.fileName, olderReport.lastPathComponent)
     }
 
+    func testLoadRecentWALFailureCrashAcknowledgedNewestAlsoHidesOlderReports() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        _ = try createCrashReport(
+            named: "retrace-emergency-wal_unavailable-2026-03-08_120000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_021_600),
+            in: directoryURL
+        )
+        _ = try createCrashReport(
+            named: "retrace-emergency-wal_unavailable-2026-03-09_110000.txt",
+            modifiedAt: Date(timeIntervalSince1970: 1_773_090_000),
+            in: directoryURL
+        )
+
+        let result = DashboardViewModel.loadRecentWALFailureCrash(
+            fileManager: fileManager,
+            crashReportDirectory: directoryURL.path,
+            now: Date(timeIntervalSince1970: 1_773_093_600),
+            acknowledgedBeforeDate: Date(timeIntervalSince1970: 1_773_090_000)
+        )
+
+        XCTAssertNil(result)
+    }
+
     func testWALFailureLaunchContextPrefillsBugReportAndEmailFocus() {
         let report = WALFailureCrashReportSummary(
             fileName: "retrace-emergency-wal_unavailable-2026-03-09_110000.txt",

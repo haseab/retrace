@@ -136,6 +136,7 @@ public class DashboardViewModel: ObservableObject {
     private static let legacyAcknowledgedWatchdogCrashReportKeysKey = "acknowledgedWatchdogCrashReportFileNames"
     private static let acknowledgedWALFailureCrashReportKey = "acknowledgedWALFailureCrashReportFileName"
     private static let acknowledgedWALFailureCrashReportKeysKey = "acknowledgedWALFailureCrashReportFileNames"
+    private static let acknowledgedWALFailureCrashReportCutoffTimestampMsKey = "acknowledgedWALFailureCrashReportCutoffTimestampMs"
 
     // MARK: - Dependencies
 
@@ -594,8 +595,27 @@ public class DashboardViewModel: ObservableObject {
         fileManager: FileManager = .default,
         crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
         now: Date = Date(),
-        acknowledgedFileNames: Set<String> = []
+        acknowledgedFileNames: Set<String> = [],
+        acknowledgedBeforeDate: Date? = nil
     ) -> WALFailureCrashReportSummary? {
+        let reports = loadRecentWALFailureCrashReports(
+            fileManager: fileManager,
+            crashReportDirectory: crashReportDirectory,
+            now: now
+        )
+        return reports.first { report in
+            if let acknowledgedBeforeDate, report.capturedAt <= acknowledgedBeforeDate {
+                return false
+            }
+            return !acknowledgedFileNames.contains(report.fileName)
+        }
+    }
+
+    nonisolated private static func loadRecentWALFailureCrashReports(
+        fileManager: FileManager = .default,
+        crashReportDirectory: String = EmergencyDiagnostics.crashReportDirectory,
+        now: Date = Date()
+    ) -> [WALFailureCrashReportSummary] {
         let directoryURL = URL(fileURLWithPath: crashReportDirectory, isDirectory: true)
         let resourceKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
@@ -608,7 +628,7 @@ public class DashboardViewModel: ObservableObject {
             includingPropertiesForKeys: Array(resourceKeys),
             options: [.skipsHiddenFiles]
         ) else {
-            return nil
+            return []
         }
 
         let prefix = "retrace-emergency-wal_unavailable-"
@@ -641,7 +661,7 @@ public class DashboardViewModel: ObservableObject {
         }
         .sorted { $0.capturedAt > $1.capturedAt }
 
-        return reports.first { !acknowledgedFileNames.contains($0.fileName) }
+        return reports
     }
 
     nonisolated static func makeCrashFeedbackDescription(
@@ -784,17 +804,30 @@ public class DashboardViewModel: ObservableObject {
     private func refreshRecentWALFailureCrashState(now: Date = Date()) {
         let previousFileName = recentWALFailureCrash?.fileName
         let acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
-        let report = Self.loadRecentWALFailureCrash(
-            now: now,
-            acknowledgedFileNames: acknowledgedFileNames
+        let acknowledgedBeforeDate = loadAcknowledgedWALFailureCrashReportCutoffDate()
+        let reports = Self.loadRecentWALFailureCrashReports(
+            now: now
         )
+        let unacknowledgedReports = reports.filter { report in
+            if let acknowledgedBeforeDate, report.capturedAt <= acknowledgedBeforeDate {
+                return false
+            }
+            return !acknowledgedFileNames.contains(report.fileName)
+        }
+        let report = unacknowledgedReports.first
 
         recentWALFailureCrash = report
 
         if report?.fileName != previousFileName {
             let acknowledgedList = acknowledgedFileNames.sorted().joined(separator: ", ")
+            let unacknowledgedPreview = unacknowledgedReports
+                .prefix(3)
+                .map(\.fileName)
+                .joined(separator: ", ")
+            let nextAfterCurrent = unacknowledgedReports.dropFirst().first?.fileName ?? "none"
+            let cutoffDescription = acknowledgedBeforeDate.map { String(Int64($0.timeIntervalSince1970)) } ?? "none"
             Log.info(
-                "[RECOVERY BANNER] Refresh previous=\(previousFileName ?? "none") next=\(report?.fileName ?? "none") acknowledgedCount=\(acknowledgedFileNames.count) acknowledgedFiles=[\(acknowledgedList)]",
+                "[RECOVERY BANNER] Refresh previous=\(previousFileName ?? "none") next=\(report?.fileName ?? "none") nextAfterCurrent=\(nextAfterCurrent) recentReportCount=\(reports.count) unacknowledgedCount=\(unacknowledgedReports.count) walAcknowledgedBeforeEpochSeconds=\(cutoffDescription) unacknowledgedPreview=[\(unacknowledgedPreview)] acknowledgedCount=\(acknowledgedFileNames.count) acknowledgedFiles=[\(acknowledgedList)]",
                 category: .ui
             )
         }
@@ -810,12 +843,29 @@ public class DashboardViewModel: ObservableObject {
     private func acknowledgeRecentWALFailureCrash(action: String) {
         guard let report = recentWALFailureCrash else { return }
         var acknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
+        let existingCutoff = loadAcknowledgedWALFailureCrashReportCutoffDate()
         let alreadyAcknowledged = acknowledgedFileNames.contains(report.fileName)
         acknowledgedFileNames.insert(report.fileName)
-        persistAcknowledgedWALFailureCrashFileNames(acknowledgedFileNames)
-        let acknowledgedList = acknowledgedFileNames.sorted().joined(separator: ", ")
+        let synchronizeSucceeded = persistAcknowledgedWALFailureCrashFileNames(acknowledgedFileNames)
+        let acknowledgedBeforeDate = max(existingCutoff ?? .distantPast, report.capturedAt)
+        let cutoffSynchronizeSucceeded = persistAcknowledgedWALFailureCrashReportCutoffDate(acknowledgedBeforeDate)
+        let persistedAcknowledgedFileNames = loadAcknowledgedWALFailureCrashFileNames()
+        let persistedCutoff = loadAcknowledgedWALFailureCrashReportCutoffDate()
+        let persistedCutoffEpochSeconds = persistedCutoff.map { Int64($0.timeIntervalSince1970) }
+        let intendedCutoffEpochSeconds = Int64(acknowledgedBeforeDate.timeIntervalSince1970)
+        let persistedCutoffMatches = persistedCutoffEpochSeconds == intendedCutoffEpochSeconds
+        let persistedContainsFile = persistedAcknowledgedFileNames.contains(report.fileName)
+        let reports = Self.loadRecentWALFailureCrashReports(now: Date())
+        let remainingUnacknowledgedReports = reports.filter { candidate in
+            if let persistedCutoff, candidate.capturedAt <= persistedCutoff {
+                return false
+            }
+            return !persistedAcknowledgedFileNames.contains(candidate.fileName)
+        }
+        let nextAfterAcknowledge = remainingUnacknowledgedReports.first?.fileName ?? "none"
+        let acknowledgedList = persistedAcknowledgedFileNames.sorted().joined(separator: ", ")
         Log.info(
-            "[RECOVERY BANNER] Acknowledge action=\(action) file=\(report.fileName) alreadyAcknowledged=\(alreadyAcknowledged) acknowledgedCount=\(acknowledgedFileNames.count) acknowledgedFiles=[\(acknowledgedList)]",
+            "[RECOVERY BANNER] Acknowledge action=\(action) file=\(report.fileName) alreadyAcknowledged=\(alreadyAcknowledged) synchronizeSucceeded=\(synchronizeSucceeded) cutoffSynchronizeSucceeded=\(cutoffSynchronizeSucceeded) persistedContainsFile=\(persistedContainsFile) persistedCutoffMatches=\(persistedCutoffMatches) walAcknowledgedBeforeEpochSeconds=\(persistedCutoffEpochSeconds.map(String.init) ?? "none") acknowledgedCount=\(persistedAcknowledgedFileNames.count) remainingUnacknowledgedCount=\(remainingUnacknowledgedReports.count) nextAfterAcknowledge=\(nextAfterAcknowledge) acknowledgedFiles=[\(acknowledgedList)]",
             category: .ui
         )
         recordWALFailureBannerAction(action, report: report)
@@ -870,10 +920,27 @@ public class DashboardViewModel: ObservableObject {
         return acknowledgedFileNames
     }
 
-    private func persistAcknowledgedWALFailureCrashFileNames(_ fileNames: Set<String>) {
+    @discardableResult
+    private func persistAcknowledgedWALFailureCrashFileNames(_ fileNames: Set<String>) -> Bool {
         settingsStore.set(fileNames.sorted(), forKey: Self.acknowledgedWALFailureCrashReportKeysKey)
         settingsStore.removeObject(forKey: Self.acknowledgedWALFailureCrashReportKey)
-        settingsStore.synchronize()
+        return settingsStore.synchronize()
+    }
+
+    private func loadAcknowledgedWALFailureCrashReportCutoffDate() -> Date? {
+        let cutoffTimestampMs = (settingsStore.object(
+            forKey: Self.acknowledgedWALFailureCrashReportCutoffTimestampMsKey
+        ) as? NSNumber)?.doubleValue
+
+        guard let cutoffTimestampMs else { return nil }
+        return Date(timeIntervalSince1970: cutoffTimestampMs / 1000)
+    }
+
+    @discardableResult
+    private func persistAcknowledgedWALFailureCrashReportCutoffDate(_ date: Date) -> Bool {
+        let timestampMs = Int64(date.timeIntervalSince1970 * 1000)
+        settingsStore.set(timestampMs, forKey: Self.acknowledgedWALFailureCrashReportCutoffTimestampMsKey)
+        return settingsStore.synchronize()
     }
 
     private func persistAcknowledgedCrashReportCutoffDate(_ date: Date) {
