@@ -2345,7 +2345,7 @@ private struct CapturedMouseCursorOverlay: View {
         return (image: recolored, hotSpot: cursor.hotSpot)
     }()
 
-    private var renderedCursorSize: CGSize {
+    private static func resolvedRenderedCursorSize() -> CGSize {
         guard let cursor = Self.macStyledCursor else { return Self.targetCursorSize }
 
         let widthScale = Self.targetCursorSize.width / cursor.image.size.width
@@ -2357,16 +2357,25 @@ private struct CapturedMouseCursorOverlay: View {
         )
     }
 
-    /// AppKit hotSpot uses image coordinates (origin bottom-left), while this overlay is top-left.
-    private var renderedHotspot: CGPoint {
+    /// Keep hotspot in the same orientation as the rendered cursor image.
+    /// The previous Y flip pushed the cursor image upward near top-edge frames.
+    private static func resolvedRenderedHotspot(for renderedCursorSize: CGSize) -> CGPoint {
         guard let cursor = Self.macStyledCursor else { return Self.fallbackHotspot }
         guard cursor.image.size.width > 0, cursor.image.size.height > 0 else { return Self.fallbackHotspot }
 
         let scale = renderedCursorSize.width / cursor.image.size.width
         return CGPoint(
             x: cursor.hotSpot.x * scale,
-            y: (cursor.image.size.height - cursor.hotSpot.y) * scale
+            y: cursor.hotSpot.y * scale
         )
+    }
+
+    private var renderedCursorSize: CGSize {
+        Self.resolvedRenderedCursorSize()
+    }
+
+    private var renderedHotspot: CGPoint {
+        Self.resolvedRenderedHotspot(for: renderedCursorSize)
     }
 
     var body: some View {
@@ -2389,7 +2398,7 @@ private struct CapturedMouseCursorOverlay: View {
                 }
             }
         }
-        .shadow(color: .black.opacity(0.3), radius: 2.2, x: 1.4, y: 1.8)
+        .shadow(color: .black.opacity(0.22), radius: 1.6, x: 0, y: 0)
         .opacity(Self.cursorOpacity)
         .frame(width: renderedCursorSize.width, height: renderedCursorSize.height, alignment: .topLeading)
         .position(
@@ -2400,6 +2409,9 @@ private struct CapturedMouseCursorOverlay: View {
 
     /// Keep native white edge pixels and recolor only the dark cursor core to brand blue.
     private static func recoloredMacCursorImage(_ image: NSImage) -> NSImage? {
+        let pointSize = image.size
+        guard pointSize.width > 0, pointSize.height > 0 else { return nil }
+
         let pixelWidth = image.representations.map(\.pixelsWide).max() ?? Int(image.size.width.rounded())
         let pixelHeight = image.representations.map(\.pixelsHigh).max() ?? Int(image.size.height.rounded())
         guard pixelWidth > 0, pixelHeight > 0 else { return nil }
@@ -2419,14 +2431,15 @@ private struct CapturedMouseCursorOverlay: View {
             return nil
         }
 
-        bitmap.size = CGSize(width: pixelWidth, height: pixelHeight)
+        // Preserve point-space sizing so cursor hotspot coordinates stay in the same unit space.
+        bitmap.size = pointSize
         NSGraphicsContext.saveGraphicsState()
         defer { NSGraphicsContext.restoreGraphicsState() }
 
         guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
         NSGraphicsContext.current = context
         image.draw(
-            in: NSRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight),
+            in: NSRect(origin: .zero, size: pointSize),
             from: .zero,
             operation: .copy,
             fraction: 1
@@ -2463,7 +2476,7 @@ private struct CapturedMouseCursorOverlay: View {
             }
         }
 
-        let output = NSImage(size: CGSize(width: pixelWidth, height: pixelHeight))
+        let output = NSImage(size: pointSize)
         output.addRepresentation(bitmap)
         return output
     }

@@ -530,10 +530,6 @@ enum AppSegmentQueries {
     ) throws -> [(bundleID: String, duration: TimeInterval, uniqueItemCount: Int)] {
         let traceID = String(UUID().uuidString.prefix(8))
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
-        Log.debug(
-            "[DASHBOARD-SQL][\(traceID)] getAppUsageStats START range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))]",
-            category: .database
-        )
         let maxGapMs: Int64 = 120_000  // 2 minutes
 
         // Browser bundle IDs as SQL list for CASE expression
@@ -686,8 +682,6 @@ enum AppSegmentQueries {
         let completionMessage = "[DASHBOARD-SQL][\(traceID)] getAppUsageStats END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
         if totalElapsedMs >= 2500 {
             Log.warning(completionMessage, category: .database)
-        } else {
-            Log.info(completionMessage, category: .database)
         }
 
         return results
@@ -1208,10 +1202,6 @@ enum AppSegmentQueries {
     ) throws -> [(date: Date, value: Int64)] {
         let traceID = String(UUID().uuidString.prefix(8))
         let totalStartedAt = CFAbsoluteTimeGetCurrent()
-        Log.debug(
-            "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime START range=[\(Log.timestamp(from: startDate)) -> \(Log.timestamp(from: endDate))]",
-            category: .database
-        )
         let maxGapMs: Int64 = 120_000  // 2 minutes - gaps larger than this are considered idle
 
         // Calculate screen time from frame gaps, grouped by local day
@@ -1319,8 +1309,6 @@ enum AppSegmentQueries {
         let completionMessage = "[DASHBOARD-SQL][\(traceID)] getDailyScreenTime END rows=\(results.count) totalDurationSec=\(Int(totalDurationMs / 1000)) prepare=\(String(format: "%.1f", prepareElapsedMs))ms execute=\(String(format: "%.1f", executeElapsedMs))ms total=\(String(format: "%.1f", totalElapsedMs))ms"
         if totalElapsedMs >= 5000 {
             Log.warning(completionMessage, category: .database)
-        } else {
-            Log.info(completionMessage, category: .database)
         }
 
         return results
