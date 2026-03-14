@@ -62,6 +62,8 @@ public enum DailyMetricsQueries {
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
         case systemMonitorOpenPowerOCRPriority = "system_monitor_open_power_ocr_priority"
         case inPageURLCollectionToggle = "in_page_url_collection_toggle"
+        case mousePositionCaptureToggle = "mouse_position_capture_toggle"
+        case mouseMovementDeduplicationToggle = "mouse_movement_deduplication_toggle"
         case inPageURLPermissionProbe = "in_page_url_permission_probe"
         case inPageURLVerification = "in_page_url_verification"
         case inPageURLHover = "in_page_url_hover"  // metadata: JSON {url, linkText, nodeID}

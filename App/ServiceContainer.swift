@@ -700,6 +700,7 @@ extension CaptureConfig {
         let deleteDuplicateFrames = defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true
         // Deduplication threshold - how similar frames must be to be considered duplicates
         let deduplicationThreshold = defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold
+        let keepFramesOnMouseMovement = defaults.object(forKey: "keepFramesOnMouseMovement") as? Bool ?? true
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
@@ -727,6 +728,7 @@ extension CaptureConfig {
             captureIntervalSeconds: captureIntervalSeconds,
             adaptiveCaptureEnabled: deleteDuplicateFrames, // Controlled by "Delete duplicate frames" setting
             deduplicationThreshold: deduplicationThreshold, // Controlled by "Similarity threshold" slider in settings
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement,
             maxResolution: .uhd4K,
             excludedAppBundleIDs: excludedBundleIDs,
             excludePrivateWindows: excludePrivateWindows,

@@ -1,5 +1,6 @@
 import XCTest
 import Shared
+import CoreGraphics
 @testable import Capture
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -203,6 +204,48 @@ final class DeduplicationTests: XCTestCase {
         // Verify: higher threshold filters more frames (is stricter)
         XCTAssertTrue(shouldKeepLowThreshold, "Low threshold keeps frames")
         XCTAssertFalse(shouldKeepHighThreshold, "High threshold filters frames")
+    }
+
+    func testShouldKeepFrameForMouseMovement_Disabled_ReturnsFalse() {
+        let shouldKeep = CaptureManager.shouldKeepFrameForMouseMovement(
+            enabled: false,
+            previousMousePosition: CGPoint(x: 10, y: 10),
+            currentMousePosition: CGPoint(x: 100, y: 100)
+        )
+
+        XCTAssertFalse(shouldKeep, "Mouse movement bypass should be disabled when setting is off")
+    }
+
+    func testShouldKeepFrameForMouseMovement_CursorEnteredFrame_ReturnsTrue() {
+        let shouldKeep = CaptureManager.shouldKeepFrameForMouseMovement(
+            enabled: true,
+            previousMousePosition: nil,
+            currentMousePosition: CGPoint(x: 50, y: 25)
+        )
+
+        XCTAssertTrue(shouldKeep, "Frame should be kept when cursor appears in captured display")
+    }
+
+    func testShouldKeepFrameForMouseMovement_BelowThreshold_ReturnsFalse() {
+        let shouldKeep = CaptureManager.shouldKeepFrameForMouseMovement(
+            enabled: true,
+            previousMousePosition: CGPoint(x: 20, y: 20),
+            currentMousePosition: CGPoint(x: 20.2, y: 20.2),
+            minimumMovementPoints: 1.0
+        )
+
+        XCTAssertFalse(shouldKeep, "Tiny movement should not bypass deduplication")
+    }
+
+    func testShouldKeepFrameForMouseMovement_AtThreshold_ReturnsTrue() {
+        let shouldKeep = CaptureManager.shouldKeepFrameForMouseMovement(
+            enabled: true,
+            previousMousePosition: CGPoint(x: 1, y: 1),
+            currentMousePosition: CGPoint(x: 2, y: 1),
+            minimumMovementPoints: 1.0
+        )
+
+        XCTAssertTrue(shouldKeep, "Movement at threshold should keep frame")
     }
 
     // ┌──────────────────────────────────────────────────────────────────────────┐

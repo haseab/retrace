@@ -1192,6 +1192,10 @@ public actor AppCoordinator {
                     source: .native
                 )
                 let frameID = try await services.database.insertFrame(frameRef)
+                await persistGlobalMousePositionIfNeeded(
+                    frameID: frameID,
+                    capturedFrame: frame
+                )
                 scheduleInPageURLMetadataCaptureIfNeeded(
                     frameID: frameID,
                     frameMetadata: frame.metadata
@@ -3103,6 +3107,7 @@ public actor AppCoordinator {
     // MARK: - In-Page URL Metadata Capture
 
     private static let inPageURLCollectionExperimentalKey = "collectInPageURLsExperimental"
+    private static let captureMousePositionKey = "captureMousePosition"
     private static let inPageURLChromiumBundleIDs: Set<String> = [
         "com.google.Chrome",
         "com.google.Chrome.canary",
@@ -3271,6 +3276,35 @@ public actor AppCoordinator {
         case invalidOutput(String)
     }
 
+    private func persistGlobalMousePositionIfNeeded(
+        frameID: Int64,
+        capturedFrame: CapturedFrame
+    ) async {
+        guard Self.isMousePositionCollectionEnabled(),
+              let mousePosition = Self.globalMousePosition(in: capturedFrame) else {
+            return
+        }
+
+        do {
+            try await services.database.replaceFrameInPageURLData(
+                frameID: FrameID(value: frameID),
+                state: Database.FrameInPageURLState(
+                    mouseX: mousePosition.x,
+                    mouseY: mousePosition.y,
+                    scrollX: nil,
+                    scrollY: nil,
+                    videoCurrentTime: nil
+                ),
+                rows: []
+            )
+        } catch {
+            Log.warning(
+                "[MousePosition] Failed to persist mouse position for frame \(frameID): \(error)",
+                category: .app
+            )
+        }
+    }
+
     private func scheduleInPageURLMetadataCaptureIfNeeded(
         frameID: Int64,
         frameMetadata: FrameMetadata
@@ -3325,6 +3359,46 @@ public actor AppCoordinator {
             return false
         }
         return defaults.bool(forKey: inPageURLCollectionExperimentalKey)
+    }
+
+    private static func isMousePositionCollectionEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.object(forKey: captureMousePositionKey) != nil else {
+            return true
+        }
+        return defaults.bool(forKey: captureMousePositionKey)
+    }
+
+    private static func globalMousePosition(in frame: CapturedFrame) -> PendingInPageURLMetadataPoint? {
+        guard frame.width > 0, frame.height > 0 else { return nil }
+
+        guard let event = CGEvent(source: nil) else { return nil }
+        let location = event.location
+        let displayID = CGDirectDisplayID(frame.metadata.displayID)
+        let displayBounds = CGDisplayBounds(displayID)
+        guard displayBounds.width > 0,
+              displayBounds.height > 0,
+              displayBounds.contains(location) else {
+            return nil
+        }
+
+        let relativeX = location.x - displayBounds.origin.x
+        let relativeY = location.y - displayBounds.origin.y
+        let scaleX = Double(frame.width) / Double(displayBounds.width)
+        let scaleY = Double(frame.height) / Double(displayBounds.height)
+
+        // CGEvent.location is already top-down in display coordinates.
+        // Store top-down frame coordinates so timeline overlays can map directly.
+        let x = relativeX * scaleX
+        let y = relativeY * scaleY
+
+        let clampedX = min(max(x, 0), Double(frame.width - 1))
+        let clampedY = min(max(y, 0), Double(frame.height - 1))
+
+        return PendingInPageURLMetadataPoint(
+            x: roundedMetadataCoordinate(clampedX),
+            y: roundedMetadataCoordinate(clampedY)
+        )
     }
 
     private static func isInPageURLCaptureSupported(bundleID: String) -> Bool {

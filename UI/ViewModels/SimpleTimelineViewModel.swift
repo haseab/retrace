@@ -375,6 +375,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     nonisolated private static let inPageURLCollectionExperimentalKey = "collectInPageURLsExperimental"
+    nonisolated private static let captureMousePositionKey = "captureMousePosition"
 
     private static func isInPageURLCollectionEnabled() -> Bool {
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
@@ -382,6 +383,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             return false
         }
         return defaults.bool(forKey: inPageURLCollectionExperimentalKey)
+    }
+
+    private static func isMousePositionCaptureEnabled() -> Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.object(forKey: captureMousePositionKey) != nil else {
+            return true
+        }
+        return defaults.bool(forKey: captureMousePositionKey)
     }
 
     // MARK: - Published State
@@ -434,6 +443,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         didSet {
             if currentIndex != oldValue {
                 endInPageURLHoverTracking()
+                frameMousePositionTask?.cancel()
+                frameMousePositionTask = nil
+                frameMousePosition = nil
                 if Self.isVerboseTimelineLoggingEnabled {
                     Log.debug("[SimpleTimelineViewModel] currentIndex changed: \(oldValue) -> \(currentIndex)", category: .ui)
                     if let frame = currentTimelineFrame {
@@ -583,6 +595,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Hyperlinks mapped from live DOM to OCR node bounds for the current frame.
     @Published public var hyperlinkMatches: [OCRHyperlinkMatch] = []
 
+    /// Global mouse position for the current frame in captured-frame pixel coordinates.
+    @Published public var frameMousePosition: CGPoint?
+
 
     /// Flag to force video reload on next updateNSView (clears AVPlayer's stale cache)
     /// Set this when window becomes visible after background refresh
@@ -650,6 +665,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Current in-flight task for stored hyperlink row loading.
     private var hyperlinkMappingTask: Task<Void, Never>?
+    private var frameMousePositionTask: Task<Void, Never>?
 
     /// Deduplicates a single continuous hover even if AppKit/SwiftUI replays hover callbacks.
     private var activeInPageURLHoverMetricKey: String?
@@ -1818,6 +1834,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         diskFrameBufferMemoryLogTask?.cancel()
         diskFrameBufferInactivityCleanupTask?.cancel()
         foregroundFrameLoadTask?.cancel()
+        frameMousePositionTask?.cancel()
         cacheExpansionTask?.cancel()
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
@@ -7531,6 +7548,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Skip during live mode - live screenshot is already displayed and OCR is handled separately
         guard !isInLiveMode else {
             clearHyperlinkMatches()
+            frameMousePositionTask?.cancel()
+            frameMousePositionTask = nil
+            frameMousePosition = nil
             return
         }
         guard presentationWorkEnabled else { return }
@@ -7541,6 +7561,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 Log.debug("[TIMELINE-LOAD] loadImageIfNeeded() called but currentTimelineFrame is nil", category: .ui)
             }
             clearHyperlinkMatches()
+            frameMousePositionTask?.cancel()
+            frameMousePositionTask = nil
+            frameMousePosition = nil
             return
         }
 
@@ -7549,6 +7572,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let presentationGeneration = currentPresentationWorkGeneration()
+        loadFrameMousePosition(expectedGeneration: presentationGeneration)
 
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {
@@ -8143,6 +8167,53 @@ public class SimpleTimelineViewModel: ObservableObject {
                     urlBoundingBox = nil
                 }
             }
+        }
+    }
+
+    private func loadFrameMousePosition(expectedGeneration: UInt64 = 0) {
+        guard Self.isMousePositionCaptureEnabled() else {
+            frameMousePositionTask?.cancel()
+            frameMousePositionTask = nil
+            frameMousePosition = nil
+            return
+        }
+
+        guard let timelineFrame = currentTimelineFrame else {
+            frameMousePositionTask?.cancel()
+            frameMousePositionTask = nil
+            frameMousePosition = nil
+            return
+        }
+
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        let frameID = timelineFrame.frame.id
+        guard canPublishPresentationResult(
+            frameID: frameID,
+            expectedGeneration: generation
+        ) else { return }
+
+        frameMousePositionTask?.cancel()
+        frameMousePositionTask = nil
+
+        let metadataMousePosition = timelineFrame.frame.metadata.mousePosition
+        let nextMousePosition: CGPoint?
+        if let metadataMousePosition,
+           metadataMousePosition.x.isFinite,
+           metadataMousePosition.y.isFinite,
+           metadataMousePosition.x >= 0,
+           metadataMousePosition.y >= 0 {
+            nextMousePosition = metadataMousePosition
+        } else {
+            nextMousePosition = nil
+        }
+
+        if canPublishPresentationResult(
+            frameID: frameID,
+            expectedGeneration: generation
+        ) {
+            frameMousePosition = nextMousePosition
         }
     }
 

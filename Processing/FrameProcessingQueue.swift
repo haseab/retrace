@@ -941,9 +941,17 @@ public actor FrameProcessingQueue {
             resolvedURLs = []
         }
 
+        var mouseX = payload.mouseposition?.x
+        var mouseY = payload.mouseposition?.y
+        if mouseX == nil, mouseY == nil,
+           let existingState = try await databaseManager.getFrameInPageURLState(frameID: frameID) {
+            mouseX = existingState.mouseX
+            mouseY = existingState.mouseY
+        }
+
         let state = FrameInPageURLState(
-            mouseX: payload.mouseposition?.x,
-            mouseY: payload.mouseposition?.y,
+            mouseX: mouseX,
+            mouseY: mouseY,
             scrollX: payload.scrollposition?.x,
             scrollY: payload.scrollposition?.y,
             videoCurrentTime: payload.videoposition?.currenttime

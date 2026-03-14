@@ -1628,6 +1628,18 @@ final class DatabaseManagerTests: XCTestCase {
                 )
             )
 
+            try await customDatabase.replaceFrameInPageURLData(
+                frameID: FrameID(value: frameID),
+                state: FrameInPageURLState(
+                    mouseX: 321.25,
+                    mouseY: 654.75,
+                    scrollX: nil,
+                    scrollY: nil,
+                    videoCurrentTime: nil
+                ),
+                rows: []
+            )
+
             let frameWithVideoInfo = try await customDatabase.getFrameWithVideoInfoByID(
                 id: FrameID(value: frameID)
             )
@@ -1638,6 +1650,8 @@ final class DatabaseManagerTests: XCTestCase {
                 videoInfo.videoPath,
                 tempDir.appendingPathComponent("chunks/202603/12/1234.mp4").path
             )
+            XCTAssertEqual(Double(frame.frame.metadata.mousePosition?.x ?? 0), 321.25, accuracy: 0.0001)
+            XCTAssertEqual(Double(frame.frame.metadata.mousePosition?.y ?? 0), 654.75, accuracy: 0.0001)
 
             try await customDatabase.close()
         } catch {

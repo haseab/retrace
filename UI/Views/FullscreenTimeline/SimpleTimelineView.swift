@@ -1985,6 +1985,7 @@ class DoubleBufferedVideoView: NSView {
 struct FrameWithURLOverlay<Content: View>: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
+    @AppStorage("captureMousePosition", store: timelineSettingsStore) private var captureMousePosition = true
     let onURLClicked: () -> Void
     let content: () -> Content
 
@@ -1999,6 +2000,12 @@ struct FrameWithURLOverlay<Content: View>: View {
             let actualFrameRect = calculateActualDisplayedFrameRect(
                 containerSize: geometry.size,
                 viewModel: viewModel
+            )
+            let framePixelSize = currentFramePixelSize(viewModel: viewModel)
+            let capturedMouseCursorPoint = capturedMouseOverlayPoint(
+                mousePosition: viewModel.frameMousePosition,
+                framePixelSize: framePixelSize,
+                actualFrameRect: actualFrameRect
             )
             let shouldGuideHideControlsInContextMenu = shouldGuideHideControlsRow(
                 containerSize: geometry.size,
@@ -2050,6 +2057,15 @@ struct FrameWithURLOverlay<Content: View>: View {
                 // Normal mode overlays (when not zooming or transitioning)
                 if showNormal {
                     // Normal mode overlays
+
+                    if captureMousePosition,
+                       !viewModel.isInLiveMode,
+                       let cursorPoint = capturedMouseCursorPoint {
+                        CapturedMouseCursorOverlay(point: cursorPoint)
+                            .scaleEffect(viewModel.frameZoomScale)
+                            .offset(viewModel.frameZoomOffset)
+                            .allowsHitTesting(false)
+                    }
 
                     // Zoom region drag preview (shown while Shift+dragging)
                     if viewModel.isDraggingZoomRegion,
@@ -2197,24 +2213,7 @@ struct FrameWithURLOverlay<Content: View>: View {
     /// Calculate the actual displayed frame rect within the container
     /// Takes into account aspect ratio fitting
     private func calculateActualDisplayedFrameRect(containerSize: CGSize, viewModel: SimpleTimelineViewModel) -> CGRect {
-        // Get the actual frame dimensions from videoInfo (database)
-        // Don't use NSImage.size as that requires extracting the frame from video first
-        let frameSize: CGSize
-        if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
-            // Live mode: use screenshot dimensions (must check BEFORE videoInfo,
-            // since videoInfo may still be set from the last recorded frame with a different aspect ratio)
-            frameSize = CGSize(
-                width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
-                height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
-            )
-        } else if let videoInfo = viewModel.currentVideoInfo,
-           let width = videoInfo.width,
-           let height = videoInfo.height {
-            frameSize = CGSize(width: width, height: height)
-        } else {
-            // Fallback to standard macOS screen dimensions (should rarely be needed)
-            frameSize = CGSize(width: 1920, height: 1080)
-        }
+        let frameSize = currentFramePixelSize(viewModel: viewModel)
 
         // Calculate aspect-fit dimensions
         let containerAspect = containerSize.width / containerSize.height
@@ -2248,6 +2247,56 @@ struct FrameWithURLOverlay<Content: View>: View {
         return CGRect(origin: offset, size: displayedSize)
     }
 
+    private func currentFramePixelSize(viewModel: SimpleTimelineViewModel) -> CGSize {
+        // Get the actual frame dimensions from videoInfo (database)
+        // Don't use NSImage.size as that requires extracting the frame from video first
+        let frameSize: CGSize
+        if viewModel.isInLiveMode, let liveImage = viewModel.liveScreenshot {
+            // Live mode: use screenshot dimensions (must check BEFORE videoInfo,
+            // since videoInfo may still be set from the last recorded frame with a different aspect ratio)
+            frameSize = CGSize(
+                width: liveImage.representations.first?.pixelsWide ?? Int(liveImage.size.width),
+                height: liveImage.representations.first?.pixelsHigh ?? Int(liveImage.size.height)
+            )
+        } else if let videoInfo = viewModel.currentVideoInfo,
+           let width = videoInfo.width,
+           let height = videoInfo.height {
+            frameSize = CGSize(width: width, height: height)
+        } else if let image = viewModel.displayableCurrentImage {
+            frameSize = CGSize(
+                width: image.representations.first?.pixelsWide ?? Int(image.size.width),
+                height: image.representations.first?.pixelsHigh ?? Int(image.size.height)
+            )
+        } else if let fallbackImage = viewModel.waitingVideoFallbackImage {
+            frameSize = CGSize(
+                width: fallbackImage.representations.first?.pixelsWide ?? Int(fallbackImage.size.width),
+                height: fallbackImage.representations.first?.pixelsHigh ?? Int(fallbackImage.size.height)
+            )
+        } else {
+            // Fallback to standard macOS screen dimensions (should rarely be needed)
+            frameSize = CGSize(width: 1920, height: 1080)
+        }
+
+        return frameSize
+    }
+
+    private func capturedMouseOverlayPoint(
+        mousePosition: CGPoint?,
+        framePixelSize: CGSize,
+        actualFrameRect: CGRect
+    ) -> CGPoint? {
+        guard let mousePosition else { return nil }
+        guard framePixelSize.width > 1, framePixelSize.height > 1 else { return nil }
+
+        let normalizedX = min(max(mousePosition.x / framePixelSize.width, 0), 1)
+        let normalizedY = min(max(mousePosition.y / framePixelSize.height, 0), 1)
+
+        return CGPoint(
+            x: actualFrameRect.origin.x + (normalizedX * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (normalizedY * actualFrameRect.height)
+        )
+    }
+
     /// Keep menu guidance behavior aligned with the top hint shown when highlighted OCR sits near the tape.
     private func shouldGuideHideControlsRow(containerSize: CGSize, actualFrameRect: CGRect) -> Bool {
         guard viewModel.isShowingSearchHighlight else { return false }
@@ -2274,6 +2323,149 @@ struct FrameWithURLOverlay<Content: View>: View {
         }
 
         return false
+    }
+}
+
+private struct CapturedMouseCursorOverlay: View {
+    let point: CGPoint
+    private static let targetCursorSize = CGSize(width: 29, height: 40)
+    private static let macCursorVisualScale: CGFloat = 1.12
+    private static let fallbackHotspot = CGPoint(x: 3.26, y: 3.26)
+    private static let fallbackOuterCursorFontSize: CGFloat = 32.6
+    private static let fallbackInnerCursorFontSize: CGFloat = 29.4
+    private static let cursorOpacity: Double = 0.5
+
+    private static let macStyledCursor: (image: NSImage, hotSpot: CGPoint)? = {
+        let cursor = NSCursor.arrow
+        let image = cursor.image
+        guard image.size.width > 0, image.size.height > 0,
+              let recolored = recoloredMacCursorImage(image) else {
+            return nil
+        }
+        return (image: recolored, hotSpot: cursor.hotSpot)
+    }()
+
+    private var renderedCursorSize: CGSize {
+        guard let cursor = Self.macStyledCursor else { return Self.targetCursorSize }
+
+        let widthScale = Self.targetCursorSize.width / cursor.image.size.width
+        let heightScale = Self.targetCursorSize.height / cursor.image.size.height
+        let scale = min(widthScale, heightScale) * Self.macCursorVisualScale
+        return CGSize(
+            width: cursor.image.size.width * scale,
+            height: cursor.image.size.height * scale
+        )
+    }
+
+    /// AppKit hotSpot uses image coordinates (origin bottom-left), while this overlay is top-left.
+    private var renderedHotspot: CGPoint {
+        guard let cursor = Self.macStyledCursor else { return Self.fallbackHotspot }
+        guard cursor.image.size.width > 0, cursor.image.size.height > 0 else { return Self.fallbackHotspot }
+
+        let scale = renderedCursorSize.width / cursor.image.size.width
+        return CGPoint(
+            x: cursor.hotSpot.x * scale,
+            y: (cursor.image.size.height - cursor.hotSpot.y) * scale
+        )
+    }
+
+    var body: some View {
+        Group {
+            if let cursor = Self.macStyledCursor {
+                Image(nsImage: cursor.image)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                ZStack(alignment: .topLeading) {
+                    Image(systemName: "cursorarrow")
+                        .font(.system(size: Self.fallbackOuterCursorFontSize, weight: .black))
+                        .foregroundStyle(.white.opacity(0.96))
+                        .offset(x: 1.2, y: 1.2)
+
+                    Image(systemName: "cursorarrow")
+                        .font(.system(size: Self.fallbackInnerCursorFontSize, weight: .black))
+                        .foregroundStyle(Color.retraceBrandBlue) // #0B336C
+                        .offset(x: 0.56, y: 0.56)
+                }
+            }
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2.2, x: 1.4, y: 1.8)
+        .opacity(Self.cursorOpacity)
+        .frame(width: renderedCursorSize.width, height: renderedCursorSize.height, alignment: .topLeading)
+        .position(
+            x: point.x + (renderedCursorSize.width / 2) - renderedHotspot.x,
+            y: point.y + (renderedCursorSize.height / 2) - renderedHotspot.y
+        )
+    }
+
+    /// Keep native white edge pixels and recolor only the dark cursor core to brand blue.
+    private static func recoloredMacCursorImage(_ image: NSImage) -> NSImage? {
+        let pixelWidth = image.representations.map(\.pixelsWide).max() ?? Int(image.size.width.rounded())
+        let pixelHeight = image.representations.map(\.pixelsHigh).max() ?? Int(image.size.height.rounded())
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return nil
+        }
+
+        bitmap.size = CGSize(width: pixelWidth, height: pixelHeight)
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+        NSGraphicsContext.current = context
+        image.draw(
+            in: NSRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        context.flushGraphics()
+
+        guard let data = bitmap.bitmapData else { return nil }
+        let bytesPerRow = bitmap.bytesPerRow
+
+        let brandRed = 11.0
+        let brandGreen = 51.0
+        let brandBlue = 108.0
+
+        for row in 0 ..< pixelHeight {
+            for col in 0 ..< pixelWidth {
+                let offset = (row * bytesPerRow) + (col * 4)
+                let r = Double(data[offset + 0])
+                let g = Double(data[offset + 1])
+                let b = Double(data[offset + 2])
+                let a = Double(data[offset + 3])
+
+                guard a > 0 else { continue }
+
+                let luminance = ((0.2126 * r) + (0.7152 * g) + (0.0722 * b)) / 255.0
+                let shouldTintCore = (a >= 150.0 && luminance <= 0.76) || (a >= 100.0 && luminance <= 0.50)
+                guard shouldTintCore else { continue }
+
+                let edgeBlend = min(max((luminance - 0.10) / 0.60, 0.0), 1.0)
+                let tone = 0.84 + (0.16 * edgeBlend)
+
+                data[offset + 0] = UInt8(max(0, min(255, Int((brandRed * tone).rounded()))))
+                data[offset + 1] = UInt8(max(0, min(255, Int((brandGreen * tone).rounded()))))
+                data[offset + 2] = UInt8(max(0, min(255, Int((brandBlue * tone).rounded()))))
+            }
+        }
+
+        let output = NSImage(size: CGSize(width: pixelWidth, height: pixelHeight))
+        output.addRepresentation(bitmap)
+        return output
     }
 }
 

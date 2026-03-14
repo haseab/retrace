@@ -119,6 +119,10 @@ public struct CaptureConfig: Codable, Sendable {
     /// - Default 0.9985 only discards nearly identical frames
     public let deduplicationThreshold: Double
 
+    /// Keep frames (do not deduplicate) when the mouse pointer moved between captures.
+    /// Useful when cursor movement should remain visible in timeline playback.
+    public let keepFramesOnMouseMovement: Bool
+
     /// Maximum resolution to capture (will downscale if screen is larger)
     public let maxResolution: Resolution
 
@@ -157,6 +161,7 @@ public struct CaptureConfig: Codable, Sendable {
         captureIntervalSeconds: Double = 2.0,
         adaptiveCaptureEnabled: Bool = true,
         deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold,
+        keepFramesOnMouseMovement: Bool = true,
         maxResolution: Resolution = .uhd4K,
         excludedAppBundleIDs: Set<String> = [],
         excludePrivateWindows: Bool = true,
@@ -170,6 +175,7 @@ public struct CaptureConfig: Codable, Sendable {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.adaptiveCaptureEnabled = adaptiveCaptureEnabled
         self.deduplicationThreshold = deduplicationThreshold
+        self.keepFramesOnMouseMovement = keepFramesOnMouseMovement
         self.maxResolution = maxResolution
         self.excludedAppBundleIDs = excludedAppBundleIDs
         self.excludePrivateWindows = excludePrivateWindows

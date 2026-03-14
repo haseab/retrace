@@ -1,5 +1,6 @@
 import Foundation
 import CoreMedia
+import CoreGraphics
 
 // MARK: - Frame Identifiers
 
@@ -45,13 +46,17 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
     /// Display ID that was captured
     public let displayID: UInt32
 
+    /// Mouse position in frame pixel coordinates (top-left origin), when captured.
+    public let mousePosition: CGPoint?
+
     public init(
         appBundleID: String? = nil,
         appName: String? = nil,
         windowName: String? = nil,
         browserURL: String? = nil,
         redactionReason: String? = nil,
-        displayID: UInt32 = 0
+        displayID: UInt32 = 0,
+        mousePosition: CGPoint? = nil
     ) {
         self.appBundleID = appBundleID
         self.appName = appName
@@ -59,6 +64,7 @@ public struct FrameMetadata: Codable, Sendable, Equatable {
         self.browserURL = browserURL
         self.redactionReason = redactionReason
         self.displayID = displayID
+        self.mousePosition = mousePosition
     }
 
     public static let empty = FrameMetadata()

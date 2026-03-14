@@ -40,9 +40,11 @@ enum SettingsDefaults {
     static let captureResolution: CaptureResolution = .original
     static let captureActiveDisplayOnly = false
     static let excludeCursor = false
+    static let captureMousePosition = true
     static let videoQuality: Double = 0.5
     static let deleteDuplicateFrames = true
     static let deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold
+    static let keepFramesOnMouseMovement = true
     static let captureOnWindowChange = true
     static let collectInPageURLsExperimental = false
 
@@ -216,9 +218,11 @@ public struct SettingsView: View {
     @AppStorage("captureResolution", store: settingsStore) private var captureResolution: CaptureResolution = SettingsDefaults.captureResolution
     @AppStorage("captureActiveDisplayOnly", store: settingsStore) private var captureActiveDisplayOnly = SettingsDefaults.captureActiveDisplayOnly
     @AppStorage("excludeCursor", store: settingsStore) private var excludeCursor = SettingsDefaults.excludeCursor
+    @AppStorage("captureMousePosition", store: settingsStore) private var captureMousePosition: Bool = SettingsDefaults.captureMousePosition
     @AppStorage("videoQuality", store: settingsStore) private var videoQuality: Double = SettingsDefaults.videoQuality
     @AppStorage("deleteDuplicateFrames", store: settingsStore) private var deleteDuplicateFrames: Bool = SettingsDefaults.deleteDuplicateFrames
     @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = SettingsDefaults.deduplicationThreshold
+    @AppStorage("keepFramesOnMouseMovement", store: settingsStore) private var keepFramesOnMouseMovement = SettingsDefaults.keepFramesOnMouseMovement
     @AppStorage("captureOnWindowChange", store: settingsStore) private var captureOnWindowChange: Bool = SettingsDefaults.captureOnWindowChange
     @AppStorage("collectInPageURLsExperimental", store: settingsStore) private var collectInPageURLsExperimental: Bool = SettingsDefaults.collectInPageURLsExperimental
     @AppStorage("inPageURLPermissionCache", store: settingsStore) private var inPageURLPermissionCacheRaw = ""
@@ -436,9 +440,9 @@ public struct SettingsView: View {
             searchableText: ["appearance", "font style", "accent color", "color theme", "timeline colored borders", "scrubbing animation", "scroll sensitivity", "scroll orientation", "horizontal scroll", "vertical scroll", "dark mode", "light mode", "theme"]),
         // Capture
         SettingsSearchEntry(id: "capture.rate", tab: .capture, cardTitle: "Capture Rate", cardIcon: "gauge.with.dots.needle.50percent",
-            searchableText: ["capture rate", "capture interval", "capture on window change", "frame rate", "screenshot frequency"]),
+            searchableText: ["capture rate", "capture interval", "capture on window change", "frame rate", "screenshot frequency", "mouse position", "capture mouse", "pointer overlay", "timeline cursor"]),
         SettingsSearchEntry(id: "capture.compression", tab: .capture, cardTitle: "Compression", cardIcon: "archivebox",
-            searchableText: ["compression", "video quality", "deduplication", "duplicate frames", "storage size"]),
+            searchableText: ["compression", "video quality", "deduplication", "duplicate frames", "storage size", "mouse movement dedup", "keep frames on mouse movement"]),
         SettingsSearchEntry(id: "capture.pauseReminder", tab: .capture, cardTitle: "Pause Reminder", cardIcon: "bell.badge",
             searchableText: ["pause reminder", "remind me later", "notification", "reminder interval"]),
         SettingsSearchEntry(id: "capture.inPageURLs", tab: .capture, cardTitle: "In-Page URLs (Experimental)", cardIcon: "link.badge.plus",
@@ -1973,6 +1977,30 @@ public struct SettingsView: View {
                                 updateCaptureOnWindowChangeSetting()
                             }
                     }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    ModernToggleRow(
+                        title: "Capture mouse position",
+                        subtitle: "Store pointer coordinates for each frame and render them in timeline playback.",
+                        isOn: $captureMousePosition
+                    )
+                    .onChange(of: captureMousePosition) { enabled in
+                        if !enabled && keepFramesOnMouseMovement {
+                            keepFramesOnMouseMovement = false
+                            updateKeepFramesOnMouseMovementSetting()
+                            recordInPageURLMetric(
+                                type: .mouseMovementDeduplicationToggle,
+                                payload: ["enabled": false, "source": "capture_mouse_position_disabled"]
+                            )
+                        }
+
+                        recordInPageURLMetric(
+                            type: .mousePositionCaptureToggle,
+                            payload: ["enabled": enabled]
+                        )
+                    }
                 }
         }
     }
@@ -2076,6 +2104,27 @@ public struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                         }
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    ModernToggleRow(
+                        title: "Keep frames on mouse movement",
+                        subtitle: captureMousePosition
+                            ? "Do not deduplicate when the pointer moved between captures."
+                            : "Enable \"Capture mouse position\" in Capture Rate to use this setting.",
+                        isOn: $keepFramesOnMouseMovement
+                    )
+                    .disabled(!captureMousePosition)
+                    .opacity(captureMousePosition ? 1.0 : 0.6)
+                    .onChange(of: keepFramesOnMouseMovement) { enabled in
+                        guard captureMousePosition else { return }
+                        updateKeepFramesOnMouseMovementSetting()
+                        recordInPageURLMetric(
+                            type: .mouseMovementDeduplicationToggle,
+                            payload: ["enabled": enabled]
+                        )
                     }
 
                 }
@@ -7000,6 +7049,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: excludedBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -7038,6 +7088,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -8973,6 +9024,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: enabled,
                 deduplicationThreshold: deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -9006,6 +9058,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -9027,6 +9080,38 @@ extension SettingsView {
         }
     }
 
+    /// Update keep-frames-on-mouse-movement setting in capture config
+    private func updateKeepFramesOnMouseMovementSetting() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: keepFramesOnMouseMovement,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: currentConfig.excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                Log.info("[SettingsView] Keep frames on mouse movement updated to: \(keepFramesOnMouseMovement)", category: .ui)
+                showCompressionUpdateFeedback()
+            } catch {
+                Log.error("[SettingsView] Failed to update keep-frames-on-mouse-movement setting: \(error)", category: .ui)
+            }
+        }
+    }
+
     /// Update capture on window change setting in capture config
     private func updateCaptureOnWindowChangeSetting() {
         Task {
@@ -9040,6 +9125,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -9122,7 +9208,9 @@ extension SettingsView {
         videoQuality = SettingsDefaults.videoQuality
         deduplicationThreshold = SettingsDefaults.deduplicationThreshold
         deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
+        keepFramesOnMouseMovement = SettingsDefaults.keepFramesOnMouseMovement
         captureOnWindowChange = SettingsDefaults.captureOnWindowChange
+        captureMousePosition = SettingsDefaults.captureMousePosition
         collectInPageURLsExperimental = SettingsDefaults.collectInPageURLsExperimental
         inPageURLVerificationByBundleID = [:]
         inPageURLVerificationBusyBundleIDs = []
@@ -9137,6 +9225,7 @@ extension SettingsView {
                 captureIntervalSeconds: SettingsDefaults.captureIntervalSeconds,
                 adaptiveCaptureEnabled: true,
                 deduplicationThreshold: SettingsDefaults.deduplicationThreshold,
+                keepFramesOnMouseMovement: SettingsDefaults.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
                 excludePrivateWindows: currentConfig.excludePrivateWindows,
@@ -9184,6 +9273,7 @@ extension SettingsView {
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
                 adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
                 deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
                 maxResolution: currentConfig.maxResolution,
                 excludedAppBundleIDs: [],
                 excludePrivateWindows: SettingsDefaults.excludePrivateWindows,

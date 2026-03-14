@@ -335,6 +335,7 @@ public final class FeedbackService: @unchecked Sendable {
         settings["captureIntervalSeconds"] = String(format: "%.2f", defaults.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0)
         settings["deleteDuplicateFrames"] = boolString(defaults.object(forKey: "deleteDuplicateFrames") as? Bool ?? true)
         settings["deduplicationThreshold"] = String(format: "%.4f", defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold)
+        settings["keepFramesOnMouseMovement"] = boolString(defaults.object(forKey: "keepFramesOnMouseMovement") as? Bool ?? true)
         settings["captureOnWindowChange"] = boolString(defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true)
         settings["excludePrivateWindows"] = boolString(defaults.object(forKey: "excludePrivateWindows") as? Bool ?? false)
         settings["excludeCursor"] = boolString(defaults.object(forKey: "excludeCursor") as? Bool ?? false)

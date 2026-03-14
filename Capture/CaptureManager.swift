@@ -369,23 +369,34 @@ public actor CaptureManager: CaptureProtocol {
     private func processFrameStream(rawStream: AsyncStream<CapturedFrame>) async {
         var totalBytes: Int64 = 0
         var totalFrames = 0
+        var lastKeptMousePosition: CGPoint?
 
         for await frame in rawStream {
             totalFrames += 1
             totalBytes += Int64(frame.imageData.count)
+            let currentMousePosition = currentConfig.keepFramesOnMouseMovement
+                ? Self.mousePositionWithinCapturedFrame(frame)
+                : nil
 
             // Apply deduplication if enabled
             if currentConfig.adaptiveCaptureEnabled {
                 let similarity = lastKeptFrame != nil ? deduplicator.computeSimilarity(frame, lastKeptFrame!) : 0.0
-                let shouldKeep = deduplicator.shouldKeepFrame(
+                let keepBySimilarity = deduplicator.shouldKeepFrame(
                     frame,
                     comparedTo: lastKeptFrame,
                     threshold: currentConfig.deduplicationThreshold
                 )
+                let keepByMouseMovement = Self.shouldKeepFrameForMouseMovement(
+                    enabled: currentConfig.keepFramesOnMouseMovement,
+                    previousMousePosition: lastKeptMousePosition,
+                    currentMousePosition: currentMousePosition
+                )
+                let shouldKeep = keepBySimilarity || keepByMouseMovement
 
                 if shouldKeep {
                     // Keep raw frame for future similarity checks. Metadata is not needed for dedup.
                     lastKeptFrame = frame
+                    lastKeptMousePosition = currentMousePosition
                     let enrichedFrame = await enrichFrameMetadata(frame)
                     dedupedFrameContinuation?.yield(enrichedFrame)
 
@@ -398,7 +409,14 @@ public actor CaptureManager: CaptureProtocol {
                         lastFrameTime: enrichedFrame.timestamp
                     )
 
-                    Log.verbose("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
+                    if keepByMouseMovement && !keepBySimilarity {
+                        Log.verbose(
+                            "Frame kept (mouse moved, similarity: \(String(format: "%.2f%%", similarity * 100)))",
+                            category: .capture
+                        )
+                    } else {
+                        Log.verbose("Frame kept (similarity: \(String(format: "%.2f%%", similarity * 100)))", category: .capture)
+                    }
                 } else {
                     // Frame was filtered out
                     stats = CaptureStatistics(
@@ -423,11 +441,58 @@ public actor CaptureManager: CaptureProtocol {
                     captureStartTime: stats.captureStartTime,
                     lastFrameTime: enrichedFrame.timestamp
                 )
+                lastKeptMousePosition = currentMousePosition
             }
         }
 
         // Stream ended
         dedupedFrameContinuation?.finish()
+    }
+
+    static func shouldKeepFrameForMouseMovement(
+        enabled: Bool,
+        previousMousePosition: CGPoint?,
+        currentMousePosition: CGPoint?,
+        minimumMovementPoints: CGFloat = 1.0
+    ) -> Bool {
+        guard enabled else { return false }
+
+        switch (previousMousePosition, currentMousePosition) {
+        case (nil, nil):
+            return false
+        case (.some, nil), (nil, .some):
+            return true
+        case let (.some(previous), .some(current)):
+            let distance = hypot(current.x - previous.x, current.y - previous.y)
+            return distance >= minimumMovementPoints
+        }
+    }
+
+    private static func mousePositionWithinCapturedFrame(_ frame: CapturedFrame) -> CGPoint? {
+        guard frame.width > 0, frame.height > 0 else { return nil }
+        guard let event = CGEvent(source: nil) else { return nil }
+
+        let location = event.location
+        let displayBounds = CGDisplayBounds(CGDirectDisplayID(frame.metadata.displayID))
+        guard displayBounds.width > 0,
+              displayBounds.height > 0,
+              displayBounds.contains(location) else {
+            return nil
+        }
+
+        let relativeX = location.x - displayBounds.origin.x
+        let relativeY = location.y - displayBounds.origin.y
+        let scaleX = CGFloat(frame.width) / displayBounds.width
+        let scaleY = CGFloat(frame.height) / displayBounds.height
+
+        // CGEvent.location is already in top-down display coordinates.
+        let x = relativeX * scaleX
+        let y = relativeY * scaleY
+
+        return CGPoint(
+            x: min(max(x, 0), CGFloat(frame.width - 1)),
+            y: min(max(y, 0), CGFloat(frame.height - 1))
+        )
     }
 
     /// Enrich frame with app metadata
