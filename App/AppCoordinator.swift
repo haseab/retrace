@@ -7,6 +7,7 @@ import Processing
 import Search
 import Migration
 import CoreGraphics
+import ImageIO
 
 // MARK: - OCR Power Settings Notifications
 
@@ -255,6 +256,7 @@ public actor AppCoordinator {
     private static let pipelineMemoryLogInterval: TimeInterval = 5.0
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
     private static let minimumDBSnapshotDiffInterval: TimeInterval = 23 * 60 * 60
+    private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
 
     // MARK: - Initialization
 
@@ -1196,6 +1198,10 @@ public actor AppCoordinator {
                     frameID: frameID,
                     capturedFrame: frame
                 )
+                writeCapturedFrameStillToTimelineDiskCache(
+                    frameID: frameID,
+                    frame: frame
+                )
                 scheduleInPageURLMetadataCaptureIfNeeded(
                     frameID: frameID,
                     frameMetadata: frame.metadata
@@ -1394,6 +1400,107 @@ public actor AppCoordinator {
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: max(0, bytes))
+    }
+
+    private static func timelineDiskFrameBufferDirectoryURL() -> URL {
+        let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return cachesDirectory
+            .appendingPathComponent("io.retrace.app", isDirectory: true)
+            .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
+    }
+
+    private static func timelineDiskFrameBufferURL(for frameID: Int64) -> URL {
+        timelineDiskFrameBufferDirectoryURL()
+            .appendingPathComponent("\(frameID)")
+            .appendingPathExtension("jpg")
+    }
+
+    private func writeCapturedFrameStillToTimelineDiskCache(
+        frameID: Int64,
+        frame: CapturedFrame
+    ) {
+        let destinationURL = Self.timelineDiskFrameBufferURL(for: frameID)
+
+        Task.detached(priority: .utility) {
+            do {
+                let jpegData = try Self.encodeCapturedFrameAsJPEG(frame)
+                try FileManager.default.createDirectory(
+                    at: destinationURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try jpegData.write(to: destinationURL, options: [.atomic])
+            } catch {
+                Log.warning(
+                    "[Timeline-DiskBuffer] Failed to persist capture-time still for frame \(frameID): \(error.localizedDescription)",
+                    category: .app
+                )
+            }
+        }
+    }
+
+    private static func encodeCapturedFrameAsJPEG(_ frame: CapturedFrame) throws -> Data {
+        guard frame.width > 0, frame.height > 0, frame.bytesPerRow > 0 else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid frame dimensions for JPEG encode"]
+            )
+        }
+
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let provider = CGDataProvider(data: frame.imageData as CFData),
+              let cgImage = CGImage(
+                  width: frame.width,
+                  height: frame.height,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: frame.bytesPerRow,
+                  space: CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: bitmapInfo,
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: false,
+                  intent: .defaultIntent
+              ) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to build CGImage from captured frame data"]
+            )
+        }
+
+        let outputData = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            outputData,
+            "public.jpeg" as CFString,
+            1,
+            nil
+        ) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create JPEG image destination"]
+            )
+        }
+
+        let properties = [
+            kCGImageDestinationLossyCompressionQuality: Self.timelineDiskCacheJPEGCompressionQuality,
+        ] as CFDictionary
+
+        CGImageDestinationAddImage(destination, cgImage, properties)
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw NSError(
+                domain: "AppCoordinator",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to finalize JPEG image destination"]
+            )
+        }
+
+        return outputData as Data
     }
 
     private func createNewWriterState(width: Int, height: Int) async throws -> VideoWriterState {

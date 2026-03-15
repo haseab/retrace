@@ -30,6 +30,7 @@ public enum DailyMetricsQueries {
         case arrowKeyNavigation = "arrow_key_navigation"  // metadata: "left" or "right"
         case shiftDragZoomRegion = "shift_drag_zoom_region"  // metadata: JSON {region, screenSize}
         case shiftDragTextCopy = "shift_drag_text_copy"  // metadata: copied text
+        case stillFrameDragOCR = "still_frame_drag_ocr"  // metadata: JSON {gesture, frameID}
         case appLaunches = "app_launches"
         case keyboardShortcut = "keyboard_shortcut"  // metadata: shortcut identifier (e.g. "cmd+c", "cmd+f")
         case dateSearchSubmitted = "date_search_submitted"

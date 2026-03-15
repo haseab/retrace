@@ -2126,6 +2126,18 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    /// Record transient OCR triggered by drag-start on a still-only frame (p=4).
+    /// - Parameters:
+    ///   - coordinator: The app coordinator
+    ///   - gesture: Gesture that triggered OCR ("shift-drag" or "cmd-drag")
+    ///   - frameID: Frame identifier for diagnostic correlation
+    public static func recordStillFrameDragOCR(coordinator: AppCoordinator, gesture: String, frameID: Int64) {
+        Task {
+            let json = "{\"gesture\":\"\(gesture)\",\"frameID\":\(frameID)}"
+            try? await coordinator.recordMetricEvent(metricType: .stillFrameDragOCR, metadata: json)
+        }
+    }
+
     /// Record an app launch event
     public static func recordAppLaunch(coordinator: AppCoordinator) {
         Task {

@@ -1429,7 +1429,7 @@ enum FrameQueries {
             FROM frame f
             LEFT JOIN segment s ON f.segmentId = s.id
             LEFT JOIN video v ON f.videoId = v.id
-            WHERE f.createdAt >= ? AND f.createdAt <= ? AND f.processingStatus != 4
+            WHERE f.createdAt >= ? AND f.createdAt <= ?
             ORDER BY f.createdAt ASC
             LIMIT ?;
             """
@@ -1478,7 +1478,6 @@ enum FrameQueries {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
                 FROM frame
-                WHERE processingStatus != 4
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
@@ -1527,7 +1526,7 @@ enum FrameQueries {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
                 FROM frame
-                WHERE createdAt < ? AND processingStatus != 4
+                WHERE createdAt < ?
                 ORDER BY createdAt DESC
                 LIMIT ?
             ) f
@@ -1575,7 +1574,7 @@ enum FrameQueries {
             FROM (
                 SELECT id, createdAt, segmentId, videoId, videoFrameIndex, encodingStatus, processingStatus, redactionReason, mousePosition
                 FROM frame
-                WHERE createdAt >= ? AND processingStatus != 4
+                WHERE createdAt >= ?
                 ORDER BY createdAt ASC
                 LIMIT ?
             ) f

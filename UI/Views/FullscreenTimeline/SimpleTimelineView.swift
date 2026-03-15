@@ -840,7 +840,9 @@ public struct SimpleTimelineView: View {
                     .font(.retraceCaption)
                     .foregroundColor(.white.opacity(0.3))
             }
-        } else if viewModel.frameNotReady {
+        } else if viewModel.frameNotReady,
+                  viewModel.displayableCurrentImage == nil,
+                  viewModel.waitingVideoFallbackImage == nil {
             // Frame not yet written to video file.
             VStack(spacing: .spacingM) {
                 Image(systemName: "clock")

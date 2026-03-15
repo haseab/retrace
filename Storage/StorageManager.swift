@@ -271,8 +271,13 @@ public actor StorageManager: StorageProtocol {
                         Log.warning("[VideoExtract] ⚠️ TIME MISMATCH (cached): frameIndex=\(frameIndex), requested=\(String(format: "%.3f", requestedSeconds))s, actual=\(String(format: "%.3f", actualSeconds))s, retrying with fresh generator", category: .storage)
                         continue // Retry with fresh generator
                     } else {
-                        // Fresh generator also returned wrong frame - video doesn't have this frame yet
+                        // Fresh generator also returned wrong frame in strict mode.
+                        // Treat this as unavailable so callers can fall back to capture-time stills.
                         Log.warning("[VideoExtract] ⚠️ TIME MISMATCH (fresh): frameIndex=\(frameIndex), requested=\(String(format: "%.3f", requestedSeconds))s, actual=\(String(format: "%.3f", actualSeconds))s, video=\(videoURL.lastPathComponent)", category: .storage)
+                        throw StorageError.fileReadFailed(
+                            path: videoURL.path,
+                            underlying: "Timestamp mismatch: requested=\(String(format: "%.3f", requestedSeconds))s actual=\(String(format: "%.3f", actualSeconds))s frameIndex=\(frameIndex)"
+                        )
                     }
                 }
 
