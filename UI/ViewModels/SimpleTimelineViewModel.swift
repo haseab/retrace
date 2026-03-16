@@ -23,10 +23,11 @@ public enum TimelineConfig {
 private enum WindowConfig {
     static let maxFrames = 100            // Maximum frames in memory
     static let loadThreshold = 20       // Start loading when within N frames of edge
-    static let loadBatchSize = 25        // Frames to load per batch
+    static let loadBatchSize = 35        // Frames to load per batch
     static let loadWindowSpanSeconds: TimeInterval = 24 * 60 * 60 // Bounded window for load-more queries
-    static let nearestFallbackBatchSize = 50 // Frames to fetch when a bounded older probe comes back empty
+    static let nearestFallbackBatchSize = 35 // Frames to fetch when fallback nearest probe is needed
     static let olderSparseRetryThreshold = loadBatchSize // Retry with nearest fallback when bounded probe under-fills the batch
+    static let newerSparseRetryThreshold = loadBatchSize // Retry with nearest fallback when bounded probe under-fills the batch
 }
 
 /// Memory tracking for debugging frame accumulation issues
@@ -365,6 +366,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private static let pendingDeleteUndoWindowSeconds: TimeInterval = 8
+    private static let pendingDeleteCompensatedFetchLimitCap = 2_000
     private enum PendingDeletePayload {
         case frame(FrameReference)
         case frames([FrameReference])
@@ -2742,6 +2744,46 @@ public class SimpleTimelineViewModel: ObservableObject {
         return "\(prefix)-\(fetchTraceID)"
     }
 
+    private func compensatedFetchLimitForPendingDeletes(_ requestedLimit: Int) -> Int {
+        let normalizedLimit = max(1, requestedLimit)
+        let pendingCount = deletedFrameIDs.count
+        guard pendingCount > 0 else { return normalizedLimit }
+
+        let compensatedLimit = max(normalizedLimit * 2, normalizedLimit + pendingCount)
+        return min(compensatedLimit, Self.pendingDeleteCompensatedFetchLimitCap)
+    }
+
+    private func filterPendingDeletedFrames(
+        _ framesWithVideoInfo: [FrameWithVideoInfo],
+        requestedLimit: Int,
+        traceID: String,
+        reason: String
+    ) -> [FrameWithVideoInfo] {
+        let normalizedLimit = max(0, requestedLimit)
+        guard normalizedLimit > 0 else { return [] }
+        guard !framesWithVideoInfo.isEmpty else { return [] }
+
+        let pendingDeleteIDs = deletedFrameIDs
+        guard !pendingDeleteIDs.isEmpty else {
+            return framesWithVideoInfo.count > normalizedLimit
+                ? Array(framesWithVideoInfo.prefix(normalizedLimit))
+                : framesWithVideoInfo
+        }
+
+        let filteredFrames = framesWithVideoInfo.filter { !pendingDeleteIDs.contains($0.frame.id) }
+        let droppedCount = framesWithVideoInfo.count - filteredFrames.count
+        if droppedCount > 0 {
+            Log.info(
+                "[TIMELINE-FETCH][\(traceID)] Filtered pending-deleted frames reason='\(reason)' dropped=\(droppedCount) pendingDeleteIDs=\(pendingDeleteIDs.count)",
+                category: .ui
+            )
+        }
+
+        return filteredFrames.count > normalizedLimit
+            ? Array(filteredFrames.prefix(normalizedLimit))
+            : filteredFrames
+    }
+
     private func fetchFramesWithVideoInfoLogged(
         from startDate: Date,
         to endDate: Date,
@@ -2749,34 +2791,42 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let requestedLimit = max(1, limit)
+        let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "window")
         let fetchStart = CFAbsoluteTimeGetCurrent()
         Log.info(
-            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' range=[\(Log.timestamp(from: startDate)) → \(Log.timestamp(from: endDate))] limit=\(limit) filters={\(summarizeFiltersForLog(filters))}",
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' range=[\(Log.timestamp(from: startDate)) → \(Log.timestamp(from: endDate))] limit=\(requestedLimit) queryLimit=\(queryLimit) filters={\(summarizeFiltersForLog(filters))}",
             category: .ui
         )
 
         do {
-            let framesWithVideoInfo: [FrameWithVideoInfo]
+            let rawFramesWithVideoInfo: [FrameWithVideoInfo]
 #if DEBUG
             if let override = test_windowFetchHooks.getFramesWithVideoInfo {
-                framesWithVideoInfo = try await override(startDate, endDate, limit, filters, reason)
+                rawFramesWithVideoInfo = try await override(startDate, endDate, queryLimit, filters, reason)
             } else {
-                framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(
+                rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(
                     from: startDate,
                     to: endDate,
-                    limit: limit,
+                    limit: queryLimit,
                     filters: filters
                 )
             }
 #else
-            framesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(
+            rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfo(
                 from: startDate,
                 to: endDate,
-                limit: limit,
+                limit: queryLimit,
                 filters: filters
             )
 #endif
+            let framesWithVideoInfo = filterPendingDeletedFrames(
+                rawFramesWithVideoInfo,
+                requestedLimit: requestedLimit,
+                traceID: traceID,
+                reason: reason
+            )
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
             Log.recordLatency(
                 "timeline.fetch.window_frames_ms",
@@ -2786,7 +2836,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 warningThresholdMs: 250,
                 criticalThresholdMs: 750
             )
-            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
+            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) rawCount=\(rawFramesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
             if elapsedMs >= 750 {
                 Log.warning(message, category: .ui)
             } else {
@@ -2809,35 +2859,43 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let requestedLimit = max(1, limit)
+        let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "before")
         let fetchStart = CFAbsoluteTimeGetCurrent()
         let effectiveDateRanges = filters.effectiveDateRanges
         let boundedStart = effectiveDateRanges.first?.start.map { Log.timestamp(from: $0) } ?? "nil"
         let boundedEnd = effectiveDateRanges.first?.end.map { Log.timestamp(from: $0) } ?? "nil"
         Log.info(
-            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' before=\(Log.timestamp(from: timestamp)) limit=\(limit) boundedRange=[\(boundedStart) → \(boundedEnd)] filters={\(summarizeFiltersForLog(filters))}",
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' before=\(Log.timestamp(from: timestamp)) limit=\(requestedLimit) queryLimit=\(queryLimit) boundedRange=[\(boundedStart) → \(boundedEnd)] filters={\(summarizeFiltersForLog(filters))}",
             category: .ui
         )
 
         do {
-            let framesWithVideoInfo: [FrameWithVideoInfo]
+            let rawFramesWithVideoInfo: [FrameWithVideoInfo]
 #if DEBUG
             if let override = test_windowFetchHooks.getFramesWithVideoInfoBefore {
-                framesWithVideoInfo = try await override(timestamp, limit, filters, reason)
+                rawFramesWithVideoInfo = try await override(timestamp, queryLimit, filters, reason)
             } else {
-                framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
+                rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
                     timestamp: timestamp,
-                    limit: limit,
+                    limit: queryLimit,
                     filters: filters
                 )
             }
 #else
-            framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
+            rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfoBefore(
                 timestamp: timestamp,
-                limit: limit,
+                limit: queryLimit,
                 filters: filters
             )
 #endif
+            let framesWithVideoInfo = filterPendingDeletedFrames(
+                rawFramesWithVideoInfo,
+                requestedLimit: requestedLimit,
+                traceID: traceID,
+                reason: reason
+            )
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
             Log.recordLatency(
                 "timeline.fetch.before_frames_ms",
@@ -2847,7 +2905,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 warningThresholdMs: 250,
                 criticalThresholdMs: 750
             )
-            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
+            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) rawCount=\(rawFramesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
             if elapsedMs >= 750 {
                 Log.warning(message, category: .ui)
             } else {
@@ -2870,35 +2928,43 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let requestedLimit = max(1, limit)
+        let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "after")
         let fetchStart = CFAbsoluteTimeGetCurrent()
         let effectiveDateRanges = filters.effectiveDateRanges
         let boundedStart = effectiveDateRanges.first?.start.map { Log.timestamp(from: $0) } ?? "nil"
         let boundedEnd = effectiveDateRanges.first?.end.map { Log.timestamp(from: $0) } ?? "nil"
         Log.info(
-            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' after=\(Log.timestamp(from: timestamp)) limit=\(limit) boundedRange=[\(boundedStart) → \(boundedEnd)] filters={\(summarizeFiltersForLog(filters))}",
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' after=\(Log.timestamp(from: timestamp)) limit=\(requestedLimit) queryLimit=\(queryLimit) boundedRange=[\(boundedStart) → \(boundedEnd)] filters={\(summarizeFiltersForLog(filters))}",
             category: .ui
         )
 
         do {
-            let framesWithVideoInfo: [FrameWithVideoInfo]
+            let rawFramesWithVideoInfo: [FrameWithVideoInfo]
 #if DEBUG
             if let override = test_windowFetchHooks.getFramesWithVideoInfoAfter {
-                framesWithVideoInfo = try await override(timestamp, limit, filters, reason)
+                rawFramesWithVideoInfo = try await override(timestamp, queryLimit, filters, reason)
             } else {
-                framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
+                rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
                     timestamp: timestamp,
-                    limit: limit,
+                    limit: queryLimit,
                     filters: filters
                 )
             }
 #else
-            framesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
+            rawFramesWithVideoInfo = try await coordinator.getFramesWithVideoInfoAfter(
                 timestamp: timestamp,
-                limit: limit,
+                limit: queryLimit,
                 filters: filters
             )
 #endif
+            let framesWithVideoInfo = filterPendingDeletedFrames(
+                rawFramesWithVideoInfo,
+                requestedLimit: requestedLimit,
+                traceID: traceID,
+                reason: reason
+            )
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
             Log.recordLatency(
                 "timeline.fetch.after_frames_ms",
@@ -2908,7 +2974,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 warningThresholdMs: 250,
                 criticalThresholdMs: 750
             )
-            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
+            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) rawCount=\(rawFramesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
             if elapsedMs >= 750 {
                 Log.warning(message, category: .ui)
             } else {
@@ -2930,24 +2996,32 @@ public class SimpleTimelineViewModel: ObservableObject {
         filters: FilterCriteria,
         reason: String
     ) async throws -> [FrameWithVideoInfo] {
+        let requestedLimit = max(1, limit)
+        let queryLimit = compensatedFetchLimitForPendingDeletes(requestedLimit)
         let traceID = nextFetchTraceID(prefix: "most-recent")
         let fetchStart = CFAbsoluteTimeGetCurrent()
         Log.info(
-            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' mostRecent limit=\(limit) filters={\(summarizeFiltersForLog(filters))}",
+            "[TIMELINE-FETCH][\(traceID)] START reason='\(reason)' mostRecent limit=\(requestedLimit) queryLimit=\(queryLimit) filters={\(summarizeFiltersForLog(filters))}",
             category: .ui
         )
 
         do {
-            let framesWithVideoInfo: [FrameWithVideoInfo]
+            let rawFramesWithVideoInfo: [FrameWithVideoInfo]
 #if DEBUG
             if let override = test_refreshFrameDataHooks.getMostRecentFramesWithVideoInfo {
-                framesWithVideoInfo = try await override(limit, filters)
+                rawFramesWithVideoInfo = try await override(queryLimit, filters)
             } else {
-                framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
+                rawFramesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: queryLimit, filters: filters)
             }
 #else
-            framesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: limit, filters: filters)
+            rawFramesWithVideoInfo = try await coordinator.getMostRecentFramesWithVideoInfo(limit: queryLimit, filters: filters)
 #endif
+            let framesWithVideoInfo = filterPendingDeletedFrames(
+                rawFramesWithVideoInfo,
+                requestedLimit: requestedLimit,
+                traceID: traceID,
+                reason: reason
+            )
             let elapsedMs = (CFAbsoluteTimeGetCurrent() - fetchStart) * 1000
             Log.recordLatency(
                 "timeline.fetch.most_recent_frames_ms",
@@ -2957,7 +3031,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 warningThresholdMs: 220,
                 criticalThresholdMs: 600
             )
-            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
+            let message = "[TIMELINE-FETCH][\(traceID)] END reason='\(reason)' count=\(framesWithVideoInfo.count) rawCount=\(rawFramesWithVideoInfo.count) elapsed=\(String(format: "%.1f", elapsedMs))ms"
             if elapsedMs >= 600 {
                 Log.warning(message, category: .ui)
             } else {
@@ -3231,6 +3305,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load image if needed for new current frame
         loadImageIfNeeded()
+        scheduleWindowRefillAfterOptimisticDelete(
+            removedFrames: [frameToDelete],
+            reason: "confirmDeleteSelectedFrame"
+        )
 
         Log.debug("[Delete] Frame \(frameID) removed from UI (optimistic deletion)", category: .ui)
 
@@ -3330,15 +3408,52 @@ public class SimpleTimelineViewModel: ObservableObject {
                 try await coordinator.deleteFrames(frameRefs)
                 Log.debug("[Delete] Committed segment deletion frames=\(frameRefs.count) reason=\(reason)", category: .ui)
             }
+            clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-success.\(reason)")
         } catch {
             Log.error("[Delete] Failed to persist deletion reason=\(reason): \(error)", category: .ui)
             if restoreOnFailure {
                 restoreDeletedOperation(operation, reason: "commit-failed")
                 showToast("Delete failed. Restored.", icon: "xmark.circle.fill")
             } else {
+                clearPendingDeletedFrameIDs(operation.removedFrameIDs, reason: "commit-failed-no-restore.\(reason)")
                 showToast("Delete may not have persisted", icon: "exclamationmark.triangle.fill")
             }
         }
+    }
+
+    private func clearPendingDeletedFrameIDs(_ frameIDs: [FrameID], reason: String) {
+        guard !frameIDs.isEmpty else { return }
+        let beforeCount = deletedFrameIDs.count
+        for frameID in frameIDs {
+            deletedFrameIDs.remove(frameID)
+        }
+        let removedCount = beforeCount - deletedFrameIDs.count
+        if removedCount > 0 {
+            Log.debug(
+                "[Delete] Cleared \(removedCount) pending-deleted frame IDs reason=\(reason) remaining=\(deletedFrameIDs.count)",
+                category: .ui
+            )
+        }
+    }
+
+    private func scheduleWindowRefillAfterOptimisticDelete(
+        removedFrames: [TimelineFrame],
+        reason: String
+    ) {
+        if frames.isEmpty {
+            oldestLoadedTimestamp = removedFrames.first?.frame.timestamp
+            newestLoadedTimestamp = removedFrames.last?.frame.timestamp
+
+            // Re-enable both directions so full-window deletions can repopulate from adjacent history.
+            hasMoreOlder = true
+            hasMoreNewer = true
+            hasReachedAbsoluteStart = false
+            hasReachedAbsoluteEnd = false
+        } else {
+            updateWindowBoundaries()
+        }
+
+        _ = checkAndLoadMoreFrames(reason: reason)
     }
 
     private func restoreDeletedOperation(_ operation: PendingDeleteOperation, reason: String) {
@@ -3515,6 +3630,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Load image if needed for new current frame
         loadImageIfNeeded()
+        scheduleWindowRefillAfterOptimisticDelete(
+            removedFrames: removedFrames,
+            reason: "confirmDeleteSegment"
+        )
 
         Log.debug("[Delete] Segment with \(deleteCount) frames removed from UI (optimistic deletion)", category: .ui)
 
@@ -13099,13 +13218,17 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
 
-            if framesWithVideoInfo.isEmpty {
+            let shouldRetryNearestFallback = framesWithVideoInfo.count < WindowConfig.newerSparseRetryThreshold
+
+            if shouldRetryNearestFallback {
+                let boundedCount = framesWithVideoInfo.count
+                let fallbackTrigger = boundedCount == 0 ? "empty" : "sparse"
                 Log.info(
-                    "[BoundaryNewer] FALLBACK_START reason=\(reason) strategy=nearest after=\(Log.timestamp(from: newestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
+                    "[BoundaryNewer] FALLBACK_START reason=\(reason) strategy=nearest trigger=\(fallbackTrigger) boundedCount=\(boundedCount) threshold=\(WindowConfig.newerSparseRetryThreshold) after=\(Log.timestamp(from: newestTimestamp)) limit=\(WindowConfig.nearestFallbackBatchSize)",
                     category: .ui
                 )
                 let fallbackStart = CFAbsoluteTimeGetCurrent()
-                framesWithVideoInfo = try await fetchFramesWithVideoInfoAfterLogged(
+                let fallbackFramesWithVideoInfo = try await fetchFramesWithVideoInfoAfterLogged(
                     timestamp: newestTimestamp,
                     limit: WindowConfig.nearestFallbackBatchSize,
                     filters: filterCriteria,
@@ -13113,9 +13236,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
                 let fallbackElapsedMs = (CFAbsoluteTimeGetCurrent() - fallbackStart) * 1000
 
-                if let first = framesWithVideoInfo.first, let last = framesWithVideoInfo.last {
+                if let first = fallbackFramesWithVideoInfo.first, let last = fallbackFramesWithVideoInfo.last {
                     Log.info(
-                        "[BoundaryNewer] FALLBACK_RESULT reason=\(reason) count=\(framesWithVideoInfo.count) first=\(Log.timestamp(from: first.frame.timestamp)) last=\(Log.timestamp(from: last.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
+                        "[BoundaryNewer] FALLBACK_RESULT reason=\(reason) count=\(fallbackFramesWithVideoInfo.count) first=\(Log.timestamp(from: first.frame.timestamp)) last=\(Log.timestamp(from: last.frame.timestamp)) query=\(String(format: "%.1f", fallbackElapsedMs))ms",
                         category: .ui
                     )
                 } else {
@@ -13123,6 +13246,21 @@ public class SimpleTimelineViewModel: ObservableObject {
                         "[BoundaryNewer] FALLBACK_RESULT reason=\(reason) count=0 query=\(String(format: "%.1f", fallbackElapsedMs))ms",
                         category: .ui
                     )
+                }
+
+                if fallbackFramesWithVideoInfo.count > boundedCount {
+                    Log.info(
+                        "[BoundaryNewer] FALLBACK_APPLY reason=\(reason) boundedCount=\(boundedCount) replacementCount=\(fallbackFramesWithVideoInfo.count)",
+                        category: .ui
+                    )
+                    framesWithVideoInfo = fallbackFramesWithVideoInfo
+                } else if boundedCount > 0 {
+                    Log.info(
+                        "[BoundaryNewer] FALLBACK_KEEP reason=\(reason) boundedCount=\(boundedCount) fallbackCount=\(fallbackFramesWithVideoInfo.count)",
+                        category: .ui
+                    )
+                } else {
+                    framesWithVideoInfo = fallbackFramesWithVideoInfo
                 }
             }
 
