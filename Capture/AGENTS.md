@@ -13,6 +13,7 @@ Capture/
 │   ├── CGWindowListCapture.swift  # Legacy CGWindowList API wrapper
 │   ├── DisplayMonitor.swift       # Track available displays
 │   ├── DisplaySwitchMonitor.swift # Detect display changes
+│   ├── ScreenLockStateMonitor.swift # Lock/screensaver state tracking
 │   ├── PrivateWindowMonitor.swift # Detect private browsing
 │   └── PermissionChecker.swift    # Screen recording permission
 ├── Deduplication/

@@ -71,6 +71,8 @@ public class SystemMonitorWindowController: NSObject {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
+        // Keep monitor sampling state aligned even if SwiftUI lifecycle callbacks are delayed.
+        ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: true)
         isVisible = true
     }
 
@@ -80,6 +82,8 @@ public class SystemMonitorWindowController: NSObject {
             return
         }
 
+        // Fail-safe: ensure the monitor consumer is not left active when window is hidden.
+        ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
         window.orderOut(nil)
         isVisible = false
     }
@@ -125,6 +129,8 @@ public class SystemMonitorWindowController: NSObject {
 
 extension SystemMonitorWindowController: NSWindowDelegate {
     public func windowWillClose(_ notification: Notification) {
+        // Fail-safe for close paths that may bypass SwiftUI onDisappear timing.
+        ProcessCPUMonitor.shared.setConsumerVisible(.systemMonitor, isVisible: false)
         isVisible = false
     }
 }

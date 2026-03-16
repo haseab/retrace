@@ -17,6 +17,8 @@ public actor CGWindowListCapture {
     nonisolated(unsafe) private var currentDisplayID: CGWindowID?
     private var isActive = false
     private var currentConfig: CaptureConfig?
+    private let screenLockStateMonitor = ScreenLockStateMonitor()
+    private var lastCaptureBlockReason: String?
 
     /// Track if array-based capture has been tested and found broken
     /// Once we know it's broken, skip directly to fallback masking
@@ -49,6 +51,7 @@ public actor CGWindowListCapture {
         let redactionContextByWindowID: [CGWindowID: RedactionWindowContext]
         let redactionWindowOrder: [CGWindowID]
         let visibleWindowContext: VisibleWindowContext?
+        let captureBlockReason: String?
     }
 
     private struct FilteredCaptureResult {
@@ -83,6 +86,8 @@ public actor CGWindowListCapture {
 
         self.currentConfig = config
         self.isActive = true
+        self.lastCaptureBlockReason = nil
+        self.screenLockStateMonitor.start()
 
         // Set up frame callback
         self.onFrameCaptured = { frame in
@@ -111,6 +116,8 @@ public actor CGWindowListCapture {
         }
 
         onFrameCaptured = nil
+        lastCaptureBlockReason = nil
+        screenLockStateMonitor.stop()
     }
 
     /// Update capture configuration
@@ -181,6 +188,12 @@ public actor CGWindowListCapture {
         let exclusionResult = await computeExcludedWindowIDs(config: config, displayID: displayID)
         let excludedIDs = exclusionResult.excludedWindowIDs
 
+        if let captureBlockReason = screenLockStateMonitor.captureBlockReason() ?? exclusionResult.captureBlockReason {
+            logCapturePauseIfNeeded(reason: captureBlockReason)
+            return
+        }
+        logCaptureResumeIfNeeded()
+
         // Capture the frame using CGWindowList with filtering
         guard let captureResult = captureWithFiltering(
             displayID: displayID,
@@ -249,6 +262,7 @@ public actor CGWindowListCapture {
         var redactionContextByWindowID: [CGWindowID: RedactionWindowContext] = [:]
         var redactionWindowOrder: [CGWindowID] = []
         var visibleWindowContext: VisibleWindowContext?
+        var captureBlockReason: String?
 
         enum BrowserURLLookupResult {
             case found(String)
@@ -265,7 +279,8 @@ public actor CGWindowListCapture {
                 redactedWindowIDs: redactedWindowIDs,
                 redactionContextByWindowID: redactionContextByWindowID,
                 redactionWindowOrder: redactionWindowOrder,
-                visibleWindowContext: visibleWindowContext
+                visibleWindowContext: visibleWindowContext,
+                captureBlockReason: captureBlockReason
             )
         }
 
@@ -305,6 +320,10 @@ public actor CGWindowListCapture {
                 } else {
                     pidsWithoutBundleID.insert(pid)
                 }
+            }
+
+            if captureBlockReason == nil {
+                captureBlockReason = Self.captureBlockReason(ownerName: ownerName, bundleID: bundleID)
             }
 
             if visibleWindowContext == nil {
@@ -559,7 +578,8 @@ public actor CGWindowListCapture {
             redactedWindowIDs: redactedWindowIDs,
             redactionContextByWindowID: redactionContextByWindowID,
             redactionWindowOrder: redactionWindowOrder,
-            visibleWindowContext: visibleWindowContext
+            visibleWindowContext: visibleWindowContext,
+            captureBlockReason: captureBlockReason
         )
     }
 
@@ -679,6 +699,36 @@ public actor CGWindowListCapture {
         }
 
         return "this app"
+    }
+
+    private func logCapturePauseIfNeeded(reason: String) {
+        guard lastCaptureBlockReason != reason else { return }
+        lastCaptureBlockReason = reason
+        Log.info("[CapturePause] Skipping capture while screen state is blocked (\(reason))", category: .capture)
+    }
+
+    private func logCaptureResumeIfNeeded() {
+        guard let previousReason = lastCaptureBlockReason else { return }
+        lastCaptureBlockReason = nil
+        Log.info("[CapturePause] Resuming capture after blocked state ended (\(previousReason))", category: .capture)
+    }
+
+    nonisolated static func captureBlockReason(ownerName: String, bundleID: String?) -> String? {
+        let normalizedOwnerName = ownerName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedBundleID = bundleID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        if normalizedOwnerName == "loginwindow" || normalizedBundleID == "com.apple.loginwindow" {
+            return "loginwindow-visible"
+        }
+
+        if normalizedOwnerName == "screensaverengine" ||
+            normalizedOwnerName == "screen saver engine" ||
+            normalizedBundleID == "com.apple.screensaver.engine" ||
+            normalizedBundleID == "com.apple.screensaver.engine.legacyscreensaver" {
+            return "screensaver-visible"
+        }
+
+        return nil
     }
 
     private func summarizeRedaction(

@@ -53,7 +53,7 @@ struct ProcessCPUSummaryCard: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.retraceSecondary.opacity(0.9))
 
-            if snapshot.hasEnoughData {
+            if snapshot.hasRenderableCPUData {
                 let totalRows = snapshot.topProcesses.count
                 let visibleRows = min(max(Self.cpuRowsPageSize, cpuProcessRowsVisible), totalRows)
                 let hasMoreRows = visibleRows < totalRows
@@ -209,7 +209,7 @@ struct ProcessCPUSummaryCard: View {
                 HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Collecting process CPU baseline...")
+                    Text("No recent process CPU history yet. Sampling now...")
                         .font(.retraceCaption2)
                         .foregroundColor(.retraceSecondary)
                 }

@@ -254,6 +254,9 @@ public actor AppCoordinator {
     private var orphanedVideoCleanupTask: Task<Void, Never>?
     private var dbStorageSnapshotTask: Task<Void, Never>?
     private static let pipelineMemoryLogInterval: TimeInterval = 5.0
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+    private static let memoryLedgerPendingRawFramesTag = "app.capture.pendingRawFrames"
+    private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
     private static let minimumDBSnapshotDiffInterval: TimeInterval = 23 * 60 * 60
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
@@ -1419,6 +1422,29 @@ public actor AppCoordinator {
         Log.info(
             "[Pipeline-Memory] reason=\(reason) pendingRawFrames=\(totalPendingFrames) pendingRawBytes=\(Self.formatBytes(totalPendingBytes)) activeWriters=\(writersByResolution.count) byResolution=[\(perResolutionSummary)]",
             category: .app
+        )
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPendingRawFramesTag,
+            bytes: totalPendingBytes,
+            count: totalPendingFrames,
+            unit: "frames",
+            function: "capture.pipeline",
+            kind: "pending-raw-frames"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerActiveWritersTag,
+            bytes: 0,
+            count: writersByResolution.count,
+            unit: "writers",
+            function: "capture.pipeline",
+            kind: "writer-pool",
+            note: "count-only"
+        )
+        MemoryLedger.emitSummary(
+            reason: "capture.pipeline.memory",
+            category: .app,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
     }
 

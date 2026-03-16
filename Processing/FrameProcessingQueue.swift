@@ -35,6 +35,10 @@ public actor FrameProcessingQueue {
     private var processingCount: Int = 0   // Frames with status 1
 
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+    private static let memoryLedgerQueueTag = "processing.ocr.queueDepth"
+    private static let memoryLedgerWorkersTag = "processing.ocr.workers"
+    private static let memoryLedgerRawCacheTag = "processing.ocr.rawFrameCache"
     private var isPausedForMemoryPressure = false
 
     // MARK: - Power-Aware Processing Control
@@ -283,6 +287,15 @@ public actor FrameProcessingQueue {
         workers.removeAll()
         memoryReportTask?.cancel()
         memoryReportTask = nil
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerWorkersTag,
+            bytes: 0,
+            count: 0,
+            unit: "workers",
+            function: "processing.ocr",
+            kind: "worker-pool"
+        )
 
         Log.info("[Queue] Workers stopped", category: .processing)
     }
@@ -1503,13 +1516,53 @@ public actor FrameProcessingQueue {
 
     private func logMemorySnapshot() async {
         let counts = await refreshLiveQueueCounts()
-        let processFields = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot().map {
+        let processSnapshot = ProcessingMemoryDiagnostics.currentProcessMemorySnapshot()
+        let processFields = processSnapshot.map {
             "footprint=\(ProcessingMemoryDiagnostics.formatBytes($0.physFootprintBytes)) resident=\(ProcessingMemoryDiagnostics.formatBytes($0.residentBytes)) internal=\(ProcessingMemoryDiagnostics.formatBytes($0.internalBytes)) compressed=\(ProcessingMemoryDiagnostics.formatBytes($0.compressedBytes)) "
         } ?? ""
 
         Log.info(
             "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(counts.depth) pending=\(counts.pending) processing=\(counts.processing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
             category: .processing
+        )
+
+        MemoryLedger.setProcessSnapshot(
+            footprintBytes: processSnapshot?.physFootprintBytes,
+            residentBytes: processSnapshot?.residentBytes,
+            internalBytes: processSnapshot?.internalBytes,
+            compressedBytes: processSnapshot?.compressedBytes
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerQueueTag,
+            bytes: 0,
+            count: counts.depth,
+            unit: "frames",
+            function: "processing.ocr",
+            kind: "queue-depth",
+            note: "count-only"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerWorkersTag,
+            bytes: 0,
+            count: workers.count,
+            unit: "workers",
+            function: "processing.ocr",
+            kind: "worker-pool",
+            note: "count-only"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRawCacheTag,
+            bytes: 0,
+            count: 0,
+            unit: "frames",
+            function: "processing.ocr",
+            kind: "raw-frame-cache",
+            note: "currently-disabled"
+        )
+        MemoryLedger.emitSummary(
+            reason: "processing.ocr.memory",
+            category: .processing,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
     }
 

@@ -1858,6 +1858,23 @@ public class SimpleTimelineViewModel: ObservableObject {
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
         pendingDeleteCommitTask?.cancel()
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDiskBufferTag,
+            bytes: 0,
+            count: 0,
+            unit: "frames",
+            function: "ui.timeline",
+            kind: "disk-frame-buffer"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerFrameWindowTag,
+            bytes: 0,
+            count: 0,
+            unit: "frames",
+            function: "ui.timeline",
+            kind: "frame-window"
+        )
     }
 
     // MARK: - Private State
@@ -1946,6 +1963,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let diskFrameBufferUnindexedPruneAgeSeconds: TimeInterval = 20 * 60
     nonisolated private static let diskFrameBufferFilenameExtension = "jpg"
     private static let diskFrameBufferMemoryLogIntervalNs: UInt64 = 5_000_000_000
+    nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+    nonisolated private static let memoryLedgerDiskBufferTag = "ui.timeline.diskFrameBuffer"
+    nonisolated private static let memoryLedgerFrameWindowTag = "ui.timeline.frameWindow"
     private var diskFrameBufferInitializationTask: Task<Void, Never>?
     nonisolated private static let appLaunchDate = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime)
     private var diskFrameBufferMemoryLogTask: Task<Void, Never>?
@@ -2222,7 +2242,33 @@ public class SimpleTimelineViewModel: ObservableObject {
             "[Timeline-Memory] diskFrameBufferCount=\(diskFrameBufferIndex.count) diskFrameBufferBytes=\(Self.formatBytes(diskFrameBufferBytes)) frameWindowCount=\(frames.count)",
             category: .ui
         )
+        updateTimelineMemoryLedger()
         logAndResetDiskFrameBufferTelemetry()
+    }
+
+    private func updateTimelineMemoryLedger() {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDiskBufferTag,
+            bytes: diskFrameBufferBytes,
+            count: diskFrameBufferIndex.count,
+            unit: "frames",
+            function: "ui.timeline",
+            kind: "disk-frame-buffer"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerFrameWindowTag,
+            bytes: 0,
+            count: frames.count,
+            unit: "frames",
+            function: "ui.timeline",
+            kind: "frame-window",
+            note: "count-only"
+        )
+        MemoryLedger.emitSummary(
+            reason: "ui.timeline.memory",
+            category: .ui,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
     }
 
     private func logAndResetDiskFrameBufferTelemetry() {

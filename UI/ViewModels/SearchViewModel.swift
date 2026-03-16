@@ -408,6 +408,10 @@ public class SearchViewModel: ObservableObject {
     private let maxSearchWords = 15  // Limit search queries to prevent performance issues
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private let maxInMemoryThumbnailCount = 60
+    nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+    nonisolated private static let memoryLedgerThumbnailTag = "ui.search.thumbnailCache"
+    nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
+    nonisolated private static let memoryLedgerResultSetTag = "ui.search.resultSet"
     private static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
     private static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
     private static let maxRecentSearchEntryCount = 80
@@ -772,6 +776,41 @@ public class SearchViewModel: ObservableObject {
         Log.info(
             "[Search-Memory] results=\(resultCount) visibleResults=\(visibleResults.count) thumbnails=\(thumbnailCache.count)/\(Self.formatBytes(thumbnailCacheBytes)) appIcons=\(appIconCache.count)/\(Self.formatBytes(appIconCacheBytes))",
             category: .ui
+        )
+
+        updateMemoryLedger(resultCount: resultCount)
+    }
+
+    private func updateMemoryLedger(resultCount: Int) {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerThumbnailTag,
+            bytes: thumbnailCacheBytes,
+            count: thumbnailCache.count,
+            unit: "images",
+            function: "ui.search",
+            kind: "images"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppIconTag,
+            bytes: appIconCacheBytes,
+            count: appIconCache.count,
+            unit: "icons",
+            function: "ui.search",
+            kind: "images"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerResultSetTag,
+            bytes: 0,
+            count: resultCount,
+            unit: "results",
+            function: "ui.search",
+            kind: "result-window",
+            note: "count-only"
+        )
+        MemoryLedger.emitSummary(
+            reason: "ui.search.memory",
+            category: .ui,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
     }
 
@@ -2395,6 +2434,31 @@ public class SearchViewModel: ObservableObject {
         currentLoadMoreTask?.cancel()
         memoryReportTask?.cancel()
         cancellables.removeAll()
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerThumbnailTag,
+            bytes: 0,
+            count: 0,
+            unit: "images",
+            function: "ui.search",
+            kind: "images"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppIconTag,
+            bytes: 0,
+            count: 0,
+            unit: "icons",
+            function: "ui.search",
+            kind: "images"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerResultSetTag,
+            bytes: 0,
+            count: 0,
+            unit: "results",
+            function: "ui.search",
+            kind: "result-window"
+        )
     }
 }
 

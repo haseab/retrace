@@ -371,7 +371,7 @@ private final class LogFile: @unchecked Sendable {
     private let fileURL: URL
     private let lock = NSLock()
     private var fileHandle: FileHandle?
-    private let maxFileSize: Int64 = 5 * 1024 * 1024  // 5MB max, then rotate
+    private let maxFileSize: Int64 = 50 * 1024 * 1024  // 50MB max, then rotate
 
     private init() {
         let logDir = NSHomeDirectory() + "/Library/Logs/Retrace"
@@ -485,6 +485,276 @@ extension Log {
         bytes: Int64
     ) {
         debug("Wrote segment \(segmentID.prefix(8)): \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))", category: .storage)
+    }
+}
+
+// MARK: - Memory Ledger
+
+/// Function-level memory attribution ledger.
+///
+/// This is intentionally explicit and app-defined. It reports what Retrace knows about
+/// its own caches/windows/queues and compares that to process-level footprint/resident.
+/// The remainder is reported as "unattributed" so allocator buckets are no longer the only view.
+public enum MemoryLedger {
+    private static let store = MemoryLedgerStore()
+
+    /// Set/update a memory component snapshot.
+    ///
+    /// - Parameters:
+    ///   - tag: Stable identifier (e.g. `ui.search.thumbnailCache`)
+    ///   - bytes: Measured/estimated bytes for this component (clamped to >= 0)
+    ///   - count: Optional item count (frames, images, workers, etc.)
+    ///   - unit: Optional count unit label
+    ///   - function: Functional area (e.g. `ui.search`, `processing.ocr`)
+    ///   - kind: Component type (e.g. `images`, `queue`, `telemetry-window`)
+    ///   - note: Optional qualifier (e.g. `estimated`, `on-disk`)
+    public static func set(
+        tag: String,
+        bytes: Int64,
+        count: Int? = nil,
+        unit: String? = nil,
+        function: String,
+        kind: String,
+        note: String? = nil,
+        countsTowardTrackedMemory: Bool = true
+    ) {
+        guard !tag.isEmpty else { return }
+        Task(priority: .utility) {
+            await store.set(
+                tag: tag,
+                bytes: bytes,
+                count: count,
+                unit: unit,
+                function: function,
+                kind: kind,
+                note: note,
+                countsTowardTrackedMemory: countsTowardTrackedMemory
+            )
+        }
+    }
+
+    /// Remove a component from the ledger.
+    public static func remove(tag: String) {
+        guard !tag.isEmpty else { return }
+        Task(priority: .utility) {
+            await store.remove(tag: tag)
+        }
+    }
+
+    /// Update process-level memory snapshot for tracked-vs-unattributed calculations.
+    public static func setProcessSnapshot(
+        footprintBytes: UInt64?,
+        residentBytes: UInt64?,
+        internalBytes: UInt64?,
+        compressedBytes: UInt64?
+    ) {
+        Task(priority: .utility) {
+            await store.setProcessSnapshot(
+                footprintBytes: footprintBytes,
+                residentBytes: residentBytes,
+                internalBytes: internalBytes,
+                compressedBytes: compressedBytes
+            )
+        }
+    }
+
+    /// Emit a unified ledger summary if enough time has elapsed.
+    public static func emitSummary(
+        reason: String,
+        category: Log.Category = .app,
+        minIntervalSeconds: TimeInterval = 30,
+        force: Bool = false
+    ) {
+        Task(priority: .utility) {
+            await store.emitSummaryIfNeeded(
+                reason: reason,
+                category: category,
+                minIntervalSeconds: minIntervalSeconds,
+                force: force
+            )
+        }
+    }
+}
+
+private actor MemoryLedgerStore {
+    private struct ComponentEntry: Sendable {
+        let tag: String
+        var bytes: Int64
+        var count: Int?
+        var unit: String?
+        var function: String
+        var kind: String
+        var note: String?
+        var countsTowardTrackedMemory: Bool
+        var updatedAt: Date
+        var updateCount: Int
+    }
+
+    private struct ProcessSnapshot: Sendable {
+        let footprintBytes: UInt64
+        let residentBytes: UInt64
+        let internalBytes: UInt64
+        let compressedBytes: UInt64
+        let updatedAt: Date
+    }
+
+    private var entries: [String: ComponentEntry] = [:]
+    private var processSnapshot: ProcessSnapshot?
+    private var lastSummaryAt: Date?
+    private static let maxBreakdownComponents = 12
+
+    func set(
+        tag: String,
+        bytes: Int64,
+        count: Int?,
+        unit: String?,
+        function: String,
+        kind: String,
+        note: String?,
+        countsTowardTrackedMemory: Bool
+    ) {
+        let normalizedBytes = max(0, bytes)
+        let now = Date()
+
+        if var existing = entries[tag] {
+            existing.bytes = normalizedBytes
+            existing.count = count
+            existing.unit = unit
+            existing.function = function
+            existing.kind = kind
+            existing.note = note
+            existing.countsTowardTrackedMemory = countsTowardTrackedMemory
+            existing.updatedAt = now
+            existing.updateCount += 1
+            entries[tag] = existing
+        } else {
+            entries[tag] = ComponentEntry(
+                tag: tag,
+                bytes: normalizedBytes,
+                count: count,
+                unit: unit,
+                function: function,
+                kind: kind,
+                note: note,
+                countsTowardTrackedMemory: countsTowardTrackedMemory,
+                updatedAt: now,
+                updateCount: 1
+            )
+        }
+    }
+
+    func remove(tag: String) {
+        entries.removeValue(forKey: tag)
+    }
+
+    func setProcessSnapshot(
+        footprintBytes: UInt64?,
+        residentBytes: UInt64?,
+        internalBytes: UInt64?,
+        compressedBytes: UInt64?
+    ) {
+        processSnapshot = ProcessSnapshot(
+            footprintBytes: footprintBytes ?? 0,
+            residentBytes: residentBytes ?? 0,
+            internalBytes: internalBytes ?? 0,
+            compressedBytes: compressedBytes ?? 0,
+            updatedAt: Date()
+        )
+    }
+
+    func emitSummaryIfNeeded(
+        reason: String,
+        category: Log.Category,
+        minIntervalSeconds: TimeInterval,
+        force: Bool
+    ) {
+        let now = Date()
+        if !force, let lastSummaryAt, now.timeIntervalSince(lastSummaryAt) < max(1, minIntervalSeconds) {
+            return
+        }
+        lastSummaryAt = now
+
+        let rankedEntries = entries.values.sorted { lhs, rhs in
+            if lhs.bytes != rhs.bytes {
+                return lhs.bytes > rhs.bytes
+            }
+            return lhs.tag < rhs.tag
+        }
+
+        let trackedMemoryBytes = rankedEntries
+            .filter(\.countsTowardTrackedMemory)
+            .reduce(into: Int64(0)) { runningTotal, entry in
+                if runningTotal > Int64.max - entry.bytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += entry.bytes
+                }
+            }
+        let contextualBytes = rankedEntries
+            .filter { !$0.countsTowardTrackedMemory }
+            .reduce(into: Int64(0)) { runningTotal, entry in
+                if runningTotal > Int64.max - entry.bytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += entry.bytes
+                }
+            }
+
+        let trackedMemoryBytesUInt64 = UInt64(max(trackedMemoryBytes, 0))
+        let contextualBytesUInt64 = UInt64(max(contextualBytes, 0))
+
+        let trackedBytesForCompatibility = rankedEntries.reduce(into: Int64(0)) { runningTotal, entry in
+            if runningTotal > Int64.max - entry.bytes {
+                runningTotal = Int64.max
+            } else {
+                runningTotal += entry.bytes
+            }
+        }
+        let trackedBytesForCompatibilityUInt64 = UInt64(max(trackedBytesForCompatibility, 0))
+
+        let footprintBytes = processSnapshot?.footprintBytes ?? 0
+        let residentBytes = processSnapshot?.residentBytes ?? 0
+        let internalBytes = processSnapshot?.internalBytes ?? 0
+        let compressedBytes = processSnapshot?.compressedBytes ?? 0
+        let unattributedBytes = footprintBytes > trackedMemoryBytesUInt64
+            ? footprintBytes - trackedMemoryBytesUInt64
+            : 0
+
+        let topEntries = rankedEntries.prefix(Self.maxBreakdownComponents)
+        let breakdown = topEntries.map(Self.formatEntry).joined(separator: " | ")
+        let omittedCount = max(0, rankedEntries.count - topEntries.count)
+
+        var message = "[Memory-Ledger] reason=\(reason) components=\(rankedEntries.count) tracked=\(Self.formatBytes(trackedMemoryBytesUInt64)) contextual=\(Self.formatBytes(contextualBytesUInt64)) trackedAll=\(Self.formatBytes(trackedBytesForCompatibilityUInt64)) footprint=\(Self.formatBytes(footprintBytes)) resident=\(Self.formatBytes(residentBytes)) internal=\(Self.formatBytes(internalBytes)) compressed=\(Self.formatBytes(compressedBytes)) unattributed=\(Self.formatBytes(unattributedBytes)) breakdown=[\(breakdown)]"
+        if omittedCount > 0 {
+            message += " omitted=\(omittedCount)"
+        }
+
+        Log.info(message, category: category)
+    }
+
+    private static func formatEntry(_ entry: ComponentEntry) -> String {
+        var parts: [String] = []
+        parts.reserveCapacity(6)
+        parts.append("fn=\(entry.function)")
+        parts.append("kind=\(entry.kind)")
+        if let count = entry.count {
+            let unit = entry.unit ?? "items"
+            parts.append("count=\(count) \(unit)")
+        }
+        if let note = entry.note, !note.isEmpty {
+            parts.append("note=\(note)")
+        }
+        parts.append("scope=\(entry.countsTowardTrackedMemory ? "memory" : "context")")
+        return "\(entry.tag):\(formatBytes(UInt64(max(entry.bytes, 0)))) {\(parts.joined(separator: ","))}"
+    }
+
+    private static func formatBytes(_ bytes: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))))
     }
 }
 

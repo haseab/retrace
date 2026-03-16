@@ -44,6 +44,8 @@ public actor CaptureManager: CaptureProtocol {
     private var currentCaptureDisplayID: UInt32?
     private var isDisplaySwitchInFlight = false
     private static let windowChangeCaptureDelayMilliseconds = 100
+    private static let rawFrameBufferLimit = 8
+    private static let dedupedFrameBufferLimit = 8
 
     /// Callback for accessibility permission warnings
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
@@ -83,11 +85,15 @@ public actor CaptureManager: CaptureProtocol {
         self.currentConfig = config
 
         // Create raw frame stream
-        let (rawStream, rawContinuation) = AsyncStream<CapturedFrame>.makeStream()
+        let (rawStream, rawContinuation) = AsyncStream<CapturedFrame>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.rawFrameBufferLimit)
+        )
         self.rawFrameContinuation = rawContinuation
 
         // Create deduped frame stream for consumers
-        let (dedupedStream, dedupedContinuation) = AsyncStream<CapturedFrame>.makeStream()
+        let (dedupedStream, dedupedContinuation) = AsyncStream<CapturedFrame>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
+        )
         self.dedupedFrameContinuation = dedupedContinuation
         self._frameStream = dedupedStream
 
@@ -157,7 +163,9 @@ public actor CaptureManager: CaptureProtocol {
         }
 
         // Create new stream if none exists
-        let (stream, continuation) = AsyncStream<CapturedFrame>.makeStream()
+        let (stream, continuation) = AsyncStream<CapturedFrame>.makeStream(
+            bufferingPolicy: .bufferingNewest(Self.dedupedFrameBufferLimit)
+        )
         self.dedupedFrameContinuation = continuation
         self._frameStream = stream
         return stream

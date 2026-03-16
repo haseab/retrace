@@ -65,7 +65,7 @@ struct ProcessMemorySummaryCard: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.retraceSecondary.opacity(0.9))
 
-                if snapshot.hasEnoughMemoryData {
+                if snapshot.hasRenderableMemoryData {
                     let totalRows = snapshot.topMemoryProcesses.count
                     let visibleRows = min(max(Self.memoryRowsPageSize, memoryProcessRowsVisible), totalRows)
                     let hasMoreRows = visibleRows < totalRows
@@ -220,7 +220,7 @@ struct ProcessMemorySummaryCard: View {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Collecting process memory baseline...")
+                        Text("No recent process memory history yet. Sampling now...")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary)
                     }

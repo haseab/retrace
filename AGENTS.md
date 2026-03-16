@@ -453,4 +453,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-12_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-15_
