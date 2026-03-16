@@ -25,6 +25,35 @@ final class AccessibilityInspectorTest: XCTestCase {
 
     // Set AX_VERBOSE=1 to see detailed extraction attempts (noisy)
     private let verboseLogging = ProcessInfo.processInfo.environment["AX_VERBOSE"] == "1"
+    private let defaultKeywordNeedles = ["private", "incognito", "inprivate", "private browsing", "guest", "secret"]
+    private let keywordCandidateAttributes: [CFString] = [
+        kAXTitleAttribute as CFString,
+        kAXValueAttribute as CFString,
+        kAXDescriptionAttribute as CFString,
+        kAXRoleDescriptionAttribute as CFString,
+        kAXDocumentAttribute as CFString,
+        "AXHelp" as CFString,
+        "AXIdentifier" as CFString,
+        "AXLabel" as CFString,
+        "AXDOMClassList" as CFString,
+        "AXDOMIdentifier" as CFString,
+        "AXDOMRole" as CFString,
+        "AXDOMTag" as CFString,
+    ]
+
+    private lazy var keywordNeedles: [String] = {
+        let env = ProcessInfo.processInfo.environment
+        let rawNeedles = env["AX_KEYWORD_NEEDLES"] ?? env["AX_TREE_KEYWORDS"] ?? ""
+        let parsedNeedles = rawNeedles
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+
+        var deduped = Set<String>()
+        let finalNeedles = (parsedNeedles.isEmpty ? defaultKeywordNeedles : parsedNeedles)
+            .filter { deduped.insert($0).inserted }
+        return finalNeedles
+    }()
 
     func testIsBrowserAppDelegatesToProductionBrowserRecognizer() {
         XCTAssertTrue(isBrowserApp("com.duckduckgo.macos.browser"))
@@ -100,6 +129,7 @@ final class AccessibilityInspectorTest: XCTestCase {
         log("║  Output file: \(outputPath)                                 ║")
         log("║  Run: tail -f \(outputPath)                                 ║")
         log("╚══════════════════════════════════════════════════════════════════════════════╝\n")
+        log("🔎 AX keyword needles: \(keywordNeedles.joined(separator: ", "))\n")
 
         // Check for accessibility permissions
         let trusted = AXIsProcessTrusted()
@@ -129,7 +159,10 @@ final class AccessibilityInspectorTest: XCTestCase {
         var lastWindowTitle = ""
         var lastBrowserURL = ""
         var lastAXDocument = ""
+        var lastAppleScriptModeProbe: AppleScriptModeProbe?
         var lastBodyLinkObservations: [AXLinkObservation] = []
+        var lastKeywordObservations: [AXKeywordObservation] = []
+        var lastWindowSnapshots: [AXWindowSnapshot] = []
 
         // Monitor indefinitely until Ctrl+C
         let startTime = Date()
@@ -142,27 +175,72 @@ final class AccessibilityInspectorTest: XCTestCase {
                     data.windowTitle != lastWindowTitle ||
                     currentURL != lastBrowserURL ||
                     currentAXDocument != lastAXDocument ||
-                    data.bodyLinkObservations != lastBodyLinkObservations {
+                    data.appleScriptModeProbe != lastAppleScriptModeProbe ||
+                    data.bodyLinkObservations != lastBodyLinkObservations ||
+                    data.keywordObservations != lastKeywordObservations ||
+                    data.windowSnapshots != lastWindowSnapshots {
                     log("\n⏱  \(String(format: "%.1f", Date().timeIntervalSince(startTime)))s")
                     log("📱 App Bundle ID:  \(data.appBundleID)")
                     log("📝 App Name:       \(data.appName)")
                     log("🪟 Window Title:   \(data.windowTitle ?? "(none)")")
                     log("🌐 URL:            \(data.browserURL ?? "(URL not found)")")
                     log("🧪 AXDocument:     \(data.focusedWindowAXDocument ?? "(none)")")
+                    if let appleScriptModeProbe = data.appleScriptModeProbe {
+                        log("🍎 AppleScript Mode: \(appleScriptModeProbe.summary)")
+                    } else {
+                        log("🍎 AppleScript Mode: (not attempted)")
+                    }
                     log("🔗 AX Links:       \(data.uniqueBodyLinks.count) unique URLs (\(data.bodyLinkObservations.count) observations)")
-                    if data.bodyLinkObservations.isEmpty {
+//                    if data.bodyLinkObservations.isEmpty {
+//                        log("   (none)")
+//                    } else {
+//                        for (index, observation) in data.bodyLinkObservations.enumerated() {
+//                            log("   [\(index + 1)] \(observation.url)")
+//                            log("       attr=\(observation.attribute) role=\(observation.role)\(observation.subrole.map { " subrole=\($0)" } ?? "") inWebArea=\(observation.isWithinWebArea ? "yes" : "no") depth=\(observation.depth)")
+//                            log("       path=\(observation.path)")
+//                            if let title = observation.titlePreview {
+//                                log("       title=\(title)")
+//                            }
+//                            if let source = observation.sourceTextPreview {
+//                                log("       source=\(source)")
+//                            }
+//                        }
+//                    }
+                    log("🔎 Keyword Hits:   \(data.keywordObservations.count) observations (\(data.keywordHitsByNeedle.count) needles)")
+                    if data.keywordObservations.isEmpty {
                         log("   (none)")
                     } else {
-                        for (index, observation) in data.bodyLinkObservations.enumerated() {
-                            log("   [\(index + 1)] \(observation.url)")
-                            log("       attr=\(observation.attribute) role=\(observation.role)\(observation.subrole.map { " subrole=\($0)" } ?? "") inWebArea=\(observation.isWithinWebArea ? "yes" : "no") depth=\(observation.depth)")
-                            log("       path=\(observation.path)")
-                            if let title = observation.titlePreview {
+                        for needle in data.keywordHitsByNeedle.keys.sorted() {
+                            guard let matches = data.keywordHitsByNeedle[needle] else { continue }
+                            log("   \"\(needle)\": \(matches.count) match(es)")
+                            for (index, match) in matches.prefix(8).enumerated() {
+                                log("       [\(index + 1)] attr=\(match.attribute) role=\(match.role)\(match.subrole.map { " subrole=\($0)" } ?? "") source=\(match.source.rawValue) inWebArea=\(match.isWithinWebArea ? "yes" : "no") depth=\(match.depth)")
+                                log("           path=\(match.path)")
+                                if let valuePreview = match.valuePreview {
+                                    log("           value=\(valuePreview)")
+                                }
+                            }
+                            if matches.count > 8 {
+                                log("       ... \(matches.count - 8) additional match(es)")
+                            }
+                        }
+                    }
+                    log("🪟 AX Window Snapshots: \(data.windowSnapshots.count)")
+                    if data.windowSnapshots.isEmpty {
+                        log("   (none)")
+                    } else {
+                        for (index, snapshot) in data.windowSnapshots.prefix(8).enumerated() {
+                            log("   [\(index + 1)] role=\(snapshot.role)\(snapshot.subrole.map { " subrole=\($0)" } ?? "") depth=\(snapshot.depth)")
+                            log("       path=\(snapshot.path)")
+                            if let title = snapshot.titlePreview {
                                 log("       title=\(title)")
                             }
-                            if let source = observation.sourceTextPreview {
-                                log("       source=\(source)")
+                            if let identifier = snapshot.identifierPreview {
+                                log("       identifier=\(identifier)")
                             }
+                        }
+                        if data.windowSnapshots.count > 8 {
+                            log("   ... \(data.windowSnapshots.count - 8) additional window snapshot(s)")
                         }
                     }
                     if let method = data.urlExtractionMethod {
@@ -179,7 +257,10 @@ final class AccessibilityInspectorTest: XCTestCase {
                     lastWindowTitle = data.windowTitle ?? ""
                     lastBrowserURL = currentURL
                     lastAXDocument = currentAXDocument
+                    lastAppleScriptModeProbe = data.appleScriptModeProbe
                     lastBodyLinkObservations = data.bodyLinkObservations
+                    lastKeywordObservations = data.keywordObservations
+                    lastWindowSnapshots = data.windowSnapshots
                 }
             }
 
@@ -216,7 +297,10 @@ final class AccessibilityInspectorTest: XCTestCase {
         }
         var chromeText: String?
         var focusedWindowAXDocument: String?
+        let appleScriptModeProbe = probeAppleScriptMode(for: appBundleID)
         var bodyLinkObservations: [AXLinkObservation] = []
+        var keywordObservations: [AXKeywordObservation] = []
+        var windowSnapshots: [AXWindowSnapshot] = []
 
         // Get focused window
         if let focusedWindow: AXUIElement = getAttributeValue(appElement, attribute: kAXFocusedWindowAttribute as CFString) {
@@ -247,7 +331,13 @@ final class AccessibilityInspectorTest: XCTestCase {
             }
 
             if isBrowserApp(appBundleID) || browserURL != nil {
-                bodyLinkObservations = collectAllLinksInAXTree(focusedWindow)
+                let observations = collectAXTreeObservations(
+                    focusedWindow,
+                    keywordNeedles: keywordNeedles
+                )
+                bodyLinkObservations = observations.links
+                keywordObservations = observations.keywordHits
+                windowSnapshots = observations.windowSnapshots
             }
         }
 
@@ -259,7 +349,10 @@ final class AccessibilityInspectorTest: XCTestCase {
             urlExtractionMethod: urlMethod,
             chromeText: chromeText,
             focusedWindowAXDocument: focusedWindowAXDocument,
-            bodyLinkObservations: bodyLinkObservations
+            appleScriptModeProbe: appleScriptModeProbe,
+            bodyLinkObservations: bodyLinkObservations,
+            keywordObservations: keywordObservations,
+            windowSnapshots: windowSnapshots
         )
     }
 
@@ -645,11 +738,111 @@ final class AccessibilityInspectorTest: XCTestCase {
     }
 
     private func runAppleScript(_ source: String) -> String? {
+        runAppleScriptDetailed(source).output
+    }
+
+    private func runAppleScriptDetailed(_ source: String) -> AppleScriptExecutionResult {
         var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else { return nil }
+        guard let script = NSAppleScript(source: source) else {
+            return AppleScriptExecutionResult(
+                output: nil,
+                errorCode: nil,
+                errorMessage: "Failed to compile AppleScript source"
+            )
+        }
         let result = script.executeAndReturnError(&error)
-        if error != nil { return nil }
-        return result.stringValue
+        let output = result.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let error {
+            return AppleScriptExecutionResult(
+                output: nil,
+                errorCode: error[NSAppleScript.errorNumber] as? Int,
+                errorMessage: makePreview(error[NSAppleScript.errorMessage] as? String, limit: 160)
+            )
+        }
+        return AppleScriptExecutionResult(
+            output: output,
+            errorCode: nil,
+            errorMessage: nil
+        )
+    }
+
+    private func probeAppleScriptMode(for bundleID: String) -> AppleScriptModeProbe? {
+        guard isBrowserApp(bundleID) else { return nil }
+
+        let script = """
+            tell application id "\(bundleID)"
+                try
+                    return (mode of front window) as text
+                on error errMsg number errNum
+                    if errNum is -1728 then return "__NO_WINDOWS__"
+                    return "__MODE_ERROR__:" & (errNum as text) & ":" & errMsg
+                end try
+            end tell
+            """
+
+        let execution = runAppleScriptDetailed(script)
+
+        if let errorCode = execution.errorCode {
+            return classifyAppleScriptModeFailure(errorCode: errorCode, errorMessage: execution.errorMessage)
+        }
+
+        guard let rawOutput = execution.output, !rawOutput.isEmpty else {
+            return AppleScriptModeProbe(status: .emptyResult, mode: nil, errorCode: nil, detail: nil)
+        }
+
+        if rawOutput == "__NO_WINDOWS__" {
+            return AppleScriptModeProbe(status: .noWindows, mode: nil, errorCode: nil, detail: nil)
+        }
+
+        let modeErrorPrefix = "__MODE_ERROR__:"
+        if rawOutput.hasPrefix(modeErrorPrefix) {
+            let payload = String(rawOutput.dropFirst(modeErrorPrefix.count))
+            let components = payload.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            let errorCode = components.isEmpty ? nil : Int(components[0])
+            let detail = components.count > 1 ? makePreview(String(components[1]), limit: 120) : nil
+            return classifyAppleScriptModeFailure(errorCode: errorCode, errorMessage: detail)
+        }
+
+        return AppleScriptModeProbe(
+            status: .works,
+            mode: makePreview(rawOutput, limit: 80),
+            errorCode: nil,
+            detail: nil
+        )
+    }
+
+    private func classifyAppleScriptModeFailure(errorCode: Int?, errorMessage: String?) -> AppleScriptModeProbe {
+        let detail = makePreview(errorMessage, limit: 120)
+        switch errorCode {
+        case -1743:
+            return AppleScriptModeProbe(
+                status: .permissionDenied,
+                mode: nil,
+                errorCode: errorCode,
+                detail: detail
+            )
+        case -600:
+            return AppleScriptModeProbe(
+                status: .appUnavailable,
+                mode: nil,
+                errorCode: errorCode,
+                detail: detail
+            )
+        case -1700, -1708, -1728, -10000:
+            return AppleScriptModeProbe(
+                status: .unsupported,
+                mode: nil,
+                errorCode: errorCode,
+                detail: detail
+            )
+        default:
+            return AppleScriptModeProbe(
+                status: .error,
+                mode: nil,
+                errorCode: errorCode,
+                detail: detail
+            )
+        }
     }
 
     // MARK: - Deep Search Helpers
@@ -682,15 +875,19 @@ final class AccessibilityInspectorTest: XCTestCase {
         return nil
     }
 
-    // MARK: - Full Tree Link Extraction
+    // MARK: - Full Tree Inspection
 
-    private func collectAllLinksInAXTree(_ root: AXUIElement) -> [AXLinkObservation] {
-        var observations: [AXLinkObservation] = []
-        var seenObservations = Set<AXLinkObservationKey>()
+    private func collectAXTreeObservations(_ root: AXUIElement, keywordNeedles: [String]) -> AXTreeObservations {
+        var linkObservations: [AXLinkObservation] = []
+        var seenLinkObservations = Set<AXLinkObservationKey>()
+        var keywordObservations: [AXKeywordObservation] = []
+        var seenKeywordObservations = Set<AXKeywordObservationKey>()
+        var windowSnapshots: [AXWindowSnapshot] = []
+        var seenWindowSnapshots = Set<AXWindowSnapshotKey>()
         var visited = Set<UnsafeRawPointer>()
         var visitedCount = 0
 
-        collectLinks(
+        collectTreeObservations(
             in: root,
             depth: 0,
             maxDepth: 40,
@@ -698,16 +895,25 @@ final class AccessibilityInspectorTest: XCTestCase {
             path: [],
             childIndex: nil,
             isWithinWebArea: false,
+            keywordNeedles: keywordNeedles,
             visited: &visited,
             visitedCount: &visitedCount,
-            observations: &observations,
-            seenObservations: &seenObservations
+            linkObservations: &linkObservations,
+            seenLinkObservations: &seenLinkObservations,
+            keywordObservations: &keywordObservations,
+            seenKeywordObservations: &seenKeywordObservations,
+            windowSnapshots: &windowSnapshots,
+            seenWindowSnapshots: &seenWindowSnapshots
         )
 
-        return observations
+        return AXTreeObservations(
+            links: linkObservations,
+            keywordHits: keywordObservations,
+            windowSnapshots: windowSnapshots
+        )
     }
 
-    private func collectLinks(
+    private func collectTreeObservations(
         in element: AXUIElement,
         depth: Int,
         maxDepth: Int,
@@ -715,10 +921,15 @@ final class AccessibilityInspectorTest: XCTestCase {
         path: [String],
         childIndex: Int?,
         isWithinWebArea: Bool,
+        keywordNeedles: [String],
         visited: inout Set<UnsafeRawPointer>,
         visitedCount: inout Int,
-        observations: inout [AXLinkObservation],
-        seenObservations: inout Set<AXLinkObservationKey>
+        linkObservations: inout [AXLinkObservation],
+        seenLinkObservations: inout Set<AXLinkObservationKey>,
+        keywordObservations: inout [AXKeywordObservation],
+        seenKeywordObservations: inout Set<AXKeywordObservationKey>,
+        windowSnapshots: inout [AXWindowSnapshot],
+        seenWindowSnapshots: inout Set<AXWindowSnapshotKey>
     ) {
         guard depth <= maxDepth, visitedCount < maxNodes else { return }
 
@@ -733,29 +944,84 @@ final class AccessibilityInspectorTest: XCTestCase {
         let currentPathComponent = makePathComponent(role: role, subrole: subrole, childIndex: childIndex)
         let currentPath = path.isEmpty ? [currentPathComponent] : path + [currentPathComponent]
         let currentWithinWebArea = isWithinWebArea || role == "AXWebArea"
+        let identifierPreview = makePreview(getAttributeValue(element, attribute: "AXIdentifier" as CFString) as String?)
 
         let context = AXLinkObservationContext(
             role: role,
             subrole: subrole,
             titlePreview: titlePreview,
+            identifierPreview: identifierPreview,
             path: currentPath.joined(separator: " > "),
             depth: depth,
             isWithinWebArea: currentWithinWebArea
         )
 
-        appendLinkAttribute(kAXURLAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
-        appendLinkAttribute(kAXDocumentAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
-        appendLinkAttribute(kAXValueAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
-        appendLinkAttribute(kAXTitleAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
-        appendLinkAttribute(kAXDescriptionAttribute as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
-        appendLinkAttribute("AXHelp" as CFString, from: element, context: context, to: &observations, seenObservations: &seenObservations)
+        if role == "AXWindow" {
+            let snapshot = AXWindowSnapshot(
+                role: role,
+                subrole: subrole,
+                titlePreview: titlePreview,
+                identifierPreview: identifierPreview,
+                path: context.path,
+                depth: depth
+            )
+            if seenWindowSnapshots.insert(snapshot.key).inserted {
+                windowSnapshots.append(snapshot)
+            }
+        }
+
+        appendLinkAttribute(kAXURLAttribute as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+        appendLinkAttribute(kAXDocumentAttribute as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+        appendLinkAttribute(kAXValueAttribute as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+        appendLinkAttribute(kAXTitleAttribute as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+        appendLinkAttribute(kAXDescriptionAttribute as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+        appendLinkAttribute("AXHelp" as CFString, from: element, context: context, to: &linkObservations, seenObservations: &seenLinkObservations)
+
+        appendKeywordMatches(
+            in: role,
+            attribute: kAXRoleAttribute as String,
+            source: .attributeValue,
+            context: context,
+            keywordNeedles: keywordNeedles,
+            to: &keywordObservations,
+            seenObservations: &seenKeywordObservations
+        )
+        if let subrole, !subrole.isEmpty {
+            appendKeywordMatches(
+                in: subrole,
+                attribute: kAXSubroleAttribute as String,
+                source: .attributeValue,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &keywordObservations,
+                seenObservations: &seenKeywordObservations
+            )
+        }
+
+        for attribute in keywordCandidateAttributes {
+            appendKeywordAttribute(
+                attribute,
+                from: element,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &keywordObservations,
+                seenObservations: &seenKeywordObservations
+            )
+        }
+        appendKeywordAttributeNames(
+            from: element,
+            context: context,
+            keywordNeedles: keywordNeedles,
+            to: &keywordObservations,
+            seenObservations: &seenKeywordObservations
+        )
 
         guard let children: [AXUIElement] = getAttributeValue(element, attribute: kAXChildrenAttribute as CFString) else {
             return
         }
 
         for (childIndex, child) in children.enumerated() {
-            collectLinks(
+            collectTreeObservations(
                 in: child,
                 depth: depth + 1,
                 maxDepth: maxDepth,
@@ -763,10 +1029,15 @@ final class AccessibilityInspectorTest: XCTestCase {
                 path: currentPath,
                 childIndex: childIndex,
                 isWithinWebArea: currentWithinWebArea,
+                keywordNeedles: keywordNeedles,
                 visited: &visited,
                 visitedCount: &visitedCount,
-                observations: &observations,
-                seenObservations: &seenObservations
+                linkObservations: &linkObservations,
+                seenLinkObservations: &seenLinkObservations,
+                keywordObservations: &keywordObservations,
+                seenKeywordObservations: &seenKeywordObservations,
+                windowSnapshots: &windowSnapshots,
+                seenWindowSnapshots: &seenWindowSnapshots
             )
         }
     }
@@ -833,6 +1104,168 @@ final class AccessibilityInspectorTest: XCTestCase {
                 observations.append(observation)
             }
         }
+    }
+
+    private func appendKeywordAttribute(
+        _ attribute: CFString,
+        from element: AXUIElement,
+        context: AXLinkObservationContext,
+        keywordNeedles: [String],
+        to observations: inout [AXKeywordObservation],
+        seenObservations: inout Set<AXKeywordObservationKey>
+    ) {
+        if let value: String = getAttributeValue(element, attribute: attribute) {
+            appendKeywordMatches(
+                in: value,
+                attribute: attribute as String,
+                source: .attributeValue,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &observations,
+                seenObservations: &seenObservations
+            )
+            return
+        }
+
+        if let value: URL = getAttributeValue(element, attribute: attribute) {
+            appendKeywordMatches(
+                in: value.absoluteString,
+                attribute: attribute as String,
+                source: .attributeValue,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &observations,
+                seenObservations: &seenObservations
+            )
+            return
+        }
+
+        if let value: NSAttributedString = getAttributeValue(element, attribute: attribute) {
+            appendKeywordMatches(
+                in: value.string,
+                attribute: attribute as String,
+                source: .attributeValue,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &observations,
+                seenObservations: &seenObservations
+            )
+            return
+        }
+
+        if let value: NSNumber = getAttributeValue(element, attribute: attribute) {
+            appendKeywordMatches(
+                in: value.stringValue,
+                attribute: attribute as String,
+                source: .attributeValue,
+                context: context,
+                keywordNeedles: keywordNeedles,
+                to: &observations,
+                seenObservations: &seenObservations
+            )
+        }
+    }
+
+    private func appendKeywordAttributeNames(
+        from element: AXUIElement,
+        context: AXLinkObservationContext,
+        keywordNeedles: [String],
+        to observations: inout [AXKeywordObservation],
+        seenObservations: inout Set<AXKeywordObservationKey>
+    ) {
+        var attributeNamesRef: CFArray?
+        guard AXUIElementCopyAttributeNames(element, &attributeNamesRef) == .success,
+              let attributeNames = attributeNamesRef as? [String] else {
+            return
+        }
+
+        for attributeName in attributeNames {
+            let matchedNeedles = matchedNeedles(in: attributeName, keywordNeedles: keywordNeedles)
+            guard !matchedNeedles.isEmpty else { continue }
+
+            let valuePreview = getKeywordAttributeNameValuePreview(element: element, attributeName: attributeName)
+            for needle in matchedNeedles {
+                let observation = AXKeywordObservation(
+                    needle: needle,
+                    attribute: attributeName,
+                    role: context.role,
+                    subrole: context.subrole,
+                    valuePreview: valuePreview,
+                    source: .attributeName,
+                    path: context.path,
+                    depth: context.depth,
+                    isWithinWebArea: context.isWithinWebArea
+                )
+
+                guard seenObservations.insert(observation.key).inserted else { continue }
+                observations.append(observation)
+            }
+        }
+    }
+
+    private func getKeywordAttributeNameValuePreview(element: AXUIElement, attributeName: String) -> String? {
+        var rawValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attributeName as CFString, &rawValue) == .success else {
+            return nil
+        }
+
+        guard let rawValue else { return nil }
+
+        if let value = rawValue as? String {
+            return makePreview(value, limit: 120)
+        }
+        if let value = rawValue as? URL {
+            return makePreview(value.absoluteString, limit: 120)
+        }
+        if let value = rawValue as? NSAttributedString {
+            return makePreview(value.string, limit: 120)
+        }
+        if let value = rawValue as? NSNumber {
+            return value.stringValue
+        }
+
+        return makePreview(String(describing: rawValue), limit: 120)
+    }
+
+    private func appendKeywordMatches(
+        in rawText: String,
+        attribute: String,
+        source: AXKeywordMatchSource,
+        context: AXLinkObservationContext,
+        keywordNeedles: [String],
+        to observations: inout [AXKeywordObservation],
+        seenObservations: inout Set<AXKeywordObservationKey>
+    ) {
+        let matches = matchedNeedles(in: rawText, keywordNeedles: keywordNeedles)
+        guard !matches.isEmpty else { return }
+
+        let valuePreview = makePreview(rawText, limit: 120)
+        for needle in matches {
+            let observation = AXKeywordObservation(
+                needle: needle,
+                attribute: attribute,
+                role: context.role,
+                subrole: context.subrole,
+                valuePreview: valuePreview,
+                source: source,
+                path: context.path,
+                depth: context.depth,
+                isWithinWebArea: context.isWithinWebArea
+            )
+            guard seenObservations.insert(observation.key).inserted else { continue }
+            observations.append(observation)
+        }
+    }
+
+    private func matchedNeedles(in rawText: String, keywordNeedles: [String]) -> [String] {
+        let normalized = rawText.lowercased()
+        guard !normalized.isEmpty else { return [] }
+
+        var matches: [String] = []
+        for needle in keywordNeedles where normalized.contains(needle) {
+            matches.append(needle)
+        }
+        return matches
     }
 
     private func makePathComponent(role: String, subrole: String?, childIndex: Int?) -> String {
@@ -1026,7 +1459,10 @@ private struct AccessibilityData {
     let urlExtractionMethod: String?
     let chromeText: String?
     let focusedWindowAXDocument: String?
+    let appleScriptModeProbe: AppleScriptModeProbe?
     let bodyLinkObservations: [AXLinkObservation]
+    let keywordObservations: [AXKeywordObservation]
+    let windowSnapshots: [AXWindowSnapshot]
 
     var uniqueBodyLinks: [String] {
         var seen = Set<String>()
@@ -1036,12 +1472,66 @@ private struct AccessibilityData {
         }
         return urls
     }
+
+    var keywordHitsByNeedle: [String: [AXKeywordObservation]] {
+        Dictionary(grouping: keywordObservations, by: \.needle)
+    }
+}
+
+private struct AppleScriptExecutionResult: Hashable {
+    let output: String?
+    let errorCode: Int?
+    let errorMessage: String?
+}
+
+private enum AppleScriptModeProbeStatus: String, Hashable {
+    case works
+    case unsupported
+    case permissionDenied
+    case appUnavailable
+    case noWindows
+    case emptyResult
+    case error
+}
+
+private struct AppleScriptModeProbe: Hashable {
+    let status: AppleScriptModeProbeStatus
+    let mode: String?
+    let errorCode: Int?
+    let detail: String?
+
+    var summary: String {
+        switch status {
+        case .works:
+            let normalizedMode = mode?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "works (\(normalizedMode ?? "unknown"))"
+        case .unsupported:
+            return "unsupported\(errorSuffix)"
+        case .permissionDenied:
+            return "permission denied\(errorSuffix)"
+        case .appUnavailable:
+            return "app unavailable\(errorSuffix)"
+        case .noWindows:
+            return "no windows"
+        case .emptyResult:
+            return "no result"
+        case .error:
+            return "error\(errorSuffix)"
+        }
+    }
+
+    private var errorSuffix: String {
+        let codePart = errorCode.map { " [\($0)]" } ?? ""
+        let detailPart = detail.map { ": \($0)" } ?? ""
+        return codePart + detailPart
+    }
 }
 
 private struct AXLinkObservationContext {
     let role: String
     let subrole: String?
     let titlePreview: String?
+    let identifierPreview: String?
     let path: String
     let depth: Int
     let isWithinWebArea: Bool
@@ -1069,6 +1559,70 @@ private struct AXLinkObservation: Hashable {
             url: url,
             attribute: attribute,
             path: path
+        )
+    }
+}
+
+private struct AXTreeObservations {
+    let links: [AXLinkObservation]
+    let keywordHits: [AXKeywordObservation]
+    let windowSnapshots: [AXWindowSnapshot]
+}
+
+private struct AXWindowSnapshotKey: Hashable {
+    let path: String
+    let titlePreview: String?
+    let identifierPreview: String?
+}
+
+private struct AXWindowSnapshot: Hashable {
+    let role: String
+    let subrole: String?
+    let titlePreview: String?
+    let identifierPreview: String?
+    let path: String
+    let depth: Int
+
+    var key: AXWindowSnapshotKey {
+        AXWindowSnapshotKey(
+            path: path,
+            titlePreview: titlePreview,
+            identifierPreview: identifierPreview
+        )
+    }
+}
+
+private enum AXKeywordMatchSource: String, Hashable {
+    case attributeValue
+    case attributeName
+}
+
+private struct AXKeywordObservationKey: Hashable {
+    let needle: String
+    let attribute: String
+    let source: AXKeywordMatchSource
+    let path: String
+    let valuePreview: String?
+}
+
+private struct AXKeywordObservation: Hashable {
+    let needle: String
+    let attribute: String
+    let role: String
+    let subrole: String?
+    let valuePreview: String?
+    let source: AXKeywordMatchSource
+    let path: String
+    let depth: Int
+    let isWithinWebArea: Bool
+
+    var key: AXKeywordObservationKey {
+        AXKeywordObservationKey(
+            needle: needle,
+            attribute: attribute,
+            source: source,
+            path: path,
+            valuePreview: valuePreview
         )
     }
 }

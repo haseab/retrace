@@ -2561,6 +2561,18 @@ public class DashboardViewModel: ObservableObject {
         recordMetric(coordinator: coordinator, type: .redactionRulesUpdated, metadata: metadata)
     }
 
+    public static func recordPrivateWindowRedactionToggle(
+        coordinator: AppCoordinator,
+        enabled: Bool,
+        source: String
+    ) {
+        let metadata = jsonMetadata([
+            "enabled": enabled,
+            "source": source
+        ])
+        recordMetric(coordinator: coordinator, type: .privateWindowRedactionToggle, metadata: metadata)
+    }
+
     public static func recordSystemMonitorSettingsOpened(coordinator: AppCoordinator, source: String) {
         recordMetric(
             coordinator: coordinator,

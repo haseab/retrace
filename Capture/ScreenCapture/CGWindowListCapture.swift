@@ -56,6 +56,17 @@ public actor CGWindowListCapture {
         let visibleExcludedWindowIDs: Set<CGWindowID>
     }
 
+    private struct PrivateWindowDecisionState: Sendable {
+        let ownerPID: pid_t
+        let isPrivate: Bool
+        let observedAt: Date
+    }
+
+    /// Positive private detections are retained briefly to avoid one-frame leaks during AX title transitions.
+    private var privateWindowDecisionStateByWindowID: [CGWindowID: PrivateWindowDecisionState] = [:]
+    private let privateWindowPositiveGraceInterval: TimeInterval = 6
+    private let privateWindowStateRetentionInterval: TimeInterval = 90
+
     // MARK: - Lifecycle
 
     /// Start capturing frames with the given configuration
@@ -267,11 +278,17 @@ public actor CGWindowListCapture {
         var bundleIDCache: [pid_t: String] = [:]
         var pidsWithoutBundleID = Set<pid_t>()
         var browserURLCache: [String: BrowserURLLookupResult] = [:]
+        var privateWindowRedactionCache: [String: Bool] = [:]
+        var privateBrowserPIDs = Set<pid_t>()
+        var privateCompanionCandidatesByPID: [pid_t: [(windowID: CGWindowID, bundleID: String?, ownerName: String)]] = [:]
+        var seenWindowIDs = Set<CGWindowID>()
+        let decisionTimestamp = Date()
         let displayBounds = CGDisplayBounds(displayID)
 
         for windowInfo in windowList {
             guard let windowID = windowInfo[kCGWindowNumber as String] as? CGWindowID else { continue }
             guard shouldConsiderWindowForCapture(windowInfo, displayBounds: displayBounds) else { continue }
+            seenWindowIDs.insert(windowID)
 
             let ownerName = windowInfo[kCGWindowOwnerName as String] as? String ?? "unknown"
             let windowName = windowInfo[kCGWindowName as String] as? String ?? ""
@@ -298,6 +315,15 @@ public actor CGWindowListCapture {
                 )
             }
 
+            if let ownerPID,
+               let bundleID,
+               BrowserURLExtractor.isBrowser(bundleID),
+               windowName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                privateCompanionCandidatesByPID[ownerPID, default: []].append(
+                    (windowID: windowID, bundleID: bundleID, ownerName: ownerName)
+                )
+            }
+
             // Check 1: Excluded app bundle IDs (check by bundle ID from PID)
             if let bundleID, config.excludedAppBundleIDs.contains(bundleID) {
                 Log.info("[Exclusion] EXCLUDING app window: '\(windowName)' from \(ownerName) (bundleID: \(bundleID))", category: .capture)
@@ -315,7 +341,99 @@ public actor CGWindowListCapture {
                 continue
             }
 
-            // Check 2: Explicit window title redaction rules (case-insensitive substring)
+            // Check 2: Private/incognito redaction via AXTitle markers.
+            if config.excludePrivateWindows,
+               let ownerPID,
+               let bundleID,
+               BrowserURLExtractor.isBrowser(bundleID) {
+                let windowCacheKey = normalizedWindowCacheKey(windowName: windowName, ownerName: ownerName)
+                let privateCacheKey = "\(ownerPID)|\(windowCacheKey.lowercased())"
+
+                let usedCache: Bool
+                let rawAXDetectionResult: Bool?
+                let rawAppleScriptModeDetectionResult: Bool?
+                let detectedByAXOrCache: Bool
+                if let cached = privateWindowRedactionCache[privateCacheKey] {
+                    usedCache = true
+                    rawAXDetectionResult = cached
+                    rawAppleScriptModeDetectionResult = nil
+                    detectedByAXOrCache = cached
+                } else {
+                    usedCache = false
+                    rawAXDetectionResult = PrivateWindowDetector.isPrivateWindowViaAXTitle(
+                        pid: ownerPID,
+                        windowTitle: windowName,
+                        bundleID: bundleID
+                    )
+                    let axDetected = rawAXDetectionResult ?? false
+                    if axDetected {
+                        rawAppleScriptModeDetectionResult = nil
+                    } else {
+                        rawAppleScriptModeDetectionResult = await BrowserURLExtractor.isPrivateModeViaAppleScript(
+                            bundleID: bundleID,
+                            pid: ownerPID,
+                            windowCacheKey: windowCacheKey
+                        )
+                    }
+                    let detected = axDetected || (rawAppleScriptModeDetectionResult ?? false)
+                    privateWindowRedactionCache[privateCacheKey] = detected
+                    detectedByAXOrCache = detected
+                }
+
+                var sourceLabel = usedCache ? "cache" : "ax"
+                if !usedCache, rawAXDetectionResult != true, rawAppleScriptModeDetectionResult == true {
+                    sourceLabel = "applescript-mode"
+                } else if !usedCache, rawAXDetectionResult == false, rawAppleScriptModeDetectionResult == false {
+                    sourceLabel = "ax+applescript-mode"
+                }
+                var shouldRedactPrivateWindow = detectedByAXOrCache
+                let existingState = privateWindowDecisionStateByWindowID[windowID]
+
+                if detectedByAXOrCache {
+                    privateWindowDecisionStateByWindowID[windowID] = PrivateWindowDecisionState(
+                        ownerPID: ownerPID,
+                        isPrivate: true,
+                        observedAt: decisionTimestamp
+                    )
+                } else if let existingState,
+                          existingState.ownerPID == ownerPID,
+                          existingState.isPrivate,
+                          decisionTimestamp.timeIntervalSince(existingState.observedAt) <= privateWindowPositiveGraceInterval {
+                    shouldRedactPrivateWindow = true
+                    sourceLabel += "+sticky"
+                    tracePrivateRedaction(
+                        "sticky-hit windowID=\(windowID) pid=\(ownerPID) age=\(String(format: "%.2fs", decisionTimestamp.timeIntervalSince(existingState.observedAt)))"
+                    )
+                } else {
+                    privateWindowDecisionStateByWindowID[windowID] = PrivateWindowDecisionState(
+                        ownerPID: ownerPID,
+                        isPrivate: false,
+                        observedAt: decisionTimestamp
+                    )
+                }
+
+                tracePrivateRedaction(
+                    "windowID=\(windowID) pid=\(ownerPID) bundleID=\(bundleID) title='\(tracePreview(windowName))' source=\(sourceLabel) axResult=\(rawAXDetectionResult.map { String($0) } ?? "nil") modeResult=\(rawAppleScriptModeDetectionResult.map { String($0) } ?? "nil") redact=\(shouldRedactPrivateWindow)"
+                )
+
+                if shouldRedactPrivateWindow {
+                    privateBrowserPIDs.insert(ownerPID)
+                    excludedIDs.insert(windowID)
+                    redactedWindowIDs.insert(windowID)
+                    if redactionContextByWindowID[windowID] == nil {
+                        redactionWindowOrder.append(windowID)
+                        redactionContextByWindowID[windowID] = RedactionWindowContext(
+                            reason: "Private/incognito browsing window",
+                            appBundleID: bundleID,
+                            appName: appDisplayName(ownerName: ownerName, bundleID: bundleID)
+                        )
+                    }
+                    Log.info("[Redaction] Redacting private/incognito window \(windowID) via \(sourceLabel)", category: .capture)
+                    continue
+                }
+            }
+
+            // Check 3: Explicit window title redaction rules (case-insensitive substring)
             if hasWindowTitlePatterns,
                let matchedPattern = firstMatchingPattern(in: windowName, patterns: windowTitlePatterns) {
                 excludedIDs.insert(windowID)
@@ -400,20 +518,40 @@ public actor CGWindowListCapture {
             }
             Log.info("[Redaction] Redacting window \(windowID) by URL rule '\(matchedPattern)'", category: .capture)
 
-            // Check 2: Private/incognito windows
-            // TODO: Re-enable once private window detection is more reliable
-            // Currently disabled because title-based detection has false positives
-            // (e.g., pages with "private" in the title) and AX-based detection
-            // doesn't reliably detect Chrome/Safari incognito windows
-            // if config.excludePrivateWindows {
-            //     if PrivateWindowDetector.isPrivateWindow(
-            //         windowInfo: windowInfo,
-            //         patterns: config.customPrivateWindowPatterns
-            //     ) {
-            //         excludedIDs.insert(windowID)
-            //         Log.info("[PrivateDetect] EXCLUDING private window: '\(windowName)' from \(ownerName)", category: .capture)
-            //     }
-            // }
+        }
+
+        for ownerPID in privateBrowserPIDs {
+            guard let candidates = privateCompanionCandidatesByPID[ownerPID] else { continue }
+            for candidate in candidates {
+                guard !excludedIDs.contains(candidate.windowID) else { continue }
+
+                excludedIDs.insert(candidate.windowID)
+                redactedWindowIDs.insert(candidate.windowID)
+                if redactionContextByWindowID[candidate.windowID] == nil {
+                    redactionWindowOrder.append(candidate.windowID)
+                    redactionContextByWindowID[candidate.windowID] = RedactionWindowContext(
+                        reason: "Private/incognito companion window",
+                        appBundleID: candidate.bundleID,
+                        appName: appDisplayName(ownerName: candidate.ownerName, bundleID: candidate.bundleID)
+                    )
+                }
+
+                tracePrivateRedaction(
+                    "companion-redaction windowID=\(candidate.windowID) pid=\(ownerPID)"
+                )
+                Log.info(
+                    "[Redaction] Redacting private/incognito companion window \(candidate.windowID) for pid \(ownerPID)",
+                    category: .capture
+                )
+            }
+        }
+
+        privateWindowDecisionStateByWindowID = privateWindowDecisionStateByWindowID.filter { windowID, state in
+            if seenWindowIDs.contains(windowID) {
+                return true
+            }
+
+            return decisionTimestamp.timeIntervalSince(state.observedAt) <= privateWindowStateRetentionInterval
         }
 
         return ExclusionComputationResult(
@@ -486,6 +624,24 @@ public actor CGWindowListCapture {
 
     private func patternHasContent(_ pattern: String) -> Bool {
         pattern.contains(where: { !$0.isWhitespace })
+    }
+
+    private func tracePrivateRedaction(_ message: String) {
+        Log.info("[PrivateAXTrace] \(message)", category: .capture)
+    }
+
+    private func tracePreview(_ value: String, limit: Int = 180) -> String {
+        let collapsed = value
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if collapsed.count <= limit {
+            return collapsed
+        }
+
+        return String(collapsed.prefix(limit)) + "..."
     }
 
     private func normalizedWindowCacheKey(windowName: String, ownerName: String) -> String {

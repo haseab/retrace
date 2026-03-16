@@ -303,9 +303,27 @@ final class BrowserURLAppleScriptCoordinatorTests: XCTestCase {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("company.thebrowser.dia"))
     }
 
-    func testIsBrowserRecognizesInstalledCometAndSigmaOSBundleIDs() {
+    func testIsBrowserRecognizesInstalledCometSigmaOSAndFirefoxBundleIDs() {
         XCTAssertTrue(BrowserURLExtractor.isBrowser("ai.perplexity.comet"))
         XCTAssertTrue(BrowserURLExtractor.isBrowser("com.sigmaos.sigmaos.macos"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefox"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefoxbeta"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.firefoxdeveloperedition"))
+        XCTAssertTrue(BrowserURLExtractor.isBrowser("org.mozilla.nightly"))
+    }
+
+    func testGetURLReturnsNilForFirefoxFamily() async {
+        let firefoxBundleIDs = [
+            "org.mozilla.firefox",
+            "org.mozilla.firefoxbeta",
+            "org.mozilla.firefoxdeveloperedition",
+            "org.mozilla.nightly",
+        ]
+
+        for bundleID in firefoxBundleIDs {
+            let url = await BrowserURLExtractor.getURL(bundleID: bundleID, pid: 0, windowCacheKey: "Firefox")
+            XCTAssertNil(url, "Expected URL extraction to be disabled for \(bundleID)")
+        }
     }
 
     func testIsBrowserRejectsSafariWebApps() {

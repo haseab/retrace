@@ -349,8 +349,12 @@ actor BrowserURLAppleScriptCoordinator {
     }
 }
 
-/// Extracts the current URL from supported web browsers
+/// Extracts the current URL from recognized web browsers.
 /// Requires Accessibility permission
+///
+/// Support tiers:
+/// - Explicit extraction paths: Safari, Arc, and Chromium-family URL extraction logic (coverage varies by browser)
+/// - Recognized but untested (best effort): Orion, iCab, OmniWeb, Opera, WebKit MiniBrowser, Waterfox, LibreWolf, Thorium, Zen, Floorp, GNOME Web
 ///
 /// Strategy by browser:
 /// - Safari: AXToolbar → AXTextField (address bar value)
@@ -362,8 +366,8 @@ struct BrowserURLExtractor: Sendable {
 
     // MARK: - Known Browser Bundle IDs
 
-    /// Browser bundle IDs matched exactly.
-    private static let knownBrowsers: Set<String> = [
+    /// Browser bundle IDs with explicit extraction coverage.
+    private static let explicitlyRecognizedBrowsers: Set<String> = [
         "com.apple.Safari",
         "com.google.Chrome",
         "com.microsoft.edgemac",
@@ -371,15 +375,23 @@ struct BrowserURLExtractor: Sendable {
         "company.thebrowser.Browser",  // Arc
         "company.thebrowser.dia",      // Dia
         "org.mozilla.firefox",
+        "org.mozilla.firefoxbeta",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
         "com.vivaldi.Vivaldi",
-        "com.operasoftware.Opera",
-        "com.nickvision.browser",      // GNOME Web
         "com.openai.chat",             // ChatGPT desktop app
         "ai.perplexity.comet",         // Comet Browser
         "org.chromium.Chromium",       // Chromium
         "com.sigmaos.sigmaos.macos",   // SigmaOS
         "com.nicklockwood.Duckduckgo", // DuckDuckGo
         "com.duckduckgo.macos.browser", // DuckDuckGo (alternate)
+    ]
+
+    /// Recognized but untested browser bundle IDs.
+    /// Extraction for these is best-effort via generic paths and not part of the explicit test matrix.
+    private static let untestedBestEffortBrowsers: Set<String> = [
+        "com.operasoftware.Opera",
+        "com.nickvision.browser",      // GNOME Web
         "com.nicklockwood.iCab",       // iCab
         "de.icab.iCab",                // iCab (alternate)
         "com.nicklockwood.OmniWeb",    // OmniWeb
@@ -393,6 +405,10 @@ struct BrowserURLExtractor: Sendable {
         "com.nicklockwood.Zen",        // Zen Browser
         "com.nicklockwood.Floorp",     // Floorp
     ]
+
+    /// Browser bundle IDs matched exactly.
+    private static let knownBrowsers: Set<String> =
+        explicitlyRecognizedBrowsers.union(untestedBestEffortBrowsers)
 
     /// Chromium app-shim bundle IDs (PWAs/installed web apps).
     /// Examples: com.google.Chrome.app.<id>, com.brave.Browser.app.<id>
@@ -446,6 +462,16 @@ struct BrowserURLExtractor: Sendable {
     private static let lowSignalWebAppTitles: Set<String> = [
         "chatgpt web - chatgpt",
         "chatgpt"
+    ]
+    private static let appleScriptModeFallbackBundleIDs: Set<String> = [
+        "com.vivaldi.Vivaldi",
+        "com.sigmaos.sigmaos.macos",
+    ]
+    private static let firefoxBundleIDs: Set<String> = [
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxbeta",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
     ]
 
     private enum HostBrowserTitleMatchMissReason: String, Sendable {
@@ -505,8 +531,8 @@ struct BrowserURLExtractor: Sendable {
             return await getFinderTargetURL(pid: pid, windowCacheKey: windowCacheKey)
         }
 
-        // Firefox URL extraction is intentionally disabled.
-        if bundleID == "org.mozilla.firefox" {
+        // Firefox family URL extraction is intentionally disabled.
+        if firefoxBundleIDs.contains(bundleID) {
             return nil
         }
 
@@ -539,6 +565,74 @@ struct BrowserURLExtractor: Sendable {
             getURLViaWebArea(bundleID: bundleID, pid: pid),
             for: bundleID
         )
+    }
+
+    /// Best-effort private/incognito signal from AppleScript `mode`.
+    /// This is intentionally limited to browsers with weak AX private markers
+    /// to reduce Automation permission prompts and subprocess overhead.
+    static func isPrivateModeViaAppleScript(
+        bundleID: String,
+        pid: pid_t,
+        windowCacheKey: String? = nil
+    ) async -> Bool? {
+        guard appleScriptModeFallbackBundleIDs.contains(bundleID) else {
+            return nil
+        }
+
+        let outputValidator: @Sendable (String) -> Bool = { output in
+            !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        let method1Result = await appleScriptCoordinator.execute(
+            source:
+            """
+            tell application id "\(bundleID)"
+                get mode of front window as text
+            end tell
+            """,
+            browserBundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey,
+            scriptLabel: "private-mode-front-window",
+            outputValidator: outputValidator
+        )
+
+        if let decision = privateModeDecision(fromAppleScriptOutput: method1Result.output) {
+            let source = method1Result.returnedFromCache ? "cache" : "AppleScript method 1"
+            Log.info("[PrivateMode] [\(bundleID)] mode decision via \(source): \(decision ? "private" : "normal")", category: .capture)
+            return decision
+        }
+
+        if method1Result.skippedByCooldown {
+            Log.debug("[PrivateMode] [\(bundleID)] AppleScript in cooldown; skipping mode fallback", category: .capture)
+            return nil
+        }
+        if method1Result.didTimeOut {
+            Log.warning("[PrivateMode] [\(bundleID)] AppleScript timed out for mode lookup", category: .capture)
+            return nil
+        }
+
+        let method2Result = await appleScriptCoordinator.execute(
+            source:
+            """
+            tell application id "\(bundleID)"
+                get mode of window 1 as text
+            end tell
+            """,
+            browserBundleID: bundleID,
+            pid: pid,
+            windowCacheKey: windowCacheKey,
+            scriptLabel: "private-mode-window-1",
+            outputValidator: outputValidator
+        )
+
+        if let decision = privateModeDecision(fromAppleScriptOutput: method2Result.output) {
+            let source = method2Result.returnedFromCache ? "cache" : "AppleScript method 2"
+            Log.info("[PrivateMode] [\(bundleID)] mode decision via \(source): \(decision ? "private" : "normal")", category: .capture)
+            return decision
+        }
+
+        return nil
     }
 
     // MARK: - Safari
@@ -620,6 +714,30 @@ struct BrowserURLExtractor: Sendable {
             ) {
                 return url
             }
+        }
+
+        return nil
+    }
+
+    private static func privateModeDecision(fromAppleScriptOutput output: String?) -> Bool? {
+        guard let normalized = output?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !normalized.isEmpty else {
+            return nil
+        }
+
+        if normalized.contains("incognito") ||
+            normalized.contains("inprivate") ||
+            normalized == "private" ||
+            normalized.contains("private browsing") {
+            return true
+        }
+
+        if normalized == "normal" ||
+            normalized == "regular" ||
+            normalized == "standard" {
+            return false
         }
 
         return nil

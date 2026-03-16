@@ -6,6 +6,19 @@ import Shared
 /// Detects private/incognito browser windows using Accessibility API and fallback methods
 struct PrivateWindowDetector {
 
+    private static let privateBrowsingAXTitleMarkers = [
+        "incognito",
+        "private browsing",
+        "inprivate",
+        "(private)",
+        "private window",
+    ]
+
+    private static let duckDuckGoBundleIDs: Set<String> = [
+        "com.duckduckgo.macos.browser",
+        "com.nicklockwood.Duckduckgo",
+    ]
+
     // MARK: - Detection Methods (SCWindow)
 
     /// Detect if a window is a private/incognito browsing window
@@ -31,7 +44,7 @@ struct PrivateWindowDetector {
         // Check if this is a browser that could have private windows
         let browserOwnerNames = [
             "Safari", "Google Chrome", "Chrome", "Brave Browser", "Microsoft Edge",
-            "Firefox", "Arc", "Vivaldi", "Chromium", "Opera", "Dia", "Dia Browser"
+            "Firefox", "Arc", "Vivaldi", "Chromium", "Opera", "Dia", "Dia Browser", "Comet", "DuckDuckGo"
         ]
 
         let isBrowser = browserOwnerNames.contains { ownerName.contains($0) }
@@ -52,6 +65,89 @@ struct PrivateWindowDetector {
 
         // Fallback to title-based detection
         return checkViaTitlePatterns(title: windowName, additionalPatterns: patterns)
+    }
+
+    /// Detect private/incognito mode strictly from AXTitle for a specific window.
+    /// - Parameters:
+    ///   - pid: Process ID of the window owner
+    ///   - windowTitle: The window title from CGWindowList
+    /// - Returns: true if matching AXTitle contains private/incognito markers, false if checked and not private, nil if AX is unavailable
+    static func isPrivateWindowViaAXTitle(pid: pid_t, windowTitle: String, bundleID: String? = nil) -> Bool? {
+        tracePrivateRedaction("begin pid=\(pid) windowTitle='\(tracePreview(windowTitle))'")
+
+        let appElement = AXUIElementCreateApplication(pid)
+
+        var windowsRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            appElement,
+            kAXWindowsAttribute as CFString,
+            &windowsRef
+        )
+
+        if result == .apiDisabled || result == .cannotComplete {
+            tracePrivateRedaction("AX unavailable pid=\(pid) result=\(result.rawValue)")
+            return nil
+        }
+
+        guard result == .success,
+              let windows = windowsRef as? [AXUIElement] else {
+            tracePrivateRedaction("AX fetch failed pid=\(pid) result=\(result.rawValue)")
+            return nil
+        }
+
+        tracePrivateRedaction("AX window count pid=\(pid): \(windows.count)")
+
+        let resolvedBundleID = bundleID ?? NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        let normalizedWindowTitle = normalizedWindowTitleForMatching(windowTitle)
+        var sawMatchingTitle = false
+        var sawMatchingMarker = false
+        var sawAnyPrivateMarker = false
+
+        for (index, axWindow) in windows.enumerated() {
+            guard let axTitle = getAXAttribute(axWindow, kAXTitleAttribute as CFString) as? String else {
+                tracePrivateRedaction("candidate[\(index)] missing AXTitle")
+                continue
+            }
+
+            let titleLikelyMatches = axTitleLikelyMatchesWindow(axTitle, normalizedWindowTitle: normalizedWindowTitle)
+            let axIdentifier = getAXAttribute(axWindow, "AXIdentifier" as CFString) as? String
+            let hasPrivateMarker = axTitleContainsPrivateMarker(axTitle, bundleID: resolvedBundleID) ||
+                axIdentifierContainsPrivateMarker(axIdentifier)
+            if hasPrivateMarker {
+                sawAnyPrivateMarker = true
+            }
+            let identifierTrace = axIdentifier.map { tracePreview($0) } ?? "(none)"
+            tracePrivateRedaction(
+                "candidate[\(index)] title='\(tracePreview(axTitle))' titleMatch=\(titleLikelyMatches) markerMatch=\(hasPrivateMarker) identifier='\(identifierTrace)'"
+            )
+
+            if titleLikelyMatches {
+                sawMatchingTitle = true
+                if hasPrivateMarker {
+                    sawMatchingMarker = true
+                }
+            }
+        }
+
+        if sawMatchingMarker {
+            tracePrivateRedaction("decision pid=\(pid): private=true (matching AXTitle contains marker)")
+            return true
+        }
+
+        if sawMatchingTitle {
+            tracePrivateRedaction("decision pid=\(pid): private=false (matching AXTitle has no marker)")
+            return false
+        }
+
+        if windowTitleLooksLikePrivatePlaceholder(normalizedWindowTitle), sawAnyPrivateMarker {
+            tracePrivateRedaction(
+                "decision pid=\(pid): private=true (fallback: private placeholder title + marker window present)"
+            )
+            return true
+        }
+
+        tracePrivateRedaction("decision pid=\(pid): private=false (no matching AXTitle)")
+        return false
     }
 
     /// Check if a window is private using Accessibility API (for CGWindowList)
@@ -118,6 +214,10 @@ struct PrivateWindowDetector {
             return "com.operasoftware.Opera"
         case "Dia", "Dia Browser":
             return "company.thebrowser.dia"
+        case "Comet":
+            return "ai.perplexity.comet"
+        case "DuckDuckGo":
+            return "com.duckduckgo.macos.browser"
         default:
             return ownerName
         }
@@ -147,6 +247,8 @@ struct PrivateWindowDetector {
             "(private browsing)",   // Firefox alternate format
             " - private window",    // Brave: "Page Title - Private Window"
             " — private window",    // Brave alternate
+            "(private)",            // Brave: "Title - Brave (Private)"
+            "fire window",          // DuckDuckGo private window title
         ]
 
         // Check browser-specific suffix patterns
@@ -243,8 +345,12 @@ struct PrivateWindowDetector {
         switch bundleID {
         case "com.google.Chrome", "com.google.Chrome.canary", "com.microsoft.edgemac",
              "com.brave.Browser", "org.chromium.Chromium", "com.vivaldi.Vivaldi",
+             "ai.perplexity.comet",
              "company.thebrowser.dia":
             return checkChromiumPrivate(element)
+
+        case "com.duckduckgo.macos.browser", "com.nicklockwood.Duckduckgo":
+            return checkDuckDuckGoPrivate(element)
 
         case "com.apple.Safari", "com.apple.SafariTechnologyPreview":
             return checkSafariPrivate(element)
@@ -305,7 +411,9 @@ struct PrivateWindowDetector {
            lowercaseTitle.contains("(incognito)") ||
            lowercaseTitle.contains(" - inprivate") ||
            lowercaseTitle.contains(" — inprivate") ||
-           lowercaseTitle.contains("(inprivate)") {
+           lowercaseTitle.contains("(inprivate)") ||
+           lowercaseTitle.contains("(private)") ||
+           lowercaseTitle.contains("private window") {
             Log.info("[ChromiumPrivate] MATCH via title: \(title)", category: .capture)
             return true
         }
@@ -392,7 +500,23 @@ struct PrivateWindowDetector {
             }
         }
 
+        if let identifier = getAXAttribute(element, "AXIdentifier" as CFString) as? String,
+           axIdentifierContainsPrivateMarker(identifier) {
+            return true
+        }
+
         return false
+    }
+
+    /// Check if DuckDuckGo browser window is in private mode.
+    /// DuckDuckGo uses "Fire Window" as the private window title.
+    private static func checkDuckDuckGoPrivate(_ element: AXUIElement) -> Bool {
+        guard let title = getAXAttribute(element, kAXTitleAttribute as CFString) as? String else {
+            return false
+        }
+
+        let normalizedTitle = normalizedWindowTitleForMatching(title)
+        return normalizedTitle == "fire window"
     }
 
     // MARK: - Title-Based Fallback Detection
@@ -425,5 +549,231 @@ struct PrivateWindowDetector {
         }
 
         return value
+    }
+
+    private static func normalizedWindowTitleForMatching(_ title: String) -> String {
+        title
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func strippedPrivateMarkers(from title: String) -> String {
+        var normalized = normalizedWindowTitleForMatching(title)
+
+        let removableMarkers = [
+            "(incognito)",
+            " - incognito",
+            " — incognito",
+            "(inprivate)",
+            " - inprivate",
+            " — inprivate",
+            "(private browsing)",
+            " - private browsing",
+            " — private browsing",
+            ", private browsing",
+            "(private)",
+            " - private",
+            " — private",
+            " - private window",
+            " — private window",
+        ]
+
+        for marker in removableMarkers {
+            normalized = normalized.replacingOccurrences(of: marker, with: "")
+        }
+
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func axTitleLikelyMatchesWindow(_ axTitle: String, normalizedWindowTitle: String) -> Bool {
+        guard !normalizedWindowTitle.isEmpty else { return false }
+
+        let normalizedAXTitle = normalizedWindowTitleForMatching(axTitle)
+        if normalizedAXTitle == normalizedWindowTitle {
+            return true
+        }
+
+        if strongContainmentMatch(normalizedAXTitle, normalizedWindowTitle) {
+            return true
+        }
+
+        let strippedAXTitle = strippedPrivateMarkers(from: normalizedAXTitle)
+        if strippedAXTitle == normalizedWindowTitle {
+            return true
+        }
+
+        if strongContainmentMatch(strippedAXTitle, normalizedWindowTitle) {
+            return true
+        }
+
+        let canonicalAXTitle = canonicalTitleForMatching(normalizedAXTitle)
+        let canonicalWindowTitle = canonicalTitleForMatching(normalizedWindowTitle)
+        guard !canonicalAXTitle.isEmpty, !canonicalWindowTitle.isEmpty else { return false }
+
+        if canonicalAXTitle == canonicalWindowTitle {
+            return true
+        }
+
+        if strongContainmentMatch(canonicalAXTitle, canonicalWindowTitle) {
+            return true
+        }
+
+        return strongTokenOverlapMatch(canonicalAXTitle, canonicalWindowTitle)
+    }
+
+    private static func axTitleContainsPrivateMarker(_ axTitle: String, bundleID: String?) -> Bool {
+        let normalizedTitle = normalizedWindowTitleForMatching(axTitle)
+        if privateBrowsingAXTitleMarkers.contains(where: { normalizedTitle.contains($0) }) {
+            return true
+        }
+
+        if let bundleID, duckDuckGoBundleIDs.contains(bundleID), normalizedTitle == "fire window" {
+            return true
+        }
+
+        return false
+    }
+
+    private static func axIdentifierContainsPrivateMarker(_ axIdentifier: String?) -> Bool {
+        guard let axIdentifier else { return false }
+        let normalizedIdentifier = normalizedWindowTitleForMatching(axIdentifier)
+
+        if normalizedIdentifier.contains("bigincognitobrowserwindow") {
+            return true
+        }
+
+        return normalizedIdentifier.contains("incognito") ||
+            normalizedIdentifier.contains("inprivate")
+    }
+
+    private static func strongContainmentMatch(_ lhs: String, _ rhs: String) -> Bool {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+        guard lhs.contains(rhs) || rhs.contains(lhs) else { return false }
+
+        let shorterCount = min(lhs.count, rhs.count)
+        let longerCount = max(lhs.count, rhs.count)
+        guard shorterCount > 0 else { return false }
+
+        let lengthRatio = Double(shorterCount) / Double(longerCount)
+        return shorterCount >= 12 || lengthRatio >= 0.60
+    }
+
+    private static func strongTokenOverlapMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsTokens = Set(
+            lhs.split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { $0.count >= 3 }
+        )
+        let rhsTokens = Set(
+            rhs.split(whereSeparator: { $0.isWhitespace })
+                .map(String.init)
+                .filter { $0.count >= 3 }
+        )
+
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else { return false }
+
+        let commonCount = lhsTokens.intersection(rhsTokens).count
+        if commonCount == 0 {
+            return false
+        }
+
+        let shorterTokenCount = min(lhsTokens.count, rhsTokens.count)
+        guard shorterTokenCount >= 3 else {
+            return false
+        }
+
+        let overlapRatio = Double(commonCount) / Double(shorterTokenCount)
+        return (commonCount >= 4 && overlapRatio >= 0.45) ||
+            (commonCount >= 3 && overlapRatio >= 0.70)
+    }
+
+    private static func canonicalTitleForMatching(_ title: String) -> String {
+        var normalized = normalizedWindowTitleForMatching(title)
+        normalized = strippedPrivateMarkers(from: normalized)
+
+        let removableSegments = [
+            " - audio playing",
+            " — audio playing",
+            " (audio playing)",
+            "🔊",
+            "🔉",
+            "🔈",
+            "🔇",
+        ]
+
+        for segment in removableSegments {
+            normalized = normalized.replacingOccurrences(of: segment, with: "")
+        }
+
+        let removableSuffixes = [
+            " - google chrome canary",
+            " — google chrome canary",
+            " - google chrome",
+            " — google chrome",
+            " - microsoft edge",
+            " — microsoft edge",
+            " - brave browser",
+            " — brave browser",
+            " - chromium",
+            " — chromium",
+            " - safari",
+            " — safari",
+            " - firefox",
+            " — firefox",
+        ]
+
+        var trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        var removedSuffix = true
+        while removedSuffix {
+            removedSuffix = false
+            for suffix in removableSuffixes {
+                if trimmed.hasSuffix(suffix) {
+                    trimmed.removeLast(suffix.count)
+                    trimmed = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+                    removedSuffix = true
+                    break
+                }
+            }
+        }
+
+        let folded = trimmed.folding(options: [.diacriticInsensitive, .widthInsensitive], locale: .current)
+        let sanitized = folded.unicodeScalars.map { scalar -> String in
+            CharacterSet.alphanumerics.contains(scalar) ? String(scalar) : " "
+        }.joined()
+
+        return sanitized
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    private static func windowTitleLooksLikePrivatePlaceholder(_ normalizedWindowTitle: String) -> Bool {
+        guard !normalizedWindowTitle.isEmpty else { return false }
+
+        return normalizedWindowTitle.contains("incognito tab") ||
+            normalizedWindowTitle.contains("new incognito") ||
+            normalizedWindowTitle.contains("private browsing") ||
+            normalizedWindowTitle.contains("inprivate") ||
+            normalizedWindowTitle.contains("private window") ||
+            normalizedWindowTitle == "fire window"
+    }
+
+    private static func tracePrivateRedaction(_ message: String) {
+        Log.info("[PrivateAXTrace] \(message)", category: .capture)
+    }
+
+    private static func tracePreview(_ value: String, limit: Int = 180) -> String {
+        let collapsed = value
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if collapsed.count <= limit {
+            return collapsed
+        }
+
+        return String(collapsed.prefix(limit)) + "..."
     }
 }

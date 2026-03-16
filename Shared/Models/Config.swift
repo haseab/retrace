@@ -129,7 +129,7 @@ public struct CaptureConfig: Codable, Sendable {
     /// App bundle IDs to exclude from capture
     public let excludedAppBundleIDs: Set<String>
 
-    /// Whether to exclude private/incognito browser windows
+    /// Whether to redact private/incognito browser windows detected via AX title markers.
     public let excludePrivateWindows: Bool
 
     /// Custom patterns to detect private windows (in addition to defaults)

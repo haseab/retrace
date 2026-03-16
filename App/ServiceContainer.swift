@@ -689,8 +689,7 @@ extension CaptureConfig {
         // Read settings from UserDefaults (synced with Settings UI)
         let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
         let captureIntervalSeconds = defaults.object(forKey: "captureIntervalSeconds") as? Double ?? 2.0
-        // TODO: Re-enable once private window detection is more reliable
-        // Currently disabled because detection has false positives and doesn't reliably detect incognito
+        // Private/incognito redaction toggle (AXTitle marker-based)
         let excludePrivateWindows = defaults.object(forKey: "excludePrivateWindows") as? Bool ?? false
         // excludeCursor = true means hide cursor, so showCursor = !excludeCursor
         let excludeCursor = defaults.object(forKey: "excludeCursor") as? Bool ?? false
@@ -701,6 +700,7 @@ extension CaptureConfig {
         // Deduplication threshold - how similar frames must be to be considered duplicates
         let deduplicationThreshold = defaults.object(forKey: "deduplicationThreshold") as? Double ?? CaptureConfig.defaultDeduplicationThreshold
         let keepFramesOnMouseMovement = defaults.object(forKey: "keepFramesOnMouseMovement") as? Bool ?? true
+        let enableCustomPatternWindowRedaction = defaults.object(forKey: "enableCustomPatternWindowRedaction") as? Bool ?? true
 
         // Parse excluded apps from settings (stored as JSON array of ExcludedAppInfo)
         var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
@@ -718,8 +718,12 @@ extension CaptureConfig {
             }
         }
 
-        let redactWindowTitlePatterns = parseRedactionPatterns(defaults.string(forKey: "redactWindowTitlePatterns"))
-        let redactBrowserURLPatterns = parseRedactionPatterns(defaults.string(forKey: "redactBrowserURLPatterns"))
+        let redactWindowTitlePatterns = enableCustomPatternWindowRedaction
+            ? parseRedactionPatterns(defaults.string(forKey: "redactWindowTitlePatterns"))
+            : []
+        let redactBrowserURLPatterns = enableCustomPatternWindowRedaction
+            ? parseRedactionPatterns(defaults.string(forKey: "redactBrowserURLPatterns"))
+            : []
 
         // Capture on window change - instantly capture when switching apps/windows
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true

@@ -17,4 +17,18 @@ final class InPageURLSettingsTests: XCTestCase {
         XCTAssertFalse(SettingsView.isSupportedDirectInPageURLBrowserBundleID("com.sigmaos.sigmaos.macos"))
         XCTAssertTrue(SettingsView.isSupportedDirectInPageURLBrowserBundleID("com.vivaldi.Vivaldi"))
     }
+
+    func testPrivateModeAutomationTargetsIncludeVivaldiAndSigmaOS() {
+        let bundleIDs = SettingsView.privateModeAutomationRequiredBundleIDs
+        XCTAssertTrue(bundleIDs.contains("com.vivaldi.Vivaldi"))
+        XCTAssertTrue(bundleIDs.contains("com.sigmaos.sigmaos.macos"))
+    }
+
+    func testPrivateModeAXCompatibleTargetsIncludeFirefoxFamily() {
+        let bundleIDs = SettingsView.privateModeAXCompatibleBundleIDs
+        XCTAssertTrue(bundleIDs.contains("org.mozilla.firefox"))
+        XCTAssertTrue(bundleIDs.contains("org.mozilla.firefoxbeta"))
+        XCTAssertTrue(bundleIDs.contains("org.mozilla.firefoxdeveloperedition"))
+        XCTAssertTrue(bundleIDs.contains("org.mozilla.nightly"))
+    }
 }

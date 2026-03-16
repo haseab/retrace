@@ -291,6 +291,22 @@ public actor AppCoordinator {
         try await services.capture.updateConfig(config)
     }
 
+    private static func privateRedactionTracePreview(_ value: String?, limit: Int = 180) -> String {
+        guard let value else { return "nil" }
+
+        let collapsed = value
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !collapsed.isEmpty else { return "(empty)" }
+        if collapsed.count <= limit {
+            return collapsed
+        }
+        return String(collapsed.prefix(limit)) + "..."
+    }
+
     // MARK: - Timeline Visibility
 
     /// Set whether the timeline is currently visible (pauses frame processing when true)
@@ -1225,7 +1241,20 @@ public actor AppCoordinator {
                     }
                 }
 
-                Log.verbose("[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), app=\(frame.metadata.appName)", category: .app)
+                let appNameForLog = frame.metadata.appName ?? "nil"
+                let appBundleIDForLog = frame.metadata.appBundleID ?? "nil"
+                let windowNameForLog = Self.privateRedactionTracePreview(frame.metadata.windowName)
+                let redactionReasonForLog = frame.metadata.redactionReason ?? "none"
+
+                Log.verbose(
+                    "[CAPTURE-DEBUG] Captured frameID=\(frameID), videoDBID=\(writerState.videoDBID), frameIndexInSegment=\(frameIndexInSegment), bundleID=\(appBundleIDForLog), app=\(appNameForLog), window=\(windowNameForLog), redactionReason=\(redactionReasonForLog)",
+                    category: .app
+                )
+
+                Log.info(
+                    "[PrivateAXTrace] frameID=\(frameID) bundleID=\(appBundleIDForLog) app=\(appNameForLog) window='\(windowNameForLog)' redactionReason='\(redactionReasonForLog)'",
+                    category: .app
+                )
 
                 if writerState.frameCount % videoUpdateInterval == 0 {
                     let width = await writerState.writer.frameWidth

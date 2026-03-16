@@ -58,7 +58,8 @@ enum SettingsDefaults {
 
     // MARK: Privacy
     static let excludedApps = ""
-    static let excludePrivateWindows = false
+    static let excludePrivateWindows = false  // Redact incognito/private-browsing windows via AXTitle markers
+    static let enableCustomPatternWindowRedaction = true
     static let redactWindowTitlePatterns = ""
     static let redactBrowserURLPatterns = ""
     static let excludeSafariPrivate = true
@@ -120,6 +121,14 @@ struct SettingsSearchEntry: Identifiable {
 }
 
 private struct InPageURLBrowserTarget: Identifiable, Hashable, Sendable {
+    let bundleID: String
+    let displayName: String
+    let appURL: URL?
+
+    var id: String { bundleID }
+}
+
+private struct PrivateModeAutomationTarget: Identifiable, Hashable, Sendable {
     let bundleID: String
     let displayName: String
     let appURL: URL?
@@ -294,6 +303,7 @@ public struct SettingsView: View {
     // MARK: Privacy Settings
     @AppStorage("excludedApps", store: settingsStore) private var excludedAppsString = SettingsDefaults.excludedApps
     @AppStorage("excludePrivateWindows", store: settingsStore) private var excludePrivateWindows = SettingsDefaults.excludePrivateWindows
+    @AppStorage("enableCustomPatternWindowRedaction", store: settingsStore) private var enableCustomPatternWindowRedaction = SettingsDefaults.enableCustomPatternWindowRedaction
     @AppStorage("redactWindowTitlePatterns", store: settingsStore) private var redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
     @AppStorage("redactBrowserURLPatterns", store: settingsStore) private var redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
 
@@ -356,6 +366,9 @@ public struct SettingsView: View {
     @AppStorage("ocrProcessingLevel", store: settingsStore) private var ocrProcessingLevel = SettingsDefaults.ocrProcessingLevel
     @AppStorage("ocrAppFilterMode", store: settingsStore) private var ocrAppFilterMode: OCRAppFilterMode = SettingsDefaults.ocrAppFilterMode
     @AppStorage("ocrFilteredApps", store: settingsStore) private var ocrFilteredAppsString = SettingsDefaults.ocrFilteredApps
+    @State private var excludedAppsPopoverShown = false
+    @State private var installedAppsForExcludedRedaction: [(bundleID: String, name: String)] = []
+    @State private var otherAppsForExcludedRedaction: [(bundleID: String, name: String)] = []
     @State private var ocrFilteredAppsPopoverShown = false
     @State private var installedAppsForOCR: [(bundleID: String, name: String)] = []
     @State private var otherAppsForOCR: [(bundleID: String, name: String)] = []
@@ -429,6 +442,12 @@ public struct SettingsView: View {
     @State private var isSafariInPageInstructionsExpanded = false
     @State private var isChromeInPageInstructionsExpanded = false
     @State private var unsupportedInPageURLTargets: [UnsupportedInPageURLTarget] = []
+    @State private var privateModeAXCompatibleTargets: [PrivateModeAutomationTarget] = []
+    @State private var privateModeAutomationTargets: [PrivateModeAutomationTarget] = []
+    @State private var privateModeAutomationPermissionStateByBundleID: [String: InPageURLPermissionState] = [:]
+    @State private var privateModeAutomationBusyBundleIDs: Set<String> = []
+    @State private var privateModeAutomationRunningBundleIDs: Set<String> = []
+    @State private var isRefreshingPrivateModeAutomationTargets = false
 
     // Quick delete state
     @State private var quickDeleteConfirmation: QuickDeleteOption? = nil
@@ -486,10 +505,10 @@ public struct SettingsView: View {
         SettingsSearchEntry(id: "exportData.comingSoon", tab: .exportData, cardTitle: "Coming Soon", cardIcon: "clock",
             searchableText: ["export", "import", "data export"]),
         // Privacy
-        SettingsSearchEntry(id: "privacy.excludedApps", tab: .privacy, cardTitle: "Excluded Apps", cardIcon: "app.badge.checkmark",
+        SettingsSearchEntry(id: "privacy.excludedApps", tab: .privacy, cardTitle: "App Level Redaction", cardIcon: "app.badge.checkmark",
             searchableText: ["excluded apps", "block app", "privacy", "apps not recorded", "app exclusion"]),
-        SettingsSearchEntry(id: "privacy.frameRedaction", tab: .privacy, cardTitle: "Window Redaction", cardIcon: "eye.slash",
-            searchableText: ["redaction", "window title", "browser url", "black frames", "privacy rules"]),
+        SettingsSearchEntry(id: "privacy.frameRedaction", tab: .privacy, cardTitle: "Window Level Redaction", cardIcon: "eye.slash",
+            searchableText: ["redaction", "window title", "browser url", "black frames", "privacy rules", "incognito", "private browsing", "automation", "vivaldi", "sigmaos"]),
         SettingsSearchEntry(id: "privacy.quickDelete", tab: .privacy, cardTitle: "Quick Delete", cardIcon: "clock.arrow.circlepath",
             searchableText: ["quick delete", "delete recent", "last 5 minutes", "last hour", "last 24 hours", "erase"]),
         SettingsSearchEntry(id: "privacy.permissions", tab: .privacy, cardTitle: "Permissions", cardIcon: "hand.raised",
@@ -585,6 +604,36 @@ public struct SettingsView: View {
     ]
     private static let inPageURLTestURLString = "https://en.wikipedia.org/wiki/Cat"
     private static let inPageURLNoMatchingWindowToken = "__NO_MATCHING_WINDOW__"
+    nonisolated private static let privateModeAutomationFallbackBundleIDs: [String] = [
+        "com.vivaldi.Vivaldi",
+        "com.sigmaos.sigmaos.macos",
+    ]
+    nonisolated private static let privateModeAXCompatibleBrowserBundleIDs: [String] = [
+        "com.apple.Safari",
+        "com.google.Chrome",
+        "com.google.Chrome.canary",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "org.chromium.Chromium",
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxbeta",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
+        "com.operasoftware.Opera",
+        "company.thebrowser.Browser",
+        "ai.perplexity.comet",
+        "company.thebrowser.dia",
+        "com.duckduckgo.macos.browser",
+        "com.nicklockwood.Thorium",
+    ]
+
+    nonisolated static var privateModeAutomationRequiredBundleIDs: [String] {
+        privateModeAutomationFallbackBundleIDs
+    }
+
+    nonisolated static var privateModeAXCompatibleBundleIDs: [String] {
+        privateModeAXCompatibleBrowserBundleIDs
+    }
 
     public var body: some View {
         GeometryReader { geometry in
@@ -3361,8 +3410,9 @@ public struct SettingsView: View {
 
     private var privacySettings: some View {
         VStack(alignment: .leading, spacing: 20) {
-            excludedAppsCard
-            redactionRulesCard
+            appLevelRedactionCard
+                .zIndex(excludedAppsPopoverShown ? 50 : 0)
+            windowLevelRedactionCard
             quickDeleteCard
             permissionsCard
         }
@@ -3371,35 +3421,85 @@ public struct SettingsView: View {
     // MARK: - Privacy Cards (extracted for search)
 
     @ViewBuilder
-    private var excludedAppsCard: some View {
-        ModernSettingsCard(title: "Excluded Apps", icon: "app.badge.checkmark") {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Apps that will not be recorded")
-                        .font(.retraceCaption)
-                        .foregroundColor(.retraceSecondary)
+    private var appLevelRedactionCard: some View {
+        ModernSettingsCard(title: "App Level Redaction", icon: "app.badge.checkmark") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Exclude entire apps from capture.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
 
-                    if excludedApps.isEmpty {
-                        Text("No apps excluded")
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.6))
-                            .padding(.vertical, 4)
-                    } else {
-                        // Wrap excluded apps in a flow layout
-                        FlowLayout(spacing: 8) {
-                            ForEach(excludedApps) { app in
-                                ExcludedAppChip(app: app) {
-                                    removeExcludedApp(app)
-                                }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Excluded Apps")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.retracePrimary)
+
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 200), spacing: 8)],
+                        alignment: .leading,
+                        spacing: 8
+                    ) {
+                        ExcludedAppsAddButton(isOpen: excludedAppsPopoverShown) {
+                            excludedAppsPopoverShown.toggle()
+                        }
+
+                        ForEach(excludedApps) { app in
+                            ExcludedAppChip(app: app) {
+                                removeExcludedApp(app)
                             }
                         }
                     }
+                    .overlay(alignment: .topLeading) {
+                        if excludedAppsPopoverShown {
+                            ZStack(alignment: .topLeading) {
+                                Color.black.opacity(0.001)
+                                    .ignoresSafeArea()
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        excludedAppsPopoverShown = false
+                                    }
 
-                    ModernButton(title: "Add App", icon: "plus", style: .secondary) {
-                        showAppPickerMultiple { apps in
-                            addExcludedApps(apps)
+                                AppsFilterPopover(
+                                    apps: installedAppsForExcludedRedaction,
+                                    otherApps: otherAppsForExcludedRedaction,
+                                    selectedApps: Set(excludedApps.map(\.bundleID)),
+                                    filterMode: .include,
+                                    allowMultiSelect: true,
+                                    showAllOption: false,
+                                    onSelectApp: { bundleID in
+                                        toggleExcludedRedactionApp(bundleID)
+                                    },
+                                    onFilterModeChange: nil,
+                                    onDismiss: {
+                                        excludedAppsPopoverShown = false
+                                    }
+                                )
+                                .fixedSize(horizontal: false, vertical: true)
+                                .offset(y: 42)
+                                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .topLeading)))
+                            }
+                            .zIndex(120)
                         }
                     }
+                    .onExitCommand {
+                        if excludedAppsPopoverShown {
+                            excludedAppsPopoverShown = false
+                        }
+                    }
+                    .zIndex(excludedAppsPopoverShown ? 80 : 0)
                 }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.white.opacity(0.025))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+            }
+        }
+        .task {
+            loadExcludedAppsForRedaction()
         }
     }
 
@@ -3455,36 +3555,99 @@ public struct SettingsView: View {
     }
 
     @ViewBuilder
-    private var redactionRulesCard: some View {
-        ModernSettingsCard(title: "Window Redaction", icon: "eye.slash") {
+    private var windowLevelRedactionCard: some View {
+        ModernSettingsCard(title: "Window Level Redaction", icon: "eye.slash") {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Mask matching window regions in captured frames (case-insensitive substring).")
                     .font(.retraceCaption)
                     .foregroundColor(.retraceSecondary)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Window title patterns (one per line)")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.retraceSecondary)
-                    redactionRuleEditor(
-                        text: $redactWindowTitlePatternsRaw,
-                        placeholder: "Examples:\nWells Fargo Bank - Home\nPassword Manager\nGusto - Payroll"
+                VStack(alignment: .leading, spacing: 12) {
+                    ModernToggleRow(
+                        title: "Automatic Private / Incognito Mode Redaction",
+                        subtitle: "Redact private/incognito windows automatically",
+                        isOn: $excludePrivateWindows
                     )
-                }
+                    .onChange(of: excludePrivateWindows) { enabled in
+                        updatePrivateWindowRedactionSetting()
+                        if enabled {
+                            Task { await refreshPrivateModeAutomationTargets(force: true) }
+                        } else {
+                            privateModeAXCompatibleTargets = []
+                            privateModeAutomationTargets = []
+                            privateModeAutomationPermissionStateByBundleID = [:]
+                            privateModeAutomationBusyBundleIDs = []
+                            privateModeAutomationRunningBundleIDs = []
+                        }
+                    }
+                    if excludePrivateWindows {
+                        Divider()
+                            .background(Color.white.opacity(0.08))
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Browser URL patterns (one per line)")
-                        .font(.retraceCaption2)
-                        .foregroundColor(.retraceSecondary)
-                    redactionRuleEditor(
-                        text: $redactBrowserURLPatternsRaw,
-                        placeholder: "Examples:\nx.com/home\nbankofamerica.com\ninstagram.com/profile"
+                        privateModeAutomationSetupSection
+                    }
+                }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.white.opacity(0.025))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+
+                Divider()
+                    .background(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 12) {
+                    ModernToggleRow(
+                        title: "Redact on Browser URL or Window Name",
+                        subtitle: "Use custom window-name and browser-URL pattern rules",
+                        isOn: $enableCustomPatternWindowRedaction
                     )
-                }
+                    .onChange(of: enableCustomPatternWindowRedaction) { _ in
+                        updateRedactionRulesConfig()
+                    }
 
-                Text("Note: Window redaction does not currently work in Firefox.")
-                    .font(.retraceCaption2)
-                    .foregroundColor(.retraceSecondary.opacity(0.85))
+                    if enableCustomPatternWindowRedaction {
+                        Divider()
+                            .background(Color.white.opacity(0.08))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Custom window title patterns (one per line)")
+                                .font(.retraceCaptionBold)
+                                .foregroundColor(.retraceSecondary)
+                            redactionRuleEditor(
+                                text: $redactWindowTitlePatternsRaw,
+                                placeholder: "Examples:\nWells Fargo Bank - Home\nPassword Manager\nGusto - Payroll"
+                            )
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Custom browser URL patterns (one per line)")
+                                .font(.retraceCaptionBold)
+                                .foregroundColor(.retraceSecondary)
+                            redactionRuleEditor(
+                                text: $redactBrowserURLPatternsRaw,
+                                placeholder: "Examples:\nx.com/home\nbankofamerica.com\ninstagram.com/profile"
+                            )
+                        }
+
+                        Text("Note: Firefox Browser URL Redaction will not work because it is not possible to read the URL")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.85))
+                    }
+                }
+                .padding(12)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.white.opacity(0.025))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
             }
             .onChange(of: redactWindowTitlePatternsRaw) { _ in
                 updateRedactionRulesConfig()
@@ -3492,6 +3655,10 @@ public struct SettingsView: View {
             .onChange(of: redactBrowserURLPatternsRaw) { _ in
                 updateRedactionRulesConfig()
             }
+        }
+        .task(id: excludePrivateWindows) {
+            guard excludePrivateWindows else { return }
+            await refreshPrivateModeAutomationTargets()
         }
     }
 
@@ -3522,6 +3689,214 @@ public struct SettingsView: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.white.opacity(0.09), lineWidth: 1)
         )
+    }
+
+    @ViewBuilder
+    private var privateModeAutomationSetupSection: some View {
+        let hasDeniedTargets = privateModeAutomationTargets.contains {
+            privateModeAutomationPermissionStateByBundleID[$0.bundleID] == .denied
+        }
+        let hasNeedsConsentTargets = privateModeAutomationTargets.contains {
+            privateModeAutomationPermissionStateByBundleID[$0.bundleID] == .needsConsent
+        }
+        let accessibilityState: InPageURLPermissionState = hasAccessibilityPermission ? .granted : .needsConsent
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Step 1: Compatible browsers")
+                .font(.retraceCaption2Bold)
+                .foregroundColor(.retracePrimary)
+
+            if privateModeAXCompatibleTargets.isEmpty {
+                Text("No compatible browsers detected.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(.retraceSecondary)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(privateModeAXCompatibleTargets.enumerated()), id: \.element.bundleID) { index, target in
+                        privateModeAXCompatibleBrowserRow(
+                            target: target,
+                            accessibilityState: accessibilityState
+                        )
+                        if index < privateModeAXCompatibleTargets.count - 1 {
+                            Divider()
+                                .background(Color.white.opacity(0.08))
+                        }
+                    }
+                }
+            }
+
+            Divider()
+                .background(Color.white.opacity(0.08))
+
+            Text("Step 2: Grant Additional Permissions for these browsers")
+                .font(.retraceCaption2Bold)
+                .foregroundColor(.retracePrimary)
+
+            if privateModeAutomationTargets.isEmpty {
+                if isRefreshingPrivateModeAutomationTargets {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Scanning for browsers that require mode-based private detection...")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary)
+                    }
+                } else {
+                    Text("No installed browsers currently require `mode`-based private detection.")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(privateModeAutomationTargets.enumerated()), id: \.element.bundleID) { index, target in
+                        privateModeAutomationPermissionRow(target: target)
+                        if index < privateModeAutomationTargets.count - 1 {
+                            Divider()
+                                .background(Color.white.opacity(0.08))
+                        }
+                    }
+                }
+            }
+
+            HStack {
+                Spacer()
+                Button(action: {
+                    Task { await refreshPrivateModeAutomationTargets(force: true) }
+                }) {
+                    HStack(spacing: 6) {
+                        if isRefreshingPrivateModeAutomationTargets {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 10))
+                        }
+                        Text(isRefreshingPrivateModeAutomationTargets ? "Refreshing..." : "Refresh Browser List")
+                            .font(.retraceCaption2)
+                    }
+                    .foregroundColor(.white.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .disabled(isRefreshingPrivateModeAutomationTargets)
+            }
+
+            if hasDeniedTargets || hasNeedsConsentTargets {
+                Text(hasDeniedTargets ? "One or more browsers are currently denied." : "At least one browser still needs Allow.")
+                    .font(.retraceCaption2)
+                    .foregroundColor(hasDeniedTargets ? .retraceDanger : .retraceWarning)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func privateModeAXCompatibleBrowserRow(
+        target: PrivateModeAutomationTarget,
+        accessibilityState: InPageURLPermissionState
+    ) -> some View {
+        HStack(spacing: 12) {
+            Group {
+                if let icon = inPageURLIconByBundleID[target.bundleID] {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "globe")
+                        .font(.system(size: 12))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 20, height: 20)
+                }
+            }
+
+            Text(target.displayName)
+                .font(.retraceCalloutMedium)
+                .foregroundColor(.retracePrimary)
+
+            Spacer()
+
+            inPageURLPermissionBadge(for: accessibilityState)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .onAppear {
+            scheduleInPageURLIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
+    }
+
+    @ViewBuilder
+    private func privateModeAutomationPermissionRow(target: PrivateModeAutomationTarget) -> some View {
+        let permissionState = privateModeAutomationPermissionStateByBundleID[target.bundleID]
+        let isRunning = privateModeAutomationRunningBundleIDs.contains(target.bundleID)
+        let isGranted = permissionState == .granted
+        let buttonTitle = isGranted ? "Change" : (isRunning ? "Allow" : "Launch")
+        let buttonBusyTitle = isRunning ? "Allowing..." : "Launching..."
+
+        HStack(spacing: 12) {
+            Group {
+                if let icon = inPageURLIconByBundleID[target.bundleID] {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "globe")
+                        .font(.system(size: 12))
+                        .foregroundColor(.retraceSecondary)
+                        .frame(width: 20, height: 20)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(target.displayName)
+                    .font(.retraceCalloutMedium)
+                    .foregroundColor(.retracePrimary)
+            }
+
+            Spacer()
+
+            inPageURLPermissionBadge(for: permissionState)
+
+            Button(action: {
+                if isGranted || permissionState == .denied {
+                    openAutomationSettings()
+                    recordPrivateWindowRedactionMetric(
+                        action: isGranted ? "change_permission_open_settings" : "denied_permission_open_settings",
+                        browserBundleID: target.bundleID,
+                        permissionState: permissionState
+                    )
+                    return
+                }
+
+                Task {
+                    if isRunning {
+                        await requestPrivateModeAutomationPermission(for: target)
+                    } else {
+                        await launchPrivateModeAutomationTarget(target)
+                    }
+                }
+            }) {
+                if privateModeAutomationBusyBundleIDs.contains(target.bundleID) {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(buttonBusyTitle)
+                    }
+                } else {
+                    Text(buttonTitle)
+                }
+            }
+            .font(.retraceCaption2Bold)
+            .foregroundColor(.white)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.retraceAccent.opacity(0.75))
+            .cornerRadius(8)
+            .buttonStyle(.plain)
+            .disabled(privateModeAutomationBusyBundleIDs.contains(target.bundleID))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .onAppear {
+            scheduleInPageURLIconLoad(bundleID: target.bundleID, appURL: target.appURL)
+        }
     }
 
     @ViewBuilder
@@ -4755,8 +5130,8 @@ public struct SettingsView: View {
         case "storage.databaseLocations": databaseLocationsCard
         case "storage.retentionPolicy": retentionPolicyCard
         case "exportData.comingSoon": comingSoonCard
-        case "privacy.excludedApps": excludedAppsCard
-        case "privacy.frameRedaction": redactionRulesCard
+        case "privacy.excludedApps": appLevelRedactionCard
+        case "privacy.frameRedaction": windowLevelRedactionCard
         case "privacy.quickDelete": quickDeleteCard
         case "privacy.permissions": permissionsCard
         case "power.ocrProcessing": ocrProcessingCard
@@ -5014,8 +5389,10 @@ private struct ModernSettingsCard<Content: View>: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.white.opacity(0.03))
-        .cornerRadius(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.white.opacity(0.03))
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 16)
                 .stroke(dangerous ? Color.retraceDanger.opacity(0.3) : Color.white.opacity(0.06), lineWidth: 1)
@@ -5095,6 +5472,7 @@ private struct ModernPermissionRow: View {
     var enableAction: (() -> Void)? = nil
     var openSettingsAction: (() -> Void)? = nil
     @State private var isHoveringGrantedControl = false
+    private static let grantedControlWidth: CGFloat = 120
 
     var body: some View {
         HStack {
@@ -5117,6 +5495,7 @@ private struct ModernPermissionRow: View {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
+                    .frame(width: Self.grantedControlWidth)
                     .background(Color.retraceSuccess.opacity(0.1))
                     .cornerRadius(8)
                     .opacity((openSettingsAction != nil && isHoveringGrantedControl) ? 0 : 1)
@@ -5126,8 +5505,8 @@ private struct ModernPermissionRow: View {
                             Text("Change")
                                 .font(.retraceCaption2Bold)
                                 .foregroundColor(.white)
-                                .padding(.horizontal, 14)
                                 .padding(.vertical, 6)
+                                .frame(width: Self.grantedControlWidth)
                                 .background(Color.retraceAccent)
                                 .cornerRadius(6)
                         }
@@ -5393,35 +5772,49 @@ private struct ExcludedAppChip: View {
     @State private var resolvedIcon: NSImage?
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             // App icon
             if let resolvedIcon {
                 Image(nsImage: resolvedIcon)
                     .resizable()
-                    .frame(width: 16, height: 16)
+                    .frame(width: 20, height: 20)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
             } else {
                 Image(systemName: "app.fill")
-                    .font(.retraceCaption2)
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.retraceSecondary)
+                    .frame(width: 20, height: 20)
             }
 
             Text(app.name)
-                .font(.retraceCaption2Medium)
+                .font(.retraceCaptionMedium)
                 .foregroundColor(.retracePrimary)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
 
             // Remove button (visible on hover)
             Button(action: onRemove) {
                 Image(systemName: "xmark")
-                    .font(.retraceTinyBold)
-                    .foregroundColor(isHovered ? .retracePrimary : .retraceSecondary)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.retraceSecondary)
+                    .frame(width: 16, height: 16)
             }
             .buttonStyle(.plain)
-            .opacity(isHovered ? 1 : 0.5)
+            .opacity(isHovered ? 1 : 0)
+            .allowsHitTesting(isHovered)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(isHovered ? 0.08 : 0.05))
-        .cornerRadius(6)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(isHovered ? 0.09 : 0.055))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(isHovered ? 0.14 : 0.07), lineWidth: 1)
+        )
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
@@ -5439,8 +5832,52 @@ private struct ExcludedAppChip: View {
     private static func resolveIconOnMainActor(forPath iconPath: String) -> NSImage? {
         guard FileManager.default.fileExists(atPath: iconPath) else { return nil }
         let icon = NSWorkspace.shared.icon(forFile: iconPath)
-        icon.size = NSSize(width: 16, height: 16)
+        icon.size = NSSize(width: 20, height: 20)
         return icon
+    }
+}
+
+private struct ExcludedAppsAddButton: View {
+    let isOpen: Bool
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.retraceSecondary.opacity(0.9))
+
+                Text("Add App...")
+                    .font(.retraceCaptionMedium)
+                    .foregroundColor(.retraceSecondary.opacity(0.9))
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.white.opacity((isHovered || isOpen) ? 0.09 : 0.045))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(
+                        isOpen ? RetraceMenuStyle.filterStrokeStrong : Color.white.opacity((isHovered || isOpen) ? 0.22 : 0.1),
+                        lineWidth: isOpen ? 1.2 : 1
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) {
+                isHovered = hovering
+            }
+        }
     }
 }
 
@@ -7230,6 +7667,64 @@ extension SettingsView {
 // MARK: - Excluded Apps Management
 
 extension SettingsView {
+    private func loadExcludedAppsForRedaction() {
+        let installed = AppNameResolver.shared.getInstalledApps()
+            .map { (bundleID: $0.bundleID, name: $0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        installedAppsForExcludedRedaction = installed
+
+        let installedBundleIDs = Set(installed.map(\.bundleID))
+        Task {
+            do {
+                let historyBundleIDs = try await coordinatorWrapper.coordinator.getDistinctAppBundleIDs()
+                let otherBundleIDs = historyBundleIDs.filter { !installedBundleIDs.contains($0) }
+                let resolvedApps = AppNameResolver.shared.resolveAll(bundleIDs: otherBundleIDs)
+                    .map { (bundleID: $0.bundleID, name: $0.name) }
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+
+                await MainActor.run {
+                    otherAppsForExcludedRedaction = resolvedApps
+                }
+            } catch {
+                Log.error("[SettingsView] Failed to load additional apps for app-level redaction: \(error)", category: .ui)
+            }
+        }
+    }
+
+    private func toggleExcludedRedactionApp(_ bundleID: String?) {
+        guard let bundleID else { return }
+
+        var apps = excludedApps
+        if let index = apps.firstIndex(where: { $0.bundleID == bundleID }) {
+            apps.remove(at: index)
+        } else {
+            let name =
+                installedAppsForExcludedRedaction.first(where: { $0.bundleID == bundleID })?.name ??
+                otherAppsForExcludedRedaction.first(where: { $0.bundleID == bundleID })?.name ??
+                bundleID
+            let iconPath = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)?.path
+            apps.append(
+                ExcludedAppInfo(
+                    bundleID: bundleID,
+                    name: name,
+                    iconPath: iconPath
+                )
+            )
+        }
+
+        saveExcludedApps(apps)
+    }
+
+    private func saveExcludedApps(_ apps: [ExcludedAppInfo]) {
+        if let data = try? JSONEncoder().encode(apps),
+           let string = String(data: data, encoding: .utf8) {
+            excludedAppsString = string
+        } else {
+            excludedAppsString = ""
+        }
+        updateExcludedAppsConfig()
+    }
+
     /// Add multiple apps to the exclusion list
     func addExcludedApps(_ newApps: [ExcludedAppInfo]) {
         guard !newApps.isEmpty else { return }
@@ -7252,14 +7747,7 @@ extension SettingsView {
 
         guard addedCount > 0 else { return }
 
-        // Save back
-        if let newData = try? JSONEncoder().encode(currentApps),
-           let string = String(data: newData, encoding: .utf8) {
-            excludedAppsString = string
-        }
-
-        // Update capture config in real-time
-        updateExcludedAppsConfig()
+        saveExcludedApps(currentApps)
 
         // Show feedback
         showExcludedAppsUpdateFeedback(added: addedCount)
@@ -7279,16 +7767,7 @@ extension SettingsView {
 
         apps.removeAll { $0.bundleID == app.bundleID }
 
-        // Save back
-        if let newData = try? JSONEncoder().encode(apps),
-           let string = String(data: newData, encoding: .utf8) {
-            excludedAppsString = string
-        } else {
-            excludedAppsString = ""
-        }
-
-        // Update capture config in real-time
-        updateExcludedAppsConfig()
+        saveExcludedApps(apps)
 
         // Show feedback
         showExcludedAppsUpdateFeedback(removed: app.name)
@@ -7337,13 +7816,50 @@ extension SettingsView {
             .filter { !$0.isEmpty }
     }
 
+    private func updatePrivateWindowRedactionSetting() {
+        Task {
+            let coordinator = coordinatorWrapper.coordinator
+            let currentConfig = await coordinator.getCaptureConfig()
+
+            let newConfig = CaptureConfig(
+                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
+                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
+                deduplicationThreshold: currentConfig.deduplicationThreshold,
+                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
+                maxResolution: currentConfig.maxResolution,
+                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
+                excludePrivateWindows: excludePrivateWindows,
+                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
+                showCursor: currentConfig.showCursor,
+                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
+                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
+                captureOnWindowChange: currentConfig.captureOnWindowChange
+            )
+
+            do {
+                try await coordinator.updateCaptureConfig(newConfig)
+                DashboardViewModel.recordPrivateWindowRedactionToggle(
+                    coordinator: coordinator,
+                    enabled: excludePrivateWindows,
+                    source: "settings_privacy"
+                )
+                await MainActor.run {
+                    showSettingsToast(excludePrivateWindows ? "Incognito/private redaction enabled" : "Incognito/private redaction disabled")
+                }
+                Log.info("[SettingsView] Private window redaction updated to: \(excludePrivateWindows)", category: .ui)
+            } catch {
+                Log.error("[SettingsView] Failed to update private window redaction setting: \(error)", category: .ui)
+            }
+        }
+    }
+
     private func updateRedactionRulesConfig() {
         Task {
             let coordinator = coordinatorWrapper.coordinator
             let currentConfig = await coordinator.getCaptureConfig()
 
-            let windowPatterns = parseRedactionPatterns(redactWindowTitlePatternsRaw)
-            let urlPatterns = parseRedactionPatterns(redactBrowserURLPatternsRaw)
+            let windowPatterns = enableCustomPatternWindowRedaction ? parseRedactionPatterns(redactWindowTitlePatternsRaw) : []
+            let urlPatterns = enableCustomPatternWindowRedaction ? parseRedactionPatterns(redactBrowserURLPatternsRaw) : []
 
             let newConfig = CaptureConfig(
                 captureIntervalSeconds: currentConfig.captureIntervalSeconds,
@@ -7590,6 +8106,185 @@ extension SettingsView {
         return .notDetermined
     }
 
+    @MainActor
+    private func refreshPrivateModeAutomationTargets(force: Bool = false) async {
+        if isRefreshingPrivateModeAutomationTargets && !force {
+            return
+        }
+        isRefreshingPrivateModeAutomationTargets = true
+        defer { isRefreshingPrivateModeAutomationTargets = false }
+
+        let compatibleTargets = Self.privateModeAXCompatibleBrowserBundleIDs.compactMap { bundleID -> PrivateModeAutomationTarget? in
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return nil
+            }
+            return PrivateModeAutomationTarget(
+                bundleID: bundleID,
+                displayName: Self.inPageURLDisplayName(for: bundleID),
+                appURL: appURL
+            )
+        }.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        let discoveredTargets = Self.privateModeAutomationFallbackBundleIDs.compactMap { bundleID -> PrivateModeAutomationTarget? in
+            guard let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+                return nil
+            }
+            return PrivateModeAutomationTarget(
+                bundleID: bundleID,
+                displayName: Self.inPageURLDisplayName(for: bundleID),
+                appURL: appURL
+            )
+        }.sorted {
+            $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+
+        privateModeAXCompatibleTargets = compatibleTargets
+        privateModeAutomationTargets = discoveredTargets
+        refreshPrivateModeAutomationRunningBundleIDs()
+
+        let validBundleIDs = Set(inPageURLTargets.map(\.bundleID))
+            .union(unsupportedInPageURLTargets.map(\.bundleID))
+            .union(compatibleTargets.map(\.bundleID))
+            .union(discoveredTargets.map(\.bundleID))
+        pruneInPageURLIconCaches(validBundleIDs: validBundleIDs)
+
+        var cachedStates = inPageURLCachedPermissionStates()
+        var nextPermissionStates: [String: InPageURLPermissionState] = [:]
+        for target in discoveredTargets {
+            let isRunning = privateModeAutomationRunningBundleIDs.contains(target.bundleID)
+            let hasStableClientIdentity = Self.inPageURLHasStableAutomationClientIdentity()
+            let previousState = privateModeAutomationPermissionStateByBundleID[target.bundleID]
+            let cachedState = cachedStates[target.bundleID]
+            let status = await inPageURLPermissionStatusAsync(
+                for: target.bundleID,
+                askUserIfNeeded: false
+            )
+            let settingsState = !isRunning
+                ? await inPageURLPermissionStateFromSystemSettingsAsync(for: target.bundleID)
+                : nil
+            let resolvedState: InPageURLPermissionState
+            let shouldTrustNeedsConsentFromSettings = hasStableClientIdentity
+            let shouldUseSettingsState: Bool = {
+                guard !isRunning, let settingsState else { return false }
+                if settingsState == .needsConsent && !shouldTrustNeedsConsentFromSettings {
+                    return false
+                }
+                return true
+            }()
+
+            if shouldUseSettingsState, let settingsState {
+                resolvedState = settingsState
+            } else if status == OSStatus(procNotFound) {
+                if let previousState, isStableInPageURLPermissionState(previousState) {
+                    resolvedState = previousState
+                } else if let cachedState, isStableInPageURLPermissionState(cachedState) {
+                    resolvedState = cachedState
+                } else {
+                    resolvedState = .needsConsent
+                }
+            } else {
+                resolvedState = inPageURLPermissionState(from: status)
+            }
+            nextPermissionStates[target.bundleID] = resolvedState
+            if inPageURLPermissionStateForCache(resolvedState) != nil {
+                cachedStates[target.bundleID] = resolvedState
+            }
+        }
+
+        privateModeAutomationPermissionStateByBundleID = nextPermissionStates
+        persistInPageURLCachedPermissionStates(cachedStates)
+    }
+
+    @MainActor
+    private func refreshPrivateModeAutomationRunningBundleIDs() {
+        let runningBundleIDs = Set(
+            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        )
+        privateModeAutomationRunningBundleIDs = Set(
+            privateModeAutomationTargets.map(\.bundleID).filter { runningBundleIDs.contains($0) }
+        )
+    }
+
+    @MainActor
+    private func requestPrivateModeAutomationPermission(for target: PrivateModeAutomationTarget) async {
+        guard !privateModeAutomationBusyBundleIDs.contains(target.bundleID) else { return }
+        privateModeAutomationBusyBundleIDs.insert(target.bundleID)
+        defer { privateModeAutomationBusyBundleIDs.remove(target.bundleID) }
+
+        let status = await inPageURLPermissionStatusAsync(
+            for: target.bundleID,
+            askUserIfNeeded: true
+        )
+        var cachedStates = inPageURLCachedPermissionStates()
+        let state = await resolvedInPageURLPermissionState(
+            from: status,
+            bundleID: target.bundleID,
+            previousState: privateModeAutomationPermissionStateByBundleID[target.bundleID],
+            cachedState: cachedStates[target.bundleID]
+        )
+        privateModeAutomationPermissionStateByBundleID[target.bundleID] = state
+        if inPageURLPermissionStateForCache(state) != nil {
+            cachedStates[target.bundleID] = state
+            persistInPageURLCachedPermissionStates(cachedStates)
+        }
+        if state == .denied {
+            openAutomationSettings()
+            recordPrivateWindowRedactionMetric(
+                action: "automation_permission_denied_open_settings",
+                browserBundleID: target.bundleID,
+                permissionState: state
+            )
+        }
+        refreshPrivateModeAutomationRunningBundleIDs()
+        recordPrivateWindowRedactionMetric(
+            action: "automation_permission_probe",
+            browserBundleID: target.bundleID,
+            permissionState: state
+        )
+    }
+
+    @MainActor
+    private func launchPrivateModeAutomationTarget(_ target: PrivateModeAutomationTarget) async {
+        guard !privateModeAutomationBusyBundleIDs.contains(target.bundleID) else { return }
+        privateModeAutomationBusyBundleIDs.insert(target.bundleID)
+        defer { privateModeAutomationBusyBundleIDs.remove(target.bundleID) }
+
+        if let appURL = target.appURL {
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            configuration.addsToRecentItems = false
+            _ = try? await NSWorkspace.shared.openApplication(at: appURL, configuration: configuration)
+        }
+
+        try? await Task.sleep(for: .milliseconds(160), clock: .continuous)
+        refreshPrivateModeAutomationRunningBundleIDs()
+
+        let status = await inPageURLPermissionStatusAsync(
+            for: target.bundleID,
+            askUserIfNeeded: false
+        )
+        var cachedStates = inPageURLCachedPermissionStates()
+        let state = await resolvedInPageURLPermissionState(
+            from: status,
+            bundleID: target.bundleID,
+            previousState: privateModeAutomationPermissionStateByBundleID[target.bundleID],
+            cachedState: cachedStates[target.bundleID]
+        )
+        privateModeAutomationPermissionStateByBundleID[target.bundleID] = state
+        if inPageURLPermissionStateForCache(state) != nil {
+            cachedStates[target.bundleID] = state
+            persistInPageURLCachedPermissionStates(cachedStates)
+        }
+
+        recordPrivateWindowRedactionMetric(
+            action: "automation_launch",
+            browserBundleID: target.bundleID,
+            permissionState: state
+        )
+    }
+
     private func inPageURLCachedPermissionStates() -> [String: InPageURLPermissionState] {
         guard !inPageURLPermissionCacheRaw.isEmpty,
               let data = inPageURLPermissionCacheRaw.data(using: .utf8),
@@ -7725,6 +8420,14 @@ extension SettingsView {
             return "Chrome Canary"
         case "org.chromium.Chromium":
             return "Chromium"
+        case "org.mozilla.firefox":
+            return "Firefox"
+        case "org.mozilla.firefoxbeta":
+            return "Firefox Beta"
+        case "org.mozilla.firefoxdeveloperedition":
+            return "Firefox Developer Edition"
+        case "org.mozilla.nightly":
+            return "Firefox Nightly"
         case "com.microsoft.edgemac":
             return "Edge"
         case "com.brave.Browser":
@@ -8214,7 +8917,8 @@ extension SettingsView {
     nonisolated private static func inPageURLPermissionStateFromSystemSettingsSync(
         for targetBundleID: String
     ) -> InPageURLPermissionState? {
-        guard let clientBundleID = Bundle.main.bundleIdentifier else {
+        let clientIdentifiers = inPageURLAutomationClientIdentifiers()
+        guard !clientIdentifiers.isEmpty else {
             return nil
         }
         let automationBundleID = Self.resolvedInPageURLAutomationBundleID(for: targetBundleID)
@@ -8230,34 +8934,41 @@ extension SettingsView {
         }
         defer { sqlite3_close(db) }
 
+        let clientPlaceholders = Array(repeating: "?", count: clientIdentifiers.count).joined(separator: ", ")
         let query = """
-        SELECT auth_value
+        SELECT auth_value, client
         FROM access
         WHERE service = 'kTCCServiceAppleEvents'
-          AND client = ?
           AND indirect_object_identifier = ?
+          AND client IN (\(clientPlaceholders))
         ORDER BY last_modified DESC
         LIMIT 1;
         """
 
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else {
-            return nil
-        }
+        guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK, let statement else { return nil }
         defer { sqlite3_finalize(statement) }
 
         let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        let bindClientResult = clientBundleID.withCString { cString in
+        let bindTargetResult = automationBundleID.withCString { cString in
             sqlite3_bind_text(statement, 1, cString, -1, sqliteTransient)
         }
-        let bindTargetResult = automationBundleID.withCString { cString in
-            sqlite3_bind_text(statement, 2, cString, -1, sqliteTransient)
-        }
-        guard bindClientResult == SQLITE_OK, bindTargetResult == SQLITE_OK else {
-            return nil
+        guard bindTargetResult == SQLITE_OK else { return nil }
+
+        var bindFailures: [String] = []
+        for (index, clientIdentifier) in clientIdentifiers.enumerated() {
+            let bindResult = clientIdentifier.withCString { cString in
+                sqlite3_bind_text(statement, Int32(index + 2), cString, -1, sqliteTransient)
+            }
+            if bindResult != SQLITE_OK {
+                bindFailures.append("\(index + 2)=\(bindResult)")
+            }
         }
 
-        switch sqlite3_step(statement) {
+        guard bindFailures.isEmpty else { return nil }
+
+        let stepResult = sqlite3_step(statement)
+        switch stepResult {
         case SQLITE_ROW:
             let authValue = sqlite3_column_int(statement, 0)
             switch authValue {
@@ -8273,6 +8984,38 @@ extension SettingsView {
         default:
             return nil
         }
+    }
+
+    nonisolated private static func inPageURLAutomationClientIdentifiers() -> [String] {
+        var identifiers: [String] = []
+
+        if let bundleID = Bundle.main.bundleIdentifier,
+           !bundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            identifiers.append(bundleID)
+        }
+
+        if let executablePath = Bundle.main.executablePath,
+           !executablePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            identifiers.append(executablePath)
+        }
+
+        let commandPath = CommandLine.arguments.first ?? ""
+        if !commandPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            identifiers.append(commandPath)
+        }
+
+        let bundlePath = Bundle.main.bundlePath
+        if !bundlePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            identifiers.append(bundlePath)
+        }
+
+        var seen: Set<String> = []
+        return identifiers.filter { seen.insert($0).inserted }
+    }
+
+    nonisolated private static func inPageURLHasStableAutomationClientIdentity() -> Bool {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return false }
+        return !bundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func inPageURLPermissionDescription(for state: InPageURLPermissionState?) -> String {
@@ -8731,6 +9474,30 @@ extension SettingsView {
             let metadata = Self.inPageURLMetricMetadata(payload)
             try? await coordinatorWrapper.coordinator.recordMetricEvent(
                 metricType: type,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func recordPrivateWindowRedactionMetric(
+        action: String,
+        browserBundleID: String?,
+        permissionState: InPageURLPermissionState?
+    ) {
+        Task {
+            var payload: [String: Any] = [
+                "action": action
+            ]
+            if let browserBundleID {
+                payload["bundleID"] = browserBundleID
+            }
+            if let permissionState {
+                payload["permission"] = inPageURLPermissionDescription(for: permissionState)
+            }
+
+            let metadata = Self.inPageURLMetricMetadata(payload)
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .privateWindowRedactionToggle,
                 metadata: metadata
             )
         }
@@ -9628,6 +10395,7 @@ extension SettingsView {
     func resetPrivacySettings() {
         excludedAppsString = SettingsDefaults.excludedApps
         excludePrivateWindows = SettingsDefaults.excludePrivateWindows
+        enableCustomPatternWindowRedaction = SettingsDefaults.enableCustomPatternWindowRedaction
         redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
         redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
         excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
