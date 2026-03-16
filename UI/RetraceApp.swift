@@ -180,8 +180,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Prompt user to move app to Applications folder if not already there
-        AppMover.moveToApplicationsFolderIfNecessary()
+        // Temporarily disabled while investigating App Management permission prompts.
+        // Prompt user to move app to Applications folder if not already there.
+        // AppMover.moveToApplicationsFolderIfNecessary()
         setupExternalDashboardRevealObserver()
         applyDockIconVisibilityPreference()
 
