@@ -760,7 +760,7 @@ struct PrivateWindowDetector {
     }
 
     private static func tracePrivateRedaction(_ message: String) {
-        Log.info("[PrivateAXTrace] \(message)", category: .capture)
+        _ = message
     }
 
     private static func tracePreview(_ value: String, limit: Int = 180) -> String {

@@ -1254,11 +1254,6 @@ public actor AppCoordinator {
                     category: .app
                 )
 
-                Log.info(
-                    "[PrivateAXTrace] frameID=\(frameID) bundleID=\(appBundleIDForLog) app=\(appNameForLog) window='\(windowNameForLog)' redactionReason='\(redactionReasonForLog)'",
-                    category: .app
-                )
-
                 if writerState.frameCount % videoUpdateInterval == 0 {
                     let width = await writerState.writer.frameWidth
                     let height = await writerState.writer.frameHeight

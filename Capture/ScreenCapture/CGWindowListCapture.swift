@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import AppKit
+import CoreImage
 import Shared
 
 /// Service that uses legacy CGWindowList API for screen capture
@@ -69,6 +70,11 @@ public actor CGWindowListCapture {
     private var privateWindowDecisionStateByWindowID: [CGWindowID: PrivateWindowDecisionState] = [:]
     private let privateWindowPositiveGraceInterval: TimeInterval = 6
     private let privateWindowStateRetentionInterval: TimeInterval = 90
+
+    private let redactionBlurRadius: Double = 400
+    private let redactionMaskCornerRadius: CGFloat = 12
+    private let redactionBorderWidth: CGFloat = 2
+    private let redactionCIContext = CIContext()
 
     // MARK: - Lifecycle
 
@@ -294,6 +300,8 @@ public actor CGWindowListCapture {
         var pidsWithoutBundleID = Set<pid_t>()
         var browserURLCache: [String: BrowserURLLookupResult] = [:]
         var privateWindowRedactionCache: [String: Bool] = [:]
+        var privateModeByPID: [pid_t: Bool] = [:]
+        var privateModeMissByPID = Set<pid_t>()
         var privateBrowserPIDs = Set<pid_t>()
         var privateCompanionCandidatesByPID: [pid_t: [(windowID: CGWindowID, bundleID: String?, ownerName: String)]] = [:]
         var seenWindowIDs = Set<CGWindowID>()
@@ -369,11 +377,13 @@ public actor CGWindowListCapture {
                 let privateCacheKey = "\(ownerPID)|\(windowCacheKey.lowercased())"
 
                 let usedCache: Bool
+                let usedPIDModeCache: Bool
                 let rawAXDetectionResult: Bool?
                 let rawAppleScriptModeDetectionResult: Bool?
                 let detectedByAXOrCache: Bool
                 if let cached = privateWindowRedactionCache[privateCacheKey] {
                     usedCache = true
+                    usedPIDModeCache = false
                     rawAXDetectionResult = cached
                     rawAppleScriptModeDetectionResult = nil
                     detectedByAXOrCache = cached
@@ -386,13 +396,26 @@ public actor CGWindowListCapture {
                     )
                     let axDetected = rawAXDetectionResult ?? false
                     if axDetected {
+                        usedPIDModeCache = false
+                        rawAppleScriptModeDetectionResult = nil
+                    } else if let cachedModeResult = privateModeByPID[ownerPID] {
+                        usedPIDModeCache = true
+                        rawAppleScriptModeDetectionResult = cachedModeResult
+                    } else if privateModeMissByPID.contains(ownerPID) {
+                        usedPIDModeCache = true
                         rawAppleScriptModeDetectionResult = nil
                     } else {
+                        usedPIDModeCache = false
                         rawAppleScriptModeDetectionResult = await BrowserURLExtractor.isPrivateModeViaAppleScript(
                             bundleID: bundleID,
                             pid: ownerPID,
                             windowCacheKey: windowCacheKey
                         )
+                        if let modeResult = rawAppleScriptModeDetectionResult {
+                            privateModeByPID[ownerPID] = modeResult
+                        } else {
+                            privateModeMissByPID.insert(ownerPID)
+                        }
                     }
                     let detected = axDetected || (rawAppleScriptModeDetectionResult ?? false)
                     privateWindowRedactionCache[privateCacheKey] = detected
@@ -404,6 +427,11 @@ public actor CGWindowListCapture {
                     sourceLabel = "applescript-mode"
                 } else if !usedCache, rawAXDetectionResult == false, rawAppleScriptModeDetectionResult == false {
                     sourceLabel = "ax+applescript-mode"
+                } else if !usedCache, rawAXDetectionResult == false, rawAppleScriptModeDetectionResult == nil, usedPIDModeCache {
+                    sourceLabel = "ax+applescript-mode-miss-cache"
+                }
+                if !usedCache, usedPIDModeCache, sourceLabel == "applescript-mode" || sourceLabel == "ax+applescript-mode" {
+                    sourceLabel += "+pid-cache"
                 }
                 var shouldRedactPrivateWindow = detectedByAXOrCache
                 let existingState = privateWindowDecisionStateByWindowID[windowID]
@@ -647,7 +675,7 @@ public actor CGWindowListCapture {
     }
 
     private func tracePrivateRedaction(_ message: String) {
-        Log.info("[PrivateAXTrace] \(message)", category: .capture)
+        _ = message
     }
 
     private func tracePreview(_ value: String, limit: Int = 180) -> String {
@@ -970,7 +998,7 @@ public actor CGWindowListCapture {
             return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
-        // Create a new image with visible excluded regions blacked out
+        // Create a new image with visible excluded regions blurred
         let width = fullScreenImage.width
         let height = fullScreenImage.height
 
@@ -991,8 +1019,13 @@ public actor CGWindowListCapture {
         // Draw the full screen image
         context.draw(fullScreenImage, in: CGRect(x: 0, y: 0, width: width, height: height))
 
-        // Black out visible excluded regions
-        context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        let fullImageRect = CGRect(x: 0, y: 0, width: width, height: height)
+        guard let blurredImage = makeBlurredRedactionImage(from: fullScreenImage) else {
+            Log.error("[Masking] Failed to create blurred redaction image", category: .capture)
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+        }
+
+        var maskPaths: [CGPath] = []
         for (_, rect) in visibleExcludedRegions {
             // Flip Y coordinate for CGContext (origin is bottom-left)
             let flippedRect = CGRect(
@@ -1001,8 +1034,42 @@ public actor CGWindowListCapture {
                 width: rect.width,
                 height: rect.height
             )
-            context.fill(flippedRect)
+
+            let strokeInset = redactionBorderWidth / 2
+            let blurRect = flippedRect.insetBy(dx: strokeInset, dy: strokeInset)
+            guard blurRect.width > 1, blurRect.height > 1 else { continue }
+
+            let maskPath = CGPath(
+                roundedRect: blurRect,
+                cornerWidth: redactionMaskCornerRadius,
+                cornerHeight: redactionMaskCornerRadius,
+                transform: nil
+            )
+            maskPaths.append(maskPath)
         }
+
+        if maskPaths.isEmpty {
+            Log.info("[Masking] Visible regions were too small after insetting, skipping blur masking", category: .capture)
+            return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
+        }
+
+        // Composite the blurred source once using a combined clip across all masked regions.
+        context.saveGState()
+        for maskPath in maskPaths {
+            context.addPath(maskPath)
+        }
+        context.clip()
+        context.draw(blurredImage, in: fullImageRect)
+        context.restoreGState()
+
+        context.saveGState()
+        context.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.35))
+        context.setLineWidth(redactionBorderWidth)
+        for maskPath in maskPaths {
+            context.addPath(maskPath)
+        }
+        context.strokePath()
+        context.restoreGState()
 
         guard let maskedImage = context.makeImage() else {
             Log.error("[Masking] Failed to create masked image", category: .capture)
@@ -1012,6 +1079,22 @@ public actor CGWindowListCapture {
         let visibleExcludedWindowIDs = Set(visibleExcludedRegions.map { $0.windowID })
         Log.info("[Masking] Successfully masked \(visibleExcludedRegions.count) visible regions", category: .capture)
         return FilteredCaptureResult(image: maskedImage, visibleExcludedWindowIDs: visibleExcludedWindowIDs)
+    }
+
+    private func makeBlurredRedactionImage(from image: CGImage) -> CGImage? {
+        let inputImage = CIImage(cgImage: image)
+        guard let gaussianBlur = CIFilter(name: "CIGaussianBlur") else {
+            return nil
+        }
+
+        gaussianBlur.setValue(inputImage.clampedToExtent(), forKey: kCIInputImageKey)
+        gaussianBlur.setValue(redactionBlurRadius, forKey: kCIInputRadiusKey)
+
+        guard let blurredOutput = gaussianBlur.outputImage?.cropped(to: inputImage.extent) else {
+            return nil
+        }
+
+        return redactionCIContext.createCGImage(blurredOutput, from: inputImage.extent)
     }
 
     /// Subtract a rectangle from a list of rectangles, returning the remaining visible regions

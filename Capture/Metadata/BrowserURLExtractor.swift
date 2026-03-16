@@ -454,6 +454,22 @@ struct BrowserURLExtractor: Sendable {
             )
         }
     )
+    private static let privateModeAppleScriptCoordinator = BrowserURLAppleScriptCoordinator(
+        bootstrapTimeoutSeconds: 1.25,
+        normalTimeoutSeconds: 0.8,
+        timeoutBaseBackoffSeconds: 1.0,
+        maxTimeoutBackoffSeconds: 8.0,
+        runner: { source, browserBundleID, pid, timeoutSeconds, isBootstrapTimeout, scriptLabel in
+            await runAppleScriptViaProcess(
+                source,
+                browserBundleID: browserBundleID,
+                pid: pid,
+                timeoutSeconds: timeoutSeconds,
+                isBootstrapTimeout: isBootstrapTimeout,
+                scriptLabel: scriptLabel
+            )
+        }
+    )
     private static let webAppAppleScriptCacheTTLSeconds: TimeInterval = 8.0
     private static let webAppTitleMatchRetryDelayMilliseconds: Int = 120
     private static let hostMatchNoWindowTitleToken = "__NO_WINDOW_TITLE__"
@@ -583,7 +599,7 @@ struct BrowserURLExtractor: Sendable {
             !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
 
-        let method1Result = await appleScriptCoordinator.execute(
+        let method1Result = await privateModeAppleScriptCoordinator.execute(
             source:
             """
             tell application id "\(bundleID)"
@@ -612,7 +628,7 @@ struct BrowserURLExtractor: Sendable {
             return nil
         }
 
-        let method2Result = await appleScriptCoordinator.execute(
+        let method2Result = await privateModeAppleScriptCoordinator.execute(
             source:
             """
             tell application id "\(bundleID)"

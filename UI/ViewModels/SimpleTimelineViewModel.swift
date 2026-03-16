@@ -316,12 +316,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         return UserDefaults.standard.bool(forKey: "retrace.debug.timelineVerboseLogs")
     }()
 
-    /// Enables expensive state-change tracing (stack traces).
-    /// Enable only when actively debugging:
-    /// `defaults write io.retrace.app retrace.debug.timelineStateTrace -bool YES`
-    private static let isTimelineStateTraceEnabled: Bool =
-        UserDefaults.standard.bool(forKey: "retrace.debug.timelineStateTrace")
-
     /// Enables filtered-timeline scrub diagnostics (tracks requested frame identities during fast scroll).
     /// Disabled by default in all builds; opt in with:
     /// `defaults write io.retrace.app retrace.debug.filteredScrubDiagnostics -bool YES`
@@ -329,12 +323,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         return UserDefaults.standard.bool(forKey: "retrace.debug.filteredScrubDiagnostics")
     }()
 
-    /// Enables per-frame still lookup diagnostics for p=4 fallback behavior.
-    /// Enable when debugging still-cache misses/placeholders:
-    /// `defaults write io.retrace.app retrace.debug.timelineStillLogs -bool YES`
-    private static let isTimelineStillLoggingEnabled: Bool = {
-        return UserDefaults.standard.bool(forKey: "retrace.debug.timelineStillLogs")
-    }()
+    // Temporary debug logging switches intentionally disabled in production.
+    private static let isTimelineStillLoggingEnabled = false
 
     /// Timestamp formatter used by comment helper actions.
     private static let commentTimestampFormatter: DateFormatter = {
@@ -507,19 +497,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var isTapeHidden: Bool = false
 
     /// Whether the current frame is not yet available in the video file (still encoding)
-    @Published public var frameNotReady: Bool = false {
-        willSet {
-            guard Self.isTimelineStateTraceEnabled, newValue != frameNotReady else { return }
-
-            let frameID = currentTimelineFrame?.frame.id.value ?? -1
-            let status = currentTimelineFrame?.processingStatus ?? -1
-            Log.info("[FRAME-READY-CHANGE] ⚠️ frameNotReady changing: \(frameNotReady) -> \(newValue) for frameID=\(frameID), processingStatus=\(status)", category: .ui)
-
-            // Print stack trace to see where this is being called from
-            let stackTrace = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
-            Log.info("[FRAME-READY-CHANGE] Stack trace:\n\(stackTrace)", category: .ui)
-        }
-    }
+    @Published public var frameNotReady: Bool = false
 
     /// Whether the current frame failed to load (e.g., index out of range, file read error)
     @Published public var frameLoadError: Bool = false
@@ -2001,6 +1979,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         let presentationGeneration: UInt64
     }
 
+    private struct ForegroundPresentationLoadResult {
+        let image: NSImage
+        let loadedFromDiskBuffer: Bool
+        let dataByteCount: Int
+        let diskBufferReadMs: Double?
+        let storageReadMs: Double?
+        let diskBufferWriteMs: Double?
+        let decodeMs: Double
+        let usedDiskFallbackAfterStorageFailure: Bool
+    }
+
     private struct UnavailableFrameFallbackCandidate: Sendable {
         let frameID: FrameID
         let index: Int
@@ -2412,7 +2401,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         diskFrameBufferAccessSequence &+= 1
         entry.lastAccessSequence = diskFrameBufferAccessSequence
         diskFrameBufferIndex[frameID] = entry
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: entry.fileURL.path)
+        // Keep hot-path access tracking in-memory only.
+        // Writing file metadata here adds synchronous filesystem churn during scrub.
     }
 
     @discardableResult
@@ -2697,6 +2687,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 origin: .timelineManaged
             )
             diskFrameBufferIndex[frameID] = entry
+
         } catch {
             Log.warning("[Timeline-DiskBuffer] Failed to write frame \(frameID.value) to disk buffer: \(error)", category: .ui)
         }
@@ -8349,8 +8340,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
 #if DEBUG
     func test_loadForegroundPresentationImage(_ timelineFrame: TimelineFrame) async throws -> NSImage {
-        let (image, _) = try await loadForegroundPresentationImage(timelineFrame)
-        return image
+        let result = try await loadForegroundPresentationImage(timelineFrame)
+        return result.image
     }
 #endif
 
@@ -8382,7 +8373,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         return image
     }
 
-    private func loadForegroundPresentationImage(_ timelineFrame: TimelineFrame) async throws -> (image: NSImage, loadedFromDiskBuffer: Bool) {
+    private func loadForegroundPresentationImage(_ timelineFrame: TimelineFrame) async throws -> ForegroundPresentationLoadResult {
         let frameID = timelineFrame.frame.id
         let lookupIndex = currentIndex
         let shouldPreferDecodedReadyFrame =
@@ -8396,21 +8387,50 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
         }
 
-        if !shouldPreferDecodedReadyFrame,
-           let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) {
-            diskFrameBufferTelemetry.diskHits += 1
-            let image = try decodeBufferedFrameImage(bufferedData, frameID: frameID, errorCode: -2)
-            return (image, true)
+        if !shouldPreferDecodedReadyFrame {
+            let diskReadStart = CFAbsoluteTimeGetCurrent()
+            if let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) {
+                let diskReadMs = (CFAbsoluteTimeGetCurrent() - diskReadStart) * 1000
+                diskFrameBufferTelemetry.diskHits += 1
+                let decodeStart = CFAbsoluteTimeGetCurrent()
+                let image = try decodeBufferedFrameImage(bufferedData, frameID: frameID, errorCode: -2)
+                let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
+                return ForegroundPresentationLoadResult(
+                    image: image,
+                    loadedFromDiskBuffer: true,
+                    dataByteCount: bufferedData.count,
+                    diskBufferReadMs: diskReadMs,
+                    storageReadMs: nil,
+                    diskBufferWriteMs: nil,
+                    decodeMs: decodeMs,
+                    usedDiskFallbackAfterStorageFailure: false
+                )
+            }
         }
 
         diskFrameBufferTelemetry.diskMisses += 1
         diskFrameBufferTelemetry.storageReads += 1
 
         do {
+            let storageReadStart = CFAbsoluteTimeGetCurrent()
             let imageData = try await loadFrameData(timelineFrame)
+            let storageReadMs = (CFAbsoluteTimeGetCurrent() - storageReadStart) * 1000
+            let diskWriteStart = CFAbsoluteTimeGetCurrent()
             await storeFrameDataInDiskFrameBuffer(frameID: frameID, data: imageData)
+            let diskWriteMs = (CFAbsoluteTimeGetCurrent() - diskWriteStart) * 1000
+            let decodeStart = CFAbsoluteTimeGetCurrent()
             let image = try decodeBufferedFrameImage(imageData, frameID: frameID, errorCode: -3)
-            return (image, false)
+            let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
+            return ForegroundPresentationLoadResult(
+                image: image,
+                loadedFromDiskBuffer: false,
+                dataByteCount: imageData.count,
+                diskBufferReadMs: nil,
+                storageReadMs: storageReadMs,
+                diskBufferWriteMs: diskWriteMs,
+                decodeMs: decodeMs,
+                usedDiskFallbackAfterStorageFailure: false
+            )
         } catch {
             guard shouldPreferDecodedReadyFrame else {
                 throw error
@@ -8423,16 +8443,29 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
 
+            let fallbackDiskReadStart = CFAbsoluteTimeGetCurrent()
             if let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) {
+                let diskReadMs = (CFAbsoluteTimeGetCurrent() - fallbackDiskReadStart) * 1000
                 diskFrameBufferTelemetry.diskHits += 1
+                let decodeStart = CFAbsoluteTimeGetCurrent()
                 let image = try decodeBufferedFrameImage(bufferedData, frameID: frameID, errorCode: -4)
+                let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
                 if Self.isTimelineStillLoggingEnabled {
                     Log.info(
                         "[Timeline-Still] P2-FALLBACK-HIT frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
                         category: .ui
                     )
                 }
-                return (image, true)
+                return ForegroundPresentationLoadResult(
+                    image: image,
+                    loadedFromDiskBuffer: true,
+                    dataByteCount: bufferedData.count,
+                    diskBufferReadMs: diskReadMs,
+                    storageReadMs: nil,
+                    diskBufferWriteMs: nil,
+                    decodeMs: decodeMs,
+                    usedDiskFallbackAfterStorageFailure: true
+                )
             }
 
             if Self.isTimelineStillLoggingEnabled {
@@ -8460,12 +8493,14 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         do {
             let loadStart = CFAbsoluteTimeGetCurrent()
-            let storageReadStart = CFAbsoluteTimeGetCurrent()
-            let (image, loadedFromDiskBuffer) = try await loadForegroundPresentationImage(timelineFrame)
-            let storageReadMs = (CFAbsoluteTimeGetCurrent() - storageReadStart) * 1000
+            let imageLoadStart = CFAbsoluteTimeGetCurrent()
+            let loadResult = try await loadForegroundPresentationImage(timelineFrame)
+            let imageLoadMs = (CFAbsoluteTimeGetCurrent() - imageLoadStart) * 1000
+            let image = loadResult.image
+            let loadedFromDiskBuffer = loadResult.loadedFromDiskBuffer
             Log.recordLatency(
                 loadedFromDiskBuffer ? "timeline.disk_buffer.read_ms" : "timeline.frame.storage_read_ms",
-                valueMs: storageReadMs,
+                valueMs: imageLoadMs,
                 category: .ui,
                 summaryEvery: 25,
                 warningThresholdMs: loadedFromDiskBuffer ? 25 : (shouldEmitInteractiveSlowSampleAlerts ? 45 : nil),
@@ -8742,7 +8777,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 continue
             }
 
-            while hasForegroundFrameLoadPressure {
+            while hasForegroundFrameLoadPressure || isActivelyScrolling {
                 if Task.isCancelled {
                     diskFrameBufferTelemetry.cacheMoreCancelled += 1
                     return
@@ -12147,8 +12182,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Parse relative offsets like "3 hours later" / "10 minutes earlier" / "1 hour before"
     /// using the current playhead timestamp.
-    /// This path is intentionally limited to "earlier|later|before|after" so "... ago" continues
-    /// to use bucket anchoring logic.
+    /// This path is intentionally limited to "earlier|later|before|after"; "... ago" is handled
+    /// by natural-language parsing plus lookback anchoring.
     private func parsePlayheadRelativeDateIfNeeded(_ text: String) -> Date? {
         let normalized = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -12170,6 +12205,27 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func parsePlayheadRelativeDate(_ normalizedText: String, relativeTo baseTimestamp: Date) -> Date? {
+        guard let offset = parsePlayheadRelativeOffset(normalizedText) else {
+            return nil
+        }
+
+        let directionSign: Int
+        switch offset.direction {
+        case .forward:
+            directionSign = 1
+        case .backward:
+            directionSign = -1
+        }
+
+        return dateByApplyingPlayheadRelativeOffset(
+            amount: offset.amount,
+            unit: offset.unit,
+            directionSign: directionSign,
+            to: baseTimestamp
+        )
+    }
+
+    private func parsePlayheadRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
         guard let regex = try? NSRegularExpression(
             pattern: #"^\s*(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs|h|day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(earlier|later|before|after)\s*$"#,
             options: [.caseInsensitive]
@@ -12189,32 +12245,45 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         let unitToken = String(normalizedText[unitRange])
         let directionToken = String(normalizedText[directionRange])
-        let directionSign: Int
+
+        let direction: PlayheadRelativeDirection
         switch directionToken {
         case "later", "after":
-            directionSign = 1
+            direction = .forward
         case "earlier", "before":
-            directionSign = -1
+            direction = .backward
         default:
             return nil
         }
+
+        guard let unit = PlayheadRelativeUnit(token: unitToken) else {
+            return nil
+        }
+
+        return PlayheadRelativeOffset(amount: amount, unit: unit, direction: direction)
+    }
+
+    private func dateByApplyingPlayheadRelativeOffset(
+        amount: Int,
+        unit: PlayheadRelativeUnit,
+        directionSign: Int,
+        to baseTimestamp: Date
+    ) -> Date? {
         let calendar = Calendar.current
 
-        switch unitToken {
-        case "minute", "minutes", "min", "mins":
+        switch unit {
+        case .minute:
             return calendar.date(byAdding: .minute, value: directionSign * amount, to: baseTimestamp)
-        case "hour", "hours", "hr", "hrs", "h":
+        case .hour:
             return calendar.date(byAdding: .minute, value: directionSign * amount * 60, to: baseTimestamp)
-        case "day", "days":
+        case .day:
             return calendar.date(byAdding: .minute, value: directionSign * amount * 24 * 60, to: baseTimestamp)
-        case "week", "weeks", "wk", "wks":
+        case .week:
             return calendar.date(byAdding: .minute, value: directionSign * amount * 7 * 24 * 60, to: baseTimestamp)
-        case "month", "months", "mo", "mos":
+        case .month:
             return calendar.date(byAdding: .month, value: directionSign * amount, to: baseTimestamp)
-        case "year", "years", "yr", "yrs":
+        case .year:
             return calendar.date(byAdding: .year, value: directionSign * amount, to: baseTimestamp)
-        default:
-            return nil
         }
     }
 
@@ -12394,10 +12463,107 @@ public class SimpleTimelineViewModel: ObservableObject {
         case firstFrameInDay
     }
 
+    private enum PlayheadRelativeDirection {
+        case backward
+        case forward
+    }
+
+    private enum PlayheadRelativeUnit {
+        case minute
+        case hour
+        case day
+        case week
+        case month
+        case year
+
+        init?(token: String) {
+            switch token {
+            case "minute", "minutes", "min", "mins":
+                self = .minute
+            case "hour", "hours", "hr", "hrs", "h":
+                self = .hour
+            case "day", "days":
+                self = .day
+            case "week", "weeks", "wk", "wks":
+                self = .week
+            case "month", "months", "mo", "mos":
+                self = .month
+            case "year", "years", "yr", "yrs":
+                self = .year
+            default:
+                return nil
+            }
+        }
+    }
+
+    private struct PlayheadRelativeOffset {
+        let amount: Int
+        let unit: PlayheadRelativeUnit
+        let direction: PlayheadRelativeDirection
+    }
+
+    private enum RelativeLookbackAnchorEdge {
+        case first
+        case last
+    }
+
+    private struct RelativeLookbackRange {
+        let start: Date
+        let end: Date
+        let anchorEdge: RelativeLookbackAnchorEdge
+    }
+
     /// Resolve a parsed date into an anchor timestamp that is better suited for timeline data.
-    /// For coarse inputs (e.g. "8 hours ago", "10 minutes ago", "Feb 12"), use the first frame
-    /// in that bucket instead of targeting an exact parsed timestamp.
+    /// For coarse inputs (e.g. "8 hours ago", "10 minutes ago", "Feb 12"), use the first/last
+    /// frame in an inferred bucket/window instead of targeting an exact parsed timestamp.
     private func resolveDateSearchAnchorDate(parsedDate: Date, input: String) async throws -> Date {
+        if let lookbackRange = relativeLookbackRangeIfNeeded(parsedDate: parsedDate, input: input) {
+            let anchorReason: String
+            let modeLabel: String
+            switch lookbackRange.anchorEdge {
+            case .first:
+                anchorReason = "searchForDate.anchor.firstFrameInRelativeLookback"
+                modeLabel = "firstFrameInRelativeLookback"
+            case .last:
+                anchorReason = "searchForDate.anchor.lastFrameInRelativeLookback"
+                modeLabel = "lastFrameInRelativeLookback"
+            }
+
+            Log.info(
+                "[DateSearchAnchor] mode=\(modeLabel) parsed=\(Log.timestamp(from: parsedDate)) bucket=\(Log.timestamp(from: lookbackRange.start))->\(Log.timestamp(from: lookbackRange.end))",
+                category: .ui
+            )
+
+            switch lookbackRange.anchorEdge {
+            case .first:
+                let firstFrame = try await fetchFramesWithVideoInfoLogged(
+                    from: lookbackRange.start,
+                    to: lookbackRange.end,
+                    limit: 1,
+                    filters: filterCriteria,
+                    reason: anchorReason
+                ).first
+                if let anchoredTimestamp = firstFrame?.frame.timestamp {
+                    return anchoredTimestamp
+                }
+            case .last:
+                let boundedEndTimestamp = lookbackRange.end.addingTimeInterval(Self.boundedLoadBoundaryEpsilonSeconds)
+                let lastFrameCandidate = try await fetchFramesWithVideoInfoBeforeLogged(
+                    timestamp: boundedEndTimestamp,
+                    limit: 1,
+                    filters: filterCriteria,
+                    reason: anchorReason
+                ).first
+                if let anchoredTimestamp = lastFrameCandidate?.frame.timestamp,
+                   anchoredTimestamp >= lookbackRange.start,
+                   anchoredTimestamp <= lookbackRange.end {
+                    return anchoredTimestamp
+                }
+            }
+
+            return parsedDate
+        }
+
         let mode = inferDateSearchAnchorMode(for: input)
         guard mode != .exact else { return parsedDate }
         guard let bucket = bucketRange(for: parsedDate, mode: mode) else { return parsedDate }
@@ -12419,6 +12585,118 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         return anchoredTimestamp
+    }
+
+    /// "X hour/day/month before|earlier", "X hour/day/month later|after", and "X hours ago"
+    /// should anchor to the edge frame of the full relative window, not an exact timestamp.
+    private func relativeLookbackRangeIfNeeded(parsedDate: Date, input: String) -> RelativeLookbackRange? {
+        if let range = playheadLookbackRangeIfNeeded(parsedDate: parsedDate, input: input) {
+            return range
+        }
+        if let range = agoLookbackRangeIfNeeded(parsedDate: parsedDate, input: input) {
+            return range
+        }
+        return nil
+    }
+
+    private func playheadLookbackRangeIfNeeded(parsedDate: Date, input: String) -> RelativeLookbackRange? {
+        let normalized = input
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        guard let offset = parsePlayheadRelativeOffset(normalized) else {
+            return nil
+        }
+
+        switch offset.unit {
+        case .hour, .day, .month:
+            break
+        case .minute, .week, .year:
+            return nil
+        }
+
+        let inverseDirectionSign: Int
+        switch offset.direction {
+        case .backward:
+            inverseDirectionSign = 1
+        case .forward:
+            inverseDirectionSign = -1
+        }
+
+        guard let baseTimestamp = dateByApplyingPlayheadRelativeOffset(
+            amount: offset.amount,
+            unit: offset.unit,
+            directionSign: inverseDirectionSign,
+            to: parsedDate
+        ) else {
+            return nil
+        }
+
+        let start = min(parsedDate, baseTimestamp)
+        let end = max(parsedDate, baseTimestamp)
+
+        switch offset.direction {
+        case .backward:
+            return RelativeLookbackRange(start: start, end: end, anchorEdge: .first)
+        case .forward:
+            return RelativeLookbackRange(start: start, end: end, anchorEdge: .last)
+        }
+    }
+
+    private func agoLookbackRangeIfNeeded(parsedDate: Date, input: String) -> RelativeLookbackRange? {
+        let normalized = input
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        guard let offset = parseAgoRelativeOffset(normalized) else {
+            return nil
+        }
+
+        switch offset.unit {
+        case .hour:
+            break
+        case .minute, .day, .week, .month, .year:
+            return nil
+        }
+
+        guard let endTimestamp = dateByApplyingPlayheadRelativeOffset(
+            amount: offset.amount,
+            unit: offset.unit,
+            directionSign: 1,
+            to: parsedDate
+        ) else {
+            return nil
+        }
+
+        if parsedDate <= endTimestamp {
+            return RelativeLookbackRange(start: parsedDate, end: endTimestamp, anchorEdge: .first)
+        }
+        return RelativeLookbackRange(start: endTimestamp, end: parsedDate, anchorEdge: .first)
+    }
+
+    private func parseAgoRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
+        guard let regex = try? NSRegularExpression(
+            pattern: #"^\s*(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs|h|day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s+ago\s*$"#,
+            options: [.caseInsensitive]
+        ) else {
+            return nil
+        }
+
+        let range = NSRange(normalizedText.startIndex..., in: normalizedText)
+        guard let match = regex.firstMatch(in: normalizedText, options: [], range: range),
+              let amountRange = Range(match.range(at: 1), in: normalizedText),
+              let unitRange = Range(match.range(at: 2), in: normalizedText),
+              let amount = Int(normalizedText[amountRange]),
+              amount > 0 else {
+            return nil
+        }
+
+        let unitToken = String(normalizedText[unitRange])
+        guard let unit = PlayheadRelativeUnit(token: unitToken) else {
+            return nil
+        }
+
+        return PlayheadRelativeOffset(amount: amount, unit: unit, direction: .backward)
     }
 
     private func inferDateSearchAnchorMode(for input: String) -> DateSearchAnchorMode {
@@ -13369,19 +13647,20 @@ public class SimpleTimelineViewModel: ObservableObject {
             // Use append(contentsOf:) to avoid unnecessary @Published triggers
             let beforeCount = frames.count
             let wasAtNewestBeforeAppend = currentIndex >= beforeCount - 1
+            let shouldPinToNewestAfterAppend = wasAtNewestBeforeAppend && shouldPinToNewestAfterBoundaryAppend(reason: reason)
             let oldLastTimestamp = frames.last?.frame.timestamp
             let previousNewestBlock = newestEdgeBlockSummary(in: frames)
             frames.append(contentsOf: uniqueTimelineFrames)
 
-            // Keep playhead pinned to "now" when the user was already at the live edge.
-            if wasAtNewestBeforeAppend {
+            // Keep playhead pinned to "now" only for flows that should track newest.
+            if shouldPinToNewestAfterAppend {
                 currentIndex = frames.count - 1
                 subFrameOffset = 0
             }
             logCmdFPlayheadState(
                 "boundary.newer.appended",
                 trace: cmdFTrace,
-                extra: "reason=\(reason) added=\(uniqueTimelineFrames.count) pinnedToNewest=\(wasAtNewestBeforeAppend)"
+                extra: "reason=\(reason) added=\(uniqueTimelineFrames.count) pinnedToNewest=\(shouldPinToNewestAfterAppend)"
             )
 
             let currentNewestBlock = newestEdgeBlockSummary(in: frames)
@@ -13444,6 +13723,20 @@ public class SimpleTimelineViewModel: ObservableObject {
                 )
             }
             isLoadingNewer = false
+        }
+    }
+
+    private func shouldPinToNewestAfterBoundaryAppend(reason: String) -> Bool {
+        if isInLiveMode {
+            return true
+        }
+
+        switch reason {
+        case "searchForDate", "searchForFrameID":
+            // Date/frame-ID jumps should stay anchored on the chosen frame.
+            return false
+        default:
+            return true
         }
     }
 
