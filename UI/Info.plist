@@ -60,10 +60,10 @@
     <key>com.apple.security.automation.apple-events</key>
     <true/>
 
-    <!-- LSUIElement: Run as menu bar app (no dock icon) -->
-    <!-- Set to false if you want the app in the Dock -->
+    <!-- Default to regular app so Dock icon is discoverable -->
+    <!-- Users can hide Dock presence at runtime via Settings (activation policy) -->
     <key>LSUIElement</key>
-    <true/>
+    <false/>
 
     <!-- Support for Dark Mode -->
     <key>NSRequiresAquaSystemAppearance</key>

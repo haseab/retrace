@@ -21,6 +21,7 @@ private let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
 enum SettingsDefaults {
     // MARK: General
     static let launchAtLogin = false
+    static let showDockIcon = true
     static let showMenuBarIcon = true
     static let theme: ThemePreference = .auto
     static let automaticUpdateChecks = true
@@ -208,6 +209,7 @@ public struct SettingsView: View {
 
     // MARK: General Settings
     @AppStorage("launchAtLogin", store: settingsStore) private var launchAtLogin = SettingsDefaults.launchAtLogin
+    @AppStorage("showDockIcon", store: settingsStore) private var showDockIcon = SettingsDefaults.showDockIcon
     @AppStorage("showMenuBarIcon", store: settingsStore) private var showMenuBarIcon = SettingsDefaults.showMenuBarIcon
     @AppStorage("theme", store: settingsStore) private var theme: ThemePreference = SettingsDefaults.theme
     @AppStorage("retraceColorThemePreference", store: settingsStore) private var colorThemePreference: String = SettingsDefaults.colorTheme
@@ -461,7 +463,7 @@ public struct SettingsView: View {
         SettingsSearchEntry(id: "general.updates", tab: .general, cardTitle: "Updates", cardIcon: "arrow.down.circle",
             searchableText: ["updates", "automatic updates", "check for updates", "check now"]),
         SettingsSearchEntry(id: "general.startup", tab: .general, cardTitle: "Startup", cardIcon: "power",
-            searchableText: ["startup", "launch at login", "start automatically", "menu bar icon", "show menu bar"]),
+            searchableText: ["startup", "launch at login", "start automatically", "dock icon", "show dock icon", "menu bar icon", "show menu bar"]),
         SettingsSearchEntry(id: "general.appearance", tab: .general, cardTitle: "Appearance", cardIcon: "paintbrush",
             searchableText: ["appearance", "font style", "accent color", "color theme", "timeline colored borders", "scrubbing animation", "scroll sensitivity", "scroll orientation", "horizontal scroll", "vertical scroll", "dark mode", "light mode", "theme"]),
         // Capture
@@ -1434,6 +1436,15 @@ public struct SettingsView: View {
             )
             .onChange(of: launchAtLogin) { newValue in
                 setLaunchAtLogin(enabled: newValue)
+            }
+
+            ModernToggleRow(
+                title: "Show Dock Icon",
+                subtitle: "Show Retrace in the Dock and app switcher",
+                isOn: $showDockIcon
+            )
+            .onChange(of: showDockIcon) { newValue in
+                setDockIconVisibility(visible: newValue)
             }
 
             ModernToggleRow(
@@ -9313,6 +9324,24 @@ extension SettingsView {
         }
     }
 
+    /// Show or hide the Dock icon (and Cmd+Tab presence) for Retrace.
+    private func setDockIconVisibility(visible: Bool) {
+        let targetPolicy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
+        let changed = NSApp.setActivationPolicy(targetPolicy)
+        let policyName = visible ? "regular" : "accessory"
+
+        Log.info(
+            "[SettingsView] Dock icon visibility updated visible=\(visible) policy=\(policyName) changed=\(changed)",
+            category: .ui
+        )
+
+        if visible {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        recordDockIconVisibilityMetric(enabled: visible)
+    }
+
     /// Show or hide the menu bar icon
     private func setMenuBarIconVisibility(visible: Bool) {
         if let menuBarManager = MenuBarManager.shared {
@@ -9321,6 +9350,19 @@ extension SettingsView {
             } else {
                 menuBarManager.hide()
             }
+        }
+    }
+
+    private func recordDockIconVisibilityMetric(enabled: Bool) {
+        Task {
+            let metadata = Self.inPageURLMetricMetadata([
+                "enabled": enabled,
+                "source": "settings_startup_card"
+            ])
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .dockIconVisibilityToggle,
+                metadata: metadata
+            )
         }
     }
 
@@ -9508,6 +9550,7 @@ extension SettingsView {
         // Startup
         launchAtLogin = SettingsDefaults.launchAtLogin
         setLaunchAtLogin(enabled: SettingsDefaults.launchAtLogin)
+        showDockIcon = SettingsDefaults.showDockIcon
         showMenuBarIcon = SettingsDefaults.showMenuBarIcon
 
         // Updates

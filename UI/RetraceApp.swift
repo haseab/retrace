@@ -1,6 +1,7 @@
 import SwiftUI
 import App
 import Shared
+import Database
 import SQLCipher
 import Darwin
 import IOKit.ps
@@ -49,7 +50,7 @@ struct RetraceApp: App {
     // MARK: - Body
 
     var body: some Scene {
-        // Menu bar app - no WindowGroup, use Settings for menu commands only
+        // Windows are managed manually via window controllers; Settings scene exists for app commands.
         Settings {
             EmptyView()
         }
@@ -63,7 +64,7 @@ struct RetraceApp: App {
     @CommandsBuilder
     private var appCommands: some Commands {
         CommandGroup(replacing: .newItem) {
-            // Remove "New Window" since we're a menu bar app
+            // Remove "New Window" because window creation is managed by dedicated controllers.
         }
 
         // Add Dashboard and Timeline to the app menu (top left, after "About Retrace")
@@ -166,6 +167,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
     private static let externalDashboardRevealNotification = Notification.Name("io.retrace.app.externalDashboardReveal")
     private static let quitConfirmationPreferenceKey = "quitConfirmationPreference"
+    private static let showDockIconPreferenceKey = "showDockIcon"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
@@ -181,14 +183,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Prompt user to move app to Applications folder if not already there
         AppMover.moveToApplicationsFolderIfNecessary()
         setupExternalDashboardRevealObserver()
-
-        // CRITICAL FIX: Ensure bundle identifier is set
-        // When running from Xcode/SPM, the bundle ID might not be set correctly
-        if Bundle.main.bundleIdentifier == nil {
-            // Set activation policy to accessory (menu bar app, no dock icon)
-            // This is required when running without a proper bundle ID
-            NSApp.setActivationPolicy(.accessory)
-        }
+        applyDockIconVisibilityPreference()
 
         // Check if another instance is already running (skip if this is a relaunch)
         let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
@@ -226,6 +221,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Note: Permissions are now handled in the onboarding flow
+    }
+
+    private func applyDockIconVisibilityPreference() {
+        let showDockIcon = settingsStore.object(forKey: Self.showDockIconPreferenceKey) as? Bool ?? true
+        let targetPolicy: NSApplication.ActivationPolicy = showDockIcon ? .regular : .accessory
+        let changed = NSApp.setActivationPolicy(targetPolicy)
+        let policyName = showDockIcon ? "regular" : "accessory"
+        let missingBundleIdentifier = Bundle.main.bundleIdentifier == nil
+
+        Log.info(
+            "[LaunchSurface] Applied startup activation policy showDockIcon=\(showDockIcon) policy=\(policyName) changed=\(changed) missingBundleID=\(missingBundleIdentifier)",
+            category: .app
+        )
     }
 
     @MainActor
@@ -355,9 +363,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         return Int(displayCount)
     }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep app running in menu bar even when window is closed
         return false
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu(title: "Retrace")
+        let isDashboardFrontAndCenter = dockDashboardIsFrontAndCenter()
+        let isSettingsFrontAndCenter = dockSettingsIsFrontAndCenter()
+
+        menu.addItem(
+            makeDockMenuItem(
+                isDashboardFrontAndCenter ? "Hide Dashboard" : "Open Dashboard",
+                systemImageName: "rectangle.3.group",
+                action: #selector(handleDockToggleDashboard)
+            )
+        )
+        menu.addItem(
+            makeDockMenuItem(
+                "Open Timeline",
+                systemImageName: "clock",
+                action: #selector(handleDockOpenTimeline)
+            )
+        )
+        menu.addItem(
+            makeDockMenuItem(
+                isSettingsFrontAndCenter ? "Hide Settings" : "Open Settings",
+                systemImageName: "gearshape",
+                action: #selector(handleDockOpenSettings)
+            )
+        )
+        menu.addItem(
+            makeDockMenuItem(
+                "Get Help...",
+                systemImageName: "exclamationmark.bubble",
+                action: #selector(handleDockOpenFeedback)
+            )
+        )
+        menu.addItem(.separator())
+        menu.addItem(
+            makeDockMenuItem(
+                dockRecordingMenuTitle(),
+                systemImageName: dockRecordingMenuSymbolName(),
+                action: #selector(handleDockToggleRecording)
+            )
+        )
+
+        return menu
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1122,6 +1176,129 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func handleDockToggleDashboard() {
+        if dockDashboardIsFrontAndCenter() {
+            recordDockMenuActionMetric("hide_dashboard")
+            DashboardWindowController.shared.hide()
+            return
+        }
+
+        recordDockMenuActionMetric("open_dashboard")
+        if TimelineWindowController.shared.isVisible {
+            TimelineWindowController.shared.hideToShowDashboard()
+        }
+        DashboardWindowController.shared.showDashboard()
+    }
+
+    @objc private func handleDockOpenTimeline() {
+        recordDockMenuActionMetric("open_timeline")
+        TimelineWindowController.shared.show()
+    }
+
+    @objc private func handleDockOpenSettings() {
+        if dockSettingsIsFrontAndCenter() {
+            recordDockMenuActionMetric("hide_settings")
+            DashboardWindowController.shared.hide()
+            return
+        }
+
+        recordDockMenuActionMetric("open_settings")
+
+        if TimelineWindowController.shared.isVisible {
+            TimelineWindowController.shared.hideToShowDashboard()
+        }
+        DashboardWindowController.shared.showSettings()
+    }
+
+    @objc private func handleDockToggleRecording() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let currentlyCapturing = await self.coordinatorWrapper?.coordinator.isCapturing() ?? false
+            self.recordDockMenuActionMetric(currentlyCapturing ? "stop_recording" : "start_recording")
+
+            do {
+                try await self.toggleRecording()
+            } catch {
+                Log.error("[DockMenu] Failed to toggle recording: \(error)", category: .ui)
+            }
+        }
+    }
+
+    @objc private func handleDockOpenFeedback() {
+        recordDockMenuActionMetric("open_help")
+        NotificationCenter.default.post(name: .openFeedback, object: nil)
+    }
+
+    private func makeDockMenuItem(
+        _ title: String,
+        systemImageName: String? = nil,
+        action: Selector
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        if let systemImageName,
+           let symbol = NSImage(systemSymbolName: systemImageName, accessibilityDescription: nil) {
+            symbol.isTemplate = true
+            item.image = symbol
+        }
+        return item
+    }
+
+    private func dockRecordingMenuTitle() -> String {
+        if menuBarManager?.isRecording == true {
+            return "Stop Recording"
+        }
+        return "Start Recording"
+    }
+
+    private func dockDashboardIsFrontAndCenter() -> Bool {
+        guard NSApp.isActive else { return false }
+        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
+        return titles.contains("Dashboard")
+    }
+
+    private func dockSettingsIsFrontAndCenter() -> Bool {
+        guard NSApp.isActive else { return false }
+        let titles = [NSApp.keyWindow?.title, NSApp.mainWindow?.title]
+        return titles.contains { title in
+            guard let title else { return false }
+            return title.hasPrefix("Settings")
+        }
+    }
+
+    private func dockRecordingMenuSymbolName() -> String {
+        if menuBarManager?.isRecording == true {
+            return "stop.circle"
+        }
+        return "record.circle"
+    }
+
+    private func recordDockMenuActionMetric(_ action: String) {
+        guard let coordinator = coordinatorWrapper?.coordinator else { return }
+
+        let metadata = Self.metricMetadata([
+            "action": action,
+            "source": "dock_menu"
+        ])
+
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: .dockMenuAction,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func metricMetadata(_ payload: [String: Any]) -> String? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return json
+    }
+
     // MARK: - Single Instance Check
 
     private func singleInstanceBundleIdentifier() -> String {
@@ -1260,17 +1437,85 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             let dashboard = DashboardWindowController.shared
+            let dashboardWasVisible = dashboard.isVisible
             if dashboard.isVisible {
                 dashboard.bringToFront()
                 Log.info("[LaunchSurface] Brought dashboard to front source=\(source) appWasHidden=\(wasHidden) after state=\(launchSurfaceStateSnapshot())", category: .app)
+                recordLaunchSurfaceRevealMetric(
+                    source: source,
+                    action: "bring_to_front",
+                    appWasHidden: wasHidden,
+                    dashboardWasVisible: dashboardWasVisible
+                )
             } else {
                 dashboard.show()
                 Log.info("[LaunchSurface] Called dashboard.show source=\(source) appWasHidden=\(wasHidden) after state=\(launchSurfaceStateSnapshot())", category: .app)
+                recordLaunchSurfaceRevealMetric(
+                    source: source,
+                    action: "show_dashboard",
+                    appWasHidden: wasHidden,
+                    dashboardWasVisible: dashboardWasVisible
+                )
             }
         } else {
             shouldShowDashboardAfterInitialization = true
             Log.info("[LaunchSurface] Queued dashboard reveal until initialization source=\(source) state=\(launchSurfaceStateSnapshot())", category: .app)
+            recordLaunchSurfaceRevealMetric(
+                source: source,
+                action: "queued_until_initialized",
+                appWasHidden: NSApp.isHidden,
+                dashboardWasVisible: DashboardWindowController.shared.isVisible
+            )
         }
+    }
+
+    @MainActor
+    private func recordLaunchSurfaceRevealMetric(
+        source: String,
+        action: String,
+        appWasHidden: Bool,
+        dashboardWasVisible: Bool
+    ) {
+        guard let coordinator = coordinatorWrapper?.coordinator else { return }
+
+        let metadata = Self.launchSurfaceRevealMetadata(
+            source: source,
+            action: action,
+            appWasHidden: appWasHidden,
+            dashboardWasVisible: dashboardWasVisible,
+            isInitialized: isInitialized
+        )
+
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: .launchSurfaceReveal,
+                metadata: metadata
+            )
+        }
+    }
+
+    private static func launchSurfaceRevealMetadata(
+        source: String,
+        action: String,
+        appWasHidden: Bool,
+        dashboardWasVisible: Bool,
+        isInitialized: Bool
+    ) -> String? {
+        let payload: [String: Any] = [
+            "source": source,
+            "action": action,
+            "appWasHidden": appWasHidden,
+            "dashboardWasVisible": dashboardWasVisible,
+            "isInitialized": isInitialized
+        ]
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return json
     }
 
     private func setupExternalDashboardRevealObserver() {

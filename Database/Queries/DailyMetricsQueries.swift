@@ -32,6 +32,7 @@ public enum DailyMetricsQueries {
         case shiftDragTextCopy = "shift_drag_text_copy"  // metadata: copied text
         case stillFrameDragOCR = "still_frame_drag_ocr"  // metadata: JSON {gesture, frameID}
         case appLaunches = "app_launches"
+        case launchSurfaceReveal = "launch_surface_reveal"  // metadata: JSON {source, action, appWasHidden, dashboardWasVisible, isInitialized}
         case keyboardShortcut = "keyboard_shortcut"  // metadata: shortcut identifier (e.g. "cmd+c", "cmd+f")
         case dateSearchSubmitted = "date_search_submitted"
         case dateSearchOutcome = "date_search_outcome"
@@ -58,6 +59,8 @@ public enum DailyMetricsQueries {
         case recordingAutoResumed = "recording_auto_resumed"
         case systemMonitorOpened = "system_monitor_opened"
         case settingsSearchOpened = "settings_search_opened"
+        case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
+        case dockMenuAction = "dock_menu_action"  // metadata: JSON {action, source}
         case redactionRulesUpdated = "redaction_rules_updated"
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
