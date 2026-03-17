@@ -98,6 +98,163 @@ final class UpdaterManagerVersionResolutionTests: XCTestCase {
         XCTAssertEqual(UpdaterManager.resolveBundleVersionValue("", fallback: "0.0.0"), "0.0.0")
     }
 }
+
+final class AppRelaunchPathSelectionTests: XCTestCase {
+    func testPreferredRelaunchPathUsesCurrentAppBundleWhenInstalledAppAlsoExists() {
+        XCTAssertEqual(
+            AppRelaunch.preferredRelaunchPath(
+                currentBundlePath: "/Users/test/Downloads/Retrace.app",
+                currentExecutablePath: "/Users/test/Downloads/Retrace.app/Contents/MacOS/Retrace",
+                applicationsAppExists: true
+            ),
+            "/Users/test/Downloads/Retrace.app"
+        )
+    }
+
+    func testPreferredRelaunchPathUsesCurrentExecutableForStandaloneDevBuild() {
+        XCTAssertEqual(
+            AppRelaunch.preferredRelaunchPath(
+                currentBundlePath: "/Users/test/src/retrace/.build/arm64-apple-macosx/debug",
+                currentExecutablePath: "/Users/test/src/retrace/.build/arm64-apple-macosx/debug/Retrace",
+                applicationsAppExists: true
+            ),
+            "/Users/test/src/retrace/.build/arm64-apple-macosx/debug/Retrace"
+        )
+    }
+
+    func testPreferredRelaunchPathFallsBackToInstalledAppWhenCurrentBundleAndExecutablePathsMissing() {
+        XCTAssertEqual(
+            AppRelaunch.preferredRelaunchPath(
+                currentBundlePath: " ",
+                currentExecutablePath: nil,
+                applicationsAppExists: true
+            ),
+            "/Applications/Retrace.app"
+        )
+    }
+
+    func testLaunchModeUsesOpenForAppBundles() {
+        XCTAssertEqual(AppRelaunch.launchMode(forPath: "/Applications/Retrace.app"), .openItem)
+    }
+
+    func testLaunchModeUsesTerminalForStandaloneDevDebugBuild() {
+        XCTAssertEqual(
+            AppRelaunch.launchMode(
+                forPath: "/Users/test/src/retrace/.build/arm64-apple-macosx/debug/Retrace",
+                isDevBuild: true
+            ),
+            .openTerminal
+        )
+    }
+
+    func testLaunchModeExecutesStandaloneBinaryForNonDevBuild() {
+        XCTAssertEqual(
+            AppRelaunch.launchMode(
+                forPath: "/Users/test/src/retrace/.build/arm64-apple-macosx/debug/Retrace",
+                isDevBuild: false
+            ),
+            .executeFile
+        )
+    }
+
+    func testLaunchModeExecutesStandaloneDevNonDebugBuild() {
+        XCTAssertEqual(
+            AppRelaunch.launchMode(
+                forPath: "/Users/test/src/retrace/bin/Retrace",
+                isDevBuild: true
+            ),
+            .executeFile
+        )
+    }
+
+    func testTerminalLauncherScriptRemovesWrapperAndExecutesBinary() {
+        XCTAssertEqual(
+            AppRelaunch.terminalLauncherScriptContents(
+                forExecutablePath: "/Users/test/src/retrace/.build/debug/Retrace"
+            ),
+            """
+            #!/bin/zsh
+            rm -f -- "$0"
+            exec '/Users/test/src/retrace/.build/debug/Retrace'
+            """
+        )
+    }
+}
+
+final class SingleInstanceLockTests: XCTestCase {
+    func testAcquireReportsAlreadyHeldWhenDescriptorAlreadyOwned() throws {
+        let lockPath = makeTemporaryLockPath()
+        defer { try? FileManager.default.removeItem(atPath: lockPath) }
+
+        var descriptor = try acquireLock(atPath: lockPath, processID: 1111)
+        defer { SingleInstanceLock.release(descriptor: &descriptor) }
+
+        guard case .alreadyHeld(let heldDescriptor) = SingleInstanceLock.acquire(
+            atPath: lockPath,
+            existingDescriptor: descriptor,
+            processID: 2222
+        ) else {
+            return XCTFail("Expected .alreadyHeld for existing descriptor")
+        }
+
+        XCTAssertEqual(heldDescriptor, descriptor)
+    }
+
+    func testAcquireReportsAnotherProcessWhenLockIsHeldElsewhere() throws {
+        let lockPath = makeTemporaryLockPath()
+        defer { try? FileManager.default.removeItem(atPath: lockPath) }
+
+        var descriptor = try acquireLock(atPath: lockPath, processID: 1111)
+        defer { SingleInstanceLock.release(descriptor: &descriptor) }
+
+        guard case .heldByAnotherProcess = SingleInstanceLock.acquire(
+            atPath: lockPath,
+            existingDescriptor: -1,
+            processID: 2222
+        ) else {
+            return XCTFail("Expected .heldByAnotherProcess while first descriptor owns the lock")
+        }
+    }
+
+    func testAcquireSucceedsAfterPreviousDescriptorReleasesLock() throws {
+        let lockPath = makeTemporaryLockPath()
+        defer { try? FileManager.default.removeItem(atPath: lockPath) }
+
+        var originalDescriptor = try acquireLock(atPath: lockPath, processID: 1111)
+        SingleInstanceLock.release(descriptor: &originalDescriptor)
+
+        var reacquiredDescriptor = try acquireLock(atPath: lockPath, processID: 2222)
+        defer { SingleInstanceLock.release(descriptor: &reacquiredDescriptor) }
+
+        XCTAssertGreaterThanOrEqual(reacquiredDescriptor, 0)
+    }
+
+    private func makeTemporaryLockPath() -> String {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("retrace-single-instance-\(UUID().uuidString).lock")
+            .path
+    }
+
+    private func acquireLock(atPath path: String, processID: pid_t) throws -> CInt {
+        switch SingleInstanceLock.acquire(
+            atPath: path,
+            existingDescriptor: -1,
+            processID: processID
+        ) {
+        case .acquired(let descriptor):
+            return descriptor
+        case .alreadyHeld:
+            XCTFail("Expected fresh lock acquisition, but descriptor was already held")
+        case .heldByAnotherProcess:
+            XCTFail("Expected fresh lock acquisition, but another process owned the lock")
+        case .error(let code):
+            XCTFail("Expected fresh lock acquisition, but lock failed with errno \(code)")
+        }
+
+        throw NSError(domain: "SingleInstanceLockTests", code: 1)
+    }
+}
+
 final class CrashReportSupportTests: XCTestCase {
     func testLoadRecentCrashReportReturnsNewestDiagnosticReportAcrossSources() throws {
         let fileManager = FileManager.default

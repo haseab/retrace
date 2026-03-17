@@ -39,6 +39,58 @@ private enum WatchdogRelaunchGuard {
     }
 }
 
+enum SingleInstanceLock {
+    enum AcquireResult {
+        case alreadyHeld(descriptor: CInt)
+        case acquired(descriptor: CInt)
+        case heldByAnotherProcess
+        case error(code: Int32)
+    }
+
+    static func acquire(
+        atPath path: String,
+        existingDescriptor: CInt = -1,
+        processID: pid_t = ProcessInfo.processInfo.processIdentifier
+    ) -> AcquireResult {
+        if existingDescriptor >= 0 {
+            return .alreadyHeld(descriptor: existingDescriptor)
+        }
+
+        let fd = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        if fd == -1 {
+            return .error(code: errno)
+        }
+
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            let lockError = errno
+            close(fd)
+
+            if lockError == EWOULDBLOCK {
+                return .heldByAnotherProcess
+            }
+
+            return .error(code: lockError)
+        }
+
+        _ = ftruncate(fd, 0)
+        _ = lseek(fd, 0, SEEK_SET)
+        let pidString = "\(processID)\n"
+        pidString.withCString { pidCString in
+            _ = write(fd, pidCString, strlen(pidCString))
+        }
+
+        return .acquired(descriptor: fd)
+    }
+
+    static func release(descriptor: inout CInt) {
+        guard descriptor >= 0 else { return }
+
+        _ = flock(descriptor, LOCK_UN)
+        close(descriptor)
+        descriptor = -1
+    }
+}
+
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -170,6 +222,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
+    private static let relaunchLockRetryAttempts = 30
+    private static let relaunchLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
 
@@ -186,21 +240,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupExternalDashboardRevealObserver()
         applyDockIconVisibilityPreference()
 
-        // Check if another instance is already running (skip if this is a relaunch)
+        // Check if another instance is already running. Relaunches still need to
+        // reacquire the lock, but can skip the duplicate-process scan during handoff.
         let isRelaunch = UserDefaults.standard.bool(forKey: "isRelaunching")
         if isRelaunch {
             Log.info("[AppDelegate] App relaunched successfully", category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
-        } else {
-            let hasSingleInstanceLock = acquireSingleInstanceLock()
-            if !hasSingleInstanceLock || isAnotherInstanceRunning() {
-                Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
-                activateExistingInstance()
-                requestImmediateTermination(skipQuitConfirmation: true)
-                return
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+
+                let hasSingleInstanceLock = await self.acquireSingleInstanceLockAfterRelaunch()
+                guard hasSingleInstanceLock else {
+                    Log.warning(
+                        "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and terminating duplicate.",
+                        category: .app
+                    )
+                    self.activateExistingInstance()
+                    self.requestImmediateTermination(skipQuitConfirmation: true)
+                    return
+                }
+
+                self.finishApplicationLaunch()
             }
+            return
         }
 
+        let hasSingleInstanceLock = acquireSingleInstanceLock()
+        if !hasSingleInstanceLock || isAnotherInstanceRunning() {
+            Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
+            activateExistingInstance()
+            requestImmediateTermination(skipQuitConfirmation: true)
+            return
+        }
+
+        finishApplicationLaunch()
+    }
+
+    private func finishApplicationLaunch() {
         // Configure app appearance
         configureAppearance()
 
@@ -222,6 +298,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Note: Permissions are now handled in the onboarding flow
+    }
+
+    private func acquireSingleInstanceLockAfterRelaunch() async -> Bool {
+        for attempt in 1...Self.relaunchLockRetryAttempts {
+            switch SingleInstanceLock.acquire(
+                atPath: Self.singleInstanceLockPath,
+                existingDescriptor: singleInstanceLockFileDescriptor
+            ) {
+            case .alreadyHeld(let descriptor), .acquired(let descriptor):
+                singleInstanceLockFileDescriptor = descriptor
+                Log.info(
+                    "[AppDelegate] Relaunch acquired single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
+                    category: .app
+                )
+                return true
+
+            case .heldByAnotherProcess:
+                if attempt == Self.relaunchLockRetryAttempts {
+                    return false
+                }
+
+                if attempt == 1 || attempt % 5 == 0 {
+                    Log.info(
+                        "[AppDelegate] Waiting for previous instance to release single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
+                        category: .app
+                    )
+                }
+
+                try? await Task.sleep(for: Self.relaunchLockRetryDelay, clock: .continuous)
+
+            case .error(let lockError):
+                Log.error(
+                    "[AppDelegate] Failed to reacquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
+                    category: .app
+                )
+                return true
+            }
+        }
+
+        return false
     }
 
     private func applyDockIconVisibilityPreference() {
@@ -1320,54 +1436,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func acquireSingleInstanceLock() -> Bool {
-        if singleInstanceLockFileDescriptor >= 0 {
+        switch SingleInstanceLock.acquire(
+            atPath: Self.singleInstanceLockPath,
+            existingDescriptor: singleInstanceLockFileDescriptor
+        ) {
+        case .alreadyHeld(let descriptor), .acquired(let descriptor):
+            singleInstanceLockFileDescriptor = descriptor
             return true
-        }
 
-        let lockPath = Self.singleInstanceLockPath
-        let fd = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-        if fd == -1 {
-            let openError = errno
+        case .heldByAnotherProcess:
+            return false
+
+        case .error(let lockError):
             Log.error(
-                "[AppDelegate] Failed to open single-instance lock file at \(lockPath): \(String(cString: strerror(openError)))",
+                "[AppDelegate] Failed to acquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
                 category: .app
             )
             return true
         }
-
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            let lockError = errno
-            close(fd)
-
-            if lockError == EWOULDBLOCK {
-                return false
-            }
-
-            Log.error(
-                "[AppDelegate] Failed to acquire single-instance lock at \(lockPath): \(String(cString: strerror(lockError)))",
-                category: .app
-            )
-            return true
-        }
-
-        let currentPID = ProcessInfo.processInfo.processIdentifier
-        _ = ftruncate(fd, 0)
-        _ = lseek(fd, 0, SEEK_SET)
-        let pidString = "\(currentPID)\n"
-        pidString.withCString { pidCString in
-            _ = write(fd, pidCString, strlen(pidCString))
-        }
-
-        singleInstanceLockFileDescriptor = fd
-        return true
     }
 
     private func releaseSingleInstanceLock() {
-        guard singleInstanceLockFileDescriptor >= 0 else { return }
-
-        _ = flock(singleInstanceLockFileDescriptor, LOCK_UN)
-        close(singleInstanceLockFileDescriptor)
-        singleInstanceLockFileDescriptor = -1
+        SingleInstanceLock.release(descriptor: &singleInstanceLockFileDescriptor)
     }
 
     private func lockFileInstancePID() -> pid_t? {
