@@ -196,6 +196,53 @@ final class ServiceContainerRewindCutoffTests: XCTestCase {
     }
 }
 
+final class DBStorageSnapshotLoggingTests: XCTestCase {
+    func testDBStorageSnapshotDeltaSummaryUsesSameDayDelta() {
+        let currentDay = Date(timeIntervalSince1970: 1_773_744_000)
+        let previous = AppCoordinator.DBStorageSnapshotLogState(
+            localDay: currentDay,
+            dbBytes: 100,
+            walBytes: 200,
+            sampledAt: currentDay
+        )
+        let current = AppCoordinator.DBStorageSnapshotLogState(
+            localDay: currentDay.addingTimeInterval(300),
+            dbBytes: 160,
+            walBytes: 260,
+            sampledAt: currentDay.addingTimeInterval(300)
+        )
+
+        let delta = AppCoordinator.dbStorageSnapshotDeltaSummary(
+            current: current,
+            previous: previous
+        )
+
+        XCTAssertEqual(delta, .init(dbDeltaBytes: 60, walDeltaBytes: 60))
+    }
+
+    func testDBStorageSnapshotDeltaSummaryResetsAcrossDays() {
+        let previous = AppCoordinator.DBStorageSnapshotLogState(
+            localDay: Date(timeIntervalSince1970: 1_773_657_600),
+            dbBytes: 100,
+            walBytes: 200,
+            sampledAt: Date(timeIntervalSince1970: 1_773_657_600)
+        )
+        let current = AppCoordinator.DBStorageSnapshotLogState(
+            localDay: Date(timeIntervalSince1970: 1_773_744_000),
+            dbBytes: 160,
+            walBytes: 260,
+            sampledAt: Date(timeIntervalSince1970: 1_773_744_060)
+        )
+
+        let delta = AppCoordinator.dbStorageSnapshotDeltaSummary(
+            current: current,
+            previous: previous
+        )
+
+        XCTAssertEqual(delta, .init(dbDeltaBytes: nil, walDeltaBytes: nil))
+    }
+}
+
 final class DBStorageSnapshotEstimateTests: XCTestCase {
     private func makeServices(storageRoot: URL) -> ServiceContainer {
         let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
@@ -269,9 +316,9 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
         )
     }
 
-    func testDailyDBStorageEstimatedBytesRequiresAboutOneDayOfHistory() async throws {
+    func testDailyDBStorageEstimatedBytesUsesAdjacentLocalDayRows() async throws {
         let storageRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("DBStorageSnapshotRequiresDay_\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("DBStorageSnapshotAdjacentDays_\(UUID().uuidString)", isDirectory: true)
         let services = makeServices(storageRoot: storageRoot)
         let coordinator = AppCoordinator(services: services)
 
@@ -286,6 +333,7 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 
             try await services.database.recordDBStorageSnapshot(timestamp: firstSnapshot)
             try await growDatabase(services.database, timestamp: firstSnapshot.addingTimeInterval(60), seed: 1)
+            try await services.database.checkpoint()
             try await services.database.recordDBStorageSnapshot(timestamp: secondSnapshot)
 
             let estimates = try await coordinator.getDailyDBStorageEstimatedBytes(
@@ -293,7 +341,9 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
                 to: secondSnapshot
             )
 
-            XCTAssertTrue(estimates.isEmpty)
+            XCTAssertEqual(estimates.count, 1)
+            XCTAssertEqual(Calendar.current.startOfDay(for: estimates[0].date), Calendar.current.startOfDay(for: secondSnapshot))
+            XCTAssertGreaterThan(estimates[0].value, 0)
 
             try await services.shutdown()
         } catch {
@@ -319,6 +369,7 @@ final class DBStorageSnapshotEstimateTests: XCTestCase {
 
             try await services.database.recordDBStorageSnapshot(timestamp: firstSnapshot)
             try await growDatabase(services.database, timestamp: firstSnapshot.addingTimeInterval(120), seed: 2)
+            try await services.database.checkpoint()
             try await services.database.recordDBStorageSnapshot(timestamp: secondSnapshot)
 
             let estimates = try await coordinator.getDailyDBStorageEstimatedBytes(

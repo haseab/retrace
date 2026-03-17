@@ -201,6 +201,18 @@ public actor AppCoordinator {
         }
     }
 
+    struct DBStorageSnapshotLogState: Equatable {
+        let localDay: Date
+        let dbBytes: Int64
+        let walBytes: Int64
+        let sampledAt: Date
+    }
+
+    struct DBStorageSnapshotDeltaSummary: Equatable {
+        let dbDeltaBytes: Int64?
+        let walDeltaBytes: Int64?
+    }
+
     // MARK: - Properties
 
     private let services: ServiceContainer
@@ -253,12 +265,12 @@ public actor AppCoordinator {
     // Periodic task to finalize orphaned videos (processingState stuck at 1)
     private var orphanedVideoCleanupTask: Task<Void, Never>?
     private var dbStorageSnapshotTask: Task<Void, Never>?
+    private var lastLoggedDBStorageSnapshot: DBStorageSnapshotLogState?
     private static let pipelineMemoryLogInterval: TimeInterval = 5.0
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerPendingRawFramesTag = "app.capture.pendingRawFrames"
     private static let memoryLedgerActiveWritersTag = "app.capture.activeWriters"
     private static let dbStorageSnapshotIntervalNanoseconds: Int64 = 60_000_000_000
-    private static let minimumDBSnapshotDiffInterval: TimeInterval = 23 * 60 * 60
     private static let timelineDiskCacheJPEGCompressionQuality: CGFloat = 0.80
 
     // MARK: - Initialization
@@ -1004,10 +1016,44 @@ public actor AppCoordinator {
     private func recordDBStorageSnapshot(reason: String) async {
         do {
             try await services.database.recordDBStorageSnapshot()
-            Log.debug("[AppCoordinator] Recorded DB storage snapshot (\(reason))", category: .app)
+            if let snapshot = try await currentDBStorageSnapshotLogState() {
+                let deltaSummary = Self.dbStorageSnapshotDeltaSummary(
+                    current: snapshot,
+                    previous: lastLoggedDBStorageSnapshot
+                )
+                lastLoggedDBStorageSnapshot = snapshot
+                Log.info(
+                    Self.dbStorageSnapshotLogMessage(
+                        snapshot: snapshot,
+                        deltaSummary: deltaSummary,
+                        reason: reason
+                    ),
+                    category: .app
+                )
+            } else {
+                Log.debug("[AppCoordinator] Recorded DB storage snapshot (\(reason))", category: .app)
+            }
         } catch {
             Log.warning("[AppCoordinator] Failed to record DB storage snapshot (\(reason)): \(error)", category: .app)
         }
+    }
+
+    private func currentDBStorageSnapshotLogState() async throws -> DBStorageSnapshotLogState? {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let snapshots = try await services.database.getDBStorageSnapshots(
+            from: today,
+            to: today
+        )
+        guard let snapshot = snapshots.last else {
+            return nil
+        }
+        return DBStorageSnapshotLogState(
+            localDay: calendar.startOfDay(for: snapshot.date),
+            dbBytes: snapshot.dbBytes,
+            walBytes: snapshot.walBytes,
+            sampledAt: snapshot.sampledAt
+        )
     }
 
     /// Finalize any orphaned videos that have processingState=1 but no active WAL session
@@ -1450,6 +1496,57 @@ public actor AppCoordinator {
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: max(0, bytes))
+    }
+
+    private static func formatLocalDay(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    static func dbStorageSnapshotDeltaSummary(
+        current: DBStorageSnapshotLogState,
+        previous: DBStorageSnapshotLogState?
+    ) -> DBStorageSnapshotDeltaSummary {
+        guard let previous else {
+            return DBStorageSnapshotDeltaSummary(dbDeltaBytes: nil, walDeltaBytes: nil)
+        }
+
+        let calendar = Calendar.current
+        guard calendar.isDate(previous.localDay, inSameDayAs: current.localDay) else {
+            return DBStorageSnapshotDeltaSummary(dbDeltaBytes: nil, walDeltaBytes: nil)
+        }
+
+        return DBStorageSnapshotDeltaSummary(
+            dbDeltaBytes: current.dbBytes - previous.dbBytes,
+            walDeltaBytes: current.walBytes - previous.walBytes
+        )
+    }
+
+    private static func dbStorageSnapshotLogMessage(
+        snapshot: DBStorageSnapshotLogState,
+        deltaSummary: DBStorageSnapshotDeltaSummary,
+        reason: String
+    ) -> String {
+        let localDay = formatLocalDay(snapshot.localDay)
+        let sampledAt = Log.timestamp(from: snapshot.sampledAt)
+        var message = "[AppCoordinator] Recorded DB storage snapshot (\(reason)) day=\(localDay) sampledAt=\(sampledAt)"
+        message += " db=\(snapshot.dbBytes) (\(formatBytes(snapshot.dbBytes)))"
+        message += " wal=\(snapshot.walBytes) (\(formatBytes(snapshot.walBytes)))"
+
+        if let dbDeltaBytes = deltaSummary.dbDeltaBytes {
+            let dbDeltaPrefix = dbDeltaBytes >= 0 ? "+" : ""
+            message += " dbDelta=\(dbDeltaPrefix)\(dbDeltaBytes) (\(formatBytes(abs(dbDeltaBytes))))"
+        }
+
+        if let walDeltaBytes = deltaSummary.walDeltaBytes {
+            let walDeltaPrefix = walDeltaBytes >= 0 ? "+" : ""
+            message += " walDelta=\(walDeltaPrefix)\(walDeltaBytes) (\(formatBytes(abs(walDeltaBytes))))"
+        }
+
+        return message
     }
 
     private static func timelineDiskFrameBufferDirectoryURL() -> URL {
@@ -3184,8 +3281,10 @@ public actor AppCoordinator {
         )
     }
 
-    /// Estimate per-day DB growth from daily DB/WAL snapshots.
-    /// Returns only days that have a previous-day snapshot at least ~1 day older.
+    /// Estimate per-day durable DB growth from daily snapshots.
+    /// Uses adjacent local-day rows directly because each day only stores one latest snapshot.
+    /// WAL growth is intentionally ignored here because it is transient journal churn rather than
+    /// retained storage growth.
     public func getDailyDBStorageEstimatedBytes(
         from startDate: Date,
         to endDate: Date
@@ -3219,14 +3318,8 @@ public actor AppCoordinator {
                 continue
             }
 
-            let sampleSpan = currentSnapshot.sampledAt.timeIntervalSince(previousSnapshot.sampledAt)
-            guard sampleSpan >= Self.minimumDBSnapshotDiffInterval else {
-                currentDay = calendar.date(byAdding: .day, value: 1, to: currentDay)!
-                continue
-            }
-
-            let currentTotal = currentSnapshot.dbBytes + currentSnapshot.walBytes
-            let previousTotal = previousSnapshot.dbBytes + previousSnapshot.walBytes
+            let currentTotal = currentSnapshot.dbBytes
+            let previousTotal = previousSnapshot.dbBytes
             let estimatedGrowth = max(0, currentTotal - previousTotal)
             results.append((date: currentDay, value: estimatedGrowth))
 
