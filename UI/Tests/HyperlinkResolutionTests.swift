@@ -97,6 +97,17 @@ final class HyperlinkResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testURLOverlayViewOutlineRectAddsPaddingAroundDetectedURL() {
+        let rawRect = CGRect(x: 20, y: 12, width: 120, height: 24)
+        let outlineRect = URLOverlayView.outlineRect(for: rawRect)
+
+        XCTAssertEqual(outlineRect.origin.x, 16)
+        XCTAssertEqual(outlineRect.origin.y, 8)
+        XCTAssertEqual(outlineRect.width, 128)
+        XCTAssertEqual(outlineRect.height, 32)
+    }
+
+    @MainActor
     func testHyperlinkBrowserApplicationURLPrefersResolvedDefaultBrowser() {
         let defaultBrowserURL = URL(fileURLWithPath: "/Applications/Arc.app")
 

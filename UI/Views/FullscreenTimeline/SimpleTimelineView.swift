@@ -3863,6 +3863,8 @@ struct URLBoundingBoxOverlay: NSViewRepresentable {
 /// Custom NSView for URL overlay with mouse tracking
 /// Only intercepts mouse events inside the bounding rect, passes through events outside
 class URLOverlayView: NSView {
+    static let outlinePadding: CGFloat = 4
+
     var boundingRect: NSRect = .zero
     var isHoveringURL: Bool = false
     var url: String = ""
@@ -3880,10 +3882,11 @@ class URLOverlayView: NSView {
         }
 
         // Add new tracking area for the bounding box
-        guard !boundingRect.isEmpty else { return }
+        let outlineRect = Self.outlineRect(for: boundingRect)
+        guard !outlineRect.isEmpty else { return }
 
         let options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInKeyWindow, .mouseMoved]
-        trackingArea = NSTrackingArea(rect: boundingRect, options: options, owner: self, userInfo: nil)
+        trackingArea = NSTrackingArea(rect: outlineRect, options: options, owner: self, userInfo: nil)
         addTrackingArea(trackingArea!)
     }
 
@@ -3901,7 +3904,7 @@ class URLOverlayView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
-        if boundingRect.contains(location) {
+        if Self.outlineRect(for: boundingRect).contains(location) {
             onClick?()
         } else {
             // Pass event to next responder (TextSelectionView)
@@ -3911,7 +3914,7 @@ class URLOverlayView: NSView {
 
     /// Only accept events inside the bounding rect - pass through elsewhere
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if boundingRect.contains(point) {
+        if Self.outlineRect(for: boundingRect).contains(point) {
             return super.hitTest(point)
         }
         // Return nil to let the event pass through to views below
@@ -3922,10 +3925,11 @@ class URLOverlayView: NSView {
         super.draw(dirtyRect)
 
         // Only draw when hovering and we have a valid bounding rect
-        guard isHoveringURL, !boundingRect.isEmpty else { return }
+        let outlineRect = Self.outlineRect(for: boundingRect)
+        guard isHoveringURL, !outlineRect.isEmpty else { return }
 
         // Draw dotted rectangle around URL
-        let path = NSBezierPath(roundedRect: boundingRect, xRadius: 4, yRadius: 4)
+        let path = NSBezierPath(roundedRect: outlineRect, xRadius: 4, yRadius: 4)
         path.lineWidth = 2.0
 
         // Set up dotted line pattern
@@ -3937,6 +3941,10 @@ class URLOverlayView: NSView {
         NSColor(red: 0.4, green: 0.9, blue: 0.4, alpha: 0.15).setFill()
         path.stroke()
         path.fill()
+    }
+
+    static func outlineRect(for boundingRect: CGRect) -> CGRect {
+        boundingRect.insetBy(dx: -outlinePadding, dy: -outlinePadding)
     }
 }
 
