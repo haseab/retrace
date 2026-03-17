@@ -868,24 +868,14 @@ public struct SimpleTimelineView: View {
                     .allowsHitTesting(isDecodedVideoInteractable)
 
                 if let image = viewModel.displayableCurrentImage {
-                    FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                        Image(nsImage: image)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                    }
+                    frameStillContent(image, interactive: true)
                 } else if let fallbackImage = viewModel.waitingVideoFallbackImage {
-                    Image(nsImage: fallbackImage)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+                    frameStillContent(fallbackImage, interactive: false)
                 }
             }
         } else if let image = viewModel.displayableCurrentImage {
             // Static image (Retrace) with URL overlay.
-            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            }
+            frameStillContent(image, interactive: true)
         } else if !viewModel.isLoading {
             // Empty state - no video or image available.
             let isFilteredEmptyState = viewModel.frames.isEmpty && viewModel.filterCriteria.hasActiveFilters
@@ -906,6 +896,26 @@ public struct SimpleTimelineView: View {
                         .foregroundColor(.white.opacity(0.3))
                 }
             }
+        }
+    }
+
+    private func fittedStillImage(_ image: NSImage) -> some View {
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+    }
+
+    @ViewBuilder
+    private func frameStillContent(_ image: NSImage, interactive: Bool) -> some View {
+        if interactive {
+            FrameWithURLOverlay(viewModel: viewModel, onURLClicked: onClose) {
+                fittedStillImage(image)
+            }
+        } else {
+            fittedStillImage(image)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .scaleEffect(viewModel.frameZoomScale)
+                .offset(viewModel.frameZoomOffset)
         }
     }
 
