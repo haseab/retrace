@@ -8,6 +8,7 @@ struct ProcessCPURow: Identifiable {
     let id: String
     let name: String
     let cpuSeconds: Double
+    let currentCapacityPercent: Double
     let energyJoules: Double
     let averagePowerWatts: Double
     let peakPowerWatts: Double
@@ -87,6 +88,87 @@ struct ProcessCPUSnapshot {
 
     var hasRenderableMemoryData: Bool {
         !topMemoryProcesses.isEmpty
+    }
+}
+
+enum ProcessCPUDisplayMetrics {
+    static func buildRows(
+        cumulativeNanosecondsByGroup: [String: UInt64],
+        latestDeltaNanosecondsByGroup: [String: UInt64],
+        latestSampleDurationSeconds: TimeInterval,
+        energyNanojoulesByGroup: [String: UInt64],
+        peakPowerWattsByGroup: [String: Double],
+        displayNamesByKey: [String: String],
+        totalDuration: TimeInterval,
+        logicalCoreCount: Int
+    ) -> [ProcessCPURow] {
+        let safeLogicalCoreCount = max(1, logicalCoreCount)
+        let safeTotalDuration = max(totalDuration, 0)
+        let capacityDenominatorSeconds = safeTotalDuration * Double(safeLogicalCoreCount)
+        let totalTrackedCPUSeconds = Double(cumulativeNanosecondsByGroup.values.reduce(UInt64(0), +)) / 1_000_000_000.0
+
+        return cumulativeNanosecondsByGroup.map { key, nanoseconds in
+            let seconds = Double(nanoseconds) / 1_000_000_000.0
+            let currentCapacityPercent = capacityPercent(
+                deltaNanoseconds: latestDeltaNanosecondsByGroup[key] ?? 0,
+                sampleDurationSeconds: latestSampleDurationSeconds,
+                logicalCoreCount: safeLogicalCoreCount
+            )
+            let shareOfTrackedPercent = cumulativeSharePercent(valueSeconds: seconds, totalSeconds: totalTrackedCPUSeconds)
+            let capacityPercent = capacityDenominatorSeconds > 0
+                ? (seconds / capacityDenominatorSeconds) * 100.0
+                : 0
+            let averagePercent = safeTotalDuration > 0 ? (seconds / safeTotalDuration) * 100.0 : 0
+            let energyJoules = Double(energyNanojoulesByGroup[key] ?? 0) / 1_000_000_000.0
+            let averagePowerWatts = safeTotalDuration > 0 ? energyJoules / safeTotalDuration : 0
+            let peakPowerWatts = peakPowerWattsByGroup[key] ?? 0
+            let name = displayNamesByKey[key] ?? key
+            return ProcessCPURow(
+                id: key,
+                name: name,
+                cpuSeconds: seconds,
+                currentCapacityPercent: currentCapacityPercent,
+                energyJoules: energyJoules,
+                averagePowerWatts: averagePowerWatts,
+                peakPowerWatts: peakPowerWatts,
+                shareOfTrackedPercent: shareOfTrackedPercent,
+                capacityPercent: capacityPercent,
+                averagePercent: averagePercent
+            )
+        }
+        .sorted(by: rankedBefore(_:_:))
+    }
+
+    static func capacityPercent(
+        deltaNanoseconds: UInt64,
+        sampleDurationSeconds: TimeInterval,
+        logicalCoreCount: Int
+    ) -> Double {
+        let safeDuration = max(sampleDurationSeconds, 0)
+        let safeLogicalCoreCount = max(1, logicalCoreCount)
+        guard safeDuration > 0, deltaNanoseconds > 0 else { return 0 }
+
+        let cpuSeconds = Double(deltaNanoseconds) / 1_000_000_000.0
+        let corePercent = (cpuSeconds / safeDuration) * 100.0
+        return corePercent / Double(safeLogicalCoreCount)
+    }
+
+    private static func cumulativeSharePercent(valueSeconds: Double, totalSeconds: Double) -> Double {
+        guard totalSeconds > 0 else { return 0 }
+        return (valueSeconds / totalSeconds) * 100.0
+    }
+
+    private static func rankedBefore(_ lhs: ProcessCPURow, _ rhs: ProcessCPURow) -> Bool {
+        if abs(lhs.capacityPercent - rhs.capacityPercent) > 0.000_001 {
+            return lhs.capacityPercent > rhs.capacityPercent
+        }
+        if abs(lhs.currentCapacityPercent - rhs.currentCapacityPercent) > 0.000_001 {
+            return lhs.currentCapacityPercent > rhs.currentCapacityPercent
+        }
+        if abs(lhs.cpuSeconds - rhs.cpuSeconds) > 0.000_001 {
+            return lhs.cpuSeconds > rhs.cpuSeconds
+        }
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
     }
 }
 
@@ -401,6 +483,8 @@ private actor ProcessCPULogSampler {
         let bucketSeconds: TimeInterval
         let windowDurationSeconds: TimeInterval
         var latestSampleTimestamp: TimeInterval?
+        var latestSampleDurationSeconds: TimeInterval?
+        var latestDeltaNanosecondsByGroup: [String: UInt64]?
         var latestResidentBytesByGroup: [String: UInt64]
         var retraceGroupKey: String?
         var buckets: [ProcessTallyBucket]
@@ -976,12 +1060,25 @@ private actor ProcessCPULogSampler {
                 guard !key.isEmpty else { return }
                 result[key] = value
             }
+            let latestDeltaNanosecondsByGroup = (decoded.latestDeltaNanosecondsByGroup ?? [:]).reduce(into: [String: UInt64]()) {
+                result, element in
+                let (key, value) = element
+                guard !key.isEmpty else { return }
+                result[key] = value
+            }
+            let latestSampleTimestamp = decoded.latestSampleTimestamp.flatMap { $0.isFinite ? $0 : nil }
+            let latestSampleDurationSeconds = decoded.latestSampleDurationSeconds.flatMap { value -> TimeInterval? in
+                guard value.isFinite, value > 0 else { return nil }
+                return value
+            }
 
             return ProcessTallyState(
                 version: tallyVersion,
                 bucketSeconds: max(1, decoded.bucketSeconds),
                 windowDurationSeconds: max(0, decoded.windowDurationSeconds),
-                latestSampleTimestamp: decoded.latestSampleTimestamp.flatMap { $0.isFinite ? $0 : nil },
+                latestSampleTimestamp: latestSampleTimestamp,
+                latestSampleDurationSeconds: latestSampleDurationSeconds,
+                latestDeltaNanosecondsByGroup: latestSampleTimestamp == nil ? nil : latestDeltaNanosecondsByGroup,
                 latestResidentBytesByGroup: latestResidentBytesByGroup,
                 retraceGroupKey: decoded.retraceGroupKey,
                 buckets: sanitizedBuckets
@@ -1213,6 +1310,8 @@ private actor ProcessCPULogSampler {
             bucketSeconds: Self.tallyBucketDurationSeconds,
             windowDurationSeconds: windowDuration,
             latestSampleTimestamp: nil,
+            latestSampleDurationSeconds: nil,
+            latestDeltaNanosecondsByGroup: nil,
             latestResidentBytesByGroup: [:],
             retraceGroupKey: retraceGroupKey,
             buckets: []
@@ -1228,6 +1327,10 @@ private actor ProcessCPULogSampler {
         let effectiveRetraceGroupKey = state.retraceGroupKey ?? entry.retraceGroupKey ?? retraceGroupKey
 
         let duration = max(entry.durationSeconds, 0)
+        let normalizedLatestDeltaNanosecondsByGroup = Self.normalizedDeltaNanosecondsByGroup(
+            entry.groupDeltaNanoseconds,
+            unit: entry.groupDeltaUnit
+        )
         let bucketSeconds = max(1, state.bucketSeconds)
         let bucketStart = floor(entry.timestamp / bucketSeconds) * bucketSeconds
 
@@ -1305,6 +1408,14 @@ private actor ProcessCPULogSampler {
         )
 
         state.latestSampleTimestamp = entry.timestamp
+        state.latestSampleDurationSeconds = duration > 0 ? duration : nil
+        state.latestDeltaNanosecondsByGroup = duration > 0
+            ? Self.cappedLatestDeltaNanosecondsByGroup(
+                normalizedLatestDeltaNanosecondsByGroup,
+                maxGroupsPerSample: maxGroups,
+                retraceGroupKey: effectiveRetraceGroupKey
+            )
+            : nil
         tallyState = state
         pruneTally(now: now, windowDuration: windowDuration)
     }
@@ -1319,6 +1430,8 @@ private actor ProcessCPULogSampler {
         if let latestSampleTimestamp = state.latestSampleTimestamp,
            latestSampleTimestamp < cutoff {
             state.latestSampleTimestamp = nil
+            state.latestSampleDurationSeconds = nil
+            state.latestDeltaNanosecondsByGroup = nil
             state.latestResidentBytesByGroup = [:]
         }
         tallyState = state
@@ -1355,6 +1468,13 @@ private actor ProcessCPULogSampler {
             maxGroupsPerSample: maxGroups,
             retraceGroupKey: effectiveRetraceGroupKey
         )
+        if let latestDeltaNanosecondsByGroup = state.latestDeltaNanosecondsByGroup {
+            state.latestDeltaNanosecondsByGroup = Self.cappedLatestDeltaNanosecondsByGroup(
+                latestDeltaNanosecondsByGroup,
+                maxGroupsPerSample: maxGroups,
+                retraceGroupKey: effectiveRetraceGroupKey
+            )
+        }
         tallyState = state
     }
 
@@ -1523,6 +1643,14 @@ private actor ProcessCPULogSampler {
         let currentResidentBytesByGroup = windowEntries.last?.groupResidentBytes ?? latestResidentBytesByGroup
         let displayNamesByKey = groupDisplayNameByKey
         var effectiveRetraceGroupKey = retraceGroupKey
+        let latestSampleDurationSeconds = tallyState?.latestSampleDurationSeconds
+            ?? windowEntries.last.map { max($0.durationSeconds, 0) }
+            ?? 0
+        let latestDeltaNanosecondsByGroup = tallyState?.latestDeltaNanosecondsByGroup
+            ?? windowEntries.last.map {
+                Self.normalizedDeltaNanosecondsByGroup($0.groupDeltaNanoseconds, unit: $0.groupDeltaUnit)
+            }
+            ?? [:]
 
         for entry in windowEntries {
             if effectiveRetraceGroupKey == nil {
@@ -1553,32 +1681,16 @@ private actor ProcessCPULogSampler {
             ? (retraceCPUSeconds / totalTrackedCPUSeconds) * 100.0
             : 0
 
-        let rankedProcesses = cumulativeByGroup.map { key, nanoseconds -> ProcessCPURow in
-            let seconds = Double(nanoseconds) / 1_000_000_000.0
-            let shareOfTrackedPercent = totalTrackedCPUSeconds > 0
-                ? (seconds / totalTrackedCPUSeconds) * 100.0
-                : 0
-            let capacityPercent = capacityDenominatorSeconds > 0
-                ? (seconds / capacityDenominatorSeconds) * 100.0
-                : 0
-            let averagePercent = totalDuration > 0 ? (seconds / totalDuration) * 100.0 : 0
-            let energyJoules = Double(energyCumulativeByGroup[key] ?? 0) / 1_000_000_000.0
-            let averagePowerWatts = totalDuration > 0 ? energyJoules / totalDuration : 0
-            let peakPowerWatts = peakPowerByGroup[key] ?? 0
-            let name = displayNamesByKey[key] ?? key
-            return ProcessCPURow(
-                id: key,
-                name: name,
-                cpuSeconds: seconds,
-                energyJoules: energyJoules,
-                averagePowerWatts: averagePowerWatts,
-                peakPowerWatts: peakPowerWatts,
-                shareOfTrackedPercent: shareOfTrackedPercent,
-                capacityPercent: capacityPercent,
-                averagePercent: averagePercent
-            )
-        }
-        .sorted { $0.cpuSeconds > $1.cpuSeconds }
+        let rankedProcesses = ProcessCPUDisplayMetrics.buildRows(
+            cumulativeNanosecondsByGroup: cumulativeByGroup,
+            latestDeltaNanosecondsByGroup: latestDeltaNanosecondsByGroup,
+            latestSampleDurationSeconds: latestSampleDurationSeconds,
+            energyNanojoulesByGroup: energyCumulativeByGroup,
+            peakPowerWattsByGroup: peakPowerByGroup,
+            displayNamesByKey: displayNamesByKey,
+            totalDuration: totalDuration,
+            logicalCoreCount: logicalCoreCount
+        )
 
         let totalTrackedCurrentResidentBytes = currentResidentBytesByGroup.values.reduce(UInt64(0), Self.saturatingAdd)
         let totalTrackedAverageResidentBytesDouble = totalDuration > 0
@@ -2050,6 +2162,37 @@ private actor ProcessCPULogSampler {
         return filteredUInt64Dictionary(residentBytesByGroup, keepSet: Set(rankedKeys))
     }
 
+    private static func cappedLatestDeltaNanosecondsByGroup(
+        _ deltaNanosecondsByGroup: [String: UInt64],
+        maxGroupsPerSample: Int,
+        retraceGroupKey: String?
+    ) -> [String: UInt64] {
+        let normalizedCap = max(1, maxGroupsPerSample)
+        guard deltaNanosecondsByGroup.count > normalizedCap else { return deltaNanosecondsByGroup }
+
+        var rankedKeys = deltaNanosecondsByGroup.keys.sorted { lhs, rhs in
+            let lhsValue = deltaNanosecondsByGroup[lhs] ?? 0
+            let rhsValue = deltaNanosecondsByGroup[rhs] ?? 0
+            if lhsValue != rhsValue {
+                return lhsValue > rhsValue
+            }
+            return lhs < rhs
+        }
+        rankedKeys = Array(rankedKeys.prefix(normalizedCap))
+
+        if let retraceGroupKey,
+           deltaNanosecondsByGroup[retraceGroupKey] != nil,
+           !rankedKeys.contains(retraceGroupKey) {
+            if rankedKeys.count < normalizedCap {
+                rankedKeys.append(retraceGroupKey)
+            } else if let replaceIndex = rankedKeys.indices.last(where: { rankedKeys[$0] != retraceGroupKey }) {
+                rankedKeys[replaceIndex] = retraceGroupKey
+            }
+        }
+
+        return filteredUInt64Dictionary(deltaNanosecondsByGroup, keepSet: Set(rankedKeys))
+    }
+
     private static func cappedTallyBucket(
         _ bucket: ProcessTallyBucket,
         maxGroupsPerSample: Int,
@@ -2368,6 +2511,19 @@ private actor ProcessCPULogSampler {
             filtered[key] = value
         }
         return filtered
+    }
+
+    private static func normalizedDeltaNanosecondsByGroup(
+        _ source: [String: UInt64],
+        unit: String?
+    ) -> [String: UInt64] {
+        guard !source.isEmpty else { return [:] }
+        var normalized: [String: UInt64] = [:]
+        normalized.reserveCapacity(source.count)
+        for (key, value) in source {
+            normalized[key] = normalizedDeltaNanoseconds(rawDelta: value, unit: unit)
+        }
+        return normalized
     }
 
     private static func filteredDoubleDictionary(

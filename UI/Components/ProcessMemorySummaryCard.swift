@@ -5,6 +5,12 @@ import Shared
 struct ProcessMemorySummaryCard: View {
     private static let memoryRowsPageSize = 10
     private static let memoryRowsContainerHeight: CGFloat = 268
+    private static let tableLeadingPadding: CGFloat = 6
+    private static let tableTrailingPadding: CGFloat = 10
+    private static let tableVerticalPadding: CGFloat = 10
+    private static let compactRankColumnWidth: CGFloat = 22
+    private static let expandedRankColumnWidth: CGFloat = 28
+    private static let processRowSpacing: CGFloat = 4
 
     private let onRowsHoverChanged: ((Bool) -> Void)?
     private let isRowsScrollEnabled: Bool
@@ -70,6 +76,7 @@ struct ProcessMemorySummaryCard: View {
                     let visibleRows = min(max(Self.memoryRowsPageSize, memoryProcessRowsVisible), totalRows)
                     let hasMoreRows = visibleRows < totalRows
                     let displayedRows = buildDisplayedRows(from: snapshot, visibleRows: visibleRows)
+                    let rankColumnWidth = processRankColumnWidth(for: displayedRows)
                     // Keep the parent scroll area in control until the user expands past the first page.
                     let allowsInnerScroll = isRowsScrollEnabled && visibleRows > Self.memoryRowsPageSize
 
@@ -106,12 +113,12 @@ struct ProcessMemorySummaryCard: View {
                                     ForEach(Array(displayedRows.enumerated()), id: \.offset) { index, displayedRow in
                                         let row = displayedRow.row
                                         let rowNumber = displayedRow.rank
-                                        HStack(spacing: 6) {
+                                        HStack(spacing: Self.processRowSpacing) {
                                             Text("\(rowNumber).")
                                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                                                 .foregroundColor(.retraceSecondary.opacity(0.75))
                                                 .lineLimit(1)
-                                                .frame(width: 28, alignment: .leading)
+                                                .frame(width: rankColumnWidth, alignment: .leading)
 
                                             processIconView(for: row)
                                                 .frame(width: 17, height: 17)
@@ -122,7 +129,7 @@ struct ProcessMemorySummaryCard: View {
                                                 .lineLimit(1)
 
                                             if displayedRow.isPinnedRetrace && showsOCRBacklogAttribution {
-                                                Text("OCR backlog")
+                                                Text("OCR running")
                                                     .font(.system(size: 9, weight: .semibold))
                                                     .foregroundColor(.retraceAccent.opacity(0.98))
                                                     .padding(.horizontal, 6)
@@ -211,7 +218,9 @@ struct ProcessMemorySummaryCard: View {
                             .padding(.top, 4)
                         }
                     }
-                    .padding(10)
+                    .padding(.leading, Self.tableLeadingPadding)
+                    .padding(.trailing, Self.tableTrailingPadding)
+                    .padding(.vertical, Self.tableVerticalPadding)
                     .background(Color.black.opacity(0.18))
                     .cornerRadius(8)
 
@@ -263,6 +272,11 @@ struct ProcessMemorySummaryCard: View {
 
     private func memoryProcessRowAnchorID(_ rowNumber: Int) -> String {
         "systemMonitor.memoryProcessRow.\(rowNumber)"
+    }
+
+    private func processRankColumnWidth(for displayedRows: [DisplayedMemoryRow]) -> CGFloat {
+        let hasThreeDigitRank = displayedRows.contains { $0.rank >= 100 }
+        return hasThreeDigitRank ? Self.expandedRankColumnWidth : Self.compactRankColumnWidth
     }
 
     private var memoryUsageGuidePanel: some View {

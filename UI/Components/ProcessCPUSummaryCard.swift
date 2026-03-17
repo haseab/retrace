@@ -4,9 +4,22 @@ import Shared
 struct ProcessCPUSummaryCard: View {
     private static let cpuRowsPageSize = 10
     private static let cpuRowsContainerHeight: CGFloat = 268
+    private static let tableLeadingPadding: CGFloat = 6
+    private static let tableTrailingPadding: CGFloat = 10
+    private static let tableVerticalPadding: CGFloat = 10
+    private static let compactRankColumnWidth: CGFloat = 22
+    private static let expandedRankColumnWidth: CGFloat = 28
+    private static let processRowSpacing: CGFloat = 4
+    private static let latestSampleTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .medium
+        formatter.dateStyle = .none
+        return formatter
+    }()
 
     private let onRowsHoverChanged: ((Bool) -> Void)?
     private let isRowsScrollEnabled: Bool
+    private let showsOCRBacklogAttribution: Bool
 
     private struct DisplayedCPURow: Identifiable {
         let row: ProcessCPURow
@@ -21,9 +34,14 @@ struct ProcessCPUSummaryCard: View {
     @State private var cpuProcessRowsVisible = Self.cpuRowsPageSize
     @State private var cpuProcessScrollTargetID: String?
 
-    init(onRowsHoverChanged: ((Bool) -> Void)? = nil, isRowsScrollEnabled: Bool = true) {
+    init(
+        onRowsHoverChanged: ((Bool) -> Void)? = nil,
+        isRowsScrollEnabled: Bool = true,
+        showsOCRBacklogAttribution: Bool = false
+    ) {
         self.onRowsHoverChanged = onRowsHoverChanged
         self.isRowsScrollEnabled = isRowsScrollEnabled
+        self.showsOCRBacklogAttribution = showsOCRBacklogAttribution
     }
 
     var body: some View {
@@ -49,7 +67,7 @@ struct ProcessCPUSummaryCard: View {
                 .background(Color.white.opacity(0.06))
 
             VStack(alignment: .leading, spacing: 12) {
-            Text("Avg % uses total machine capacity (\(max(snapshot.logicalCoreCount, 1)) cores). Energy is cumulative per-process estimate.")
+            Text("Now % is the latest sampled share of total machine capacity (\(max(snapshot.logicalCoreCount, 1)) cores). Avg % is the window average. Energy is cumulative per-process estimate.")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.retraceSecondary.opacity(0.9))
 
@@ -58,12 +76,13 @@ struct ProcessCPUSummaryCard: View {
                 let visibleRows = min(max(Self.cpuRowsPageSize, cpuProcessRowsVisible), totalRows)
                 let hasMoreRows = visibleRows < totalRows
                 let displayedRows = buildDisplayedRows(from: snapshot, visibleRows: visibleRows)
+                let rankColumnWidth = processRankColumnWidth(for: displayedRows)
                 // Keep the parent scroll area in control until the user expands past the first page.
                 let allowsInnerScroll = isRowsScrollEnabled && visibleRows > Self.cpuRowsPageSize
 
                 Text(
                     "Sampled duration: \(formatWindowDuration(snapshot.sampleDurationSeconds))"
-                        + " • Total tracked: \(formatCPUSec(snapshot.totalTrackedCPUSeconds)) CPU Seconds"
+                        + " • Latest sample: \(formatLatestSampleTime(snapshot.latestSampleTimestamp))"
                         + " • \(formatEnergy(snapshot.totalTrackedEnergyJoules)) J"
                 )
                     .font(.system(size: 10, weight: .medium))
@@ -75,22 +94,22 @@ struct ProcessCPUSummaryCard: View {
                             .font(.system(size: 10, weight: .semibold))
                             .foregroundColor(.retraceSecondary.opacity(0.7))
                         Spacer()
-                        Text("CPU s")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 50, alignment: .trailing)
+                        Text("Now %")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                            .frame(width: 50, alignment: .trailing)
                         Text("Energy (J)")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 62, alignment: .trailing)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                            .frame(width: 62, alignment: .trailing)
                         Text("Avg %")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.retraceAccent.opacity(0.95))
-                        .frame(width: 46, alignment: .trailing)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.retraceAccent.opacity(0.95))
+                            .frame(width: 46, alignment: .trailing)
                         Text("Peak %")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(.retraceSecondary.opacity(0.7))
-                        .frame(width: 50, alignment: .trailing)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                            .frame(width: 50, alignment: .trailing)
                     }
                     .padding(.bottom, 6)
 
@@ -104,12 +123,12 @@ struct ProcessCPUSummaryCard: View {
                                         ? ((snapshot.peakPercentByGroup[row.id] ?? 0) / Double(snapshot.logicalCoreCount))
                                         : 0
 
-                                    HStack(spacing: 6) {
+                                    HStack(spacing: Self.processRowSpacing) {
                                         Text("\(rowNumber).")
                                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retraceSecondary.opacity(0.75))
                                             .lineLimit(1)
-                                            .frame(width: 28, alignment: .leading)
+                                            .frame(width: rankColumnWidth, alignment: .leading)
 
                                         processIconView(for: row)
                                             .frame(width: 17, height: 17)
@@ -119,9 +138,23 @@ struct ProcessCPUSummaryCard: View {
                                             .foregroundColor(.retracePrimary)
                                             .lineLimit(1)
 
+                                        if displayedRow.isPinnedRetrace && showsOCRBacklogAttribution {
+                                            Text("OCR running")
+                                                .font(.system(size: 9, weight: .semibold))
+                                                .foregroundColor(.retraceAccent.opacity(0.98))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.retraceAccent.opacity(0.14))
+                                                .overlay(
+                                                    Capsule()
+                                                        .stroke(Color.retraceAccent.opacity(0.32), lineWidth: 1)
+                                                )
+                                                .clipShape(Capsule())
+                                        }
+
                                         Spacer(minLength: 2)
 
-                                        Text(formatCPUSec(row.cpuSeconds))
+                                        Text(formatCPUPercent(row.currentCapacityPercent))
                                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundColor(.retracePrimary)
                                             .frame(width: 50, alignment: .trailing)
@@ -200,7 +233,9 @@ struct ProcessCPUSummaryCard: View {
                         .padding(.top, 4)
                     }
                 }
-                .padding(10)
+                .padding(.leading, Self.tableLeadingPadding)
+                .padding(.trailing, Self.tableTrailingPadding)
+                .padding(.vertical, Self.tableVerticalPadding)
                 .background(Color.black.opacity(0.18))
                 .cornerRadius(8)
 
@@ -228,13 +263,6 @@ struct ProcessCPUSummaryCard: View {
         }
     }
 
-    private func formatCPUSec(_ seconds: Double) -> String {
-        if seconds >= 100 {
-            return String(format: "%.0f", seconds)
-        }
-        return String(format: "%.1f", seconds)
-    }
-
     private func formatCPUPercent(_ percent: Double) -> String {
         String(format: "%.1f%%", percent)
     }
@@ -250,8 +278,18 @@ struct ProcessCPUSummaryCard: View {
         return String(format: "%.2f", safeJoules)
     }
 
+    private func formatLatestSampleTime(_ timestamp: TimeInterval?) -> String {
+        guard let timestamp else { return "waiting..." }
+        return Self.latestSampleTimeFormatter.string(from: Date(timeIntervalSince1970: timestamp))
+    }
+
     private func cpuProcessRowAnchorID(_ rowNumber: Int) -> String {
         "systemMonitor.cpuProcessRow.\(rowNumber)"
+    }
+
+    private func processRankColumnWidth(for displayedRows: [DisplayedCPURow]) -> CGFloat {
+        let hasThreeDigitRank = displayedRows.contains { $0.rank >= 100 }
+        return hasThreeDigitRank ? Self.expandedRankColumnWidth : Self.compactRankColumnWidth
     }
 
     private var cpuUsageGuidePanel: some View {

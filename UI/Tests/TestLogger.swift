@@ -2727,35 +2727,35 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
 }
 
 @MainActor
-final class SystemMonitorOCRMemoryAttributionTests: XCTestCase {
-    func testOCRMemoryAttributionShowsWhenOCRIsActivelyProcessing() {
+final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
+    func testOCRBacklogAttributionShowsWhenOCRIsActivelyProcessing() {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
         viewModel.queueDepth = 1
         viewModel.processingCount = 2
 
-        XCTAssertTrue(viewModel.shouldShowOCRMemoryAttribution)
+        XCTAssertTrue(viewModel.shouldShowOCRBacklogAttribution)
     }
 
-    func testOCRMemoryAttributionShowsEvenWithNoBacklogWhenOCRIsActivelyProcessing() {
+    func testOCRBacklogAttributionShowsEvenWithNoBacklogWhenOCRIsActivelyProcessing() {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
         viewModel.queueDepth = 0
         viewModel.processingCount = 1
 
-        XCTAssertTrue(viewModel.shouldShowOCRMemoryAttribution)
+        XCTAssertTrue(viewModel.shouldShowOCRBacklogAttribution)
     }
 
-    func testOCRMemoryAttributionHiddenWhenOCRIsNotActivelyProcessing() {
+    func testOCRBacklogAttributionHiddenWhenOCRIsNotActivelyProcessing() {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
         viewModel.queueDepth = 24
         viewModel.processingCount = 0
 
-        XCTAssertFalse(viewModel.shouldShowOCRMemoryAttribution)
+        XCTAssertFalse(viewModel.shouldShowOCRBacklogAttribution)
     }
 }
 

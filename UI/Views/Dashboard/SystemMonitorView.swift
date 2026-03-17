@@ -588,7 +588,8 @@ public struct SystemMonitorView: View {
             onRowsHoverChanged: { hovering in
                 scrollLatch.updateHover(cpu: hovering)
             },
-            isRowsScrollEnabled: isCPUScrollEnabled
+            isRowsScrollEnabled: isCPUScrollEnabled,
+            showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
         )
     }
 
@@ -598,7 +599,7 @@ public struct SystemMonitorView: View {
                 scrollLatch.updateHover(memory: hovering)
             },
             isRowsScrollEnabled: isMemoryScrollEnabled,
-            showsOCRBacklogAttribution: viewModel.shouldShowOCRMemoryAttribution
+            showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
         )
     }
 
@@ -1415,7 +1416,7 @@ class SystemMonitorViewModel: ObservableObject {
         !pauseOnLowPowerModeSetting
     }
 
-    var shouldShowOCRMemoryAttribution: Bool {
+    var shouldShowOCRBacklogAttribution: Bool {
         ocrEnabled &&
         !isPausedForBattery &&
         processingCount > 0
