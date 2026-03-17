@@ -61,6 +61,7 @@ UI/
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
     ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
+    ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage
     ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage

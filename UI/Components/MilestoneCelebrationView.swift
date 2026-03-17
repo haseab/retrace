@@ -11,6 +11,17 @@ struct MilestoneCelebrationView: View {
     let onMaybeLater: () -> Void
     let onSupport: () -> Void
 
+    enum ActionLayout: Equatable {
+        case continueOnly
+        case maybeLaterAndSupport
+        case acceptCrown
+    }
+
+    enum SingleButtonAction: Equatable {
+        case dismiss
+        case maybeLater
+    }
+
     /// Creator profile image cached after first successful resolve.
     @State private var creatorProfileImage: NSImage? = nil
 
@@ -217,8 +228,8 @@ struct MilestoneCelebrationView: View {
 
     private var actionButtons: some View {
         Group {
-            if milestone == .tenThousandHours {
-                // Special button for 10k - no support ask, just celebration
+            switch Self.actionLayout(for: milestone) {
+            case .acceptCrown:
                 Button(action: onDismiss) {
                     HStack(spacing: 8) {
                         Text("🐐")
@@ -244,7 +255,32 @@ struct MilestoneCelebrationView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(24)
-            } else {
+            case .continueOnly:
+                Button(action: {
+                    switch Self.singleButtonAction(for: milestone) {
+                    case .dismiss:
+                        onDismiss()
+                    case .maybeLater:
+                        onMaybeLater()
+                    }
+                }) {
+                    Text("Continue")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(
+                            LinearGradient(
+                                colors: [Color.retraceAccent, Color.retraceAccent.opacity(0.8)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .padding(24)
+            case .maybeLaterAndSupport:
                 HStack(spacing: 16) {
                     // Dismiss button
                     Button(action: onMaybeLater) {
@@ -289,6 +325,28 @@ struct MilestoneCelebrationView: View {
                 }
                 .padding(24)
             }
+        }
+    }
+
+    static func actionLayout(for milestone: MilestoneCelebrationManager.Milestone) -> ActionLayout {
+        switch milestone {
+        case .tenHours:
+            return .continueOnly
+        case .hundredHours, .thousandHours:
+            return .maybeLaterAndSupport
+        case .tenThousandHours:
+            return .acceptCrown
+        }
+    }
+
+    static func singleButtonAction(for milestone: MilestoneCelebrationManager.Milestone) -> SingleButtonAction {
+        switch milestone {
+        case .tenHours:
+            return .maybeLater
+        case .tenThousandHours:
+            return .dismiss
+        case .hundredHours, .thousandHours:
+            return .dismiss
         }
     }
 
@@ -571,7 +629,7 @@ struct DiscordFollowupView: View {
                     .font(.retraceTitle3)
                     .foregroundColor(.white)
 
-                Text("Updates, feedback, and community.")
+                Text("All the power users are hanging out here!")
                     .font(.retraceCaption)
                     .foregroundColor(.white.opacity(0.9))
                     .multilineTextAlignment(.center)
