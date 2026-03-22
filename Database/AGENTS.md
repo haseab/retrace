@@ -26,7 +26,8 @@ Database/
 │   ├── V11_SegmentCommentLinkCompositeIndex.swift
 │   ├── V12_FrameMetadata.swift
 │   ├── V13_RemoveInPageURLRects.swift
-│   └── V14_DBStorageSnapshot.swift
+│   ├── V14_DBStorageSnapshot.swift
+│   └── V15_NodeRedactionFlag.swift
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations

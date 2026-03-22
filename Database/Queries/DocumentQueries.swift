@@ -153,7 +153,12 @@ enum DocumentQueries {
     static func getByFrameID(db: OpaquePointer, frameID: FrameID) throws -> IndexedDocument? {
         let sql = """
             SELECT sr.rowid, ds.frameId, sr.text, sr.otherText, sr.title, f.createdAt, s.browserUrl
-            FROM doc_segment ds
+            FROM (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                WHERE frameId IS NOT NULL
+                GROUP BY frameId
+            ) ds
             JOIN frame f ON f.id = ds.frameId
             JOIN searchRanking sr ON sr.rowid = ds.docid
             LEFT JOIN segment s ON s.id = f.segmentId
@@ -187,7 +192,12 @@ enum DocumentQueries {
     static func getCount(db: OpaquePointer) throws -> Int {
         let sql = """
             SELECT COUNT(*)
-            FROM doc_segment ds
+            FROM (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                WHERE frameId IS NOT NULL
+                GROUP BY frameId
+            ) ds
             JOIN frame f ON f.id = ds.frameId;
             """
 

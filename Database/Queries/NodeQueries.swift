@@ -17,14 +17,15 @@ enum NodeQueries {
         db: OpaquePointer,
         frameID: FrameID,
         nodes: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
+        encryptedTexts: [Int: String] = [:],
         frameWidth: Int,
         frameHeight: Int
     ) throws {
         let sql = """
             INSERT INTO node (
                 frameId, nodeOrder, textOffset, textLength,
-                leftX, topY, width, height, windowIndex
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                leftX, topY, width, height, windowIndex, encryptedText
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
         var statement: OpaquePointer?
@@ -61,6 +62,11 @@ enum NodeQueries {
             } else {
                 sqlite3_bind_null(statement, 9)
             }
+            if let encryptedText = encryptedTexts[index] {
+                sqlite3_bind_text(statement, 10, encryptedText, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(statement, 10)
+            }
 
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw DatabaseError.queryFailed(
@@ -86,7 +92,8 @@ enum NodeQueries {
         let sql = """
             SELECT
                 id, nodeOrder, textOffset, textLength,
-                leftX, topY, width, height, windowIndex
+                leftX, topY, width, height, windowIndex,
+                CASE WHEN encryptedText IS NOT NULL THEN 1 ELSE 0 END AS isRedacted
             FROM node
             WHERE frameId = ?
             ORDER BY nodeOrder ASC
@@ -135,10 +142,18 @@ enum NodeQueries {
                 n.width,
                 n.height,
                 n.windowIndex,
-                sc.c0
+                CASE WHEN n.encryptedText IS NOT NULL THEN 1 ELSE 0 END AS isRedacted,
+                CASE
+                    WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                    ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
+                END AS nodeText
             FROM node n
-            JOIN doc_segment ds ON n.frameId = ds.frameId
-            JOIN searchRanking_content sc ON ds.docid = sc.id
+            LEFT JOIN (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                GROUP BY frameId
+            ) ds ON n.frameId = ds.frameId
+            LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
             ORDER BY n.nodeOrder ASC
             """
@@ -165,28 +180,7 @@ enum NodeQueries {
                 frameHeight: frameHeight
             )
 
-            // Extract text substring using textOffset and textLength
-            guard let fullTextCStr = sqlite3_column_text(statement, 9) else {
-                throw DatabaseError.queryFailed(
-                    query: sql,
-                    underlying: "Missing searchRanking_content.c0"
-                )
-            }
-            let fullText = String(cString: fullTextCStr)
-
-            let startIndex = fullText.index(
-                fullText.startIndex,
-                offsetBy: node.textOffset,
-                limitedBy: fullText.endIndex
-            ) ?? fullText.endIndex
-
-            let endIndex = fullText.index(
-                startIndex,
-                offsetBy: node.textLength,
-                limitedBy: fullText.endIndex
-            ) ?? fullText.endIndex
-
-            let text = String(fullText[startIndex..<endIndex])
+            let text = sqlite3_column_text(statement, 10).map { String(cString: $0) } ?? ""
             results.append((node, text))
         }
 
@@ -238,6 +232,7 @@ enum NodeQueries {
         let windowIndex = sqlite3_column_type(statement, 8) != SQLITE_NULL
             ? Int(sqlite3_column_int(statement, 8))
             : nil
+        let isRedacted = sqlite3_column_int(statement, 9) != 0
 
         // Denormalize coordinates back to pixels
         let bounds = Schema.denormalizeRect(
@@ -255,7 +250,8 @@ enum NodeQueries {
             textOffset: textOffset,
             textLength: textLength,
             bounds: bounds,
-            windowIndex: windowIndex
+            windowIndex: windowIndex,
+            isRedacted: isRedacted
         )
     }
 }

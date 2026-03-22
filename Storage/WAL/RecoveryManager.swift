@@ -583,7 +583,7 @@ public actor RecoveryManager {
                 )
 
                 let status = descriptor.processingStatus ?? 0
-                if descriptor.isMapped, status != 2 {
+                if descriptor.isMapped, status != 2, status != 7 {
                     mappedFramesRepaired += 1
                 }
                 continue
@@ -1027,12 +1027,13 @@ public actor RecoveryManager {
 
         var framesToMarkReadable: [Int64] = []
         var framesToResetToPending: [Int64] = []
+        var framesAwaitingRewriteRecovery: [Int64] = []
         var framesToProcess: [Int64] = []
 
         for frameID in uniqueFrameIDs {
             let status = statuses[frameID] ?? 0
             switch status {
-            case 2:
+            case 2, 7:
                 continue
             case 4:
                 framesToMarkReadable.append(frameID)
@@ -1040,6 +1041,11 @@ public actor RecoveryManager {
             case 1, 3:
                 framesToResetToPending.append(frameID)
                 framesToProcess.append(frameID)
+            case 5, 6, 8:
+                // Rewrite-lane frames were already OCR-complete before recovery.
+                // Preserve their status so startup rewrite recovery can resume the
+                // segment rewrite without re-entering OCR and duplicating FTS state.
+                framesAwaitingRewriteRecovery.append(frameID)
             case 0:
                 framesToProcess.append(frameID)
             default:
@@ -1059,6 +1065,12 @@ public actor RecoveryManager {
         }
         if !framesToResetToPending.isEmpty {
             Log.info("\(context) Reset \(framesToResetToPending.count) frames to pending status", category: .storage)
+        }
+        if !framesAwaitingRewriteRecovery.isEmpty {
+            Log.info(
+                "\(context) Preserved \(framesAwaitingRewriteRecovery.count) rewrite-state frames for rewrite recovery",
+                category: .storage
+            )
         }
 
         if !framesToProcess.isEmpty {
@@ -1584,7 +1596,7 @@ private struct RecoveryFrameDescriptor {
     }
 
     var isMappedComplete: Bool {
-        isMapped && existingFrame != nil && processingStatus == 2
+        isMapped && existingFrame != nil && (processingStatus == 2 || processingStatus == 7)
     }
 }
 

@@ -12,6 +12,359 @@ public struct WALAvailabilityIssue: Sendable, Equatable {
     public let reportPath: String?
 }
 
+fileprivate struct SegmentRewriteArtifacts: Sendable {
+    let segmentID: VideoSegmentID
+    let segmentURL: URL
+    var tempURL: URL?
+    var backupURL: URL?
+}
+
+fileprivate struct SegmentRewriteRequest: Sendable {
+    let segmentID: VideoSegmentID
+    let segmentURL: URL
+    let tempURL: URL
+    let backupURL: URL
+    let targetsByFrameIndex: [Int: [SegmentRedactionTarget]]
+    let secret: String
+}
+
+fileprivate func ensureNoConflictingSegmentRewriteArtifactsOnDisk(
+    segmentID: VideoSegmentID,
+    segmentURL: URL,
+    tempURL: URL,
+    backupURL: URL
+) throws {
+    if FileManager.default.fileExists(atPath: tempURL.path) {
+        removeItemIfExistsOnDisk(at: tempURL)
+    }
+
+    if FileManager.default.fileExists(atPath: backupURL.path) {
+        Log.warning(
+            "[StorageManager] Removing stale rewrite backup before starting new rewrite for segment \(segmentID.value): \(backupURL.lastPathComponent)",
+            category: .storage
+        )
+        removeItemIfExistsOnDisk(at: backupURL)
+    }
+
+    guard FileManager.default.fileExists(atPath: segmentURL.path) else {
+        throw StorageError.fileNotFound(path: segmentURL.path)
+    }
+}
+
+fileprivate func swapRewrittenSegmentIntoPlaceOnDisk(
+    segmentURL: URL,
+    tempURL: URL,
+    backupURL: URL
+) throws {
+    let fileManager = FileManager.default
+
+    try fileManager.moveItem(at: segmentURL, to: backupURL)
+    do {
+        try fileManager.moveItem(at: tempURL, to: segmentURL)
+    } catch {
+        if fileManager.fileExists(atPath: backupURL.path),
+           !fileManager.fileExists(atPath: segmentURL.path) {
+            try? fileManager.moveItem(at: backupURL, to: segmentURL)
+        }
+        throw error
+    }
+}
+
+fileprivate func inferSegmentRewriteRecoveryModeFromDisk(
+    segmentURL: URL,
+    tempURL: URL?,
+    backupURL: URL?
+) -> SegmentRedactionRecoveryAction.Mode {
+    let fileManager = FileManager.default
+    let segmentExists = fileManager.fileExists(atPath: segmentURL.path)
+    let tempExists = tempURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
+    let backupExists = backupURL.map { fileManager.fileExists(atPath: $0.path) } ?? false
+
+    if segmentExists && backupExists {
+        return .markCompleted
+    }
+
+    if backupExists || tempExists {
+        return .rollbackToPending
+    }
+
+    return .rollbackToPending
+}
+
+fileprivate func rollbackInterruptedSegmentRewriteIfNeededOnDisk(
+    segmentURL: URL,
+    tempURL: URL?,
+    backupURL: URL?
+) {
+    let fileManager = FileManager.default
+
+    if let backupURL, fileManager.fileExists(atPath: backupURL.path) {
+        do {
+            if fileManager.fileExists(atPath: segmentURL.path) {
+                _ = try fileManager.replaceItemAt(
+                    segmentURL,
+                    withItemAt: backupURL,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            } else {
+                try fileManager.moveItem(at: backupURL, to: segmentURL)
+            }
+        } catch {
+            Log.error(
+                "[StorageManager] Failed to roll back interrupted segment rewrite at \(segmentURL.lastPathComponent): \(error.localizedDescription)",
+                category: .storage
+            )
+        }
+    }
+
+    if let tempURL {
+        removeItemIfExistsOnDisk(at: tempURL)
+    }
+}
+
+fileprivate func removeItemIfExistsOnDisk(at url: URL) {
+    guard FileManager.default.fileExists(atPath: url.path) else { return }
+    try? FileManager.default.removeItem(at: url)
+}
+
+fileprivate actor SegmentRewriteExecutor {
+    private struct DecodedFrame {
+        let pts: CMTime
+        let image: CGImage
+    }
+
+    private let encoderConfig: VideoEncoderConfig
+
+    init(encoderConfig: VideoEncoderConfig) {
+        self.encoderConfig = encoderConfig
+    }
+
+    func rewrite(_ request: SegmentRewriteRequest) async throws {
+        let decodedFrames = try await decodeAllFrames(
+            from: request.segmentURL,
+            segmentID: request.segmentID.value
+        )
+        guard !decodedFrames.isEmpty else { return }
+
+        let width = decodedFrames[0].image.width
+        let height = decodedFrames[0].image.height
+        guard width > 0, height > 0 else { return }
+
+        var encoder: HEVCEncoder?
+        do {
+            try ensureNoConflictingSegmentRewriteArtifactsOnDisk(
+                segmentID: request.segmentID,
+                segmentURL: request.segmentURL,
+                tempURL: request.tempURL,
+                backupURL: request.backupURL
+            )
+
+            let newEncoder = HEVCEncoder()
+            encoder = newEncoder
+            try await newEncoder.initialize(
+                width: width,
+                height: height,
+                config: encoderConfig,
+                outputURL: request.tempURL,
+                segmentStartTime: Date()
+            )
+
+            var loggedTargets = 0
+            for (frameIndex, decodedFrame) in decodedFrames.enumerated() {
+                var bgra = try StorageManager.makeBGRAData(from: decodedFrame.image)
+                if let targets = request.targetsByFrameIndex[frameIndex], !targets.isEmpty {
+                    for target in targets {
+                        let pixelRect = BGRAImageUtilities.pixelRect(
+                            from: target.normalizedRect,
+                            imageWidth: width,
+                            imageHeight: height
+                        )
+                        guard pixelRect.width > 1, pixelRect.height > 1 else { continue }
+                        if loggedTargets < 20 {
+                            Log.debug(
+                                "[PhraseRedaction][Storage] Scramble mapping node=\(target.nodeID) frame=\(target.frameID) normalized=(\(String(format: "%.4f", target.normalizedRect.origin.x)),\(String(format: "%.4f", target.normalizedRect.origin.y)),\(String(format: "%.4f", target.normalizedRect.width)),\(String(format: "%.4f", target.normalizedRect.height))) pixelRect=(x=\(Int(pixelRect.origin.x)),y=\(Int(pixelRect.origin.y)),w=\(Int(pixelRect.width)),h=\(Int(pixelRect.height))) image=\(width)x\(height)",
+                                category: .storage
+                            )
+                            loggedTargets += 1
+                        }
+                        guard var patch = BGRAImageUtilities.extractPatch(
+                            from: bgra,
+                            frameBytesPerRow: width * 4,
+                            rect: pixelRect
+                        ) else {
+                            continue
+                        }
+                        ReversibleOCRScrambler.scramblePatchBGRA(
+                            &patch.data,
+                            width: patch.width,
+                            height: patch.height,
+                            bytesPerRow: patch.bytesPerRow,
+                            frameID: target.frameID,
+                            nodeID: target.nodeID,
+                            secret: request.secret
+                        )
+                        BGRAImageUtilities.writePatch(
+                            patch,
+                            into: &bgra,
+                            frameBytesPerRow: width * 4,
+                            rect: pixelRect
+                        )
+                    }
+                }
+
+                let frame = CapturedFrame(
+                    timestamp: Date(),
+                    imageData: bgra,
+                    width: width,
+                    height: height,
+                    bytesPerRow: width * 4
+                )
+                let pixelBuffer = try FrameConverter.createPixelBuffer(from: frame)
+                let timestamp = CMTime(value: Int64(frameIndex) * 20, timescale: 600)
+                try await newEncoder.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+            }
+
+            try await newEncoder.finalize()
+            try swapRewrittenSegmentIntoPlaceOnDisk(
+                segmentURL: request.segmentURL,
+                tempURL: request.tempURL,
+                backupURL: request.backupURL
+            )
+        } catch {
+            await encoder?.reset()
+            rollbackInterruptedSegmentRewriteIfNeededOnDisk(
+                segmentURL: request.segmentURL,
+                tempURL: request.tempURL,
+                backupURL: request.backupURL
+            )
+            throw error
+        }
+    }
+
+    private func decodeAllFrames(from url: URL, segmentID: Int64) async throws -> [DecodedFrame] {
+        let assetURL: URL
+        if url.pathExtension.lowercased() == "mp4" {
+            assetURL = url
+        } else {
+            let tempDir = FileManager.default.temporaryDirectory
+            let symlinkPath = tempDir.appendingPathComponent("\(UUID().uuidString).mp4")
+
+            do {
+                try FileManager.default.createSymbolicLink(
+                    atPath: symlinkPath.path,
+                    withDestinationPath: url.path
+                )
+            } catch {
+                Log.error(
+                    "[StorageManager] Failed to create symlink for segment \(segmentID): \(symlinkPath.path)",
+                    category: .storage,
+                    error: error
+                )
+                throw StorageError.fileWriteFailed(
+                    path: symlinkPath.path,
+                    underlying: error.localizedDescription
+                )
+            }
+            assetURL = symlinkPath
+        }
+
+        let asset = AVAsset(url: assetURL)
+        _ = try await asset.load(.duration)
+
+        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+            throw StorageError.fileReadFailed(path: url.path, underlying: "No video track")
+        }
+
+        let trackDuration = try await videoTrack.load(.timeRange)
+        let nominalFrameRate = try await videoTrack.load(.nominalFrameRate)
+        let estimatedFrameCount = Int(trackDuration.duration.seconds * Double(nominalFrameRate))
+        Log.debug(
+            "[StorageManager] Video track: trackDuration=\(String(format: "%.3f", trackDuration.duration.seconds))s, frameRate=\(nominalFrameRate), estimatedFrames=\(estimatedFrameCount)",
+            category: .storage
+        )
+
+        let reader = try AVAssetReader(asset: asset)
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+
+        let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+        trackOutput.alwaysCopiesSampleData = false
+
+        guard reader.canAdd(trackOutput) else {
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Cannot add track output to reader")
+        }
+        reader.add(trackOutput)
+
+        guard reader.startReading() else {
+            let errorDesc = reader.error?.localizedDescription ?? "Unknown error"
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Failed to start reading: \(errorDesc)")
+        }
+
+        var framesWithPTS: [(pts: CMTime, image: CGImage)] = []
+        let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
+        while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                Log.warning(
+                    "[StorageManager] Skipping frame - no image buffer at PTS \(String(format: "%.3f", pts.seconds))s, segment \(segmentID)",
+                    category: .storage
+                )
+                continue
+            }
+
+            let ciImage = CIImage(cvPixelBuffer: imageBuffer)
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+                Log.warning(
+                    "[StorageManager] Failed to create CGImage at PTS \(String(format: "%.3f", pts.seconds))s, segment \(segmentID)",
+                    category: .storage
+                )
+                continue
+            }
+
+            framesWithPTS.append((pts: pts, image: cgImage))
+        }
+
+        if reader.status == .failed {
+            let errorDesc = reader.error?.localizedDescription ?? "Unknown error"
+            Log.error(
+                "[StorageManager] AVAssetReader failed: \(errorDesc), segmentID=\(segmentID)",
+                category: .storage
+            )
+            throw StorageError.fileReadFailed(path: url.path, underlying: "Reader failed: \(errorDesc)")
+        }
+
+        Log.debug(
+            "[StorageManager] Read \(framesWithPTS.count) frames from AVAssetReader, expected ~\(estimatedFrameCount)",
+            category: .storage
+        )
+
+        framesWithPTS.sort { $0.pts.seconds < $1.pts.seconds }
+
+        let decodedFrames = framesWithPTS.map { frame in
+            DecodedFrame(pts: frame.pts, image: frame.image)
+        }
+
+        Log.info(
+            "[StorageManager] Decoded \(decodedFrames.count) frames from segment \(segmentID), sorted by PTS",
+            category: .storage
+        )
+
+        if let firstPTS = decodedFrames.first?.pts.seconds,
+           let lastPTS = decodedFrames.last?.pts.seconds {
+            Log.debug(
+                "[StorageManager] PTS range: \(String(format: "%.3f", firstPTS))s - \(String(format: "%.3f", lastPTS))s",
+                category: .storage
+            )
+        }
+
+        return decodedFrames
+    }
+}
+
 /// Main StorageProtocol implementation.
 public actor StorageManager: StorageProtocol {
     private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
@@ -22,6 +375,7 @@ public actor StorageManager: StorageProtocol {
     private let walRootURL: URL
     private let walManager: WALManager
     private let crashReportDirectory: String
+    private let segmentRewriteExecutor: SegmentRewriteExecutor
     private var walAvailabilityIssue: WALAvailabilityIssue?
 
     /// Counter to ensure unique segment IDs even if created within same millisecond
@@ -67,6 +421,7 @@ public actor StorageManager: StorageProtocol {
         let walRoot = storageRoot.appendingPathComponent("wal", isDirectory: true)
         self.walRootURL = walRoot
         self.walManager = WALManager(walRoot: walRoot)
+        self.segmentRewriteExecutor = SegmentRewriteExecutor(encoderConfig: encoderConfig)
     }
 
     /// Entry in the frame cache containing decoded frames sorted by PTS
@@ -131,6 +486,18 @@ public actor StorageManager: StorageProtocol {
     /// Get WAL manager for recovery operations
     public func getWALManager() -> WALManager {
         return walManager
+    }
+
+    public func readFrameFromWAL(
+        segmentID: VideoSegmentID,
+        frameID: Int64,
+        fallbackFrameIndex: Int
+    ) async throws -> CapturedFrame? {
+        try await walManager.readFrame(
+            videoID: segmentID,
+            frameID: frameID,
+            fallbackFrameIndex: fallbackFrameIndex
+        )
     }
 
     public func validateCaptureReadiness() async throws {
@@ -329,6 +696,108 @@ public actor StorageManager: StorageProtocol {
             frameIndex: frameIndex,
             enforceTimestampMatch: enforceTimestampMatch
         )
+    }
+
+    /// Rewrite a finalized segment by encoding a new file to a temp path, then swapping it into
+    /// the original segment location once complete.
+    public func rewriteSegmentForRedaction(
+        segmentID: VideoSegmentID,
+        frameIDs: [Int64],
+        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
+        secret: String
+    ) async throws {
+        guard !targetsByFrameIndex.isEmpty else { return }
+        guard !frameIDs.isEmpty else { return }
+
+        let segmentURL = try await getSegmentPath(id: segmentID)
+        let tempURL = segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let backupURL = segmentRewriteBackupURL(for: segmentURL, segmentID: segmentID)
+        let request = SegmentRewriteRequest(
+            segmentID: segmentID,
+            segmentURL: segmentURL,
+            tempURL: tempURL,
+            backupURL: backupURL,
+            targetsByFrameIndex: targetsByFrameIndex,
+            secret: secret
+        )
+
+        try await Task.detached(priority: .utility) { [segmentRewriteExecutor] in
+            try await segmentRewriteExecutor.rewrite(request)
+        }.value
+
+        clearFrameCache(for: segmentID)
+        generatorCache.removeValue(forKey: segmentURL.path)
+
+        Log.info(
+            "[StorageManager] Rewrote segment \(segmentID.value) with reversible OCR scrambling (\(targetsByFrameIndex.count) frame(s))",
+            category: .storage
+        )
+    }
+
+    public func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction] {
+        let artifacts = try findInterruptedSegmentRewriteArtifacts()
+        var actions: [SegmentRedactionRecoveryAction] = []
+        for artifact in artifacts {
+            let tempURL = artifact.tempURL
+            let backupURL = artifact.backupURL
+            let recoveryMode = inferSegmentRewriteRecoveryMode(
+                segmentURL: artifact.segmentURL,
+                tempURL: tempURL,
+                backupURL: backupURL
+            )
+
+            if recoveryMode == .rollbackToPending {
+                rollbackInterruptedSegmentRewriteIfNeeded(
+                    segmentURL: artifact.segmentURL,
+                    tempURL: tempURL,
+                    backupURL: backupURL
+                )
+            } else if let tempURL {
+                removeItemIfExists(at: tempURL)
+            }
+
+            clearFrameCache(for: artifact.segmentID)
+            generatorCache.removeValue(forKey: artifact.segmentURL.path)
+            actions.append(
+                SegmentRedactionRecoveryAction(
+                    mode: recoveryMode,
+                    segmentID: artifact.segmentID
+                )
+            )
+        }
+
+        return actions
+    }
+
+    public func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws {
+        guard let artifact = try findInterruptedSegmentRewriteArtifacts(segmentID: segmentID).first else {
+            return
+        }
+
+        if let tempURL = artifact.tempURL {
+            removeItemIfExists(at: tempURL)
+        }
+        if let backupURL = artifact.backupURL {
+            removeItemIfExists(at: backupURL)
+        }
+    }
+
+    func forceRollbackSegmentRewriteStateForTesting(segmentID: VideoSegmentID) async throws {
+        guard let artifact = try findInterruptedSegmentRewriteArtifacts(segmentID: segmentID).first,
+              artifact.backupURL != nil else {
+            throw StorageError.fileNotFound(path: "rollback-artifacts-\(segmentID.value)")
+        }
+
+        let segmentURL = artifact.segmentURL
+        let tempURL = artifact.tempURL ?? segmentRewriteTempURL(for: segmentURL, segmentID: segmentID)
+        let fileManager = FileManager.default
+
+        if fileManager.fileExists(atPath: segmentURL.path) {
+            if fileManager.fileExists(atPath: tempURL.path) {
+                removeItemIfExists(at: tempURL)
+            }
+            try fileManager.moveItem(at: segmentURL, to: tempURL)
+        }
     }
 
     // MARK: - Legacy decode-all methods (kept for easy rollback if B-frame issues occur)
@@ -559,6 +1028,14 @@ public actor StorageManager: StorageProtocol {
             throw StorageError.fileReadFailed(path: "", underlying: "Failed to convert CGImage to JPEG")
         }
         return jpegData
+    }
+
+    static func makeBGRAData(from image: CGImage) throws -> Data {
+        do {
+            return try BGRAImageUtilities.makeData(from: image)
+        } catch {
+            throw StorageError.fileReadFailed(path: "", underlying: "Failed to create BGRA bitmap context")
+        }
     }
 
     /// Evict oldest cache entries to keep memory usage bounded
@@ -1082,6 +1559,141 @@ public actor StorageManager: StorageProtocol {
             body: report,
             directory: crashReportDirectory
         )
+    }
+
+    private func segmentRewriteTempURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        segmentURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(segmentURL.lastPathComponent).redaction-working-\(segmentID.value).mp4")
+    }
+
+    private func segmentRewriteBackupName(for segmentURL: URL, segmentID: VideoSegmentID) -> String {
+        ".\(segmentURL.lastPathComponent).redaction-backup-\(segmentID.value)"
+    }
+
+    private func segmentRewriteBackupURL(for segmentURL: URL, segmentID: VideoSegmentID) -> URL {
+        segmentURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(segmentRewriteBackupName(for: segmentURL, segmentID: segmentID))
+    }
+
+    private func findInterruptedSegmentRewriteArtifacts(
+        segmentID targetSegmentID: VideoSegmentID? = nil
+    ) throws -> [SegmentRewriteArtifacts] {
+        let chunksRoot = storageRootURL.appendingPathComponent("chunks", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: chunksRoot.path) else {
+            return []
+        }
+
+        let enumerator = FileManager.default.enumerator(
+            at: chunksRoot,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: []
+        )
+
+        var artifactsByPath: [String: SegmentRewriteArtifacts] = [:]
+        while let url = enumerator?.nextObject() as? URL {
+            guard (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                continue
+            }
+            guard let artifact = parseSegmentRewriteArtifact(at: url) else {
+                continue
+            }
+            if let targetSegmentID, artifact.segmentID != targetSegmentID {
+                continue
+            }
+
+            var merged = artifactsByPath[artifact.segmentURL.path] ?? SegmentRewriteArtifacts(
+                segmentID: artifact.segmentID,
+                segmentURL: artifact.segmentURL,
+                tempURL: nil,
+                backupURL: nil
+            )
+            if let tempURL = artifact.tempURL {
+                merged.tempURL = tempURL
+            }
+            if let backupURL = artifact.backupURL {
+                merged.backupURL = backupURL
+            }
+            artifactsByPath[artifact.segmentURL.path] = merged
+        }
+
+        return artifactsByPath.values.sorted { lhs, rhs in
+            if lhs.segmentID.value == rhs.segmentID.value {
+                return lhs.segmentURL.path < rhs.segmentURL.path
+            }
+            return lhs.segmentID.value < rhs.segmentID.value
+        }
+    }
+
+    private func parseSegmentRewriteArtifact(at url: URL) -> SegmentRewriteArtifacts? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix(".") else { return nil }
+
+        let hiddenStart = name.index(after: name.startIndex)
+
+        if let markerRange = name.range(of: ".redaction-working-", options: .backwards),
+           name.hasSuffix(".mp4") {
+            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+            let idEnd = name.index(name.endIndex, offsetBy: -4)
+            guard !originalName.isEmpty,
+                  markerRange.upperBound < idEnd,
+                  let rawID = Int64(name[markerRange.upperBound..<idEnd]) else {
+                return nil
+            }
+            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
+            return SegmentRewriteArtifacts(
+                segmentID: VideoSegmentID(value: rawID),
+                segmentURL: segmentURL,
+                tempURL: url,
+                backupURL: nil
+            )
+        }
+
+        if let markerRange = name.range(of: ".redaction-backup-", options: .backwards) {
+            let originalName = String(name[hiddenStart..<markerRange.lowerBound])
+            guard !originalName.isEmpty,
+                  let rawID = Int64(name[markerRange.upperBound...]) else {
+                return nil
+            }
+            let segmentURL = url.deletingLastPathComponent().appendingPathComponent(originalName)
+            return SegmentRewriteArtifacts(
+                segmentID: VideoSegmentID(value: rawID),
+                segmentURL: segmentURL,
+                tempURL: nil,
+                backupURL: url
+            )
+        }
+
+        return nil
+    }
+
+    private func inferSegmentRewriteRecoveryMode(
+        segmentURL: URL,
+        tempURL: URL?,
+        backupURL: URL?
+    ) -> SegmentRedactionRecoveryAction.Mode {
+        inferSegmentRewriteRecoveryModeFromDisk(
+            segmentURL: segmentURL,
+            tempURL: tempURL,
+            backupURL: backupURL
+        )
+    }
+
+    private func rollbackInterruptedSegmentRewriteIfNeeded(
+        segmentURL: URL,
+        tempURL: URL?,
+        backupURL: URL?
+    ) {
+        rollbackInterruptedSegmentRewriteIfNeededOnDisk(
+            segmentURL: segmentURL,
+            tempURL: tempURL,
+            backupURL: backupURL
+        )
+    }
+
+    private func removeItemIfExists(at url: URL) {
+        removeItemIfExistsOnDisk(at: url)
     }
 
     private func describeFilesystemItem(at url: URL) -> String {

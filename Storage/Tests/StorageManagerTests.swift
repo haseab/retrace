@@ -1,5 +1,7 @@
 import CryptoKit
+import CoreGraphics
 import Foundation
+import ImageIO
 import XCTest
 import Shared
 @testable import Storage
@@ -130,6 +132,99 @@ final class StorageManagerTests: XCTestCase {
             bytesPerRow: rowBytes,
             metadata: metadata
         )
+    }
+
+    private func makePatternedCapturedFrame(
+        width: Int = 64,
+        height: Int = 64,
+        targetRect: CGRect
+    ) -> CapturedFrame {
+        let bytesPerRow = width * 4
+        var data = Data(count: bytesPerRow * height)
+
+        data.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                return
+            }
+
+            for y in 0..<height {
+                for x in 0..<width {
+                    let offset = y * bytesPerRow + x * 4
+                    let point = CGPoint(x: x, y: y)
+                    if targetRect.contains(point) {
+                        let checker = ((x / 4) + (y / 4)).isMultiple(of: 2)
+                        baseAddress[offset] = checker ? 24 : 232
+                        baseAddress[offset + 1] = UInt8((x * 3) % 256)
+                        baseAddress[offset + 2] = UInt8((y * 5) % 256)
+                        baseAddress[offset + 3] = 255
+                    } else {
+                        baseAddress[offset] = 212
+                        baseAddress[offset + 1] = 212
+                        baseAddress[offset + 2] = 212
+                        baseAddress[offset + 3] = 255
+                    }
+                }
+            }
+        }
+
+        return CapturedFrame(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            imageData: data,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            metadata: .empty
+        )
+    }
+
+    private func decodeJPEG(_ data: Data) throws -> CGImage {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+    }
+
+    private func extractPatch(
+        from data: Data,
+        imageWidth: Int,
+        rect: CGRect
+    ) -> Data {
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        let originX = Int(rect.origin.x)
+        let originY = Int(rect.origin.y)
+        let bytesPerRow = imageWidth * 4
+        let patchBytesPerRow = width * 4
+        var patch = Data(count: patchBytesPerRow * height)
+
+        data.withUnsafeBytes { sourceRaw in
+            patch.withUnsafeMutableBytes { patchRaw in
+                guard let sourceBase = sourceRaw.baseAddress,
+                      let patchBase = patchRaw.baseAddress else {
+                    return
+                }
+
+                for row in 0..<height {
+                    let sourceOffset = (originY + row) * bytesPerRow + originX * 4
+                    let destinationOffset = row * patchBytesPerRow
+                    memcpy(
+                        patchBase.advanced(by: destinationOffset),
+                        sourceBase.advanced(by: sourceOffset),
+                        patchBytesPerRow
+                    )
+                }
+            }
+        }
+
+        return patch
+    }
+
+    private func averageAbsoluteDifference(_ lhs: Data, _ rhs: Data) -> Double {
+        guard lhs.count == rhs.count, !lhs.isEmpty else { return 0 }
+        let lhsBytes = Array(lhs)
+        let rhsBytes = Array(rhs)
+        let totalDifference = zip(lhsBytes, rhsBytes).reduce(0) { partialResult, pair in
+            partialResult + abs(Int(pair.0) - Int(pair.1))
+        }
+        return Double(totalDifference) / Double(lhs.count)
     }
 
     private func makeDatabase(name: String) async throws -> RecoveryTestDatabase {
@@ -357,6 +452,59 @@ final class StorageManagerTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testMakeBGRADataPreservesImageRowOrdering() throws {
+        let width = 2
+        let height = 2
+        let bytesPerRow = width * 4
+        var source = Data(count: bytesPerRow * height)
+
+        source.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                XCTFail("Missing source image buffer")
+                return
+            }
+
+            func writePixel(x: Int, y: Int, red: UInt8, green: UInt8, blue: UInt8) {
+                let offset = (y * bytesPerRow) + (x * 4)
+                baseAddress[offset + 0] = blue
+                baseAddress[offset + 1] = green
+                baseAddress[offset + 2] = red
+                baseAddress[offset + 3] = 255
+            }
+
+            // Top row is red, bottom row is blue.
+            writePixel(x: 0, y: 0, red: 255, green: 0, blue: 0)
+            writePixel(x: 1, y: 0, red: 255, green: 0, blue: 0)
+            writePixel(x: 0, y: 1, red: 0, green: 0, blue: 255)
+            writePixel(x: 1, y: 1, red: 0, green: 0, blue: 255)
+        }
+
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        let provider = try XCTUnwrap(CGDataProvider(data: source as CFData))
+        let image = try XCTUnwrap(
+            CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: bitmapInfo,
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+            )
+        )
+
+        let converted = try StorageManager.makeBGRAData(from: image)
+        XCTAssertEqual(Array(converted.prefix(bytesPerRow)), Array(source.prefix(bytesPerRow)))
+        XCTAssertEqual(Array(converted.suffix(bytesPerRow)), Array(source.suffix(bytesPerRow)))
+    }
+
     // ┌──────────────────────────────────────────────────────────────────────────┐
     // │                        Segment Writer Tests                              │
     // └──────────────────────────────────────────────────────────────────────────┘
@@ -386,6 +534,188 @@ final class StorageManagerTests: XCTestCase {
         } catch {
             throw XCTSkip("HEVC encoding unavailable in test environment: \(error)")
         }
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRewriteSegmentWithScrambledNodesRewritesTargetPatchEndToEnd() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        let targetRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: targetRect
+            )
+        )
+        _ = try await writer.finalize()
+
+        let beforeJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        try await storage.rewriteSegmentForRedaction(
+            segmentID: segmentID,
+            frameIDs: [42],
+            targetsByFrameIndex: [
+                0: [
+                    SegmentRedactionTarget(
+                        frameID: 42,
+                        nodeID: 7,
+                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                    )
+                ]
+            ],
+            secret: "unit-test-secret"
+        )
+        let afterJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+
+        let beforeImage = try decodeJPEG(beforeJPEG)
+        let afterImage = try decodeJPEG(afterJPEG)
+        let beforeBGRA = try StorageManager.makeBGRAData(from: beforeImage)
+        let afterBGRA = try StorageManager.makeBGRAData(from: afterImage)
+
+        let beforeTarget = extractPatch(from: beforeBGRA, imageWidth: beforeImage.width, rect: targetRect)
+        let afterTarget = extractPatch(from: afterBGRA, imageWidth: afterImage.width, rect: targetRect)
+        let beforeControl = extractPatch(
+            from: beforeBGRA,
+            imageWidth: beforeImage.width,
+            rect: CGRect(x: 0, y: 0, width: 16, height: 16)
+        )
+        let afterControl = extractPatch(
+            from: afterBGRA,
+            imageWidth: afterImage.width,
+            rect: CGRect(x: 0, y: 0, width: 16, height: 16)
+        )
+
+        let targetDifference = averageAbsoluteDifference(beforeTarget, afterTarget)
+        let controlDifference = averageAbsoluteDifference(beforeControl, afterControl)
+
+        XCTAssertGreaterThan(targetDifference, 6.0)
+        XCTAssertGreaterThan(targetDifference, controlDifference * 1.8)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRecoverInterruptedCommittedSegmentRewriteReturnsCompletionAction() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        let targetRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: targetRect
+            )
+        )
+        _ = try await writer.finalize()
+
+        let beforeJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        try await storage.rewriteSegmentForRedaction(
+            segmentID: segmentID,
+            frameIDs: [42],
+            targetsByFrameIndex: [
+                0: [
+                    SegmentRedactionTarget(
+                        frameID: 42,
+                        nodeID: 7,
+                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                    )
+                ]
+            ],
+            secret: "unit-test-secret"
+        )
+        let afterJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+
+        let actions = try await storage.recoverInterruptedSegmentRedactions()
+        XCTAssertEqual(
+            actions,
+            [
+                SegmentRedactionRecoveryAction(
+                    mode: .markCompleted,
+                    segmentID: segmentID
+                )
+            ]
+        )
+
+        let beforeImage = try decodeJPEG(beforeJPEG)
+        let afterImage = try decodeJPEG(afterJPEG)
+        let beforeBGRA = try StorageManager.makeBGRAData(from: beforeImage)
+        let afterBGRA = try StorageManager.makeBGRAData(from: afterImage)
+        let beforeTarget = extractPatch(from: beforeBGRA, imageWidth: beforeImage.width, rect: targetRect)
+        let afterTarget = extractPatch(from: afterBGRA, imageWidth: afterImage.width, rect: targetRect)
+        XCTAssertGreaterThan(averageAbsoluteDifference(beforeTarget, afterTarget), 6.0)
+
+        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: segmentID)
+        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRedactions()
+        XCTAssertTrue(actionsAfterCleanup.isEmpty)
+
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testRecoverInterruptedSegmentRewriteRollbackStateRollsBackToOriginalSegment() async throws {
+        let root = makeTempRoot()
+        let storage = StorageManager(storageRoot: root)
+        try await storage.initialize(config: makeStorageConfig(root: root))
+
+        let writer = try await storage.createSegmentWriter()
+        let segmentID = await writer.segmentID
+        let targetRect = CGRect(x: 16, y: 16, width: 32, height: 32)
+        try await writer.appendFrame(
+            makePatternedCapturedFrame(
+                width: 64,
+                height: 64,
+                targetRect: targetRect
+            )
+        )
+        _ = try await writer.finalize()
+
+        let originalJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        try await storage.rewriteSegmentForRedaction(
+            segmentID: segmentID,
+            frameIDs: [42],
+            targetsByFrameIndex: [
+                0: [
+                    SegmentRedactionTarget(
+                        frameID: 42,
+                        nodeID: 7,
+                        normalizedRect: CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+                    )
+                ]
+            ],
+            secret: "unit-test-secret"
+        )
+
+        try await storage.forceRollbackSegmentRewriteStateForTesting(segmentID: segmentID)
+        let actions = try await storage.recoverInterruptedSegmentRedactions()
+        XCTAssertEqual(
+            actions,
+            [
+                SegmentRedactionRecoveryAction(
+                    mode: .rollbackToPending,
+                    segmentID: segmentID
+                )
+            ]
+        )
+
+        let recoveredJPEG = try await storage.readFrame(segmentID: segmentID, frameIndex: 0)
+        let originalImage = try decodeJPEG(originalJPEG)
+        let recoveredImage = try decodeJPEG(recoveredJPEG)
+        let originalBGRA = try StorageManager.makeBGRAData(from: originalImage)
+        let recoveredBGRA = try StorageManager.makeBGRAData(from: recoveredImage)
+        let originalTarget = extractPatch(from: originalBGRA, imageWidth: originalImage.width, rect: targetRect)
+        let recoveredTarget = extractPatch(from: recoveredBGRA, imageWidth: recoveredImage.width, rect: targetRect)
+        XCTAssertLessThan(averageAbsoluteDifference(originalTarget, recoveredTarget), 1.0)
+
+        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: segmentID)
+        let actionsAfterCleanup = try await storage.recoverInterruptedSegmentRedactions()
+        XCTAssertTrue(actionsAfterCleanup.isEmpty)
 
         try? FileManager.default.removeItem(at: root)
     }
@@ -1533,7 +1863,7 @@ final class StorageManagerTests: XCTestCase {
         let sessionVideoID = VideoSegmentID(value: 1_771_610_472_577)
         var session = try await walManager.createSession(videoID: sessionVideoID)
         let start = Date(timeIntervalSince1970: 1_720_000_700)
-        let frames = (0..<3).map { index in
+        let frames = (0..<6).map { index in
             makeCapturedFrame(
                 width: 8,
                 height: 8,
@@ -1560,8 +1890,8 @@ final class StorageManagerTests: XCTestCase {
             type: 0
         )
 
-        let statuses = [4, 1, 3]
-        let frameIDs: [Int64] = [9_400, 9_401, 9_402]
+        let statuses = [4, 1, 3, 5, 6, 8]
+        let frameIDs: [Int64] = [9_400, 9_401, 9_402, 9_403, 9_404, 9_405]
         for (index, frame) in frames.enumerated() {
             let frameID = frameIDs[index]
             try await walManager.registerFrameID(videoID: sessionVideoID, frameID: frameID, frameIndex: index)
@@ -1602,10 +1932,15 @@ final class StorageManagerTests: XCTestCase {
         let rawReadOffsets = await walManager.debugRawReadOffsets(for: sessionVideoID)
         let enqueuedFrameIDs = await enqueueCollector.snapshot()
         XCTAssertEqual(rawReadOffsets, [])
-        XCTAssertEqual(Set(enqueuedFrameIDs), Set(frameIDs))
+        XCTAssertEqual(Set(enqueuedFrameIDs), Set(frameIDs.prefix(3)))
 
         let repairedStatuses = try await database.getFrameProcessingStatuses(frameIDs: frameIDs)
-        XCTAssertEqual(Set(repairedStatuses.values), [0])
+        XCTAssertEqual(repairedStatuses[frameIDs[0]], 0)
+        XCTAssertEqual(repairedStatuses[frameIDs[1]], 0)
+        XCTAssertEqual(repairedStatuses[frameIDs[2]], 0)
+        XCTAssertEqual(repairedStatuses[frameIDs[3]], 5)
+        XCTAssertEqual(repairedStatuses[frameIDs[4]], 6)
+        XCTAssertEqual(repairedStatuses[frameIDs[5]], 8)
 
         try? await database.close()
         try? FileManager.default.removeItem(at: root)
@@ -3806,6 +4141,37 @@ private actor RecoveryTestStorage: StorageProtocol {
         }
 
         return existingFrameCounts[id.value] ?? 0
+    }
+
+    func readFrameFromWAL(
+        segmentID: VideoSegmentID,
+        frameID: Int64,
+        fallbackFrameIndex: Int
+    ) async throws -> CapturedFrame? {
+        _ = segmentID
+        _ = frameID
+        _ = fallbackFrameIndex
+        return nil
+    }
+
+    func rewriteSegmentForRedaction(
+        segmentID: VideoSegmentID,
+        frameIDs: [Int64],
+        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
+        secret: String
+    ) async throws {
+        _ = segmentID
+        _ = frameIDs
+        _ = targetsByFrameIndex
+        _ = secret
+    }
+
+    func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction] {
+        []
+    }
+
+    func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws {
+        _ = segmentID
     }
 
     func isVideoValid(id: VideoSegmentID) async throws -> Bool {

@@ -193,3 +193,141 @@ final class VisionOCRTests: XCTestCase {
     }
     */
 }
+
+final class ReversibleOCRScramblerTests: XCTestCase {
+    func testScrambleAndDescrambleRoundTripForOddDimensions() {
+        let width = 37
+        let height = 17
+        let bytesPerRow = width * 4
+        let original = patternedPatch(width: width, height: height, bytesPerRow: bytesPerRow)
+
+        var scrambled = original
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &scrambled,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 1001,
+            nodeID: 42,
+            secret: "test-secret"
+        )
+        XCTAssertNotEqual(scrambled, original)
+
+        ReversibleOCRScrambler.descramblePatchBGRA(
+            &scrambled,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 1001,
+            nodeID: 42,
+            secret: "test-secret"
+        )
+        XCTAssertEqual(scrambled, original)
+    }
+
+    func testScrambleIsDeterministicForSameInputs() {
+        let width = 35
+        let height = 21
+        let bytesPerRow = width * 4
+        let original = patternedPatch(width: width, height: height, bytesPerRow: bytesPerRow)
+
+        var scrambledA = original
+        var scrambledB = original
+
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &scrambledA,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 500,
+            nodeID: 7,
+            secret: "deterministic-key"
+        )
+
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &scrambledB,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 500,
+            nodeID: 7,
+            secret: "deterministic-key"
+        )
+
+        XCTAssertEqual(scrambledA, scrambledB)
+    }
+
+    func testDifferentSecretsProduceDifferentScrambles() {
+        let width = 31
+        let height = 19
+        let bytesPerRow = width * 4
+        let original = patternedPatch(width: width, height: height, bytesPerRow: bytesPerRow)
+
+        var scrambledA = original
+        var scrambledB = original
+
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &scrambledA,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 888,
+            nodeID: 3,
+            secret: "key-A"
+        )
+
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &scrambledB,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 888,
+            nodeID: 3,
+            secret: "key-B"
+        )
+
+        XCTAssertNotEqual(scrambledA, scrambledB)
+    }
+
+    func testRoundTripPreservesPaddedRows() {
+        let width = 19
+        let height = 11
+        let bytesPerRow = 96 // Includes per-row padding beyond width*4.
+        let original = patternedPatch(width: width, height: height, bytesPerRow: bytesPerRow)
+
+        var patch = original
+        ReversibleOCRScrambler.scramblePatchBGRA(
+            &patch,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 77,
+            nodeID: 5,
+            secret: "padding-key"
+        )
+        ReversibleOCRScrambler.descramblePatchBGRA(
+            &patch,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            frameID: 77,
+            nodeID: 5,
+            secret: "padding-key"
+        )
+
+        XCTAssertEqual(patch, original)
+    }
+
+    private func patternedPatch(width: Int, height: Int, bytesPerRow: Int) -> Data {
+        var data = Data(count: bytesPerRow * height)
+        data.withUnsafeMutableBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            for row in 0..<height {
+                for column in 0..<bytesPerRow {
+                    base[(row * bytesPerRow) + column] = UInt8((row &* 37 &+ column &* 11) & 0xFF)
+                }
+            }
+        }
+        return data
+    }
+}

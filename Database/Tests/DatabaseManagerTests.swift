@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CoreGraphics
 import Shared
 import SQLCipher
 @testable import Database
@@ -70,6 +71,702 @@ final class DatabaseManagerTests: XCTestCase {
             columnNames,
             ["local_day", "db_bytes", "wal_bytes", "sampled_at"]
         )
+    }
+
+    func testMigrationFromV14LeavesLegacyDocSegmentAndFTSStateUntouched() async throws {
+        let testRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RetraceDatabaseLegacyMigrationTests_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: testRoot)
+        }
+
+        let dbPath = testRoot.appendingPathComponent("legacy-retrace.db").path
+
+        let segmentID: Int64 = 10_000_111
+        let videoID: Int64 = 1_000_111
+        let frameID: Int64 = 50_000_111
+        let missingFrameID: Int64 = 50_999_999
+        let timestampMs: Int64 = 1_700_000_000_000
+
+        do {
+            let legacyDB = try openRawDatabase(at: dbPath)
+            defer {
+                sqlite3_close(legacyDB)
+            }
+
+            try await runLegacyMigrations(throughVersion: 14, db: legacyDB)
+
+            try executeRawSQL(
+                """
+                INSERT INTO segment (id, bundleID, startDate, endDate, windowName, browserUrl, type)
+                VALUES (\(segmentID), 'com.test.legacy', \(timestampMs), \(timestampMs + 1_000), 'Legacy Window', NULL, 0);
+                """,
+                db: legacyDB
+            )
+            try executeRawSQL(
+                """
+                INSERT INTO video (id, height, width, path, fileSize, frameRate, uploadedAt, xid, processingState, frameCount)
+                VALUES (\(videoID), 720, 1280, 'chunks/202603/17/\(videoID)', 4096, 30.0, \(timestampMs), NULL, 0, 1);
+                """,
+                db: legacyDB
+            )
+            try executeRawSQL(
+                """
+                INSERT INTO frame (
+                    id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex,
+                    isStarred, encodingStatus, processingStatus
+                )
+                VALUES (
+                    \(frameID), \(timestampMs), 'legacy-frame.jpg', \(segmentID), \(videoID), 0,
+                    0, 'success', 2
+                );
+                """,
+                db: legacyDB
+            )
+
+            try executeRawSQL(
+                "INSERT INTO searchRanking(rowid, text, otherText, title) VALUES (101, 'legacy old text', NULL, 'Legacy');",
+                db: legacyDB
+            )
+            try executeRawSQL(
+                "INSERT INTO searchRanking(rowid, text, otherText, title) VALUES (102, 'legacy current text', NULL, 'Legacy');",
+                db: legacyDB
+            )
+            try executeRawSQL(
+                "INSERT INTO searchRanking(rowid, text, otherText, title) VALUES (103, 'orphan stale text', NULL, 'Orphan');",
+                db: legacyDB
+            )
+
+            try executeRawSQL(
+                "INSERT INTO doc_segment (docid, segmentId, frameId) VALUES (101, \(segmentID), \(frameID));",
+                db: legacyDB
+            )
+            try executeRawSQL(
+                "INSERT INTO doc_segment (docid, segmentId, frameId) VALUES (102, \(segmentID), \(frameID));",
+                db: legacyDB
+            )
+            try executeRawSQL(
+                "INSERT INTO doc_segment (docid, segmentId, frameId) VALUES (103, \(segmentID), \(missingFrameID));",
+                db: legacyDB
+            )
+        }
+
+        let migratedDatabase = DatabaseManager(databasePath: dbPath)
+        try await migratedDatabase.initialize()
+
+        let migratedConnectionOptional = await migratedDatabase.getConnection()
+        let migratedConnection = try XCTUnwrap(migratedConnectionOptional)
+
+        XCTAssertEqual(
+            try fetchInt64(
+                "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+                db: migratedConnection,
+                bind: { statement in
+                    sqlite3_bind_int64(statement, 1, frameID)
+                }
+            ),
+            2
+        )
+        XCTAssertEqual(
+            try fetchInt64(
+                "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+                db: migratedConnection,
+                bind: { statement in
+                    sqlite3_bind_int64(statement, 1, missingFrameID)
+                }
+            ),
+            1
+        )
+        XCTAssertEqual(try fetchInt64("SELECT COUNT(*) FROM searchRanking WHERE rowid = 101;", db: migratedConnection), 1)
+        XCTAssertEqual(try fetchInt64("SELECT COUNT(*) FROM searchRanking WHERE rowid = 102;", db: migratedConnection), 1)
+        XCTAssertEqual(try fetchInt64("SELECT COUNT(*) FROM searchRanking WHERE rowid = 103;", db: migratedConnection), 1)
+        XCTAssertEqual(
+            try fetchInt64(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'index_doc_segment_on_frameid_unique';",
+                db: migratedConnection
+            ),
+            0
+        )
+        XCTAssertEqual(
+            try fetchInt64(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'trigger_frame_delete_doc_segment_cleanup';",
+                db: migratedConnection
+            ),
+            0
+        )
+        XCTAssertEqual(
+            try fetchInt64(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'trigger_doc_segment_delete_search_cleanup';",
+                db: migratedConnection
+            ),
+            0
+        )
+        try await migratedDatabase.close()
+    }
+
+    func testFrameTableIncludesRewritePurposeColumn() async throws {
+        let columnNames = try await tableColumnNames("frame")
+        XCTAssertTrue(columnNames.contains("rewritePurpose"))
+    }
+
+    func testFrameTableIncludesRewrittenAtColumn() async throws {
+        let columnNames = try await tableColumnNames("frame")
+        XCTAssertTrue(columnNames.contains("rewrittenAt"))
+    }
+
+    func testNodeTableIncludesEncryptedTextColumnAndOmitsLegacyRedactedColumn() async throws {
+        let columnNames = try await tableColumnNames("node")
+        XCTAssertTrue(columnNames.contains("encryptedText"))
+        XCTAssertFalse(columnNames.contains("redacted"))
+    }
+
+    func testGetOCRNodesWithTextReturnsMaskedVisibleTextAndProtectedPayloadForRedactedNode() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let segmentID = try await fetchInt64(
+            "SELECT segmentId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        let ciphertext = try XCTUnwrap(
+            ReversibleOCRScrambler.encryptOCRText(
+                "secret",
+                frameID: frameID.value,
+                nodeOrder: 0,
+                secret: "unit-test-secret"
+            )
+        )
+        let docid = try await database.indexFrameText(
+            mainText: String(repeating: " ", count: 6),
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: segmentID,
+            frameId: frameID.value
+        )
+
+        try await database.insertNodes(
+            frameID: frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: ciphertext],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let uiNodes = try await database.getOCRNodesWithText(frameID: frameID)
+        let dbNodes = try await database.getNodesWithText(
+            frameID: frameID,
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        let storedContent = try await database.getFTSContent(docid: docid)
+
+        XCTAssertEqual(uiNodes.count, 1)
+        XCTAssertEqual(uiNodes[0].text, String(repeating: " ", count: 6))
+        XCTAssertEqual(uiNodes[0].encryptedText, ciphertext)
+        XCTAssertTrue(uiNodes[0].isRedacted)
+
+        XCTAssertEqual(dbNodes.count, 1)
+        XCTAssertEqual(dbNodes[0].text, String(repeating: " ", count: 6))
+        XCTAssertTrue(dbNodes[0].node.isRedacted)
+
+        XCTAssertEqual(storedContent?.mainText, String(repeating: " ", count: 6))
+    }
+
+    func testGetOCRNodesWithTextReturnsProtectedPayloadWithoutFTSDocument() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let ciphertext = try XCTUnwrap(
+            ReversibleOCRScrambler.encryptOCRText(
+                "secret",
+                frameID: frameID.value,
+                nodeOrder: 0,
+                secret: "unit-test-secret"
+            )
+        )
+
+        try await database.insertNodes(
+            frameID: frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: ciphertext],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        let uiNodes = try await database.getOCRNodesWithText(frameID: frameID)
+        let dbNodes = try await database.getNodesWithText(
+            frameID: frameID,
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+
+        XCTAssertEqual(uiNodes.count, 1)
+        XCTAssertEqual(uiNodes[0].text, String(repeating: " ", count: 6))
+        XCTAssertEqual(uiNodes[0].encryptedText, ciphertext)
+        XCTAssertTrue(uiNodes[0].isRedacted)
+
+        XCTAssertEqual(dbNodes.count, 1)
+        XCTAssertEqual(dbNodes[0].text, String(repeating: " ", count: 6))
+        XCTAssertTrue(dbNodes[0].node.isRedacted)
+    }
+
+    func testIndexFrameTextReplacesExistingDocSegmentForFrame() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let segmentID = try await fetchInt64(
+            "SELECT segmentId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+
+        _ = try await database.indexFrameText(
+            mainText: "alpha",
+            chromeText: nil,
+            windowTitle: "First",
+            segmentId: segmentID,
+            frameId: frameID.value
+        )
+        let secondDocid = try await database.indexFrameText(
+            mainText: "beta",
+            chromeText: "chrome",
+            windowTitle: "Second",
+            segmentId: segmentID,
+            frameId: frameID.value
+        )
+
+        let docSegmentCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        let currentDocid = try await database.getDocidForFrame(frameId: frameID.value)
+        let content = try await database.getFTSContent(docid: try XCTUnwrap(currentDocid))
+
+        XCTAssertEqual(docSegmentCount, 1)
+        XCTAssertEqual(currentDocid, secondDocid)
+        XCTAssertEqual(content?.mainText, "beta")
+        XCTAssertEqual(content?.chromeText, "chrome")
+        XCTAssertEqual(content?.windowTitle, "Second")
+    }
+
+    func testDeleteFrameRemovesAssociatedFTSRowsFromCoreDatabasePath() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let segmentID = try await fetchInt64(
+            "SELECT segmentId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+
+        let docid = try await database.indexFrameText(
+            mainText: "delete me",
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: segmentID,
+            frameId: frameID.value
+        )
+
+        try await database.deleteFrame(id: frameID)
+
+        let remainingDocSegments = try await fetchInt64(
+            "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        let remainingFTSRows = try await fetchInt64(
+            "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, docid)
+            }
+        )
+
+        XCTAssertEqual(remainingDocSegments, 0)
+        XCTAssertEqual(remainingFTSRows, 0)
+    }
+
+    func testDeleteFramesOlderThanRemovesAssociatedFTSRows() async throws {
+        let now = Date()
+        let oldTimestamp = now.addingTimeInterval(-3_600)
+        let newTimestamp = now.addingTimeInterval(3_600)
+
+        let oldFrameID = try await insertTestFrame(browserURL: nil, timestamp: oldTimestamp)
+        let newFrameID = try await insertTestFrame(browserURL: nil, timestamp: newTimestamp)
+
+        let oldSegmentID = try await fetchInt64(
+            "SELECT segmentId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, oldFrameID.value)
+            }
+        )
+        let newSegmentID = try await fetchInt64(
+            "SELECT segmentId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, newFrameID.value)
+            }
+        )
+
+        let oldDocid = try await database.indexFrameText(
+            mainText: "old frame",
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: oldSegmentID,
+            frameId: oldFrameID.value
+        )
+        let newDocid = try await database.indexFrameText(
+            mainText: "new frame",
+            chromeText: nil,
+            windowTitle: nil,
+            segmentId: newSegmentID,
+            frameId: newFrameID.value
+        )
+
+        let deletedCount = try await database.deleteFrames(olderThan: now)
+        let deletedOldFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, oldFrameID.value)
+            }
+        )
+        let deletedOldFTSCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, oldDocid)
+            }
+        )
+        let survivingNewFrameCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, newFrameID.value)
+            }
+        )
+        let survivingNewFTSCount = try await fetchInt64(
+            "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, newDocid)
+            }
+        )
+
+        XCTAssertEqual(deletedCount, 1)
+        XCTAssertEqual(deletedOldFrameCount, 0)
+        XCTAssertEqual(deletedOldFTSCount, 0)
+        XCTAssertEqual(survivingNewFrameCount, 1)
+        XCTAssertEqual(survivingNewFTSCount, 1)
+    }
+
+    func testUpdateFrameProcessingStatusStoresRewrittenAtWithoutOverwritingProcessedAt() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+
+        try await database.updateFrameProcessingStatus(frameID: frameID.value, status: 2)
+        let processedAtAfterOCR = try await fetchInt64(
+            """
+            SELECT processedAt
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 2
+              AND processedAt IS NOT NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        let pendingRewriteCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 5
+              AND rewritePurpose = 'redaction';
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        XCTAssertEqual(pendingRewriteCount, 1)
+        let unsetRewrittenAtCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND rewrittenAt IS NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        XCTAssertEqual(unsetRewrittenAtCount, 1)
+
+        try await database.updateFrameProcessingStatus(
+            frameID: frameID.value,
+            status: 7,
+            rewritePurpose: "redaction"
+        )
+
+        let completedRewriteCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 7
+              AND rewritePurpose = 'redaction'
+              AND processedAt = ?
+              AND rewrittenAt IS NOT NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+                sqlite3_bind_int64(statement, 2, processedAtAfterOCR)
+            }
+        )
+        XCTAssertEqual(completedRewriteCount, 1)
+
+        try await database.updateFrameProcessingStatus(frameID: frameID.value, status: 0)
+
+        let resetToPendingCount = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND processingStatus = 0
+              AND rewritePurpose IS NULL;
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+        XCTAssertEqual(resetToPendingCount, 1)
+    }
+
+    func testGetFrameStatusCountsSeparatesOCRAndRewriteLanes() async throws {
+        let ocrPendingFrameID = try await insertTestFrame(browserURL: nil)
+        let ocrProcessingFrameID = try await insertTestFrame(browserURL: nil)
+        let rewritePendingFrameID = try await insertTestFrame(browserURL: nil)
+        let rewriteProcessingFrameID = try await insertTestFrame(browserURL: nil)
+
+        try await database.updateFrameProcessingStatus(frameID: ocrPendingFrameID.value, status: 0)
+        try await database.updateFrameProcessingStatus(frameID: ocrProcessingFrameID.value, status: 1)
+        try await database.updateFrameProcessingStatus(
+            frameID: rewritePendingFrameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: rewriteProcessingFrameID.value,
+            status: 6,
+            rewritePurpose: "redaction"
+        )
+
+        let counts = try await database.getFrameStatusCounts()
+
+        XCTAssertEqual(counts.ocrPending, 1)
+        XCTAssertEqual(counts.ocrProcessing, 1)
+        XCTAssertEqual(counts.rewritePending, 1)
+        XCTAssertEqual(counts.rewriteProcessing, 1)
+    }
+
+    func testGetFramesRewrittenPerMinuteBucketsByRewrittenAt() async throws {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let currentMinuteMs = (nowMs / 60_000) * 60_000
+
+        let currentMinuteFrameID = try await insertTestFrame(browserURL: nil)
+        let previousMinuteFrameID = try await insertTestFrame(browserURL: nil)
+        let oldFrameID = try await insertTestFrame(browserURL: nil)
+
+        try await database.updateFrameProcessingStatus(
+            frameID: currentMinuteFrameID.value,
+            status: 7,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: previousMinuteFrameID.value,
+            status: 7,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: oldFrameID.value,
+            status: 7,
+            rewritePurpose: "redaction"
+        )
+
+        try await executeRawSQL(
+            """
+            UPDATE frame
+            SET rewrittenAt = CASE id
+                WHEN \(currentMinuteFrameID.value) THEN \(currentMinuteMs + 5_000)
+                WHEN \(previousMinuteFrameID.value) THEN \(currentMinuteMs - 60_000 + 5_000)
+                WHEN \(oldFrameID.value) THEN \(currentMinuteMs - 31 * 60_000)
+            END
+            WHERE id IN (\(currentMinuteFrameID.value), \(previousMinuteFrameID.value), \(oldFrameID.value));
+            """
+        )
+
+        let buckets = try await database.getFramesRewrittenPerMinute(lastMinutes: 30)
+
+        XCTAssertEqual(buckets[0], 1)
+        XCTAssertEqual(buckets[1], 1)
+        XCTAssertNil(buckets[29])
+    }
+
+    func testPendingNodeRedactionQueriesCanIncludeRetryableFailures() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let videoID = try await fetchInt64(
+            "SELECT videoId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+
+        try await database.insertNodes(
+            frameID: frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: frameID.value,
+            status: 8,
+            rewritePurpose: "redaction"
+        )
+
+        let defaultPendingVideoIDs = try await database.getVideoIDsWithPendingNodeRedactions()
+        let retryablePendingVideoIDs = try await database.getVideoIDsWithPendingNodeRedactions(
+            includeRetryableFailures: true
+        )
+        let defaultJobs = try await database.getPendingNodeRedactionJobs(videoID: videoID)
+        let retryableJobs = try await database.getPendingNodeRedactionJobs(
+            videoID: videoID,
+            includeRetryableFailures: true
+        )
+
+        XCTAssertTrue(defaultPendingVideoIDs.isEmpty)
+        XCTAssertEqual(retryablePendingVideoIDs, [videoID])
+        XCTAssertTrue(defaultJobs.isEmpty)
+        XCTAssertEqual(retryableJobs.map(\.frameID), [frameID.value])
+    }
+
+    func testHasProtectedPhraseRedactionDataReturnsTrueWhenEncryptedNodesExist() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let hasProtectedDataBeforeInsert = try await database.hasProtectedPhraseRedactionData()
+
+        XCTAssertFalse(hasProtectedDataBeforeInsert)
+
+        try await database.insertNodes(
+            frameID: frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        let hasProtectedDataAfterInsert = try await database.hasProtectedPhraseRedactionData()
+
+        XCTAssertTrue(hasProtectedDataAfterInsert)
+    }
+
+    func testAbandonPendingNodeRedactionsMarksJobsFailedAndRemovesThemFromRetryScan() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil)
+        let videoID = try await fetchInt64(
+            "SELECT videoId FROM frame WHERE id = ?;",
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+            }
+        )
+
+        try await database.insertNodes(
+            frameID: frameID,
+            nodes: [(
+                textOffset: 0,
+                textLength: 6,
+                bounds: CGRect(x: 10, y: 10, width: 120, height: 24),
+                windowIndex: nil
+            )],
+            encryptedTexts: [0: "cipher"],
+            frameWidth: 1_000,
+            frameHeight: 1_000
+        )
+        try await database.updateFrameProcessingStatus(
+            frameID: frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        let abandonedCount = try await database.abandonPendingNodeRedactions(
+            missingKeyRewritePurpose: "redaction_missing_master_key_abandoned"
+        )
+        let pendingVideoIDs = try await database.getVideoIDsWithPendingNodeRedactions(
+            includeRetryableFailures: true
+        )
+        let abandonedFrames = try await fetchInt64(
+            """
+            SELECT COUNT(*)
+            FROM frame
+            WHERE id = ?
+              AND videoId = ?
+              AND processingStatus = 8
+              AND rewritePurpose = 'redaction_missing_master_key_abandoned';
+            """,
+            bind: { statement in
+                sqlite3_bind_int64(statement, 1, frameID.value)
+                sqlite3_bind_int64(statement, 2, videoID)
+            }
+        )
+
+        XCTAssertEqual(abandonedCount, 1)
+        XCTAssertTrue(pendingVideoIDs.isEmpty)
+        XCTAssertEqual(abandonedFrames, 1)
+    }
+
+    func testVideoHasFramesAwaitingOCRReturnsTrueForPendingStatuses() async throws {
+        let firstFrameID = try await insertTestFrame(browserURL: nil)
+        let secondFrameID = try await insertTestFrame(browserURL: nil)
+
+        try await executeRawSQL(
+            """
+            UPDATE frame
+            SET videoId = (SELECT videoId FROM frame WHERE id = \(firstFrameID.value))
+            WHERE id = \(secondFrameID.value);
+            """
+        )
+
+        try await database.updateFrameProcessingStatus(frameID: firstFrameID.value, status: 5)
+        try await database.updateFrameProcessingStatus(frameID: secondFrameID.value, status: 1)
+
+        let hasAwaitingOCR = try await database.videoHasFramesAwaitingOCR(
+            videoID: try await fetchInt64(
+                "SELECT videoId FROM frame WHERE id = ?;",
+                bind: { statement in
+                    sqlite3_bind_int64(statement, 1, firstFrameID.value)
+                }
+            )
+        )
+
+        XCTAssertTrue(hasAwaitingOCR)
     }
 
     func testRecordDBStorageSnapshotUpsertsSingleRowWithinSameDay() async throws {
@@ -897,7 +1594,7 @@ final class DatabaseManagerTests: XCTestCase {
         let columnNames = try await tableColumnNames("frame_in_page_url")
         let storedRows = try await database.getFrameInPageURLRows(frameID: frameID)
 
-        XCTAssertEqual(currentVersion, 13)
+        XCTAssertGreaterThanOrEqual(currentVersion, 13)
         XCTAssertTrue(columnNames.contains("frameId"))
         XCTAssertTrue(columnNames.contains("ord"))
         XCTAssertTrue(columnNames.contains("urlId"))
@@ -1759,9 +2456,9 @@ final class DatabaseManagerTests: XCTestCase {
 
     private func insertTestFrame(
         browserURL: String?,
-        bundleID: String = "com.apple.Safari"
+        bundleID: String = "com.apple.Safari",
+        timestamp: Date = Date()
     ) async throws -> FrameID {
-        let timestamp = Date()
         let videoSegment = VideoSegment(
             id: VideoSegmentID(value: 0),
             startTime: timestamp,
@@ -1806,6 +2503,10 @@ final class DatabaseManagerTests: XCTestCase {
 
     private func executeRawSQL(_ sql: String) async throws {
         let db = try await databaseConnection()
+        try executeRawSQL(sql, db: db)
+    }
+
+    private func executeRawSQL(_ sql: String, db: OpaquePointer) throws {
         var errorMessage: UnsafeMutablePointer<CChar>?
         defer { sqlite3_free(errorMessage) }
 
@@ -1847,6 +2548,30 @@ final class DatabaseManagerTests: XCTestCase {
         return sqlite3_column_int64(statement, 0)
     }
 
+    private func fetchText(
+        _ sql: String,
+        bind: ((OpaquePointer?) -> Void)? = nil
+    ) async throws -> String? {
+        let db = try await databaseConnection()
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw NSError(
+                domain: "DatabaseManagerTests",
+                code: 6,
+                userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(db))]
+            )
+        }
+
+        bind?(statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw NSError(domain: "DatabaseManagerTests", code: 7, userInfo: [NSLocalizedDescriptionKey: "Expected one row for query: \(sql)"])
+        }
+
+        return sqlite3_column_text(statement, 0).map { String(cString: $0) }
+    }
+
     private func tableColumnNames(_ table: String) async throws -> [String] {
         let db = try await databaseConnection()
         let sql = "PRAGMA table_info(\(table));"
@@ -1869,5 +2594,49 @@ final class DatabaseManagerTests: XCTestCase {
         }
 
         return columnNames
+    }
+
+    private func openRawDatabase(at path: String) throws -> OpaquePointer {
+        var db: OpaquePointer?
+        let flags = SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(path, &db, flags, nil) == SQLITE_OK, let db else {
+            let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open raw database"
+            sqlite3_close(db)
+            throw NSError(domain: "DatabaseManagerTests", code: 8, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+
+        try executeRawSQL("PRAGMA foreign_keys = ON;", db: db)
+        try executeRawSQL("PRAGMA journal_mode = WAL;", db: db)
+        try executeRawSQL("PRAGMA synchronous = NORMAL;", db: db)
+        return db
+    }
+
+    private func runLegacyMigrations(throughVersion version: Int, db: OpaquePointer) async throws {
+        try executeRawSQL(Schema.createSchemaMigrationsTable, db: db)
+
+        let migrations: [Migration] = [
+            V1_InitialSchema(),
+            V2_UnfinalisedVideoTracking(),
+            V3_TagSystem(),
+            V4_DailyMetrics(),
+            V5_FTSUnicode61(),
+            V6_FrameProcessedAt(),
+            V7_FrameRedactionReason(),
+            V8_SegmentComments(),
+            V9_SegmentCommentFrameAnchor(),
+            V10_SegmentCommentSearchIndex(),
+            V11_SegmentCommentLinkCompositeIndex(),
+            V12_FrameMetadata(),
+            V13_RemoveInPageURLRects(),
+            V14_DBStorageSnapshot()
+        ]
+
+        for migration in migrations where migration.version <= version {
+            try await migration.migrate(db: db)
+            try executeRawSQL(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (\(migration.version), \(Int64(Date().timeIntervalSince1970 * 1_000)));",
+                db: db
+            )
+        }
     }
 }

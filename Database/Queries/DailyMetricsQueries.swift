@@ -62,6 +62,10 @@ public enum DailyMetricsQueries {
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
         case dockMenuAction = "dock_menu_action"  // metadata: JSON {action, source}
         case redactionRulesUpdated = "redaction_rules_updated"
+        case masterKeyFlow = "master_key_flow"  // metadata: JSON {action, source, ...}
+        case phraseLevelRedactionRulesUpdated = "phrase_level_redaction_rules_updated"
+        case phraseLevelRedactionReveal = "phrase_level_redaction_reveal"
+        case phraseLevelRedactionQueuedHover = "phrase_level_redaction_queued_hover"  // metadata: JSON {nodeID, frameID, processingStatus}
         case privateWindowRedactionToggle = "private_window_redaction_toggle"
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"

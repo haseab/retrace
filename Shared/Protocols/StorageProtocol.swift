@@ -1,4 +1,35 @@
+import CoreGraphics
 import Foundation
+
+public struct SegmentRedactionTarget: Sendable, Equatable {
+    public let frameID: Int64
+    public let nodeID: Int
+    public let normalizedRect: CGRect
+
+    public init(frameID: Int64, nodeID: Int, normalizedRect: CGRect) {
+        self.frameID = frameID
+        self.nodeID = nodeID
+        self.normalizedRect = normalizedRect
+    }
+}
+
+public struct SegmentRedactionRecoveryAction: Sendable, Equatable {
+    public enum Mode: String, Sendable {
+        case rollbackToPending
+        case markCompleted
+    }
+
+    public let mode: Mode
+    public let segmentID: VideoSegmentID
+
+    public init(
+        mode: Mode,
+        segmentID: VideoSegmentID
+    ) {
+        self.mode = mode
+        self.segmentID = segmentID
+    }
+}
 
 // MARK: - Storage Protocol
 
@@ -32,6 +63,28 @@ public protocol StorageProtocol: Actor {
     /// Count the number of readable frames in an existing video file
     /// Returns 0 if the file doesn't exist or is unreadable
     func countFramesInSegment(id: VideoSegmentID) async throws -> Int
+
+    /// Read a frame directly from the WAL when the segment is still being written.
+    /// Returns `nil` when the frame is not durable enough to read yet.
+    func readFrameFromWAL(
+        segmentID: VideoSegmentID,
+        frameID: Int64,
+        fallbackFrameIndex: Int
+    ) async throws -> CapturedFrame?
+
+    /// Rewrite finalized segment bytes for phrase-redaction protection.
+    func rewriteSegmentForRedaction(
+        segmentID: VideoSegmentID,
+        frameIDs: [Int64],
+        targetsByFrameIndex: [Int: [SegmentRedactionTarget]],
+        secret: String
+    ) async throws
+
+    /// Recover interrupted phrase-redaction rewrites discovered on disk.
+    func recoverInterruptedSegmentRedactions() async throws -> [SegmentRedactionRecoveryAction]
+
+    /// Remove on-disk recovery artifacts once DB reconciliation succeeds.
+    func finishInterruptedSegmentRedactionRecovery(segmentID: VideoSegmentID) async throws
 
     /// Check if a video file has valid timestamps (first frame dts=0)
     /// Returns false if the video was not properly finalized (crash recovery case)

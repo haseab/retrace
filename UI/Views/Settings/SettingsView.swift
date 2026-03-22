@@ -9,10 +9,46 @@ import SQLCipher
 import ServiceManagement
 import Darwin
 import Carbon
+import UniformTypeIdentifiers
 
 /// Shared UserDefaults store for consistent settings across debug/release builds
 private let settingsStore: UserDefaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 private let rewindCutoffDateDefaultsKey = "rewindCutoffDate"
+private let phraseLevelRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
+
+private enum MasterKeyProtectedFeature: String, Identifiable {
+    case phraseLevelRedaction
+
+    var id: String { rawValue }
+
+    var metricSource: String {
+        rawValue
+    }
+
+    var setupPromptTitle: String {
+        "Create Master Key?"
+    }
+
+    var setupPromptMessage: String {
+        "Turning on keyword redaction requires a master key stored in your Keychain. Retrace will create it locally on this Mac before enabling the feature."
+    }
+
+    var successTitle: String {
+        "Master Key Created"
+    }
+}
+
+private struct MasterKeySetupSession: Identifiable {
+    enum Step: Equatable {
+        case created
+        case recovery
+    }
+
+    let id = UUID()
+    let feature: MasterKeyProtectedFeature
+    let recoveryPhrase: String
+    var step: Step = .created
+}
 
 // MARK: - Settings Defaults (Single Source of Truth)
 
@@ -62,6 +98,8 @@ enum SettingsDefaults {
     static let enableCustomPatternWindowRedaction = true
     static let redactWindowTitlePatterns = ""
     static let redactBrowserURLPatterns = ""
+    static let phraseLevelRedactionEnabled = false
+    static let phraseLevelRedactionPhrases = "[]"
     static let excludeSafariPrivate = true
     static let excludeChromeIncognito = true
     static let encryptionEnabled = true
@@ -306,6 +344,15 @@ public struct SettingsView: View {
     @AppStorage("enableCustomPatternWindowRedaction", store: settingsStore) private var enableCustomPatternWindowRedaction = SettingsDefaults.enableCustomPatternWindowRedaction
     @AppStorage("redactWindowTitlePatterns", store: settingsStore) private var redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
     @AppStorage("redactBrowserURLPatterns", store: settingsStore) private var redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
+    @AppStorage("phraseLevelRedactionPhrases", store: settingsStore) private var phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
+    @State private var phraseLevelRedactionInput = ""
+    @State private var phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
+    @State private var phraseLevelRedactionToggleInitialized = false
+    @State private var hasMasterKeyInKeychain = false
+    @State private var pendingMasterKeyFeature: MasterKeyProtectedFeature?
+    @State private var masterKeySetupSession: MasterKeySetupSession?
+    @State private var isCreatingMasterKey = false
+    @State private var animateMasterKeyCreatedState = false
 
     // Computed property to manage excluded apps as array
     private var excludedApps: [ExcludedAppInfo] {
@@ -326,6 +373,7 @@ public struct SettingsView: View {
             excludedAppsString = string
         }
     }
+
     @AppStorage("excludeSafariPrivate", store: settingsStore) private var excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
     @AppStorage("excludeChromeIncognito", store: settingsStore) private var excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
     @AppStorage("encryptionEnabled", store: settingsStore) private var encryptionEnabled = SettingsDefaults.encryptionEnabled
@@ -509,6 +557,8 @@ public struct SettingsView: View {
             searchableText: ["excluded apps", "block app", "privacy", "apps not recorded", "app exclusion"]),
         SettingsSearchEntry(id: "privacy.frameRedaction", tab: .privacy, cardTitle: "Window Level Redaction", cardIcon: "eye.slash",
             searchableText: ["redaction", "window title", "browser url", "black frames", "privacy rules", "incognito", "private browsing", "automation", "vivaldi", "sigmaos"]),
+        SettingsSearchEntry(id: "privacy.phraseRedaction", tab: .privacy, cardTitle: "Phrase Level Redaction", cardIcon: "text.viewfinder",
+            searchableText: ["phrase redaction", "keyword redaction", "redact on keyword", "banned phrases", "sensitive text", "scramble", "ocr redaction", "searchable text", "manual phrases"]),
         SettingsSearchEntry(id: "privacy.quickDelete", tab: .privacy, cardTitle: "Quick Delete", cardIcon: "clock.arrow.circlepath",
             searchableText: ["quick delete", "delete recent", "last 5 minutes", "last hour", "last 24 hours", "erase"]),
         SettingsSearchEntry(id: "privacy.permissions", tab: .privacy, cardTitle: "Permissions", cardIcon: "hand.raised",
@@ -685,6 +735,8 @@ public struct SettingsView: View {
                 launchedPathInitialized = true
             }
 
+            initializeProtectedFeatureStateIfNeeded()
+
             // Sync launch at login toggle with actual system state
             let systemLaunchAtLoginEnabled = SMAppService.mainApp.status == .enabled
             if launchAtLogin != systemLaunchAtLoginEnabled {
@@ -754,6 +806,22 @@ public struct SettingsView: View {
             settingsSearchOverlay
                 .animation(.easeOut(duration: 0.15), value: showSettingsSearch)
         }
+        .alert(item: $pendingMasterKeyFeature) { feature in
+            Alert(
+                title: Text(feature.setupPromptTitle),
+                message: Text(feature.setupPromptMessage),
+                primaryButton: .default(Text(isCreatingMasterKey ? "Creating..." : "Create Master Key")) {
+                    createMasterKeyForPendingFeature(feature)
+                },
+                secondaryButton: .cancel {
+                    recordMasterKeyMetric(action: "cancel_prompt", source: feature.metricSource)
+                }
+            )
+        }
+        .sheet(item: $masterKeySetupSession) { session in
+            masterKeySetupSheet(session)
+                .interactiveDismissDisabled()
+        }
         .overlay(alignment: .top) {
             if let message = settingsToastMessage {
                 HStack(spacing: 10) {
@@ -785,6 +853,466 @@ public struct SettingsView: View {
             .keyboardShortcut("k", modifiers: .command)
             .frame(width: 0, height: 0)
             .opacity(0)
+        }
+    }
+
+    private var privateWindowRedactionBinding: Binding<Bool> {
+        Binding(
+            get: { excludePrivateWindows },
+            set: { enabled in
+                setPrivateWindowRedactionEnabled(enabled)
+            }
+        )
+    }
+
+    private var phraseLevelRedactionBinding: Binding<Bool> {
+        Binding(
+            get: { phraseLevelRedactionEnabled },
+            set: { enabled in
+                setPhraseLevelRedactionEnabled(enabled)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func masterKeySetupSheet(_ session: MasterKeySetupSession) -> some View {
+        ZStack {
+            themeBaseBackground
+                .overlay(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.025),
+                            Color.clear
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .ignoresSafeArea()
+
+            Group {
+                if session.step == .created {
+                    masterKeyCreatedStep
+                } else {
+                    masterKeyRecoveryStep(session)
+                }
+            }
+            .padding(28)
+            .frame(width: 560)
+        }
+    }
+
+    @ViewBuilder
+    private var masterKeyCreatedStep: some View {
+        VStack(spacing: 26) {
+            Spacer(minLength: 0)
+
+            ZStack {
+                Circle()
+                    .fill(Color.retraceSuccess.opacity(0.08))
+                    .frame(width: 126, height: 126)
+                    .scaleEffect(animateMasterKeyCreatedState ? 1 : 0.9)
+                    .opacity(animateMasterKeyCreatedState ? 1 : 0.7)
+
+                Circle()
+                    .stroke(Color.retraceSuccess.opacity(0.24), lineWidth: 1)
+                    .frame(width: 148, height: 148)
+                    .scaleEffect(animateMasterKeyCreatedState ? 1.02 : 0.84)
+                    .opacity(animateMasterKeyCreatedState ? 1 : 0.25)
+
+                Image(systemName: "checkmark")
+                    .font(.system(size: 44, weight: .bold))
+                    .foregroundColor(.retraceSuccess)
+                    .scaleEffect(animateMasterKeyCreatedState ? 1 : 0.72)
+                    .opacity(animateMasterKeyCreatedState ? 1 : 0)
+            }
+
+            VStack(spacing: 8) {
+                Text("Master Key Created")
+                    .font(.retraceMediumNumber)
+                    .foregroundColor(.retracePrimary)
+
+                Text("Stored in Keychain on this Mac")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            Button("Continue") {
+                advanceMasterKeySetupToRecovery()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 360)
+        .frame(maxWidth: .infinity)
+        .multilineTextAlignment(.center)
+        .onAppear {
+            animateMasterKeyCreatedState = false
+            withAnimation(.spring(response: 0.54, dampingFraction: 0.72).delay(0.04)) {
+                animateMasterKeyCreatedState = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func masterKeyRecoveryStep(_ session: MasterKeySetupSession) -> some View {
+        let recoveryWords = session.recoveryPhrase
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Save Your Recovery Phrase")
+                    .font(.retraceMediumNumber)
+                    .foregroundColor(.retracePrimary)
+
+                Text("This is the only recovery path if the Keychain copy on this Mac is lost.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+
+            alertBanner(
+                icon: "exclamationmark.triangle.fill",
+                title: "Store this offline and keep it private",
+                message: "Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain entry on this Mac, that data is gone."
+            )
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Recovery phrase")
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.retraceSecondary)
+
+                ZStack(alignment: .topTrailing) {
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(Color.white.opacity(0.04))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+
+                    Button {
+                        copyMasterKeyRecoveryPhrase(session.recoveryPhrase)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.retracePrimary)
+                            .padding(10)
+                            .background(
+                                Circle()
+                                    .fill(Color.white.opacity(0.08))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .padding(12)
+
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 86), spacing: 8)],
+                        alignment: .leading,
+                        spacing: 8
+                    ) {
+                        ForEach(Array(recoveryWords.enumerated()), id: \.offset) { index, word in
+                            HStack(spacing: 6) {
+                                Text("\(index + 1).")
+                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.retraceSecondary.opacity(0.75))
+
+                                Text(word)
+                                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(.retracePrimary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.white.opacity(0.05))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                            )
+                        }
+                    }
+                    .padding(.top, 18)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 18)
+                    .padding(.trailing, 48)
+                }
+            }
+
+            HStack {
+                ModernButton(title: "Download TXT", icon: "arrow.down.doc", style: .secondary) {
+                    saveMasterKeyRecoveryPhrase(session.recoveryPhrase)
+                }
+
+                Spacer()
+
+                Button("I Saved It") {
+                    dismissMasterKeySetup()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func alertBanner(
+        icon: String,
+        title: String,
+        message: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(.retraceDanger)
+                .frame(width: 20)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.retraceCaptionBold)
+                    .foregroundColor(.retracePrimary)
+
+                Text(message)
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.retraceDanger.opacity(0.1))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.retraceDanger.opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    private func initializeProtectedFeatureStateIfNeeded() {
+        guard !phraseLevelRedactionToggleInitialized else { return }
+
+        if let storedValue = settingsStore.object(forKey: phraseLevelRedactionEnabledDefaultsKey) as? Bool {
+            phraseLevelRedactionEnabled = storedValue
+        } else {
+            phraseLevelRedactionEnabled = !phraseLevelRedactionPhrases.isEmpty
+        }
+
+        hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+        phraseLevelRedactionToggleInitialized = true
+    }
+
+    private func setPrivateWindowRedactionEnabled(_ enabled: Bool) {
+        guard enabled != excludePrivateWindows else { return }
+
+        excludePrivateWindows = enabled
+        updatePrivateWindowRedactionSetting()
+
+        if enabled {
+            Task { await refreshPrivateModeAutomationTargets(force: true) }
+        } else {
+            privateModeAXCompatibleTargets = []
+            privateModeAutomationTargets = []
+            privateModeAutomationPermissionStateByBundleID = [:]
+            privateModeAutomationBusyBundleIDs = []
+            privateModeAutomationRunningBundleIDs = []
+        }
+    }
+
+    private func setPhraseLevelRedactionEnabled(_ enabled: Bool) {
+        guard enabled != phraseLevelRedactionEnabled else { return }
+
+        if enabled && !hasMasterKeyInKeychain {
+            promptForMasterKey(feature: .phraseLevelRedaction)
+            return
+        }
+
+        phraseLevelRedactionEnabled = enabled
+        settingsStore.set(enabled, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        Task { @MainActor in
+            showSettingsToast(enabled ? "Keyword redaction enabled" : "Keyword redaction disabled")
+        }
+        recordMasterKeyMetric(
+            action: enabled ? "feature_enabled" : "feature_disabled",
+            source: MasterKeyProtectedFeature.phraseLevelRedaction.metricSource
+        )
+    }
+
+    private func promptForMasterKey(feature: MasterKeyProtectedFeature) {
+        Task { @MainActor in
+            let state = await coordinatorWrapper.coordinator.missingMasterKeyRedactionState()
+            guard state.requiresRecoveryPrompt else {
+                pendingMasterKeyFeature = feature
+                recordMasterKeyMetric(action: "prompt_shown", source: feature.metricSource)
+                return
+            }
+
+            let outcome = await MasterKeyRedactionFlowCoordinator.resolveMissingKey(
+                coordinator: coordinatorWrapper.coordinator,
+                state: state,
+                defaults: settingsStore,
+                configuration: .settings,
+                recordMetric: { action, metadata in
+                    recordMasterKeyMetric(action: action, source: feature.metricSource, metadata: metadata)
+                }
+            )
+
+            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+            switch outcome {
+            case .deferred:
+                return
+            case .recoveredExistingKey, .keyAlreadyAvailable:
+                applyProtectedFeatureActivation(feature, showToast: false)
+                showSettingsToast(
+                    state.hasPendingRedactionRewrites
+                        ? "Master key recovered; pending redaction rewrites will resume"
+                        : "Master key recovered; keyword redaction enabled"
+                )
+            case .createdFreshKey(let recoveryPhrase, let abandonedRewriteCount):
+                applyProtectedFeatureActivation(feature, showToast: false)
+                showSettingsToast(
+                    abandonedRewriteCount > 0
+                        ? "Master key created; old pending rewrites were marked failed"
+                        : "Keyword redaction enabled"
+                )
+                masterKeySetupSession = MasterKeySetupSession(
+                    feature: feature,
+                    recoveryPhrase: recoveryPhrase
+                )
+            }
+        }
+    }
+
+    private func createMasterKeyForPendingFeature(_ feature: MasterKeyProtectedFeature) {
+        guard !isCreatingMasterKey else { return }
+        isCreatingMasterKey = true
+
+        do {
+            let result = try MasterKeyManager.createMasterKeyIfNeeded(defaults: settingsStore)
+            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+            pendingMasterKeyFeature = nil
+            isCreatingMasterKey = false
+
+            applyProtectedFeatureActivation(feature)
+            if feature == .phraseLevelRedaction, hasMasterKeyInKeychain {
+                Task {
+                    if !result.created {
+                        await coordinatorWrapper.coordinator.recoverPendingPhraseRedactionRewritesIfPossible()
+                    }
+                }
+            }
+
+            if result.created, let recoveryPhrase = result.recoveryPhrase {
+                masterKeySetupSession = MasterKeySetupSession(
+                    feature: feature,
+                    recoveryPhrase: recoveryPhrase
+                )
+                recordMasterKeyMetric(action: "created", source: feature.metricSource)
+            } else {
+                recordMasterKeyMetric(action: "already_exists", source: feature.metricSource)
+            }
+        } catch {
+            pendingMasterKeyFeature = nil
+            isCreatingMasterKey = false
+            Task { @MainActor in
+                showSettingsToast("Couldn't create the master key", isError: true)
+            }
+            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+            Log.error("[SettingsView] Failed to create master key: \(error)", category: .ui)
+            recordMasterKeyMetric(
+                action: "create_failed",
+                source: feature.metricSource,
+                metadata: ["error": error.localizedDescription]
+            )
+        }
+    }
+
+    private func applyProtectedFeatureActivation(
+        _ feature: MasterKeyProtectedFeature,
+        showToast: Bool = true
+    ) {
+        phraseLevelRedactionEnabled = true
+        settingsStore.set(true, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        if showToast {
+            Task { @MainActor in
+                showSettingsToast("Keyword redaction enabled")
+            }
+        }
+    }
+
+    private func advanceMasterKeySetupToRecovery() {
+        guard var session = masterKeySetupSession else { return }
+        session.step = .recovery
+        masterKeySetupSession = session
+        animateMasterKeyCreatedState = false
+        recordMasterKeyMetric(action: "recovery_step_opened", source: session.feature.metricSource)
+    }
+
+    private func dismissMasterKeySetup() {
+        guard let session = masterKeySetupSession else { return }
+        MasterKeyManager.noteRecoveryPhraseShown(defaults: settingsStore)
+        recordMasterKeyMetric(
+            action: "recovery_acknowledged",
+            source: session.feature.metricSource
+        )
+        masterKeySetupSession = nil
+    }
+
+    private func copyMasterKeyRecoveryPhrase(_ recoveryPhrase: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(recoveryPhrase, forType: .string)
+        Task { @MainActor in
+            showSettingsToast("Recovery phrase copied")
+        }
+        if let session = masterKeySetupSession {
+            recordMasterKeyMetric(action: "recovery_copied", source: session.feature.metricSource)
+        }
+    }
+
+    private func saveMasterKeyRecoveryPhrase(_ recoveryPhrase: String) {
+        switch MasterKeyPromptUI.saveRecoveryPhraseDocument(recoveryPhrase) {
+        case .saved:
+            Task { @MainActor in
+                showSettingsToast("Recovery phrase saved")
+            }
+            if let session = masterKeySetupSession {
+                recordMasterKeyMetric(action: "recovery_downloaded", source: session.feature.metricSource)
+            }
+        case .failed:
+            Task { @MainActor in
+                showSettingsToast("Couldn't save the recovery phrase", isError: true)
+            }
+            if let session = masterKeySetupSession {
+                recordMasterKeyMetric(
+                    action: "recovery_download_failed",
+                    source: session.feature.metricSource,
+                    metadata: ["error": "save_failed"]
+                )
+            }
+        case .cancelled:
+            break
+        }
+    }
+
+    private func recordMasterKeyMetric(
+        action: String,
+        source: String,
+        metadata: [String: Any] = [:]
+    ) {
+        Task {
+            var payload = metadata
+            payload["action"] = action
+            payload["source"] = source
+            let encodedMetadata = Self.inPageURLMetricMetadata(payload)
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .masterKeyFlow,
+                metadata: encodedMetadata
+            )
         }
     }
 
@@ -3413,6 +3941,7 @@ public struct SettingsView: View {
             appLevelRedactionCard
                 .zIndex(excludedAppsPopoverShown ? 50 : 0)
             windowLevelRedactionCard
+            phraseLevelRedactionCard
             quickDeleteCard
             permissionsCard
         }
@@ -3566,20 +4095,8 @@ public struct SettingsView: View {
                     ModernToggleRow(
                         title: "Automatic Private / Incognito Mode Redaction",
                         subtitle: "Redact private/incognito windows automatically",
-                        isOn: $excludePrivateWindows
+                        isOn: privateWindowRedactionBinding
                     )
-                    .onChange(of: excludePrivateWindows) { enabled in
-                        updatePrivateWindowRedactionSetting()
-                        if enabled {
-                            Task { await refreshPrivateModeAutomationTargets(force: true) }
-                        } else {
-                            privateModeAXCompatibleTargets = []
-                            privateModeAutomationTargets = []
-                            privateModeAutomationPermissionStateByBundleID = [:]
-                            privateModeAutomationBusyBundleIDs = []
-                            privateModeAutomationRunningBundleIDs = []
-                        }
-                    }
                     if excludePrivateWindows {
                         Divider()
                             .background(Color.white.opacity(0.08))
@@ -3659,6 +4176,198 @@ public struct SettingsView: View {
         .task(id: excludePrivateWindows) {
             guard excludePrivateWindows else { return }
             await refreshPrivateModeAutomationTargets()
+        }
+    }
+
+    private var phraseLevelRedactionPhrases: [String] {
+        if let data = phraseLevelRedactionPhrasesRaw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return normalizePhraseLevelRedactionPhrases(decoded)
+        }
+
+        let fallback = phraseLevelRedactionPhrasesRaw
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map(String.init)
+        return normalizePhraseLevelRedactionPhrases(fallback)
+    }
+
+    @ViewBuilder
+    private func redactionSettingsSubcard<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            content()
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.025))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var phraseLevelRedactionCard: some View {
+        ModernSettingsCard(title: "Phrase Level Redaction", icon: "text.viewfinder") {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Redact matching OCR text with reversible scrambling from manual keywords.")
+                    .font(.retraceCaption)
+                    .foregroundColor(.retraceSecondary)
+
+                redactionSettingsSubcard {
+                    ModernToggleRow(
+                        title: "Redact on Keyword",
+                        subtitle: hasMasterKeyInKeychain
+                            ? "Scramble matching OCR text using the master key stored in Keychain"
+                            : "Requires creating a master key in Keychain before this feature can turn on",
+                        isOn: phraseLevelRedactionBinding
+                    )
+
+                    if phraseLevelRedactionEnabled {
+                        Divider()
+                            .background(Color.white.opacity(0.08))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Keywords and phrases")
+                                .font(.retraceCaptionBold)
+                                .foregroundColor(.retraceSecondary)
+
+                            HStack(spacing: 10) {
+                                TextField("Type a phrase and press Return", text: $phraseLevelRedactionInput)
+                                    .textFieldStyle(.plain)
+                                    .font(.retraceCallout)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 9)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .fill(Color.white.opacity(0.05))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                                    )
+                                    .onSubmit {
+                                        addPhraseLevelRedactionPhrase()
+                                    }
+
+                                Button("Add") {
+                                    addPhraseLevelRedactionPhrase()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(phraseLevelRedactionInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                        }
+
+                        if phraseLevelRedactionPhrases.isEmpty {
+                            Text("No keywords configured yet.")
+                                .font(.retraceCaption)
+                                .foregroundColor(.retraceSecondary.opacity(0.8))
+                        } else {
+                            LazyVGrid(
+                                columns: [GridItem(.adaptive(minimum: 170), spacing: 8)],
+                                alignment: .leading,
+                                spacing: 8
+                            ) {
+                                ForEach(phraseLevelRedactionPhrases, id: \.self) { phrase in
+                                    HStack(spacing: 8) {
+                                        Text(phrase)
+                                            .font(.retraceCaption)
+                                            .foregroundColor(.retracePrimary)
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+
+                                        Spacer(minLength: 0)
+
+                                        Button {
+                                            removePhraseLevelRedactionPhrase(phrase)
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .foregroundColor(.white.opacity(0.75))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        Capsule()
+                                            .fill(Color.white.opacity(0.08))
+                                    )
+                                    .overlay(
+                                        Capsule()
+                                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func normalizePhraseLevelRedactionPhrases(_ phrases: [String]) -> [String] {
+        var seen: Set<String> = []
+        var normalized: [String] = []
+        normalized.reserveCapacity(phrases.count)
+
+        for phrase in phrases {
+            let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let dedupeKey = trimmed.lowercased()
+            guard seen.insert(dedupeKey).inserted else { continue }
+            normalized.append(trimmed)
+        }
+
+        return normalized
+    }
+
+    private func persistPhraseLevelRedactionPhrases(_ phrases: [String], action: String) {
+        let normalized = normalizePhraseLevelRedactionPhrases(phrases)
+        if let data = try? JSONEncoder().encode(normalized),
+           let encoded = String(data: data, encoding: .utf8) {
+            phraseLevelRedactionPhrasesRaw = encoded
+            Task { @MainActor in
+                showSettingsToast("Keyword redaction rules updated")
+            }
+            recordPhraseLevelRedactionRulesMetric(action: action, phraseCount: normalized.count)
+            return
+        }
+        phraseLevelRedactionPhrasesRaw = "[]"
+    }
+
+    private func addPhraseLevelRedactionPhrase() {
+        guard phraseLevelRedactionEnabled else { return }
+        let input = phraseLevelRedactionInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
+        var phrases = phraseLevelRedactionPhrases
+        phrases.append(input)
+        persistPhraseLevelRedactionPhrases(phrases, action: "add")
+        phraseLevelRedactionInput = ""
+    }
+
+    private func removePhraseLevelRedactionPhrase(_ phrase: String) {
+        guard phraseLevelRedactionEnabled else { return }
+        var phrases = phraseLevelRedactionPhrases
+        phrases.removeAll { $0.caseInsensitiveCompare(phrase) == .orderedSame }
+        persistPhraseLevelRedactionPhrases(phrases, action: "remove")
+    }
+
+    private func recordPhraseLevelRedactionRulesMetric(action: String, phraseCount: Int) {
+        Task {
+            let payload: [String: Any] = [
+                "action": action,
+                "phraseCount": phraseCount
+            ]
+            let metadata = Self.inPageURLMetricMetadata(payload)
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .phraseLevelRedactionRulesUpdated,
+                metadata: metadata
+            )
         }
     }
 
@@ -5052,6 +5761,15 @@ public struct SettingsView: View {
             .sheet(isPresented: $showingDatabaseSchema) {
                 DatabaseSchemaView(schemaText: databaseSchemaText, isPresented: $showingDatabaseSchema)
             }
+
+            if BuildInfo.isDevBuild {
+                Divider()
+                    .padding(.vertical, 8)
+
+                ModernButton(title: "Reset Master Key", icon: "key.horizontal", style: .danger) {
+                    resetMasterKeyForDebug()
+                }
+            }
         }
     }
 
@@ -5132,6 +5850,7 @@ public struct SettingsView: View {
         case "exportData.comingSoon": comingSoonCard
         case "privacy.excludedApps": appLevelRedactionCard
         case "privacy.frameRedaction": windowLevelRedactionCard
+        case "privacy.phraseRedaction": phraseLevelRedactionCard
         case "privacy.quickDelete": quickDeleteCard
         case "privacy.permissions": permissionsCard
         case "power.ocrProcessing": ocrProcessingCard
@@ -10398,6 +11117,10 @@ extension SettingsView {
         enableCustomPatternWindowRedaction = SettingsDefaults.enableCustomPatternWindowRedaction
         redactWindowTitlePatternsRaw = SettingsDefaults.redactWindowTitlePatterns
         redactBrowserURLPatternsRaw = SettingsDefaults.redactBrowserURLPatterns
+        phraseLevelRedactionEnabled = SettingsDefaults.phraseLevelRedactionEnabled
+        settingsStore.set(SettingsDefaults.phraseLevelRedactionEnabled, forKey: phraseLevelRedactionEnabledDefaultsKey)
+        phraseLevelRedactionPhrasesRaw = SettingsDefaults.phraseLevelRedactionPhrases
+        phraseLevelRedactionInput = ""
         excludeSafariPrivate = SettingsDefaults.excludeSafariPrivate
         excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
 
@@ -10427,6 +11150,35 @@ extension SettingsView {
             } catch {
                 Log.error("[SettingsView] Failed to reset privacy settings: \(error)", category: .ui)
             }
+        }
+    }
+
+    private func resetMasterKeyForDebug() {
+        do {
+            let removed = try MasterKeyManager.resetMasterKey(defaults: settingsStore)
+            hasMasterKeyInKeychain = MasterKeyManager.hasMasterKey()
+            pendingMasterKeyFeature = nil
+            masterKeySetupSession = nil
+            isCreatingMasterKey = false
+            animateMasterKeyCreatedState = false
+            phraseLevelRedactionEnabled = false
+            settingsStore.set(false, forKey: phraseLevelRedactionEnabledDefaultsKey)
+
+            showSettingsToast(
+                removed ? "Master key reset for this Mac" : "No master key was stored on this Mac"
+            )
+            recordMasterKeyMetric(
+                action: removed ? "debug_reset" : "debug_reset_noop",
+                source: "developer"
+            )
+        } catch {
+            showSettingsToast("Couldn't reset the master key", isError: true)
+            Log.error("[SettingsView] Failed to reset master key: \(error)", category: .ui)
+            recordMasterKeyMetric(
+                action: "debug_reset_failed",
+                source: "developer",
+                metadata: ["error": error.localizedDescription]
+            )
         }
     }
 

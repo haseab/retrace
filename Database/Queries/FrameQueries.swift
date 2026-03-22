@@ -5,7 +5,7 @@ import Shared
 
 /// CRUD operations for frame table (Rewind-compatible schema)
 /// Uses: id, createdAt, imageFileName, segmentId, videoId, videoFrameIndex, isStarred, encodingStatus
-enum FrameQueries {
+public enum FrameQueries {
     // MARK: - Insert
 
     /// Insert a new frame and return the auto-generated ID
@@ -1150,62 +1150,93 @@ enum FrameQueries {
     // MARK: - Delete
 
     static func delete(db: OpaquePointer, id: FrameID) throws {
-        let sql = "DELETE FROM frame WHERE id = ?;"
+        _ = try delete(db: db, frameIDs: [id])
+    }
 
-        var statement: OpaquePointer?
-        defer {
-            sqlite3_finalize(statement)
-        }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(statement, 1, id.value)
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
+    public static func delete(db: OpaquePointer, frameIDs: [FrameID]) throws -> Int {
+        try deleteFrameIDs(db: db, frameIDs: frameIDs.map(\.value))
     }
 
     static func deleteOlderThan(db: OpaquePointer, date: Date) throws -> Int {
-        let sql = "DELETE FROM frame WHERE createdAt < ?;"
-
-        var statement: OpaquePointer?
-        defer {
-            sqlite3_finalize(statement)
-        }
-
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
-
-        guard sqlite3_step(statement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
-        }
-
-        return Int(sqlite3_changes(db))
+        try deleteFramesMatching(
+            db: db,
+            selectionSQL: "SELECT id FROM frame WHERE createdAt < ?;",
+            bindSelection: { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        )
     }
 
     /// Delete all frames newer than (after) the specified date
     /// Used for quick delete functionality to remove recent recordings
     static func deleteNewerThan(db: OpaquePointer, date: Date) throws -> Int {
-        let sql = "DELETE FROM frame WHERE createdAt > ?;"
+        try deleteFramesMatching(
+            db: db,
+            selectionSQL: "SELECT id FROM frame WHERE createdAt > ?;",
+            bindSelection: { statement in
+                sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+            }
+        )
+    }
 
+    private static func deleteFramesMatching(
+        db: OpaquePointer,
+        selectionSQL: String,
+        bindSelection: (OpaquePointer?) -> Void
+    ) throws -> Int {
+        var selectionStatement: OpaquePointer?
+        defer {
+            sqlite3_finalize(selectionStatement)
+        }
+
+        guard sqlite3_prepare_v2(db, selectionSQL, -1, &selectionStatement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: selectionSQL,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        bindSelection(selectionStatement)
+
+        var frameIDs: [Int64] = []
+        while sqlite3_step(selectionStatement) == SQLITE_ROW {
+            frameIDs.append(sqlite3_column_int64(selectionStatement, 0))
+        }
+
+        return try deleteFrameIDs(db: db, frameIDs: frameIDs)
+    }
+
+    private static func deleteFrameIDs(db: OpaquePointer, frameIDs: [Int64]) throws -> Int {
+        guard !frameIDs.isEmpty else {
+            return 0
+        }
+
+        let managesOwnTransaction = sqlite3_get_autocommit(db) != 0
+        if managesOwnTransaction {
+            try beginTransaction(db: db)
+        }
+
+        do {
+            for frameID in frameIDs {
+                try FTSQueries.deleteForFrame(db: db, frameId: frameID)
+                try deleteFrameRow(db: db, frameID: frameID)
+            }
+
+            if managesOwnTransaction {
+                try commitTransaction(db: db)
+            }
+        } catch {
+            if managesOwnTransaction {
+                try? rollbackTransaction(db: db)
+            }
+            throw error
+        }
+
+        return frameIDs.count
+    }
+
+    private static func deleteFrameRow(db: OpaquePointer, frameID: Int64) throws {
+        let sql = "DELETE FROM frame WHERE id = ?;"
         var statement: OpaquePointer?
         defer {
             sqlite3_finalize(statement)
@@ -1218,7 +1249,7 @@ enum FrameQueries {
             )
         }
 
-        sqlite3_bind_int64(statement, 1, Schema.dateToTimestamp(date))
+        sqlite3_bind_int64(statement, 1, frameID)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
             throw DatabaseError.queryFailed(
@@ -1226,8 +1257,6 @@ enum FrameQueries {
                 underlying: String(cString: sqlite3_errmsg(db))
             )
         }
-
-        return Int(sqlite3_changes(db))
     }
 
     // MARK: - Exists Check

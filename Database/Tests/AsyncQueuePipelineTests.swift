@@ -331,6 +331,14 @@ final class AsyncQueuePipelineTests: XCTestCase {
                 XCTFail("Frame \(frameID) still marked as processing after queue drain")
             case .completed:
                 completedCount += 1
+            case .rewritePending:
+                XCTFail("Frame \(frameID) is still waiting on rewrite after queue drain")
+            case .rewriteProcessing:
+                XCTFail("Frame \(frameID) is still being rewritten after queue drain")
+            case .rewriteCompleted:
+                completedCount += 1
+            case .rewriteFailed:
+                failedCount += 1
             case .failed:
                 failedCount += 1
             }
@@ -380,7 +388,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
     // MARK: - Helper Methods
 
     /// Get frame processing status
-    private func getFrameProcessingStatus(frameID: Int64) async throws -> FrameProcessingStatus {
+    private func getFrameProcessingStatus(frameID: Int64) async throws -> Processing.FrameProcessingStatus {
         guard let db = await database.getConnection() else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
@@ -400,7 +408,7 @@ final class AsyncQueuePipelineTests: XCTestCase {
         }
 
         let statusInt = Int(sqlite3_column_int(stmt, 0))
-        return FrameProcessingStatus(rawValue: statusInt) ?? .pending
+        return Processing.FrameProcessingStatus(rawValue: statusInt) ?? .pending
     }
 
     /// Convert NSImage to CapturedFrame with raw BGRA pixel data

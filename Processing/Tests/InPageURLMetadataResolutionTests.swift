@@ -225,10 +225,122 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         XCTAssertNil(clearedMetadata)
     }
 
+    func testProcessPendingRedactionsDefersUntilVideoOCRQuiesces() async throws {
+        let fixture = try await insertFrameFixture()
+        let pendingFrameID = try await insertFrame(
+            videoID: fixture.videoID,
+            segmentID: fixture.segmentID,
+            timestamp: fixture.timestamp.addingTimeInterval(2),
+            frameIndex: 1
+        )
+
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "secret phrase",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
+            redactedNodeOrders: [0]
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: fixture.frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+        try await database.updateFrameProcessingStatus(frameID: pendingFrameID.value, status: 1)
+
+        try await queue.processPendingRedactions(for: fixture.videoID.value)
+
+        let statuses = try await database.getFrameProcessingStatuses(
+            frameIDs: [fixture.frameID.value, pendingFrameID.value]
+        )
+        XCTAssertEqual(statuses[fixture.frameID.value], 5)
+        XCTAssertEqual(statuses[pendingFrameID.value], 1)
+    }
+
+    func testProcessPendingRedactionsDefersWhileTimelineIsVisible() async throws {
+        let fixture = try await insertFrameFixture()
+
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "secret phrase",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
+            redactedNodeOrders: [0]
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: fixture.frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        await queue.setTimelineVisibleForRewriteScheduling(true)
+        try await queue.processPendingRedactions(for: fixture.videoID.value)
+
+        let statuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
+        XCTAssertEqual(statuses[fixture.frameID.value], 5)
+    }
+
+    func testProcessPendingRedactionsResumeAfterTimelineScrubbingEnds() async throws {
+        let fixture = try await insertFrameFixture()
+
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "secret phrase",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
+            redactedNodeOrders: [0]
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: fixture.frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        await queue.setTimelineScrubbingForRewriteScheduling(true)
+        try await queue.processPendingRedactions(for: fixture.videoID.value)
+
+        let deferredStatuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
+        XCTAssertEqual(deferredStatuses[fixture.frameID.value], 5)
+
+        await queue.setTimelineScrubbingForRewriteScheduling(false)
+
+        let resumedStatus = try await waitForProcessingStatus(
+            frameID: fixture.frameID.value,
+            expected: 8
+        )
+        XCTAssertEqual(resumedStatus, 8)
+    }
+
+    func testProcessPendingRedactionsMarksRewriteFailedWhenRewriteThrows() async throws {
+        let fixture = try await insertFrameFixture()
+
+        try await insertIndexedNode(
+            frameID: fixture.frameID,
+            segmentID: fixture.segmentID,
+            text: "secret phrase",
+            bounds: CGRect(x: 100, y: 200, width: 300, height: 50),
+            redactedNodeOrders: [0]
+        )
+
+        try await database.updateFrameProcessingStatus(
+            frameID: fixture.frameID.value,
+            status: 5,
+            rewritePurpose: "redaction"
+        )
+
+        try? await queue.processPendingRedactions(for: fixture.videoID.value)
+
+        let statuses = try await database.getFrameProcessingStatuses(frameIDs: [fixture.frameID.value])
+        XCTAssertEqual(statuses[fixture.frameID.value], 8)
+    }
+
     private func insertFrameFixture(
         frameWidth: Int = 1_000,
         frameHeight: Int = 1_000
-    ) async throws -> (frameID: FrameID, segmentID: Int64) {
+    ) async throws -> (frameID: FrameID, segmentID: Int64, videoID: VideoSegmentID, timestamp: Date) {
         let timestamp = Date(timeIntervalSince1970: 1_700_000_000)
         let insertedVideoID = try await database.insertVideoSegment(
             VideoSegment(
@@ -237,7 +349,7 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
                 endTime: timestamp.addingTimeInterval(120),
                 frameCount: 1,
                 fileSizeBytes: 1_024,
-                relativePath: "segments/in-page-resolution-test.mp4",
+                relativePath: "segments/1700000000000",
                 width: frameWidth,
                 height: frameHeight,
                 source: .native
@@ -271,7 +383,39 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
             )
         )
 
-        return (FrameID(value: insertedFrameID), segmentID)
+        return (
+            FrameID(value: insertedFrameID),
+            segmentID,
+            VideoSegmentID(value: insertedVideoID),
+            timestamp
+        )
+    }
+
+    private func insertFrame(
+        videoID: VideoSegmentID,
+        segmentID: Int64,
+        timestamp: Date,
+        frameIndex: Int
+    ) async throws -> FrameID {
+        let insertedFrameID = try await database.insertFrame(
+            FrameReference(
+                id: FrameID(value: 0),
+                timestamp: timestamp,
+                segmentID: AppSegmentID(value: segmentID),
+                videoID: videoID,
+                frameIndexInSegment: frameIndex,
+                encodingStatus: .success,
+                metadata: FrameMetadata(
+                    appBundleID: "com.apple.Safari",
+                    appName: "Safari",
+                    browserURL: "https://example.com/articles/current",
+                    displayID: 1
+                ),
+                source: .native
+            )
+        )
+
+        return FrameID(value: insertedFrameID)
     }
 
     private func insertIndexedNode(
@@ -279,28 +423,69 @@ final class InPageURLMetadataResolutionTests: XCTestCase {
         segmentID: Int64,
         text: String,
         bounds: CGRect,
+        redactedNodeOrders: Set<Int> = [],
         frameWidth: Int = 1_000,
         frameHeight: Int = 1_000
     ) async throws {
+        let indexedText = redactedNodeOrders.isEmpty
+            ? text
+            : String(repeating: " ", count: text.count)
         _ = try await database.indexFrameText(
-            mainText: text,
+            mainText: indexedText,
             chromeText: nil,
             windowTitle: nil,
             segmentId: segmentID,
             frameId: frameID.value
         )
 
-        try await database.insertNodes(
-            frameID: frameID,
-            nodes: [(
-                textOffset: 0,
-                textLength: text.count,
-                bounds: bounds,
-                windowIndex: nil
-            )],
-            frameWidth: frameWidth,
-            frameHeight: frameHeight
+        let node = (
+            textOffset: 0,
+            textLength: text.count,
+            bounds: bounds,
+            windowIndex: Optional<Int>.none
         )
+
+        if redactedNodeOrders.isEmpty {
+            try await database.insertNodes(
+                frameID: frameID,
+                nodes: [node],
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
+        } else {
+            let encryptedText = ReversibleOCRScrambler.encryptOCRText(
+                text,
+                frameID: frameID.value,
+                nodeOrder: 0,
+                secret: "test-secret"
+            ) ?? text
+            try await database.insertNodes(
+                frameID: frameID,
+                nodes: [node],
+                encryptedTexts: redactedNodeOrders.contains(0) ? [0: encryptedText] : [:],
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
+        }
+    }
+
+    private func waitForProcessingStatus(
+        frameID: Int64,
+        expected: Int,
+        timeoutNs: UInt64 = 2_000_000_000
+    ) async throws -> Int? {
+        let start = ContinuousClock.now
+
+        while ContinuousClock.now - start < .nanoseconds(Int64(timeoutNs)) {
+            let statuses = try await database.getFrameProcessingStatuses(frameIDs: [frameID])
+            if statuses[frameID] == expected {
+                return expected
+            }
+            try await Task.sleep(for: .milliseconds(50), clock: .continuous)
+        }
+
+        let statuses = try await database.getFrameProcessingStatuses(frameIDs: [frameID])
+        return statuses[frameID]
     }
 
     private func makeRawLinkMetadataJSON(

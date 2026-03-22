@@ -31,7 +31,7 @@ public class AppCoordinatorWrapper: ObservableObject {
 
     // MARK: - Lifecycle
 
-    public func initialize() async throws {
+    public func initialize(autoStartRecording: Bool = true) async throws {
         Log.debug("[AppCoordinatorWrapper] initialize() called - starting coordinator.initialize()", category: .app)
         try await coordinator.initialize()
         Log.debug("[AppCoordinatorWrapper] coordinator.initialize() completed", category: .app)
@@ -43,26 +43,37 @@ public class AppCoordinatorWrapper: ObservableObject {
             }
         }
 
+        await updateStatus()
+
+        guard autoStartRecording else {
+            Log.debug("[AppCoordinatorWrapper] Deferring auto-start until launch guards complete", category: .app)
+            return
+        }
+
+        await autoStartRecordingIfNeeded()
+    }
+
+    public func autoStartRecordingIfNeeded() async {
         let hasCompletedOnboarding = await coordinator.onboardingManager.hasCompletedOnboarding
         if !hasCompletedOnboarding {
             Log.debug("[AppCoordinatorWrapper] Skipping auto-start: onboarding not completed", category: .app)
             return
         }
 
-        // Auto-start recording if it was previously running
         let shouldAutoStart = AppCoordinator.shouldAutoStartRecording()
         Log.debug("[AppCoordinatorWrapper] shouldAutoStartRecording() = \(shouldAutoStart)", category: .app)
-        if shouldAutoStart {
-            Log.debug("[AppCoordinatorWrapper] Auto-starting recording based on previous state", category: .app)
-            do {
-                try await coordinator.startPipeline()
-                await updateStatus()
-                Log.debug("[AppCoordinatorWrapper] Auto-start recording succeeded", category: .app)
-            } catch {
-                Log.error("[AppCoordinatorWrapper] Auto-start recording failed: \(error)", category: .app)
-            }
-        } else {
+        guard shouldAutoStart else {
             Log.debug("[AppCoordinatorWrapper] Not auto-starting (shouldAutoStart=false)", category: .app)
+            return
+        }
+
+        Log.debug("[AppCoordinatorWrapper] Auto-starting recording based on previous state", category: .app)
+        do {
+            try await coordinator.startPipeline()
+            await updateStatus()
+            Log.debug("[AppCoordinatorWrapper] Auto-start recording succeeded", category: .app)
+        } catch {
+            Log.error("[AppCoordinatorWrapper] Auto-start recording failed: \(error)", category: .app)
         }
     }
 

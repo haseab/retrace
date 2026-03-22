@@ -6,6 +6,7 @@ import Database
 import SQLCipher
 import Darwin
 import IOKit.ps
+import UniformTypeIdentifiers
 
 enum SingleInstanceLock {
     enum AcquireResult {
@@ -336,7 +337,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let wrapper = AppCoordinatorWrapper()
             self.coordinatorWrapper = wrapper
-            try await wrapper.initialize()
+            try await wrapper.initialize(autoStartRecording: false)
             Log.info("[AppDelegate] Coordinator initialized successfully", category: .app)
 
             configureWatchdogAutoQuit()
@@ -369,6 +370,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ProcessCPUMonitor.shared.start()
 
             Log.info("[AppDelegate] Menu bar and window controllers initialized", category: .app)
+
+            let launchRequestedAutoStart = AppCoordinator.shouldAutoStartRecording()
+            let shouldAllowLaunchAutoStart = await handleMissingMasterKeyRedactionIfNeeded(
+                coordinator: wrapper.coordinator,
+                autoStartRequested: launchRequestedAutoStart
+            )
+            if launchRequestedAutoStart && shouldAllowLaunchAutoStart {
+                await wrapper.autoStartRecordingIfNeeded()
+            } else if launchRequestedAutoStart {
+                Log.warning(
+                    "[AppDelegate] Skipping launch auto-start because the missing master key flow was deferred",
+                    category: .app
+                )
+            }
 
             // Mark as initialized before processing pending deeplinks
             isInitialized = true
@@ -729,6 +744,139 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         TimelineWindowController.shared.hide()
         DashboardWindowController.shared.hide()
         NSApp.hide(nil)
+    }
+
+    private func handleMissingMasterKeyRedactionIfNeeded(
+        coordinator: AppCoordinator,
+        autoStartRequested: Bool
+    ) async -> Bool {
+        let state = await coordinator.missingMasterKeyRedactionState()
+        guard state.requiresRecoveryPrompt else { return true }
+
+        let outcome = await MasterKeyRedactionFlowCoordinator.resolveMissingKey(
+            coordinator: coordinator,
+            state: state,
+            defaults: settingsStore,
+            configuration: .startup,
+            recordMetric: { action, metadata in
+                Task {
+                    await self.recordMasterKeyLaunchMetric(
+                        coordinator: coordinator,
+                        action: action,
+                        metadata: metadata
+                    )
+                }
+            }
+        )
+
+        switch outcome {
+        case .recoveredExistingKey, .keyAlreadyAvailable:
+            MasterKeyPromptUI.showRecoveredAlert(hasPendingRewrites: state.hasPendingRedactionRewrites)
+            return true
+        case .createdFreshKey(let recoveryPhrase, let abandonedRewriteCount):
+            await presentRecoveryPhraseSavePrompt(
+                coordinator: coordinator,
+                recoveryPhrase: recoveryPhrase,
+                abandonedRewriteCount: abandonedRewriteCount
+            )
+            return true
+        case .deferred:
+            if autoStartRequested {
+                await recordMasterKeyLaunchMetric(
+                    coordinator: coordinator,
+                    action: "startup_missing_key_autostart_blocked"
+                )
+                return false
+            }
+            return true
+        }
+    }
+
+    private func presentRecoveryPhraseSavePrompt(
+        coordinator: AppCoordinator,
+        recoveryPhrase: String,
+        abandonedRewriteCount: Int
+    ) async {
+        let abandonmentMessage: String
+        if abandonedRewriteCount > 0 {
+            abandonmentMessage = "\n\n\(abandonedRewriteCount) pending redaction rewrite job(s) tied to the missing key were marked failed."
+        } else {
+            abandonmentMessage = ""
+        }
+
+        while true {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.icon = NSApp.applicationIconImage
+            alert.messageText = "Save Your Recovery Phrase"
+            alert.informativeText = """
+                Store this offline and keep it private.
+
+                Anyone with this phrase can recover your protected data. If you lose both this phrase and the Keychain copy on this Mac, that data is gone.\(abandonmentMessage)
+
+                Recovery Phrase:
+                \(recoveryPhrase)
+                """
+            alert.addButton(withTitle: "I Saved It")
+            alert.addButton(withTitle: "Copy Phrase")
+            alert.addButton(withTitle: "Save TXT")
+
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                MasterKeyManager.noteRecoveryPhraseShown(defaults: settingsStore)
+                await recordMasterKeyLaunchMetric(
+                    coordinator: coordinator,
+                    action: "startup_missing_key_recovery_acknowledged"
+                )
+                return
+            case .alertSecondButtonReturn:
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(recoveryPhrase, forType: .string)
+                await recordMasterKeyLaunchMetric(
+                    coordinator: coordinator,
+                    action: "startup_missing_key_recovery_copied"
+                )
+            default:
+                switch MasterKeyPromptUI.saveRecoveryPhraseDocument(recoveryPhrase) {
+                case .saved:
+                    await recordMasterKeyLaunchMetric(
+                        coordinator: coordinator,
+                        action: "startup_missing_key_recovery_downloaded"
+                    )
+                case .cancelled:
+                    await recordMasterKeyLaunchMetric(
+                        coordinator: coordinator,
+                        action: "startup_missing_key_recovery_download_cancelled"
+                    )
+                case .failed:
+                    await recordMasterKeyLaunchMetric(
+                        coordinator: coordinator,
+                        action: "startup_missing_key_recovery_download_failed"
+                    )
+                }
+            }
+        }
+    }
+
+    private func recordMasterKeyLaunchMetric(
+        coordinator: AppCoordinator,
+        action: String,
+        metadata: [String: Any] = [:]
+    ) async {
+        var payload = metadata
+        payload["action"] = action
+        payload["source"] = "startup_missing_key_redaction"
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        try? await coordinator.recordMetricEvent(
+            metricType: .masterKeyFlow,
+            metadata: json
+        )
     }
 
     // MARK: - Storage Path Validation

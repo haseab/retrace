@@ -37,6 +37,20 @@ public struct FrameInPageURLState: Sendable, Equatable {
     }
 }
 
+public struct PendingNodeRedactionJob: Sendable, Equatable {
+    public let frameID: Int64
+    public let frameIndex: Int
+    public let nodeID: Int
+    public let normalizedRect: CGRect
+
+    public init(frameID: Int64, frameIndex: Int, nodeID: Int, normalizedRect: CGRect) {
+        self.frameID = frameID
+        self.frameIndex = frameIndex
+        self.nodeID = nodeID
+        self.normalizedRect = normalizedRect
+    }
+}
+
 /// Task-local diagnostics propagated across actor hops so callers can stamp enqueue time.
 public enum DatabaseActorTraceContext {
     @TaskLocal public static var requestEnqueuedAt: CFAbsoluteTime?
@@ -557,11 +571,20 @@ public actor DatabaseManager: DatabaseProtocol {
                 n.topY,
                 n.width,
                 n.height,
-                sc.c0,
+                CASE WHEN n.encryptedText IS NOT NULL THEN 1 ELSE 0 END AS isRedacted,
+                CASE
+                    WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                    ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
+                END AS nodeText,
+                n.encryptedText,
                 n.frameId
             FROM node n
-            JOIN doc_segment ds ON n.frameId = ds.frameId
-            JOIN searchRanking_content sc ON ds.docid = sc.id
+            LEFT JOIN (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                GROUP BY frameId
+            ) ds ON n.frameId = ds.frameId
+            LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
             ORDER BY n.nodeOrder ASC
             """
@@ -582,33 +605,17 @@ public actor DatabaseManager: DatabaseProtocol {
         while sqlite3_step(statement) == SQLITE_ROW {
             let id = Int(sqlite3_column_int64(statement, 0))
             let nodeOrder = Int(sqlite3_column_int(statement, 1))
-            let textOffset = Int(sqlite3_column_int(statement, 2))
-            let textLength = Int(sqlite3_column_int(statement, 3))
             let leftX = sqlite3_column_double(statement, 4)
             let topY = sqlite3_column_double(statement, 5)
             let width = sqlite3_column_double(statement, 6)
             let height = sqlite3_column_double(statement, 7)
+            let isRedacted = sqlite3_column_int(statement, 8) != 0
 
-            // Extract text substring
-            guard let fullTextCStr = sqlite3_column_text(statement, 8) else { continue }
-            let fullText = String(cString: fullTextCStr)
+            let text = sqlite3_column_text(statement, 9).map { String(cString: $0) } ?? ""
+            let encryptedText = sqlite3_column_text(statement, 10).map { String(cString: $0) }
 
-            // Column 9: frameId for debugging
-            let nodeFrameId = sqlite3_column_int64(statement, 9)
-
-            let startIndex = fullText.index(
-                fullText.startIndex,
-                offsetBy: textOffset,
-                limitedBy: fullText.endIndex
-            ) ?? fullText.endIndex
-
-            let endIndex = fullText.index(
-                startIndex,
-                offsetBy: textLength,
-                limitedBy: fullText.endIndex
-            ) ?? fullText.endIndex
-
-            let text = String(fullText[startIndex..<endIndex])
+            // Column 11: frameId for debugging
+            let nodeFrameId = sqlite3_column_int64(statement, 11)
 
             results.append(OCRNodeWithText(
                 id: id,
@@ -618,7 +625,9 @@ public actor DatabaseManager: DatabaseProtocol {
                 y: topY,
                 width: width,
                 height: height,
-                text: text
+                text: text,
+                encryptedText: encryptedText,
+                isRedacted: isRedacted
             ))
         }
 
@@ -1991,6 +2000,26 @@ public actor DatabaseManager: DatabaseProtocol {
                 db: db,
                 frameID: frameID,
                 nodes: nodes,
+                encryptedTexts: [:],
+                frameWidth: frameWidth,
+                frameHeight: frameHeight
+            )
+        }
+    }
+
+    public func insertNodes(
+        frameID: FrameID,
+        nodes: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)],
+        encryptedTexts: [Int: String],
+        frameWidth: Int,
+        frameHeight: Int
+    ) async throws {
+        try withTracedDatabaseOperation("insert_nodes_batch_encrypted") { db in
+            try NodeQueries.insertBatch(
+                db: db,
+                frameID: frameID,
+                nodes: nodes,
+                encryptedTexts: encryptedTexts,
                 frameWidth: frameWidth,
                 frameHeight: frameHeight
             )
@@ -2069,6 +2098,216 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try FTSQueries.deleteForFrame(db: db, frameId: frameId)
+    }
+
+    public func getPendingNodeRedactionJobs(
+        videoID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws -> [PendingNodeRedactionJob] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let pendingStatuses = includeInProgressJobs ? [5, 6] : [5]
+        let includedStatuses = includeRetryableFailures
+            ? Array(Set(pendingStatuses + [8])).sorted()
+            : pendingStatuses
+        let statusFilter = includedStatuses.count == 1
+            ? "f.processingStatus = \(includedStatuses[0])"
+            : "f.processingStatus IN (\(includedStatuses.map(String.init).joined(separator: ", ")))"
+        let sql = """
+            SELECT
+                f.id,
+                f.videoFrameIndex,
+                n.id,
+                n.leftX,
+                n.topY,
+                n.width,
+                n.height
+            FROM frame f
+            JOIN node n ON n.frameId = f.id
+            WHERE f.videoId = ?
+              AND \(statusFilter)
+              AND COALESCE(f.rewritePurpose, 'redaction') = 'redaction'
+              AND n.encryptedText IS NOT NULL
+            ORDER BY f.videoFrameIndex ASC, n.nodeOrder ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+
+        var jobs: [PendingNodeRedactionJob] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frameID = sqlite3_column_int64(statement, 0)
+            let frameIndex = Int(sqlite3_column_int(statement, 1))
+            let nodeID = Int(sqlite3_column_int64(statement, 2))
+            let leftX = sqlite3_column_double(statement, 3)
+            let topY = sqlite3_column_double(statement, 4)
+            let width = sqlite3_column_double(statement, 5)
+            let height = sqlite3_column_double(statement, 6)
+            jobs.append(
+                PendingNodeRedactionJob(
+                    frameID: frameID,
+                    frameIndex: frameIndex,
+                    nodeID: nodeID,
+                    normalizedRect: CGRect(x: leftX, y: topY, width: width, height: height)
+                )
+            )
+        }
+
+        return jobs
+    }
+
+    /// Return distinct video IDs that still have frame-level redaction work pending or in progress.
+    public func getVideoIDsWithPendingNodeRedactions(
+        includeRetryableFailures: Bool = false
+    ) async throws -> [Int64] {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let statuses = includeRetryableFailures ? [5, 6, 8] : [5, 6]
+        let sql = """
+            SELECT DISTINCT f.videoId
+            FROM frame f
+            JOIN node n ON n.frameId = f.id
+            WHERE f.processingStatus IN (\(statuses.map(String.init).joined(separator: ", ")))
+              AND COALESCE(f.rewritePurpose, 'redaction') = 'redaction'
+              AND n.encryptedText IS NOT NULL
+            ORDER BY f.videoId ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        var videoIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            videoIDs.append(sqlite3_column_int64(statement, 0))
+        }
+
+        return videoIDs
+    }
+
+    public func hasProtectedPhraseRedactionData() async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT EXISTS(
+                SELECT 1
+                FROM node
+                WHERE encryptedText IS NOT NULL
+                LIMIT 1
+            );
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        return sqlite3_column_int(statement, 0) != 0
+    }
+
+    public func abandonPendingNodeRedactions(missingKeyRewritePurpose: String) async throws -> Int {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            UPDATE frame
+            SET processingStatus = 8,
+                rewritePurpose = ?
+            WHERE processingStatus IN (5, 6, 8)
+              AND COALESCE(rewritePurpose, 'redaction') = 'redaction'
+              AND EXISTS (
+                  SELECT 1
+                  FROM node n
+                  WHERE n.frameId = frame.id
+                    AND n.encryptedText IS NOT NULL
+              );
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(statement, 1, missingKeyRewritePurpose, -1, transient)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        return Int(sqlite3_changes(db))
+    }
+
+    /// Returns true when a video still has frames waiting on OCR/readability before
+    /// phrase-level rewrite batching should run.
+    public func videoHasFramesAwaitingOCR(videoID: Int64) async throws -> Bool {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let sql = """
+            SELECT 1
+            FROM frame
+            WHERE videoId = ?
+              AND processingStatus IN (0, 1, 4)
+            LIMIT 1;
+            """
+
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, videoID)
+        return sqlite3_step(statement) == SQLITE_ROW
     }
 
     // MARK: - Daily Metrics Operations
@@ -2612,6 +2851,12 @@ public actor DatabaseManager: DatabaseProtocol {
             return
         }
 
+        // TODO(master-key-recovery): When DB encryption is formally integrated into the
+        // missing-key UX, stop silently generating a replacement SQLCipher key here.
+        // We want a startup decision tree that lets the user recover the original DB key,
+        // explicitly create a new one with destructive confirmation, or abort opening the
+        // encrypted database. That branch is intentionally deferred for now.
+
         // Get or generate encryption key from Keychain
         let keychainService = AppPaths.keychainService
         let keychainAccount = AppPaths.keychainAccount
@@ -2904,13 +3149,13 @@ public actor DatabaseManager: DatabaseProtocol {
         return Int(sqlite3_column_int(stmt, 0))
     }
 
-    /// Get count of frames that are pending or currently processing (status 0 or 1)
+    /// Get count of frames that are pending or currently processing (status 0, 1, or rewrite-processing 6)
     public func getPendingFrameCount() async throws -> Int {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus IN (0, 1);"
+        let sql = "SELECT COUNT(*) FROM frame WHERE processingStatus IN (0, 1, 6);"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 
@@ -2922,13 +3167,23 @@ public actor DatabaseManager: DatabaseProtocol {
         return Int(sqlite3_column_int(stmt, 0))
     }
 
-    /// Get separate counts for pending (status 0) and processing (status 1) frames
-    public func getFrameStatusCounts() async throws -> (pending: Int, processing: Int) {
+    /// Get separate counts for OCR and rewrite lanes.
+    public func getFrameStatusCounts() async throws -> (
+        ocrPending: Int,
+        ocrProcessing: Int,
+        rewritePending: Int,
+        rewriteProcessing: Int
+    ) {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        let sql = "SELECT processingStatus, COUNT(*) FROM frame WHERE processingStatus IN (0, 1) GROUP BY processingStatus;"
+        let sql = """
+            SELECT processingStatus, COUNT(*)
+            FROM frame
+            WHERE processingStatus IN (0, 1, 5, 6)
+            GROUP BY processingStatus;
+            """
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
 
@@ -2936,20 +3191,31 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
         }
 
-        var pending = 0
-        var processing = 0
+        var ocrPending = 0
+        var ocrProcessing = 0
+        var rewritePending = 0
+        var rewriteProcessing = 0
 
         while sqlite3_step(stmt) == SQLITE_ROW {
             let status = Int(sqlite3_column_int(stmt, 0))
             let count = Int(sqlite3_column_int(stmt, 1))
             if status == 0 {
-                pending = count
+                ocrPending = count
             } else if status == 1 {
-                processing = count
+                ocrProcessing = count
+            } else if status == 5 {
+                rewritePending = count
+            } else if status == 6 {
+                rewriteProcessing = count
             }
         }
 
-        return (pending: pending, processing: processing)
+        return (
+            ocrPending: ocrPending,
+            ocrProcessing: ocrProcessing,
+            rewritePending: rewritePending,
+            rewriteProcessing: rewriteProcessing
+        )
     }
 
     /// Clear the entire processing queue (used when changing database location)
@@ -2996,12 +3262,36 @@ public actor DatabaseManager: DatabaseProtocol {
     /// Get count of frames processed per minute for the last N minutes
     /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute
     public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await getFrameCountsPerMinute(
+            lastMinutes: lastMinutes,
+            timestampColumn: "processedAt",
+            extraWhereClause: "",
+            logLabel: "processed"
+        )
+    }
+
+    /// Get count of frames rewritten per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where offset 0 = current minute.
+    public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        try await getFrameCountsPerMinute(
+            lastMinutes: lastMinutes,
+            timestampColumn: "rewrittenAt",
+            extraWhereClause: "",
+            logLabel: "rewritten"
+        )
+    }
+
+    private func getFrameCountsPerMinute(
+        lastMinutes: Int,
+        timestampColumn: String,
+        extraWhereClause: String,
+        logLabel: String
+    ) async throws -> [Int: Int] {
         guard let db = db else {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
 
-        // Query frames by processedAt (when OCR completed) in the last N minutes
-        // processedAt is stored as INTEGER Unix timestamp in milliseconds
+        // Query frames by timestampColumn (stored as INTEGER Unix timestamp in milliseconds)
         // Use clean minute boundaries (floor to start of minute) for consistent bucketing
         // e.g., 17:05:23 becomes minute key for 17:05:00
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -3013,11 +3303,12 @@ public actor DatabaseManager: DatabaseProtocol {
         // minuteOffset 1 = previous minute (e.g., 17:04:00 to 17:04:59)
         let sql = """
             SELECT
-                CAST((\(currentMinuteMs) - (processedAt / 60000) * 60000) / 60000 AS INTEGER) as minuteOffset,
+                CAST((\(currentMinuteMs) - (\(timestampColumn) / 60000) * 60000) / 60000 AS INTEGER) as minuteOffset,
                 COUNT(*) as count
             FROM frame
-            WHERE processedAt IS NOT NULL
-              AND processedAt >= \(cutoffMs)
+            WHERE \(timestampColumn) IS NOT NULL
+              AND \(timestampColumn) >= \(cutoffMs)
+              \(extraWhereClause)
             GROUP BY minuteOffset
             ORDER BY minuteOffset ASC;
         """
@@ -3038,7 +3329,10 @@ public actor DatabaseManager: DatabaseProtocol {
             }
         }
 
-        Log.debug("[DatabaseManager] getFramesProcessedPerMinute returned \(result.count) minute buckets, total: \(result.values.reduce(0, +)) frames", category: .database)
+        Log.debug(
+            "[DatabaseManager] getFrames\(logLabel.capitalized)PerMinute returned \(result.count) minute buckets, total: \(result.values.reduce(0, +)) frames",
+            category: .database
+        )
 
         return result
     }
@@ -3073,17 +3367,45 @@ public actor DatabaseManager: DatabaseProtocol {
         }
     }
 
-    /// Update frame processing status
-    /// When status is 2 (completed), also sets processedAt timestamp
+    /// Update frame processing status.
+    /// Ordinary OCR statuses clear any stored rewritePurpose.
+    /// Status 2 records OCR completion in processedAt.
+    /// Status 7 records rewrite completion in rewrittenAt.
     public func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws {
+        try await updateFrameProcessingStatus(frameID: frameID, status: status, rewritePurpose: nil)
+    }
+
+    /// Update frame processing status with an optional rewrite purpose for rewrite-lane statuses (5-8).
+    public func updateFrameProcessingStatus(
+        frameID: Int64,
+        status: Int,
+        rewritePurpose: String?
+    ) async throws {
         try withTracedDatabaseOperation("update_frame_processing_status") { db in
-            // If status is 2 (completed), also set processedAt timestamp
+            let isRewriteStatus = (5...8).contains(status)
+            let shouldBindRewritePurpose = rewritePurpose != nil || !isRewriteStatus
             let sql: String
+
             if status == 2 {
                 let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-                sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+                if shouldBindRewritePurpose {
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs), rewritePurpose = ? WHERE id = ?;"
+                } else {
+                    sql = "UPDATE frame SET processingStatus = ?, processedAt = \(nowMs) WHERE id = ?;"
+                }
+            } else if status == 7 {
+                let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                if shouldBindRewritePurpose {
+                    sql = "UPDATE frame SET processingStatus = ?, rewrittenAt = \(nowMs), rewritePurpose = ? WHERE id = ?;"
+                } else {
+                    sql = "UPDATE frame SET processingStatus = ?, rewrittenAt = \(nowMs) WHERE id = ?;"
+                }
             } else {
-                sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+                if shouldBindRewritePurpose {
+                    sql = "UPDATE frame SET processingStatus = ?, rewritePurpose = ? WHERE id = ?;"
+                } else {
+                    sql = "UPDATE frame SET processingStatus = ? WHERE id = ?;"
+                }
             }
 
             var stmt: OpaquePointer?
@@ -3094,7 +3416,17 @@ public actor DatabaseManager: DatabaseProtocol {
             }
 
             sqlite3_bind_int(stmt, 1, Int32(status))
-            sqlite3_bind_int64(stmt, 2, frameID)
+            if shouldBindRewritePurpose {
+                if let rewritePurpose {
+                    let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                    sqlite3_bind_text(stmt, 2, rewritePurpose, -1, transient)
+                } else {
+                    sqlite3_bind_null(stmt, 2)
+                }
+                sqlite3_bind_int64(stmt, 3, frameID)
+            } else {
+                sqlite3_bind_int64(stmt, 2, frameID)
+            }
 
             guard sqlite3_step(stmt) == SQLITE_DONE else {
                 throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
@@ -3148,7 +3480,7 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     /// Get processing status for multiple frames in a single query
-    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    /// Returns dictionary of frameID -> processingStatus
     public func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int] {
         guard !frameIDs.isEmpty else {
             return [:]

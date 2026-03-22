@@ -66,6 +66,9 @@ retrace/
 ├── Shared/                      # CRITICAL: Shared types and protocols
 │   ├── Logging.swift            # Central log utility (Log.debug/info/warning/error)
 │   ├── AppPaths.swift           # Application path configuration
+│   ├── BGRAImageUtilities.swift # Shared BGRA conversion + patch extraction helpers
+│   ├── MasterKeyManager.swift   # Keychain-backed master key creation + recovery phrase export
+│   ├── ReversibleOCRScrambler.swift # Deterministic reversible OCR patch scrambling + text protection
 │   ├── Models/                  # Data types used across modules
 │   │   ├── Frame.swift          # FrameID, CapturedFrame, VideoSegment
 │   │   ├── Text.swift           # ExtractedText, OCRTextRegion
@@ -160,6 +163,7 @@ retrace/
     ├── CrashRecoverySupport/    # Shared crash-recovery support code for app + helper targets
     ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
+    │   └── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback)
     ├── Views/
     │   ├── Dashboard/           # App usage analytics views
@@ -456,4 +460,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-17_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-21_

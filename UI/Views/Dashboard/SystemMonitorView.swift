@@ -42,6 +42,7 @@ public struct SystemMonitorView: View {
                         VStack(alignment: .leading, spacing: 16) {
                             // OCR Processing Section
                             ocrProcessingSection
+                            videoRewritingSection
                                 .padding(.bottom, 40)
                             processResourceSummarySection(isCompactLayout: isCompactLayout)
 
@@ -225,303 +226,362 @@ public struct SystemMonitorView: View {
     // MARK: - OCR Processing Section
 
     private var ocrProcessingSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(spacing: 0) {
-                HStack {
-                    Image(systemName: "text.viewfinder")
-                        .font(.retraceCallout)
-                        .foregroundColor(.retraceSecondary)
-                    Text("OCR Processing")
-                        .font(.retraceCalloutBold)
-                        .foregroundColor(.retracePrimary)
-
-                    Spacer()
-                    statusBadge
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 14)
-
+        activityMonitorCard(
+            model: ocrMonitorCardModel,
+            hoveredIndex: $viewModel.hoveredOCRBarIndex
+        ) {
+            if viewModel.isPausedForBattery {
                 Divider()
                     .background(Color.white.opacity(0.06))
 
-                // Chart area
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack(spacing: 6) {
-                        Text("Frames processed")
-                            .font(.retraceCaption)
-                            .foregroundColor(.retraceSecondary)
-                        Text("·")
+                HStack(spacing: 8) {
+                    Image(systemName: "bolt.slash.fill")
+                        .font(.retraceCaption)
+                        .foregroundColor(.orange)
+                    Text("Processing paused by power settings — adjust them in ")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary)
+                    + Text("Settings")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceAccent)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
+                        coordinator: coordinator,
+                        source: "monitor_paused_warning"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.05))
+            }
+
+            if !viewModel.ocrEnabled {
+                Divider()
+                    .background(Color.white.opacity(0.06))
+
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.retraceAccent.opacity(0.28))
+                            .frame(width: 28, height: 28)
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("OCR is paused")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.95))
+                        Text("New frames are still captured, but text won’t be searchable until OCR resumes.")
                             .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.5))
-                        Text("Last 30 min")
+                            .foregroundColor(.white.opacity(0.78))
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Text("Open Power Settings")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceAccent.opacity(0.30))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.retraceAccent.opacity(0.55), lineWidth: 1)
+                    )
+                    .cornerRadius(8)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
+                        coordinator: coordinator,
+                        source: "monitor_ocr_disabled_warning"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.retraceAccent.opacity(0.22),
+                                    Color.retraceAccent.opacity(0.10)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.retraceAccent.opacity(0.35), lineWidth: 1)
+                        )
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+
+            if viewModel.shouldShowPerformanceNudge {
+                Divider()
+                    .background(Color.white.opacity(0.06))
+
+                HStack(alignment: .center, spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.orange.opacity(0.25))
+                            .frame(width: 30, height: 30)
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.orange)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Large OCR Backlog Detected")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.96))
+                        Text("\(viewModel.ocrQueueDepth) frames queued. Go to System Settings to increase your OCR Priority.")
+                            .font(.retraceCaption2)
+                            .foregroundColor(.white.opacity(0.82))
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Text("Go to System Settings")
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.95))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.retraceAccent.opacity(0.3))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.retraceAccent.opacity(0.6), lineWidth: 1)
+                    )
+                    .cornerRadius(8)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    DashboardViewModel.recordSystemMonitorOpenPowerOCRPriority(
+                        coordinator: coordinator,
+                        source: "monitor_backlog_nudge"
+                    )
+                    NotificationCenter.default.post(name: .openSettingsPowerOCRPriority, object: nil)
+                }
+                .padding(14)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.orange.opacity(0.24),
+                                    Color.orange.opacity(0.12)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.orange.opacity(0.42), lineWidth: 1)
+                        )
+                )
+                .padding(.horizontal, 8)
+                .padding(.vertical, 8)
+            }
+        }
+    }
+
+    private var videoRewritingSection: some View {
+        activityMonitorCard(
+            model: videoRewritingCardModel,
+            hoveredIndex: $viewModel.hoveredRewriteBarIndex
+        ) {
+            EmptyView()
+        }
+    }
+
+    private var ocrMonitorCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "text.viewfinder",
+            title: "OCR Processing",
+            statusText: viewModel.ocrStatusBadgeText,
+            statusColor: viewModel.ocrStatusColor,
+            metricTitle: "Frames processed",
+            history: viewModel.ocrProcessingHistory,
+            completedLast30Minutes: viewModel.ocrProcessedLast30Min,
+            completedLabel: "processed",
+            activeCount: viewModel.ocrProcessingCount,
+            activeLabel: "processing",
+            pendingCount: viewModel.ocrPendingCount,
+            pendingLabel: "pending",
+            queueDepth: viewModel.ocrQueueDepth,
+            etaText: viewModel.ocrEtaText,
+            etaSuffixText: viewModel.ocrEtaSuffixText,
+            backlogAxisLabel: "backlog"
+        )
+    }
+
+    private var videoRewritingCardModel: ActivityMonitorCardModel {
+        ActivityMonitorCardModel(
+            icon: "film.stack",
+            title: "Video Rewriting",
+            statusText: viewModel.rewriteStatusBadgeText,
+            statusColor: viewModel.rewriteStatusColor,
+            metricTitle: "Frames rewritten",
+            history: viewModel.rewriteHistory,
+            completedLast30Minutes: viewModel.rewrittenLast30Min,
+            completedLabel: "rewritten",
+            activeCount: viewModel.rewriteProcessingCount,
+            activeLabel: "rewriting",
+            pendingCount: viewModel.rewritePendingCount,
+            pendingLabel: "queued",
+            queueDepth: viewModel.rewriteQueueDepth,
+            etaText: viewModel.rewriteEtaText,
+            etaSuffixText: viewModel.rewriteEtaSuffixText,
+            backlogAxisLabel: "queue"
+        )
+    }
+
+    private func activityMonitorCard<Footer: View>(
+        model: ActivityMonitorCardModel,
+        hoveredIndex: Binding<Int?>,
+        @ViewBuilder footer: () -> Footer
+    ) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: model.icon)
+                    .font(.retraceCallout)
+                    .foregroundColor(.retraceSecondary)
+                Text(model.title)
+                    .font(.retraceCalloutBold)
+                    .foregroundColor(.retracePrimary)
+
+                Spacer()
+                statusBadge(text: model.statusText, color: model.statusColor)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 6) {
+                    Text(model.metricTitle)
+                        .font(.retraceCaption)
+                        .foregroundColor(.retraceSecondary)
+                    Text("·")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.5))
+                    Text("Last 30 min")
+                        .font(.retraceCaption2)
+                        .foregroundColor(.retraceSecondary.opacity(0.7))
+                    Spacer()
+                }
+
+                ActivityBarChart(
+                    dataPoints: model.history,
+                    pendingCount: model.pendingCount,
+                    processingCount: model.activeCount,
+                    completedTint: model.completedTint,
+                    activeTint: model.activeTint,
+                    pendingTint: model.pendingTint,
+                    backlogLabel: model.backlogAxisLabel,
+                    hoveredIndex: hoveredIndex
+                )
+                .frame(height: 140)
+            }
+            .padding(.vertical, 16)
+            .padding(.horizontal, 20)
+
+            Divider()
+                .background(Color.white.opacity(0.06))
+
+            HStack(spacing: 16) {
+                HStack(spacing: 4) {
+                    Text("\(model.completedLast30Minutes)")
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
+                        .foregroundColor(model.completedTint)
+                    if model.isIdle {
+                        Text("\(model.completedLabel) in the last 30 minutes")
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
-                        Spacer()
+                    } else {
+                        Text(model.completedLabel)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
-
-                    ProcessingBarChart(
-                        dataPoints: viewModel.processingHistory,
-                        pendingCount: viewModel.pendingCount,
-                        processingCount: viewModel.processingCount,
-                        hoveredIndex: $viewModel.hoveredBarIndex
-                    )
-                    .frame(height: 140)
                 }
-                .padding(.vertical, 16)
-                .padding(.horizontal, 20)
 
-                Divider()
-                    .background(Color.white.opacity(0.06))
+                if model.activeCount > 0 {
+                    Circle()
+                        .fill(Color.retraceSecondary.opacity(0.3))
+                        .frame(width: 3, height: 3)
 
-                // Stats row - horizontal layout with dots between
-                HStack(spacing: 16) {
-                    // Processed (left) - blue
                     HStack(spacing: 4) {
-                        Text("\(viewModel.processedLast30Min)")
+                        Text("\(model.activeCount)")
                             .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .foregroundColor(.retraceAccent)
-                        // Show "in the last 30 minutes" only when idle (no pending/processing)
-                        if viewModel.processingCount == 0 && viewModel.pendingCount == 0 {
-                            Text("processed in the last 30 minutes")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        } else {
-                            Text("processed")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                    }
-
-                    if viewModel.processingCount > 0 {
-                        Circle()
-                            .fill(Color.retraceSecondary.opacity(0.3))
-                            .frame(width: 3, height: 3)
-
-                        // Processing (status 1) - green
-                        HStack(spacing: 4) {
-                            Text("\(viewModel.processingCount)")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.green)
-                            Text("processing")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                    }
-
-                    if viewModel.pendingCount > 0 {
-                        Circle()
-                            .fill(Color.retraceSecondary.opacity(0.3))
-                            .frame(width: 3, height: 3)
-
-                        // Pending (status 0) - orange
-                        HStack(spacing: 4) {
-                            Text("\(viewModel.pendingCount)")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.orange)
-                            Text("pending")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                    }
-
-                    Spacer()
-
-                    // ETA (right side)
-                    if viewModel.queueDepth > 0 {
-                        HStack(spacing: 4) {
-                            Text(viewModel.etaText)
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundColor(.retracePrimary)
-                            Text(viewModel.etaSuffixText)
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                    }
-                }
-                .padding(.vertical, 12)
-                .padding(.horizontal, 16)
-
-                // Paused warning
-                if viewModel.isPausedForBattery {
-                    Divider()
-                        .background(Color.white.opacity(0.06))
-
-                    HStack(spacing: 8) {
-                        Image(systemName: "bolt.slash.fill")
-                            .font(.retraceCaption)
-                            .foregroundColor(.orange)
-                        Text("Processing paused by power settings — adjust them in ")
+                            .foregroundColor(model.activeTint)
+                        Text(model.activeLabel)
                             .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary)
-                        + Text("Settings")
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                    }
+                }
+
+                if model.pendingCount > 0 {
+                    Circle()
+                        .fill(Color.retraceSecondary.opacity(0.3))
+                        .frame(width: 3, height: 3)
+
+                    HStack(spacing: 4) {
+                        Text("\(model.pendingCount)")
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundColor(model.pendingTint)
+                        Text(model.pendingLabel)
                             .font(.retraceCaption2)
-                            .foregroundColor(.retraceAccent)
-                        Spacer()
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
-                            coordinator: coordinator,
-                            source: "monitor_paused_warning"
-                        )
-                        NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
-                    }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.05))
                 }
 
-                // OCR disabled warning
-                if !viewModel.ocrEnabled {
-                    Divider()
-                        .background(Color.white.opacity(0.06))
+                Spacer()
 
-                    HStack(alignment: .center, spacing: 12) {
-                        ZStack {
-                            Circle()
-                                .fill(Color.retraceAccent.opacity(0.28))
-                                .frame(width: 28, height: 28)
-                            Image(systemName: "eye.slash.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.white)
-                        }
-
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("OCR is paused")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.95))
-                            Text("New frames are still captured, but text won’t be searchable until OCR resumes.")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.white.opacity(0.78))
-                        }
-
-                        Spacer()
-
-                        HStack(spacing: 4) {
-                            Text("Open Power Settings")
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.95))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.retraceAccent.opacity(0.30))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.retraceAccent.opacity(0.55), lineWidth: 1)
-                        )
-                        .cornerRadius(8)
+                if model.queueDepth > 0,
+                   let etaText = model.etaText,
+                   let etaSuffixText = model.etaSuffixText {
+                    HStack(spacing: 4) {
+                        Text(etaText)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundColor(.retracePrimary)
+                        Text(etaSuffixText)
+                            .font(.retraceCaption2)
+                            .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        DashboardViewModel.recordSystemMonitorOpenPowerOCRCard(
-                            coordinator: coordinator,
-                            source: "monitor_ocr_disabled_warning"
-                        )
-                        NotificationCenter.default.post(name: .openSettingsPowerOCRCard, object: nil)
-                    }
-                    .padding(14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color.retraceAccent.opacity(0.22),
-                                        Color.retraceAccent.opacity(0.10)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.retraceAccent.opacity(0.35), lineWidth: 1)
-                            )
-                    )
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 8)
-                }
-
-                if viewModel.shouldShowPerformanceNudge {
-                    Divider()
-                        .background(Color.white.opacity(0.06))
-
-                    HStack(alignment: .center, spacing: 12) {
-                        ZStack {
-                            Circle()
-                                .fill(Color.orange.opacity(0.25))
-                                .frame(width: 30, height: 30)
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundColor(.orange)
-                        }
-
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Large OCR Backlog Detected")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.96))
-                            Text("\(viewModel.queueDepth) frames queued. Go to System Settings to increase your OCR Priority.")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.white.opacity(0.82))
-                        }
-
-                        Spacer()
-
-                        HStack(spacing: 4) {
-                            Text("Go to System Settings")
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 9, weight: .semibold))
-                        }
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.95))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.retraceAccent.opacity(0.3))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.retraceAccent.opacity(0.6), lineWidth: 1)
-                        )
-                        .cornerRadius(8)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        DashboardViewModel.recordSystemMonitorOpenPowerOCRPriority(
-                            coordinator: coordinator,
-                            source: "monitor_backlog_nudge"
-                        )
-                        NotificationCenter.default.post(name: .openSettingsPowerOCRPriority, object: nil)
-                    }
-                    .padding(14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color.orange.opacity(0.24),
-                                        Color.orange.opacity(0.12)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.orange.opacity(0.42), lineWidth: 1)
-                            )
-                    )
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 8)
                 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.white.opacity(0.02))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.06), lineWidth: 1)
-            )
+            .padding(.vertical, 12)
+            .padding(.horizontal, 16)
+
+            footer()
         }
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.white.opacity(0.02))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
     }
 
     private func processResourceSummarySection(isCompactLayout: Bool) -> some View {
@@ -603,12 +663,12 @@ public struct SystemMonitorView: View {
         )
     }
 
-    private var statusBadge: some View {
+    private func statusBadge(text: String, color: Color) -> some View {
         HStack(spacing: 4) {
             Circle()
-                .fill(viewModel.statusColor)
+                .fill(color)
                 .frame(width: 6, height: 6)
-            Text(viewModel.statusBadgeText)
+            Text(text)
                 .font(.retraceCaption2)
                 .foregroundColor(.retraceSecondary)
         }
@@ -616,15 +676,6 @@ public struct SystemMonitorView: View {
         .padding(.vertical, 4)
         .background(Color.white.opacity(0.05))
         .cornerRadius(6)
-    }
-
-    private func formatNumber(_ number: Int) -> String {
-        if number >= 1_000_000 {
-            return String(format: "%.1fM", Double(number) / 1_000_000)
-        } else if number >= 1_000 {
-            return String(format: "%.1fK", Double(number) / 1_000)
-        }
-        return "\(number)"
     }
 
     private var isOuterScrollDisabled: Bool {
@@ -752,12 +803,42 @@ private final class SystemMonitorScrollLatchState: ObservableObject {
     }
 }
 
+private struct ActivityMonitorCardModel {
+    let icon: String
+    let title: String
+    let statusText: String
+    let statusColor: Color
+    let metricTitle: String
+    let history: [ProcessingDataPoint]
+    let completedLast30Minutes: Int
+    let completedLabel: String
+    let activeCount: Int
+    let activeLabel: String
+    let pendingCount: Int
+    let pendingLabel: String
+    let queueDepth: Int
+    let etaText: String?
+    let etaSuffixText: String?
+    let completedTint: Color = .retraceAccent
+    let activeTint: Color = .green
+    let pendingTint: Color = .orange
+    let backlogAxisLabel: String
+
+    var isIdle: Bool {
+        queueDepth == 0
+    }
+}
+
 // MARK: - Processing Bar Chart
 
-struct ProcessingBarChart: View {
+struct ActivityBarChart: View {
     let dataPoints: [ProcessingDataPoint]
     let pendingCount: Int
     let processingCount: Int
+    let completedTint: Color
+    let activeTint: Color
+    let pendingTint: Color
+    let backlogLabel: String
     @Binding var hoveredIndex: Int?
 
     // Backlog hover state
@@ -833,7 +914,7 @@ struct ProcessingBarChart: View {
                                     bottomTrailingRadius: 0,
                                     topTrailingRadius: 2
                                 )
-                                .fill(Color.retraceAccent.opacity(isHovered ? 0.9 : 0.6))
+                                .fill(completedTint.opacity(isHovered ? 0.9 : 0.6))
                                 .frame(width: barWidth, height: max(barHeight, point.count > 0 ? 3 : 1))
                                 .animation(.easeOut(duration: 0.15), value: isHovered)
                                 .contentShape(Rectangle().size(width: barWidth, height: chartHeight))
@@ -916,8 +997,8 @@ struct ProcessingBarChart: View {
                             .frame(width: separatorWidth)
 
                         // Backlog label
-                        Text("backlog")
-                            .foregroundColor(.orange.opacity(0.7))
+                        Text(backlogLabel)
+                            .foregroundColor(pendingTint.opacity(0.7))
                             .frame(width: backlogWidth)
                     }
                 }
@@ -955,7 +1036,7 @@ struct ProcessingBarChart: View {
                         bottomTrailingRadius: 0,
                         topTrailingRadius: 2
                     )
-                    .fill(Color.green.opacity(isHovered ? 1.0 : 0.8))
+                    .fill(activeTint.opacity(isHovered ? 1.0 : 0.8))
                     .frame(width: barWidth, height: max(processingHeight, 3))
                 }
 
@@ -967,7 +1048,7 @@ struct ProcessingBarChart: View {
                         bottomTrailingRadius: 0,
                         topTrailingRadius: processingCount > 0 ? 0 : 2
                     )
-                    .fill(Color.retraceAccent.opacity(isHovered ? 0.9 : 0.6))
+                    .fill(completedTint.opacity(isHovered ? 0.9 : 0.6))
                     .frame(width: barWidth, height: max(processedHeight, processedCount > 0 ? 3 : 1))
                 }
             }
@@ -1013,7 +1094,7 @@ struct ProcessingBarChart: View {
                     bottomTrailingRadius: 0,
                     topTrailingRadius: 3
                 )
-                .fill(Color.orange.opacity(isHoveringBacklog ? 0.8 : 0.5))
+                .fill(pendingTint.opacity(isHoveringBacklog ? 0.8 : 0.5))
                 .frame(width: singleBarWidth, height: max(barHeight, 6))
             }
         }
@@ -1046,12 +1127,12 @@ struct ProcessingBarChart: View {
                 HStack(spacing: 6) {
                     tooltipMetricChip(
                         text: "\(point.count)",
-                        tint: .retraceAccent
+                        tint: completedTint
                     )
                     if isLive && processingCount > 0 {
                         tooltipMetricChip(
                             text: "+\(processingCount)",
-                            tint: .green
+                            tint: activeTint
                         )
                     }
                 }
@@ -1063,16 +1144,16 @@ struct ProcessingBarChart: View {
         VStack(spacing: 0) {
             Text("\(pendingCount)")
                 .font(.system(size: 11, weight: .bold, design: .rounded))
-                .foregroundColor(.orange)
+                .foregroundColor(pendingTint)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(
                     Capsule(style: .continuous)
-                        .fill(Color.orange.opacity(0.18))
+                        .fill(pendingTint.opacity(0.18))
                 )
                 .overlay(
                     Capsule(style: .continuous)
-                        .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+                        .stroke(pendingTint.opacity(0.35), lineWidth: 1)
                 )
                 .padding(.horizontal, 6)
                 .padding(.top, 5)
@@ -1247,17 +1328,21 @@ struct ProcessingDataPoint: Identifiable {
 class SystemMonitorViewModel: ObservableObject {
     #if DEBUG
     private enum DebugDefaultsKey {
-        static let pendingCount = "debugSystemMonitorPendingCount"
-        static let processingCount = "debugSystemMonitorProcessingCount"
-        static let queueDepth = "debugSystemMonitorQueueDepth"
+        static let ocrPendingCount = "debugSystemMonitorPendingCount"
+        static let ocrProcessingCount = "debugSystemMonitorProcessingCount"
+        static let ocrQueueDepth = "debugSystemMonitorQueueDepth"
     }
     #endif
 
     // Queue stats
-    @Published var queueDepth: Int = 0
-    @Published var pendingCount: Int = 0       // Frames waiting (status 0)
-    @Published var processingCount: Int = 0    // Frames being processed (status 1)
-    @Published var totalProcessed: Int = 0
+    @Published var ocrQueueDepth: Int = 0
+    @Published var ocrPendingCount: Int = 0
+    @Published var ocrProcessingCount: Int = 0
+    @Published var rewriteQueueDepth: Int = 0
+    @Published var rewritePendingCount: Int = 0
+    @Published var rewriteProcessingCount: Int = 0
+    @Published var ocrTotalProcessed: Int = 0
+    @Published var totalRewritten: Int = 0
     @Published var ocrEnabled: Bool = true
     @Published var isPausedForBattery: Bool = false
     @Published var powerSource: PowerStateMonitor.PowerSource = .unknown
@@ -1267,8 +1352,10 @@ class SystemMonitorViewModel: ObservableObject {
     @Published var isRecordingActive: Bool = false
 
     // Chart data
-    @Published var processingHistory: [ProcessingDataPoint] = []
-    @Published var hoveredBarIndex: Int? = nil
+    @Published var ocrProcessingHistory: [ProcessingDataPoint] = []
+    @Published var rewriteHistory: [ProcessingDataPoint] = []
+    @Published var hoveredOCRBarIndex: Int? = nil
+    @Published var hoveredRewriteBarIndex: Int? = nil
 
     // Animation
     @Published var pulseScale: CGFloat = 1.0
@@ -1279,9 +1366,11 @@ class SystemMonitorViewModel: ObservableObject {
 
     // Track frames processed per minute using minute key (minutes since epoch)
     // Using Int key instead of Date to avoid timezone/rounding issues at minute boundaries
-    private var minuteProcessingCounts: [Int: Int] = [:]
-    private var queueDepthSamples: [(timestamp: Date, depth: Int)] = []
+    private var ocrMinuteProcessingCounts: [Int: Int] = [:]
+    private var rewriteMinuteCounts: [Int: Int] = [:]
+    private var ocrQueueDepthSamples: [(timestamp: Date, depth: Int)] = []
     private var previousTotalProcessed: Int = 0
+    private var previousTotalRewritten: Int = 0
     private let backlogNudgeThreshold = 100
     private let queueDepthSampleWindowSeconds: TimeInterval = 45
     private let minimumQueueTrendWindowSeconds: TimeInterval = 12
@@ -1289,7 +1378,7 @@ class SystemMonitorViewModel: ObservableObject {
 
     init(coordinator: AppCoordinator) {
         self.coordinator = coordinator
-        initializeHistory()
+        initializeHistories()
     }
 
     /// Convert a Date to a minute key (minutes since epoch)
@@ -1302,60 +1391,74 @@ class SystemMonitorViewModel: ObservableObject {
         Date(timeIntervalSince1970: Double(key) * 60)
     }
 
-    private func initializeHistory() {
+    private func initializeHistories() {
         // Create 30 empty data points (one per minute)
         let nowKey = minuteKey(for: Date())
-        processingHistory = (0..<30).reversed().map { minutesAgo in
+        let emptyHistory = (0..<30).reversed().map { minutesAgo in
             let key = nowKey - minutesAgo
             return ProcessingDataPoint(minute: date(fromMinuteKey: key), count: 0)
         }
+        ocrProcessingHistory = emptyHistory
+        rewriteHistory = emptyHistory
     }
 
     /// Total frames processed in the last 30 minutes (sum of history)
-    var processedLast30Min: Int {
-        processingHistory.reduce(0) { $0 + $1.count }
+    var ocrProcessedLast30Min: Int {
+        ocrProcessingHistory.reduce(0) { $0 + $1.count }
     }
 
-    var statusColor: Color {
+    var rewrittenLast30Min: Int {
+        rewriteHistory.reduce(0) { $0 + $1.count }
+    }
+
+    var ocrStatusColor: Color {
         if !ocrEnabled {
             return .gray
         } else if isPausedForBattery {
             return .orange
-        } else if queueDepth > 0 {
+        } else if ocrQueueDepth > 0 {
             return .retraceAccent
         } else {
             return .retraceAccent
         }
     }
 
-    var statusBadgeText: String {
+    var ocrStatusBadgeText: String {
         if !ocrEnabled {
             return "Disabled"
         } else if isPausedForBattery {
             return "Paused"
-        } else if queueDepth > 0 {
+        } else if ocrQueueDepth > 0 {
             return "Processing"
         } else {
             return "Idle"
         }
     }
 
-    private var recentProcessingRateFramesPerMinute: Double? {
-        let recentProcessed = processingHistory.suffix(5).reduce(0) { $0 + $1.count }
-        let minutesOfData = min(5, processingHistory.count)
+    var rewriteStatusColor: Color {
+        rewriteQueueDepth > 0 ? .green : .gray
+    }
+
+    var rewriteStatusBadgeText: String {
+        rewriteQueueDepth > 0 ? "Rewriting" : "Idle"
+    }
+
+    private func recentCompletionRateFramesPerMinute(for history: [ProcessingDataPoint]) -> Double? {
+        let recentProcessed = history.suffix(5).reduce(0) { $0 + $1.count }
+        let minutesOfData = min(5, history.count)
         guard recentProcessed > 0, minutesOfData > 0 else { return nil }
         return Double(recentProcessed) / Double(minutesOfData)
     }
 
     private var recentQueueDepthChangePerMinute: Double? {
         Self.queueDepthChangePerMinute(
-            samples: queueDepthSamples,
+            samples: ocrQueueDepthSamples,
             minimumObservationWindow: minimumQueueTrendWindowSeconds
         )
     }
 
-    private var effectiveDrainRateFramesPerMinute: Double? {
-        guard let processingRate = recentProcessingRateFramesPerMinute else { return nil }
+    private var effectiveOCRDrainRateFramesPerMinute: Double? {
+        guard let processingRate = recentCompletionRateFramesPerMinute(for: ocrProcessingHistory) else { return nil }
         guard isRecordingActive else {
             return processingRate
         }
@@ -1371,7 +1474,7 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     var isBacklogGrowingAtCurrentRates: Bool {
-        guard queueDepth > 0,
+        guard ocrQueueDepth > 0,
               isRecordingActive,
               let queueDepthChange = recentQueueDepthChangePerMinute else {
             return false
@@ -1379,9 +1482,9 @@ class SystemMonitorViewModel: ObservableObject {
         return queueDepthChange > queueDepthGrowthEpsilonPerMinute
     }
 
-    var etaText: String {
+    private func etaText(queueDepth: Int, drainRate: Double?) -> String {
         guard queueDepth > 0 else { return "—" }
-        guard let drainRate = effectiveDrainRateFramesPerMinute else { return "..." }
+        guard let drainRate else { return "..." }
         guard drainRate > 0 else { return "∞" }
 
         let minutesRemaining = Double(queueDepth) / drainRate
@@ -1397,7 +1500,11 @@ class SystemMonitorViewModel: ObservableObject {
         }
     }
 
-    var etaSuffixText: String {
+    var ocrEtaText: String {
+        etaText(queueDepth: ocrQueueDepth, drainRate: effectiveOCRDrainRateFramesPerMinute)
+    }
+
+    var ocrEtaSuffixText: String {
         if isPausedForBattery || !ocrEnabled {
             return "processing time"
         }
@@ -1407,10 +1514,21 @@ class SystemMonitorViewModel: ObservableObject {
         return "remaining"
     }
 
+    var rewriteEtaText: String {
+        etaText(
+            queueDepth: rewriteQueueDepth,
+            drainRate: recentCompletionRateFramesPerMinute(for: rewriteHistory)
+        )
+    }
+
+    var rewriteEtaSuffixText: String {
+        "remaining"
+    }
+
     var shouldShowPerformanceNudge: Bool {
         ocrEnabled &&
         !isPausedForBattery &&
-        queueDepth >= backlogNudgeThreshold &&
+        ocrQueueDepth >= backlogNudgeThreshold &&
         ocrProcessingLevel == 3 &&
         !pauseOnBatterySetting &&
         !pauseOnLowPowerModeSetting
@@ -1419,7 +1537,7 @@ class SystemMonitorViewModel: ObservableObject {
     var shouldShowOCRBacklogAttribution: Bool {
         ocrEnabled &&
         !isPausedForBattery &&
-        processingCount > 0
+        ocrProcessingCount > 0
     }
 
     func startMonitoring() async {
@@ -1457,17 +1575,24 @@ class SystemMonitorViewModel: ObservableObject {
     }
 
     private func loadHistoricalData() async {
-        // Query frames processed in last 30 minutes from database
-        // Group by minute offset
-        if let historicalCounts = try? await coordinator.getFramesProcessedPerMinute(lastMinutes: 30) {
-            let nowKey = minuteKey(for: Date())
+        let nowKey = minuteKey(for: Date())
 
+        if let historicalCounts = try? await coordinator.getFramesProcessedPerMinute(lastMinutes: 30) {
             for (minuteOffset, count) in historicalCounts {
                 let key = nowKey - minuteOffset
-                minuteProcessingCounts[key] = count
+                ocrMinuteProcessingCounts[key] = count
             }
-            updateProcessingHistory()
         }
+
+        if let rewriteCounts = try? await coordinator.getFramesRewrittenPerMinute(lastMinutes: 30) {
+            for (minuteOffset, count) in rewriteCounts {
+                let key = nowKey - minuteOffset
+                rewriteMinuteCounts[key] = count
+            }
+        }
+
+        updateOCRProcessingHistory()
+        updateRewriteHistory()
     }
 
     private func updateStats() async {
@@ -1475,27 +1600,38 @@ class SystemMonitorViewModel: ObservableObject {
 
         // Get queue statistics
         if let stats = await coordinator.getQueueStatistics() {
-            queueDepth = stats.queueDepth
-            pendingCount = stats.pendingCount
-            processingCount = stats.processingCount
+            ocrQueueDepth = stats.ocrQueueDepth
+            ocrPendingCount = stats.ocrPendingCount
+            ocrProcessingCount = stats.ocrProcessingCount
+            rewriteQueueDepth = stats.rewriteQueueDepth
+            rewritePendingCount = stats.rewritePendingCount
+            rewriteProcessingCount = stats.rewriteProcessingCount
 
             // Calculate frames processed since last update
             let newlyProcessed = stats.totalProcessed - previousTotalProcessed
             if previousTotalProcessed > 0 && newlyProcessed > 0 {
-                // Add to current minute's count using stable minute key
                 let currentKey = minuteKey(for: Date())
-                minuteProcessingCounts[currentKey, default: 0] += newlyProcessed
+                ocrMinuteProcessingCounts[currentKey, default: 0] += newlyProcessed
             }
             previousTotalProcessed = stats.totalProcessed
-            totalProcessed = stats.totalProcessed
+            ocrTotalProcessed = stats.totalProcessed
 
-            updateProcessingHistory()
+            let newlyRewritten = stats.totalRewritten - previousTotalRewritten
+            if previousTotalRewritten > 0 && newlyRewritten > 0 {
+                let currentKey = minuteKey(for: Date())
+                rewriteMinuteCounts[currentKey, default: 0] += newlyRewritten
+            }
+            previousTotalRewritten = stats.totalRewritten
+            totalRewritten = stats.totalRewritten
+
+            updateOCRProcessingHistory()
+            updateRewriteHistory()
         }
 
         #if DEBUG
         applyDebugQueueOverrides(defaults: defaults)
         #endif
-        recordQueueDepthSample(queueDepth)
+        recordQueueDepthSample(ocrQueueDepth)
 
         // Get power state
         let powerState = coordinator.getCurrentPowerState()
@@ -1514,49 +1650,64 @@ class SystemMonitorViewModel: ObservableObject {
 
     #if DEBUG
     private func applyDebugQueueOverrides(defaults: UserDefaults) {
-        let pendingOverride = (defaults.object(forKey: DebugDefaultsKey.pendingCount) as? NSNumber)?.intValue
-        let processingOverride = (defaults.object(forKey: DebugDefaultsKey.processingCount) as? NSNumber)?.intValue
-        let queueDepthOverride = (defaults.object(forKey: DebugDefaultsKey.queueDepth) as? NSNumber)?.intValue
+        let pendingOverride = (defaults.object(forKey: DebugDefaultsKey.ocrPendingCount) as? NSNumber)?.intValue
+        let processingOverride = (defaults.object(forKey: DebugDefaultsKey.ocrProcessingCount) as? NSNumber)?.intValue
+        let queueDepthOverride = (defaults.object(forKey: DebugDefaultsKey.ocrQueueDepth) as? NSNumber)?.intValue
 
         if let pendingOverride {
-            pendingCount = max(pendingOverride, 0)
+            ocrPendingCount = max(pendingOverride, 0)
         }
 
         if let processingOverride {
-            processingCount = max(processingOverride, 0)
+            ocrProcessingCount = max(processingOverride, 0)
         }
 
         if let queueDepthOverride {
-            queueDepth = max(queueDepthOverride, 0)
+            ocrQueueDepth = max(queueDepthOverride, 0)
         } else if pendingOverride != nil || processingOverride != nil {
-            queueDepth = max(pendingCount + processingCount, 0)
+            ocrQueueDepth = max(ocrPendingCount + ocrProcessingCount, 0)
         }
     }
     #endif
 
-    private func updateProcessingHistory() {
+    private func updateOCRProcessingHistory() {
         let nowKey = minuteKey(for: Date())
 
-        // Build new history with current minute counts
         var newHistory: [ProcessingDataPoint] = []
 
         for minutesAgo in (0..<30).reversed() {
             let key = nowKey - minutesAgo
-            let count = minuteProcessingCounts[key] ?? 0
+            let count = ocrMinuteProcessingCounts[key] ?? 0
             newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
         }
 
-        processingHistory = newHistory
+        ocrProcessingHistory = newHistory
 
-        // Clean up old entries (older than 31 minutes)
         let cutoffKey = nowKey - 31
-        minuteProcessingCounts = minuteProcessingCounts.filter { $0.key > cutoffKey }
+        ocrMinuteProcessingCounts = ocrMinuteProcessingCounts.filter { $0.key > cutoffKey }
+    }
+
+    private func updateRewriteHistory() {
+        let nowKey = minuteKey(for: Date())
+
+        var newHistory: [ProcessingDataPoint] = []
+
+        for minutesAgo in (0..<30).reversed() {
+            let key = nowKey - minutesAgo
+            let count = rewriteMinuteCounts[key] ?? 0
+            newHistory.append(ProcessingDataPoint(minute: date(fromMinuteKey: key), count: count))
+        }
+
+        rewriteHistory = newHistory
+
+        let cutoffKey = nowKey - 31
+        rewriteMinuteCounts = rewriteMinuteCounts.filter { $0.key > cutoffKey }
     }
 
     private func recordQueueDepthSample(_ depth: Int, at timestamp: Date = Date()) {
-        queueDepthSamples.append((timestamp: timestamp, depth: max(depth, 0)))
+        ocrQueueDepthSamples.append((timestamp: timestamp, depth: max(depth, 0)))
         let cutoff = timestamp.addingTimeInterval(-queueDepthSampleWindowSeconds)
-        queueDepthSamples.removeAll { $0.timestamp < cutoff }
+        ocrQueueDepthSamples.removeAll { $0.timestamp < cutoff }
     }
 
     static func queueDepthChangePerMinute(

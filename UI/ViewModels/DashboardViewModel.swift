@@ -261,7 +261,7 @@ public class DashboardViewModel: ObservableObject {
 
     private func updateQueueStatus() async {
         if let stats = await coordinator.getQueueStatistics() {
-            ocrQueueDepth = stats.queueDepth
+            ocrQueueDepth = stats.ocrQueueDepth
             ocrTotalProcessed = stats.totalProcessed
         }
 

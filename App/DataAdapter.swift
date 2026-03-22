@@ -29,6 +29,14 @@ public actor DataAdapter {
     private static let searchDedupeSameTextMinWidthRatio: Double = 0.92
     private static let searchDedupeSameTextMinHeightRatio: Double = 0.8
     private static let searchAllRawBatchSize = 150
+    private static let currentFrameDocSegmentSQL = """
+        (
+            SELECT frameId, MAX(docid) AS docid
+            FROM doc_segment
+            WHERE frameId IS NOT NULL
+            GROUP BY frameId
+        )
+        """
 
     // MARK: - Connections
 
@@ -915,11 +923,11 @@ public actor DataAdapter {
             throw DataAdapterError.notInitialized
         }
 
-        let connection = frameSource == .rewind && rewindConnection != nil
-            ? rewindConnection!
-            : retraceConnection
+        let (connection, config) = frameSource == .rewind && rewindConnection != nil
+            ? (rewindConnection!, rewindConfig!)
+            : (retraceConnection, effectiveRetraceConfig)
 
-        return try getAllOCRNodes(frameID: frameID, connection: connection)
+        return try getAllOCRNodes(frameID: frameID, connection: connection, config: config)
     }
 
     // MARK: - App Discovery
@@ -2841,10 +2849,27 @@ public actor DataAdapter {
         guard sqlite3_step(frameStatement) == SQLITE_ROW else { return [] }
 
         let frameID = FrameID(value: sqlite3_column_int64(frameStatement, 0))
-        return try getAllOCRNodes(frameID: frameID, connection: connection)
+        return try getAllOCRNodes(frameID: frameID, connection: connection, config: config)
     }
 
-    private func getAllOCRNodes(frameID: FrameID, connection: DatabaseConnection) throws -> [OCRNodeWithText] {
+    private func getAllOCRNodes(frameID: FrameID, connection: DatabaseConnection, config: DatabaseConfig) throws -> [OCRNodeWithText] {
+        let redactedColumn = config.source == .rewind
+            ? "0 as redacted"
+            : "CASE WHEN n.encryptedText IS NOT NULL THEN 1 ELSE 0 END as redacted"
+        let nodeTextColumn: String
+        let encryptedTextColumn: String
+        if config.source == .rewind {
+            nodeTextColumn = "SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength) as nodeText"
+            encryptedTextColumn = "NULL as encryptedText"
+        } else {
+            nodeTextColumn = """
+                CASE
+                    WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                    ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
+                END as nodeText
+                """
+            encryptedTextColumn = "n.encryptedText as encryptedText"
+        }
         let sql = """
             SELECT
                 n.id,
@@ -2855,11 +2880,17 @@ public actor DataAdapter {
                 n.topY,
                 n.width,
                 n.height,
-                (COALESCE(sc.c0, '') || COALESCE(sc.c1, '')) as fullText,
+                \(redactedColumn),
+                \(nodeTextColumn),
+                \(encryptedTextColumn),
                 n.frameId
             FROM node n
-            JOIN doc_segment ds ON n.frameId = ds.frameId
-            JOIN searchRanking_content sc ON ds.docid = sc.id
+            LEFT JOIN (
+                SELECT frameId, MAX(docid) AS docid
+                FROM doc_segment
+                GROUP BY frameId
+            ) ds ON n.frameId = ds.frameId
+            LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
             ORDER BY n.nodeOrder ASC;
             """
@@ -2937,10 +2968,12 @@ public actor DataAdapter {
         // Get FTS content
         let ftsSQL = """
             SELECT src.c0, src.c1
-            FROM doc_segment ds
-            JOIN searchRanking_content src ON ds.docid = src.id
-            WHERE ds.frameId = ?
-            LIMIT 1;
+            FROM searchRanking_content src
+            JOIN (
+                SELECT MAX(docid) AS docid
+                FROM doc_segment
+                WHERE frameId = ?
+            ) ds ON ds.docid = src.id;
             """
 
         guard let ftsStmt = try? connection.prepare(sql: ftsSQL) else { return nil }
@@ -3283,10 +3316,18 @@ public actor DataAdapter {
 
         let dedupeTokens = parseSearchDedupeTokens(query.text)
         let highlightTerms = dedupeTokens.map(\.matchingTerm).filter { !$0.isEmpty }
+        let visibleNodeTextSQL = isRewind
+            ? "SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)"
+            : """
+                CASE
+                    WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                    ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
+                END
+                """
         let highlightMatchClause: String = {
             guard !highlightTerms.isEmpty else { return "0" }
             return highlightTerms.map { _ in
-                "INSTR(LOWER(SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)), ?) > 0"
+                "INSTR(LOWER(\(visibleNodeTextSQL)), ?) > 0"
             }.joined(separator: " OR ")
         }()
 
@@ -3340,7 +3381,7 @@ public actor DataAdapter {
                     r.rank AS rank,
                     r.docid AS docid
                 FROM ranked r
-                JOIN doc_segment ds ON r.docid = ds.docid
+                JOIN \(Self.currentFrameDocSegmentSQL) ds ON r.docid = ds.docid
                 JOIN frame f ON ds.frameId = f.id
                 JOIN segment s ON f.segmentId = s.id
                 LEFT JOIN video v ON v.id = f.videoId
@@ -3363,7 +3404,7 @@ public actor DataAdapter {
                         TRIM(
                             REPLACE(
                                 REPLACE(
-                                    SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength),
+                                    \(visibleNodeTextSQL),
                                     char(10),
                                     ' '
                                 ),
@@ -3852,10 +3893,18 @@ public actor DataAdapter {
             let frameId: Int64
         }
 
+        let visibleNodeTextSQL = isRewind
+            ? "SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)"
+            : """
+                CASE
+                    WHEN n.encryptedText IS NOT NULL THEN printf('%.*c', n.textLength, ' ')
+                    ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
+                END
+                """
         let highlightMatchClause: String = {
             guard !highlightTerms.isEmpty else { return "0" }
             return highlightTerms.map { _ in
-                "INSTR(LOWER(SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)), ?) > 0"
+                "INSTR(LOWER(\(visibleNodeTextSQL)), ?) > 0"
             }.joined(separator: " OR ")
         }()
 
@@ -3903,7 +3952,7 @@ public actor DataAdapter {
                         s.browserUrl AS browser_url,
                         d.docid AS docid
                     FROM fts_docs d
-                    JOIN doc_segment ds ON ds.docid = d.docid
+                    JOIN \(Self.currentFrameDocSegmentSQL) ds ON ds.docid = d.docid
                     JOIN frame f ON f.id = ds.frameId
                     JOIN segment s ON s.id = f.segmentId
                     LEFT JOIN video v ON v.id = f.videoId
@@ -3934,7 +3983,7 @@ public actor DataAdapter {
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
                     FROM fts_matches fts
-                    JOIN doc_segment ds ON fts.docid = ds.docid
+                    JOIN \(Self.currentFrameDocSegmentSQL) ds ON fts.docid = ds.docid
                     JOIN frame f ON ds.frameId = f.id
                     JOIN segment s ON f.segmentId = s.id
                     LEFT JOIN video v ON v.id = f.videoId
@@ -3977,7 +4026,7 @@ public actor DataAdapter {
                         s.windowName AS window_name,
                         s.browserUrl AS browser_url,
                         ds.docid AS docid
-                    FROM doc_segment ds
+                    FROM \(Self.currentFrameDocSegmentSQL) ds
                     JOIN frame f ON ds.frameId = f.id
                     JOIN segment s ON s.id = f.segmentId
                     LEFT JOIN video v ON v.id = f.videoId
@@ -4011,7 +4060,7 @@ public actor DataAdapter {
                             TRIM(
                                 REPLACE(
                                     REPLACE(
-                                        SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength),
+                                        \(visibleNodeTextSQL),
                                         char(10),
                                         ' '
                                     ),
@@ -4864,7 +4913,7 @@ public actor DataAdapter {
             )
             SELECT COUNT(DISTINCT f.id)
             FROM fts_matches fts
-            JOIN doc_segment ds ON fts.docid = ds.docid
+            JOIN \(Self.currentFrameDocSegmentSQL) ds ON fts.docid = ds.docid
             JOIN frame f ON ds.frameId = f.id
             JOIN segment s ON f.segmentId = s.id
             \(tagJoin)
@@ -4906,41 +4955,10 @@ public actor DataAdapter {
 
     private func deleteFrames(frameIDs: [FrameID], connection: DatabaseConnection) throws {
         guard !frameIDs.isEmpty else { return }
-
-        try connection.beginTransaction()
-
-        do {
-            for frameID in frameIDs {
-                // Delete OCR nodes
-                let deleteNodesSql = "DELETE FROM node WHERE frameId = ?;"
-                if let stmt = try? connection.prepare(sql: deleteNodesSql) {
-                    sqlite3_bind_int64(stmt, 1, frameID.value)
-                    sqlite3_step(stmt)
-                    connection.finalize(stmt)
-                }
-
-                // Delete doc_segment entries
-                let deleteDocSegmentSql = "DELETE FROM doc_segment WHERE frameId = ?;"
-                if let stmt = try? connection.prepare(sql: deleteDocSegmentSql) {
-                    sqlite3_bind_int64(stmt, 1, frameID.value)
-                    sqlite3_step(stmt)
-                    connection.finalize(stmt)
-                }
-
-                // Delete frame itself
-                let deleteFrameSql = "DELETE FROM frame WHERE id = ?;"
-                if let stmt = try? connection.prepare(sql: deleteFrameSql) {
-                    sqlite3_bind_int64(stmt, 1, frameID.value)
-                    sqlite3_step(stmt)
-                    connection.finalize(stmt)
-                }
-            }
-
-            try connection.commit()
-        } catch {
-            try connection.rollback()
-            throw error
+        guard let db = connection.getConnection() else {
+            throw DataAdapterError.databaseError("Database connection unavailable")
         }
+        _ = try FrameQueries.delete(db: db, frameIDs: frameIDs)
     }
 
     // MARK: - Row Parsing
@@ -5045,32 +5063,17 @@ public actor DataAdapter {
     private func parseOCRNodeFromRow(statement: OpaquePointer) -> OCRNodeWithText? {
         let id = Int(sqlite3_column_int64(statement, 0))
         let nodeOrder = Int(sqlite3_column_int(statement, 1))
-        let textOffset = Int(sqlite3_column_int(statement, 2))
-        let textLength = Int(sqlite3_column_int(statement, 3))
         let leftX = sqlite3_column_double(statement, 4)
         let topY = sqlite3_column_double(statement, 5)
         let width = sqlite3_column_double(statement, 6)
         let height = sqlite3_column_double(statement, 7)
+        let isRedacted = sqlite3_column_int(statement, 8) != 0
 
-        guard let fullTextCStr = sqlite3_column_text(statement, 8) else { return nil }
-        let fullText = String(cString: fullTextCStr)
+        let text = sqlite3_column_text(statement, 9).map { String(cString: $0) } ?? ""
+        let encryptedText = sqlite3_column_text(statement, 10).map { String(cString: $0) }
 
-        // Column 9: frameId for debugging
-        let frameId = sqlite3_column_int64(statement, 9)
-
-        let startIndex = fullText.index(
-            fullText.startIndex,
-            offsetBy: textOffset,
-            limitedBy: fullText.endIndex
-        ) ?? fullText.endIndex
-
-        let endIndex = fullText.index(
-            startIndex,
-            offsetBy: textLength,
-            limitedBy: fullText.endIndex
-        ) ?? fullText.endIndex
-
-        let text = String(fullText[startIndex..<endIndex])
+        // Column 11: frameId for debugging
+        let frameId = sqlite3_column_int64(statement, 11)
 
         return OCRNodeWithText(
             id: id,
@@ -5080,7 +5083,9 @@ public actor DataAdapter {
             y: topY,
             width: width,
             height: height,
-            text: text
+            text: text,
+            encryptedText: encryptedText,
+            isRedacted: isRedacted
         )
     }
 
@@ -5319,6 +5324,7 @@ public enum DataAdapterError: Error, LocalizedError {
     case noSourceForTimestamp(Date)
     case frameNotFound
     case parseFailed
+    case databaseError(String)
 
     public var errorDescription: String? {
         switch self {
@@ -5332,6 +5338,8 @@ public enum DataAdapterError: Error, LocalizedError {
             return "Frame not found"
         case .parseFailed:
             return "Failed to parse database row"
+        case .databaseError(let message):
+            return message
         }
     }
 }

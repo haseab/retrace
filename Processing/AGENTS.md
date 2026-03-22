@@ -9,24 +9,25 @@ You are responsible for the **Processing** module of Retrace. Your job is to imp
 ```
 Processing/
 ├── ProcessingManager.swift        # Main ProcessingProtocol implementation
+├── FrameProcessingQueue.swift     # OCR pipeline orchestration + phrase-level rewrite staging
+├── URLExtractor.swift             # URL extraction utilities
 ├── OCR/
-│   ├── VisionOCR.swift            # Vision framework OCR implementation
-│   └── TextRecognitionConfig.swift # OCR configuration
+│   ├── FullFrameOCRCache.swift    # Full-frame OCR result cache
+│   ├── OCRTileCache.swift         # Tiled OCR cache
+│   ├── RegionOCRMerger.swift      # Merge tiled OCR regions into frame output
+│   ├── RegionOCRResult.swift      # OCR tile result model
+│   ├── TileChangeDetector.swift   # OCR tile invalidation helpers
+│   ├── TileGridConfig.swift       # OCR tiling configuration
+│   ├── TileOCRProcessor.swift     # Tiled Vision OCR runner
+│   └── VisionOCR.swift            # Vision framework OCR implementation
 ├── Accessibility/
-│   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
-│   ├── AXTreeWalker.swift          # Walk accessibility tree
-│   └── TextElementFilter.swift     # Filter relevant text elements
+│   └── AccessibilityService.swift # AccessibilityProtocol implementation
 ├── TextMerger/
-│   ├── TextMerger.swift            # Combine OCR + AX results
-│   └── DeduplicationFilter.swift   # Remove duplicate text
-├── Queue/
-│   ├── ProcessingQueue.swift       # Background processing queue
-│   └── FrameProcessor.swift        # Single frame processor
+│   └── TextMerger.swift           # Combine OCR + AX results
 └── Tests/
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry/resolve coverage
-    ├── VisionOCRTests.swift
-    ├── AccessibilityTests.swift
-    └── TextMergerTests.swift
+    ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
+    └── TestLogger.swift                       # Shared processing test logging helpers
 ```
 
 ## Protocols You Must Implement

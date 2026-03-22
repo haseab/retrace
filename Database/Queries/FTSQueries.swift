@@ -7,13 +7,13 @@ import Shared
 ///
 /// Rewind-compatible FTS Pattern:
 /// 1. INSERT INTO searchRanking (text, otherText, title) → FTS auto-indexes, get rowid
-/// 2. INSERT INTO searchRanking_content (id, c0, c1, c2) with same id for OCR lookups
+/// 2. SQLite populates searchRanking_content shadow rows with the same rowid
 /// 3. INSERT INTO doc_segment (docid, segmentId, frameId)
 enum FTSQueries {
 
     // MARK: - Insert FTS Content
 
-    /// Insert OCR text into searchRanking (FTS) and searchRanking_content, return the docid
+    /// Insert OCR text into searchRanking (FTS) and return the docid.
     /// This matches Rewind's pattern where FTS table auto-indexes on insert
     ///
     /// - Parameters:
@@ -131,7 +131,11 @@ enum FTSQueries {
         segmentId: Int64,
         frameId: Int64
     ) throws -> Int64 {
-        // Step 1: Insert into searchRanking_content
+        if try getDocidForFrame(db: db, frameId: frameId) != nil {
+            try deleteForFrame(db: db, frameId: frameId)
+        }
+
+        // Step 1: Insert into searchRanking (and its shadow content row)
         let docid = try insertContent(
             db: db,
             mainText: mainText,
@@ -152,12 +156,12 @@ enum FTSQueries {
 
     // MARK: - Select
 
-    /// Get FTS content by docid
+    /// Get indexed content by docid
     static func getContent(db: OpaquePointer, docid: Int64) throws -> (mainText: String, chromeText: String?, windowTitle: String?)? {
         let sql = """
-            SELECT text, otherText, title
-            FROM searchRanking
-            WHERE rowid = ?;
+            SELECT c0, c1, c2
+            FROM searchRanking_content
+            WHERE id = ?;
             """
 
         var statement: OpaquePointer?
@@ -188,7 +192,7 @@ enum FTSQueries {
     /// Get docid for a frame
     static func getDocidForFrame(db: OpaquePointer, frameId: Int64) throws -> Int64? {
         let sql = """
-            SELECT docid
+            SELECT MAX(docid)
             FROM doc_segment
             WHERE frameId = ?;
             """
@@ -211,15 +215,49 @@ enum FTSQueries {
             return nil
         }
 
+        guard sqlite3_column_type(statement, 0) != SQLITE_NULL else {
+            return nil
+        }
+
         return sqlite3_column_int64(statement, 0)
+    }
+
+    /// Get all docids currently associated with a frame.
+    static func getDocidsForFrame(db: OpaquePointer, frameId: Int64) throws -> [Int64] {
+        let sql = """
+            SELECT DISTINCT docid
+            FROM doc_segment
+            WHERE frameId = ?
+            ORDER BY docid ASC;
+            """
+
+        var statement: OpaquePointer?
+        defer {
+            sqlite3_finalize(statement)
+        }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(
+                query: sql,
+                underlying: String(cString: sqlite3_errmsg(db))
+            )
+        }
+
+        sqlite3_bind_int64(statement, 1, frameId)
+
+        var docids: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            docids.append(sqlite3_column_int64(statement, 0))
+        }
+        return docids
     }
 
     // MARK: - Delete
 
     /// Delete FTS content and associated doc_segment records for a frame
     static func deleteForFrame(db: OpaquePointer, frameId: Int64) throws {
-        // First get the docid
-        guard let docid = try getDocidForFrame(db: db, frameId: frameId) else {
+        let docids = try getDocidsForFrame(db: db, frameId: frameId)
+        guard !docids.isEmpty else {
             return // Nothing to delete
         }
 
@@ -246,7 +284,7 @@ enum FTSQueries {
             )
         }
 
-        // Delete from searchRanking (FTS virtual table)
+        // Delete from searchRanking (FTS virtual table) only if the docid is now orphaned.
         let deleteContentSQL = "DELETE FROM searchRanking WHERE rowid = ?;"
         var contentStatement: OpaquePointer?
         defer {
@@ -260,13 +298,40 @@ enum FTSQueries {
             )
         }
 
-        sqlite3_bind_int64(contentStatement, 1, docid)
+        for docid in docids {
+            let stillReferencedSQL = """
+                SELECT 1
+                FROM doc_segment
+                WHERE docid = ?
+                LIMIT 1;
+                """
+            var referencedStatement: OpaquePointer?
+            defer {
+                sqlite3_finalize(referencedStatement)
+            }
 
-        guard sqlite3_step(contentStatement) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(
-                query: deleteContentSQL,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
+            guard sqlite3_prepare_v2(db, stillReferencedSQL, -1, &referencedStatement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: stillReferencedSQL,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            sqlite3_bind_int64(referencedStatement, 1, docid)
+            if sqlite3_step(referencedStatement) == SQLITE_ROW {
+                continue
+            }
+
+            sqlite3_bind_int64(contentStatement, 1, docid)
+            guard sqlite3_step(contentStatement) == SQLITE_DONE else {
+                throw DatabaseError.queryFailed(
+                    query: deleteContentSQL,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            sqlite3_reset(contentStatement)
+            sqlite3_clear_bindings(contentStatement)
         }
     }
 

@@ -2679,7 +2679,7 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 100
+        viewModel.ocrQueueDepth = 100
         viewModel.ocrProcessingLevel = 3
         viewModel.pauseOnBatterySetting = false
         viewModel.pauseOnLowPowerModeSetting = false
@@ -2691,7 +2691,7 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 100
+        viewModel.ocrQueueDepth = 100
         viewModel.ocrProcessingLevel = 3
         viewModel.pauseOnBatterySetting = true
         viewModel.pauseOnLowPowerModeSetting = false
@@ -2703,7 +2703,7 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 100
+        viewModel.ocrQueueDepth = 100
         viewModel.ocrProcessingLevel = 3
         viewModel.pauseOnBatterySetting = false
         viewModel.pauseOnLowPowerModeSetting = true
@@ -2716,7 +2716,7 @@ final class SystemMonitorPerformanceNudgeTests: XCTestCase {
             let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
             viewModel.ocrEnabled = true
             viewModel.isPausedForBattery = false
-            viewModel.queueDepth = 100
+            viewModel.ocrQueueDepth = 100
             viewModel.ocrProcessingLevel = level
             viewModel.pauseOnBatterySetting = false
             viewModel.pauseOnLowPowerModeSetting = false
@@ -2732,8 +2732,8 @@ final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 1
-        viewModel.processingCount = 2
+        viewModel.ocrQueueDepth = 1
+        viewModel.ocrProcessingCount = 2
 
         XCTAssertTrue(viewModel.shouldShowOCRBacklogAttribution)
     }
@@ -2742,8 +2742,8 @@ final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 0
-        viewModel.processingCount = 1
+        viewModel.ocrQueueDepth = 0
+        viewModel.ocrProcessingCount = 1
 
         XCTAssertTrue(viewModel.shouldShowOCRBacklogAttribution)
     }
@@ -2752,8 +2752,19 @@ final class SystemMonitorOCRBacklogAttributionTests: XCTestCase {
         let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
         viewModel.ocrEnabled = true
         viewModel.isPausedForBattery = false
-        viewModel.queueDepth = 24
-        viewModel.processingCount = 0
+        viewModel.ocrQueueDepth = 24
+        viewModel.ocrProcessingCount = 0
+
+        XCTAssertFalse(viewModel.shouldShowOCRMemoryAttribution)
+    }
+
+    func testOCRMemoryAttributionHiddenWhenOnlyRewriteIsActive() {
+        let viewModel = SystemMonitorViewModel(coordinator: AppCoordinator())
+        viewModel.ocrEnabled = true
+        viewModel.isPausedForBattery = false
+        viewModel.ocrQueueDepth = 0
+        viewModel.ocrProcessingCount = 0
+        viewModel.rewriteProcessingCount = 2
 
         XCTAssertFalse(viewModel.shouldShowOCRBacklogAttribution)
     }
@@ -3830,6 +3841,39 @@ final class CommandDragTextSelectionTests: XCTestCase {
             height: height,
             text: text
         )
+    }
+}
+
+@MainActor
+final class PhraseLevelRedactionInteractionTests: XCTestCase {
+    func testPhraseLevelRedactionTooltipStateUsesCopyTextAfterReveal() {
+        let state = SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+            for: 7,
+            isRevealed: true
+        )
+
+        XCTAssertEqual(state, .copyText)
+        XCTAssertEqual(state?.title, "Copy text")
+    }
+
+    func testCopyablePhraseLevelRedactionTextPrefersVisiblePlaintext() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let node = OCRNodeWithText(
+            id: 101,
+            nodeOrder: 0,
+            frameId: 1,
+            x: 0.20,
+            y: 0.25,
+            width: 0.18,
+            height: 0.05,
+            text: "revealed text",
+            encryptedText: "rtx1.mock",
+            isRedacted: true
+        )
+
+        viewModel.ocrNodes = [node]
+
+        XCTAssertEqual(viewModel.copyablePhraseLevelRedactionText(for: node), "revealed text")
     }
 }
 

@@ -148,6 +148,33 @@ public final class PipelineStatusHolder: @unchecked Sendable {
 /// Implements the core data pipeline: Capture → Storage → Processing → Database → Search
 /// Owner: APP integration
 public actor AppCoordinator {
+    public struct MissingMasterKeyRedactionState: Sendable {
+        public let hasMasterKey: Bool
+        public let phraseLevelRedactionEnabled: Bool
+        public let hasProtectedRedactionData: Bool
+        public let hasPendingRedactionRewrites: Bool
+
+        public init(
+            hasMasterKey: Bool,
+            phraseLevelRedactionEnabled: Bool,
+            hasProtectedRedactionData: Bool,
+            hasPendingRedactionRewrites: Bool
+        ) {
+            self.hasMasterKey = hasMasterKey
+            self.phraseLevelRedactionEnabled = phraseLevelRedactionEnabled
+            self.hasProtectedRedactionData = hasProtectedRedactionData
+            self.hasPendingRedactionRewrites = hasPendingRedactionRewrites
+        }
+
+        public var requiresRecoveryPrompt: Bool {
+            !hasMasterKey && (
+                phraseLevelRedactionEnabled
+                    || hasProtectedRedactionData
+                    || hasPendingRedactionRewrites
+            )
+        }
+    }
+
     public struct SegmentCommentCreateResult: Sendable {
         public let comment: SegmentComment
         public let linkedSegmentIDs: [SegmentID]
@@ -325,13 +352,22 @@ public actor AppCoordinator {
     // MARK: - Timeline Visibility
 
     /// Set whether the timeline is currently visible (pauses frame processing when true)
-    public func setTimelineVisible(_ visible: Bool) {
+    public func setTimelineVisible(_ visible: Bool) async {
         isTimelineVisible = visible
         // When timeline becomes visible, signal to flush any buffered frames to OCR queue
         if visible {
             shouldFlushPendingFrames = true
         }
+        if let queue = await services.processingQueue {
+            await queue.setTimelineVisibleForRewriteScheduling(visible)
+        }
         Log.info("Timeline visibility changed: \(visible) - frame processing \(visible ? "paused" : "resumed")", category: .app)
+    }
+
+    public func setTimelineScrubbing(_ scrubbing: Bool) async {
+        if let queue = await services.processingQueue {
+            await queue.setTimelineScrubbingForRewriteScheduling(scrubbing)
+        }
     }
 
     /// Release cached AVFoundation decode state after timeline/search teardown.
@@ -594,6 +630,8 @@ public actor AppCoordinator {
     // MARK: - Recording State Persistence
 
     private static let recordingStateKey = "shouldAutoStartRecording"
+    private static let phraseLevelRedactionEnabledKey = "phraseLevelRedactionEnabled"
+    private static let abandonedMissingMasterKeyRewritePurpose = "redaction_missing_master_key_abandoned"
     /// Use a fixed suite name so it works regardless of how the app is launched (swift build vs .app bundle)
     private static let userDefaultsSuite = UserDefaults(suiteName: "io.retrace.app") ?? .standard
 
@@ -1901,6 +1939,71 @@ public actor AppCoordinator {
                 }
                 writerState.pendingFrames = []
             }
+
+            // Trigger segment-level video rewrites for any p=5 frames now that the file is finalized.
+            try? await processingQueue.processPendingRedactions(for: writerState.videoDBID)
+        }
+    }
+
+    public func recoverPendingPhraseRedactionRewritesIfPossible() async {
+        if let processingQueue = await services.processingQueue {
+            await processingQueue.recoverPendingRedactionsIfPossible()
+        }
+    }
+
+    public func missingMasterKeyRedactionState() async -> MissingMasterKeyRedactionState {
+        let defaults = Self.userDefaultsSuite
+        let hasMasterKey = MasterKeyManager.hasMasterKey()
+        let phraseLevelRedactionEnabled =
+            defaults.object(forKey: Self.phraseLevelRedactionEnabledKey) as? Bool ?? false
+
+        var hasProtectedRedactionData = false
+        var hasPendingRedactionRewrites = false
+
+        do {
+            hasProtectedRedactionData = try await services.database.hasProtectedPhraseRedactionData()
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to inspect protected phrase-redaction data state: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+
+        do {
+            let pendingVideoIDs = try await services.database.getVideoIDsWithPendingNodeRedactions(
+                includeRetryableFailures: true
+            )
+            hasPendingRedactionRewrites = !pendingVideoIDs.isEmpty
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to inspect pending phrase-redaction rewrites: \(error.localizedDescription)",
+                category: .app
+            )
+        }
+
+        // TODO(master-key-recovery): Extend this startup decision tree once database encryption
+        // is formally wired into the master-key UX. That branch needs to distinguish a missing
+        // phrase-redaction key from a missing SQLCipher database key and may need to block DB open.
+        return MissingMasterKeyRedactionState(
+            hasMasterKey: hasMasterKey,
+            phraseLevelRedactionEnabled: phraseLevelRedactionEnabled,
+            hasProtectedRedactionData: hasProtectedRedactionData,
+            hasPendingRedactionRewrites: hasPendingRedactionRewrites
+        )
+    }
+
+    @discardableResult
+    public func abandonPendingPhraseRedactionRewritesForFreshKey() async -> Int {
+        do {
+            return try await services.database.abandonPendingNodeRedactions(
+                missingKeyRewritePurpose: Self.abandonedMissingMasterKeyRewritePurpose
+            )
+        } catch {
+            Log.error(
+                "[AppCoordinator] Failed to abandon pending phrase-redaction rewrites for fresh key: \(error.localizedDescription)",
+                category: .app
+            )
+            return 0
         }
     }
 
@@ -2146,8 +2249,15 @@ public actor AppCoordinator {
     /// Get frames processed per minute for the last N minutes
     /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute
     public func getFramesProcessedPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
-        let db = await services.database
+        let db = services.database
         return try await db.getFramesProcessedPerMinute(lastMinutes: lastMinutes)
+    }
+
+    /// Get frames rewritten per minute for the last N minutes.
+    /// Returns dictionary of [minuteOffset: count] where minuteOffset 0 = current minute.
+    public func getFramesRewrittenPerMinute(lastMinutes: Int) async throws -> [Int: Int] {
+        let db = services.database
+        return try await db.getFramesRewrittenPerMinute(lastMinutes: lastMinutes)
     }
 
     // MARK: - Search Interface
@@ -3026,10 +3136,12 @@ public actor AppCoordinator {
             return .pending
         case 1: // processing
             return .processing
-        case 2: // completed
+        case 2, 7: // completed
             return .completed
-        case 3: // failed
+        case 3, 8: // failed
             return .failed
+        case 5, 6: // rewrite pending/processing
+            return .rewriting
         default:
             return .unknown
         }
@@ -3044,6 +3156,15 @@ public actor AppCoordinator {
 
         // Record OCR reprocess metric
         try? await recordMetricEvent(metricType: .ocrReprocessRequests, metadata: "\(frameID.value)")
+
+        let existingNodes = try await services.database.getOCRNodesWithText(frameID: frameID)
+        if existingNodes.contains(where: \.isRedacted) {
+            Log.warning(
+                "[OCR-REPROCESS] Refusing to reprocess frame \(frameID.value) because it contains redacted OCR nodes",
+                category: .processing
+            )
+            throw AppError.ocrReprocessBlockedForRedactedFrame(frameID: frameID.value)
+        }
 
         // Clear existing OCR nodes for this frame
         try await services.database.deleteNodes(frameID: frameID)
@@ -4309,7 +4430,9 @@ public struct OCRProcessingStatus: Sendable, Equatable {
         case queued
         /// Frame is currently being processed (OCR in progress)
         case processing
-        /// OCR failed permanently
+        /// OCR is complete and frame is queued for a video rewrite / re-encode.
+        case rewriting
+        /// OCR or a follow-up rewrite failed permanently
         case failed
         /// Frame not found or status unknown
         case unknown
@@ -4338,7 +4461,8 @@ public struct OCRProcessingStatus: Sendable, Equatable {
             }
             return "Queued"
         case .processing: return "Indexing..."
-        case .failed: return "OCR Failed"
+        case .rewriting: return "Re-encoding..."
+        case .failed: return "Processing Failed"
         case .unknown: return ""
         }
     }
@@ -4346,7 +4470,7 @@ public struct OCRProcessingStatus: Sendable, Equatable {
     /// Whether OCR is still in progress (queued or processing)
     public var isInProgress: Bool {
         switch state {
-        case .queued, .processing, .pending:
+        case .queued, .processing, .pending, .rewriting:
             return true
         case .completed, .failed, .unknown:
             return false
@@ -4357,6 +4481,7 @@ public struct OCRProcessingStatus: Sendable, Equatable {
     public static let completed = OCRProcessingStatus(state: .completed)
     public static let pending = OCRProcessingStatus(state: .pending)
     public static let processing = OCRProcessingStatus(state: .processing)
+    public static let rewriting = OCRProcessingStatus(state: .rewriting)
     public static let failed = OCRProcessingStatus(state: .failed)
     public static let unknown = OCRProcessingStatus(state: .unknown)
 
@@ -4372,6 +4497,7 @@ public enum AppError: Error {
     case alreadyRunning
     case notRunning
     case processingQueueNotAvailable
+    case ocrReprocessBlockedForRedactedFrame(frameID: Int64)
 }
 
 extension AppError: LocalizedError {
@@ -4389,6 +4515,8 @@ extension AppError: LocalizedError {
             return "Recording is not running."
         case .processingQueueNotAvailable:
             return "The processing queue is not available."
+        case .ocrReprocessBlockedForRedactedFrame(let frameID):
+            return "OCR refresh is not available for frame \(frameID) because it contains protected redacted text."
         }
     }
 }

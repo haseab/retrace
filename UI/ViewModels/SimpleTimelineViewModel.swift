@@ -8,6 +8,7 @@ import Database
 import Processing
 import SwiftyChrono
 import UniformTypeIdentifiers
+import ImageIO
 
 /// Shared timeline configuration
 public enum TimelineConfig {
@@ -550,6 +551,13 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the user is actively scrolling (disables tape animation during rapid scrolling)
     @Published public var isActivelyScrolling = false {
         didSet {
+            guard oldValue != isActivelyScrolling else { return }
+            let scrubbing = isActivelyScrolling
+            let coordinator = self.coordinator
+            Task(priority: .utility) {
+                await coordinator.setTimelineScrubbing(scrubbing)
+            }
+
             // Apply deferred rolling-window trims only after scrub interaction settles.
             guard oldValue, !isActivelyScrolling else { return }
             applyDeferredTrimIfNeeded(trigger: "scroll-ended")
@@ -594,6 +602,43 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// All OCR nodes for the current frame (used for text selection)
     @Published public var ocrNodes: [OCRNodeWithText] = []
+
+    /// Temporary in-memory overlays for revealed redacted OCR nodes (keyed by node ID).
+    @Published public var revealedRedactedNodePatches: [Int: NSImage] = [:]
+    private var revealedRedactedFrameID: FrameID?
+    @Published public var activeRedactionTooltipNodeID: Int?
+
+    enum PhraseLevelRedactionTooltipState: Equatable {
+        case queued
+        case reveal
+        case copyText
+
+        var title: String {
+            switch self {
+            case .queued:
+                return "Queued..."
+            case .reveal:
+                return "Reveal"
+            case .copyText:
+                return "Copy text"
+            }
+        }
+
+        var isInteractive: Bool {
+            switch self {
+            case .queued:
+                return false
+            case .reveal, .copyText:
+                return true
+            }
+        }
+    }
+
+    enum PhraseLevelRedactionOutlineState: Equatable {
+        case hidden
+        case queued
+        case active
+    }
 
     /// Previous frame's OCR nodes (only populated when showOCRDebugOverlay is enabled, for diff visualization)
     @Published public var previousOcrNodes: [OCRNodeWithText] = []
@@ -6162,6 +6207,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Always dismiss context menus
         dismissContextMenu()
         dismissTimelineContextMenu()
+        dismissRedactionTooltip()
     }
 
     /// Dialog types for mutual exclusion
@@ -8354,6 +8400,40 @@ public class SimpleTimelineViewModel: ObservableObject {
         return FileManager.default.fileExists(atPath: fileURL.path)
     }
 
+    private static func isSuccessfulProcessingStatus(_ status: Int) -> Bool {
+        status == 2 || status == 7
+    }
+
+    static func phraseLevelRedactionTooltipState(
+        for processingStatus: Int,
+        isRevealed: Bool
+    ) -> PhraseLevelRedactionTooltipState? {
+        switch processingStatus {
+        case 5, 6:
+            return .queued
+        case 2, 7:
+            return isRevealed ? .copyText : .reveal
+        default:
+            return nil
+        }
+    }
+
+    static func phraseLevelRedactionOutlineState(
+        for processingStatus: Int,
+        isTooltipActive: Bool
+    ) -> PhraseLevelRedactionOutlineState {
+        if isTooltipActive {
+            return .active
+        }
+
+        switch processingStatus {
+        case 5, 6:
+            return .queued
+        default:
+            return .hidden
+        }
+    }
+
     private func decodeBufferedFrameImage(_ data: Data, frameID: FrameID, errorCode: Int) throws -> NSImage {
         guard let image = NSImage(data: data) else {
             diskFrameBufferTelemetry.decodeFailures += 1
@@ -8377,12 +8457,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         let frameID = timelineFrame.frame.id
         let lookupIndex = currentIndex
         let shouldPreferDecodedReadyFrame =
-            timelineFrame.processingStatus == 2
+            Self.isSuccessfulProcessingStatus(timelineFrame.processingStatus)
             && hasExternalCaptureStillInDiskFrameBuffer(frameID: frameID)
 
         if shouldPreferDecodedReadyFrame, Self.isTimelineStillLoggingEnabled {
             Log.info(
-                "[Timeline-Still] P2-DECODE-FIRST frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
+                "[Timeline-Still] READY-DECODE-FIRST frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
                 category: .ui
             )
         }
@@ -8438,7 +8518,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if Self.isTimelineStillLoggingEnabled {
                 Log.warning(
-                    "[Timeline-Still] P2-DECODE-FAILED frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus) reason=\(error.localizedDescription) fallback=external-still",
+                    "[Timeline-Still] READY-DECODE-FAILED frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus) reason=\(error.localizedDescription) fallback=external-still",
                     category: .ui
                 )
             }
@@ -8452,7 +8532,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
                 if Self.isTimelineStillLoggingEnabled {
                     Log.info(
-                        "[Timeline-Still] P2-FALLBACK-HIT frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
+                        "[Timeline-Still] READY-FALLBACK-HIT frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
                         category: .ui
                     )
                 }
@@ -8470,7 +8550,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             if Self.isTimelineStillLoggingEnabled {
                 Log.warning(
-                    "[Timeline-Still] P2-FALLBACK-MISS frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
+                    "[Timeline-Still] READY-FALLBACK-MISS frameID=\(frameID.value) index=\(lookupIndex) processingStatus=\(timelineFrame.processingStatus)",
                     category: .ui
                 )
             }
@@ -8563,7 +8643,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             ) {
                 clearCurrentImagePresentation()
                 frameLoadError = false
-                if timelineFrame.processingStatus != 2 {
+                if !Self.isSuccessfulProcessingStatus(timelineFrame.processingStatus) {
                     frameNotReady = true
                 }
             }
@@ -8577,7 +8657,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 expectedGeneration: expectedGeneration
             ) {
                 clearCurrentImagePresentation()
-                if timelineFrame.processingStatus != 2 {
+                if !Self.isSuccessfulProcessingStatus(timelineFrame.processingStatus) {
                     frameNotReady = true
                     frameLoadError = false
                 } else {
@@ -8595,7 +8675,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 expectedGeneration: expectedGeneration
             ) {
                 clearCurrentImagePresentation()
-                if timelineFrame.processingStatus != 2 {
+                if !Self.isSuccessfulProcessingStatus(timelineFrame.processingStatus) {
                     frameNotReady = true
                     frameLoadError = false
                 } else {
@@ -9894,8 +9974,321 @@ public class SimpleTimelineViewModel: ObservableObject {
         if showOCRDebugOverlay {
             previousOcrNodes = ocrNodes
         }
+
+        let redactedNodes = nodes.filter(\.isRedacted)
+        if !redactedNodes.isEmpty {
+            let sample = redactedNodes.prefix(5).map { node in
+                "id=\(node.id) rect=(\(String(format: "%.4f", node.x)),\(String(format: "%.4f", node.y)),\(String(format: "%.4f", node.width)),\(String(format: "%.4f", node.height)))"
+            }.joined(separator: "; ")
+            let frameID = redactedNodes.first?.frameId ?? -1
+            Log.debug(
+                "[PhraseRedaction][UI] Loaded redacted nodes frame=\(frameID) count=\(redactedNodes.count) sample=\(sample)",
+                category: .ui
+            )
+        }
+
+        if let activeRedactionTooltipNodeID,
+           !nodes.contains(where: { $0.id == activeRedactionTooltipNodeID }) {
+            dismissRedactionTooltip()
+        }
+
         ocrNodes = nodes
         currentNodesVersion += 1
+    }
+
+    public func clearTemporaryRedactionReveals() {
+        let revealedNodeIDs = Set(revealedRedactedNodePatches.keys)
+        if !revealedNodeIDs.isEmpty {
+            var updatedNodes = ocrNodes
+            var didRestoreMaskedText = false
+
+            for index in updatedNodes.indices where revealedNodeIDs.contains(updatedNodes[index].id) {
+                guard updatedNodes[index].encryptedText != nil else { continue }
+                updatedNodes[index] = updatedNodes[index].replacingText(maskedOCRText(for: updatedNodes[index]))
+                didRestoreMaskedText = true
+            }
+
+            if didRestoreMaskedText {
+                ocrNodes = updatedNodes
+                currentNodesVersion += 1
+            }
+        }
+
+        revealedRedactedNodePatches.removeAll()
+        revealedRedactedFrameID = nil
+        dismissRedactionTooltip()
+    }
+
+    public func showRedactionTooltip(for nodeID: Int) {
+        guard activeRedactionTooltipNodeID != nodeID else { return }
+        withAnimation(.easeOut(duration: 0.14)) {
+            activeRedactionTooltipNodeID = nodeID
+        }
+    }
+
+    func showRedactionTooltip(
+        for nodeID: Int,
+        state: PhraseLevelRedactionTooltipState
+    ) {
+        guard state == .queued else { return }
+        let payload: [String: Any] = [
+            "nodeID": nodeID,
+            "frameID": currentTimelineFrame?.frame.id.value ?? -1,
+            "processingStatus": currentTimelineFrame?.processingStatus ?? -1
+        ]
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+
+        Task {
+            try? await coordinator.recordMetricEvent(
+                metricType: .phraseLevelRedactionQueuedHover,
+                metadata: json
+            )
+        }
+    }
+
+    public func dismissRedactionTooltip() {
+        guard activeRedactionTooltipNodeID != nil else { return }
+        withAnimation(.easeOut(duration: 0.14)) {
+            activeRedactionTooltipNodeID = nil
+        }
+    }
+
+    private func updateOCRNode(
+        nodeID: Int,
+        transform: (OCRNodeWithText) -> OCRNodeWithText
+    ) {
+        guard let index = ocrNodes.firstIndex(where: { $0.id == nodeID }) else { return }
+        var updatedNodes = ocrNodes
+        updatedNodes[index] = transform(updatedNodes[index])
+        ocrNodes = updatedNodes
+        currentNodesVersion += 1
+    }
+
+    private func decryptedOCRText(for node: OCRNodeWithText, secret: String) -> String? {
+        guard let encryptedText = node.encryptedText else { return nil }
+        return ReversibleOCRScrambler.decryptOCRText(
+            encryptedText,
+            frameID: node.frameId,
+            nodeOrder: node.nodeOrder,
+            secret: secret
+        )
+    }
+
+    private func maskedOCRText(for node: OCRNodeWithText) -> String {
+        String(repeating: " ", count: node.text.count)
+    }
+
+    func copyablePhraseLevelRedactionText(for node: OCRNodeWithText) -> String? {
+        let currentNode = ocrNodes.first(where: { $0.id == node.id }) ?? node
+        let visibleText = currentNode.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !visibleText.isEmpty, visibleText != currentNode.encryptedText {
+            return visibleText
+        }
+
+        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
+            return nil
+        }
+
+        return decryptedOCRText(for: currentNode, secret: secret)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public func copyPhraseLevelRedactionText(for node: OCRNodeWithText) {
+        guard let text = copyablePhraseLevelRedactionText(for: node), !text.isEmpty else {
+            showToast("Text unavailable", icon: "exclamationmark.circle.fill")
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showToast("Text copied", icon: "doc.on.doc.fill")
+        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: text)
+    }
+
+    public func togglePhraseLevelRedactionReveal(for node: OCRNodeWithText) {
+        guard node.isRedacted else { return }
+        guard let frame = currentTimelineFrame?.frame else { return }
+        guard Self.isSuccessfulProcessingStatus(currentTimelineFrame?.processingStatus ?? -1) else {
+            Log.debug(
+                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) processingStatus=\(currentTimelineFrame?.processingStatus ?? -1)",
+                category: .ui
+            )
+            return
+        }
+        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
+            Log.warning(
+                "[PhraseRedaction][UI] Skip reveal node=\(node.id) frame=\(node.frameId) because no master key exists",
+                category: .ui
+            )
+            return
+        }
+
+        if revealedRedactedNodePatches[node.id] != nil {
+            revealedRedactedNodePatches.removeValue(forKey: node.id)
+            if node.encryptedText != nil {
+                updateOCRNode(nodeID: node.id) { currentNode in
+                    currentNode.replacingText(maskedOCRText(for: currentNode))
+                }
+            }
+            dismissRedactionTooltip()
+            Log.debug("[PhraseRedaction][UI] Hide node \(node.id) frame=\(node.frameId)", category: .ui)
+            return
+        }
+
+        revealedRedactedFrameID = frame.id
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let sourceImage = try await self.sourceCGImageForCurrentFrame(frame: frame)
+                guard let patch = self.buildDescrambledPatchImage(
+                    node: node,
+                    sourceImage: sourceImage,
+                    secret: secret
+                ) else {
+                    return
+                }
+                let revealedText = self.decryptedOCRText(for: node, secret: secret)
+
+                await MainActor.run {
+                    guard self.currentTimelineFrame?.frame.id == frame.id else { return }
+                    self.revealedRedactedFrameID = frame.id
+                    self.revealedRedactedNodePatches[node.id] = patch
+                    if let revealedText {
+                        self.updateOCRNode(nodeID: node.id) { $0.replacingText(revealedText) }
+                    }
+                    self.dismissRedactionTooltip()
+                }
+
+                try? await self.coordinator.recordMetricEvent(
+                    metricType: .phraseLevelRedactionReveal,
+                    metadata: "{\"nodeID\":\(node.id),\"frameID\":\(node.frameId)}"
+                )
+            } catch {
+                Log.warning("[PhraseRedaction] Failed to reveal node \(node.id): \(error.localizedDescription)", category: .ui)
+            }
+        }
+    }
+
+    private func sourceCGImageForCurrentFrame(frame: FrameReference) async throws -> CGImage {
+        if isInLiveMode, let liveScreenshot {
+            if let cgImage = liveScreenshot.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                return cgImage
+            }
+        }
+
+        if let videoInfo = currentVideoInfo {
+            let data = try await coordinator.getFrameImageFromPath(
+                videoPath: videoInfo.videoPath,
+                frameIndex: videoInfo.frameIndex,
+                enforceTimestampMatch: false
+            )
+            if let image = cgImage(fromJPEGData: data) {
+                return image
+            }
+        }
+
+        let data = try await coordinator.getFrameImage(
+            segmentID: frame.videoID,
+            timestamp: frame.timestamp
+        )
+        guard let image = cgImage(fromJPEGData: data) else {
+            throw NSError(
+                domain: "SimpleTimelineViewModel",
+                code: -8901,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to decode frame image for redaction reveal"]
+            )
+        }
+        return image
+    }
+
+    private func cgImage(fromJPEGData data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    private func buildDescrambledPatchImage(
+        node: OCRNodeWithText,
+        sourceImage: CGImage,
+        secret: String
+    ) -> NSImage? {
+        let width = sourceImage.width
+        let height = sourceImage.height
+        guard width > 0, height > 0 else { return nil }
+
+        guard let frameData = try? BGRAImageUtilities.makeData(from: sourceImage) else { return nil }
+        let bytesPerRow = width * 4
+
+        let patchRect = BGRAImageUtilities.pixelRect(
+            from: CGRect(x: node.x, y: node.y, width: node.width, height: node.height),
+            imageWidth: width,
+            imageHeight: height
+        )
+        guard patchRect.width > 1, patchRect.height > 1 else {
+            Log.warning(
+                "[PhraseRedaction][UI] Skipping reveal for tiny node \(node.id) frame=\(node.frameId)",
+                category: .ui
+            )
+            return nil
+        }
+
+        guard let patch = BGRAImageUtilities.extractPatch(
+            from: frameData,
+            frameBytesPerRow: bytesPerRow,
+            rect: patchRect
+        ) else { return nil }
+
+        var descrambledPatch = patch.data
+        ReversibleOCRScrambler.descramblePatchBGRA(
+            &descrambledPatch,
+            width: patch.width,
+            height: patch.height,
+            bytesPerRow: patch.bytesPerRow,
+            frameID: node.frameId,
+            nodeID: node.id,
+            secret: secret
+        )
+
+        Log.debug(
+            "[PhraseRedaction][UI] Reveal node=\(node.id) frame=\(node.frameId) strategy=COVERING+CURRENT pixelRect=(x=\(Int(patchRect.origin.x)),y=\(Int(patchRect.origin.y)),w=\(Int(patchRect.width)),h=\(Int(patchRect.height))) image=\(width)x\(height)",
+            category: .ui
+        )
+
+        guard let patchImage = nsImageFromBGRA(
+            data: descrambledPatch,
+            width: patch.width,
+            height: patch.height,
+            bytesPerRow: patch.bytesPerRow
+        ) else { return nil }
+
+        return patchImage
+    }
+
+    private func nsImageFromBGRA(data: Data, width: Int, height: Int, bytesPerRow: Int) -> NSImage? {
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let cgImage = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else {
+            return nil
+        }
+        return NSImage(cgImage: cgImage, size: NSSize(width: width, height: height))
     }
 
     /// Load all OCR nodes for the current frame
@@ -9914,7 +10307,14 @@ public class SimpleTimelineViewModel: ObservableObject {
             ocrStatusPollingTask = nil
             clearHyperlinkMatches()
             clearTextSelection()
+            clearTemporaryRedactionReveals()
             return
+        }
+
+        if let currentFrameID = currentTimelineFrame?.frame.id,
+           revealedRedactedFrameID != currentFrameID {
+            clearTemporaryRedactionReveals()
+            revealedRedactedFrameID = currentFrameID
         }
 
         // Clear previous selection when frame changes

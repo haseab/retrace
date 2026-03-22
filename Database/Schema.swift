@@ -231,6 +231,7 @@ extension Schema {
     ///   - REAL width NOT NULL (normalized 0.0-1.0)
     ///   - REAL height NOT NULL (normalized 0.0-1.0)
     ///   - INTEGER windowIndex
+    ///   - TEXT encryptedText
     ///
     /// video: Video metadata
     ///   - INTEGER id (PK, auto-increment)
@@ -261,8 +262,8 @@ extension Schema {
     ///
     /// searchRanking_content: FTS external content table
     ///   - INTEGER id (PK, auto-increment)
-    ///   - TEXT c0 (main OCR text, 100-1000+ chars per frame)
-    ///   - TEXT c1 (dual purpose: UI chrome text ~40-50 chars OR overflow OCR 500+ chars)
+    ///   - TEXT c0 (masked OCR text used for FTS and node offsets)
+    ///   - TEXT c1 (masked chrome text)
     ///   - TEXT c2 (window/app title, can be NULL)
     ///
     /// searchRanking: FTS5 virtual table (external content)

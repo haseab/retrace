@@ -984,13 +984,14 @@ public struct SimpleTimelineView: View {
                         set: { viewModel.forceVideoReload = $0 }
                     ), onLoadFailed: {
                         guard viewModel.currentTimelineFrame?.frame.id == frameID else { return }
-                        // Don't set frameNotReady=true for completed frames (processingStatus=2) or Rewind frames (-1)
-                        // Temporary video reload issues shouldn't show "Still encoding..." for ready frames
-                        if processingStatus != 2 && processingStatus != -1 {
+                        // Don't set frameNotReady=true for successful frames (processingStatus=2/7)
+                        // or Rewind frames (-1). Temporary reload issues shouldn't show
+                        // "Still encoding..." for already-ready frames.
+                        if processingStatus != 2 && processingStatus != 7 && processingStatus != -1 {
                             viewModel.frameNotReady = true
                             viewModel.frameLoadError = false
                         } else {
-                            // For completed frames or Rewind frames, this is a real error
+                            // For ready frames or Rewind frames, this is a real error
                             viewModel.frameNotReady = false
                             viewModel.frameLoadError = true
                         }
@@ -2031,6 +2032,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                     TimelineWindowController.shared.hide(restorePreviousFocus: false)
                 }
             }
+            let redactedNodes = viewModel.ocrNodes.filter(\.isRedacted)
             let hyperlinkContextMenuEntries = (showsHyperlinkVisualOverlays ? viewModel.hyperlinkMatches : []).compactMap { match -> HyperlinkContextMenuEntry? in
                 let rect = transformedHyperlinkContextMenuRect(
                     for: match,
@@ -2042,6 +2044,55 @@ struct FrameWithURLOverlay<Content: View>: View {
                 guard rect.width > 1, rect.height > 1 else { return nil }
                 return HyperlinkContextMenuEntry(match: match, rect: rect)
             }
+            let redactionContextMenuEntries: [RedactedNodeContextMenuEntry] = {
+                if showFinal, let zoomRegion = viewModel.zoomRegion {
+                    let zoomedRect = zoomedFrameRectForContextMenu(
+                        zoomRegion: zoomRegion,
+                        containerSize: geometry.size,
+                        actualFrameRect: actualFrameRect
+                    )
+                    guard zoomedRect.width > 1, zoomedRect.height > 1 else { return [] }
+                    return redactedNodes.compactMap { node in
+                        guard let rect = zoomedRedactionContextMenuRect(
+                            for: node,
+                            zoomRegion: zoomRegion,
+                            zoomedRect: zoomedRect
+                        ),
+                        rect.width > 1,
+                        rect.height > 1 else {
+                            return nil
+                        }
+                        return RedactedNodeContextMenuEntry(
+                            node: node,
+                            rect: rect,
+                            tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+                                for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
+                                isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                            )
+                        )
+                    }
+                }
+
+                guard showNormal else { return [] }
+                return redactedNodes.compactMap { node in
+                    let rect = transformedRedactionContextMenuRect(
+                        for: node,
+                        actualFrameRect: actualFrameRect,
+                        containerSize: geometry.size,
+                        scale: viewModel.frameZoomScale,
+                        offset: viewModel.frameZoomOffset
+                    )
+                    guard rect.width > 1, rect.height > 1 else { return nil }
+                    return RedactedNodeContextMenuEntry(
+                        node: node,
+                        rect: rect,
+                        tooltipState: SimpleTimelineViewModel.phraseLevelRedactionTooltipState(
+                            for: viewModel.currentTimelineFrame?.processingStatus ?? -1,
+                            isRevealed: viewModel.revealedRedactedNodePatches[node.id] != nil
+                        )
+                    )
+                }
+            }()
 
             ZStack {
                 // The actual frame content (always present as base layer)
@@ -2094,8 +2145,20 @@ struct FrameWithURLOverlay<Content: View>: View {
                         .offset(viewModel.frameZoomOffset)
                     }
 
+                    if !viewModel.ocrNodes.isEmpty {
+                        RedactedNodeRevealOverlay(
+                            viewModel: viewModel,
+                            nodes: redactedNodes,
+                            actualFrameRect: actualFrameRect
+                        )
+                        .scaleEffect(viewModel.frameZoomScale)
+                        .offset(viewModel.frameZoomOffset)
+                        .allowsHitTesting(false)
+                    }
+
                     // Text selection overlay (for drag selection and zoom region creation)
-                    // Always render to allow shift-drag zoom region even when OCR nodes are empty (e.g., during/after scrolling)
+                    // Keep this above revealed patches so selection highlights remain visible after reveal.
+                    // Always render to allow shift-drag zoom region even when OCR nodes are empty.
                     TextSelectionOverlay(
                         viewModel: viewModel,
                         containerSize: geometry.size,
@@ -2180,9 +2243,25 @@ struct FrameWithURLOverlay<Content: View>: View {
                 }
 
             }
+            .overlay {
+                if !redactionContextMenuEntries.isEmpty {
+                    RedactionTooltipOverlay(
+                        viewModel: viewModel,
+                        entries: redactionContextMenuEntries,
+                        containerSize: geometry.size,
+                        onReveal: { node in
+                            viewModel.togglePhraseLevelRedactionReveal(for: node)
+                        },
+                        onCopyText: { node in
+                            viewModel.copyPhraseLevelRedactionText(for: node)
+                        }
+                    )
+                }
+            }
             .onRightClick(
                 hyperlinkEntries: hyperlinkContextMenuEntries,
                 onHyperlinkRightClick: { match in
+                    viewModel.dismissRedactionTooltip()
                     viewModel.recordInPageURLRightClick(for: match)
                 },
                 onHyperlinkCopy: { match in
@@ -2191,6 +2270,7 @@ struct FrameWithURLOverlay<Content: View>: View {
             ) { location in
                 // Keep right-clicks on the floating filter card from opening the frame menu behind it.
                 guard !viewModel.isFilterPanelVisible else { return }
+                viewModel.dismissRedactionTooltip()
                 viewModel.contextMenuLocation = location
                 withAnimation(.easeOut(duration: 0.16)) {
                     viewModel.showContextMenu = true
@@ -2524,9 +2604,101 @@ private func transformedHyperlinkContextMenuRect(
     )
 }
 
+private func transformedRedactionContextMenuRect(
+    for node: OCRNodeWithText,
+    actualFrameRect: CGRect,
+    containerSize: CGSize,
+    scale: CGFloat,
+    offset: CGSize
+) -> CGRect {
+    let rect = CGRect(
+        x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+        y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+        width: node.width * actualFrameRect.width,
+        height: node.height * actualFrameRect.height
+    )
+
+    guard scale != 1 else {
+        return rect.offsetBy(dx: offset.width, dy: offset.height)
+    }
+
+    let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+    let scaledOrigin = CGPoint(
+        x: center.x + ((rect.origin.x - center.x) * scale) + offset.width,
+        y: center.y + ((rect.origin.y - center.y) * scale) + offset.height
+    )
+
+    return CGRect(
+        origin: scaledOrigin,
+        size: CGSize(width: rect.width * scale, height: rect.height * scale)
+    )
+}
+
+private func zoomedFrameRectForContextMenu(
+    zoomRegion: CGRect,
+    containerSize: CGSize,
+    actualFrameRect: CGRect
+) -> CGRect {
+    let menuWidth: CGFloat = 180
+    let menuGap: CGFloat = 30
+    let maxWidth = containerSize.width * 0.70
+    let maxHeight = containerSize.height * 0.75
+    let regionWidth = zoomRegion.width * actualFrameRect.width
+    let regionHeight = zoomRegion.height * actualFrameRect.height
+    guard regionWidth > 0, regionHeight > 0 else { return .zero }
+
+    let scaleToFit = min(maxWidth / regionWidth, maxHeight / regionHeight)
+    let enlargedWidth = regionWidth * scaleToFit
+    let enlargedHeight = regionHeight * scaleToFit
+    let availableWidth = containerSize.width - menuWidth - menuGap
+
+    return CGRect(
+        x: (availableWidth - enlargedWidth) / 2,
+        y: (containerSize.height - enlargedHeight) / 2,
+        width: enlargedWidth,
+        height: enlargedHeight
+    )
+}
+
+private func zoomedRedactionContextMenuRect(
+    for node: OCRNodeWithText,
+    zoomRegion: CGRect,
+    zoomedRect: CGRect
+) -> CGRect? {
+    let regionMaxX = zoomRegion.origin.x + zoomRegion.width
+    let regionMaxY = zoomRegion.origin.y + zoomRegion.height
+    let nodeMaxX = node.x + node.width
+    let nodeMaxY = node.y + node.height
+
+    guard nodeMaxX > zoomRegion.origin.x,
+          node.x < regionMaxX,
+          nodeMaxY > zoomRegion.origin.y,
+          node.y < regionMaxY else {
+        return nil
+    }
+
+    let relativeX = (node.x - zoomRegion.origin.x) / zoomRegion.width
+    let relativeY = (node.y - zoomRegion.origin.y) / zoomRegion.height
+    let relativeWidth = node.width / zoomRegion.width
+    let relativeHeight = node.height / zoomRegion.height
+
+    return CGRect(
+        x: zoomedRect.origin.x + (relativeX * zoomedRect.width),
+        y: zoomedRect.origin.y + (relativeY * zoomedRect.height),
+        width: relativeWidth * zoomedRect.width,
+        height: relativeHeight * zoomedRect.height
+    )
+}
+
 struct HyperlinkContextMenuEntry {
     let match: OCRHyperlinkMatch
     let rect: CGRect
+}
+
+struct RedactedNodeContextMenuEntry {
+    let node: OCRNodeWithText
+    let rect: CGRect
+    let tooltipState: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState?
 }
 
 // MARK: - Frame Zoom Indicator
@@ -2550,6 +2722,529 @@ struct FrameZoomIndicator: View {
                 .fill(Color.black.opacity(0.6))
         )
         .transition(.opacity.combined(with: .scale))
+    }
+}
+
+private struct DemystifiedRevealPatchView: View {
+    let patch: NSImage
+    let size: CGSize
+
+    @State private var revealProgress: CGFloat = 0
+
+    var body: some View {
+        ZStack {
+            Image(nsImage: patch)
+                .resizable()
+                .interpolation(.none)
+                .frame(width: size.width, height: size.height)
+                .blur(radius: (1.0 - revealProgress) * 12.0)
+                .saturation(0.65 + (0.35 * revealProgress))
+                .brightness((1.0 - revealProgress) * 0.08)
+                .scaleEffect(1.03 - (0.03 * revealProgress))
+
+            LinearGradient(
+                colors: [
+                    Color.white.opacity(0.0),
+                    Color.white.opacity(0.55),
+                    Color.white.opacity(0.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(width: max(size.width * 0.28, 18), height: size.height * 1.5)
+            .rotationEffect(.degrees(16))
+            .offset(x: (size.width * 1.35 * revealProgress) - (size.width * 0.7))
+            .opacity(1.0 - min(revealProgress * 1.1, 1.0))
+            .blendMode(.screen)
+        }
+        .compositingGroup()
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .onAppear {
+            revealProgress = 0
+            withAnimation(.spring(response: 0.46, dampingFraction: 0.84)) {
+                revealProgress = 1
+            }
+        }
+    }
+}
+
+struct RedactedNodeRevealOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let nodes: [OCRNodeWithText]
+    let actualFrameRect: CGRect
+
+    private var processingStatus: Int {
+        viewModel.currentTimelineFrame?.processingStatus ?? -1
+    }
+
+    var body: some View {
+        ZStack {
+            ForEach(nodes, id: \.id) { node in
+                let rect = nodeRect(for: node)
+                if rect.width > 1, rect.height > 1 {
+                    let isTooltipActive = viewModel.activeRedactionTooltipNodeID == node.id
+                    let outlineState = SimpleTimelineViewModel.phraseLevelRedactionOutlineState(
+                        for: processingStatus,
+                        isTooltipActive: isTooltipActive
+                    )
+                    ZStack {
+                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                            DemystifiedRevealPatchView(
+                                patch: patch,
+                                size: CGSize(width: rect.width, height: rect.height)
+                            )
+                                .frame(width: rect.width, height: rect.height)
+                        }
+
+                        if outlineState != .hidden {
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(
+                                    outlineColor(for: outlineState),
+                                    style: StrokeStyle(
+                                        lineWidth: 1.5,
+                                        dash: outlineState == .queued ? [4, 3] : []
+                                    )
+                                )
+                        }
+                    }
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                }
+            }
+        }
+    }
+
+    private func nodeRect(for node: OCRNodeWithText) -> CGRect {
+        CGRect(
+            x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+            width: node.width * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
+        )
+    }
+
+    private func outlineColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionOutlineState
+    ) -> Color {
+        switch state {
+        case .hidden:
+            return .clear
+        case .queued:
+            return Color.white.opacity(0.22)
+        case .active:
+            return Color.white.opacity(0.82)
+        }
+    }
+}
+
+struct ZoomedRedactedNodeRevealOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let zoomRegion: CGRect
+    let zoomedRect: CGRect
+
+    private var processingStatus: Int {
+        viewModel.currentTimelineFrame?.processingStatus ?? -1
+    }
+
+    var body: some View {
+        ZStack {
+            ForEach(viewModel.ocrNodes.filter(\.isRedacted), id: \.id) { node in
+                if let rect = transformedRect(for: node), rect.width > 1, rect.height > 1 {
+                    let isTooltipActive = viewModel.activeRedactionTooltipNodeID == node.id
+                    let outlineState = SimpleTimelineViewModel.phraseLevelRedactionOutlineState(
+                        for: processingStatus,
+                        isTooltipActive: isTooltipActive
+                    )
+
+                    ZStack {
+                        if let patch = viewModel.revealedRedactedNodePatches[node.id] {
+                            DemystifiedRevealPatchView(
+                                patch: patch,
+                                size: CGSize(width: rect.width, height: rect.height)
+                            )
+                                .frame(width: rect.width, height: rect.height)
+                        }
+
+                        if outlineState != .hidden {
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(
+                                    outlineColor(for: outlineState),
+                                    style: StrokeStyle(
+                                        lineWidth: 1.5,
+                                        dash: outlineState == .queued ? [4, 3] : []
+                                    )
+                                )
+                        }
+                    }
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+                }
+            }
+        }
+        .mask(
+            Rectangle()
+                .frame(width: zoomedRect.width, height: zoomedRect.height)
+                .position(x: zoomedRect.midX, y: zoomedRect.midY)
+        )
+    }
+
+    private func transformedRect(for node: OCRNodeWithText) -> CGRect? {
+        let regionMaxX = zoomRegion.origin.x + zoomRegion.width
+        let regionMaxY = zoomRegion.origin.y + zoomRegion.height
+        let nodeMaxX = node.x + node.width
+        let nodeMaxY = node.y + node.height
+
+        guard nodeMaxX > zoomRegion.origin.x,
+              node.x < regionMaxX,
+              nodeMaxY > zoomRegion.origin.y,
+              node.y < regionMaxY else {
+            return nil
+        }
+
+        let relativeX = (node.x - zoomRegion.origin.x) / zoomRegion.width
+        let relativeY = (node.y - zoomRegion.origin.y) / zoomRegion.height
+        let relativeWidth = node.width / zoomRegion.width
+        let relativeHeight = node.height / zoomRegion.height
+
+        return CGRect(
+            x: zoomedRect.origin.x + (relativeX * zoomedRect.width),
+            y: zoomedRect.origin.y + (relativeY * zoomedRect.height),
+            width: relativeWidth * zoomedRect.width,
+            height: relativeHeight * zoomedRect.height
+        )
+    }
+
+    private func outlineColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionOutlineState
+    ) -> Color {
+        switch state {
+        case .hidden:
+            return .clear
+        case .queued:
+            return Color.white.opacity(0.26)
+        case .active:
+            return Color.white.opacity(0.9)
+        }
+    }
+}
+
+struct RedactionTooltipOverlay: View {
+    @ObservedObject var viewModel: SimpleTimelineViewModel
+    let entries: [RedactedNodeContextMenuEntry]
+    let containerSize: CGSize
+    let onReveal: (OCRNodeWithText) -> Void
+    let onCopyText: (OCRNodeWithText) -> Void
+    @State private var escapeMonitor: Any?
+    @State private var hoveredNodeIDs: Set<Int> = []
+    @State private var hoveredButtonIDs: Set<Int> = []
+
+    private let buttonHeight: CGFloat = 30
+    private let edgePadding: CGFloat = 14
+    private let buttonOverlap: CGFloat = 2
+
+    private var hoverEntries: [RedactionTooltipHoverEntry] {
+        entries.compactMap { entry in
+            guard let tooltipState = entry.tooltipState else { return nil }
+            return RedactionTooltipHoverEntry(
+                nodeID: entry.node.id,
+                triggerFrame: Self.triggerFrame(for: entry.rect),
+                tooltipState: tooltipState
+            )
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RedactionTooltipHoverTracker(
+                entries: hoverEntries,
+                onHoveredNodeChanged: handleHoveredNodeChanged
+            )
+            .frame(width: containerSize.width, height: containerSize.height)
+
+            ForEach(entries, id: \.node.id) { entry in
+                if let tooltipState = entry.tooltipState {
+                    let tooltipFrame = Self.tooltipFrame(
+                        for: entry.rect,
+                        state: tooltipState,
+                        containerSize: containerSize,
+                        edgePadding: edgePadding,
+                        buttonHeight: buttonHeight,
+                        buttonOverlap: buttonOverlap
+                    )
+
+                    if isTooltipVisible(for: entry.node.id) {
+                        Group {
+                            if tooltipState.isInteractive {
+                                Button {
+                                    handlePrimaryAction(for: entry.node, state: tooltipState)
+                                } label: {
+                                    tooltipLabel(for: tooltipState)
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                tooltipLabel(for: tooltipState)
+                                    .contentShape(Capsule())
+                                    .onTapGesture {
+                                        // Disabled-looking queued state still absorbs direct taps.
+                                    }
+                            }
+                        }
+                        .frame(width: tooltipFrame.width, height: tooltipFrame.height)
+                        .offset(x: tooltipFrame.minX, y: tooltipFrame.minY)
+                        .onHover { hovering in
+                            updateButtonHoverState(hovering, for: entry.node.id)
+                        }
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                        .zIndex(1)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(.easeOut(duration: 0.12), value: hoveredNodeIDs)
+        .animation(.easeOut(duration: 0.12), value: hoveredButtonIDs)
+        .onChange(of: entries.map(\.node.id)) { nodeIDs in
+            let visibleNodeIDs = Set(nodeIDs)
+            hoveredNodeIDs.formIntersection(visibleNodeIDs)
+            hoveredButtonIDs.formIntersection(visibleNodeIDs)
+        }
+        .onAppear {
+            guard escapeMonitor == nil else { return }
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard event.keyCode == 53 else { return event }
+                guard !hoveredNodeIDs.isEmpty || !hoveredButtonIDs.isEmpty else { return event }
+                hoveredNodeIDs.removeAll()
+                hoveredButtonIDs.removeAll()
+                return nil
+            }
+        }
+        .onDisappear {
+            hoveredNodeIDs.removeAll()
+            hoveredButtonIDs.removeAll()
+            if let escapeMonitor {
+                NSEvent.removeMonitor(escapeMonitor)
+                self.escapeMonitor = nil
+            }
+        }
+    }
+
+    private func isTooltipVisible(for nodeID: Int) -> Bool {
+        hoveredNodeIDs.contains(nodeID) || hoveredButtonIDs.contains(nodeID)
+    }
+
+    private func handleHoveredNodeChanged(_ nodeID: Int?) {
+        hoveredNodeIDs.removeAll()
+
+        guard let nodeID,
+              let hoveredEntry = hoverEntries.first(where: { $0.nodeID == nodeID }) else {
+            return
+        }
+
+        hoveredNodeIDs.insert(nodeID)
+        viewModel.showRedactionTooltip(for: nodeID, state: hoveredEntry.tooltipState)
+    }
+
+    private func handlePrimaryAction(
+        for node: OCRNodeWithText,
+        state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) {
+        switch state {
+        case .queued:
+            break
+        case .reveal:
+            onReveal(node)
+        case .copyText:
+            onCopyText(node)
+        }
+    }
+
+    private func updateButtonHoverState(_ isHovering: Bool, for nodeID: Int) {
+        if isHovering {
+            hoveredButtonIDs.insert(nodeID)
+        } else {
+            hoveredButtonIDs.remove(nodeID)
+        }
+    }
+
+    static func triggerFrame(for rect: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: rect.minY,
+            width: max(rect.width, 1),
+            height: max(rect.height, 1)
+        )
+    }
+
+    private func tooltipWidth(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> CGFloat {
+        switch state {
+        case .queued:
+            return 94
+        case .reveal:
+            return 78
+        case .copyText:
+            return 92
+        }
+    }
+
+    private func tooltipForegroundColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> Color {
+        state.isInteractive ? .white : .white.opacity(0.5)
+    }
+
+    private func tooltipBackgroundColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> Color {
+        state.isInteractive ? Color.black.opacity(0.84) : Color.black.opacity(0.58)
+    }
+
+    private func tooltipBorderColor(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> Color {
+        state.isInteractive ? Color.white.opacity(0.22) : Color.white.opacity(0.12)
+    }
+
+    @ViewBuilder
+    private func tooltipLabel(
+        for state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+    ) -> some View {
+        Text(state.title)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundColor(tooltipForegroundColor(for: state))
+            .frame(width: tooltipWidth(for: state), height: buttonHeight)
+            .background(
+                Capsule()
+                    .fill(tooltipBackgroundColor(for: state))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(tooltipBorderColor(for: state), lineWidth: 1)
+            )
+    }
+
+    static func tooltipFrame(
+        for rect: CGRect,
+        state: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState,
+        containerSize: CGSize,
+        edgePadding: CGFloat = 14,
+        buttonHeight: CGFloat = 30,
+        buttonOverlap: CGFloat = 2
+    ) -> CGRect {
+        let tooltipWidth: CGFloat
+        switch state {
+        case .queued:
+            tooltipWidth = 94
+        case .reveal:
+            tooltipWidth = 78
+        case .copyText:
+            tooltipWidth = 92
+        }
+
+        var originX = rect.midX - (tooltipWidth / 2)
+        originX = min(
+            max(originX, edgePadding),
+            containerSize.width - tooltipWidth - edgePadding
+        )
+
+        let preferredTopY = rect.minY - buttonHeight + buttonOverlap
+        let fallbackBottomY = rect.maxY - buttonOverlap
+        let originY: CGFloat
+        if preferredTopY >= edgePadding {
+            originY = preferredTopY
+        } else {
+            originY = min(
+                max(fallbackBottomY, edgePadding),
+                containerSize.height - buttonHeight - edgePadding
+            )
+        }
+
+        return CGRect(x: originX, y: originY, width: tooltipWidth, height: buttonHeight)
+    }
+}
+
+private struct RedactionTooltipHoverEntry: Equatable {
+    let nodeID: Int
+    let triggerFrame: CGRect
+    let tooltipState: SimpleTimelineViewModel.PhraseLevelRedactionTooltipState
+}
+
+private struct RedactionTooltipHoverTracker: NSViewRepresentable {
+    let entries: [RedactionTooltipHoverEntry]
+    let onHoveredNodeChanged: (Int?) -> Void
+
+    func makeNSView(context: Context) -> RedactionTooltipHoverTrackingView {
+        let view = RedactionTooltipHoverTrackingView()
+        view.onHoveredNodeChanged = onHoveredNodeChanged
+        return view
+    }
+
+    func updateNSView(_ nsView: RedactionTooltipHoverTrackingView, context: Context) {
+        let didEntriesChange = nsView.entries != entries
+        nsView.entries = entries
+        nsView.onHoveredNodeChanged = onHoveredNodeChanged
+        if didEntriesChange || !nsView.hasPerformedInitialHoverSync {
+            nsView.refreshHoverStateForCurrentMouseLocation()
+            nsView.hasPerformedInitialHoverSync = true
+        }
+    }
+}
+
+private final class RedactionTooltipHoverTrackingView: NSView {
+    var entries: [RedactionTooltipHoverEntry] = []
+    var onHoveredNodeChanged: ((Int?) -> Void)?
+    var hasPerformedInitialHoverSync = false
+
+    private var trackingArea: NSTrackingArea?
+
+    override var isFlipped: Bool {
+        true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+
+        let options: NSTrackingArea.Options = [
+            .activeInKeyWindow,
+            .mouseEnteredAndExited,
+            .mouseMoved,
+            .inVisibleRect
+        ]
+        let trackingArea = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
+        self.trackingArea = trackingArea
+        addTrackingArea(trackingArea)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        onHoveredNodeChanged?(nil)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    func refreshHoverStateForCurrentMouseLocation() {
+        guard let window else { return }
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        onHoveredNodeChanged?(hoveredNodeID(at: location))
+    }
+
+    private func hoveredNodeID(at location: CGPoint) -> Int? {
+        entries.first(where: { $0.triggerFrame.contains(location) })?.nodeID
     }
 }
 
@@ -2894,6 +3589,13 @@ struct ZoomUnifiedOverlay<Content: View>: View {
                     zoomedRect: endRect
                 )
                 // This layer handles text selection - allows hit testing only within its bounds
+
+                ZoomedRedactedNodeRevealOverlay(
+                    viewModel: viewModel,
+                    zoomRegion: zoomRegion,
+                    zoomedRect: endRect
+                )
+                .allowsHitTesting(false)
             }
 
             // LAYER 8: Action menu - interactive, should receive clicks
@@ -5454,11 +6156,20 @@ struct DebugFrameIDBadge: View {
                             case 2: "completed"
                             case 3: "failed"
                             case 4: "not readable"
+                            case 5: "rewrite pending"
+                            case 6: "rewrite processing"
+                            case 7: "rewrite completed"
+                            case 8: "rewrite failed"
                             default: "unknown"
                         }
                         Text("p=\(status) (\(statusText))")
                             .font(.retraceMonoSmall)
-                            .foregroundColor(status == -1 ? .blue.opacity(0.8) : status == 4 ? .red.opacity(0.8) : status == 2 ? .green.opacity(0.8) : .yellow.opacity(0.8))
+                            .foregroundColor(
+                                status == -1 ? .blue.opacity(0.8)
+                                : (status == 4 || status == 3 || status == 8) ? .red.opacity(0.8)
+                                : (status == 2 || status == 7) ? .green.opacity(0.8)
+                                : .yellow.opacity(0.8)
+                            )
                     }
 
                 }
@@ -5642,6 +6353,8 @@ struct OCRStatusIndicator: View {
             return "tray.and.arrow.down"
         case .processing:
             return "gearshape.2"
+        case .rewriting:
+            return "eye.slash"
         default:
             return "doc.text"
         }
@@ -5656,6 +6369,8 @@ struct OCRStatusIndicator: View {
             return .orange
         case .processing:
             return .blue
+        case .rewriting:
+            return .orange
         case .failed:
             return .red
         default:
@@ -6171,20 +6886,35 @@ struct RightClickOverlay: ViewModifier {
         }
     }
 
+    final class RedactionMenuTarget: NSObject {
+        var node: OCRNodeWithText?
+        var onToggleReveal: (OCRNodeWithText) -> Void = { _ in }
+
+        @objc func toggleRevealAction(_ sender: Any?) {
+            guard let node else { return }
+            onToggleReveal(node)
+        }
+    }
+
     final class MonitorState: ObservableObject {
         var hyperlinkEntries: [HyperlinkContextMenuEntry] = []
+        var redactionEntries: [RedactedNodeContextMenuEntry] = []
         var onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void = { _ in }
         var onCopyHyperlink: (OCRHyperlinkMatch) -> Void = { _ in }
+        var onRedactionRevealToggle: (OCRNodeWithText) -> Void = { _ in }
         var onRightClick: (CGPoint) -> Void = { _ in }
         var viewBounds: CGRect = .zero
         let hyperlinkMenuTarget = HyperlinkMenuTarget()
+        let redactionMenuTarget = RedactionMenuTarget()
     }
 
     struct MonitorStateSyncView: NSViewRepresentable {
         let monitorState: MonitorState
         let hyperlinkEntries: [HyperlinkContextMenuEntry]
+        let redactionEntries: [RedactedNodeContextMenuEntry]
         let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
         let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
+        let onRedactionRevealToggle: (OCRNodeWithText) -> Void
         let onRightClick: (CGPoint) -> Void
         let viewBounds: CGRect
 
@@ -6194,16 +6924,20 @@ struct RightClickOverlay: ViewModifier {
 
         func updateNSView(_ nsView: NSView, context: Context) {
             monitorState.hyperlinkEntries = hyperlinkEntries
+            monitorState.redactionEntries = redactionEntries
             monitorState.onHyperlinkRightClick = onHyperlinkRightClick
             monitorState.onCopyHyperlink = onHyperlinkCopy
+            monitorState.onRedactionRevealToggle = onRedactionRevealToggle
             monitorState.onRightClick = onRightClick
             monitorState.viewBounds = viewBounds
         }
     }
 
     let hyperlinkEntries: [HyperlinkContextMenuEntry]
+    let redactionEntries: [RedactedNodeContextMenuEntry]
     let onHyperlinkRightClick: (OCRHyperlinkMatch) -> Void
     let onHyperlinkCopy: (OCRHyperlinkMatch) -> Void
+    let onRedactionRevealToggle: (OCRNodeWithText) -> Void
     let onRightClick: (CGPoint) -> Void
     @State private var eventMonitor: Any?
     @State private var viewBounds: CGRect = .zero
@@ -6221,8 +6955,10 @@ struct RightClickOverlay: ViewModifier {
                 MonitorStateSyncView(
                     monitorState: monitorState,
                     hyperlinkEntries: hyperlinkEntries,
+                    redactionEntries: redactionEntries,
                     onHyperlinkRightClick: onHyperlinkRightClick,
                     onHyperlinkCopy: onHyperlinkCopy,
+                    onRedactionRevealToggle: onRedactionRevealToggle,
                     onRightClick: onRightClick,
                     viewBounds: viewBounds
                 )
@@ -6263,8 +6999,10 @@ struct RightClickOverlay: ViewModifier {
 
     private func syncMonitorState() {
         monitorState.hyperlinkEntries = hyperlinkEntries
+        monitorState.redactionEntries = redactionEntries
         monitorState.onHyperlinkRightClick = onHyperlinkRightClick
         monitorState.onCopyHyperlink = onHyperlinkCopy
+        monitorState.onRedactionRevealToggle = onRedactionRevealToggle
         monitorState.onRightClick = onRightClick
         monitorState.viewBounds = viewBounds
     }
@@ -6292,6 +7030,8 @@ struct RightClickOverlay: ViewModifier {
                 let localPoint = CGPoint(x: localX, y: localY)
                 let hyperlinkEntries = monitorState.hyperlinkEntries
                 let matchedHyperlink = hyperlinkEntries.first(where: { $0.rect.contains(localPoint) })
+                let redactionEntries = monitorState.redactionEntries
+                let matchedRedaction = redactionEntries.first(where: { $0.rect.contains(localPoint) })
 
                 // Check if click is in the timeline tape area at the bottom
                 // If so, let the event pass through to SwiftUI's native contextMenu
@@ -6307,6 +7047,27 @@ struct RightClickOverlay: ViewModifier {
                     let copyItem = NSMenuItem(title: "Copy Link", action: #selector(HyperlinkMenuTarget.copyLinkAction(_:)), keyEquivalent: "")
                     copyItem.target = target
                     menu.addItem(copyItem)
+                    NSMenu.popUpContextMenu(menu, with: event, for: contentView)
+                    return nil
+                }
+
+                if let matchedRedaction,
+                   let tooltipState = matchedRedaction.tooltipState,
+                   let contentView = window.contentView {
+                    let target = monitorState.redactionMenuTarget
+                    target.node = matchedRedaction.node
+                    target.onToggleReveal = monitorState.onRedactionRevealToggle
+
+                    let menu = NSMenu()
+                    let title = tooltipState.title
+                    let toggleItem = NSMenuItem(
+                        title: title,
+                        action: #selector(RedactionMenuTarget.toggleRevealAction(_:)),
+                        keyEquivalent: ""
+                    )
+                    toggleItem.target = target
+                    toggleItem.isEnabled = tooltipState.isInteractive
+                    menu.addItem(toggleItem)
                     NSMenu.popUpContextMenu(menu, with: event, for: contentView)
                     return nil
                 }
@@ -6336,15 +7097,19 @@ struct RightClickOverlay: ViewModifier {
 extension View {
     func onRightClick(
         hyperlinkEntries: [HyperlinkContextMenuEntry] = [],
+        redactionEntries: [RedactedNodeContextMenuEntry] = [],
         onHyperlinkRightClick: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
         onHyperlinkCopy: @escaping (OCRHyperlinkMatch) -> Void = { _ in },
+        onRedactionRevealToggle: @escaping (OCRNodeWithText) -> Void = { _ in },
         perform action: @escaping (CGPoint) -> Void
     ) -> some View {
         modifier(
             RightClickOverlay(
                 hyperlinkEntries: hyperlinkEntries,
+                redactionEntries: redactionEntries,
                 onHyperlinkRightClick: onHyperlinkRightClick,
                 onHyperlinkCopy: onHyperlinkCopy,
+                onRedactionRevealToggle: onRedactionRevealToggle,
                 onRightClick: action
             )
         )

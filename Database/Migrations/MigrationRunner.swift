@@ -101,7 +101,8 @@ actor MigrationRunner {
             V11_SegmentCommentLinkCompositeIndex(),
             V12_FrameMetadata(),
             V13_RemoveInPageURLRects(),
-            V14_DBStorageSnapshot()
+            V14_DBStorageSnapshot(),
+            V15_NodeRedactionFlag()
         ]
     }
 
@@ -165,6 +166,7 @@ actor MigrationRunner {
             throw DatabaseError.queryFailed(query: sql, underlying: message)
         }
     }
+
 }
 
 // MARK: - Migration Utilities

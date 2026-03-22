@@ -3,6 +3,7 @@ import CoreGraphics
 import Shared
 import Database
 import Storage
+import SQLCipher
 @testable import App
 
 final class InPageURLCaptureRoutingTests: XCTestCase {
@@ -525,6 +526,40 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         try await fixture.rewindDatabase.close()
     }
 
+    private func withConnection<T>(
+        _ database: DatabaseManager,
+        _ body: (OpaquePointer) throws -> T
+    ) async throws -> T {
+        let connection = await database.getConnection()
+        let db = try XCTUnwrap(connection)
+        return try body(db)
+    }
+
+    private func fetchInt64(
+        db: OpaquePointer,
+        sql: String,
+        bind: ((OpaquePointer) -> Void)? = nil
+    ) throws -> Int64 {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            XCTFail("Failed to prepare SQL: \(sql)")
+            return 0
+        }
+
+        if let bind, let statement {
+            bind(statement)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            XCTFail("Expected row for SQL: \(sql)")
+            return 0
+        }
+
+        return sqlite3_column_int64(statement, 0)
+    }
+
     func testMostRecentFramesExcludeRetraceFramesBeforeCutoff() async throws {
         let cutoffDate = makeCutoffDate()
         let fixture = try await makeFixture(cutoffDate: cutoffDate)
@@ -707,6 +742,102 @@ final class DataAdapterRewindBoundaryTests: XCTestCase {
         XCTAssertFalse(bundleIDs.contains("com.retrace.old"))
         XCTAssertTrue(bundleIDs.contains("com.retrace.new"))
         XCTAssertTrue(bundleIDs.contains("com.rewind.old"))
+    }
+
+    func testDeleteFrameRemovesFTSRowsForNativeSource() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let frameID = try await seedFrame(
+            in: fixture.retraceDatabase,
+            timestamp: cutoffDate.addingTimeInterval(3600),
+            bundleID: "com.retrace.delete",
+            text: "native delete me",
+            source: .native
+        )
+
+        let docid = try await withConnection(fixture.retraceDatabase) { db in
+            try fetchInt64(
+                db: db,
+                sql: "SELECT MAX(docid) FROM doc_segment WHERE frameId = ?;",
+                bind: { sqlite3_bind_int64($0, 1, frameID.value) }
+            )
+        }
+        XCTAssertGreaterThan(docid, 0)
+
+        try await fixture.adapter.deleteFrame(frameID: frameID, source: .native)
+
+        try await withConnection(fixture.retraceDatabase) { db in
+            XCTAssertEqual(
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, frameID.value) }
+                ),
+                0
+            )
+            XCTAssertEqual(
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, docid) }
+                ),
+                0
+            )
+        }
+    }
+
+    func testDeleteFrameRemovesFTSRowsForRewindSource() async throws {
+        let cutoffDate = makeCutoffDate()
+        let fixture = try await makeFixture(cutoffDate: cutoffDate)
+        defer {
+            Task {
+                try? await self.close(fixture)
+            }
+        }
+
+        let frameID = try await seedFrame(
+            in: fixture.rewindDatabase,
+            timestamp: cutoffDate.addingTimeInterval(-3600),
+            bundleID: "com.rewind.delete",
+            text: "rewind delete me",
+            source: .rewind
+        )
+
+        let docid = try await withConnection(fixture.rewindDatabase) { db in
+            try fetchInt64(
+                db: db,
+                sql: "SELECT MAX(docid) FROM doc_segment WHERE frameId = ?;",
+                bind: { sqlite3_bind_int64($0, 1, frameID.value) }
+            )
+        }
+        XCTAssertGreaterThan(docid, 0)
+
+        try await fixture.adapter.deleteFrame(frameID: frameID, source: .rewind)
+
+        try await withConnection(fixture.rewindDatabase) { db in
+            XCTAssertEqual(
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM doc_segment WHERE frameId = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, frameID.value) }
+                ),
+                0
+            )
+            XCTAssertEqual(
+                try fetchInt64(
+                    db: db,
+                    sql: "SELECT COUNT(*) FROM searchRanking WHERE rowid = ?;",
+                    bind: { sqlite3_bind_int64($0, 1, docid) }
+                ),
+                0
+            )
+        }
     }
 }
 
@@ -1352,6 +1483,134 @@ final class CrashRecoveryStartupTests: XCTestCase {
                 videoInfo.videoPath,
                 storageRoot.appendingPathComponent("chunks/202603/12/9876.mp4").path
             )
+
+            try await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+        } catch {
+            try? await services.shutdown()
+            try? FileManager.default.removeItem(at: storageRoot)
+            throw error
+        }
+    }
+}
+
+final class OCRReprocessSafetyTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
+            databasePath: "file:app_ocr_reprocess_\(UUID().uuidString)?mode=memory&cache=shared",
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            ),
+            storageCrashReportDirectory: crashReportDirectory
+        )
+    }
+
+    func testReprocessOCRRejectsFramesWithRedactedNodes() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OCRReprocessSafetyTests_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+
+        do {
+            try await services.initialize()
+
+            let database = await services.database
+            guard let queue = await services.processingQueue else {
+                XCTFail("Expected processing queue to be initialized")
+                return
+            }
+            let timestamp = Date(timeIntervalSince1970: 1_740_500_000)
+            let videoID = try await database.insertVideoSegment(
+                VideoSegment(
+                    id: VideoSegmentID(value: 9_999),
+                    startTime: timestamp,
+                    endTime: timestamp,
+                    frameCount: 1,
+                    fileSizeBytes: 123,
+                    relativePath: "chunks/202603/12/9999",
+                    width: 8,
+                    height: 8
+                )
+            )
+            let segmentID = try await database.insertSegment(
+                bundleID: "com.apple.Safari",
+                startDate: timestamp,
+                endDate: timestamp,
+                windowName: "Protected Window",
+                browserUrl: "https://example.com",
+                type: 0
+            )
+            let frameIDValue = try await database.insertFrame(
+                FrameReference(
+                    id: FrameID(value: 0),
+                    timestamp: timestamp,
+                    segmentID: AppSegmentID(value: segmentID),
+                    videoID: VideoSegmentID(value: videoID),
+                    frameIndexInSegment: 0,
+                    metadata: FrameMetadata(
+                        appBundleID: "com.apple.Safari",
+                        appName: "Safari",
+                        windowName: "Protected Window",
+                        browserURL: "https://example.com",
+                        displayID: 1
+                    ),
+                    source: .native
+                )
+            )
+            let frameID = FrameID(value: frameIDValue)
+            let docid = try await database.indexFrameText(
+                mainText: "super secret",
+                chromeText: nil,
+                windowTitle: "Protected Window",
+                segmentId: segmentID,
+                frameId: frameIDValue
+            )
+            try await database.insertNodes(
+                frameID: frameID,
+                nodes: [(
+                    textOffset: 0,
+                    textLength: 12,
+                    bounds: CGRect(x: 0, y: 0, width: 8, height: 8),
+                    windowIndex: nil
+                )],
+                encryptedTexts: [0: "ciphertext"],
+                frameWidth: 8,
+                frameHeight: 8
+            )
+            try await database.updateFrameProcessingStatus(frameID: frameIDValue, status: 2)
+
+            let queueDepthBefore = try await queue.getQueueDepth()
+
+            do {
+                try await coordinator.reprocessOCR(frameID: frameID)
+                XCTFail("Expected redacted frame reprocess to be rejected")
+            } catch let error as AppError {
+                guard case .ocrReprocessBlockedForRedactedFrame(let rejectedFrameID) = error else {
+                    XCTFail("Expected ocrReprocessBlockedForRedactedFrame, got \(error)")
+                    return
+                }
+                XCTAssertEqual(rejectedFrameID, frameIDValue)
+            }
+
+            let queueDepthAfter = try await queue.getQueueDepth()
+            XCTAssertEqual(queueDepthAfter, queueDepthBefore)
+
+            let preservedNodes = try await database.getOCRNodesWithText(frameID: frameID)
+            XCTAssertEqual(preservedNodes.count, 1)
+            XCTAssertTrue(preservedNodes[0].isRedacted)
+            XCTAssertEqual(preservedNodes[0].encryptedText, "ciphertext")
+
+            let preservedDocid = try await database.getDocidForFrame(frameId: frameIDValue)
+            XCTAssertEqual(preservedDocid, docid)
+            let preservedFTS = try await database.getFTSContent(docid: docid)
+            XCTAssertEqual(preservedFTS?.mainText, "super secret")
+
+            let statuses = try await database.getFrameProcessingStatuses(frameIDs: [frameIDValue])
+            XCTAssertEqual(statuses[frameIDValue], 2)
 
             try await services.shutdown()
             try? FileManager.default.removeItem(at: storageRoot)

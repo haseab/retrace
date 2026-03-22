@@ -2,7 +2,6 @@ import CoreGraphics
 import Foundation
 import Shared
 import Database
-import Storage
 import Search
 import ImageIO
 
@@ -29,17 +28,30 @@ public actor FrameProcessingQueue {
 
     // Statistics
     private var totalProcessed: Int = 0
+    private var totalRewritten: Int = 0
     private var totalFailed: Int = 0
     private var currentQueueDepth: Int = 0
-    private var pendingCount: Int = 0      // Frames with status 0
-    private var processingCount: Int = 0   // Frames with status 1
+    private var ocrPendingCount: Int = 0
+    private var ocrProcessingCount: Int = 0
+    private var rewritePendingCount: Int = 0
+    private var rewriteProcessingCount: Int = 0
 
     private let memoryReportIntervalNs: UInt64 = 5_000_000_000
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerQueueTag = "processing.ocr.queueDepth"
     private static let memoryLedgerWorkersTag = "processing.ocr.workers"
     private static let memoryLedgerRawCacheTag = "processing.ocr.rawFrameCache"
+    private static let rewriteResumeDebounceNs: UInt64 = 300_000_000
+    private static let phraseRedactionPhrasesDefaultsKey = "phraseLevelRedactionPhrases"
+    private static let phraseRedactionEnabledDefaultsKey = "phraseLevelRedactionEnabled"
+    private static let phraseRedactionExtraTokenSlack = 2
+    private static let phraseRedactionMaxNodeSpan = 8
     private var isPausedForMemoryPressure = false
+    private var activeRewriteVideoIDs: Set<Int64> = []
+    private var isRewriteTimelineVisible = false
+    private var isRewriteTimelineScrubbing = false
+    private var rewriteResumeTask: Task<Void, Never>?
+    private var startupRewriteRecoveryPending = false
 
     // MARK: - Power-Aware Processing Control
 
@@ -208,6 +220,179 @@ public actor FrameProcessingQueue {
         return allowed
     }
 
+    // MARK: - Rewrite Scheduling
+
+    private var isRewriteSchedulingSuspended: Bool {
+        isRewriteTimelineVisible || isRewriteTimelineScrubbing
+    }
+
+    public func setTimelineVisibleForRewriteScheduling(_ visible: Bool) {
+        guard isRewriteTimelineVisible != visible else { return }
+        isRewriteTimelineVisible = visible
+        handleRewriteSchedulingStateChange(
+            trigger: visible ? "timeline-visible" : "timeline-hidden"
+        )
+    }
+
+    public func setTimelineScrubbingForRewriteScheduling(_ scrubbing: Bool) {
+        guard isRewriteTimelineScrubbing != scrubbing else { return }
+        isRewriteTimelineScrubbing = scrubbing
+        handleRewriteSchedulingStateChange(
+            trigger: scrubbing ? "timeline-scrubbing" : "timeline-scrub-idle"
+        )
+    }
+
+    private func handleRewriteSchedulingStateChange(trigger: String) {
+        rewriteResumeTask?.cancel()
+        rewriteResumeTask = nil
+
+        if isRewriteSchedulingSuspended {
+            Log.info(
+                "[Queue-Rewrite] Suspended pending segment rewrites (\(trigger)); timelineVisible=\(isRewriteTimelineVisible), scrubbing=\(isRewriteTimelineScrubbing)",
+                category: .processing
+            )
+            return
+        }
+
+        let delayNs = Self.rewriteResumeDebounceNs
+        rewriteResumeTask = Task { [delayNs] in
+            try? await Task.sleep(for: .nanoseconds(Int64(delayNs)), clock: .continuous)
+            guard !Task.isCancelled else { return }
+            await self.resumePendingRedactionsAfterInteractiveTimeline(trigger: trigger)
+        }
+
+        Log.debug(
+            "[Queue-Rewrite] Scheduling pending segment rewrite resume in \(delayNs / 1_000_000)ms (\(trigger))",
+            category: .processing
+        )
+    }
+
+    private func resumePendingRedactionsAfterInteractiveTimeline(trigger: String) async {
+        guard !isRewriteSchedulingSuspended else { return }
+
+        if await performStartupRewriteRecoveryIfPending(trigger: "interactive-idle:\(trigger)") {
+            return
+        }
+
+        await drainPendingRedactionsIfPossible(
+            includeInProgressJobs: false,
+            includeRetryableFailures: false,
+            trigger: "interactive-idle:\(trigger)"
+        )
+    }
+
+    @discardableResult
+    private func performStartupRewriteRecoveryIfPending(trigger: String) async -> Bool {
+        guard startupRewriteRecoveryPending else { return false }
+        guard !isRewriteSchedulingSuspended else {
+            Log.debug(
+                "[Queue-Rewrite] Startup rewrite recovery still deferred while timeline is active (\(trigger))",
+                category: .processing
+            )
+            return false
+        }
+
+        startupRewriteRecoveryPending = false
+
+        do {
+            await reconcileInterruptedSegmentRedactionsOnStartup()
+
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+                includeRetryableFailures: true
+            )
+            guard !pendingVideoIDs.isEmpty else { return true }
+
+            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
+                Log.warning(
+                    "[Queue-Rewrite] Deferring startup rewrite recovery for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction",
+                    category: .processing
+                )
+                return true
+            }
+
+            Log.info(
+                "[Queue-Rewrite] Startup recovery found \(pendingVideoIDs.count) video(s) with pending rewrites, purpose=redaction (\(trigger))",
+                category: .processing
+            )
+
+            for videoID in pendingVideoIDs {
+                do {
+                    try await processPendingRedactions(
+                        for: videoID,
+                        includeInProgressJobs: true,
+                        includeRetryableFailures: true
+                    )
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Startup recovery failed for video \(videoID): \(error.localizedDescription), purpose=redaction",
+                        category: .processing
+                    )
+                }
+            }
+        } catch {
+            Log.error(
+                "[Queue-Rewrite] Failed to scan pending rewrites on startup: \(error.localizedDescription), purpose=redaction",
+                category: .processing
+            )
+        }
+
+        return true
+    }
+
+    private func drainPendingRedactionsIfPossible(
+        includeInProgressJobs: Bool,
+        includeRetryableFailures: Bool,
+        trigger: String
+    ) async {
+        guard !isRewriteSchedulingSuspended else {
+            Log.debug(
+                "[Queue-Rewrite] Skipping pending rewrite drain while timeline interaction is active (\(trigger))",
+                category: .processing
+            )
+            return
+        }
+
+        do {
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+                includeRetryableFailures: includeRetryableFailures
+            )
+            guard !pendingVideoIDs.isEmpty else { return }
+
+            guard ReversibleOCRScrambler.currentAppWideSecret() != nil else {
+                Log.warning(
+                    "[Queue-Rewrite] Deferring pending rewrite drain for \(pendingVideoIDs.count) video(s) because no master key exists, purpose=redaction (\(trigger))",
+                    category: .processing
+                )
+                return
+            }
+
+            Log.info(
+                "[Queue-Rewrite] Draining \(pendingVideoIDs.count) pending rewrite video(s), includeRetryableFailures=\(includeRetryableFailures), trigger=\(trigger)",
+                category: .processing
+            )
+
+            for videoID in pendingVideoIDs {
+                do {
+                    try await processPendingRedactions(
+                        for: videoID,
+                        includeInProgressJobs: includeInProgressJobs,
+                        includeRetryableFailures: includeRetryableFailures
+                    )
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Pending rewrite drain failed for video \(videoID): \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                        category: .processing
+                    )
+                }
+            }
+        } catch {
+            Log.error(
+                "[Queue-Rewrite] Failed to scan pending rewrites for drain: \(error.localizedDescription), purpose=redaction, trigger=\(trigger)",
+                category: .processing
+            )
+        }
+    }
+
     // MARK: - Queue Operations
 
     /// Enqueue a frame for processing
@@ -254,9 +439,11 @@ public actor FrameProcessingQueue {
 
         // Initialize counts from actual frame statuses
         if let counts = try? await databaseManager.getFrameStatusCounts() {
-            pendingCount = counts.pending
-            processingCount = counts.processing
-            currentQueueDepth = counts.pending + counts.processing
+            ocrPendingCount = counts.ocrPending
+            ocrProcessingCount = counts.ocrProcessing
+            rewritePendingCount = counts.rewritePending
+            rewriteProcessingCount = counts.rewriteProcessing
+            currentQueueDepth = counts.ocrPending + counts.ocrProcessing
         }
 
         let priority = workerPriority
@@ -265,6 +452,13 @@ public actor FrameProcessingQueue {
                 await runWorker(id: workerID)
             }
             workers.append(task)
+        }
+
+        // Recovery can leave rewrite-pending/in-progress frames stranded after OCR
+        // completed. Sweep and finish those rewrites on startup.
+        startupRewriteRecoveryPending = true
+        Task {
+            _ = await performStartupRewriteRecoveryIfPending(trigger: "startup")
         }
 
         startMemoryReporting()
@@ -287,6 +481,8 @@ public actor FrameProcessingQueue {
         workers.removeAll()
         memoryReportTask?.cancel()
         memoryReportTask = nil
+        rewriteResumeTask?.cancel()
+        rewriteResumeTask = nil
 
         MemoryLedger.set(
             tag: Self.memoryLedgerWorkersTag,
@@ -459,26 +655,32 @@ public actor FrameProcessingQueue {
         let tFrame = ocrStage.ocrStartTime
         let tOCR = CFAbsoluteTimeGetCurrent()
 
-        // Index in FTS
+        let phraseRedactionResult = applyPhraseLevelRedaction(
+            to: ocrStage.extractedText,
+            actualFrameID: frameID
+        )
+        let indexedText = phraseRedactionResult.sanitizedText
+        let hasRedactedNodes = !phraseRedactionResult.redactedCombinedNodeOrders.isEmpty
+
         let docid = try await search.index(
-            text: ocrStage.extractedText,
+            text: indexedText,
             segmentId: frameRef.segmentID.value,
             frameId: frameID
         )
 
         // Insert OCR nodes for both main and chrome regions so any FTS hit can be highlighted.
-        let hasAnyOCRRegions = !ocrStage.extractedText.regions.isEmpty || !ocrStage.extractedText.chromeRegions.isEmpty
-        if docid > 0 && hasAnyOCRRegions {
+        let hasAnyOCRRegions = !indexedText.regions.isEmpty || !indexedText.chromeRegions.isEmpty
+        if hasAnyOCRRegions && (docid > 0 || hasRedactedNodes) {
             // Delete any existing nodes first to prevent duplicates
             // (can happen if frame is reprocessed without going through reprocessOCR)
             try await databaseManager.deleteNodes(frameID: FrameID(value: frameID))
 
             var nodeData: [(textOffset: Int, textLength: Int, bounds: CGRect, windowIndex: Int?)] = []
-            nodeData.reserveCapacity(ocrStage.extractedText.regions.count + ocrStage.extractedText.chromeRegions.count)
+            nodeData.reserveCapacity(indexedText.regions.count + indexedText.chromeRegions.count)
 
             // c0 offsets: main OCR text joined with single-space separators.
             var mainOffset = 0
-            for region in ocrStage.extractedText.regions {
+            for region in indexedText.regions {
                 let textLength = region.text.count
                 nodeData.append((
                     textOffset: mainOffset,
@@ -490,8 +692,8 @@ public actor FrameProcessingQueue {
             }
 
             // c1 offsets are relative to (c0 + c1) because node text is read using COALESCE(c0,'') || COALESCE(c1,'').
-            var chromeOffset = ocrStage.extractedText.fullText.count
-            for region in ocrStage.extractedText.chromeRegions {
+            var chromeOffset = indexedText.fullText.count
+            for region in indexedText.chromeRegions {
                 let textLength = region.text.count
                 nodeData.append((
                     textOffset: chromeOffset,
@@ -506,6 +708,7 @@ public actor FrameProcessingQueue {
             try await databaseManager.insertNodes(
                 frameID: FrameID(value: frameID),
                 nodes: nodeData,
+                encryptedTexts: phraseRedactionResult.encryptedRedactedTexts,
                 frameWidth: videoSegment.width,
                 frameHeight: videoSegment.height
             )
@@ -524,8 +727,21 @@ public actor FrameProcessingQueue {
             )
         }
 
-        // Mark as completed
-        try await updateFrameProcessingStatus(frameID, status: .completed)
+        if phraseRedactionResult.redactedCombinedNodeOrders.isEmpty {
+            try await updateFrameProcessingStatus(frameID, status: .completed)
+        } else {
+            try await updateFrameProcessingStatus(
+                frameID,
+                status: .rewritePending,
+                rewritePurpose: "redaction"
+            )
+        }
+
+        // Video rewrites run only on finalized segments. Defer the actual rewrite
+        // until OCR has quiesced for the whole video so we only re-encode once.
+        if frameWithInfo.videoInfo?.isVideoFinalized ?? true {
+            try? await processPendingRedactions(for: frameRef.videoID.value)
+        }
 
         let tDone = CFAbsoluteTimeGetCurrent()
         Log.info("[Queue-TIMING] Frame \(frameID): prep=\(String(format: "%.0f", (tPrep-t0)*1000))ms frame=\(String(format: "%.0f", (tFrame-tPrep)*1000))ms ocr=\(String(format: "%.0f", (tOCR-tFrame)*1000))ms index=\(String(format: "%.0f", (tDone-tOCR)*1000))ms total=\(String(format: "%.0f", (tDone-t0)*1000))ms size=\(ocrStage.frameWidth)x\(ocrStage.frameHeight)", category: .processing)
@@ -660,17 +876,9 @@ public actor FrameProcessingQueue {
 
     /// Returns nil when WAL data is not ready yet and frame should be deferred.
     private func readFrameFromWAL(frameID: Int64, segmentID: VideoSegmentID, frameIndex: Int) async throws -> CapturedFrame? {
-        guard let storageManager = storage as? StorageManager else {
-            throw StorageError.fileReadFailed(
-                path: "WAL(\(segmentID.value))",
-                underlying: "Storage manager does not expose WAL manager"
-            )
-        }
-
-        let walManager = await storageManager.getWALManager()
         do {
-            return try await walManager.readFrame(
-                videoID: segmentID,
+            return try await storage.readFrameFromWAL(
+                segmentID: segmentID,
                 frameID: frameID,
                 fallbackFrameIndex: frameIndex
             )
@@ -1274,11 +1482,727 @@ public actor FrameProcessingQueue {
         }
     }
 
+    // MARK: - Phrase-Level Redaction
+
+    private struct PhraseLevelRedactionResult {
+        let sanitizedText: ExtractedText
+        let redactedCombinedNodeOrders: Set<Int>
+        let encryptedRedactedTexts: [Int: String]
+    }
+
+    private struct NormalizedPhraseRedactionPhrase {
+        let normalizedText: String
+        let compactText: String
+        let tokenCount: Int
+    }
+
+    private struct IndexedPhraseRedactionToken {
+        let token: String
+        let combinedNodeOrder: Int
+    }
+
+    private func applyPhraseLevelRedaction(
+        to extracted: ExtractedText,
+        actualFrameID: Int64? = nil
+    ) -> PhraseLevelRedactionResult {
+        let defaults = UserDefaults(suiteName: ReversibleOCRScrambler.settingsSuiteName) ?? .standard
+        let preliminaryResult = Self.applyPhraseLevelRedaction(
+            to: extracted,
+            phrases: loadPhraseLevelRedactionPhrases(defaults: defaults)
+        )
+
+        guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
+            return preliminaryResult
+        }
+
+        let secret = ReversibleOCRScrambler.currentAppWideSecret()
+        let effectiveFrameID = actualFrameID ?? extracted.frameID.value
+        let finalResult = Self.finalizedPhraseLevelRedactionResult(
+            extracted: extracted,
+            preliminaryResult: preliminaryResult,
+            secret: secret,
+            actualFrameID: effectiveFrameID
+        )
+        if secret != nil {
+            return finalResult
+        }
+
+        Log.warning(
+            "[PhraseRedaction] Skipping phrase-level redaction for frame \(effectiveFrameID) because no master key exists",
+            category: .processing
+        )
+        return finalResult
+    }
+
+    static func applyPhraseLevelRedactionForTesting(
+        to extracted: ExtractedText,
+        phrases: [String],
+        redactionSecret: String? = "test-secret",
+        actualFrameID: Int64? = nil
+    ) -> (
+        sanitizedText: ExtractedText,
+        redactedCombinedNodeOrders: Set<Int>,
+        encryptedRedactedTexts: [Int: String]
+    ) {
+        let preliminaryResult = applyPhraseLevelRedaction(
+            to: extracted,
+            phrases: normalizedRedactionPhrases(phrases)
+        )
+        let finalResult = finalizedPhraseLevelRedactionResult(
+            extracted: extracted,
+            preliminaryResult: preliminaryResult,
+            secret: redactionSecret,
+            actualFrameID: actualFrameID ?? extracted.frameID.value
+        )
+        return (
+            finalResult.sanitizedText,
+            finalResult.redactedCombinedNodeOrders,
+            finalResult.encryptedRedactedTexts
+        )
+    }
+
+    private static func applyPhraseLevelRedaction(
+        to extracted: ExtractedText,
+        phrases: [NormalizedPhraseRedactionPhrase]
+    ) -> PhraseLevelRedactionResult {
+        var redactedNodeOrders: Set<Int> = []
+
+        if !phrases.isEmpty {
+            redactedNodeOrders.formUnion(
+                redactedCombinedNodeOrders(in: extracted.regions, offset: 0, phrases: phrases)
+            )
+            redactedNodeOrders.formUnion(
+                redactedCombinedNodeOrders(
+                    in: extracted.chromeRegions,
+                    offset: extracted.regions.count,
+                    phrases: phrases
+                )
+            )
+        }
+
+        guard !redactedNodeOrders.isEmpty else {
+            return PhraseLevelRedactionResult(
+                sanitizedText: extracted,
+                redactedCombinedNodeOrders: [],
+                encryptedRedactedTexts: [:]
+            )
+        }
+
+        let maskedMainRegions: [TextRegion] = extracted.regions.enumerated().map { index, region in
+            guard redactedNodeOrders.contains(index) else { return region }
+            return TextRegion(
+                id: region.databaseID,
+                frameID: region.frameID,
+                text: maskedTextPreservingLength(region.text),
+                bounds: region.bounds,
+                confidence: region.confidence,
+                createdAt: region.createdAt
+            )
+        }
+
+        let chromeBaseOrder = extracted.regions.count
+        let maskedChromeRegions: [TextRegion] = extracted.chromeRegions.enumerated().map { index, region in
+            guard redactedNodeOrders.contains(chromeBaseOrder + index) else { return region }
+            return TextRegion(
+                id: region.databaseID,
+                frameID: region.frameID,
+                text: maskedTextPreservingLength(region.text),
+                bounds: region.bounds,
+                confidence: region.confidence,
+                createdAt: region.createdAt
+            )
+        }
+
+        let sanitized = ExtractedText(
+            frameID: extracted.frameID,
+            timestamp: extracted.timestamp,
+            regions: maskedMainRegions,
+            chromeRegions: maskedChromeRegions,
+            fullText: maskedMainRegions.map(\.text).joined(separator: " "),
+            chromeText: maskedChromeRegions.map(\.text).joined(separator: " "),
+            metadata: extracted.metadata
+        )
+
+        return PhraseLevelRedactionResult(
+            sanitizedText: sanitized,
+            redactedCombinedNodeOrders: redactedNodeOrders,
+            encryptedRedactedTexts: [:]
+        )
+    }
+
+    private static func encryptedRedactedTexts(
+        from extracted: ExtractedText,
+        redactedCombinedNodeOrders: Set<Int>,
+        frameID: Int64,
+        secret: String
+    ) -> [Int: String] {
+        guard !redactedCombinedNodeOrders.isEmpty else {
+            return [:]
+        }
+
+        var encryptedTexts: [Int: String] = [:]
+
+        for (index, region) in extracted.regions.enumerated() {
+            guard redactedCombinedNodeOrders.contains(index) else { continue }
+            guard let encryptedText = ReversibleOCRScrambler.encryptOCRText(
+                region.text,
+                frameID: frameID,
+                nodeOrder: index,
+                secret: secret
+            ) else {
+                continue
+            }
+            encryptedTexts[index] = encryptedText
+        }
+
+        let chromeBaseOrder = extracted.regions.count
+        for (index, region) in extracted.chromeRegions.enumerated() {
+            let combinedNodeOrder = chromeBaseOrder + index
+            guard redactedCombinedNodeOrders.contains(combinedNodeOrder) else { continue }
+            guard let encryptedText = ReversibleOCRScrambler.encryptOCRText(
+                region.text,
+                frameID: frameID,
+                nodeOrder: combinedNodeOrder,
+                secret: secret
+            ) else {
+                continue
+            }
+            encryptedTexts[combinedNodeOrder] = encryptedText
+        }
+
+        return encryptedTexts
+    }
+
+    private static func finalizedPhraseLevelRedactionResult(
+        extracted: ExtractedText,
+        preliminaryResult: PhraseLevelRedactionResult,
+        secret: String?,
+        actualFrameID: Int64
+    ) -> PhraseLevelRedactionResult {
+        guard !preliminaryResult.redactedCombinedNodeOrders.isEmpty else {
+            return preliminaryResult
+        }
+        guard let secret else {
+            return PhraseLevelRedactionResult(
+                sanitizedText: extracted,
+                redactedCombinedNodeOrders: [],
+                encryptedRedactedTexts: [:]
+            )
+        }
+        let encryptedTexts = encryptedRedactedTexts(
+            from: extracted,
+            redactedCombinedNodeOrders: preliminaryResult.redactedCombinedNodeOrders,
+            frameID: actualFrameID,
+            secret: secret
+        )
+        return PhraseLevelRedactionResult(
+            sanitizedText: preliminaryResult.sanitizedText,
+            redactedCombinedNodeOrders: preliminaryResult.redactedCombinedNodeOrders,
+            encryptedRedactedTexts: encryptedTexts
+        )
+    }
+
+    private func loadPhraseLevelRedactionPhrases(defaults: UserDefaults) -> [NormalizedPhraseRedactionPhrase] {
+        guard let raw = defaults.string(forKey: Self.phraseRedactionPhrasesDefaultsKey),
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        guard Self.isPhraseLevelRedactionEnabled(defaults: defaults, hasStoredPhrases: true) else { return [] }
+
+        if let data = raw.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return Self.normalizedRedactionPhrases(decoded)
+        }
+
+        let fallback = raw
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map(String.init)
+        return Self.normalizedRedactionPhrases(fallback)
+    }
+
+    private static func isPhraseLevelRedactionEnabled(
+        defaults: UserDefaults,
+        hasStoredPhrases: Bool
+    ) -> Bool {
+        if let storedEnabled = defaults.object(forKey: Self.phraseRedactionEnabledDefaultsKey) as? Bool {
+            return storedEnabled
+        }
+
+        // Preserve legacy behavior for installs created before the explicit toggle existed.
+        return hasStoredPhrases
+    }
+
+    private static func normalizedRedactionPhrases(_ phrases: [String]) -> [NormalizedPhraseRedactionPhrase] {
+        var unique: Set<String> = []
+        var ordered: [NormalizedPhraseRedactionPhrase] = []
+        ordered.reserveCapacity(phrases.count)
+
+        for phrase in phrases {
+            let normalized = normalizePhraseRedactionText(phrase)
+            let compact = compactPhraseRedactionText(normalized)
+            guard !normalized.isEmpty, !compact.isEmpty else { continue }
+            guard unique.insert(compact).inserted else { continue }
+            ordered.append(
+                NormalizedPhraseRedactionPhrase(
+                    normalizedText: normalized,
+                    compactText: compact,
+                    tokenCount: phraseRedactionTokens(from: normalized).count
+                )
+            )
+        }
+
+        return ordered
+    }
+
+    private static func redactedCombinedNodeOrders(
+        in regions: [TextRegion],
+        offset: Int,
+        phrases: [NormalizedPhraseRedactionPhrase],
+        allowApproximateMatching: Bool = true
+    ) -> Set<Int> {
+        let tokenStream = indexedPhraseRedactionTokens(in: regions, offset: offset)
+        guard !tokenStream.isEmpty else { return [] }
+
+        var redactedNodeOrders: Set<Int> = []
+
+        for phrase in phrases {
+            let maxWindowLength = min(
+                tokenStream.count,
+                max(1, phrase.tokenCount + phraseRedactionExtraTokenSlack)
+            )
+
+            for start in tokenStream.indices {
+                let upperBound = min(tokenStream.count, start + maxWindowLength)
+                guard upperBound > start else { continue }
+
+                for endExclusive in (start + 1)...upperBound {
+                    let candidate = tokenStream[start..<endExclusive]
+                    let candidateNodeOrders = Set(candidate.map(\.combinedNodeOrder))
+                    guard !candidateNodeOrders.isEmpty else { continue }
+                    guard candidateNodeOrders.count <= max(phrase.tokenCount + phraseRedactionExtraTokenSlack, 1) else { continue }
+                    guard candidateNodeOrders.count <= phraseRedactionMaxNodeSpan else { continue }
+
+                    if phraseMatchesCandidate(
+                        candidate,
+                        phrase: phrase,
+                        allowApproximateMatching: allowApproximateMatching
+                    ) {
+                        redactedNodeOrders.formUnion(candidateNodeOrders)
+                    }
+                }
+            }
+        }
+
+        return redactedNodeOrders
+    }
+
+    private static func indexedPhraseRedactionTokens(
+        in regions: [TextRegion],
+        offset: Int
+    ) -> [IndexedPhraseRedactionToken] {
+        var indexedTokens: [IndexedPhraseRedactionToken] = []
+
+        for (index, region) in regions.enumerated() {
+            let normalizedText = normalizePhraseRedactionText(region.text)
+            let tokens = phraseRedactionTokens(from: normalizedText)
+            guard !tokens.isEmpty else { continue }
+
+            let combinedNodeOrder = offset + index
+            indexedTokens.append(
+                contentsOf: tokens.map {
+                    IndexedPhraseRedactionToken(token: $0, combinedNodeOrder: combinedNodeOrder)
+                }
+            )
+        }
+
+        return indexedTokens
+    }
+
+    private static func phraseMatchesCandidate(
+        _ candidate: ArraySlice<IndexedPhraseRedactionToken>,
+        phrase: NormalizedPhraseRedactionPhrase,
+        allowApproximateMatching: Bool
+    ) -> Bool {
+        let candidateTokens = candidate.map(\.token)
+        guard !candidateTokens.isEmpty else { return false }
+
+        let candidateNormalized = candidateTokens.joined(separator: " ")
+        let candidateCompact = candidateTokens.joined()
+        guard !candidateCompact.isEmpty else { return false }
+
+        if candidateNormalized == phrase.normalizedText || candidateCompact == phrase.compactText {
+            return true
+        }
+
+        let candidateNodeOrders = Set(candidate.map(\.combinedNodeOrder))
+        if candidateNodeOrders.count == 1,
+           (candidateNormalized.contains(phrase.normalizedText) || candidateCompact.contains(phrase.compactText)) {
+            return true
+        }
+
+        guard allowApproximateMatching else { return false }
+
+        let maxLength = max(candidateCompact.count, phrase.compactText.count)
+        let minLength = min(candidateCompact.count, phrase.compactText.count)
+        let maxDistance = maximumPhraseRedactionEditDistance(for: maxLength)
+        guard maxLength - minLength <= maxDistance else { return false }
+
+        let distance = levenshteinDistance(candidateCompact, phrase.compactText)
+        let similarity = normalizedLevenshteinSimilarity(
+            distance: distance,
+            lhsLength: candidateCompact.count,
+            rhsLength: phrase.compactText.count
+        )
+        return distance <= maxDistance && similarity >= minimumPhraseRedactionSimilarity(for: maxLength)
+    }
+
+    private static func normalizePhraseRedactionText(_ text: String) -> String {
+        normalizeInPageText(text)
+    }
+
+    private static func phraseRedactionTokens(from normalizedText: String) -> [String] {
+        normalizedText
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+    }
+
+    private static func compactPhraseRedactionText(_ normalizedText: String) -> String {
+        normalizedText.replacingOccurrences(of: " ", with: "")
+    }
+
+    private static func minimumPhraseRedactionSimilarity(for length: Int) -> Double {
+        switch length {
+        case ...3:
+            return 1.0
+        case 4...5:
+            return 0.80
+        case 6...8:
+            return 0.75
+        case 9...12:
+            return 0.72
+        default:
+            return 0.70
+        }
+    }
+
+    private static func maximumPhraseRedactionEditDistance(for length: Int) -> Int {
+        switch length {
+        case ...3:
+            return 0
+        case 4...6:
+            return 1
+        case 7...12:
+            return 2
+        default:
+            return 3
+        }
+    }
+
+    private static func normalizedLevenshteinSimilarity(
+        distance: Int,
+        lhsLength: Int,
+        rhsLength: Int
+    ) -> Double {
+        let scale = max(lhsLength, rhsLength)
+        guard scale > 0 else { return 1.0 }
+        return 1.0 - (Double(distance) / Double(scale))
+    }
+
+    private static func levenshteinDistance(_ lhs: String, _ rhs: String) -> Int {
+        if lhs == rhs { return 0 }
+        if lhs.isEmpty { return rhs.count }
+        if rhs.isEmpty { return lhs.count }
+
+        let lhsCharacters = Array(lhs)
+        let rhsCharacters = Array(rhs)
+
+        var previousRow = Array(0...rhsCharacters.count)
+        var currentRow = Array(repeating: 0, count: rhsCharacters.count + 1)
+
+        for (lhsIndex, lhsCharacter) in lhsCharacters.enumerated() {
+            currentRow[0] = lhsIndex + 1
+
+            for (rhsIndex, rhsCharacter) in rhsCharacters.enumerated() {
+                let substitutionCost = lhsCharacter == rhsCharacter ? 0 : 1
+                currentRow[rhsIndex + 1] = min(
+                    min(previousRow[rhsIndex + 1] + 1, currentRow[rhsIndex] + 1),
+                    previousRow[rhsIndex] + substitutionCost
+                )
+            }
+
+            swap(&previousRow, &currentRow)
+        }
+
+        return previousRow[rhsCharacters.count]
+    }
+
+    private static func maskedTextPreservingLength(_ text: String) -> String {
+        guard !text.isEmpty else { return text }
+        return String(repeating: " ", count: text.count)
+    }
+
+    public func processPendingRedactions(
+        for videoDatabaseID: Int64,
+        includeInProgressJobs: Bool = false,
+        includeRetryableFailures: Bool = false
+    ) async throws {
+        if isRewriteSchedulingSuspended {
+            Log.debug(
+                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) while timeline interaction is active, purpose=redaction",
+                category: .processing
+            )
+            return
+        }
+
+        let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+            videoID: videoDatabaseID,
+            includeInProgressJobs: includeInProgressJobs,
+            includeRetryableFailures: includeRetryableFailures
+        )
+        guard !jobs.isEmpty else { return }
+
+        if try await databaseManager.videoHasFramesAwaitingOCR(videoID: videoDatabaseID) {
+            let pendingFrameCount = Set(jobs.map(\.frameID)).count
+            Log.debug(
+                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) until OCR quiesces; pendingRewriteFrames=\(pendingFrameCount), purpose=redaction",
+                category: .processing
+            )
+            return
+        }
+
+        guard !activeRewriteVideoIDs.contains(videoDatabaseID) else { return }
+        activeRewriteVideoIDs.insert(videoDatabaseID)
+        defer { activeRewriteVideoIDs.remove(videoDatabaseID) }
+
+        guard let videoSegment = try await databaseManager.getVideoSegment(
+            id: VideoSegmentID(value: videoDatabaseID)
+        ) else {
+            return
+        }
+
+        let actualSegmentID = try parseActualSegmentID(from: videoSegment.relativePath)
+        var targetsByFrameIndex: [Int: [SegmentRedactionTarget]] = [:]
+        var frameIDs: Set<Int64> = []
+        var seenTargets: Set<String> = []
+
+        for job in jobs {
+            let targetKey = "\(job.frameID)|\(job.nodeID)"
+            guard seenTargets.insert(targetKey).inserted else { continue }
+            frameIDs.insert(job.frameID)
+            targetsByFrameIndex[job.frameIndex, default: []].append(
+                SegmentRedactionTarget(
+                    frameID: job.frameID,
+                    nodeID: job.nodeID,
+                    normalizedRect: job.normalizedRect
+                )
+            )
+        }
+
+        guard let secret = ReversibleOCRScrambler.currentAppWideSecret() else {
+            for frameID in frameIDs {
+                try? await updateFrameProcessingStatus(
+                    frameID,
+                    status: .rewritePending,
+                    rewritePurpose: "redaction"
+                )
+            }
+            Log.warning(
+                "[Queue-Rewrite] Deferring segment rewrite for video \(videoDatabaseID) because no master key exists, purpose=redaction",
+                category: .processing
+            )
+            return
+        }
+
+        let sortedFrameIDs = Array(frameIDs).sorted()
+        var rewriteCommitted = false
+
+        do {
+            for frameID in frameIDs {
+                try await updateFrameProcessingStatus(
+                    frameID,
+                    status: .rewriteProcessing,
+                    rewritePurpose: "redaction"
+                )
+            }
+            try await storage.rewriteSegmentForRedaction(
+                segmentID: actualSegmentID,
+                frameIDs: sortedFrameIDs,
+                targetsByFrameIndex: targetsByFrameIndex,
+                secret: secret
+            )
+            rewriteCommitted = true
+            for frameID in frameIDs {
+                try await updateFrameProcessingStatus(
+                    frameID,
+                    status: .rewriteCompleted,
+                    rewritePurpose: "redaction"
+                )
+            }
+            totalRewritten += frameIDs.count
+            do {
+                try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: actualSegmentID)
+            } catch {
+                Log.warning(
+                    "[Queue-Rewrite] Completed rewrite for video \(videoDatabaseID) but failed to remove rewrite artifacts for segment \(actualSegmentID.value): \(error.localizedDescription)",
+                    category: .processing
+                )
+            }
+            Log.info(
+                "[Queue-Rewrite] Completed segment rewrite for video \(videoDatabaseID), frames=\(frameIDs.count), purpose=redaction",
+                category: .processing
+            )
+        } catch {
+            if rewriteCommitted {
+                Log.error(
+                    "[Queue-Rewrite] Segment rewrite for video \(videoDatabaseID) committed to disk but DB completion failed; leaving rewrite artifacts for startup reconciliation: \(error.localizedDescription), purpose=redaction",
+                    category: .processing
+                )
+            } else {
+                for frameID in frameIDs {
+                    try? await updateFrameProcessingStatus(
+                        frameID,
+                        status: .rewriteFailed,
+                        rewritePurpose: "redaction"
+                    )
+                }
+            }
+            let failureSummary = rewriteCommitted
+                ? "segment bytes are committed; rewrite artifacts retained for startup reconciliation"
+                : "marked jobs retryable-failed"
+            Log.error(
+                "[Queue-Rewrite] Failed segment rewrite for video \(videoDatabaseID); \(failureSummary): \(error.localizedDescription), purpose=redaction",
+                category: .processing
+            )
+            throw error
+        }
+    }
+
+    private func recoverPendingRedactionsOnStartup() async {
+        _ = await performStartupRewriteRecoveryIfPending(trigger: "startup-manual")
+    }
+
+    public func recoverPendingRedactionsIfPossible() async {
+        if await performStartupRewriteRecoveryIfPending(trigger: "manual-request") {
+            return
+        }
+
+        await drainPendingRedactionsIfPossible(
+            includeInProgressJobs: true,
+            includeRetryableFailures: true,
+            trigger: "manual-request"
+        )
+    }
+
+    private func reconcileInterruptedSegmentRedactionsOnStartup() async {
+        do {
+            let actions = try await storage.recoverInterruptedSegmentRedactions()
+            guard !actions.isEmpty else { return }
+
+            Log.warning(
+                "[Queue-Rewrite] Startup reconciliation found \(actions.count) interrupted rewrite artifact set(s)",
+                category: .processing
+            )
+
+            let pendingVideoIDs = try await databaseManager.getVideoIDsWithPendingNodeRedactions(
+                includeRetryableFailures: true
+            )
+            var videoIDBySegmentID: [Int64: Int64] = [:]
+            for videoID in pendingVideoIDs {
+                guard let videoSegment = try await databaseManager.getVideoSegment(
+                    id: VideoSegmentID(value: videoID)
+                ) else {
+                    continue
+                }
+                guard let actualSegmentID = try? parseActualSegmentID(from: videoSegment.relativePath) else {
+                    continue
+                }
+                videoIDBySegmentID[actualSegmentID.value] = videoID
+            }
+
+            for action in actions {
+                let frameIDs: [Int64]
+                if let videoID = videoIDBySegmentID[action.segmentID.value] {
+                    let jobs = try await databaseManager.getPendingNodeRedactionJobs(
+                        videoID: videoID,
+                        includeInProgressJobs: true,
+                        includeRetryableFailures: false
+                    )
+                    frameIDs = Array(Set(jobs.map(\.frameID))).sorted()
+                } else {
+                    frameIDs = []
+                }
+
+                guard !frameIDs.isEmpty else {
+                    do {
+                        try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                    } catch {
+                        Log.error(
+                            "[Queue-Rewrite] Failed to clean stale interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
+                            category: .processing
+                        )
+                    }
+                    continue
+                }
+
+                var didPersistAllStatuses = true
+                let targetStatus: FrameProcessingStatus = {
+                    switch action.mode {
+                    case .rollbackToPending:
+                        return .rewritePending
+                    case .markCompleted:
+                        return .rewriteCompleted
+                    }
+                }()
+
+                for frameID in frameIDs {
+                    do {
+                        try await updateFrameProcessingStatus(
+                            frameID,
+                            status: targetStatus,
+                            rewritePurpose: "redaction"
+                        )
+                    } catch {
+                        didPersistAllStatuses = false
+                        Log.error(
+                            "[Queue-Rewrite] Failed to persist startup rewrite reconciliation for segment \(action.segmentID.value), frame \(frameID): \(error.localizedDescription)",
+                            category: .processing
+                        )
+                    }
+                }
+
+                guard didPersistAllStatuses else { continue }
+
+                do {
+                    try await storage.finishInterruptedSegmentRedactionRecovery(segmentID: action.segmentID)
+                } catch {
+                    Log.error(
+                        "[Queue-Rewrite] Failed to clean interrupted rewrite artifacts for segment \(action.segmentID.value): \(error.localizedDescription)",
+                        category: .processing
+                    )
+                }
+            }
+        } catch {
+            Log.error(
+                "[Queue-Rewrite] Failed to reconcile interrupted rewrite artifacts on startup: \(error.localizedDescription)",
+                category: .processing
+            )
+        }
+    }
+
     // MARK: - Status Management
 
     /// Update frame processing status
-    private func updateFrameProcessingStatus(_ frameID: Int64, status: FrameProcessingStatus) async throws {
-        try await databaseManager.updateFrameProcessingStatus(frameID: frameID, status: status.rawValue)
+    private func updateFrameProcessingStatus(
+        _ frameID: Int64,
+        status: FrameProcessingStatus,
+        rewritePurpose: String? = nil
+    ) async throws {
+        try await databaseManager.updateFrameProcessingStatus(
+            frameID: frameID,
+            status: status.rawValue,
+            rewritePurpose: rewritePurpose
+        )
     }
 
     /// Retry a failed frame
@@ -1483,18 +2407,26 @@ public actor FrameProcessingQueue {
 
     public func getStatistics() async -> QueueStatistics {
         // Query live counts from database for accuracy
-        var pending = pendingCount
-        var processing = processingCount
+        var ocrPending = ocrPendingCount
+        var ocrProcessing = ocrProcessingCount
+        var rewritePending = rewritePendingCount
+        var rewriteProcessing = rewriteProcessingCount
         if let counts = try? await databaseManager.getFrameStatusCounts() {
-            pending = counts.pending
-            processing = counts.processing
+            ocrPending = counts.ocrPending
+            ocrProcessing = counts.ocrProcessing
+            rewritePending = counts.rewritePending
+            rewriteProcessing = counts.rewriteProcessing
         }
 
         return QueueStatistics(
-            queueDepth: pending + processing,
-            pendingCount: pending,
-            processingCount: processing,
+            ocrQueueDepth: ocrPending + ocrProcessing,
+            ocrPendingCount: ocrPending,
+            ocrProcessingCount: ocrProcessing,
+            rewriteQueueDepth: rewritePending + rewriteProcessing,
+            rewritePendingCount: rewritePending,
+            rewriteProcessingCount: rewriteProcessing,
             totalProcessed: totalProcessed,
+            totalRewritten: totalRewritten,
             totalFailed: totalFailed,
             workerCount: workers.count
         )
@@ -1522,7 +2454,7 @@ public actor FrameProcessingQueue {
         } ?? ""
 
         Log.info(
-            "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB queueDepth=\(counts.depth) pending=\(counts.pending) processing=\(counts.processing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
+            "[Queue-Memory] \(processFields)rawCacheFrames=0 rawCacheBytes=0 KB ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing) workers=\(workers.count) memoryPaused=\(isPausedForMemoryPressure)",
             category: .processing
         )
 
@@ -1535,7 +2467,7 @@ public actor FrameProcessingQueue {
         MemoryLedger.set(
             tag: Self.memoryLedgerQueueTag,
             bytes: 0,
-            count: counts.depth,
+            count: counts.ocrDepth,
             unit: "frames",
             function: "processing.ocr",
             kind: "queue-depth",
@@ -1575,13 +2507,27 @@ public actor FrameProcessingQueue {
         return formatter.string(fromByteCount: max(0, bytes))
     }
 
-    private func refreshLiveQueueCounts() async -> (pending: Int, processing: Int, depth: Int) {
+    private func refreshLiveQueueCounts() async -> (
+        ocrPending: Int,
+        ocrProcessing: Int,
+        rewritePending: Int,
+        rewriteProcessing: Int,
+        ocrDepth: Int
+    ) {
         if let counts = try? await databaseManager.getFrameStatusCounts() {
-            pendingCount = counts.pending
-            processingCount = counts.processing
-            currentQueueDepth = counts.pending + counts.processing
+            ocrPendingCount = counts.ocrPending
+            ocrProcessingCount = counts.ocrProcessing
+            rewritePendingCount = counts.rewritePending
+            rewriteProcessingCount = counts.rewriteProcessing
+            currentQueueDepth = counts.ocrPending + counts.ocrProcessing
         }
-        return (pendingCount, processingCount, pendingCount + processingCount)
+        return (
+            ocrPending: ocrPendingCount,
+            ocrProcessing: ocrProcessingCount,
+            rewritePending: rewritePendingCount,
+            rewriteProcessing: rewriteProcessingCount,
+            ocrDepth: ocrPendingCount + ocrProcessingCount
+        )
     }
 
     private func applyMemoryBackpressureIfNeeded() async -> Bool {
@@ -1610,7 +2556,7 @@ public actor FrameProcessingQueue {
 
         isPausedForMemoryPressure = shouldPause
         let counts = await refreshLiveQueueCounts()
-        let baseMessage = "footprint=\(ProcessingMemoryDiagnostics.formatFootprint(snapshot)) pauseAt=\(ProcessingMemoryDiagnostics.formatBytes(policy.pauseThresholdBytes)) resumeBelow=\(ProcessingMemoryDiagnostics.formatBytes(policy.resumeThresholdBytes)) queueDepth=\(counts.depth) pending=\(counts.pending) processing=\(counts.processing)"
+        let baseMessage = "footprint=\(ProcessingMemoryDiagnostics.formatFootprint(snapshot)) pauseAt=\(ProcessingMemoryDiagnostics.formatBytes(policy.pauseThresholdBytes)) resumeBelow=\(ProcessingMemoryDiagnostics.formatBytes(policy.resumeThresholdBytes)) ocrQueueDepth=\(counts.ocrDepth) ocrPending=\(counts.ocrPending) ocrProcessing=\(counts.ocrProcessing) rewritePending=\(counts.rewritePending) rewriteProcessing=\(counts.rewriteProcessing)"
 
         if shouldPause {
             Log.warning("[Queue-Backpressure] paused \(baseMessage)", category: .processing)
@@ -1838,7 +2784,11 @@ public enum FrameProcessingStatus: Int, Sendable {
     case processing = 1
     case completed = 2
     case failed = 3
-    // Note: 4 = "not yet readable" (used elsewhere, don't add new values here)
+    // 4 is reserved for "not yet readable" (set by frame insert path)
+    case rewritePending = 5
+    case rewriteProcessing = 6
+    case rewriteCompleted = 7
+    case rewriteFailed = 8
 }
 
 /// Internal result of processing a frame
@@ -1862,10 +2812,14 @@ private struct OCRStageOutput {
 }
 
 public struct QueueStatistics: Sendable {
-    public let queueDepth: Int
-    public let pendingCount: Int      // Frames waiting in queue (status 0)
-    public let processingCount: Int   // Frames currently being processed (status 1)
+    public let ocrQueueDepth: Int
+    public let ocrPendingCount: Int
+    public let ocrProcessingCount: Int
+    public let rewriteQueueDepth: Int
+    public let rewritePendingCount: Int
+    public let rewriteProcessingCount: Int
     public let totalProcessed: Int
+    public let totalRewritten: Int
     public let totalFailed: Int
     public let workerCount: Int
 }

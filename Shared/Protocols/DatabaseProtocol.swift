@@ -64,7 +64,9 @@ public protocol DatabaseProtocol: Actor {
     func getFrameMetadata(frameID: FrameID) async throws -> String?
 
     /// Get processing status for multiple frames in a single query
-    /// Returns dictionary of frameID -> processingStatus (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    /// Returns dictionary of frameID -> processingStatus
+    /// 0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable,
+    /// 5=rewrite pending, 6=rewrite processing, 7=rewrite completed, 8=rewrite failed
     func getFrameProcessingStatuses(frameIDs: [Int64]) async throws -> [Int64: Int]
 
     /// Mark frame as readable from video file (processingStatus 4 -> 0)
@@ -74,7 +76,9 @@ public protocol DatabaseProtocol: Actor {
     /// Update frame's processing status
     /// - Parameters:
     ///   - frameID: The frame ID to update
-    ///   - status: The new processing status (0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable)
+    ///   - status: The new processing status
+    ///     0=pending, 1=processing, 2=completed, 3=failed, 4=not yet readable,
+    ///     5=rewrite pending, 6=rewrite processing, 7=rewrite completed, 8=rewrite failed
     func updateFrameProcessingStatus(frameID: Int64, status: Int) async throws
 
     // MARK: - Video Segment Operations (Video Files)
@@ -352,13 +356,18 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
     /// Used for multi-window text separation
     public let windowIndex: Int?
 
+    /// Whether this node's on-screen pixels were redacted/scrambled.
+    /// Derived from whether a protected OCR payload exists for the node.
+    public let isRedacted: Bool
+
     public init(
         id: Int64? = nil,
         nodeOrder: Int,
         textOffset: Int,
         textLength: Int,
         bounds: CGRect,
-        windowIndex: Int? = nil
+        windowIndex: Int? = nil,
+        isRedacted: Bool = false
     ) {
         self.id = id
         self.nodeOrder = nodeOrder
@@ -366,6 +375,7 @@ public struct OCRNode: Sendable, Equatable, Identifiable {
         self.textLength = textLength
         self.bounds = bounds
         self.windowIndex = windowIndex
+        self.isRedacted = isRedacted
     }
 
     /// X coordinate in pixels
@@ -416,6 +426,10 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
     public let height: CGFloat
     /// The text content of this node
     public let text: String
+    /// Stored protected OCR text for redacted nodes, read from node.encryptedText.
+    public let encryptedText: String?
+    /// Whether this node was redacted in storage.
+    public let isRedacted: Bool
 
     public init(
         id: Int,
@@ -425,7 +439,9 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
         y: CGFloat,
         width: CGFloat,
         height: CGFloat,
-        text: String
+        text: String,
+        encryptedText: String? = nil,
+        isRedacted: Bool = false
     ) {
         self.id = id
         self.nodeOrder = nodeOrder ?? id
@@ -435,5 +451,22 @@ public struct OCRNodeWithText: Identifiable, Equatable, Sendable {
         self.width = width
         self.height = height
         self.text = text
+        self.encryptedText = encryptedText
+        self.isRedacted = isRedacted
+    }
+
+    public func replacingText(_ text: String) -> OCRNodeWithText {
+        OCRNodeWithText(
+            id: id,
+            nodeOrder: nodeOrder,
+            frameId: frameId,
+            x: x,
+            y: y,
+            width: width,
+            height: height,
+            text: text,
+            encryptedText: encryptedText,
+            isRedacted: isRedacted
+        )
     }
 }
