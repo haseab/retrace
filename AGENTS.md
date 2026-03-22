@@ -156,6 +156,9 @@ retrace/
     ├── AGENTS.md
     ├── RetraceApp.swift         # App entry point
     ├── ContentView.swift        # Root content view
+    ├── CrashRecoveryHelper/     # Bundled crash-recovery XPC helper executable
+    ├── CrashRecoverySupport/    # Shared crash-recovery support code for app + helper targets
+    ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback)
     ├── Views/
@@ -453,4 +456,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-15_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-17_

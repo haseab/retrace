@@ -18,6 +18,8 @@ import Shared
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 final class OCRPipelineTests: XCTestCase {
+    private static let screenshotFixtureSkipMessage =
+        "Integration-only test. Set TEST_SCREENSHOT_PATH to a directory of .jpeg screenshots to run it."
 
     // MARK: - Properties
 
@@ -29,8 +31,13 @@ final class OCRPipelineTests: XCTestCase {
     var testRoot: URL!
 
     /// Path to test screenshots (set via TEST_SCREENSHOT_PATH env var)
-    var screenshotPath: String {
-        ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"] ?? NSString(string: "~/ScreenMemoryData/screenshots").expandingTildeInPath
+    var screenshotPath: String? {
+        let path = ProcessInfo.processInfo.environment["TEST_SCREENSHOT_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let path, !path.isEmpty else {
+            return nil
+        }
+        return path
     }
 
     /// Database path for this test (isolated temp location)
@@ -46,6 +53,10 @@ final class OCRPipelineTests: XCTestCase {
     // MARK: - Setup/Teardown
 
     override func setUp() async throws {
+        guard screenshotPath != nil else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         print("\n" + String(repeating: "═", count: 70))
         print("  OCR PIPELINE TEST - Processing Real Screenshots")
         print(String(repeating: "═", count: 70))
@@ -114,6 +125,10 @@ final class OCRPipelineTests: XCTestCase {
 
     /// Process all screenshots through the full pipeline
     func testProcessScreenshotsThroughFullPipeline() async throws {
+        guard let screenshotPath else {
+            throw XCTSkip(Self.screenshotFixtureSkipMessage)
+        }
+
         // STEP 1: Discover all screenshot files
         print("\n📁 Scanning for screenshots...")
         let files = try FileManager.default.contentsOfDirectory(atPath: screenshotPath)

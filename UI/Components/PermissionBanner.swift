@@ -56,6 +56,12 @@ struct PermissionBanner: View {
 
 /// Helper to open System Settings to specific panes
 struct SystemSettingsOpener {
+    /// Open the main System Settings app.
+    static func openSystemSettingsApp() {
+        let url = URL(fileURLWithPath: "/System/Applications/System Settings.app")
+        NSWorkspace.shared.open(url)
+    }
+
     /// Open Accessibility privacy settings
     static func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!

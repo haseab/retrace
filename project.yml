@@ -31,10 +31,25 @@ targets:
     sources:
       - path: UI
         excludes:
+          - CrashRecoveryHelper
+          - CrashRecoverySupport
+          - LaunchAgents
           - Tests
           - README.md
           - AGENTS.md
+      - path: UI/LaunchAgents/io.retrace.app.crash-recovery.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
     dependencies:
+      - target: RetraceCrashRecoveryHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/Helpers
+      - target: CrashRecoverySupport
       - target: Shared
       - target: App
       - target: Database
@@ -61,6 +76,40 @@ targets:
         CODE_SIGNING_ALLOWED: YES
         ENABLE_HARDENED_RUNTIME: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  RetraceCrashRecoveryHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: UI/CrashRecoveryHelper
+    dependencies:
+      - target: CrashRecoverySupport
+    settings:
+      base:
+        PRODUCT_NAME: RetraceCrashRecoveryHelper
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app.crashrecoveryhelper
+        SKIP_INSTALL: YES
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        DEVELOPMENT_TEAM: 5X5W7C3L9D
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+
+  CrashRecoverySupport:
+    type: framework
+    platform: macOS
+    sources:
+      - path: UI/CrashRecoverySupport
+    settings:
+      base:
+        PRODUCT_NAME: CrashRecoverySupport
+        MACH_O_TYPE: staticlib
+        DEFINES_MODULE: YES
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.retrace.CrashRecoverySupport
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
 
   Shared:
     type: framework

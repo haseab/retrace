@@ -1,43 +1,11 @@
 import SwiftUI
 import App
+import CrashRecoverySupport
 import Shared
 import Database
 import SQLCipher
 import Darwin
 import IOKit.ps
-
-private enum WatchdogRelaunchGuard {
-    private static let lock = NSLock()
-    private static let relaunchTimestampsKey = "watchdogAutoRelaunchTimestamps"
-    private static let relaunchWindowSeconds: TimeInterval = 5 * 60
-    private static let maxRelaunchesPerWindow = 2
-
-    struct Decision {
-        let shouldRelaunch: Bool
-        let recentCount: Int
-    }
-
-    static func evaluateAndRecord(now: Date = Date()) -> Decision {
-        lock.lock()
-        defer { lock.unlock() }
-
-        let defaults = UserDefaults.standard
-        let cutoff = now.timeIntervalSince1970 - relaunchWindowSeconds
-        var timestamps = (defaults.array(forKey: relaunchTimestampsKey) as? [TimeInterval] ?? [])
-            .filter { $0 >= cutoff }
-
-        if timestamps.count >= maxRelaunchesPerWindow {
-            defaults.set(timestamps, forKey: relaunchTimestampsKey)
-            defaults.synchronize()
-            return Decision(shouldRelaunch: false, recentCount: timestamps.count)
-        }
-
-        timestamps.append(now.timeIntervalSince1970)
-        defaults.set(timestamps, forKey: relaunchTimestampsKey)
-        defaults.synchronize()
-        return Decision(shouldRelaunch: true, recentCount: timestamps.count)
-    }
-}
 
 enum SingleInstanceLock {
     enum AcquireResult {
@@ -90,7 +58,6 @@ enum SingleInstanceLock {
         descriptor = -1
     }
 }
-
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -213,7 +180,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminationFlushInProgress = false
     private var isTerminationDecisionInProgress = false
     private var bypassQuitConfirmationPromptOnce = false
-    private var quitConfirmationHostWindow: NSWindow?
     private var singleInstanceLockFileDescriptor: CInt = -1
     private let settingsStore = UserDefaults(suiteName: "io.retrace.app") ?? .standard
     private static let devDeeplinkEnvKey = "RETRACE_DEV_DEEPLINK_URL"
@@ -277,6 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finishApplicationLaunch() {
+        CrashRecoveryManager.shared.armAtLaunch()
         // Configure app appearance
         configureAppearance()
 
@@ -294,6 +261,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Record app launch metric
             if let coordinator = coordinatorWrapper?.coordinator {
                 DashboardViewModel.recordAppLaunch(coordinator: coordinator)
+                if let source = CrashRecoveryManager.shared.recoveryLaunchSource {
+                    DashboardViewModel.recordCrashAutoRestart(
+                        coordinator: coordinator,
+                        source: source
+                    )
+                }
             }
         }
 
@@ -452,7 +425,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Log.critical("[Watchdog] Auto-quit threshold reached (\(blockedFor)s). Capturing diagnostics and attempting automatic relaunch.", category: .ui)
             EmergencyDiagnostics.capture(trigger: "watchdog_auto_quit")
 
-            let relaunchDecision = WatchdogRelaunchGuard.evaluateAndRecord()
+            let relaunchDecision = CrashRecoverySupport.evaluateAndRecordCrashAutoRestart()
             guard relaunchDecision.shouldRelaunch else {
                 Log.critical(
                     "[Watchdog] Auto-relaunch suppressed to prevent restart loop (\(relaunchDecision.recentCount) relaunches in last 5 minutes). Exiting without relaunch.",
@@ -467,8 +440,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Darwin.exit(0)
             }
 
-            // Reuse the same restart path as Settings so watchdog quits auto-recover.
-            AppRelaunch.relaunch()
+            AppRelaunch.relaunchForCrashRecovery()
         }
     }
 
@@ -541,6 +513,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { @MainActor in
+            CrashRecoveryManager.shared.refreshUserFacingStatus()
             let shouldReveal = shouldRevealDashboardForActivation()
             Log.info("[LaunchSurface] applicationDidBecomeActive shouldReveal=\(shouldReveal) state=\(launchSurfaceStateSnapshot())", category: .app)
 
@@ -610,6 +583,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Flush active timeline metrics asynchronously with a bounded timeout.
         // Use terminateLater to avoid blocking the main thread during shutdown.
         Task { @MainActor [weak self] in
+            await CrashRecoveryManager.shared.prepareForExpectedExit()
             _ = await TimelineWindowController.shared.forceRecordSessionMetrics(timeoutMs: 350)
             self?.isTerminationFlushInProgress = false
             NSApp.reply(toApplicationShouldTerminate: true)
@@ -630,16 +604,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Run Retrace in Background")
         alert.addButton(withTitle: "Cancel")
         styleQuitAlertPrimaryButton(alert, context: "initial")
+        scheduleQuitButtonStyleEnforcement(for: alert, context: "quit-confirmation")
 
-        let anchorWindow = currentTerminationAnchorWindow() ?? makeQuitConfirmationHostWindow()
-        scheduleQuitButtonStyleEnforcement(for: alert, context: "sheet")
-        alert.beginSheetModal(for: anchorWindow) { [weak self] response in
-            Task { @MainActor in
-                guard let self else { return }
-                self.handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
-                self.dismissQuitConfirmationHostWindowIfNeeded(anchorWindow)
+        if let anchorWindow = currentTerminationAnchorWindow() {
+            alert.beginSheetModal(for: anchorWindow) { [weak self] response in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
+                }
             }
+            return
         }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        handleQuitAlertResponse(response, dontAskAgain: alert.suppressionButton?.state == .on)
     }
 
     private func handleQuitAlertResponse(_ response: NSApplication.ModalResponse, dontAskAgain: Bool) {
@@ -656,40 +635,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func currentTerminationAnchorWindow() -> NSWindow? {
-        if let keyWindow = NSApp.keyWindow {
+        Self.preferredQuitConfirmationAnchorWindow(
+            keyWindow: NSApp.keyWindow,
+            mainWindow: NSApp.mainWindow
+        )
+    }
+
+    static func preferredQuitConfirmationAnchorWindow(
+        keyWindow: NSWindow?,
+        mainWindow: NSWindow?
+    ) -> NSWindow? {
+        if let keyWindow, canPresentQuitConfirmationSheet(on: keyWindow) {
             return keyWindow
         }
-        return NSApp.mainWindow
-    }
-
-    private func makeQuitConfirmationHostWindow() -> NSWindow {
-        if let window = quitConfirmationHostWindow {
-            return window
+        if let mainWindow, canPresentQuitConfirmationSheet(on: mainWindow) {
+            return mainWindow
         }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 220),
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Retrace"
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovable = false
-        window.isReleasedWhenClosed = false
-        window.center()
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        quitConfirmationHostWindow = window
-        return window
+        return nil
     }
 
-    private func dismissQuitConfirmationHostWindowIfNeeded(_ window: NSWindow) {
-        guard quitConfirmationHostWindow === window else { return }
-        window.orderOut(nil)
-        window.close()
-        quitConfirmationHostWindow = nil
+    static func canPresentQuitConfirmationSheet(on window: NSWindow) -> Bool {
+        window.isVisible && !window.isMiniaturized
     }
 
     private func scheduleQuitButtonStyleEnforcement(for alert: NSAlert, context: String) {

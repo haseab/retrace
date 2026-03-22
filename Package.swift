@@ -28,7 +28,9 @@ let package = Package(
         .library(name: "Search", targets: ["Search"]),
         .library(name: "Migration", targets: ["Migration"]),
         .library(name: "App", targets: ["App"]),
+        .library(name: "CrashRecoverySupport", targets: ["CrashRecoverySupport"]),
         .executable(name: "Retrace", targets: ["Retrace"]),
+        .executable(name: "RetraceCrashRecoveryHelper", targets: ["RetraceCrashRecoveryHelper"]),
         .executable(name: "TestMostRecentFrame", targets: ["TestMostRecentFrame"]),
         .executable(name: "QueryRewindApps", targets: ["QueryRewindApps"]),
     ],
@@ -211,6 +213,13 @@ let package = Package(
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),
 
+        // MARK: - Crash recovery support
+        .target(
+            name: "CrashRecoverySupport",
+            dependencies: [],
+            path: "UI/CrashRecoverySupport"
+        ),
+
         // MARK: - UI module
         .executableTarget(
             name: "Retrace",
@@ -223,11 +232,15 @@ let package = Package(
                 "Processing",
                 "Search",
                 "Migration",
+                "CrashRecoverySupport",
                 .product(name: "Sparkle", package: "Sparkle"),
                 .product(name: "SwiftyChrono", package: "SwiftyChrono")
             ],
             path: "UI",
             exclude: [
+                "CrashRecoveryHelper",
+                "CrashRecoverySupport",
+                "LaunchAgents",
                 "Tests",
                 "README.md",
                 "AGENTS.md",
@@ -238,6 +251,14 @@ let package = Package(
                 .process("Assets.xcassets")
             ]
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
+        ),
+        .executableTarget(
+            name: "RetraceCrashRecoveryHelper",
+            dependencies: ["CrashRecoverySupport"],
+            path: "UI/CrashRecoveryHelper",
+            sources: [
+                "main.swift"
+            ]
         ),
 
         // MARK: - Test executable for getMostRecentFrameTimestamp
@@ -261,7 +282,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RetraceTests",
-            dependencies: ["Retrace", "Shared", "App"],
+            dependencies: ["Retrace", "CrashRecoverySupport", "Shared", "App"],
             path: "UI/Tests"
             // ⚠️ RELEASE 2 ONLY - Whisper cSettings and linkerSettings removed for Release 1
         ),

@@ -1,10 +1,13 @@
-import AppKit
+import CrashRecoverySupport
+import Darwin
+import Foundation
 import Shared
 
 /// Utility for relaunching the app
 enum AppRelaunch {
     private static let applicationsPath = "/Applications/Retrace.app"
     private static let terminalApplicationName = "Terminal"
+
     enum LaunchMode: String {
         case openItem
         case openTerminal
@@ -12,24 +15,52 @@ enum AppRelaunch {
     }
 
     /// Relaunch the app from the best available location.
-    /// Uses the currently running app bundle so restart flows preserve the active build.
-    /// Falls back to /Applications/Retrace.app only if the current bundle path is unavailable.
+    /// Prefers the current launch target, otherwise falls back to /Applications/Retrace.app.
     static func relaunch() {
-        relaunch(atPath: preferredRelaunchPath())
+        relaunch(markAsCrashRecovery: false, crashRecoverySource: nil)
+    }
+
+    /// Relaunch the app after an unexpected crash/watchdog-triggered termination.
+    static func relaunchForCrashRecovery(
+        source: CrashRecoverySupport.RelaunchSource = .watchdogAutoQuit
+    ) {
+        relaunch(markAsCrashRecovery: true, crashRecoverySource: source)
+    }
+
+    private static func relaunch(
+        markAsCrashRecovery: Bool,
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+    ) {
+        let currentLaunchTarget = CrashRecoverySupport.currentLaunchTarget()
+        let appPath = preferredRelaunchPath(currentLaunchTarget: currentLaunchTarget)
+
+        relaunch(
+            atPath: appPath,
+            markAsCrashRecovery: markAsCrashRecovery,
+            currentLaunchTarget: currentLaunchTarget,
+            crashRecoverySource: crashRecoverySource
+        )
     }
 
     static func preferredRelaunchPath(
+        currentLaunchTarget: CrashRecoverySupport.LaunchTarget? = nil,
         currentBundlePath: String = Bundle.main.bundlePath,
         currentExecutablePath: String? = Bundle.main.executablePath,
         applicationsAppExists: Bool = FileManager.default.fileExists(atPath: applicationsPath)
     ) -> String {
+        if let currentLaunchTarget {
+            return currentLaunchTarget.path
+        }
+
         let normalizedBundlePath = currentBundlePath.trimmingCharacters(in: .whitespacesAndNewlines)
         if normalizedBundlePath.hasSuffix(".app") {
             return normalizedBundlePath
         }
 
         if let currentExecutablePath {
-            let normalizedExecutablePath = currentExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedExecutablePath = currentExecutablePath.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
             if !normalizedExecutablePath.isEmpty {
                 return normalizedExecutablePath
             }
@@ -59,9 +90,21 @@ enum AppRelaunch {
 
     /// Relaunch the app from a specific path
     static func relaunch(atPath path: String) {
+        relaunch(atPath: path, markAsCrashRecovery: false, crashRecoverySource: nil)
+    }
+
+    private static func relaunch(
+        atPath path: String,
+        markAsCrashRecovery: Bool,
+        currentLaunchTarget: CrashRecoverySupport.LaunchTarget? = CrashRecoverySupport.currentLaunchTarget(),
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+    ) {
         let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
         let launchMode = launchMode(forPath: normalizedPath)
-        Log.info("[AppRelaunch] Relaunching from: \(normalizedPath) mode=\(launchMode.rawValue)", category: .app)
+        Log.info(
+            "[AppRelaunch] Relaunching from: \(normalizedPath) mode=\(launchMode.rawValue) crashRecovery=\(markAsCrashRecovery)",
+            category: .app
+        )
 
         // Set flag so the new instance skips the single-instance check
         UserDefaults.standard.set(true, forKey: "isRelaunching")
@@ -72,39 +115,55 @@ enum AppRelaunch {
 
         let resolvedLaunchTargetPath: String
         do {
-            resolvedLaunchTargetPath = try launchTargetPath(forPath: normalizedPath, launchMode: launchMode)
+            resolvedLaunchTargetPath = try launchTargetPath(
+                forPath: normalizedPath,
+                launchMode: launchMode,
+                markAsCrashRecovery: markAsCrashRecovery,
+                crashRecoverySource: crashRecoverySource
+            )
         } catch {
-            Log.error("[AppRelaunch] Failed to prepare launch target for \(normalizedPath): \(error)", category: .app)
+            Log.error(
+                "[AppRelaunch] Failed to prepare launch target for \(normalizedPath): \(error)",
+                category: .app
+            )
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
             return
         }
 
-        // We must terminate BEFORE launching, because macOS won't create a new instance
-        // of an app with the same bundle ID that's already running.
-        // Use a shell script to launch the app after we exit.
-        let script = """
-            sleep 1
-            if [ "$1" = "openItem" ]; then
-                open "$2"
-            elif [ "$1" = "openTerminal" ]; then
-                open -a "\(terminalApplicationName)" "$2"
-            else
-                nohup "$2" >/dev/null 2>&1 &
-            fi
-            """
-
-        let task = Process()
-        task.launchPath = "/bin/bash"
-        task.arguments = ["-c", script, "--", launchMode.rawValue, resolvedLaunchTargetPath]
-
-        do {
-            try task.run()
-            Log.info("[AppRelaunch] Terminating for relaunch", category: .app)
-            exit(0)
-        } catch {
-            Log.error("[AppRelaunch] Failed to start launch script: \(error)", category: .app)
-            UserDefaults.standard.removeObject(forKey: "isRelaunching")
+        if !markAsCrashRecovery && shouldUseBundledHelperForIntentionalRelaunch(
+            currentLaunchTarget: currentLaunchTarget
+        ) {
+            Task { @MainActor in
+                let helperPrepared = await CrashRecoveryManager.shared
+                    .requestIntentionalRelaunch(targetAppPath: normalizedPath)
+                if helperPrepared {
+                    Log.info("[AppRelaunch] Relaunch handed off to crash recovery helper", category: .app)
+                    Darwin.exit(0)
+                } else {
+                    fallbackShellRelaunch(
+                        atPath: resolvedLaunchTargetPath,
+                        launchMode: launchMode,
+                        markAsCrashRecovery: false,
+                        crashRecoverySource: nil
+                    )
+                }
+            }
+            return
         }
+
+        fallbackShellRelaunch(
+            atPath: resolvedLaunchTargetPath,
+            launchMode: launchMode,
+            markAsCrashRecovery: markAsCrashRecovery,
+            crashRecoverySource: crashRecoverySource
+        )
+    }
+
+    static func shouldUseBundledHelperForIntentionalRelaunch(
+        currentLaunchTarget: CrashRecoverySupport.LaunchTarget? = CrashRecoverySupport.currentLaunchTarget(),
+        isMainThread: Bool = Thread.isMainThread
+    ) -> Bool {
+        isMainThread && currentLaunchTarget?.isAppBundle == true
     }
 
     static func launchMode(forPath path: String, isDevBuild: Bool = BuildInfo.isDevBuild) -> LaunchMode {
@@ -113,7 +172,8 @@ enum AppRelaunch {
         }
 
         var isDirectory = ObjCBool(false)
-        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+        if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+           isDirectory.boolValue {
             return .openItem
         }
 
@@ -125,10 +185,18 @@ enum AppRelaunch {
     }
 
     static func terminalLauncherScriptContents(forExecutablePath path: String) -> String {
-        """
+        terminalLauncherScriptContents(forExecutablePath: path, arguments: [])
+    }
+
+    private static func terminalLauncherScriptContents(
+        forExecutablePath path: String,
+        arguments: [String]
+    ) -> String {
+        let command = ([shellQuoted(path)] + arguments.map(shellQuoted)).joined(separator: " ")
+        return """
         #!/bin/zsh
         rm -f -- "$0"
-        exec \(shellQuoted(path))
+        exec \(command)
         """
     }
 
@@ -144,19 +212,30 @@ enum AppRelaunch {
         }
     }
 
-    private static func launchTargetPath(forPath path: String, launchMode: LaunchMode) throws -> String {
+    private static func launchTargetPath(
+        forPath path: String,
+        launchMode: LaunchMode,
+        markAsCrashRecovery: Bool,
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+    ) throws -> String {
         switch launchMode {
         case .openItem, .executeFile:
             return path
         case .openTerminal:
-            return try createTerminalLauncherScript(forExecutablePath: path)
+            let arguments = markAsCrashRecovery
+                ? CrashRecoverySupport.crashRecoveryLaunchArguments(source: crashRecoverySource)
+                : []
+            return try createTerminalLauncherScript(forExecutablePath: path, arguments: arguments)
         }
     }
 
-    private static func createTerminalLauncherScript(forExecutablePath path: String) throws -> String {
+    private static func createTerminalLauncherScript(
+        forExecutablePath path: String,
+        arguments: [String]
+    ) throws -> String {
         let scriptURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("retrace-relaunch-\(UUID().uuidString).command")
-        try terminalLauncherScriptContents(forExecutablePath: path)
+        try terminalLauncherScriptContents(forExecutablePath: path, arguments: arguments)
             .write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: NSNumber(value: Int(0o755))],
@@ -168,6 +247,100 @@ enum AppRelaunch {
     private static func isDebugExecutablePath(_ path: String) -> Bool {
         let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalizedPath.contains("/.build/") && normalizedPath.contains("/debug/")
+    }
+
+    static func fallbackLaunchCommand(
+        atPath path: String,
+        markAsCrashRecovery: Bool,
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource? = nil
+    ) -> String {
+        let quotedPath = shellQuoted(path)
+        let crashRecoveryArguments = CrashRecoverySupport.crashRecoveryLaunchArguments(
+            source: crashRecoverySource
+        )
+            .joined(separator: " ")
+        if path.hasSuffix(".app") {
+            if markAsCrashRecovery {
+                return "open \(quotedPath) --args \(crashRecoveryArguments)"
+            }
+            return "open \(quotedPath)"
+        }
+
+        if markAsCrashRecovery {
+            return "\(quotedPath) \(crashRecoveryArguments)"
+        }
+        return quotedPath
+    }
+
+    @discardableResult
+    static func prepareDisconnectSuppressionForShellFallback(
+        defaults: UserDefaults? = nil
+    ) -> Bool {
+        CrashRecoverySupport.storeDisconnectSuppression(defaults: defaults)
+    }
+
+    private static func fallbackShellRelaunch(
+        atPath path: String,
+        launchMode: LaunchMode,
+        markAsCrashRecovery: Bool,
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+    ) {
+        // Fallback for environments where the bundled helper is unavailable or the main actor is unavailable.
+        let launchCommand = fallbackLaunchCommand(
+            atPath: path,
+            launchMode: launchMode,
+            markAsCrashRecovery: markAsCrashRecovery,
+            crashRecoverySource: crashRecoverySource
+        )
+
+        let script = """
+            sleep 1
+            \(launchCommand)
+            """
+
+        let task = Process()
+        task.launchPath = "/bin/bash"
+        task.arguments = ["-c", script]
+        let preparedHelperSuppression = prepareDisconnectSuppressionForShellFallback()
+
+        do {
+            try task.run()
+            Log.info("[AppRelaunch] Terminating for relaunch via shell fallback", category: .app)
+            Darwin.exit(0)
+        } catch {
+            if preparedHelperSuppression {
+                _ = CrashRecoverySupport.clearDisconnectSuppression()
+            }
+            if markAsCrashRecovery {
+                _ = CrashRecoverySupport.clearPendingCrashRecoveryLaunchSource()
+            }
+            Log.error("[AppRelaunch] Failed to start fallback launch script: \(error)", category: .app)
+            UserDefaults.standard.removeObject(forKey: "isRelaunching")
+        }
+    }
+
+    private static func fallbackLaunchCommand(
+        atPath path: String,
+        launchMode: LaunchMode,
+        markAsCrashRecovery: Bool,
+        crashRecoverySource: CrashRecoverySupport.RelaunchSource?
+    ) -> String {
+        switch launchMode {
+        case .openItem:
+            return fallbackLaunchCommand(
+                atPath: path,
+                markAsCrashRecovery: markAsCrashRecovery,
+                crashRecoverySource: crashRecoverySource
+            )
+        case .openTerminal:
+            return "open -a \(shellQuoted(terminalApplicationName)) \(shellQuoted(path))"
+        case .executeFile:
+            return fallbackLaunchCommand(
+                atPath: path,
+                markAsCrashRecovery: markAsCrashRecovery,
+                crashRecoverySource: crashRecoverySource
+            )
+        }
     }
 
     private static func shellQuoted(_ value: String) -> String {

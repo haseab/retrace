@@ -2,7 +2,7 @@
 
 You are the **UI** agent responsible for building the SwiftUI interface for Retrace.
 
-**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, and feedback views all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
+**Status**: ✅ Fully implemented with modern SwiftUI design. Timeline, dashboard, search, settings, onboarding, feedback, and bundled crash-recovery helper integration all working. Global hotkeys functional (Cmd+Shift+T for timeline, Cmd+Shift+D for dashboard). Menu bar integration complete. **Apple Silicon required**. Audio transcription UI not implemented (planned for future release).
 
 ## Your Directory
 
@@ -40,8 +40,15 @@ UI/
 │       ├── StorageSettings.swift        # Storage/retention
 │       ├── PrivacySettings.swift        # Exclusions/permissions
 │       └── AdvancedSettings.swift       # Power user options
+├── CrashRecoveryHelper/
+│   └── main.swift                       # Bundled launch-agent XPC helper supervising unexpected app termination
+├── CrashRecoverySupport/
+│   └── CrashRecoverySupport.swift       # Shared crash-recovery constants, disconnect suppression, and XPC protocol
+├── LaunchAgents/
+│   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
 ├── Components/
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
+│   ├── CrashRecoveryManager.swift       # App-side SMAppService/XPC lifecycle manager
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # URL scheme routing
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
@@ -51,18 +58,27 @@ UI/
 │   ├── TimelineViewModel.swift
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
+│   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
 │   ├── FeedbackSubmissionProgress.swift # Feedback submission stage copy/progress metadata
 │   └── SettingsViewModel.swift
 └── Tests/
     ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
+    ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
+    ├── CrashReportSupportTests.swift     # Dashboard crash/WAL report discovery and launch-context coverage
+    ├── QuitConfirmationPresentationTests.swift # Quit alert anchor-window selection coverage
     ├── FeedbackExportTests.swift         # Feedback report export formatting coverage
     ├── FeedbackSubmissionProgressTests.swift # Feedback sending-state sequence coverage
+    ├── HyperlinkMappingTests.swift       # Stored hyperlink row to OCR-node mapping coverage
     ├── HyperlinkResolutionTests.swift    # Hyperlink parsing/resolution coverage
     ├── InPageURLSettingsTests.swift      # In-page URL setup instructions and toggle coverage
     ├── MilestoneCelebrationViewTests.swift # Milestone dialog action layout coverage
     ├── OnboardingAutomationTargetTests.swift # Onboarding/settings unsupported browser coverage
+    ├── AppNameResolverInstalledAppsTests.swift # Installed-app scan deduplication coverage
+    ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
+    ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
+    ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
 ```

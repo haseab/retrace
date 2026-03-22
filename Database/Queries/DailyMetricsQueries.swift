@@ -80,9 +80,12 @@ public enum DailyMetricsQueries {
         case watchdogCrashBannerAction = "watchdog_crash_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case walFailureBannerAction = "wal_failure_banner_action"  // metadata: JSON {action, fileName, reportAgeSeconds}
         case storageHealthBannerAction = "storage_health_banner_action"  // metadata: JSON {action, severity, availableGB, shouldStop}
+        case crashRecoveryApprovalBannerAction = "crash_recovery_approval_banner_action"  // metadata: JSON {action, status}
         case debugWatchdogHangTriggered = "debug_watchdog_hang_triggered"
+        case debugForcedTerminationTriggered = "debug_forced_termination_triggered"
         case developerSettingToggle = "developer_setting_toggle"  // metadata: JSON {source, settingKey, isEnabled}
         case debugCrashTriggered = "debug_crash_triggered"
+        case crashAutoRestart = "crash_auto_restart"  // metadata: JSON {source}
         case rewindCutoffDateUpdated = "rewind_cutoff_date_updated"  // metadata: JSON {cutoffTimestampMs}
 
         // Delete actions

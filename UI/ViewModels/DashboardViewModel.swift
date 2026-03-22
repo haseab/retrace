@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import CrashRecoverySupport
 import Shared
 import App
 import Database
@@ -2145,6 +2146,17 @@ public class DashboardViewModel: ObservableObject {
         }
     }
 
+    public static func recordCrashAutoRestart(
+        coordinator: AppCoordinator,
+        source: CrashRecoverySupport.RelaunchSource
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .crashAutoRestart,
+            metadata: jsonMetadata(["source": source.rawValue])
+        )
+    }
+
     /// Record a keyboard shortcut usage
     /// - Parameters:
     ///   - coordinator: The app coordinator
@@ -2158,6 +2170,11 @@ public class DashboardViewModel: ObservableObject {
     /// Record a debug-only watchdog hang trigger from the dashboard.
     public static func recordDebugWatchdogHangTriggered(coordinator: AppCoordinator) {
         recordMetric(coordinator: coordinator, type: .debugWatchdogHangTriggered)
+    }
+
+    /// Record a debug-only forced termination trigger from the dashboard.
+    public static func recordDebugForcedTerminationTriggered(coordinator: AppCoordinator) {
+        recordMetric(coordinator: coordinator, type: .debugForcedTerminationTriggered)
     }
 
     public static func recordDeveloperSettingToggle(
@@ -2181,6 +2198,7 @@ public class DashboardViewModel: ObservableObject {
     public static func recordDebugCrashTriggered(coordinator: AppCoordinator) {
         recordMetric(coordinator: coordinator, type: .debugCrashTriggered)
     }
+
     public static func recordDateSearchSubmitted(
         coordinator: AppCoordinator,
         source: String,

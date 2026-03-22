@@ -61,6 +61,7 @@ public struct DashboardView: View {
 
     @ObservedObject var viewModel: DashboardViewModel
     @StateObject private var coordinatorWrapper: AppCoordinatorWrapper
+    @StateObject private var crashRecoveryBannerModel: CrashRecoveryBannerModel
     @ObservedObject var launchOnLoginReminderManager: LaunchOnLoginReminderManager
     @ObservedObject var milestoneCelebrationManager: MilestoneCelebrationManager
     @ObservedObject private var updaterManager = UpdaterManager.shared
@@ -90,6 +91,21 @@ public struct DashboardView: View {
         AppUsageViewMode(rawValue: usageViewModeRawValue) ?? .list
     }
 
+    private var hasPreStorageBanner: Bool {
+        viewModel.showAccessibilityWarning
+            || viewModel.showScreenRecordingWarning
+            || launchOnLoginReminderManager.shouldShowReminder
+            || crashRecoveryBannerModel.state != nil
+    }
+
+    private var hasPreWALFailureBanner: Bool {
+        hasPreStorageBanner || viewModel.storageHealthBanner != nil
+    }
+
+    private var hasPreCrashBanner: Bool {
+        hasPreWALFailureBanner || viewModel.recentWALFailureCrash != nil
+    }
+
     // MARK: - Initialization
 
     public init(
@@ -101,6 +117,9 @@ public struct DashboardView: View {
     ) {
         self.viewModel = viewModel
         _coordinatorWrapper = StateObject(wrappedValue: AppCoordinatorWrapper(coordinator: coordinator))
+        _crashRecoveryBannerModel = StateObject(
+            wrappedValue: CrashRecoveryBannerModel(coordinator: coordinator)
+        )
         self.launchOnLoginReminderManager = launchOnLoginReminderManager
         self.milestoneCelebrationManager = milestoneCelebrationManager
         self._hasLoadedInitialData = hasLoadedInitialData
@@ -164,11 +183,17 @@ public struct DashboardView: View {
                 .padding(.top, (viewModel.showAccessibilityWarning || viewModel.showScreenRecordingWarning) ? 12 : 20)
             }
 
-            if let storageHealthBanner = viewModel.storageHealthBanner {
-                StorageHealthBanner(
-                    state: storageHealthBanner,
+            if let statusBanner = crashRecoveryBannerModel.state {
+                CrashRecoveryStatusBanner(
+                    state: statusBanner,
+                    onOpenSettings: statusBanner.showsOpenSettingsAction ? {
+                        crashRecoveryBannerModel.openSettings()
+                    } : nil,
+                    onRetry: {
+                        crashRecoveryBannerModel.retry()
+                    },
                     onDismiss: {
-                        viewModel.dismissStorageHealthBanner()
+                        crashRecoveryBannerModel.dismiss()
                     }
                 )
                 .frame(maxWidth: dashboardMaxWidth)
@@ -180,6 +205,19 @@ public struct DashboardView: View {
                         || viewModel.showScreenRecordingWarning
                         || launchOnLoginReminderManager.shouldShowReminder) ? 12 : 20
                 )
+            }
+
+            if let storageHealthBanner = viewModel.storageHealthBanner {
+                StorageHealthBanner(
+                    state: storageHealthBanner,
+                    onDismiss: {
+                        viewModel.dismissStorageHealthBanner()
+                    }
+                )
+                .frame(maxWidth: dashboardMaxWidth)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .padding(.top, hasPreStorageBanner ? 12 : 20)
             }
 
             if let recentWALFailureCrash = viewModel.recentWALFailureCrash {
@@ -206,13 +244,7 @@ public struct DashboardView: View {
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 24)
-                .padding(
-                    .top,
-                    (viewModel.showAccessibilityWarning
-                        || viewModel.showScreenRecordingWarning
-                        || launchOnLoginReminderManager.shouldShowReminder
-                        || viewModel.storageHealthBanner != nil) ? 12 : 20
-                )
+                .padding(.top, hasPreWALFailureBanner ? 12 : 20)
             }
 
             if let recentCrashReport = viewModel.recentCrashReport {
@@ -239,14 +271,7 @@ public struct DashboardView: View {
                 .frame(maxWidth: dashboardMaxWidth)
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, 24)
-                .padding(
-                    .top,
-                    (viewModel.showAccessibilityWarning
-                        || viewModel.showScreenRecordingWarning
-                        || launchOnLoginReminderManager.shouldShowReminder
-                        || viewModel.storageHealthBanner != nil
-                        || viewModel.recentWALFailureCrash != nil) ? 12 : 20
-                )
+                .padding(.top, hasPreCrashBanner ? 12 : 20)
             }
 
             // Header
@@ -338,6 +363,7 @@ public struct DashboardView: View {
         )
         .task {
             viewModel.isWindowVisible = true
+            crashRecoveryBannerModel.refresh()
             if !hasLoadedInitialData {
                 hasLoadedInitialData = true
                 Log.debug("[Dashboard] Initial load - first appearance", category: .ui)
@@ -1670,11 +1696,14 @@ public struct DashboardView: View {
                         }
                     }
                     Divider()
-                    Button("Trigger Watchdog Hang (15s)") {
-                        triggerDebugWatchdogHang()
-                    }
                     Button("Trigger Crash (SIGABRT)") {
                         triggerDebugCrash()
+                    }
+                    Button("Trigger Forced Termination (SIGKILL)") {
+                        triggerDebugForcedTermination()
+                    }
+                    Button("Trigger Watchdog Hang (15s)") {
+                        triggerDebugWatchdogHang()
                     }
                 } label: {
                     HStack(spacing: 6) {
@@ -1735,10 +1764,19 @@ public struct DashboardView: View {
 
     private func triggerDebugCrash() {
         DashboardViewModel.recordDebugCrashTriggered(coordinator: coordinatorWrapper.coordinator)
-        Log.warning("[DEBUG] Scheduling intentional SIGABRT to exercise DiagnosticReports crash detection", category: .ui)
+        Log.warning("[DEBUG] Scheduling intentional SIGABRT to exercise crash-report generation and crash recovery", category: .ui)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-            Darwin.raise(SIGABRT)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            Darwin.abort()
+        }
+    }
+
+    private func triggerDebugForcedTermination() {
+        DashboardViewModel.recordDebugForcedTerminationTriggered(coordinator: coordinatorWrapper.coordinator)
+        Log.warning("[DEBUG] Scheduling intentional SIGKILL to exercise forced-termination recovery without crash diagnostics", category: .ui)
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            Darwin.kill(getpid(), SIGKILL)
         }
     }
 
@@ -1826,6 +1864,70 @@ private struct CrashReportBanner: View {
         .background(
             Color(red: 0.42, green: 0.18, blue: 0.11).opacity(0.22)
         )
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct CrashRecoveryStatusBanner: View {
+    let state: CrashRecoveryStatusBannerState
+    let onOpenSettings: (() -> Void)?
+    let onRetry: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.trianglehead.2.clockwise.rotate.90.circle.fill")
+                .foregroundColor(.orange)
+                .font(.retraceTitle3)
+
+            Text(state.messageText)
+                .font(.retraceCaption)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 10) {
+                if let onOpenSettings {
+                    Button("Open Settings", action: onOpenSettings)
+                        .font(.retraceCaption2Medium)
+                        .foregroundColor(.white.opacity(0.92))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(6)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                        .buttonStyle(.plain)
+                }
+
+                Button("Retry", action: onRetry)
+                    .font(.retraceCaption2Medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.9))
+                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+            }
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.retraceHeadline)
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(Color.orange.opacity(0.12))
         .cornerRadius(8)
         .overlay(
             RoundedRectangle(cornerRadius: 8)
