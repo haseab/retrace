@@ -211,4 +211,50 @@ final class SearchHighlightTooltipTests: XCTestCase {
         XCTAssertEqual(matches.map(\.node.id), [matchingNode.id])
         XCTAssertTrue(matches[0].ranges.isEmpty)
     }
+
+    @MainActor
+    func testCmdHHideArmsControlsRestoreGuidance() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+
+        viewModel.toggleControlsVisibility(showRestoreHint: true)
+
+        XCTAssertTrue(viewModel.areControlsHidden)
+        XCTAssertTrue(viewModel.showControlsHiddenRestoreHintBanner)
+        XCTAssertTrue(viewModel.highlightShowControlsContextMenuRow)
+    }
+
+    @MainActor
+    func testNonShortcutHideDoesNotArmControlsRestoreGuidance() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+
+        viewModel.toggleControlsVisibility()
+
+        XCTAssertTrue(viewModel.areControlsHidden)
+        XCTAssertFalse(viewModel.showControlsHiddenRestoreHintBanner)
+        XCTAssertFalse(viewModel.highlightShowControlsContextMenuRow)
+    }
+
+    @MainActor
+    func testShowingControlsClearsControlsRestoreGuidance() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.toggleControlsVisibility(showRestoreHint: true)
+
+        viewModel.openSearchOverlay()
+
+        XCTAssertFalse(viewModel.areControlsHidden)
+        XCTAssertFalse(viewModel.showControlsHiddenRestoreHintBanner)
+        XCTAssertFalse(viewModel.highlightShowControlsContextMenuRow)
+    }
+
+    @MainActor
+    func testDismissingControlsRestoreBannerKeepsContextMenuGuidanceArmed() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.toggleControlsVisibility(showRestoreHint: true)
+
+        viewModel.dismissControlsHiddenRestoreHint()
+
+        XCTAssertTrue(viewModel.areControlsHidden)
+        XCTAssertFalse(viewModel.showControlsHiddenRestoreHintBanner)
+        XCTAssertTrue(viewModel.highlightShowControlsContextMenuRow)
+    }
 }

@@ -745,6 +745,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Whether the hint banner has already been shown for the current drag session
     private var hasShownHintThisDrag: Bool = false
 
+    // MARK: - Controls Hidden Restore Guidance State
+
+    /// Whether to show the top-center restore guidance after hiding controls with Cmd+H.
+    @Published public private(set) var showControlsHiddenRestoreHintBanner: Bool = false
+
+    /// Whether the frame context menu should guide the user to the Show Controls row.
+    @Published public private(set) var highlightShowControlsContextMenuRow: Bool = false
+
     // MARK: - Scroll Orientation Hint Banner State
 
     /// Whether to show the scroll orientation hint banner
@@ -4828,13 +4836,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                     offset: offset
                 )
                 let results = entries.map { entry in
-                    commentTimelineRow(
+                    self.commentTimelineRow(
                         comment: entry.comment,
                         context: CommentTimelineSegmentContext(
                             segmentID: entry.segmentID,
-                            appBundleID: normalizedMetadataString(entry.appBundleID),
-                            appName: normalizedMetadataString(entry.appName),
-                            browserURL: normalizedMetadataString(entry.browserURL),
+                            appBundleID: self.normalizedMetadataString(entry.appBundleID),
+                            appName: self.normalizedMetadataString(entry.appName),
+                            browserURL: self.normalizedMetadataString(entry.browserURL),
                             referenceTimestamp: entry.referenceTimestamp
                         )
                     )
@@ -6237,11 +6245,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Always reset dropdown/popover state when opening the panel
         dismissFilterDropdown()
         // Show controls if hidden (user expects to see the filter panel)
-        if areControlsHidden {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                areControlsHidden = false
-            }
-        }
+        showControlsIfHidden()
         // Initialize pending with current applied filters
         let normalized = normalizedTimelineFilterCriteria(filterCriteria)
         if normalized != filterCriteria {
@@ -6353,11 +6357,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .dateSearch)
         // Show controls if hidden (user expects to see the date search panel)
-        if areControlsHidden {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                areControlsHidden = false
-            }
-        }
+        showControlsIfHidden()
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
             isDateSearchActive = true
         }
@@ -6399,11 +6399,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Open in-frame OCR search and focus the top-right search field.
     public func openInFrameSearch() {
         dismissOtherDialogs(except: .inFrameSearch)
-        if areControlsHidden {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                areControlsHidden = false
-            }
-        }
+        showControlsIfHidden()
         inFrameSearchDebounceTask?.cancel()
         inFrameSearchDebounceTask = nil
         isInFrameSearchVisible = true
@@ -6469,11 +6465,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Dismiss other dialogs first
         dismissOtherDialogs(except: .search)
         // Show controls if hidden (user expects to see the search overlay)
-        if areControlsHidden {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                areControlsHidden = false
-            }
-        }
+        showControlsIfHidden()
         searchViewModel.setNextRecentEntriesRevealDelay(recentEntriesRevealDelay)
         isSearchOverlayVisible = true
         // Clear any existing search highlight
@@ -7465,11 +7457,6 @@ public class SimpleTimelineViewModel: ObservableObject {
         df.timeZone = .current
         Log.info("[SearchNavigation] Navigating to search result: frameID=\(frameID.stringValue), timestamp=\(df.string(from: timestamp)) (epoch: \(timestamp.timeIntervalSince1970)), query='\(highlightQuery)'", category: .ui)
 
-        // Log current frames window for debugging
-        if let first = frames.first, let last = frames.last {
-        } else {
-        }
-
         // First, try to find a frame with this ID in our current data
         if let index = frames.firstIndex(where: { $0.frame.id == frameID }) {
             navigateToFrame(index)
@@ -7626,13 +7613,24 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     /// Toggle visibility of timeline controls (tape, playhead, buttons)
-    public func toggleControlsVisibility() {
+    public func toggleControlsVisibility(showRestoreHint: Bool = false) {
+        let willHideControls = !areControlsHidden
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-            areControlsHidden.toggle()
+            areControlsHidden = willHideControls
             // Dismiss filter panel when hiding controls
-            if areControlsHidden && isFilterPanelVisible {
+            if willHideControls && isFilterPanelVisible {
                 dismissFilterPanel()
             }
+        }
+
+        if willHideControls {
+            if showRestoreHint {
+                armControlsHiddenRestoreGuidance()
+            } else {
+                clearControlsHiddenRestoreGuidance()
+            }
+        } else {
+            clearControlsHiddenRestoreGuidance()
         }
     }
 
@@ -11262,6 +11260,48 @@ public class SimpleTimelineViewModel: ObservableObject {
             NotificationCenter.default.post(name: .openSettingsTimelineScrollOrientation, object: nil)
         }
         dismissScrollOrientationHint()
+    }
+
+    // MARK: - Controls Hidden Restore Guidance
+
+    /// Clear any controls-hidden restore guidance and ensure controls start visible on the next open.
+    public func resetControlsVisibilityForNextOpen() {
+        areControlsHidden = false
+        clearControlsHiddenRestoreGuidance(animated: false)
+    }
+
+    private func showControlsIfHidden() {
+        guard areControlsHidden else { return }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            areControlsHidden = false
+        }
+        clearControlsHiddenRestoreGuidance()
+    }
+
+    private func armControlsHiddenRestoreGuidance() {
+        highlightShowControlsContextMenuRow = true
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            showControlsHiddenRestoreHintBanner = true
+        }
+    }
+
+    public func dismissControlsHiddenRestoreHint() {
+        withAnimation(.easeOut(duration: 0.2)) {
+            showControlsHiddenRestoreHintBanner = false
+        }
+    }
+
+    private func clearControlsHiddenRestoreGuidance(animated: Bool = true) {
+        highlightShowControlsContextMenuRow = false
+
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
+                showControlsHiddenRestoreHintBanner = false
+            }
+        } else {
+            showControlsHiddenRestoreHintBanner = false
+        }
     }
 
     // MARK: - Zoom Region Methods (Shift+Drag)

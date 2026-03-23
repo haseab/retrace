@@ -1294,7 +1294,7 @@ public class TimelineWindowController: NSObject {
 
         if let viewModel {
             viewModel.isTapeHidden = true
-            viewModel.areControlsHidden = false  // Reset controls visibility so they show on next open
+            viewModel.resetControlsVisibilityForNextOpen()  // Reset controls visibility so they show on next open
             viewModel.resetFrameZoom()  // Reset zoom so it's at 100% on next open
             viewModel.compactPresentationState(
                 reason: "hide-keep-headless-state",
@@ -2714,7 +2714,7 @@ public class TimelineWindowController: NSObject {
         if event.keyCode == 4 && modifiers == [.command] { // H key with Command
             recordShortcut("cmd+h")
             if let viewModel = timelineViewModel {
-                viewModel.toggleControlsVisibility()
+                viewModel.toggleControlsVisibility(showRestoreHint: true)
                 return true
             }
         }

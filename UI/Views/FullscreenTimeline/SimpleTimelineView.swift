@@ -65,6 +65,7 @@ public struct SimpleTimelineView: View {
             )
             let shouldRenderSearchHighlightControlsHint =
                 shouldShowSearchHighlightControlsHint && !isSearchHighlightControlsHintDismissed
+            let controlsHiddenHintBannerStackOffset: CGFloat = viewModel.showControlsHiddenRestoreHintBanner ? 58 : 0
 
             ZStack {
                 // Full screen frame display
@@ -301,6 +302,23 @@ public struct SimpleTimelineView: View {
                 // OCR debug overlay (dev setting)
                 ocrDebugOverlay(containerSize: geometry.size, actualFrameRect: actualFrameRect)
 
+                // Controls hidden restore affordance (top center)
+                if viewModel.showControlsHiddenRestoreHintBanner {
+                    VStack {
+                        ControlsHiddenRestoreHintBanner(
+                            onDismiss: { viewModel.dismissControlsHiddenRestoreHint() }
+                        )
+                            .fixedSize()
+                            .padding(.top, 60)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .top).combined(with: .opacity),
+                                removal: .opacity
+                            ))
+                        Spacer()
+                    }
+                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: viewModel.showControlsHiddenRestoreHintBanner)
+                }
+
                 // Text selection hint toast (top center)
                 if viewModel.showTextSelectionHint {
                     VStack {
@@ -310,7 +328,7 @@ public struct SimpleTimelineView: View {
                             }
                         )
                         .fixedSize()
-                        .padding(.top, 60)
+                        .padding(.top, 60 + controlsHiddenHintBannerStackOffset)
                         .transition(.asymmetric(
                             insertion: .move(edge: .top).combined(with: .opacity),
                             removal: .opacity
@@ -329,7 +347,12 @@ public struct SimpleTimelineView: View {
                             }
                         )
                             .fixedSize()
-                            .padding(.top, viewModel.showTextSelectionHint ? 118 : 60)
+                            .padding(
+                                .top,
+                                60 +
+                                    controlsHiddenHintBannerStackOffset +
+                                    (viewModel.showTextSelectionHint ? 58 : 0)
+                            )
                             .transition(.asymmetric(
                                 insertion: .move(edge: .top).combined(with: .opacity),
                                 removal: .opacity
@@ -350,7 +373,10 @@ public struct SimpleTimelineView: View {
                         .fixedSize()
                         .padding(
                             .top,
-                            60 + (viewModel.showTextSelectionHint ? 58 : 0) + (shouldRenderSearchHighlightControlsHint ? 58 : 0)
+                            60 +
+                                controlsHiddenHintBannerStackOffset +
+                                (viewModel.showTextSelectionHint ? 58 : 0) +
+                                (shouldRenderSearchHighlightControlsHint ? 58 : 0)
                         )
                         .transition(.asymmetric(
                             insertion: .move(edge: .top).combined(with: .opacity),
@@ -2020,10 +2046,12 @@ struct FrameWithURLOverlay<Content: View>: View {
                 framePixelSize: framePixelSize,
                 actualFrameRect: actualFrameRect
             )
-            let shouldGuideHideControlsInContextMenu = shouldGuideHideControlsRow(
-                containerSize: geometry.size,
-                actualFrameRect: actualFrameRect
-            )
+            let highlightControlsVisibilityRow =
+                viewModel.highlightShowControlsContextMenuRow ||
+                shouldGuideHideControlsRow(
+                    containerSize: geometry.size,
+                    actualFrameRect: actualFrameRect
+                )
             let showsHyperlinkVisualOverlays = !viewModel.isInLiveMode
             let openHyperlink: (OCRHyperlinkMatch) -> Void = { match in
                 let didOpen = viewModel.openHyperlinkMatch(match)
@@ -2285,7 +2313,7 @@ struct FrameWithURLOverlay<Content: View>: View {
                             isPresented: $viewModel.showContextMenu,
                             location: viewModel.contextMenuLocation,
                             containerSize: geometry.size,
-                            highlightHideControlsRow: shouldGuideHideControlsInContextMenu
+                            highlightControlsVisibilityRow: highlightControlsVisibilityRow
                         )
                     }
                 }
@@ -6604,6 +6632,69 @@ struct DeveloperActionsMenu: View {
 }
 #endif
 
+// MARK: - Controls Hidden Restore Hint Banner
+
+/// Banner displayed after Cmd+H hides the timeline controls.
+/// Guides the user to right-click anywhere on the frame to restore them.
+struct ControlsHiddenRestoreHintBanner: View {
+    let onDismiss: () -> Void
+    @State private var isDismissHovering = false
+    private var scale: CGFloat { TimelineScaleFactor.current }
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            Image(systemName: "menubar.arrow.down.rectangle")
+                .font(.system(size: 16 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text("Controls hidden")
+                .font(.system(size: 15 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.92))
+
+            Rectangle()
+                .fill(Color.white.opacity(0.28))
+                .frame(width: 1, height: 16 * scale)
+
+            KeyboardBadge(symbol: "Right-click")
+
+            Text("on screen to bring them back")
+                .font(.system(size: 14 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.76))
+
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11 * scale, weight: .bold))
+                    .foregroundColor(.white.opacity(isDismissHovering ? 0.88 : 0.66))
+                    .frame(width: 22 * scale, height: 22 * scale)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(isDismissHovering ? 0.16 : 0.1))
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isDismissHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+        }
+        .padding(.horizontal, 18 * scale)
+        .padding(.vertical, 10 * scale)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.72))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                )
+        )
+        .shadow(color: .black.opacity(0.28), radius: 16, y: 6)
+    }
+}
+
 // MARK: - Text Selection Hint Banner
 
 /// Banner displayed at the top of the screen when user attempts text selection
@@ -7125,7 +7216,7 @@ struct FloatingContextMenu: View {
     @Binding var isPresented: Bool
     let location: CGPoint
     let containerSize: CGSize
-    let highlightHideControlsRow: Bool
+    let highlightControlsVisibilityRow: Bool
 
     // Menu dimensions (approximate)
     private let menuWidth: CGFloat = 272
@@ -7147,7 +7238,7 @@ struct FloatingContextMenu: View {
             ContextMenuContent(
                 viewModel: viewModel,
                 showMenu: $isPresented,
-                highlightHideControlsRow: highlightHideControlsRow
+                highlightControlsVisibilityRow: highlightControlsVisibilityRow
             )
                 .retraceMenuContainer()
                 .fixedSize()

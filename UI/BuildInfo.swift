@@ -1,8 +1,5 @@
 import Foundation
 
-#if SWIFT_PACKAGE
-private typealias EmbeddedBuildMetadata = SwiftPMBuildMetadata
-#else
 private enum EmbeddedBuildMetadata {
     static let version = "dev"
     static let buildNumber = "unknown"
@@ -12,15 +9,13 @@ private enum EmbeddedBuildMetadata {
     static let buildDate = "unknown"
     static let forkName = ""
 }
-#endif
 
 /// Build metadata used by UI version surfaces.
 ///
 /// Resolution order:
 /// 1. Environment variables (for explicit local overrides)
 /// 2. Bundle Info.plist keys (for packaged apps)
-/// 3. SwiftPM-generated metadata (for standalone `swift build` binaries)
-/// 4. Safe literal defaults
+/// 3. Safe embedded defaults
 public enum BuildInfo {
     // MARK: - Defaults
 

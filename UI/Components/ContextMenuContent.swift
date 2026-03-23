@@ -10,7 +10,7 @@ import App
 struct ContextMenuContent: View {
     @ObservedObject var viewModel: SimpleTimelineViewModel
     @Binding var showMenu: Bool
-    var highlightHideControlsRow: Bool = false
+    var highlightControlsVisibilityRow: Bool = false
     @EnvironmentObject var coordinatorWrapper: AppCoordinatorWrapper
 
     var body: some View {
@@ -53,7 +53,7 @@ struct ContextMenuContent: View {
                 title: viewModel.areControlsHidden ? "Show Controls" : "Hide Controls",
                 icon: viewModel.areControlsHidden ? "menubar.arrow.up.rectangle" : "menubar.arrow.down.rectangle",
                 shortcut: "⌘H",
-                showGuideRing: highlightHideControlsRow
+                showGuideRing: highlightControlsVisibilityRow
             ) {
                 showMenu = false
                 viewModel.toggleControlsVisibility()
