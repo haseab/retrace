@@ -160,6 +160,7 @@ struct RetraceApp: App {
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static private(set) var isApplicationTerminating = false
 
     var menuBarManager: MenuBarManager?
     private var coordinatorWrapper: AppCoordinatorWrapper?
@@ -591,6 +592,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminationFlushInProgress else { return }
 
         isTerminationFlushInProgress = true
+        Self.isApplicationTerminating = true
 
         // Save timeline state (filters, search) for cross-session persistence.
         TimelineWindowController.shared.saveStateForTermination()
@@ -1768,6 +1770,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        Self.isApplicationTerminating = true
         releaseSingleInstanceLock()
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter

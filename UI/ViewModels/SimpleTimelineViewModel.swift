@@ -9162,6 +9162,68 @@ public class SimpleTimelineViewModel: ObservableObject {
         return true
     }
 
+    /// Copy the current YouTube page as markdown in the form:
+    /// `<channel-name> - [matched-title-node](segment.browserUrl)`
+    @discardableResult
+    public func copyCurrentYouTubeMarkdownLink() -> Bool {
+        guard let context = currentYouTubeMarkdownCopyContext(),
+              let timelineFrame = currentTimelineFrame else {
+            showToast("No YouTube page to copy", icon: "exclamationmark.circle.fill")
+            return false
+        }
+
+        guard let ocrMatch = Self.resolveYouTubeOCRMatch(
+            windowName: context.windowName,
+            nodes: ocrNodes
+        ) else {
+            showToast("Couldn't find YouTube channel", icon: "exclamationmark.circle.fill")
+            Log.warning(
+                "[Timeline] Failed to copy YouTube markdown link for frame \(timelineFrame.frame.id.value) url=\(context.urlString)",
+                category: .ui
+            )
+            return false
+        }
+
+        copyYouTubeMarkdownLinkToPasteboard(
+            match: ocrMatch,
+            context: context
+        )
+        return true
+    }
+
+    private func copyYouTubeMarkdownLinkToPasteboard(
+        match: YouTubeOCRMatch,
+        context: YouTubeMarkdownCopyContext
+    ) {
+        let markdown = Self.youtubeMarkdownClipboardString(
+            channelName: match.channelText,
+            titleText: match.titleText,
+            urlString: context.urlString
+        )
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(markdown, forType: .string)
+        pasteboard.setString(markdown, forType: NSPasteboard.PasteboardType("net.daringfireball.markdown"))
+        showToast("YouTube link copied")
+        DashboardViewModel.recordTextCopy(coordinator: coordinator, text: markdown)
+        Log.info("[Timeline] Copied YouTube markdown link: \(markdown)", category: .ui)
+    }
+
+    private func currentYouTubeMarkdownCopyContext() -> YouTubeMarkdownCopyContext? {
+        guard let timelineFrame = currentTimelineFrame,
+              let windowName = normalizedMetadataString(timelineFrame.frame.metadata.windowName),
+              let urlString = normalizedMetadataString(timelineFrame.frame.metadata.browserURL),
+              Self.isYouTubeMarkdownCopyCandidate(windowName: windowName, urlString: urlString) else {
+            return nil
+        }
+
+        return YouTubeMarkdownCopyContext(
+            windowName: windowName,
+            urlString: urlString
+        )
+    }
+
     private func timestampedCurrentBrowserURLString(
         baseURLString: String,
         videoCurrentTime: Double?
@@ -9205,8 +9267,406 @@ public class SimpleTimelineViewModel: ObservableObject {
         return components.url?.absoluteString ?? urlString
     }
 
+    static func isYouTubeMarkdownCopyCandidate(
+        windowName: String?,
+        urlString: String?
+    ) -> Bool {
+        guard let normalizedWindowName = normalizedNonEmptyString(windowName),
+              normalizedWindowName.localizedCaseInsensitiveContains("youtube"),
+              let normalizedURLString = normalizedNonEmptyString(urlString),
+              let url = URL(string: normalizedURLString) else {
+            return false
+        }
+
+        return isYouTubePageURL(url)
+    }
+
+    static func youtubeMarkdownClipboardString(
+        channelName: String,
+        titleText: String,
+        urlString: String
+    ) -> String {
+        let safeChannelName = escapeMarkdownInlineText(sanitizedMarkdownClipboardComponent(channelName))
+        let safeTitleText = escapeMarkdownInlineText(sanitizedMarkdownClipboardComponent(titleText))
+        let destination = urlString
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ")", with: "%29")
+
+        return "\(safeChannelName) - [\(safeTitleText)](\(destination))"
+    }
+
+    static func resolveYouTubeOCRMatch(
+        windowName: String,
+        nodes: [OCRNodeWithText]
+    ) -> YouTubeOCRMatch? {
+        let titleCandidates = youTubeWindowTitleCandidates(from: windowName)
+        guard let titleNode = youTubeTitleNode(
+            titleCandidates: titleCandidates,
+            nodes: nodes
+        ) else {
+            return nil
+        }
+
+        guard let titleText = normalizedNonEmptyString(titleNode.text),
+              let channelText = youTubeChannelText(
+            titleCandidates: titleCandidates,
+            titleNode: titleNode,
+            nodes: nodes
+        ) else {
+            return nil
+        }
+
+        return YouTubeOCRMatch(
+            titleText: sanitizedMarkdownClipboardComponent(titleText),
+            channelText: channelText
+        )
+    }
+
+    private static func youTubeTitleNode(
+        titleCandidates: [String],
+        nodes: [OCRNodeWithText]
+    ) -> OCRNodeWithText? {
+        let scoredNodes = nodes.compactMap { node -> (node: OCRNodeWithText, score: Double, hasChannel: Bool)? in
+            guard let nodeText = normalizedNonEmptyString(node.text) else {
+                return nil
+            }
+
+            let score = youTubeTitleNodeScore(
+                nodeText: nodeText,
+                titleCandidates: titleCandidates,
+                width: node.width
+            )
+
+            guard score >= 120 else {
+                return nil
+            }
+
+            return (
+                node: node,
+                score: score,
+                hasChannel: youTubeChannelText(
+                    titleCandidates: titleCandidates,
+                    titleNode: node,
+                    nodes: nodes
+                ) != nil
+            )
+        }
+
+        guard !scoredNodes.isEmpty else {
+            return nil
+        }
+
+        let preferredNodes = scoredNodes.filter(\.hasChannel)
+        let pool = preferredNodes.isEmpty ? scoredNodes : preferredNodes
+
+        return pool.max { lhs, rhs in
+            if lhs.score != rhs.score {
+                return lhs.score < rhs.score
+            }
+            if lhs.node.width != rhs.node.width {
+                return lhs.node.width < rhs.node.width
+            }
+            return lhs.node.y < rhs.node.y
+        }?.node
+    }
+
+    private static func youTubeChannelText(
+        titleCandidates: [String],
+        titleNode: OCRNodeWithText,
+        nodes: [OCRNodeWithText]
+    ) -> String? {
+        let candidateNodes = youTubeNodesBelowTitle(
+            titleNode: titleNode,
+            nodes: nodes
+        )
+        guard !candidateNodes.isEmpty else {
+            return nil
+        }
+
+        if let subscriberNode = candidateNodes.first(where: {
+            youTubeIsSubscriberText($0.text)
+        }) {
+            if let inlineChannelText = youTubeInlineChannelText(
+                from: subscriberNode.text,
+                titleCandidates: titleCandidates
+            ) {
+                return inlineChannelText
+            }
+
+            let nodesAboveSubscriber = candidateNodes.prefix { $0.id != subscriberNode.id }
+            let alignedCandidate = nodesAboveSubscriber.compactMap { node -> (text: String, xGap: CGFloat, yGap: CGFloat)? in
+                guard let text = youTubeUsableChannelText(
+                    from: node.text,
+                    titleCandidates: titleCandidates
+                ) else {
+                    return nil
+                }
+
+                let yGap = max(0, subscriberNode.y - (node.y + node.height))
+                return (
+                    text: text,
+                    xGap: abs(node.x - subscriberNode.x),
+                    yGap: yGap
+                )
+            }.min { lhs, rhs in
+                if lhs.xGap != rhs.xGap {
+                    return lhs.xGap < rhs.xGap
+                }
+                return lhs.yGap < rhs.yGap
+            }
+
+            if let alignedCandidate {
+                return alignedCandidate.text
+            }
+        }
+
+        return candidateNodes.compactMap { node in
+            youTubeUsableChannelText(
+                from: node.text,
+                titleCandidates: titleCandidates
+            )
+        }.first
+    }
+
+    private static func youTubeNodesBelowTitle(
+        titleNode: OCRNodeWithText,
+        nodes: [OCRNodeWithText]
+    ) -> [OCRNodeWithText] {
+        let leftColumnBoundary = youTubeLeftMetadataRightBoundary(for: titleNode)
+        let titleBottom = titleNode.y + titleNode.height
+
+        return nodes.filter { node in
+            guard node.id != titleNode.id else {
+                return false
+            }
+            guard node.x <= leftColumnBoundary else {
+                return false
+            }
+
+            let verticalGap = node.y - titleBottom
+            return verticalGap >= -0.01 && verticalGap <= 0.18
+        }.sorted {
+            if $0.y != $1.y {
+                return $0.y < $1.y
+            }
+            return $0.x < $1.x
+        }
+    }
+
+    private static func youTubeUsableChannelText(
+        from rawText: String,
+        titleCandidates: [String]
+    ) -> String? {
+        guard let text = normalizedNonEmptyString(rawText) else {
+            return nil
+        }
+
+        let normalizedText = youTubeComparisonText(text)
+        guard !normalizedText.isEmpty else {
+            return nil
+        }
+        guard !isYouTubeURLLikeOCRText(text) else {
+            return nil
+        }
+        guard !youTubeIsSubscriberText(text) else {
+            return nil
+        }
+        guard !youTubeIsCountMetadataText(text) else {
+            return nil
+        }
+        guard !youTubeIsExactActionText(normalizedText) else {
+            return nil
+        }
+
+        if titleCandidates.contains(where: {
+            let normalizedTitle = youTubeComparisonText($0)
+            return normalizedText == normalizedTitle || normalizedTitle.contains(normalizedText)
+        }) {
+            return nil
+        }
+
+        let letterCount = text.unicodeScalars.filter(CharacterSet.letters.contains).count
+        guard letterCount >= 2 else {
+            return nil
+        }
+
+        let cleanedText = youTubeCleanChannelDisplayText(text)
+        guard let cleanedText = normalizedNonEmptyString(cleanedText) else {
+            return nil
+        }
+        return sanitizedMarkdownClipboardComponent(cleanedText)
+    }
+
+    private static func youTubeTitleNodeScore(
+        nodeText: String,
+        titleCandidates: [String],
+        width: CGFloat
+    ) -> Double {
+        let normalizedNodeText = youTubeComparisonText(nodeText)
+        guard !normalizedNodeText.isEmpty else { return -Double.greatestFiniteMagnitude }
+        guard !isYouTubeURLLikeOCRText(nodeText) else { return -Double.greatestFiniteMagnitude }
+
+        var bestScore = -Double.greatestFiniteMagnitude
+
+        for titleCandidate in titleCandidates {
+            let normalizedTitle = youTubeComparisonText(titleCandidate)
+            guard !normalizedTitle.isEmpty else { continue }
+
+            if normalizedNodeText == normalizedTitle {
+                bestScore = max(bestScore, 1000 + Double(width) * 100)
+                continue
+            }
+
+            let titleTokens = Set(normalizedTitle.split(separator: " ").map(String.init))
+            let nodeTokens = Set(normalizedNodeText.split(separator: " ").map(String.init))
+            let overlapCount = titleTokens.intersection(nodeTokens).count
+            guard overlapCount > 0 else { continue }
+
+            let overlapRatio = Double(overlapCount) / Double(max(titleTokens.count, 1))
+            let tokenDeltaPenalty = Double(abs(titleTokens.count - nodeTokens.count)) * 20
+            let score = overlapRatio * 500 + Double(width) * 100 - tokenDeltaPenalty
+            bestScore = max(bestScore, score)
+        }
+
+        return bestScore
+    }
+
+    private static func youTubeWindowTitleCandidates(from windowName: String) -> [String] {
+        let trimmedWindowName = sanitizedMarkdownClipboardComponent(windowName)
+        guard !trimmedWindowName.isEmpty else { return [] }
+
+        var candidates = [trimmedWindowName]
+
+        if let range = trimmedWindowName.range(
+            of: " - YouTube",
+            options: [.caseInsensitive, .backwards]
+        ) {
+            let stripped = trimmedWindowName[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !stripped.isEmpty {
+                candidates.append(stripped)
+            }
+        }
+
+        return Array(NSOrderedSet(array: candidates)) as? [String] ?? candidates
+    }
+
+    private static func youTubeLeftMetadataRightBoundary(for titleNode: OCRNodeWithText) -> CGFloat {
+        let titleWidth = max(0, titleNode.width)
+        return titleNode.x + min(max(titleWidth * 0.35, 0.16), 0.22)
+    }
+
+    private static func youTubeInlineChannelText(
+        from rawText: String,
+        titleCandidates: [String]
+    ) -> String? {
+        let lowered = rawText.lowercased()
+        guard let subscriberRange = lowered.range(of: "subscriber") else {
+            return nil
+        }
+
+        let rawPrefix = rawText[..<subscriberRange.lowerBound]
+        let cleanedPrefix = String(rawPrefix)
+            .replacingOccurrences(
+                of: "\\b\\d[\\d.,kKmM\\s]*$",
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return youTubeUsableChannelText(
+            from: cleanedPrefix,
+            titleCandidates: titleCandidates
+        )
+    }
+
+    private static func youTubeIsSubscriberText(_ text: String) -> Bool {
+        let normalizedText = youTubeComparisonText(text)
+        return normalizedText.contains("subscriber")
+    }
+
+    private static func youTubeIsCountMetadataText(_ text: String) -> Bool {
+        let normalizedText = youTubeComparisonText(text)
+        let digitCount = text.unicodeScalars.filter(CharacterSet.decimalDigits.contains).count
+        guard digitCount > 0 else {
+            return false
+        }
+
+        return normalizedText.contains("views")
+            || normalizedText.contains("ago")
+            || normalizedText.contains("comment")
+    }
+
+    private static func youTubeIsExactActionText(_ normalizedText: String) -> Bool {
+        youTubeExactActionLabels.contains(normalizedText)
+    }
+
+    private static func youTubeCleanChannelDisplayText(_ text: String) -> String {
+        text.trimmingCharacters(
+            in: CharacterSet.whitespacesAndNewlines.union(
+                CharacterSet(charactersIn: "•·-|:–—")
+            )
+        )
+    }
+
+    private static func normalizedNonEmptyString(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func sanitizedMarkdownClipboardComponent(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func escapeMarkdownInlineText(_ text: String) -> String {
+        var escaped = ""
+        escaped.reserveCapacity(text.count)
+
+        for character in text {
+            switch character {
+            case "\\", "*", "_", "[", "]", "(", ")":
+                escaped.append("\\")
+                escaped.append(character)
+            default:
+                escaped.append(character)
+            }
+        }
+
+        return escaped
+    }
+
+    private static func youTubeComparisonText(_ text: String) -> String {
+        let lowered = text.lowercased()
+        let filteredScalars = lowered.unicodeScalars.map { scalar -> Character in
+            if CharacterSet.alphanumerics.contains(scalar) || CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                return Character(scalar)
+            }
+            return " "
+        }
+
+        return sanitizedMarkdownClipboardComponent(String(filteredScalars))
+    }
+
+    private static func isYouTubeURLLikeOCRText(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return lowered.contains("http://")
+            || lowered.contains("https://")
+            || lowered.contains("www.")
+            || lowered.contains("youtube.com/")
+            || lowered.contains("youtu.be/")
+            || lowered.contains("/watch")
+            || lowered.contains("?v=")
+    }
+
     private static func isYouTubeWatchURL(_ url: URL) -> Bool {
         normalizedHost(url.host) == "youtube.com" && url.path.lowercased() == "/watch"
+    }
+
+    private static func isYouTubePageURL(_ url: URL) -> Bool {
+        let host = normalizedHost(url.host)
+        return host == "youtu.be" || host == "youtube.com" || host.hasSuffix(".youtube.com")
     }
 
     private func hasScrolledPastFirstViewport(scrollY: Double?) -> Bool {
@@ -9258,6 +9718,16 @@ public class SimpleTimelineViewModel: ObservableObject {
         let endText: String?
         let centerY: CGFloat
         let isolationScore: CGFloat
+    }
+
+    private struct YouTubeMarkdownCopyContext: Sendable {
+        let windowName: String
+        let urlString: String
+    }
+
+    struct YouTubeOCRMatch: Sendable, Equatable {
+        let titleText: String
+        let channelText: String
     }
 
     private func smartTextFragmentDirectiveForCurrentFrame() -> String? {
@@ -9519,6 +9989,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         allowed.remove(charactersIn: "#&?=,+-")
         return allowed
     }()
+
+    private static let youTubeExactActionLabels: Set<String> = [
+        "join",
+        "subscribe",
+        "subscribed",
+        "share",
+        "save",
+        "download",
+    ]
 
     private static let textFragmentExcludedDomains: [String] = [
         "youtube.com",
@@ -9968,6 +10447,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         return try await coordinator.getAllOCRNodes(frameID: frameID, source: source)
     }
 
+    private static func filteredPresentationOCRNodes(_ nodes: [OCRNodeWithText]) -> [OCRNodeWithText] {
+        nodes.filter { node in
+            node.x >= 0.0 && node.x <= 1.0 &&
+            node.y >= 0.0 && node.y <= 1.0 &&
+            (node.x + node.width) <= 1.0 &&
+            (node.y + node.height) <= 1.0
+        }
+    }
+
     /// Set OCR nodes and invalidate the selection cache
     private func setOCRNodes(_ nodes: [OCRNodeWithText]) {
         // Capture previous nodes for diff visualization (only when debug overlay is enabled)
@@ -10369,12 +10857,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 // Filter out nodes with invalid coordinates (multi-monitor captures)
                 // Valid normalized coordinates should be in range [0.0, 1.0]
-                let filteredNodes = nodes.filter { node in
-                    node.x >= 0.0 && node.x <= 1.0 &&
-                    node.y >= 0.0 && node.y <= 1.0 &&
-                    (node.x + node.width) <= 1.0 &&
-                    (node.y + node.height) <= 1.0
-                }
+                let filteredNodes = Self.filteredPresentationOCRNodes(nodes)
 
                 setOCRNodes(filteredNodes)
                 startHyperlinkMapping(

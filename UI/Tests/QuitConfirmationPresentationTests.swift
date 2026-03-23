@@ -4,6 +4,22 @@ import XCTest
 
 @MainActor
 final class QuitConfirmationPresentationTests: XCTestCase {
+    func testDashboardCloseSideEffectsRunWhenAppIsNotTerminating() {
+        XCTAssertTrue(
+            DashboardWindowController.shouldPerformCloseSideEffects(
+                isApplicationTerminating: false
+            )
+        )
+    }
+
+    func testDashboardCloseSideEffectsSkipWhenAppIsTerminating() {
+        XCTAssertFalse(
+            DashboardWindowController.shouldPerformCloseSideEffects(
+                isApplicationTerminating: true
+            )
+        )
+    }
+
     func testPreferredQuitConfirmationAnchorWindowPrefersVisibleKeyWindow() {
         let keyWindow = StubQuitConfirmationWindow(isVisible: true)
         let mainWindow = StubQuitConfirmationWindow(isVisible: true)

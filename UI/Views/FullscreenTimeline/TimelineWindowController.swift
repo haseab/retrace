@@ -1536,6 +1536,17 @@ public class TimelineWindowController: NSObject {
         return modifiers == [.command] ? "Cmd+L" : nil
     }
 
+    /// Resolve copy-YouTube-markdown shortcut key from an NSEvent.
+    /// Supports Option+Cmd+L with both keycode and character fallback.
+    private func copyYouTubeMarkdownLinkShortcutTrigger(
+        for event: NSEvent,
+        modifiers: NSEvent.ModifierFlags
+    ) -> String? {
+        let matchesLKey = event.keyCode == 37 || event.charactersIgnoringModifiers?.lowercased() == "l"
+        guard matchesLKey else { return nil }
+        return modifiers == [.command, .option] ? "Option+Cmd+L" : nil
+    }
+
     /// Resolve copy-moment-link shortcut key from an NSEvent.
     /// Supports Option+Shift+L with both keycode and character fallback.
     private func copyMomentLinkShortcutTrigger(for event: NSEvent, modifiers: NSEvent.ModifierFlags) -> String? {
@@ -2074,6 +2085,7 @@ public class TimelineWindowController: NSObject {
                 let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
                 let openLinkTrigger = self?.openLinkShortcutTrigger(for: event, modifiers: modifiers)
                 let copyLinkTrigger = self?.copyLinkShortcutTrigger(for: event, modifiers: modifiers)
+                let copyYouTubeMarkdownLinkTrigger = self?.copyYouTubeMarkdownLinkShortcutTrigger(for: event, modifiers: modifiers)
                 let copyMomentLinkTrigger = self?.copyMomentLinkShortcutTrigger(for: event, modifiers: modifiers)
                 if event.keyCode == 53 { // Escape
                     if self?.handleKeyEvent(event) == true {
@@ -2111,7 +2123,9 @@ public class TimelineWindowController: NSObject {
                     return viewModel.isInFrameSearchVisible
                 }()
                 if isInFrameSearchFieldActive {
-                    if openLinkTrigger == nil && copyLinkTrigger == nil {
+                    if openLinkTrigger == nil
+                        && copyLinkTrigger == nil
+                        && copyYouTubeMarkdownLinkTrigger == nil {
                         return event
                     }
                 }
@@ -2206,8 +2220,11 @@ public class TimelineWindowController: NSObject {
                     return nil // Always consume the event to prevent propagation
                 }
 
-                // Link shortcuts (Cmd+L / Cmd+Shift+L / Option+Shift+L): handle before AppKit key-equivalent fallback.
-                if openLinkTrigger != nil || copyLinkTrigger != nil || copyMomentLinkTrigger != nil {
+                // Link shortcuts (Cmd+L / Cmd+Shift+L / Option+Cmd+L / Option+Shift+L): handle before AppKit key-equivalent fallback.
+                if openLinkTrigger != nil
+                    || copyLinkTrigger != nil
+                    || copyYouTubeMarkdownLinkTrigger != nil
+                    || copyMomentLinkTrigger != nil {
                     _ = self?.handleKeyEvent(event)
                     return nil // Always consume to avoid dead-end beep
                 }
@@ -2662,6 +2679,15 @@ public class TimelineWindowController: NSObject {
         if copyLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
             recordShortcut("cmd+l")
             if let viewModel = timelineViewModel, viewModel.copyCurrentBrowserURL() {
+                return true
+            }
+            return true
+        }
+
+        // Option+Cmd+L to copy YouTube markdown link
+        if copyYouTubeMarkdownLinkShortcutTrigger(for: event, modifiers: modifiers) != nil {
+            recordShortcut("opt+cmd+l")
+            if let viewModel = timelineViewModel, viewModel.copyCurrentYouTubeMarkdownLink() {
                 return true
             }
             return true

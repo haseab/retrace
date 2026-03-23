@@ -53,6 +53,10 @@ public class DashboardWindowController: NSObject {
         self.coordinator = coordinator
     }
 
+    nonisolated static func shouldPerformCloseSideEffects(isApplicationTerminating: Bool) -> Bool {
+        !isApplicationTerminating
+    }
+
     // MARK: - Show/Hide
 
     /// Show the dashboard window
@@ -222,6 +226,12 @@ extension DashboardWindowController: NSWindowDelegate {
         Log.info("[DashboardWindowController] windowWillClose state(before)=\(windowStateSnapshot())", category: .ui)
         isVisible = false
         Log.info("[DashboardWindowController] windowWillClose state(after)=\(windowStateSnapshot())", category: .ui)
+
+        if !Self.shouldPerformCloseSideEffects(isApplicationTerminating: AppDelegate.isApplicationTerminating) {
+            Log.info("[DashboardWindowController] windowWillClose skipping app-hide/close-notification during termination", category: .ui)
+            return
+        }
+
         hideAppIfNoForegroundWindows(ignoring: window)
         NotificationCenter.default.post(name: .dashboardDidClose, object: nil)
     }
@@ -234,6 +244,11 @@ extension DashboardWindowController: NSWindowDelegate {
 
 private extension DashboardWindowController {
     func hideAppIfNoForegroundWindows(ignoring dashboardWindow: NSWindow?) {
+        guard Self.shouldPerformCloseSideEffects(isApplicationTerminating: AppDelegate.isApplicationTerminating) else {
+            Log.info("[DashboardWindowController] skipping app hide while application is terminating", category: .ui)
+            return
+        }
+
         let hasOtherForegroundWindows = NSApp.windows.contains { candidate in
             guard candidate !== dashboardWindow else { return false }
             return candidate.level.rawValue == 0 && candidate.isVisible
