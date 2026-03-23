@@ -29,6 +29,7 @@ private enum WindowConfig {
     static let nearestFallbackBatchSize = 35 // Frames to fetch when fallback nearest probe is needed
     static let olderSparseRetryThreshold = loadBatchSize // Retry with nearest fallback when bounded probe under-fills the batch
     static let newerSparseRetryThreshold = loadBatchSize // Retry with nearest fallback when bounded probe under-fills the batch
+    static let presentationOverlayIdleDelayNanoseconds: Int64 = 150_000_000
 }
 
 /// Memory tracking for debugging frame accumulation issues
@@ -443,6 +444,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         didSet {
             if currentIndex != oldValue {
                 endInPageURLHoverTracking()
+                cancelPresentationOverlayTasks()
                 frameMousePositionTask?.cancel()
                 frameMousePositionTask = nil
                 frameMousePosition = nil
@@ -1922,6 +1924,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Task for tape drag momentum animation
     private var tapeDragMomentumTask: Task<Void, Never>?
+    private var presentationOverlayIdleTask: Task<Void, Never>?
 
     /// Task for polling OCR status when processing is in progress
     private var ocrStatusPollingTask: Task<Void, Never>?
@@ -2075,6 +2078,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private var loadingStateStartedAt: CFAbsoluteTime?
     /// Reason associated with the currently active loading state.
     private var activeLoadingReason: String = "idle"
+    private var criticalTimelineFetchDepth = 0
+    private var criticalTimelineFetchWaiters: [CheckedContinuation<Void, Never>] = []
+    private var deferredPresentationOverlayRefreshNeeded = false
     /// Whether async image/OCR/URL presentation work is allowed to publish results.
     private var presentationWorkEnabled = false
     /// Monotonic generation used to invalidate stale presentation tasks across hide/show.
@@ -2102,6 +2108,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// In-flight boundary load tasks. Cancel these when a jump/reload replaces the frame window.
     private var olderBoundaryLoadTask: Task<Void, Never>?
     private var newerBoundaryLoadTask: Task<Void, Never>?
+    private var urlBoundingBoxTask: Task<Void, Never>?
+    private var ocrNodesLoadTask: Task<Void, Never>?
 
     /// Flag to prevent duplicate initial frame loading (set synchronously to avoid race conditions)
     private var isInitialLoadInProgress = false
@@ -2611,6 +2619,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         if didChange {
             presentationWorkGeneration &+= 1
         }
+        if !enabled {
+            cancelPresentationOverlayTasks()
+        }
         if Self.isVerboseTimelineLoggingEnabled {
             Log.debug(
                 "[TIMELINE-PRESENTATION] enabled=\(enabled) generation=\(presentationWorkGeneration) reason=\(reason)",
@@ -2792,6 +2803,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             activeLoadingReason = reason
             loadingStateStartedAt = CFAbsoluteTimeGetCurrent()
             isLoading = true
+            beginCriticalTimelineFetch()
             Log.info(
                 "[TIMELINE-LOADING][\(loadingTransitionID)] START reason='\(reason)' frames=\(frames.count) index=\(currentIndex) filters={\(summarizeFiltersForLog(filterCriteria))}",
                 category: .ui
@@ -2811,6 +2823,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         isLoading = false
         loadingStateStartedAt = nil
         activeLoadingReason = "idle"
+        endCriticalTimelineFetch()
 
         Log.recordLatency(
             "timeline.loading.overlay_visible_ms",
@@ -2827,6 +2840,132 @@ public class SimpleTimelineViewModel: ObservableObject {
         } else {
             Log.info(message, category: .ui)
         }
+    }
+
+    private var isCriticalTimelineFetchActive: Bool {
+        criticalTimelineFetchDepth > 0
+    }
+
+    private func beginCriticalTimelineFetch() {
+        criticalTimelineFetchDepth += 1
+        deferredPresentationOverlayRefreshNeeded = true
+        cancelPresentationOverlayTasks()
+    }
+
+    private func endCriticalTimelineFetch() {
+        guard criticalTimelineFetchDepth > 0 else { return }
+
+        criticalTimelineFetchDepth -= 1
+        guard criticalTimelineFetchDepth == 0 else { return }
+
+        let waiters = criticalTimelineFetchWaiters
+        criticalTimelineFetchWaiters.removeAll(keepingCapacity: false)
+        waiters.forEach { $0.resume() }
+
+        if deferredPresentationOverlayRefreshNeeded {
+            deferredPresentationOverlayRefreshNeeded = false
+            scheduleDeferredPresentationOverlayRefresh()
+        }
+    }
+
+    private func scheduleDeferredPresentationOverlayRefresh() {
+        guard presentationWorkEnabled, !isActivelyScrolling else { return }
+        let generation = currentPresentationWorkGeneration()
+        guard canPublishPresentationResult(expectedGeneration: generation) else { return }
+        refreshStaticPresentationIfNeeded()
+    }
+
+    @discardableResult
+    private func prioritizeBoundaryLoadOverPresentationOverlays() -> Bool {
+        guard presentationWorkEnabled, !isActivelyScrolling else { return false }
+        let boundaryLoad = checkAndLoadMoreFrames(reason: "presentationOverlay")
+        guard boundaryLoad.any else { return false }
+
+        deferredPresentationOverlayRefreshNeeded = true
+        cancelPresentationOverlayTasks()
+        return true
+    }
+
+    private func schedulePresentationOverlayRefresh(expectedGeneration: UInt64 = 0) {
+        guard presentationWorkEnabled, !isInLiveMode else { return }
+        guard let frame = currentTimelineFrame?.frame else {
+            presentationOverlayIdleTask?.cancel()
+            presentationOverlayIdleTask = nil
+            return
+        }
+
+        let generation = expectedGeneration == 0
+            ? currentPresentationWorkGeneration()
+            : expectedGeneration
+        guard canPublishPresentationResult(
+            frameID: frame.id,
+            expectedGeneration: generation
+        ) else { return }
+
+        if isCriticalTimelineFetchActive {
+            deferredPresentationOverlayRefreshNeeded = true
+            return
+        }
+
+        if prioritizeBoundaryLoadOverPresentationOverlays() {
+            return
+        }
+
+        presentationOverlayIdleTask?.cancel()
+        presentationOverlayIdleTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                for: .nanoseconds(WindowConfig.presentationOverlayIdleDelayNanoseconds),
+                clock: .continuous
+            )
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            guard self.presentationWorkEnabled, !self.isInLiveMode, !self.isActivelyScrolling else {
+                self.deferredPresentationOverlayRefreshNeeded = true
+                return
+            }
+            guard self.canPublishPresentationResult(
+                frameID: frame.id,
+                expectedGeneration: generation
+            ) else { return }
+            guard !self.isCriticalTimelineFetchActive else {
+                self.deferredPresentationOverlayRefreshNeeded = true
+                return
+            }
+            if self.prioritizeBoundaryLoadOverPresentationOverlays() {
+                return
+            }
+
+            self.loadURLBoundingBox(expectedGeneration: generation)
+            self.loadOCRNodes(expectedGeneration: generation)
+        }
+    }
+
+    private func cancelPresentationOverlayTasks() {
+        presentationOverlayIdleTask?.cancel()
+        presentationOverlayIdleTask = nil
+        urlBoundingBoxTask?.cancel()
+        urlBoundingBoxTask = nil
+        ocrNodesLoadTask?.cancel()
+        ocrNodesLoadTask = nil
+        ocrStatusPollingTask?.cancel()
+        ocrStatusPollingTask = nil
+    }
+
+    private func waitForCriticalTimelineFetchToFinishIfNeeded(
+        frameID: FrameID,
+        expectedGeneration: UInt64
+    ) async -> Bool {
+        guard isCriticalTimelineFetchActive else {
+            return canPublishPresentationResult(frameID: frameID, expectedGeneration: expectedGeneration)
+        }
+
+        deferredPresentationOverlayRefreshNeeded = true
+        await withCheckedContinuation { continuation in
+            criticalTimelineFetchWaiters.append(continuation)
+        }
+
+        guard !Task.isCancelled else { return false }
+        return canPublishPresentationResult(frameID: frameID, expectedGeneration: expectedGeneration)
     }
 
     private func nextFetchTraceID(prefix: String) -> String {
@@ -6821,6 +6960,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         allowNearLiveAutoAdvance: Bool = true,
         refreshPresentation: Bool = true
     ) async {
+        beginCriticalTimelineFetch()
+        defer { endCriticalTimelineFetch() }
+
         // If we have frames and a current position, just refresh the current image
         if !frames.isEmpty {
             // Reopen refresh rules:
@@ -6955,8 +7097,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         if currentVideoInfo != nil {
             let generation = currentPresentationWorkGeneration()
             guard canPublishPresentationResult(expectedGeneration: generation) else { return }
-            loadURLBoundingBox(expectedGeneration: generation)
-            loadOCRNodes(expectedGeneration: generation)
+            schedulePresentationOverlayRefresh(expectedGeneration: generation)
             return
         }
 
@@ -8077,8 +8218,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         // Defer heavy OCR/URL loading until scrolling stops for smoother scrubbing
         if !isActivelyScrolling {
-            loadURLBoundingBox(expectedGeneration: presentationGeneration)
-            loadOCRNodes(expectedGeneration: presentationGeneration)
+            schedulePresentationOverlayRefresh(expectedGeneration: presentationGeneration)
         } else {
             // Clear stale OCR/URL data during scrolling so old bounding boxes don't persist
             setOCRNodes([])
@@ -8951,6 +9091,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Load URL bounding box for the current frame (if it's a browser URL)
     private func loadURLBoundingBox(expectedGeneration: UInt64 = 0) {
         guard let timelineFrame = currentTimelineFrame else {
+            urlBoundingBoxTask?.cancel()
+            urlBoundingBoxTask = nil
             urlBoundingBox = nil
             return
         }
@@ -8967,29 +9109,43 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Reset hover state when frame changes
         isHoveringURL = false
 
+        if isCriticalTimelineFetchActive {
+            deferredPresentationOverlayRefreshNeeded = true
+            urlBoundingBox = nil
+            return
+        }
+
+        urlBoundingBoxTask?.cancel()
+
         // Load URL bounding box asynchronously
-        Task {
+        urlBoundingBoxTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            guard await self.waitForCriticalTimelineFetchToFinishIfNeeded(
+                frameID: frame.id,
+                expectedGeneration: generation
+            ) else { return }
+
             do {
-                let boundingBox = try await fetchURLBoundingBoxForPresentation(
+                let boundingBox = try await self.fetchURLBoundingBoxForPresentation(
                     timestamp: frame.timestamp,
                     source: frame.source
                 )
-                if canPublishPresentationResult(
+                if self.canPublishPresentationResult(
                     frameID: frame.id,
                     expectedGeneration: generation
                 ) {
-                    urlBoundingBox = boundingBox
-                    if let box = boundingBox {
-                        Log.debug("[URLBoundingBox] Found URL '\(box.url)' at (\(box.x), \(box.y), \(box.width), \(box.height))", category: .ui)
-                    }
+                    self.urlBoundingBox = boundingBox
                 }
+            } catch is CancellationError {
+                return
             } catch {
                 Log.error("[SimpleTimelineViewModel] Failed to load URL bounding box: \(error)", category: .app)
-                if canPublishPresentationResult(
+                if self.canPublishPresentationResult(
                     frameID: frame.id,
                     expectedGeneration: generation
                 ) {
-                    urlBoundingBox = nil
+                    self.urlBoundingBox = nil
                 }
             }
         }
@@ -10786,7 +10942,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             : expectedGeneration
         guard canPublishPresentationResult(expectedGeneration: generation) else { return }
 
-        guard currentTimelineFrame != nil else {
+        guard let timelineFrame = currentTimelineFrame else {
+            ocrNodesLoadTask?.cancel()
+            ocrNodesLoadTask = nil
             setOCRNodes([])
             ocrStatus = .unknown
             ocrStatusPollingTask?.cancel()
@@ -10797,18 +10955,36 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        if let currentFrameID = currentTimelineFrame?.frame.id,
-           revealedRedactedFrameID != currentFrameID {
+        let frameID = timelineFrame.frame.id
+        if revealedRedactedFrameID != frameID {
             clearTemporaryRedactionReveals()
-            revealedRedactedFrameID = currentFrameID
+            revealedRedactedFrameID = frameID
         }
 
         // Clear previous selection when frame changes
         clearTextSelection()
 
+        if isCriticalTimelineFetchActive {
+            deferredPresentationOverlayRefreshNeeded = true
+            ocrNodesLoadTask?.cancel()
+            ocrNodesLoadTask = nil
+            setOCRNodes([])
+            ocrStatus = .unknown
+            clearHyperlinkMatches()
+            return
+        }
+
+        ocrNodesLoadTask?.cancel()
+
         // Load OCR nodes asynchronously
-        Task {
-            await loadOCRNodesAsync(expectedGeneration: generation)
+        ocrNodesLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            guard await self.waitForCriticalTimelineFetchToFinishIfNeeded(
+                frameID: frameID,
+                expectedGeneration: generation
+            ) else { return }
+            await self.loadOCRNodesAsync(expectedGeneration: generation)
         }
     }
 
@@ -10864,6 +11040,8 @@ public class SimpleTimelineViewModel: ObservableObject {
                     expectedGeneration: generation
                 )
             }
+        } catch is CancellationError {
+            return
         } catch {
             Log.error("[SimpleTimelineViewModel] Failed to load OCR nodes: \(error)", category: .app)
             if canPublishPresentationResult(
@@ -12370,15 +12548,13 @@ public class SimpleTimelineViewModel: ObservableObject {
             clearSearchHighlight()
         }
 
-        // Debounce: settle tape to frame center and load OCR/URL after 100ms of no scroll
+        // Debounce: settle tape to frame center and load OCR/URL after 200ms of no scroll
         scrollDebounceTask = Task {
-            try? await Task.sleep(for: .nanoseconds(Int64(100_000_000)), clock: .continuous) // 100ms
+            try? await Task.sleep(for: .nanoseconds(Int64(200_000_000)), clock: .continuous)
             if !Task.isCancelled {
                 await MainActor.run {
                     self.isActivelyScrolling = false
-                    // Now load OCR/URL data that was deferred during scrubbing
-                    self.loadURLBoundingBox()
-                    self.loadOCRNodes()
+                    self.schedulePresentationOverlayRefresh()
                 }
             }
         }
@@ -12422,15 +12598,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
                 if !Task.isCancelled {
                     self.isActivelyScrolling = false
-                    self.loadURLBoundingBox()
-                    self.loadOCRNodes()
+                    self.schedulePresentationOverlayRefresh()
                 }
             }
         } else {
             // No meaningful velocity — just re-enable deferred operations
             isActivelyScrolling = false
-            loadURLBoundingBox()
-            loadOCRNodes()
+            schedulePresentationOverlayRefresh()
         }
     }
 
@@ -14156,6 +14330,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let oldestTimestamp = oldestLoadedTimestamp else { return }
         guard !isLoadingOlder else { return }
         guard !Task.isCancelled else { return }
+        beginCriticalTimelineFetch()
+        defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingOlder = true
@@ -14419,6 +14595,8 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let newestTimestamp = newestLoadedTimestamp else { return }
         guard !isLoadingNewer else { return }
         guard !Task.isCancelled else { return }
+        beginCriticalTimelineFetch()
+        defer { endCriticalTimelineFetch() }
 
         let loadStart = CFAbsoluteTimeGetCurrent()
         isLoadingNewer = true

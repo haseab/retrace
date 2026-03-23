@@ -148,11 +148,7 @@ enum NodeQueries {
                     ELSE SUBSTR(COALESCE(sc.c0, '') || COALESCE(sc.c1, ''), n.textOffset + 1, n.textLength)
                 END AS nodeText
             FROM node n
-            LEFT JOIN (
-                SELECT frameId, MAX(docid) AS docid
-                FROM doc_segment
-                GROUP BY frameId
-            ) ds ON n.frameId = ds.frameId
+            LEFT JOIN doc_segment ds ON n.frameId = ds.frameId
             LEFT JOIN searchRanking_content sc ON ds.docid = sc.id
             WHERE n.frameId = ?
             ORDER BY n.nodeOrder ASC
