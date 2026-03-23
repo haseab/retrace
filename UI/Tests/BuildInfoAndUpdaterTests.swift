@@ -23,6 +23,17 @@ final class BuildInfoFormattingTests: XCTestCase {
         )
     }
 
+    func testDisplayVersionForFallbackDevBuildUsesDevLabel() {
+        XCTAssertEqual(
+            BuildInfo.makeDisplayVersion(version: "dev", isDevBuild: true, gitCommit: "unknown"),
+            "dev"
+        )
+        XCTAssertEqual(
+            BuildInfo.makeDisplayVersion(version: "dev", isDevBuild: true, gitCommit: "abc1234"),
+            "dev · abc1234"
+        )
+    }
+
     func testFullVersionForReleaseBuild() {
         XCTAssertEqual(
             BuildInfo.makeFullVersion(
@@ -46,6 +57,29 @@ final class BuildInfoFormattingTests: XCTestCase {
                 gitBranch: "feature/xyz"
             ),
             "1.2.3-dev · abc1234 (feature/xyz)"
+        )
+    }
+
+    func testFullVersionForFallbackDevBuildUsesDevLabel() {
+        XCTAssertEqual(
+            BuildInfo.makeFullVersion(
+                version: "dev",
+                buildNumber: "unknown",
+                isDevBuild: true,
+                gitCommit: "unknown",
+                gitBranch: "unknown"
+            ),
+            "dev"
+        )
+        XCTAssertEqual(
+            BuildInfo.makeFullVersion(
+                version: "dev",
+                buildNumber: "unknown",
+                isDevBuild: true,
+                gitCommit: "abc1234",
+                gitBranch: "feature/xyz"
+            ),
+            "dev · abc1234 (feature/xyz)"
         )
     }
 

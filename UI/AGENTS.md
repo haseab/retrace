@@ -46,6 +46,7 @@ UI/
 │   └── CrashRecoverySupport.swift       # Shared crash-recovery constants, disconnect suppression, and XPC protocol
 ├── LaunchAgents/
 │   └── io.retrace.app.crash-recovery.plist # SMAppService launch-agent plist for crash recovery
+├── BuildMetadata.generated.swift        # SwiftPM-generated fallback metadata for standalone `.build` runs
 ├── Components/
 │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
 │   ├── BoundingBoxOverlay.swift         # Text region highlighting
