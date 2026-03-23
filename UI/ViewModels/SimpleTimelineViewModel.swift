@@ -445,6 +445,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             if currentIndex != oldValue {
                 endInPageURLHoverTracking()
                 cancelPresentationOverlayTasks()
+                clearCurrentFrameOverlayPresentation()
                 frameMousePositionTask?.cancel()
                 frameMousePositionTask = nil
                 frameMousePosition = nil
@@ -6196,6 +6197,15 @@ public class SimpleTimelineViewModel: ObservableObject {
         preserveWaitingFallbackImage(for: timelineFrame)
         clearCurrentImagePresentation()
         configurePendingVideoPresentationState(for: timelineFrame)
+    }
+
+    private func clearCurrentFrameOverlayPresentation() {
+        urlBoundingBox = nil
+        clearHyperlinkMatches()
+        clearTextSelection()
+        clearTemporaryRedactionReveals()
+        setOCRNodes([])
+        ocrStatus = .unknown
     }
 
     private func setCurrentImagePresentation(
