@@ -3628,6 +3628,50 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertEqual(ocrCalls, 0)
     }
 
+    func testHistoricalOpenUsesDiskBufferFallbackUntilVideoReady() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+
+        let frameID = FrameID(value: 42_424_209)
+        viewModel.frames = [
+            makeVideoTimelineFrame(
+                frameID: frameID,
+                timestamp: Date(timeIntervalSince1970: 1_700_100_209),
+                frameIndex: 9,
+                processingStatus: 2
+            ),
+        ]
+        viewModel.currentIndex = 0
+
+        let stillImage = makeSolidImage(size: NSSize(width: 33, height: 33), color: .systemPurple)
+        let stillData = try makeJPEGData(stillImage)
+        let cacheFileURL = timelineDiskBufferFileURL(frameID: frameID)
+        try FileManager.default.createDirectory(
+            at: cacheFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try stillData.write(to: cacheFileURL, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: cacheFileURL) }
+
+        let didPreload = await viewModel.prepareHistoricalOpenStillFallbackIfNeeded()
+
+        XCTAssertTrue(didPreload)
+        XCTAssertEqual(viewModel.pendingVideoPresentationFrameID, frameID)
+        XCTAssertFalse(viewModel.isPendingVideoPresentationReady)
+        XCTAssertEqual(viewModel.currentFrameMediaDisplayMode, .decodedVideo)
+        XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .waitingFallback)
+
+        let fallbackImage = try XCTUnwrap(viewModel.waitingFallbackImage)
+        XCTAssertEqual(Int(fallbackImage.size.width), 33)
+        XCTAssertEqual(Int(fallbackImage.size.height), 33)
+
+        viewModel.markVideoPresentationReady(frameID: frameID)
+
+        XCTAssertTrue(viewModel.isPendingVideoPresentationReady)
+        XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .none)
+        XCTAssertNil(viewModel.waitingFallbackImage)
+    }
+
     func testCompactPresentationStateClearsPresentationPayloadsButPreservesTimelineState() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         viewModel.frames = [
@@ -3657,6 +3701,45 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertNil(viewModel.shiftDragDisplaySnapshotFrameID)
         XCTAssertFalse(viewModel.forceVideoReload)
         XCTAssertFalse(viewModel.isInLiveMode)
+    }
+
+    func testCompactPresentationStateClearsHistoricalOpenFallbackState() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+
+        let frameID = FrameID(value: 42_424_210)
+        viewModel.frames = [
+            makeVideoTimelineFrame(
+                frameID: frameID,
+                timestamp: Date(timeIntervalSince1970: 1_700_100_210),
+                frameIndex: 10,
+                processingStatus: 2
+            ),
+        ]
+        viewModel.currentIndex = 0
+
+        let stillImage = makeSolidImage(size: NSSize(width: 34, height: 34), color: .systemRed)
+        let stillData = try makeJPEGData(stillImage)
+        let cacheFileURL = timelineDiskBufferFileURL(frameID: frameID)
+        try FileManager.default.createDirectory(
+            at: cacheFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try stillData.write(to: cacheFileURL, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: cacheFileURL) }
+
+        let didPreload = await viewModel.prepareHistoricalOpenStillFallbackIfNeeded()
+        XCTAssertTrue(didPreload)
+        XCTAssertNotNil(viewModel.waitingFallbackImage)
+        XCTAssertEqual(viewModel.pendingVideoPresentationFrameID, frameID)
+
+        viewModel.compactPresentationState(reason: "unit-test", purgeDiskFrameBuffer: false)
+
+        XCTAssertNil(viewModel.currentImage)
+        XCTAssertNil(viewModel.currentImageFrameID)
+        XCTAssertNil(viewModel.waitingFallbackImage)
+        XCTAssertNil(viewModel.pendingVideoPresentationFrameID)
+        XCTAssertFalse(viewModel.isPendingVideoPresentationReady)
     }
 
     func testInFlightMostRecentLoadDoesNotRebuildPresentationAfterCompaction() async throws {

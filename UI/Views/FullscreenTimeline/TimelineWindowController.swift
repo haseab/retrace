@@ -36,6 +36,8 @@ public class TimelineWindowController: NSObject {
     private var deferredHostingViewDetachTask: Task<Void, Never>?
     private var tapeShowAnimationTask: Task<Void, Never>?
     private var liveModeCaptureTask: Task<Void, Never>?
+    private var windowFadeInTask: Task<Void, Never>?
+    private var windowFadeInGeneration: UInt64 = 0
     private var isHiding = false
     /// Ignore scroll-wheel input for a short grace period after opening in live mode.
     /// This prevents residual trackpad momentum from immediately exiting live mode.
@@ -682,6 +684,7 @@ public class TimelineWindowController: NSObject {
 	    /// Show the timeline overlay on the current screen
     public func show() {
         cancelDeferredHostingViewDetach()
+        cancelWindowFadeIn(reason: "show")
 
         // If we're in the middle of hiding, cancel the animation and snap back to visible
         if isHiding, let window = window {
@@ -945,12 +948,8 @@ public class TimelineWindowController: NSObject {
         )
 
         // Fade in only for non-live opens (prevents the live screenshot "zoom" feel)
-        if !isLive {
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.35
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().alphaValue = 1
-            })
+        if !isLive, let viewModel = timelineViewModel {
+            scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
         }
 
         // Trigger tape slide-up animation (Cmd+H style)
@@ -990,6 +989,7 @@ public class TimelineWindowController: NSObject {
         )
         let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
         isHiding = true
+        cancelWindowFadeIn(reason: "hide")
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
 
@@ -1385,6 +1385,7 @@ public class TimelineWindowController: NSObject {
 
     private func destroyMountedPresentation() {
         cancelDeferredHostingViewDetach()
+        cancelWindowFadeIn(reason: "destroyMountedPresentation")
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         timelineViewModel?.setPresentationWorkEnabled(false, reason: "destroyMountedPresentation")
@@ -1783,6 +1784,7 @@ public class TimelineWindowController: NSObject {
     /// Fade in the prepared window (called after data is loaded)
     private func fadeInPreparedWindow() {
         guard let window = window, let coordinator = coordinator else { return }
+        cancelWindowFadeIn(reason: "fadeInPreparedWindow")
 
         // Reattach SwiftUI view if it was detached (on hide, we remove it from superview to stop display cycle)
         if let hostingView = hostingView, hostingView.superview == nil {
@@ -1822,11 +1824,9 @@ public class TimelineWindowController: NSObject {
             }
         }
 
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.35
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
-        })
+        if let viewModel = timelineViewModel {
+            scheduleHistoricalFadeIn(window: window, viewModel: viewModel)
+        }
 
         // Trigger tape slide-up animation
         tapeShowAnimationTask = Task { @MainActor in
@@ -1850,6 +1850,42 @@ public class TimelineWindowController: NSObject {
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
+    }
+
+    private func cancelWindowFadeIn(reason _: String) {
+        windowFadeInTask?.cancel()
+        windowFadeInTask = nil
+        windowFadeInGeneration &+= 1
+    }
+
+    private func scheduleHistoricalFadeIn(window: NSWindow, viewModel: SimpleTimelineViewModel) {
+        cancelWindowFadeIn(reason: "scheduleHistoricalFadeIn")
+        windowFadeInGeneration &+= 1
+        let generation = windowFadeInGeneration
+        windowFadeInTask = Task { @MainActor [weak self, weak viewModel] in
+            guard let self, let viewModel else { return }
+
+            _ = await viewModel.prepareHistoricalOpenStillFallbackIfNeeded()
+
+            guard !Task.isCancelled,
+                  self.windowFadeInGeneration == generation,
+                  self.isVisible,
+                  !self.isHiding,
+                  self.window === window,
+                  self.timelineViewModel === viewModel else {
+                return
+            }
+
+            await NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.35
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                window.animator().alphaValue = 1
+            })
+
+            if self.windowFadeInGeneration == generation {
+                self.windowFadeInTask = nil
+            }
+        }
     }
 
     // MARK: - Window Creation

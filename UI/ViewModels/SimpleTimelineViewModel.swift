@@ -7115,6 +7115,74 @@ public class SimpleTimelineViewModel: ObservableObject {
         loadImageIfNeeded()
     }
 
+    /// Best-effort historical-open fallback that reuses the cached still image from the
+    /// disk frame buffer while the video decoder warms up after the window is remounted.
+    @discardableResult
+    func prepareHistoricalOpenStillFallbackIfNeeded() async -> Bool {
+        guard presentationWorkEnabled, !isInLiveMode else { return false }
+        guard let timelineFrame = currentTimelineFrame,
+              timelineFrame.videoInfo != nil else {
+            return false
+        }
+        guard currentImage == nil else { return false }
+
+        let frameID = timelineFrame.frame.id
+        let generation = currentPresentationWorkGeneration()
+        guard canPublishPresentationResult(
+            frameID: frameID,
+            expectedGeneration: generation
+        ) else {
+            return false
+        }
+
+        if pendingVideoPresentationFrameID == frameID, isPendingVideoPresentationReady {
+            return false
+        }
+
+        if pendingVideoPresentationFrameID != frameID {
+            clearWaitingFallbackImage()
+            pendingVideoPresentationFrameID = frameID
+            isPendingVideoPresentationReady = false
+        }
+
+        if waitingFallbackImage != nil {
+            return true
+        }
+
+        guard let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) else {
+            return false
+        }
+
+        do {
+            let image = try decodeBufferedFrameImage(
+                bufferedData,
+                frameID: frameID,
+                errorCode: -5
+            )
+
+            guard canPublishPresentationResult(
+                frameID: frameID,
+                expectedGeneration: generation
+            ) else {
+                return false
+            }
+            guard pendingVideoPresentationFrameID == frameID, !isPendingVideoPresentationReady else {
+                return false
+            }
+
+            waitingFallbackImage = image
+            frameNotReady = false
+            frameLoadError = false
+            return true
+        } catch {
+            Log.warning(
+                "[Timeline-Reopen] Failed to decode disk-buffer still for frame \(frameID.value): \(error)",
+                category: .ui
+            )
+            return false
+        }
+    }
+
     /// Release image/video-adjacent state while preserving the warmed metadata window.
     /// Use this when the timeline is hidden but we want fast reopen semantics without
     /// retaining decoded images, live screenshots, or disk-backed frame payloads.
@@ -7132,7 +7200,9 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         isInLiveMode = false
         liveScreenshot = nil
-        currentImage = nil
+        clearCurrentImagePresentation()
+        clearWaitingFallbackImage()
+        clearPendingVideoPresentationState()
         shiftDragDisplaySnapshot = nil
         shiftDragDisplaySnapshotFrameID = nil
         shiftDragDisplayRequestID &+= 1

@@ -1,6 +1,7 @@
 import XCTest
 @testable import Retrace
 import Shared
+import App
 
 final class SearchHighlightTooltipTests: XCTestCase {
     func testTooltipSafeZoneIncludesBridgeBetweenHighlightAndTooltip() {
