@@ -540,18 +540,24 @@ public struct SystemMonitorView: View {
                 }
 
                 if model.pendingCount > 0 {
-                    Circle()
-                        .fill(Color.retraceSecondary.opacity(0.3))
-                        .frame(width: 3, height: 3)
+                    HStack(spacing: 16) {
+                        Circle()
+                            .fill(Color.retraceSecondary.opacity(0.3))
+                            .frame(width: 3, height: 3)
 
-                    HStack(spacing: 4) {
-                        Text("\(model.pendingCount)")
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .foregroundColor(model.pendingTint)
-                        Text(model.pendingLabel)
-                            .font(.retraceCaption2)
-                            .foregroundColor(.retraceSecondary.opacity(0.7))
+                        HStack(spacing: 4) {
+                            Text("\(model.pendingCount)")
+                                .font(.system(size: 14, weight: .semibold, design: .rounded))
+                                .foregroundColor(model.pendingTint)
+                            Text(model.pendingLabel)
+                                .font(.retraceCaption2)
+                                .foregroundColor(.retraceSecondary.opacity(0.7))
+                        }
                     }
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity
+                    ))
                 }
 
                 Spacer()
@@ -567,10 +573,13 @@ public struct SystemMonitorView: View {
                             .font(.retraceCaption2)
                             .foregroundColor(.retraceSecondary.opacity(0.7))
                     }
+                    .transition(.opacity.combined(with: .move(edge: .trailing)))
                 }
             }
             .padding(.vertical, 12)
             .padding(.horizontal, 16)
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.pendingCount > 0)
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.queueDepth > 0)
 
             footer()
         }
@@ -850,6 +859,10 @@ struct ActivityBarChart: View {
     private let tooltipEstimatedHeight: CGFloat = 56
     private let tooltipGapAboveBar: CGFloat = 8
     private let tooltipTopOverflowAllowance: CGFloat = 14
+    private let tooltipBubbleWidth: CGFloat = 55
+    private let tooltipHorizontalOverflowAllowance: CGFloat = 20
+    private let tooltipPointerInset: CGFloat = 14
+    private let backlogTransitionAnimation = Animation.spring(response: 0.28, dampingFraction: 0.84)
 
     var body: some View {
         GeometryReader { geometry in
@@ -900,8 +913,7 @@ struct ActivityBarChart: View {
                                     maxValue: maxValue,
                                     barWidth: barWidth,
                                     height: chartHeight,
-                                    isHovered: isHovered,
-                                    index: index
+                                    isHovered: isHovered
                                 )
                             } else {
                                 // Historical bar (blue)
@@ -917,20 +929,36 @@ struct ActivityBarChart: View {
                                 .fill(completedTint.opacity(isHovered ? 0.9 : 0.6))
                                 .frame(width: barWidth, height: max(barHeight, point.count > 0 ? 3 : 1))
                                 .animation(.easeOut(duration: 0.15), value: isHovered)
-                                .contentShape(Rectangle().size(width: barWidth, height: chartHeight))
-                                .onHover { hovering in
-                                    hoveredIndex = hovering ? index : nil
-                                }
                             }
                         }
                     }
                     .frame(width: chartWidth, height: chartHeight, alignment: .bottom)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            hoveredIndex = Self.hoveredDataIndex(
+                                at: location.x,
+                                dataPointCount: dataPoints.count,
+                                barWidth: barWidth,
+                                spacing: spacing
+                            )
+                        case .ended:
+                            hoveredIndex = nil
+                        }
+                    }
                     .overlay(alignment: .top) {
                         // Tooltip for main chart (index >= 0 excludes backlog hover which uses -1)
                         if let index = hoveredIndex, index >= 0, index < dataPoints.count {
                             let point = dataPoints[index]
                             let isLive = index == lastIndex
                             let xPosition = CGFloat(index) * (barWidth + spacing) + barWidth / 2
+                            let tooltipCenterX = Self.clampedTooltipCenterX(
+                                anchorX: xPosition,
+                                containerWidth: chartWidth,
+                                tooltipWidth: tooltipBubbleWidth,
+                                horizontalOverflowAllowance: tooltipHorizontalOverflowAllowance
+                            )
                             let yPosition = mainTooltipYOffset(
                                 for: point,
                                 isLive: isLive,
@@ -938,8 +966,17 @@ struct ActivityBarChart: View {
                                 chartHeight: chartHeight
                             )
 
-                            tooltipView(for: point, isLive: isLive)
-                                .offset(x: clampTooltipOffset(xPosition, in: chartWidth), y: yPosition)
+                            tooltipView(
+                                for: point,
+                                isLive: isLive,
+                                pointerOffset: Self.tooltipPointerOffset(
+                                    bubbleCenterX: tooltipCenterX,
+                                    anchorX: xPosition,
+                                    tooltipWidth: tooltipBubbleWidth,
+                                    pointerInset: tooltipPointerInset
+                                )
+                            )
+                                .offset(x: tooltipCenterX - (chartWidth / 2), y: yPosition)
                                 .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
                                 .animation(.spring(response: 0.18, dampingFraction: 0.86), value: hoveredIndex)
                         }
@@ -947,34 +984,42 @@ struct ActivityBarChart: View {
 
                     // Separator and backlog section
                     if hasBacklog {
-                        // Dotted vertical line separator
-                        Path { path in
-                            let dashHeight: CGFloat = 4
-                            let gapHeight: CGFloat = 3
-                            var y: CGFloat = 0
-                            while y < chartHeight {
-                                path.move(to: CGPoint(x: separatorWidth / 2, y: y))
-                                path.addLine(to: CGPoint(x: separatorWidth / 2, y: min(y + dashHeight, chartHeight)))
-                                y += dashHeight + gapHeight
+                        HStack(alignment: .bottom, spacing: 0) {
+                            // Dotted vertical line separator
+                            Path { path in
+                                let dashHeight: CGFloat = 4
+                                let gapHeight: CGFloat = 3
+                                var y: CGFloat = 0
+                                while y < chartHeight {
+                                    path.move(to: CGPoint(x: separatorWidth / 2, y: y))
+                                    path.addLine(to: CGPoint(x: separatorWidth / 2, y: min(y + dashHeight, chartHeight)))
+                                    y += dashHeight + gapHeight
+                                }
                             }
-                        }
-                        .stroke(Color.retraceSecondary.opacity(0.3), lineWidth: 1)
-                        .frame(width: separatorWidth, height: chartHeight)
+                            .stroke(Color.retraceSecondary.opacity(0.3), lineWidth: 1)
+                            .frame(width: separatorWidth, height: chartHeight)
 
-                        // Backlog bars (orange) - multiple bars if count exceeds cap
-                        backlogBarsView(
-                            pendingCount: pendingCount,
-                            maxValue: maxValue,
-                            visibleBarCount: visibleBacklogBarCount,
-                            totalBarCount: totalBacklogBarCount,
-                            singleBarWidth: singleBarWidth,
-                            spacing: backlogSpacing,
-                            totalWidth: backlogWidth,
-                            height: chartHeight
-                        )
+                            // Backlog bars (orange) - multiple bars if count exceeds cap
+                            backlogBarsView(
+                                pendingCount: pendingCount,
+                                maxValue: maxValue,
+                                visibleBarCount: visibleBacklogBarCount,
+                                totalBarCount: totalBacklogBarCount,
+                                singleBarWidth: singleBarWidth,
+                                spacing: backlogSpacing,
+                                totalWidth: backlogWidth,
+                                height: chartHeight
+                            )
+                        }
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity.combined(with: .scale(scale: 0.96, anchor: .trailing))
+                        ))
                     }
                 }
                 .frame(height: chartHeight)
+                .animation(backlogTransitionAnimation, value: hasBacklog)
+                .animation(backlogTransitionAnimation, value: visibleBacklogBarCount)
 
                 // X-axis line (spans full width including backlog)
                 Rectangle()
@@ -992,20 +1037,27 @@ struct ActivityBarChart: View {
                     .frame(width: chartWidth)
 
                     if hasBacklog {
-                        // Separator space
-                        Spacer()
-                            .frame(width: separatorWidth)
+                        HStack(spacing: 0) {
+                            // Separator space
+                            Spacer()
+                                .frame(width: separatorWidth)
 
-                        // Backlog label
-                        Text(backlogLabel)
-                            .foregroundColor(pendingTint.opacity(0.7))
-                            .frame(width: backlogWidth)
+                            // Backlog label
+                            Text(backlogLabel)
+                                .foregroundColor(pendingTint.opacity(0.7))
+                                .frame(width: backlogWidth)
+                        }
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity
+                        ))
                     }
                 }
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(.retraceSecondary.opacity(0.5))
                 .padding(.top, labelPadding)
                 .frame(height: labelPadding + labelHeight)
+                .animation(backlogTransitionAnimation, value: hasBacklog)
             }
         }
     }
@@ -1018,8 +1070,7 @@ struct ActivityBarChart: View {
         maxValue: Int,
         barWidth: CGFloat,
         height: CGFloat,
-        isHovered: Bool,
-        index: Int
+        isHovered: Bool
     ) -> some View {
         let processedNormalized = CGFloat(processedCount) / CGFloat(maxValue)
         let processingNormalized = CGFloat(processingCount) / CGFloat(maxValue)
@@ -1055,10 +1106,6 @@ struct ActivityBarChart: View {
         }
         .frame(width: barWidth, height: height, alignment: .bottom)
         .animation(.easeOut(duration: 0.15), value: isHovered)
-        .contentShape(Rectangle().size(width: barWidth, height: height))
-        .onHover { hovering in
-            hoveredIndex = hovering ? index : nil
-        }
     }
 
     // MARK: - Backlog Bars (orange pending, multiple bars for overflow)
@@ -1104,6 +1151,8 @@ struct ActivityBarChart: View {
             isHoveringBacklog = hovering
             hoveredIndex = hovering ? -1 : nil // Use -1 for backlog
         }
+        .animation(backlogTransitionAnimation, value: visibleBarCount)
+        .animation(backlogTransitionAnimation, value: pendingCount > 0)
         .overlay(alignment: .top) {
             if isHoveringBacklog {
                 backlogTooltipView(pendingCount: pendingCount)
@@ -1116,8 +1165,12 @@ struct ActivityBarChart: View {
 
     // MARK: - Tooltips
 
-    private func tooltipView(for point: ProcessingDataPoint, isLive: Bool) -> some View {
-        floatingTooltip {
+    private func tooltipView(
+        for point: ProcessingDataPoint,
+        isLive: Bool,
+        pointerOffset: CGFloat
+    ) -> some View {
+        floatingTooltip(pointerOffset: pointerOffset, width: tooltipBubbleWidth) {
             VStack(spacing: 5) {
                 Text(isLive ? "LIVE NOW" : point.minute.formatted(date: .omitted, time: .shortened))
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
@@ -1189,9 +1242,14 @@ struct ActivityBarChart: View {
     }
 
     @ViewBuilder
-    private func floatingTooltip<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+    private func floatingTooltip<Content: View>(
+        pointerOffset: CGFloat = 0,
+        width: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
         VStack(spacing: 0) {
             content()
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 10)
                 .padding(.top, 7)
                 .padding(.bottom, 8)
@@ -1213,6 +1271,7 @@ struct ActivityBarChart: View {
                         )
                         .shadow(color: Color.black.opacity(0.34), radius: 14, x: 0, y: 8)
                 )
+                .frame(width: width)
 
             TooltipPointer()
                 .fill(Color(red: 0.08, green: 0.10, blue: 0.15).opacity(0.98))
@@ -1221,8 +1280,9 @@ struct ActivityBarChart: View {
                     TooltipPointer()
                         .stroke(Color.white.opacity(0.14), lineWidth: 0.8)
                 )
-                .offset(y: -1)
+                .offset(x: pointerOffset, y: -1)
         }
+        .frame(width: width)
     }
 
     private func tooltipMetricChip(text: String, tint: Color) -> some View {
@@ -1287,12 +1347,41 @@ struct ActivityBarChart: View {
         return max(barHeight, point.count > 0 ? 3 : 1)
     }
 
-    private func clampTooltipOffset(_ x: CGFloat, in width: CGFloat) -> CGFloat {
-        let center = width / 2
-        let offset = x - center
-        let tooltipHalfWidth: CGFloat = 66
-        let maxOffset = max(0, (width / 2) - tooltipHalfWidth)
-        return min(max(offset, -maxOffset), maxOffset)
+    static func hoveredDataIndex(
+        at x: CGFloat,
+        dataPointCount: Int,
+        barWidth: CGFloat,
+        spacing: CGFloat
+    ) -> Int? {
+        guard dataPointCount > 0 else { return nil }
+
+        let stride = barWidth + spacing
+        guard stride > 0 else { return 0 }
+
+        let index = Int(floor((max(0, x) + (spacing / 2)) / stride))
+        return min(max(index, 0), dataPointCount - 1)
+    }
+
+    static func clampedTooltipCenterX(
+        anchorX: CGFloat,
+        containerWidth: CGFloat,
+        tooltipWidth: CGFloat,
+        horizontalOverflowAllowance: CGFloat
+    ) -> CGFloat {
+        let halfWidth = tooltipWidth / 2
+        let minCenter = halfWidth - horizontalOverflowAllowance
+        let maxCenter = max(minCenter, containerWidth - halfWidth + horizontalOverflowAllowance)
+        return min(max(anchorX, minCenter), maxCenter)
+    }
+
+    static func tooltipPointerOffset(
+        bubbleCenterX: CGFloat,
+        anchorX: CGFloat,
+        tooltipWidth: CGFloat,
+        pointerInset: CGFloat
+    ) -> CGFloat {
+        let maxPointerOffset = max(0, (tooltipWidth / 2) - pointerInset)
+        return min(max(anchorX - bubbleCenterX, -maxPointerOffset), maxPointerOffset)
     }
 }
 
