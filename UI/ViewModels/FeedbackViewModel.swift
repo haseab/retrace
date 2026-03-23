@@ -14,6 +14,17 @@ struct FeedbackSubmissionFailureState: Equatable {
     let isNetworkRelated: Bool
 }
 
+enum FeedbackExportDestinationError: LocalizedError {
+    case downloadsUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .downloadsUnavailable:
+            return "Retrace couldn't find your Downloads folder."
+        }
+    }
+}
+
 @MainActor
 public final class FeedbackViewModel: ObservableObject {
 
@@ -351,8 +362,16 @@ public final class FeedbackViewModel: ObservableObject {
         error = nil
 
         let suggestedFileName = "\(FeedbackSubmission.suggestedBaseName(forType: feedbackType.rawValue)).txt"
-        guard let exportURL = await chooseExportURL(defaultFileName: suggestedFileName) else {
-            recordFeedbackExportMetric(outcome: "cancelled", exportedFileCount: 0)
+        let exportURL: URL
+        do {
+            guard let selectedExportURL = try await chooseExportURL(defaultFileName: suggestedFileName) else {
+                recordFeedbackExportMetric(outcome: "cancelled", exportedFileCount: 0)
+                return
+            }
+            exportURL = selectedExportURL
+        } catch {
+            self.error = "Failed to save feedback report: \(error.localizedDescription)"
+            recordFeedbackExportMetric(outcome: "failed", exportedFileCount: 0)
             return
         }
 
@@ -552,14 +571,11 @@ public final class FeedbackViewModel: ObservableObject {
         includeLogs: Bool,
         stats: DiagnosticInfo.DatabaseStats
     ) async -> DiagnosticInfo {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
-                let diagnostics = includeLogs
-                    ? feedbackService.collectDiagnosticsQuick(with: stats)
-                    : feedbackService.collectDiagnosticsNoLogs(with: stats)
-                continuation.resume(returning: diagnostics)
-            }
+        if includeLogs {
+            return await feedbackService.collectDiagnosticsQuickAsync(with: stats)
         }
+
+        return feedbackService.collectDiagnosticsNoLogs(with: stats)
     }
 
     private func collectFullDiagnosticsInBackground(
@@ -568,21 +584,18 @@ public final class FeedbackViewModel: ObservableObject {
     ) async -> DiagnosticInfo {
         let fallbackStats = fallbackDatabaseStats
 
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [feedbackService] in
-                let diagnostics: DiagnosticInfo
-                if let stats {
-                    diagnostics = includeLogs
-                        ? feedbackService.collectDiagnostics(with: stats)
-                        : feedbackService.collectDiagnosticsNoLogs(with: stats)
-                } else if includeLogs {
-                    diagnostics = feedbackService.collectDiagnostics()
-                } else {
-                    diagnostics = feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
-                }
-                continuation.resume(returning: diagnostics)
+        if let stats {
+            if includeLogs {
+                return await feedbackService.collectDiagnosticsAsync(with: stats)
             }
+            return feedbackService.collectDiagnosticsNoLogs(with: stats)
         }
+
+        if includeLogs {
+            return await feedbackService.collectDiagnosticsAsync()
+        }
+
+        return feedbackService.collectDiagnosticsNoLogs(with: fallbackStats)
     }
 
     // MARK: - Image Attachment
@@ -649,12 +662,15 @@ public final class FeedbackViewModel: ObservableObject {
         )
     }
 
-    private func chooseExportURL(defaultFileName: String) async -> URL? {
-        await withCheckedContinuation { continuation in
+    private func chooseExportURL(defaultFileName: String) async throws -> URL? {
+        let suggestedURL = try Self.downloadsExportURL(defaultFileName: defaultFileName)
+
+        return await withCheckedContinuation { continuation in
             let panel = NSSavePanel()
             panel.allowedContentTypes = [.plainText]
             panel.canCreateDirectories = true
-            panel.nameFieldStringValue = defaultFileName
+            panel.directoryURL = suggestedURL.deletingLastPathComponent()
+            panel.nameFieldStringValue = suggestedURL.lastPathComponent
             panel.message = "Save the feedback report as a text file"
             panel.prompt = "Download"
 
@@ -662,6 +678,26 @@ public final class FeedbackViewModel: ObservableObject {
                 continuation.resume(returning: response == .OK ? panel.url : nil)
             }
         }
+    }
+
+    nonisolated static func downloadsExportURL(
+        defaultFileName: String,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        guard let downloadsURL = fileManager.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+            throw FeedbackExportDestinationError.downloadsUnavailable
+        }
+        return suggestedExportURL(
+            defaultFileName: defaultFileName,
+            directoryURL: downloadsURL
+        )
+    }
+
+    nonisolated static func suggestedExportURL(
+        defaultFileName: String,
+        directoryURL: URL
+    ) -> URL {
+        directoryURL.appendingPathComponent(defaultFileName, isDirectory: false)
     }
 
     private func recordFeedbackExportMetric(outcome: String, exportedFileCount: Int) {

@@ -2832,6 +2832,47 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(map[segmentB.value], 1)
     }
 
+    // ┌─────────────────────────────────────────────────────────────────────────┐
+    // │ PROCESSING QUEUE TESTS                                                 │
+    // └─────────────────────────────────────────────────────────────────────────┘
+
+    func testDequeueFrameForProcessingMarksFrameProcessingAtomically() async throws {
+        let frameID = try await insertTestFrame(browserURL: nil).value
+        let pendingStatus = 0
+        let processingStatus = 1
+
+        try await database.updateFrameProcessingStatus(
+            frameID: frameID,
+            status: pendingStatus
+        )
+        try await database.enqueueFrameForProcessing(frameID: frameID)
+
+        let pendingOrphansBeforeDequeue = try await database.countPendingFramesNotInQueue()
+        let queuedRowCountBeforeDequeue = try await fetchInt64(
+            "SELECT COUNT(*) FROM processing_queue WHERE frameId = ?;",
+            bind: { sqlite3_bind_int64($0, 1, frameID) }
+        )
+
+        XCTAssertEqual(pendingOrphansBeforeDequeue, 0)
+        XCTAssertEqual(queuedRowCountBeforeDequeue, 1)
+
+        let dequeued = try await database.dequeueFrameForProcessing()
+        let frameStatusAfterDequeue = try await database.getFrameProcessingStatus(frameID: frameID)
+        let queuedRowCountAfterDequeue = try await fetchInt64(
+            "SELECT COUNT(*) FROM processing_queue WHERE frameId = ?;",
+            bind: { sqlite3_bind_int64($0, 1, frameID) }
+        )
+        let pendingOrphansAfterDequeue = try await database.countPendingFramesNotInQueue()
+
+        XCTAssertEqual(dequeued?.frameID, frameID)
+        XCTAssertEqual(frameStatusAfterDequeue, processingStatus)
+        XCTAssertEqual(queuedRowCountAfterDequeue, 0)
+        XCTAssertEqual(pendingOrphansAfterDequeue, 0)
+
+        let crashedFrames = try await database.getCrashedProcessingFrameIDs()
+        XCTAssertTrue(crashedFrames.contains(frameID))
+    }
+
     // MARK: - Helpers
 
     private func insertTestAppSegment(bundleID: String) async throws -> SegmentID {

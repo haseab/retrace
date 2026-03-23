@@ -2,6 +2,52 @@ import XCTest
 @testable import Retrace
 
 final class FeedbackExportTests: XCTestCase {
+    func testCollectDiagnosticsQuickAsyncBuildsMemorySummaryOffMainThread() async {
+        let stats = DiagnosticInfo.DatabaseStats(
+            sessionCount: 0,
+            frameCount: 0,
+            segmentCount: 0,
+            databaseSizeMB: 0
+        )
+
+        let diagnostics = await Task.detached {
+            await FeedbackService.shared.collectDiagnosticsQuickAsync(with: stats)
+        }.value
+
+        XCTAssertFalse(
+            diagnostics.recentLogs.contains {
+                $0.contains("Retrace memory summary unavailable off the main thread")
+            }
+        )
+        XCTAssertTrue(
+            diagnostics.recentLogs.contains {
+                $0.contains("[FeedbackMemoryProfile]")
+            }
+        )
+    }
+
+    func testFilteredFeedbackLogEntriesExcludeVMMapSummaryLogs() {
+        let filtered = FeedbackService.filteredFeedbackLogEntries([
+            "[2026-03-13T11:57:00Z] [INFO] [ProcessMonitor-VMMap] TOTAL, minus reserved VM space: 1.2G",
+            "[2026-03-13T11:59:00Z] [INFO] [UI] Sample log line"
+        ])
+
+        XCTAssertEqual(filtered, [
+            "[2026-03-13T11:59:00Z] [INFO] [UI] Sample log line"
+        ])
+    }
+
+    func testFormattedMemoryProfileBytesUsesGBBeforeMBHitsFourDigits() {
+        XCTAssertEqual(
+            FeedbackService.formattedMemoryProfileBytes(1016 * 1024 * 1024),
+            "0.99 GB"
+        )
+        XCTAssertEqual(
+            FeedbackService.formattedMemoryProfileBytes(512 * 1024 * 1024),
+            "512 MB"
+        )
+    }
+
     @MainActor
     func testCanExportWithoutDescriptionOrValidEmail() {
         let viewModel = FeedbackViewModel()
@@ -33,7 +79,10 @@ final class FeedbackExportTests: XCTestCase {
             ],
             recentErrors: ["[ERROR] Sample error"],
             recentLogs: [
-                "2026-03-13T11:58:00Z [FeedbackMemoryProfile] Retrace current=512MB count=1",
+                "2026-03-13T11:57:00Z [FeedbackMemoryProfile] Sampler window: 12.0 h | latest sample age: 1 s",
+                "2026-03-13T11:58:00Z [FeedbackMemoryProfile] Retrace memory hierarchy:",
+                "2026-03-13T11:58:01Z [FeedbackMemoryProfile] Retrace: now 512 MB | avg 480 MB | peak 600 MB | tracked share now 55.0%",
+                "2026-03-13T11:58:02Z [FeedbackMemoryProfile]   storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB | tracked share now 27.5%",
                 "2026-03-13T11:59:00Z [INFO] Sample log line"
             ],
             displayInfo: DiagnosticInfo.DisplayInfo(
@@ -108,6 +157,10 @@ final class FeedbackExportTests: XCTestCase {
         XCTAssertTrue(text.contains("=== FEEDBACK ==="))
         XCTAssertTrue(text.contains("Description:\nSteps to reproduce"))
         XCTAssertTrue(text.contains("=== DIAGNOSTICS ==="))
+        XCTAssertTrue(text.contains("=== RETRACE MEMORY SUMMARY ==="))
+        XCTAssertTrue(text.contains("\nRetrace memory hierarchy:"))
+        XCTAssertTrue(text.contains("\n  storage.videoEncoding: now 256 MB | avg 240 MB | peak 320 MB"))
+        XCTAssertFalse(text.contains("\n-   storage.videoEncoding"))
         XCTAssertTrue(text.contains("--- FULL LOGS (last hour) ---"))
         XCTAssertTrue(text.contains("=== BEGIN SUBMISSION JSON ==="))
         XCTAssertTrue(text.contains("=== END SUBMISSION JSON ==="))
@@ -131,6 +184,38 @@ final class FeedbackExportTests: XCTestCase {
         )
 
         XCTAssertEqual(baseName, "retrace-feedback-feature-request-2026-03-14-120000")
+    }
+
+    func testSuggestedExportURLUsesProvidedDirectory() throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let exportURL = FeedbackViewModel.suggestedExportURL(
+            defaultFileName: "retrace-feedback-bug-report.txt",
+            directoryURL: directoryURL
+        )
+
+        XCTAssertEqual(exportURL.deletingLastPathComponent(), directoryURL)
+        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
+    }
+
+    func testSuggestedExportURLKeepsProvidedFilenameWhenFileAlreadyExists() throws {
+        let directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let existingURL = directoryURL.appendingPathComponent("retrace-feedback-bug-report.txt")
+        try "existing".write(to: existingURL, atomically: true, encoding: .utf8)
+
+        let exportURL = FeedbackViewModel.suggestedExportURL(
+            defaultFileName: "retrace-feedback-bug-report.txt",
+            directoryURL: directoryURL
+        )
+
+        XCTAssertEqual(exportURL.lastPathComponent, "retrace-feedback-bug-report.txt")
     }
 
     private func exportPayload(from text: String) throws -> [String: Any] {

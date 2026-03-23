@@ -75,6 +75,7 @@ public enum DailyMetricsQueries {
         case systemMonitorSettingsOpened = "system_monitor_settings_opened"
         case systemMonitorOpenPowerOCRCard = "system_monitor_open_power_ocr_card"
         case systemMonitorOpenPowerOCRPriority = "system_monitor_open_power_ocr_priority"
+        case systemMonitorMemoryLogToggle = "system_monitor_memory_log_toggle"
         case inPageURLCollectionToggle = "in_page_url_collection_toggle"
         case mousePositionCaptureToggle = "mouse_position_capture_toggle"
         case mouseMovementDeduplicationToggle = "mouse_movement_deduplication_toggle"

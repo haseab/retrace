@@ -23,19 +23,78 @@ public protocol FrameExtractionCacheInvalidating: Sendable {
     func purgeFrameExtractionCaches(reason: String)
 }
 
+private struct CacheFootprintSummary: Sendable {
+    let entryCount: Int
+    let bytes: Int64
+}
+
+private struct FrameGeneratorMemoryEstimate: Sendable {
+    let bytes: Int64
+    let pixelWidth: Int
+    let pixelHeight: Int
+}
+
+private struct GeneratorCacheSummary: Sendable {
+    let generatorCount: Int
+    let bytes: Int64
+    let maxPixelWidth: Int
+    let maxPixelHeight: Int
+}
+
 // MARK: - Frame Generator Actor
 
 /// Actor that serializes access to AVAssetImageGenerator for a single video file
 /// This prevents concurrent access issues that cause intermittent decode failures
 private actor FrameGenerator {
+    private static let bytesPerPixel: Int64 = 4
+    private static let retainedSurfaceMultiplier: Int64 = 2
+    private static let minimumEstimatedBytes: Int64 = 4 * 1024 * 1024
+    private static let generatorOverheadBytes: Int64 = 512 * 1024
+
     private let asset: AVURLAsset
     private let generator: AVAssetImageGenerator
     private let symlinkURL: URL?
 
-    init(assetURL: URL, symlinkURL: URL?) {
-        self.asset = AVURLAsset(url: assetURL, options: [
+    nonisolated static func makeAsset(url: URL) -> AVURLAsset {
+        AVURLAsset(url: url, options: [
             AVURLAssetPreferPreciseDurationAndTimingKey: true
         ])
+    }
+
+    nonisolated static func estimateDecodeState(for asset: AVURLAsset) -> FrameGeneratorMemoryEstimate {
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            return FrameGeneratorMemoryEstimate(
+                bytes: Self.minimumEstimatedBytes,
+                pixelWidth: 0,
+                pixelHeight: 0
+            )
+        }
+
+        let transformedSize = track.naturalSize.applying(track.preferredTransform)
+        let pixelWidth = max(Int(abs(transformedSize.width.rounded())), 0)
+        let pixelHeight = max(Int(abs(transformedSize.height.rounded())), 0)
+        guard pixelWidth > 0, pixelHeight > 0 else {
+            return FrameGeneratorMemoryEstimate(
+                bytes: Self.minimumEstimatedBytes,
+                pixelWidth: 0,
+                pixelHeight: 0
+            )
+        }
+
+        let surfaceBytes = Int64(pixelWidth) * Int64(pixelHeight) * Self.bytesPerPixel
+        let estimatedBytes = max(
+            surfaceBytes * Self.retainedSurfaceMultiplier + Self.generatorOverheadBytes,
+            Self.minimumEstimatedBytes
+        )
+        return FrameGeneratorMemoryEstimate(
+            bytes: estimatedBytes,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight
+        )
+    }
+
+    init(asset: AVURLAsset, symlinkURL: URL?) {
+        self.asset = asset
         self.symlinkURL = symlinkURL
 
         let gen = AVAssetImageGenerator(asset: asset)
@@ -71,12 +130,16 @@ private actor FrameGenerator {
 
 /// Thread-safe cache for FrameGenerator actors
 /// Uses NSCache for automatic memory management with LRU eviction
-private final class GeneratorCache: @unchecked Sendable {
+private final class GeneratorCache: NSObject, NSCacheDelegate, @unchecked Sendable {
     private let cache = NSCache<NSString, AnyObject>()
     private let lock = NSLock()
+    private var estimatesByKey: [String: FrameGeneratorMemoryEstimate] = [:]
+    private var keyByObjectID: [ObjectIdentifier: String] = [:]
 
     init(countLimit: Int) {
+        super.init()
         cache.countLimit = countLimit
+        cache.delegate = self
     }
 
     func get(_ key: String) -> FrameGenerator? {
@@ -85,22 +148,157 @@ private final class GeneratorCache: @unchecked Sendable {
         return cache.object(forKey: key as NSString) as? FrameGenerator
     }
 
-    func set(_ key: String, generator: FrameGenerator) {
+    func set(_ key: String, generator: FrameGenerator, estimate: FrameGeneratorMemoryEstimate) {
+        let object = generator as AnyObject
+        if let existingObject = cache.object(forKey: key as NSString) {
+            lock.lock()
+            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
+            estimatesByKey.removeValue(forKey: key)
+            lock.unlock()
+        }
+
+        lock.lock()
+        estimatesByKey[key] = estimate
+        keyByObjectID[ObjectIdentifier(object)] = key
+        lock.unlock()
+
+        cache.setObject(
+            object,
+            forKey: key as NSString,
+            cost: Self.sanitizedCost(estimate.bytes)
+        )
+    }
+
+    func summary() -> GeneratorCacheSummary {
         lock.lock()
         defer { lock.unlock() }
-        cache.setObject(generator as AnyObject, forKey: key as NSString)
+        let totalBytes = estimatesByKey.values.reduce(into: Int64(0)) { total, estimate in
+            total = Self.clampedAdd(total, estimate.bytes)
+        }
+        let maxWidth = estimatesByKey.values.map(\.pixelWidth).max() ?? 0
+        let maxHeight = estimatesByKey.values.map(\.pixelHeight).max() ?? 0
+        return GeneratorCacheSummary(
+            generatorCount: estimatesByKey.count,
+            bytes: totalBytes,
+            maxPixelWidth: maxWidth,
+            maxPixelHeight: maxHeight
+        )
     }
 
     func remove(_ key: String) {
+        if let existingObject = cache.object(forKey: key as NSString) {
+            lock.lock()
+            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
+            estimatesByKey.removeValue(forKey: key)
+            lock.unlock()
+        }
         lock.lock()
-        defer { lock.unlock() }
+        if estimatesByKey[key] != nil {
+            estimatesByKey.removeValue(forKey: key)
+        }
+        lock.unlock()
         cache.removeObject(forKey: key as NSString)
     }
 
     func removeAll() {
         lock.lock()
-        defer { lock.unlock() }
+        estimatesByKey.removeAll()
+        keyByObjectID.removeAll()
+        lock.unlock()
         cache.removeAllObjects()
+    }
+
+    func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
+        guard let object = obj as AnyObject? else { return }
+        lock.lock()
+        if let key = keyByObjectID.removeValue(forKey: ObjectIdentifier(object)) {
+            estimatesByKey.removeValue(forKey: key)
+        }
+        lock.unlock()
+    }
+
+    private static func sanitizedCost(_ bytes: Int64) -> Int {
+        if bytes <= 0 {
+            return 0
+        }
+        return Int(clamping: bytes)
+    }
+
+    private static func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        if lhs > Int64.max - rhs {
+            return Int64.max
+        }
+        return lhs + rhs
+    }
+}
+
+private final class TrackedDataCache: NSObject, NSCacheDelegate, @unchecked Sendable {
+    private let cache = NSCache<NSString, NSData>()
+    private let lock = NSLock()
+    private var bytesByKey: [String: Int64] = [:]
+    private var keyByObjectID: [ObjectIdentifier: String] = [:]
+
+    init(countLimit: Int, totalCostLimit: Int) {
+        super.init()
+        cache.countLimit = countLimit
+        cache.totalCostLimit = totalCostLimit
+        cache.delegate = self
+    }
+
+    func get(_ key: String) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache.object(forKey: key as NSString) as Data?
+    }
+
+    func set(_ key: String, data: Data) {
+        let nsData = data as NSData
+        if let existingObject = cache.object(forKey: key as NSString) {
+            lock.lock()
+            keyByObjectID.removeValue(forKey: ObjectIdentifier(existingObject))
+            bytesByKey.removeValue(forKey: key)
+            lock.unlock()
+        }
+
+        lock.lock()
+        bytesByKey[key] = Int64(data.count)
+        keyByObjectID[ObjectIdentifier(nsData)] = key
+        lock.unlock()
+
+        cache.setObject(nsData, forKey: key as NSString, cost: data.count)
+    }
+
+    func summary() -> CacheFootprintSummary {
+        lock.lock()
+        defer { lock.unlock() }
+        let totalBytes = bytesByKey.values.reduce(into: Int64(0)) { total, bytes in
+            total = Self.clampedAdd(total, bytes)
+        }
+        return CacheFootprintSummary(entryCount: bytesByKey.count, bytes: totalBytes)
+    }
+
+    func removeAll() {
+        lock.lock()
+        bytesByKey.removeAll()
+        keyByObjectID.removeAll()
+        lock.unlock()
+        cache.removeAllObjects()
+    }
+
+    func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
+        guard let object = obj as AnyObject? else { return }
+        lock.lock()
+        if let key = keyByObjectID.removeValue(forKey: ObjectIdentifier(object)) {
+            bytesByKey.removeValue(forKey: key)
+        }
+        lock.unlock()
+    }
+
+    private static func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        if lhs > Int64.max - rhs {
+            return Int64.max
+        }
+        return lhs + rhs
     }
 }
 
@@ -109,29 +307,33 @@ private final class GeneratorCache: @unchecked Sendable {
 /// Image extractor for Retrace's custom HEVC storage
 /// Uses actor-based serialization for safe concurrent access
 public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInvalidating {
+    private static let memoryLedgerGeneratorCacheTag = "storage.frameExtraction.retrace.generatorCache"
+    private static let memoryLedgerImageCacheTag = "storage.frameExtraction.retrace.jpegCache"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+
     private let storageRoot: String
-    private let imageCache = NSCache<NSString, NSData>()
+    private let imageCache: TrackedDataCache
     private let generatorCache: GeneratorCache
 
     public init(storageManager: StorageManager) {
         self.storageRoot = AppPaths.expandedStorageRoot
-        imageCache.countLimit = 100
-        imageCache.totalCostLimit = 5 * 1024 * 1024
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
         generatorCache = GeneratorCache(countLimit: 10)
+        updateMemoryLedger()
     }
 
     public init(storageRoot: String) {
         self.storageRoot = storageRoot
-        imageCache.countLimit = 100
-        imageCache.totalCostLimit = 5 * 1024 * 1024
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
         generatorCache = GeneratorCache(countLimit: 10)
+        updateMemoryLedger()
     }
 
     public func extractFrame(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> Data {
         // Check image cache first
-        let frameCacheKey = "\(videoPath)_\(frameIndex)" as NSString
-        if let cached = imageCache.object(forKey: frameCacheKey) {
-            return cached as Data
+        let frameCacheKey = "\(videoPath)_\(frameIndex)"
+        if let cached = imageCache.get(frameCacheKey) {
+            return cached
         }
 
         let fullVideoPath = resolveFullVideoPath(videoPath)
@@ -145,7 +347,8 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
         let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
 
         // Cache the result
-        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
+        imageCache.set(frameCacheKey, data: jpegData)
+        updateMemoryLedger()
         return jpegData
     }
 
@@ -187,6 +390,7 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
         } catch {
             // On failure, invalidate cache (file may have changed)
             generatorCache.remove(fullVideoPath)
+            updateMemoryLedger()
             throw ImageExtractionError.extractionFailed(
                 path: fullVideoPath,
                 frameIndex: frameIndex,
@@ -247,8 +451,11 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
         }
 
         // Create generator actor (owns symlink lifetime)
-        let generator = FrameGenerator(assetURL: assetURL, symlinkURL: symlinkURL)
-        generatorCache.set(fullVideoPath, generator: generator)
+        let asset = FrameGenerator.makeAsset(url: assetURL)
+        let estimate = FrameGenerator.estimateDecodeState(for: asset)
+        let generator = FrameGenerator(asset: asset, symlinkURL: symlinkURL)
+        generatorCache.set(fullVideoPath, generator: generator, estimate: estimate)
+        updateMemoryLedger()
         return generator
     }
 
@@ -266,9 +473,46 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
     }
 
     public func purgeFrameExtractionCaches(reason: String) {
-        imageCache.removeAllObjects()
+        imageCache.removeAll()
         generatorCache.removeAll()
+        updateMemoryLedger()
         Log.info("[HEVCStorageExtractor] Purged frame extraction caches (\(reason))", category: .storage)
+    }
+
+    private func updateMemoryLedger() {
+        let imageSummary = imageCache.summary()
+        let generatorSummary = generatorCache.summary()
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerGeneratorCacheTag,
+            bytes: generatorSummary.bytes,
+            count: generatorSummary.generatorCount,
+            unit: "generators",
+            function: "storage.frame_extraction.retrace",
+            kind: "decode-generator-cache",
+            note: Self.generatorCacheNote(for: generatorSummary)
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerImageCacheTag,
+            bytes: imageSummary.bytes,
+            count: imageSummary.entryCount,
+            unit: "frames",
+            function: "storage.frame_extraction.retrace",
+            kind: "jpeg-cache",
+            note: "compressed"
+        )
+        MemoryLedger.emitSummary(
+            reason: "storage.frame_extraction.memory",
+            category: .storage,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
+    }
+
+    private static func generatorCacheNote(for summary: GeneratorCacheSummary) -> String {
+        guard summary.maxPixelWidth > 0, summary.maxPixelHeight > 0 else {
+            return "estimated-native"
+        }
+        return "estimated-native,max=\(summary.maxPixelWidth)x\(summary.maxPixelHeight)"
     }
 }
 
@@ -277,22 +521,26 @@ public final class HEVCStorageExtractor: ImageExtractor, FrameExtractionCacheInv
 /// Image extractor for Rewind's MP4 videos using AVFoundation
 /// Uses actor-based serialization for safe concurrent access
 public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalidating {
-    private let imageCache = NSCache<NSString, NSData>()
+    private static let memoryLedgerGeneratorCacheTag = "storage.frameExtraction.rewind.generatorCache"
+    private static let memoryLedgerImageCacheTag = "storage.frameExtraction.rewind.jpegCache"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
+
+    private let imageCache: TrackedDataCache
     private let generatorCache: GeneratorCache
     private let storageRoot: String
 
     public init(storageRoot: String) {
         self.storageRoot = storageRoot
-        imageCache.countLimit = 100
-        imageCache.totalCostLimit = 5 * 1024 * 1024
+        imageCache = TrackedDataCache(countLimit: 100, totalCostLimit: 5 * 1024 * 1024)
         generatorCache = GeneratorCache(countLimit: 10)
+        updateMemoryLedger()
     }
 
     public func extractFrame(videoPath: String, frameIndex: Int, frameRate: Double?) async throws -> Data {
         // Check image cache first
-        let frameCacheKey = "\(videoPath)_\(frameIndex)" as NSString
-        if let cached = imageCache.object(forKey: frameCacheKey) {
-            return cached as Data
+        let frameCacheKey = "\(videoPath)_\(frameIndex)"
+        if let cached = imageCache.get(frameCacheKey) {
+            return cached
         }
 
         let fullVideoPath = resolveFullVideoPath(videoPath)
@@ -306,7 +554,8 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
         let jpegData = try convertToJPEG(cgImage: cgImage, path: fullVideoPath)
 
         // Cache the result
-        imageCache.setObject(jpegData as NSData, forKey: frameCacheKey, cost: jpegData.count)
+        imageCache.set(frameCacheKey, data: jpegData)
+        updateMemoryLedger()
         return jpegData
     }
 
@@ -360,6 +609,7 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
         } catch {
             // On failure, invalidate cache (file may have changed)
             generatorCache.remove(fullVideoPath)
+            updateMemoryLedger()
             throw ImageExtractionError.extractionFailed(
                 path: fullVideoPath,
                 frameIndex: frameIndex,
@@ -415,8 +665,11 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
         }
 
         // Create generator actor (owns symlink lifetime)
-        let generator = FrameGenerator(assetURL: assetURL, symlinkURL: symlinkURL)
-        generatorCache.set(fullVideoPath, generator: generator)
+        let asset = FrameGenerator.makeAsset(url: assetURL)
+        let estimate = FrameGenerator.estimateDecodeState(for: asset)
+        let generator = FrameGenerator(asset: asset, symlinkURL: symlinkURL)
+        generatorCache.set(fullVideoPath, generator: generator, estimate: estimate)
+        updateMemoryLedger()
         return generator
     }
 
@@ -434,9 +687,46 @@ public final class AVAssetExtractor: ImageExtractor, FrameExtractionCacheInvalid
     }
 
     public func purgeFrameExtractionCaches(reason: String) {
-        imageCache.removeAllObjects()
+        imageCache.removeAll()
         generatorCache.removeAll()
+        updateMemoryLedger()
         Log.info("[AVAssetExtractor] Purged frame extraction caches (\(reason))", category: .storage)
+    }
+
+    private func updateMemoryLedger() {
+        let imageSummary = imageCache.summary()
+        let generatorSummary = generatorCache.summary()
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerGeneratorCacheTag,
+            bytes: generatorSummary.bytes,
+            count: generatorSummary.generatorCount,
+            unit: "generators",
+            function: "storage.frame_extraction.rewind",
+            kind: "decode-generator-cache",
+            note: Self.generatorCacheNote(for: generatorSummary)
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerImageCacheTag,
+            bytes: imageSummary.bytes,
+            count: imageSummary.entryCount,
+            unit: "frames",
+            function: "storage.frame_extraction.rewind",
+            kind: "jpeg-cache",
+            note: "compressed"
+        )
+        MemoryLedger.emitSummary(
+            reason: "storage.frame_extraction.memory",
+            category: .storage,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
+    }
+
+    private static func generatorCacheNote(for summary: GeneratorCacheSummary) -> String {
+        guard summary.maxPixelWidth > 0, summary.maxPixelHeight > 0 else {
+            return "estimated-native"
+        }
+        return "estimated-native,max=\(summary.maxPixelWidth)x\(summary.maxPixelHeight)"
     }
 }
 

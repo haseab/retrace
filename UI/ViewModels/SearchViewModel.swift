@@ -235,6 +235,7 @@ public class SearchViewModel: ObservableObject {
     }
     @Published public var results: SearchResults? {
         didSet {
+            resultSetBytes = SearchMemoryEstimator.searchResultsBytes(results?.results ?? [])
             updateVisibleResults()
         }
     }
@@ -305,13 +306,13 @@ public class SearchViewModel: ObservableObject {
     // Thumbnail cache - persists across overlay open/close, cleared on new search
     @Published public var thumbnailCache: [String: NSImage] = [:] {
         didSet {
-            thumbnailCacheBytes = Self.estimatedImageBytes(thumbnailCache)
+            thumbnailCacheBytes = UIMemoryEstimator.imageDictionaryBytes(thumbnailCache)
         }
     }
     @Published public var loadingThumbnails: Set<String> = []
     @Published public var appIconCache: [String: NSImage] = [:] {
         didSet {
-            appIconCacheBytes = Self.estimatedImageBytes(appIconCache)
+            appIconCacheBytes = UIMemoryEstimator.imageDictionaryBytes(appIconCache)
         }
     }
 
@@ -364,7 +365,11 @@ public class SearchViewModel: ObservableObject {
     @Published public var dismissRecentEntriesPopoverSignal: UUID = UUID()
 
     /// Recent submitted search queries used by spotlight "Recent Entries" popover.
-    @Published public private(set) var recentSearchEntries: [RecentSearchEntry] = []
+    @Published public private(set) var recentSearchEntries: [RecentSearchEntry] = [] {
+        didSet {
+            recentSearchEntriesBytes = SearchMemoryEstimator.recentSearchEntriesBytes(recentSearchEntries)
+        }
+    }
 
     /// One-shot delay for showing the "Recent Entries" popover on next overlay open.
     private var nextRecentEntriesRevealDelay: TimeInterval = 0
@@ -402,6 +407,8 @@ public class SearchViewModel: ObservableObject {
     private var memoryReportTask: Task<Void, Never>?
     private var thumbnailCacheBytes: Int64 = 0
     private var appIconCacheBytes: Int64 = 0
+    private var resultSetBytes: Int64 = 0
+    private var recentSearchEntriesBytes: Int64 = 0
     private var thumbnailLRUKeys: [String] = []
 
     // MARK: - Constants
@@ -416,6 +423,7 @@ public class SearchViewModel: ObservableObject {
     nonisolated private static let memoryLedgerThumbnailTag = "ui.search.thumbnailCache"
     nonisolated private static let memoryLedgerAppIconTag = "ui.search.appIconCache"
     nonisolated private static let memoryLedgerResultSetTag = "ui.search.resultSet"
+    nonisolated private static let memoryLedgerRecentSearchesTag = "ui.search.recentEntries"
     private static let thumbnailDiskCacheMaxBytes: Int64 = 512 * 1024 * 1024
     private static let thumbnailDiskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
     private static let maxRecentSearchEntryCount = 80
@@ -815,37 +823,27 @@ public class SearchViewModel: ObservableObject {
         )
         MemoryLedger.set(
             tag: Self.memoryLedgerResultSetTag,
-            bytes: 0,
+            bytes: resultSetBytes,
             count: resultCount,
             unit: "results",
             function: "ui.search",
             kind: "result-window",
-            note: "count-only"
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRecentSearchesTag,
+            bytes: recentSearchEntriesBytes,
+            count: recentSearchEntries.count,
+            unit: "entries",
+            function: "ui.search",
+            kind: "recent-searches",
+            note: "estimated"
         )
         MemoryLedger.emitSummary(
             reason: "ui.search.memory",
             category: .ui,
             minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
-    }
-
-    private static func estimatedImageBytes(_ images: [String: NSImage]) -> Int64 {
-        images.values.reduce(into: Int64(0)) { total, image in
-            total += estimatedMemoryBytes(for: image)
-        }
-    }
-
-    private static func estimatedMemoryBytes(for image: NSImage) -> Int64 {
-        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-            return Int64(cgImage.bytesPerRow * cgImage.height)
-        }
-        if let bitmapRep = image.representations.first(where: { $0 is NSBitmapImageRep }) as? NSBitmapImageRep {
-            return Int64(bitmapRep.bytesPerRow * bitmapRep.pixelsHigh)
-        }
-
-        let width = max(Int(image.size.width), 1)
-        let height = max(Int(image.size.height), 1)
-        return Int64(width * height * 4)
     }
 
     private static func formatBytes(_ bytes: Int64) -> String {

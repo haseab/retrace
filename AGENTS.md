@@ -163,7 +163,8 @@ retrace/
     ├── CrashRecoverySupport/    # Shared crash-recovery support code for app + helper targets
     ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
-    │   └── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
+    │   ├── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
+    │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/

@@ -6,6 +6,14 @@ import Shared
 /// This cache stores regions from full-frame OCR and allows incremental updates
 /// when only parts of the screen change.
 public actor FullFrameOCRCache {
+    public struct MemoryEstimate: Sendable {
+        public let totalBytes: Int64
+        public let regionBytes: Int64
+        public let tileGridBytes: Int64
+        public let regionCount: Int
+        public let tileCount: Int
+    }
+
 
     /// Cached OCR regions from the last processed frame
     private var cachedRegions: [TextRegion] = []
@@ -133,5 +141,34 @@ public actor FullFrameOCRCache {
     public func resetStats() {
         hitCount = 0
         missCount = 0
+    }
+
+    public func memoryEstimate() -> MemoryEstimate {
+        let regionBytes = cachedRegions.reduce(into: Int64(0)) { total, region in
+            total += Self.estimatedTextRegionBytes(region)
+        }
+        let tileGridBytes = cachedTileGrid.reduce(into: Int64(0)) { total, tile in
+            total += Self.estimatedTileInfoBytes(tile)
+        }
+
+        return MemoryEstimate(
+            totalBytes: regionBytes + tileGridBytes,
+            regionBytes: regionBytes,
+            tileGridBytes: tileGridBytes,
+            regionCount: cachedRegions.count,
+            tileCount: cachedTileGrid.count
+        )
+    }
+
+    private static func estimatedTextRegionBytes(_ region: TextRegion) -> Int64 {
+        Int64(MemoryLayout<TextRegion>.stride) + estimatedStringBytes(region.text)
+    }
+
+    private static func estimatedTileInfoBytes(_ tile: TileInfo) -> Int64 {
+        Int64(MemoryLayout<TileInfo>.stride) + estimatedStringBytes(tile.cacheKey)
+    }
+
+    private static func estimatedStringBytes(_ string: String) -> Int64 {
+        Int64(MemoryLayout<String>.stride + string.utf8.count)
     }
 }

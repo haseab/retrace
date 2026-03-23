@@ -241,6 +241,12 @@ public actor DatabaseManager: DatabaseProtocol {
         return try block(db)
     }
 
+    private func executeImmediateSQL(_ sql: String, db: OpaquePointer) throws {
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+    }
+
     // MARK: - Initialization
 
     public init(databasePath: String, storageRootPath: String = AppPaths.expandedStorageRoot) {
@@ -3320,54 +3326,108 @@ public actor DatabaseManager: DatabaseProtocol {
     }
 
     /// Dequeue the next frame for processing (highest priority, oldest first)
-    /// Only dequeues frames with processingStatus = 0 (pending)
+    /// Atomically removes it from the queue and marks processingStatus = 1.
     /// Returns tuple of (queueID, frameID, retryCount) or nil if queue is empty
     public func dequeueFrameForProcessing() async throws -> (queueID: Int64, frameID: Int64, retryCount: Int)? {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation("dequeue_frame_for_processing") { db in
+            var transactionOpen = false
+            do {
+                try executeImmediateSQL("BEGIN IMMEDIATE TRANSACTION;", db: db)
+                transactionOpen = true
+
+                // Get highest priority item where frame still has processingStatus = 0.
+                let selectSql = """
+                    SELECT pq.id, pq.frameId, pq.retryCount
+                    FROM processing_queue pq
+                    INNER JOIN frame f ON pq.frameId = f.id
+                    WHERE f.processingStatus = 0
+                    ORDER BY pq.priority DESC, pq.enqueuedAt ASC
+                    LIMIT 1;
+                """
+
+                let selection: (queueID: Int64, frameID: Int64, retryCount: Int)?
+                do {
+                    var selectStmt: OpaquePointer?
+                    defer { sqlite3_finalize(selectStmt) }
+
+                    guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_step(selectStmt) == SQLITE_ROW else {
+                        selection = nil
+                        try executeImmediateSQL("COMMIT;", db: db)
+                        transactionOpen = false
+                        return nil
+                    }
+
+                    selection = (
+                        queueID: sqlite3_column_int64(selectStmt, 0),
+                        frameID: sqlite3_column_int64(selectStmt, 1),
+                        retryCount: Int(sqlite3_column_int(selectStmt, 2))
+                    )
+                }
+
+                guard let selection else {
+                    return nil
+                }
+
+                let updateSql = "UPDATE frame SET processingStatus = 1 WHERE id = ? AND processingStatus = 0;"
+                do {
+                    var updateStmt: OpaquePointer?
+                    defer { sqlite3_finalize(updateStmt) }
+
+                    guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: updateSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    sqlite3_bind_int64(updateStmt, 1, selection.frameID)
+
+                    guard sqlite3_step(updateStmt) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: updateSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_changes(db) == 1 else {
+                        throw DatabaseError.queryFailed(
+                            query: updateSql,
+                            underlying: "Frame \(selection.frameID) was not pending during dequeue"
+                        )
+                    }
+                }
+
+                let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
+                do {
+                    var deleteStmt: OpaquePointer?
+                    defer { sqlite3_finalize(deleteStmt) }
+
+                    guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
+                        throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    sqlite3_bind_int64(deleteStmt, 1, selection.queueID)
+
+                    guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
+                        throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
+                    }
+
+                    guard sqlite3_changes(db) == 1 else {
+                        throw DatabaseError.queryFailed(
+                            query: deleteSql,
+                            underlying: "Queue row \(selection.queueID) disappeared during dequeue"
+                        )
+                    }
+                }
+
+                try executeImmediateSQL("COMMIT;", db: db)
+                transactionOpen = false
+                return selection
+            } catch {
+                if transactionOpen {
+                    try? executeImmediateSQL("ROLLBACK;", db: db)
+                }
+                throw error
+            }
         }
-
-        // Get highest priority item where frame still has processingStatus = 0
-        let selectSql = """
-            SELECT pq.id, pq.frameId, pq.retryCount
-            FROM processing_queue pq
-            INNER JOIN frame f ON pq.frameId = f.id
-            WHERE f.processingStatus = 0
-            ORDER BY pq.priority DESC, pq.enqueuedAt ASC
-            LIMIT 1;
-        """
-
-        var selectStmt: OpaquePointer?
-        defer { sqlite3_finalize(selectStmt) }
-
-        guard sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: selectSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        guard sqlite3_step(selectStmt) == SQLITE_ROW else {
-            return nil // Queue empty
-        }
-
-        let queueID = sqlite3_column_int64(selectStmt, 0)
-        let frameID = sqlite3_column_int64(selectStmt, 1)
-        let retryCount = Int(sqlite3_column_int(selectStmt, 2))
-
-        // Delete from queue
-        let deleteSql = "DELETE FROM processing_queue WHERE id = ?;"
-        var deleteStmt: OpaquePointer?
-        defer { sqlite3_finalize(deleteStmt) }
-
-        guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        sqlite3_bind_int64(deleteStmt, 1, queueID)
-
-        guard sqlite3_step(deleteStmt) == SQLITE_DONE else {
-            throw DatabaseError.queryFailed(query: deleteSql, underlying: String(cString: sqlite3_errmsg(db)))
-        }
-
-        return (queueID: queueID, frameID: frameID, retryCount: retryCount)
     }
 
     /// Get the current processing queue depth

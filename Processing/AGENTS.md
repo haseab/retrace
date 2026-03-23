@@ -8,26 +8,37 @@ You are responsible for the **Processing** module of Retrace. Your job is to imp
 
 ```
 Processing/
+├── ExtractMemoryInstrumentation.swift # Request-scoped extract residual/handoff instrumentation helper
+├── ExtractRequestInstrumentation.swift # Request wrapper that drives extract-stage residual accounting
 ├── ProcessingManager.swift        # Main ProcessingProtocol implementation
-├── FrameProcessingQueue.swift     # OCR pipeline orchestration + phrase-level rewrite staging
-├── URLExtractor.swift             # URL extraction utilities
+├── FrameProcessingQueue.swift     # OCR pipeline orchestration + queue telemetry
+├── URLExtractor.swift             # URL extraction from OCR text
 ├── OCR/
-│   ├── FullFrameOCRCache.swift    # Full-frame OCR result cache
-│   ├── OCRTileCache.swift         # Tiled OCR cache
-│   ├── RegionOCRMerger.swift      # Merge tiled OCR regions into frame output
-│   ├── RegionOCRResult.swift      # OCR tile result model
-│   ├── TileChangeDetector.swift   # OCR tile invalidation helpers
-│   ├── TileGridConfig.swift       # OCR tiling configuration
-│   ├── TileOCRProcessor.swift     # Tiled Vision OCR runner
-│   └── VisionOCR.swift            # Vision framework OCR implementation
+│   ├── VisionOCR.swift            # Vision framework OCR implementation
+│   ├── VisionOCRHelpers.swift     # OCR output structs plus geometry/image helper methods
+│   ├── VisionOCRInstrumentation.swift # OCR-local memory ledger runtime and tracker plumbing
+│   ├── VisionOCRRequestConfig.swift # OCR request config type plus full-frame/region config builders
+│   ├── VisionOCRResidualSupport.swift # OCR residual reset tables and reconciliation helpers
+│   ├── FullFrameOCRCache.swift    # Cached full-frame OCR results for region re-OCR
+│   ├── OCRTileCache.swift         # Tile cache support for region OCR
+│   ├── RegionOCRMerger.swift      # Region OCR merge helpers
+│   ├── RegionOCRResult.swift      # Region OCR result/stat models
+│   ├── TileChangeDetector.swift   # Tile-based change detection
+│   ├── TileGridConfig.swift       # Tile grid tuning
+│   └── TileOCRProcessor.swift     # Tile OCR processing helpers
 ├── Accessibility/
-│   └── AccessibilityService.swift # AccessibilityProtocol implementation
+│   ├── AccessibilityService.swift  # AccessibilityProtocol implementation
+│   └── TextElementFilter.swift     # Filter relevant text elements
+│
 ├── TextMerger/
-│   └── TextMerger.swift           # Combine OCR + AX results
+│   └── TextMerger.swift            # Combine OCR + AX results
 └── Tests/
     ├── InPageURLMetadataResolutionTests.swift # In-page URL metadata retry/resolve coverage
     ├── PhraseLevelRedactionTests.swift        # Manual + automatic OCR phrase-level redaction coverage
-    └── TestLogger.swift                       # Shared processing test logging helpers
+    ├── TestLogger.swift                       # Shared processing test logging helpers
+    └── _future/
+        ├── AccessibilityTests.swift
+        └── VisionOCRTests.swift
 ```
 
 ## Protocols You Must Implement

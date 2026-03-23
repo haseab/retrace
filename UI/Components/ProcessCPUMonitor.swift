@@ -4,174 +4,6 @@ import Shared
 import Darwin
 import AppKit
 
-struct ProcessCPURow: Identifiable {
-    let id: String
-    let name: String
-    let cpuSeconds: Double
-    let currentCapacityPercent: Double
-    let energyJoules: Double
-    let averagePowerWatts: Double
-    let peakPowerWatts: Double
-    let shareOfTrackedPercent: Double
-    let capacityPercent: Double
-    let averagePercent: Double
-}
-
-struct ProcessMemoryRow: Identifiable {
-    let id: String
-    let name: String
-    let currentBytes: UInt64
-    let averageBytes: UInt64
-    let peakBytes: UInt64
-    let currentSharePercent: Double
-    let averageSharePercent: Double
-}
-
-struct ProcessCPUSnapshot {
-    static let empty = ProcessCPUSnapshot(
-        sampleDurationSeconds: 0,
-        peakInstantPercent: 0,
-        peakCapacityPercent: 0,
-        averagePercent: 0,
-        capacityPercent: 0,
-        trackedSharePercent: 0,
-        logicalCoreCount: 0,
-        retraceCPUSeconds: 0,
-        totalTrackedCPUSeconds: 0,
-        retraceEnergyJoules: 0,
-        totalTrackedEnergyJoules: 0,
-        retraceRank: nil,
-        retraceGroupKey: nil,
-        peakPercentByGroup: [:],
-        peakPowerWattsByGroup: [:],
-        topProcesses: [],
-        totalTrackedCurrentResidentBytes: 0,
-        totalTrackedAverageResidentBytes: 0,
-        peakResidentBytesByGroup: [:],
-        topMemoryProcesses: [],
-        latestSampleTimestamp: nil
-    )
-
-    let sampleDurationSeconds: TimeInterval
-    let peakInstantPercent: Double
-    let peakCapacityPercent: Double
-    let averagePercent: Double
-    let capacityPercent: Double
-    let trackedSharePercent: Double
-    let logicalCoreCount: Int
-    let retraceCPUSeconds: Double
-    let totalTrackedCPUSeconds: Double
-    let retraceEnergyJoules: Double
-    let totalTrackedEnergyJoules: Double
-    let retraceRank: Int?
-    let retraceGroupKey: String?
-    let peakPercentByGroup: [String: Double]
-    let peakPowerWattsByGroup: [String: Double]
-    let topProcesses: [ProcessCPURow]
-    let totalTrackedCurrentResidentBytes: UInt64
-    let totalTrackedAverageResidentBytes: UInt64
-    let peakResidentBytesByGroup: [String: UInt64]
-    let topMemoryProcesses: [ProcessMemoryRow]
-    let latestSampleTimestamp: TimeInterval?
-
-    var hasEnoughData: Bool {
-        sampleDurationSeconds >= 5 && !topProcesses.isEmpty
-    }
-
-    var hasEnoughMemoryData: Bool {
-        sampleDurationSeconds >= 5 && !topMemoryProcesses.isEmpty
-    }
-
-    var hasRenderableCPUData: Bool {
-        !topProcesses.isEmpty
-    }
-
-    var hasRenderableMemoryData: Bool {
-        !topMemoryProcesses.isEmpty
-    }
-}
-
-enum ProcessCPUDisplayMetrics {
-    static func buildRows(
-        cumulativeNanosecondsByGroup: [String: UInt64],
-        latestDeltaNanosecondsByGroup: [String: UInt64],
-        latestSampleDurationSeconds: TimeInterval,
-        energyNanojoulesByGroup: [String: UInt64],
-        peakPowerWattsByGroup: [String: Double],
-        displayNamesByKey: [String: String],
-        totalDuration: TimeInterval,
-        logicalCoreCount: Int
-    ) -> [ProcessCPURow] {
-        let safeLogicalCoreCount = max(1, logicalCoreCount)
-        let safeTotalDuration = max(totalDuration, 0)
-        let capacityDenominatorSeconds = safeTotalDuration * Double(safeLogicalCoreCount)
-        let totalTrackedCPUSeconds = Double(cumulativeNanosecondsByGroup.values.reduce(UInt64(0), +)) / 1_000_000_000.0
-
-        return cumulativeNanosecondsByGroup.map { key, nanoseconds in
-            let seconds = Double(nanoseconds) / 1_000_000_000.0
-            let currentCapacityPercent = capacityPercent(
-                deltaNanoseconds: latestDeltaNanosecondsByGroup[key] ?? 0,
-                sampleDurationSeconds: latestSampleDurationSeconds,
-                logicalCoreCount: safeLogicalCoreCount
-            )
-            let shareOfTrackedPercent = cumulativeSharePercent(valueSeconds: seconds, totalSeconds: totalTrackedCPUSeconds)
-            let capacityPercent = capacityDenominatorSeconds > 0
-                ? (seconds / capacityDenominatorSeconds) * 100.0
-                : 0
-            let averagePercent = safeTotalDuration > 0 ? (seconds / safeTotalDuration) * 100.0 : 0
-            let energyJoules = Double(energyNanojoulesByGroup[key] ?? 0) / 1_000_000_000.0
-            let averagePowerWatts = safeTotalDuration > 0 ? energyJoules / safeTotalDuration : 0
-            let peakPowerWatts = peakPowerWattsByGroup[key] ?? 0
-            let name = displayNamesByKey[key] ?? key
-            return ProcessCPURow(
-                id: key,
-                name: name,
-                cpuSeconds: seconds,
-                currentCapacityPercent: currentCapacityPercent,
-                energyJoules: energyJoules,
-                averagePowerWatts: averagePowerWatts,
-                peakPowerWatts: peakPowerWatts,
-                shareOfTrackedPercent: shareOfTrackedPercent,
-                capacityPercent: capacityPercent,
-                averagePercent: averagePercent
-            )
-        }
-        .sorted(by: rankedBefore(_:_:))
-    }
-
-    static func capacityPercent(
-        deltaNanoseconds: UInt64,
-        sampleDurationSeconds: TimeInterval,
-        logicalCoreCount: Int
-    ) -> Double {
-        let safeDuration = max(sampleDurationSeconds, 0)
-        let safeLogicalCoreCount = max(1, logicalCoreCount)
-        guard safeDuration > 0, deltaNanoseconds > 0 else { return 0 }
-
-        let cpuSeconds = Double(deltaNanoseconds) / 1_000_000_000.0
-        let corePercent = (cpuSeconds / safeDuration) * 100.0
-        return corePercent / Double(safeLogicalCoreCount)
-    }
-
-    private static func cumulativeSharePercent(valueSeconds: Double, totalSeconds: Double) -> Double {
-        guard totalSeconds > 0 else { return 0 }
-        return (valueSeconds / totalSeconds) * 100.0
-    }
-
-    private static func rankedBefore(_ lhs: ProcessCPURow, _ rhs: ProcessCPURow) -> Bool {
-        if abs(lhs.capacityPercent - rhs.capacityPercent) > 0.000_001 {
-            return lhs.capacityPercent > rhs.capacityPercent
-        }
-        if abs(lhs.currentCapacityPercent - rhs.currentCapacityPercent) > 0.000_001 {
-            return lhs.currentCapacityPercent > rhs.currentCapacityPercent
-        }
-        if abs(lhs.cpuSeconds - rhs.cpuSeconds) > 0.000_001 {
-            return lhs.cpuSeconds > rhs.cpuSeconds
-        }
-        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-    }
-}
-
 @MainActor
 final class ProcessCPUMonitor: ObservableObject {
     enum Consumer: Hashable {
@@ -378,6 +210,8 @@ private actor ProcessCPULogSampler {
         let groupDeltaEnergyNanojoules: [String: UInt64]?
         let groupDeltaUnit: String?
         let groupResidentBytes: [String: UInt64]?
+        let retraceChildResidentBytes: [String: UInt64]?
+        let memoryLedgerComponentBytes: [String: UInt64]?
         let groupDisplayNames: [String: String]?
     }
 
@@ -391,6 +225,10 @@ private actor ProcessCPULogSampler {
         var groupDeltaEnergyNanojoules: [String: UInt64] = [:]
         var groupResidentByteSeconds: [String: Double] = [:]
         var latestResidentBytesByGroup: [String: UInt64] = [:]
+        var retraceChildResidentByteSeconds: [String: Double] = [:]
+        var latestResidentBytesByRetraceChild: [String: UInt64] = [:]
+        var memoryLedgerComponentByteSeconds: [String: Double] = [:]
+        var latestMemoryLedgerComponentBytes: [String: UInt64] = [:]
 
         init(entry: CPULogEntry, bucketIndex: Int64, bucketSizeSeconds: TimeInterval) {
             self.bucketIndex = bucketIndex
@@ -423,16 +261,41 @@ private actor ProcessCPULogSampler {
                 }
             }
 
-            guard let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty else {
+            let sampleDuration = max(0, entry.durationSeconds)
+            if let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty {
+                latestResidentBytesByGroup = groupResidentBytes
+                guard sampleDuration > 0 else { return }
+
+                for (key, residentBytes) in groupResidentBytes {
+                    groupResidentByteSeconds[key, default: 0] += Double(residentBytes) * sampleDuration
+                }
+            }
+
+            guard sampleDuration > 0 else { return }
+
+            guard let retraceChildResidentBytes = entry.retraceChildResidentBytes,
+                  !retraceChildResidentBytes.isEmpty else {
+                if let memoryLedgerComponentBytes = entry.memoryLedgerComponentBytes,
+                   !memoryLedgerComponentBytes.isEmpty {
+                    latestMemoryLedgerComponentBytes = memoryLedgerComponentBytes
+                    for (key, residentBytes) in memoryLedgerComponentBytes {
+                        memoryLedgerComponentByteSeconds[key, default: 0] += Double(residentBytes) * sampleDuration
+                    }
+                }
                 return
             }
 
-            latestResidentBytesByGroup = groupResidentBytes
-            let sampleDuration = max(0, entry.durationSeconds)
-            guard sampleDuration > 0 else { return }
+            latestResidentBytesByRetraceChild = retraceChildResidentBytes
+            for (key, residentBytes) in retraceChildResidentBytes {
+                retraceChildResidentByteSeconds[key, default: 0] += Double(residentBytes) * sampleDuration
+            }
 
-            for (key, residentBytes) in groupResidentBytes {
-                groupResidentByteSeconds[key, default: 0] += Double(residentBytes) * sampleDuration
+            if let memoryLedgerComponentBytes = entry.memoryLedgerComponentBytes,
+               !memoryLedgerComponentBytes.isEmpty {
+                latestMemoryLedgerComponentBytes = memoryLedgerComponentBytes
+                for (key, residentBytes) in memoryLedgerComponentBytes {
+                    memoryLedgerComponentByteSeconds[key, default: 0] += Double(residentBytes) * sampleDuration
+                }
             }
         }
 
@@ -454,6 +317,40 @@ private actor ProcessCPULogSampler {
                 mergedResidentByGroup = latestResidentBytesByGroup
             }
 
+            var mergedResidentByRetraceChild: [String: UInt64] = [:]
+            if durationSeconds > 0 {
+                mergedResidentByRetraceChild.reserveCapacity(
+                    max(retraceChildResidentByteSeconds.count, latestResidentBytesByRetraceChild.count)
+                )
+                for (key, byteSeconds) in retraceChildResidentByteSeconds {
+                    mergedResidentByRetraceChild[key] = ProcessCPULogSampler.doubleToUInt64(
+                        byteSeconds / durationSeconds
+                    )
+                }
+                for (key, bytes) in latestResidentBytesByRetraceChild where mergedResidentByRetraceChild[key] == nil {
+                    mergedResidentByRetraceChild[key] = bytes
+                }
+            } else {
+                mergedResidentByRetraceChild = latestResidentBytesByRetraceChild
+            }
+
+            var mergedMemoryLedgerComponents: [String: UInt64] = [:]
+            if durationSeconds > 0 {
+                mergedMemoryLedgerComponents.reserveCapacity(
+                    max(memoryLedgerComponentByteSeconds.count, latestMemoryLedgerComponentBytes.count)
+                )
+                for (key, byteSeconds) in memoryLedgerComponentByteSeconds {
+                    mergedMemoryLedgerComponents[key] = ProcessCPULogSampler.doubleToUInt64(
+                        byteSeconds / durationSeconds
+                    )
+                }
+                for (key, bytes) in latestMemoryLedgerComponentBytes where mergedMemoryLedgerComponents[key] == nil {
+                    mergedMemoryLedgerComponents[key] = bytes
+                }
+            } else {
+                mergedMemoryLedgerComponents = latestMemoryLedgerComponentBytes
+            }
+
             return CPULogEntry(
                 timestamp: latestTimestamp,
                 durationSeconds: durationSeconds,
@@ -462,6 +359,8 @@ private actor ProcessCPULogSampler {
                 groupDeltaEnergyNanojoules: groupDeltaEnergyNanojoules.isEmpty ? nil : groupDeltaEnergyNanojoules,
                 groupDeltaUnit: ProcessCPULogSampler.nanosecondUnit,
                 groupResidentBytes: mergedResidentByGroup.isEmpty ? nil : mergedResidentByGroup,
+                retraceChildResidentBytes: mergedResidentByRetraceChild.isEmpty ? nil : mergedResidentByRetraceChild,
+                memoryLedgerComponentBytes: mergedMemoryLedgerComponents.isEmpty ? nil : mergedMemoryLedgerComponents,
                 groupDisplayNames: nil
             )
         }
@@ -476,6 +375,12 @@ private actor ProcessCPULogSampler {
         var peakPercentByGroup: [String: Double]
         var peakPowerByGroup: [String: Double]
         var peakResidentBytesByGroup: [String: UInt64]
+        var retraceChildMemoryByteSecondsByKey: [String: Double]?
+        var peakResidentBytesByRetraceChild: [String: UInt64]?
+        var memoryLedgerComponentByteSeconds: [String: Double]?
+        var peakMemoryLedgerBytesByComponent: [String: UInt64]?
+        var memoryLedgerFamilyByteSeconds: [String: Double]?
+        var peakMemoryLedgerBytesByFamily: [String: UInt64]?
     }
 
     private struct ProcessTallyState: Codable {
@@ -486,6 +391,8 @@ private actor ProcessCPULogSampler {
         var latestSampleDurationSeconds: TimeInterval?
         var latestDeltaNanosecondsByGroup: [String: UInt64]?
         var latestResidentBytesByGroup: [String: UInt64]
+        var latestResidentBytesByRetraceChild: [String: UInt64]?
+        var latestMemoryLedgerComponentBytes: [String: UInt64]?
         var retraceGroupKey: String?
         var buckets: [ProcessTallyBucket]
     }
@@ -495,19 +402,18 @@ private actor ProcessCPULogSampler {
     private static let displayNamePersistInterval: TimeInterval = 30
     private static let tallyPersistInterval: TimeInterval = 5
     private static let tallyBucketDurationSeconds: TimeInterval = 60
-    private static let tallyVersion = 1
+    private static let tallyVersion = 2
     private static let memoryCompositionLogInterval: TimeInterval = 30
-    private static let vmmapSummaryLogInterval: TimeInterval = 120
     private static let logReadChunkSize = 64 * 1024
     private static let nanosecondUnit = "ns"
     private static let acceptedSampleGapMultiplier: TimeInterval = 4.0
     private static let minimumAcceptedSampleGapSeconds: TimeInterval = 4.0
     private static let memoryCompositionLoggingDefaultsKey = "retrace.debug.processMonitorMemoryCompositionLoggingEnabled"
-    private static let vmmapSummaryLoggingDefaultsKey = "retrace.debug.processMonitorVMMapSummaryLoggingEnabled"
     private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     private static let memoryLedgerSamplerStateTag = "ui.systemMonitor.samplerWindow"
     private static let memoryLedgerLogFileTag = "ui.systemMonitor.cpuProcessLogFile"
     private static let memoryLedgerTallyFileTag = "ui.systemMonitor.tallyFile"
+    private static let memoryLedgerUnattributedComponentTag = "memory.unattributed.total"
     private static let warmHistoryWindowDuration: TimeInterval = 60
     private static let maxGroupsPerSampleDefaultsKey = "retrace.debug.processMonitorMaxGroupsPerSample"
     private static let defaultMaxGroupsPerSample = 64
@@ -551,7 +457,6 @@ private actor ProcessCPULogSampler {
     private var retraceGroupKey: String?
     private var lastCompactionDate: Date?
     private var lastMemoryCompositionLogDate: Date?
-    private var lastVMMapSummaryLogDate: Date?
     private let retraceBundleID: String
     private let retraceDisplayName: String
     private var bundleMetadataByCanonicalPath: [String: BundleMetadata] = [:]
@@ -562,15 +467,24 @@ private actor ProcessCPULogSampler {
     private var windowTotalDeltaPairs: Int = 0
     private var windowTotalEnergyPairs: Int = 0
     private var windowTotalResidentPairs: Int = 0
+    private var windowTotalRetraceChildResidentPairs: Int = 0
     private var windowCumulativeByGroup: [String: UInt64] = [:]
     private var windowPeakPercentByGroup: [String: Double] = [:]
     private var windowEnergyCumulativeByGroup: [String: UInt64] = [:]
     private var windowPeakPowerByGroup: [String: Double] = [:]
     private var windowMemoryIntegralByteSecondsByGroup: [String: Double] = [:]
     private var windowPeakResidentBytesByGroup: [String: UInt64] = [:]
+    private var windowMemoryIntegralByteSecondsByRetraceChild: [String: Double] = [:]
+    private var windowPeakResidentBytesByRetraceChild: [String: UInt64] = [:]
+    private var windowMemoryLedgerIntegralByteSecondsByComponent: [String: Double] = [:]
+    private var windowPeakMemoryLedgerBytesByComponent: [String: UInt64] = [:]
+    private var windowMemoryLedgerIntegralByteSecondsByFamily: [String: Double] = [:]
+    private var windowPeakMemoryLedgerBytesByFamily: [String: UInt64] = [:]
     private var lastWindowDownsampleDate: Date?
     private var lastTallyDownsampleDate: Date?
     private var latestResidentBytesByGroup: [String: UInt64] = [:]
+    private var latestResidentBytesByRetraceChild: [String: UInt64] = [:]
+    private var latestMemoryLedgerComponentBytes: [String: UInt64] = [:]
     private var latestTallySampleTimestamp: TimeInterval?
     private var tallyState: ProcessTallyState?
     private var lastTallyPersistDate: Date?
@@ -603,9 +517,9 @@ private actor ProcessCPULogSampler {
         windowDuration: TimeInterval,
         expectedIntervalSeconds: TimeInterval,
         shouldBuildSnapshot: Bool
-    ) -> ProcessCPUSnapshot? {
+    ) async -> ProcessCPUSnapshot? {
         let now = Date()
-        let appendedEntry = captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
+        let appendedEntry = await captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds)
         maybePersistDisplayNameMap(at: now)
         if let appendedEntry {
             applyEntryToTally(appendedEntry, windowDuration: windowDuration, now: now)
@@ -630,10 +544,10 @@ private actor ProcessCPULogSampler {
     func resetAndLoadSnapshot(
         windowDuration: TimeInterval,
         expectedIntervalSeconds: TimeInterval
-    ) -> ProcessCPUSnapshot {
+    ) async -> ProcessCPUSnapshot {
         clearLogAndState()
         let now = Date()
-        if let entry = captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds) {
+        if let entry = await captureSample(at: now, expectedIntervalSeconds: expectedIntervalSeconds) {
             applyEntryToTally(entry, windowDuration: windowDuration, now: now)
         }
         maybePersistDisplayNameMap(at: now, force: true)
@@ -662,6 +576,8 @@ private actor ProcessCPULogSampler {
         clearWindowState(keepingCapacity: false)
         lastWindowDownsampleDate = nil
         latestResidentBytesByGroup = [:]
+        latestResidentBytesByRetraceChild = [:]
+        latestMemoryLedgerComponentBytes = [:]
         latestTallySampleTimestamp = nil
     }
 
@@ -675,13 +591,16 @@ private actor ProcessCPULogSampler {
         lastTallyDownsampleDate = nil
     }
 
-    private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) -> CPULogEntry? {
+    private func captureSample(at now: Date, expectedIntervalSeconds: TimeInterval) async -> CPULogEntry? {
         let allPIDs = Self.listAllProcessIDs()
 
         var currentCPUByPID: [pid_t: UInt64] = [:]
         var currentEnergyByPID: [pid_t: UInt64] = [:]
         var currentResidentBytesByPID: [pid_t: UInt64] = [:]
         var currentIdentityByPID: [pid_t: ProcessIdentity] = [:]
+        var currentResidentBytesByRetraceChild: [String: UInt64] = [:]
+        let memoryLedgerSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let memoryLedgerComponentBytes = Self.cappedMemoryLedgerComponentBytes(from: memoryLedgerSnapshot, limit: 25)
 
         for pid in allPIDs {
             guard let taskMetrics = Self.processTaskMetrics(for: pid) else { continue }
@@ -696,6 +615,13 @@ private actor ProcessCPULogSampler {
             updateGroupDisplayNameIfNeeded(forKey: identity.key, name: identity.name)
             if pid == retracePID {
                 retraceGroupKey = identity.key
+            }
+            if let retraceChildIdentity = resolveRetraceChildIdentity(for: pid, groupIdentity: identity) {
+                updateGroupDisplayNameIfNeeded(forKey: retraceChildIdentity.key, name: retraceChildIdentity.name)
+                currentResidentBytesByRetraceChild[retraceChildIdentity.key] = Self.saturatingAdd(
+                    currentResidentBytesByRetraceChild[retraceChildIdentity.key] ?? 0,
+                    taskMetrics.residentBytes
+                )
             }
         }
 
@@ -747,6 +673,8 @@ private actor ProcessCPULogSampler {
                         groupDeltaEnergyNanojoules: groupDeltaEnergyNanojoules.isEmpty ? nil : groupDeltaEnergyNanojoules,
                         groupDeltaUnit: Self.nanosecondUnit,
                         groupResidentBytes: groupResidentBytes.isEmpty ? nil : groupResidentBytes,
+                        retraceChildResidentBytes: currentResidentBytesByRetraceChild.isEmpty ? nil : currentResidentBytesByRetraceChild,
+                        memoryLedgerComponentBytes: memoryLedgerComponentBytes.isEmpty ? nil : memoryLedgerComponentBytes,
                         groupDisplayNames: nil
                     )
                     let compactedEntry = compactEntryForStorage(entry)
@@ -765,6 +693,8 @@ private actor ProcessCPULogSampler {
                     groupDeltaEnergyNanojoules: nil,
                     groupDeltaUnit: Self.nanosecondUnit,
                     groupResidentBytes: groupResidentBytes,
+                    retraceChildResidentBytes: currentResidentBytesByRetraceChild.isEmpty ? nil : currentResidentBytesByRetraceChild,
+                    memoryLedgerComponentBytes: memoryLedgerComponentBytes.isEmpty ? nil : memoryLedgerComponentBytes,
                     groupDisplayNames: nil
                 )
                 let compactedEntry = compactEntryForStorage(entry)
@@ -795,6 +725,33 @@ private actor ProcessCPULogSampler {
         }
 
         return groupResidentBytes
+    }
+
+    private func resolveRetraceChildIdentity(
+        for pid: pid_t,
+        groupIdentity: ProcessIdentity
+    ) -> ProcessIdentity? {
+        guard groupIdentity.key == "bundle:\(retraceBundleID)" else {
+            return nil
+        }
+
+        let executableName = Self.processName(for: pid)
+            ?? Self.processPath(for: pid).map { URL(fileURLWithPath: $0).lastPathComponent }
+            ?? (pid == retracePID ? retraceDisplayName : "pid\(pid)")
+        let trimmedName = executableName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayName: String
+        if pid == retracePID {
+            displayName = "\(retraceDisplayName) (main)"
+        } else if trimmedName.isEmpty {
+            displayName = "pid\(pid)"
+        } else {
+            displayName = trimmedName
+        }
+
+        return ProcessIdentity(
+            key: "retrace-proc:\(Self.normalizedKeyComponent(displayName))",
+            name: displayName
+        )
     }
 
     private func resolveIdentity(for pid: pid_t) -> ProcessIdentity? {
@@ -1041,6 +998,48 @@ private actor ProcessCPULogSampler {
                     guard !key.isEmpty else { return }
                     result[key] = value
                 }
+                let retraceChildMemoryByteSecondsByKey = (bucket.retraceChildMemoryByteSecondsByKey ?? [:]).reduce(
+                    into: [String: Double]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty, value.isFinite, value >= 0 else { return }
+                    result[key] = value
+                }
+                let peakResidentBytesByRetraceChild = (bucket.peakResidentBytesByRetraceChild ?? [:]).reduce(
+                    into: [String: UInt64]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty else { return }
+                    result[key] = value
+                }
+                let memoryLedgerComponentByteSeconds = (bucket.memoryLedgerComponentByteSeconds ?? [:]).reduce(
+                    into: [String: Double]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty, value.isFinite, value >= 0 else { return }
+                    result[key] = value
+                }
+                let peakMemoryLedgerBytesByComponent = (bucket.peakMemoryLedgerBytesByComponent ?? [:]).reduce(
+                    into: [String: UInt64]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty else { return }
+                    result[key] = value
+                }
+                let memoryLedgerFamilyByteSeconds = (bucket.memoryLedgerFamilyByteSeconds ?? [:]).reduce(
+                    into: [String: Double]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty, value.isFinite, value >= 0 else { return }
+                    result[key] = value
+                }
+                let peakMemoryLedgerBytesByFamily = (bucket.peakMemoryLedgerBytesByFamily ?? [:]).reduce(
+                    into: [String: UInt64]()
+                ) { result, element in
+                    let (key, value) = element
+                    guard !key.isEmpty else { return }
+                    result[key] = value
+                }
 
                 return ProcessTallyBucket(
                     startTimestamp: bucket.startTimestamp,
@@ -1050,12 +1049,32 @@ private actor ProcessCPULogSampler {
                     memoryByteSecondsByGroup: memoryByteSecondsByGroup,
                     peakPercentByGroup: peakPercentByGroup,
                     peakPowerByGroup: peakPowerByGroup,
-                    peakResidentBytesByGroup: peakResidentBytesByGroup
+                    peakResidentBytesByGroup: peakResidentBytesByGroup,
+                    retraceChildMemoryByteSecondsByKey: retraceChildMemoryByteSecondsByKey.isEmpty ? nil : retraceChildMemoryByteSecondsByKey,
+                    peakResidentBytesByRetraceChild: peakResidentBytesByRetraceChild.isEmpty ? nil : peakResidentBytesByRetraceChild,
+                    memoryLedgerComponentByteSeconds: memoryLedgerComponentByteSeconds.isEmpty ? nil : memoryLedgerComponentByteSeconds,
+                    peakMemoryLedgerBytesByComponent: peakMemoryLedgerBytesByComponent.isEmpty ? nil : peakMemoryLedgerBytesByComponent,
+                    memoryLedgerFamilyByteSeconds: memoryLedgerFamilyByteSeconds.isEmpty ? nil : memoryLedgerFamilyByteSeconds,
+                    peakMemoryLedgerBytesByFamily: peakMemoryLedgerBytesByFamily.isEmpty ? nil : peakMemoryLedgerBytesByFamily
                 )
             }
             .sorted { $0.startTimestamp < $1.startTimestamp }
 
             let latestResidentBytesByGroup = decoded.latestResidentBytesByGroup.reduce(into: [String: UInt64]()) { result, element in
+                let (key, value) = element
+                guard !key.isEmpty else { return }
+                result[key] = value
+            }
+            let latestResidentBytesByRetraceChild = (decoded.latestResidentBytesByRetraceChild ?? [:]).reduce(
+                into: [String: UInt64]()
+            ) { result, element in
+                let (key, value) = element
+                guard !key.isEmpty else { return }
+                result[key] = value
+            }
+            let latestMemoryLedgerComponentBytes = (decoded.latestMemoryLedgerComponentBytes ?? [:]).reduce(
+                into: [String: UInt64]()
+            ) { result, element in
                 let (key, value) = element
                 guard !key.isEmpty else { return }
                 result[key] = value
@@ -1080,6 +1099,8 @@ private actor ProcessCPULogSampler {
                 latestSampleDurationSeconds: latestSampleDurationSeconds,
                 latestDeltaNanosecondsByGroup: latestSampleTimestamp == nil ? nil : latestDeltaNanosecondsByGroup,
                 latestResidentBytesByGroup: latestResidentBytesByGroup,
+                latestResidentBytesByRetraceChild: latestResidentBytesByRetraceChild.isEmpty ? nil : latestResidentBytesByRetraceChild,
+                latestMemoryLedgerComponentBytes: latestMemoryLedgerComponentBytes.isEmpty ? nil : latestMemoryLedgerComponentBytes,
                 retraceGroupKey: decoded.retraceGroupKey,
                 buckets: sanitizedBuckets
             )
@@ -1131,19 +1152,54 @@ private actor ProcessCPULogSampler {
             }
         }
 
-        guard let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty else {
-            return
+        if let groupResidentBytes = entry.groupResidentBytes, !groupResidentBytes.isEmpty {
+            latestResidentBytesByGroup = groupResidentBytes
+            windowTotalResidentPairs += groupResidentBytes.count
+            let sampleDuration = max(entry.durationSeconds, 0)
+            for (key, residentBytes) in groupResidentBytes {
+                if sampleDuration > 0 {
+                    windowMemoryIntegralByteSecondsByGroup[key, default: 0] += Double(residentBytes) * sampleDuration
+                }
+                if residentBytes > (windowPeakResidentBytesByGroup[key] ?? 0) {
+                    windowPeakResidentBytesByGroup[key] = residentBytes
+                }
+            }
         }
 
-        latestResidentBytesByGroup = groupResidentBytes
-        windowTotalResidentPairs += groupResidentBytes.count
-        let sampleDuration = max(entry.durationSeconds, 0)
-        for (key, residentBytes) in groupResidentBytes {
-            if sampleDuration > 0 {
-                windowMemoryIntegralByteSecondsByGroup[key, default: 0] += Double(residentBytes) * sampleDuration
+        if let retraceChildResidentBytes = entry.retraceChildResidentBytes, !retraceChildResidentBytes.isEmpty {
+            latestResidentBytesByRetraceChild = retraceChildResidentBytes
+            windowTotalRetraceChildResidentPairs += retraceChildResidentBytes.count
+            let sampleDuration = max(entry.durationSeconds, 0)
+            for (key, residentBytes) in retraceChildResidentBytes {
+                if sampleDuration > 0 {
+                    windowMemoryIntegralByteSecondsByRetraceChild[key, default: 0] += Double(residentBytes) * sampleDuration
+                }
+                if residentBytes > (windowPeakResidentBytesByRetraceChild[key] ?? 0) {
+                    windowPeakResidentBytesByRetraceChild[key] = residentBytes
+                }
             }
-            if residentBytes > (windowPeakResidentBytesByGroup[key] ?? 0) {
-                windowPeakResidentBytesByGroup[key] = residentBytes
+        }
+
+        if let memoryLedgerComponentBytes = entry.memoryLedgerComponentBytes, !memoryLedgerComponentBytes.isEmpty {
+            latestMemoryLedgerComponentBytes = memoryLedgerComponentBytes
+            let sampleDuration = max(entry.durationSeconds, 0)
+            for (key, residentBytes) in memoryLedgerComponentBytes {
+                if sampleDuration > 0 {
+                    windowMemoryLedgerIntegralByteSecondsByComponent[key, default: 0] += Double(residentBytes) * sampleDuration
+                }
+                if residentBytes > (windowPeakMemoryLedgerBytesByComponent[key] ?? 0) {
+                    windowPeakMemoryLedgerBytesByComponent[key] = residentBytes
+                }
+            }
+
+            let familyBytes = Self.memoryLedgerFamilyBytes(from: memoryLedgerComponentBytes)
+            for (familyKey, residentBytes) in familyBytes {
+                if sampleDuration > 0 {
+                    windowMemoryLedgerIntegralByteSecondsByFamily[familyKey, default: 0] += Double(residentBytes) * sampleDuration
+                }
+                if residentBytes > (windowPeakMemoryLedgerBytesByFamily[familyKey] ?? 0) {
+                    windowPeakMemoryLedgerBytesByFamily[familyKey] = residentBytes
+                }
             }
         }
     }
@@ -1154,13 +1210,22 @@ private actor ProcessCPULogSampler {
         windowTotalDeltaPairs = 0
         windowTotalEnergyPairs = 0
         windowTotalResidentPairs = 0
+        windowTotalRetraceChildResidentPairs = 0
         windowCumulativeByGroup.removeAll(keepingCapacity: keepingCapacity)
         windowPeakPercentByGroup.removeAll(keepingCapacity: keepingCapacity)
         windowEnergyCumulativeByGroup.removeAll(keepingCapacity: keepingCapacity)
         windowPeakPowerByGroup.removeAll(keepingCapacity: keepingCapacity)
         windowMemoryIntegralByteSecondsByGroup.removeAll(keepingCapacity: keepingCapacity)
         windowPeakResidentBytesByGroup.removeAll(keepingCapacity: keepingCapacity)
+        windowMemoryIntegralByteSecondsByRetraceChild.removeAll(keepingCapacity: keepingCapacity)
+        windowPeakResidentBytesByRetraceChild.removeAll(keepingCapacity: keepingCapacity)
+        windowMemoryLedgerIntegralByteSecondsByComponent.removeAll(keepingCapacity: keepingCapacity)
+        windowPeakMemoryLedgerBytesByComponent.removeAll(keepingCapacity: keepingCapacity)
+        windowMemoryLedgerIntegralByteSecondsByFamily.removeAll(keepingCapacity: keepingCapacity)
+        windowPeakMemoryLedgerBytesByFamily.removeAll(keepingCapacity: keepingCapacity)
         latestResidentBytesByGroup.removeAll(keepingCapacity: keepingCapacity)
+        latestResidentBytesByRetraceChild.removeAll(keepingCapacity: keepingCapacity)
+        latestMemoryLedgerComponentBytes.removeAll(keepingCapacity: keepingCapacity)
         latestTallySampleTimestamp = nil
     }
 
@@ -1177,6 +1242,9 @@ private actor ProcessCPULogSampler {
         var peakKeysToRebuild: Set<String> = []
         var peakPowerKeysToRebuild: Set<String> = []
         var peakMemoryKeysToRebuild: Set<String> = []
+        var peakRetraceChildMemoryKeysToRebuild: Set<String> = []
+        var peakMemoryLedgerComponentKeysToRebuild: Set<String> = []
+        var peakMemoryLedgerFamilyKeysToRebuild: Set<String> = []
         var removeCount = 0
         while removeCount < windowEntries.count, windowEntries[removeCount].timestamp < cutoffTimestamp {
             let entry = windowEntries[removeCount]
@@ -1239,6 +1307,68 @@ private actor ProcessCPULogSampler {
                     }
                 }
             }
+
+            if let retraceChildResidentBytes = entry.retraceChildResidentBytes, !retraceChildResidentBytes.isEmpty {
+                windowTotalRetraceChildResidentPairs = max(0, windowTotalRetraceChildResidentPairs - retraceChildResidentBytes.count)
+                let sampleDuration = max(entry.durationSeconds, 0)
+                for (key, residentBytes) in retraceChildResidentBytes {
+                    if sampleDuration > 0 {
+                        let deltaByteSeconds = Double(residentBytes) * sampleDuration
+                        let remaining = (windowMemoryIntegralByteSecondsByRetraceChild[key] ?? 0) - deltaByteSeconds
+                        if remaining <= 0.000_001 {
+                            windowMemoryIntegralByteSecondsByRetraceChild.removeValue(forKey: key)
+                            windowPeakResidentBytesByRetraceChild.removeValue(forKey: key)
+                            peakRetraceChildMemoryKeysToRebuild.remove(key)
+                        } else {
+                            windowMemoryIntegralByteSecondsByRetraceChild[key] = remaining
+                        }
+                    }
+
+                    if let currentPeakBytes = windowPeakResidentBytesByRetraceChild[key], residentBytes >= currentPeakBytes {
+                        peakRetraceChildMemoryKeysToRebuild.insert(key)
+                    }
+                }
+            }
+
+            if let memoryLedgerComponentBytes = entry.memoryLedgerComponentBytes, !memoryLedgerComponentBytes.isEmpty {
+                let sampleDuration = max(entry.durationSeconds, 0)
+                for (key, residentBytes) in memoryLedgerComponentBytes {
+                    if sampleDuration > 0 {
+                        let deltaByteSeconds = Double(residentBytes) * sampleDuration
+                        let remaining = (windowMemoryLedgerIntegralByteSecondsByComponent[key] ?? 0) - deltaByteSeconds
+                        if remaining <= 0.000_001 {
+                            windowMemoryLedgerIntegralByteSecondsByComponent.removeValue(forKey: key)
+                            windowPeakMemoryLedgerBytesByComponent.removeValue(forKey: key)
+                            peakMemoryLedgerComponentKeysToRebuild.remove(key)
+                        } else {
+                            windowMemoryLedgerIntegralByteSecondsByComponent[key] = remaining
+                        }
+                    }
+
+                    if let currentPeakBytes = windowPeakMemoryLedgerBytesByComponent[key], residentBytes >= currentPeakBytes {
+                        peakMemoryLedgerComponentKeysToRebuild.insert(key)
+                    }
+                }
+
+                let familyBytes = Self.memoryLedgerFamilyBytes(from: memoryLedgerComponentBytes)
+                for (familyKey, residentBytes) in familyBytes {
+                    if sampleDuration > 0 {
+                        let deltaByteSeconds = Double(residentBytes) * sampleDuration
+                        let remaining = (windowMemoryLedgerIntegralByteSecondsByFamily[familyKey] ?? 0) - deltaByteSeconds
+                        if remaining <= 0.000_001 {
+                            windowMemoryLedgerIntegralByteSecondsByFamily.removeValue(forKey: familyKey)
+                            windowPeakMemoryLedgerBytesByFamily.removeValue(forKey: familyKey)
+                            peakMemoryLedgerFamilyKeysToRebuild.remove(familyKey)
+                        } else {
+                            windowMemoryLedgerIntegralByteSecondsByFamily[familyKey] = remaining
+                        }
+                    }
+
+                    if let currentPeakBytes = windowPeakMemoryLedgerBytesByFamily[familyKey], residentBytes >= currentPeakBytes {
+                        peakMemoryLedgerFamilyKeysToRebuild.insert(familyKey)
+                    }
+                }
+            }
             removeCount += 1
         }
 
@@ -1247,6 +1377,9 @@ private actor ProcessCPULogSampler {
             recomputePeakPercentages(for: peakKeysToRebuild)
             recomputePeakPowers(for: peakPowerKeysToRebuild)
             recomputePeakResidentBytes(for: peakMemoryKeysToRebuild)
+            recomputePeakResidentBytesForRetraceChildren(for: peakRetraceChildMemoryKeysToRebuild)
+            recomputePeakMemoryLedgerBytesForComponents(for: peakMemoryLedgerComponentKeysToRebuild)
+            recomputePeakMemoryLedgerBytesForFamilies(for: peakMemoryLedgerFamilyKeysToRebuild)
         }
 
         if windowTotalDuration < 0 {
@@ -1313,6 +1446,8 @@ private actor ProcessCPULogSampler {
             latestSampleDurationSeconds: nil,
             latestDeltaNanosecondsByGroup: nil,
             latestResidentBytesByGroup: [:],
+            latestResidentBytesByRetraceChild: nil,
+            latestMemoryLedgerComponentBytes: nil,
             retraceGroupKey: retraceGroupKey,
             buckets: []
         )
@@ -1352,7 +1487,13 @@ private actor ProcessCPULogSampler {
                     memoryByteSecondsByGroup: [:],
                     peakPercentByGroup: [:],
                     peakPowerByGroup: [:],
-                    peakResidentBytesByGroup: [:]
+                    peakResidentBytesByGroup: [:],
+                    retraceChildMemoryByteSecondsByKey: nil,
+                    peakResidentBytesByRetraceChild: nil,
+                    memoryLedgerComponentByteSeconds: nil,
+                    peakMemoryLedgerBytesByComponent: nil,
+                    memoryLedgerFamilyByteSeconds: nil,
+                    peakMemoryLedgerBytesByFamily: nil
                 )
             )
             bucketIndex = state.buckets.count - 1
@@ -1401,6 +1542,52 @@ private actor ProcessCPULogSampler {
             )
         }
 
+        if let retraceChildResidentBytes = entry.retraceChildResidentBytes, !retraceChildResidentBytes.isEmpty {
+            var retraceChildMemoryByteSecondsByKey = state.buckets[bucketIndex].retraceChildMemoryByteSecondsByKey ?? [:]
+            var peakResidentBytesByRetraceChild = state.buckets[bucketIndex].peakResidentBytesByRetraceChild ?? [:]
+            for (childKey, residentBytes) in retraceChildResidentBytes {
+                if duration > 0 {
+                    retraceChildMemoryByteSecondsByKey[childKey, default: 0] += Double(residentBytes) * duration
+                }
+                if residentBytes > (peakResidentBytesByRetraceChild[childKey] ?? 0) {
+                    peakResidentBytesByRetraceChild[childKey] = residentBytes
+                }
+            }
+            state.buckets[bucketIndex].retraceChildMemoryByteSecondsByKey = retraceChildMemoryByteSecondsByKey.isEmpty ? nil : retraceChildMemoryByteSecondsByKey
+            state.buckets[bucketIndex].peakResidentBytesByRetraceChild = peakResidentBytesByRetraceChild.isEmpty ? nil : peakResidentBytesByRetraceChild
+            state.latestResidentBytesByRetraceChild = retraceChildResidentBytes
+        }
+
+        if let memoryLedgerComponentBytes = entry.memoryLedgerComponentBytes, !memoryLedgerComponentBytes.isEmpty {
+            var memoryLedgerComponentByteSeconds = state.buckets[bucketIndex].memoryLedgerComponentByteSeconds ?? [:]
+            var peakMemoryLedgerBytesByComponent = state.buckets[bucketIndex].peakMemoryLedgerBytesByComponent ?? [:]
+            for (componentKey, residentBytes) in memoryLedgerComponentBytes {
+                if duration > 0 {
+                    memoryLedgerComponentByteSeconds[componentKey, default: 0] += Double(residentBytes) * duration
+                }
+                if residentBytes > (peakMemoryLedgerBytesByComponent[componentKey] ?? 0) {
+                    peakMemoryLedgerBytesByComponent[componentKey] = residentBytes
+                }
+            }
+            state.buckets[bucketIndex].memoryLedgerComponentByteSeconds = memoryLedgerComponentByteSeconds.isEmpty ? nil : memoryLedgerComponentByteSeconds
+            state.buckets[bucketIndex].peakMemoryLedgerBytesByComponent = peakMemoryLedgerBytesByComponent.isEmpty ? nil : peakMemoryLedgerBytesByComponent
+
+            let familyBytes = Self.memoryLedgerFamilyBytes(from: memoryLedgerComponentBytes)
+            var memoryLedgerFamilyByteSeconds = state.buckets[bucketIndex].memoryLedgerFamilyByteSeconds ?? [:]
+            var peakMemoryLedgerBytesByFamily = state.buckets[bucketIndex].peakMemoryLedgerBytesByFamily ?? [:]
+            for (familyKey, residentBytes) in familyBytes {
+                if duration > 0 {
+                    memoryLedgerFamilyByteSeconds[familyKey, default: 0] += Double(residentBytes) * duration
+                }
+                if residentBytes > (peakMemoryLedgerBytesByFamily[familyKey] ?? 0) {
+                    peakMemoryLedgerBytesByFamily[familyKey] = residentBytes
+                }
+            }
+            state.buckets[bucketIndex].memoryLedgerFamilyByteSeconds = memoryLedgerFamilyByteSeconds.isEmpty ? nil : memoryLedgerFamilyByteSeconds
+            state.buckets[bucketIndex].peakMemoryLedgerBytesByFamily = peakMemoryLedgerBytesByFamily.isEmpty ? nil : peakMemoryLedgerBytesByFamily
+            state.latestMemoryLedgerComponentBytes = Self.cappedMemoryLedgerComponentDictionary(memoryLedgerComponentBytes, limit: 25)
+        }
+
         state.buckets[bucketIndex] = Self.cappedTallyBucket(
             state.buckets[bucketIndex],
             maxGroupsPerSample: maxGroups,
@@ -1433,6 +1620,8 @@ private actor ProcessCPULogSampler {
             state.latestSampleDurationSeconds = nil
             state.latestDeltaNanosecondsByGroup = nil
             state.latestResidentBytesByGroup = [:]
+            state.latestResidentBytesByRetraceChild = nil
+            state.latestMemoryLedgerComponentBytes = nil
         }
         tallyState = state
     }
@@ -1473,6 +1662,12 @@ private actor ProcessCPULogSampler {
                 latestDeltaNanosecondsByGroup,
                 maxGroupsPerSample: maxGroups,
                 retraceGroupKey: effectiveRetraceGroupKey
+            )
+        }
+        if let latestMemoryLedgerComponentBytes = state.latestMemoryLedgerComponentBytes {
+            state.latestMemoryLedgerComponentBytes = Self.cappedMemoryLedgerComponentDictionary(
+                latestMemoryLedgerComponentBytes,
+                limit: 25
             )
         }
         tallyState = state
@@ -1518,6 +1713,7 @@ private actor ProcessCPULogSampler {
             windowTotalDeltaPairs += bucket.deltaNanosecondsByGroup.count
             windowTotalEnergyPairs += bucket.energyNanojoulesByGroup.count
             windowTotalResidentPairs += bucket.memoryByteSecondsByGroup.count
+            windowTotalRetraceChildResidentPairs += bucket.retraceChildMemoryByteSecondsByKey?.count ?? 0
 
             for (groupKey, deltaNanoseconds) in bucket.deltaNanosecondsByGroup {
                 windowCumulativeByGroup[groupKey, default: 0] += deltaNanoseconds
@@ -1546,9 +1742,49 @@ private actor ProcessCPULogSampler {
                     windowPeakResidentBytesByGroup[groupKey] = peakResidentBytes
                 }
             }
+
+            if let retraceChildMemoryByteSecondsByKey = bucket.retraceChildMemoryByteSecondsByKey {
+                for (childKey, byteSeconds) in retraceChildMemoryByteSecondsByKey {
+                    windowMemoryIntegralByteSecondsByRetraceChild[childKey, default: 0] += byteSeconds
+                }
+            }
+            if let peakResidentBytesByRetraceChild = bucket.peakResidentBytesByRetraceChild {
+                for (childKey, peakResidentBytes) in peakResidentBytesByRetraceChild {
+                    if peakResidentBytes > (windowPeakResidentBytesByRetraceChild[childKey] ?? 0) {
+                        windowPeakResidentBytesByRetraceChild[childKey] = peakResidentBytes
+                    }
+                }
+            }
+
+            if let memoryLedgerComponentByteSeconds = bucket.memoryLedgerComponentByteSeconds {
+                for (componentKey, byteSeconds) in memoryLedgerComponentByteSeconds {
+                    windowMemoryLedgerIntegralByteSecondsByComponent[componentKey, default: 0] += byteSeconds
+                }
+            }
+            if let peakMemoryLedgerBytesByComponent = bucket.peakMemoryLedgerBytesByComponent {
+                for (componentKey, peakBytes) in peakMemoryLedgerBytesByComponent {
+                    if peakBytes > (windowPeakMemoryLedgerBytesByComponent[componentKey] ?? 0) {
+                        windowPeakMemoryLedgerBytesByComponent[componentKey] = peakBytes
+                    }
+                }
+            }
+            if let memoryLedgerFamilyByteSeconds = bucket.memoryLedgerFamilyByteSeconds {
+                for (familyKey, byteSeconds) in memoryLedgerFamilyByteSeconds {
+                    windowMemoryLedgerIntegralByteSecondsByFamily[familyKey, default: 0] += byteSeconds
+                }
+            }
+            if let peakMemoryLedgerBytesByFamily = bucket.peakMemoryLedgerBytesByFamily {
+                for (familyKey, peakBytes) in peakMemoryLedgerBytesByFamily {
+                    if peakBytes > (windowPeakMemoryLedgerBytesByFamily[familyKey] ?? 0) {
+                        windowPeakMemoryLedgerBytesByFamily[familyKey] = peakBytes
+                    }
+                }
+            }
         }
 
         latestResidentBytesByGroup = tallyState.latestResidentBytesByGroup
+        latestResidentBytesByRetraceChild = tallyState.latestResidentBytesByRetraceChild ?? [:]
+        latestMemoryLedgerComponentBytes = tallyState.latestMemoryLedgerComponentBytes ?? [:]
         latestTallySampleTimestamp = tallyState.latestSampleTimestamp
         if retraceGroupKey == nil {
             retraceGroupKey = tallyState.retraceGroupKey
@@ -1632,6 +1868,80 @@ private actor ProcessCPULogSampler {
         }
     }
 
+    private func recomputePeakResidentBytesForRetraceChildren(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+
+        var recomputed: [String: UInt64] = [:]
+        for entry in windowEntries {
+            guard let residentByChild = entry.retraceChildResidentBytes else { continue }
+            for (key, residentBytes) in residentByChild {
+                guard keys.contains(key) else { continue }
+                if residentBytes > (recomputed[key] ?? 0) {
+                    recomputed[key] = residentBytes
+                }
+            }
+        }
+
+        for key in keys {
+            if windowMemoryIntegralByteSecondsByRetraceChild[key] == nil {
+                windowPeakResidentBytesByRetraceChild.removeValue(forKey: key)
+            } else if let peakBytes = recomputed[key] {
+                windowPeakResidentBytesByRetraceChild[key] = peakBytes
+            } else {
+                windowPeakResidentBytesByRetraceChild.removeValue(forKey: key)
+            }
+        }
+    }
+
+    private func recomputePeakMemoryLedgerBytesForComponents(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+
+        var recomputed: [String: UInt64] = [:]
+        for entry in windowEntries {
+            guard let componentBytes = entry.memoryLedgerComponentBytes else { continue }
+            for (key, residentBytes) in componentBytes where keys.contains(key) {
+                if residentBytes > (recomputed[key] ?? 0) {
+                    recomputed[key] = residentBytes
+                }
+            }
+        }
+
+        for key in keys {
+            if windowMemoryLedgerIntegralByteSecondsByComponent[key] == nil {
+                windowPeakMemoryLedgerBytesByComponent.removeValue(forKey: key)
+            } else if let peakBytes = recomputed[key] {
+                windowPeakMemoryLedgerBytesByComponent[key] = peakBytes
+            } else {
+                windowPeakMemoryLedgerBytesByComponent.removeValue(forKey: key)
+            }
+        }
+    }
+
+    private func recomputePeakMemoryLedgerBytesForFamilies(for keys: Set<String>) {
+        guard !keys.isEmpty else { return }
+
+        var recomputed: [String: UInt64] = [:]
+        for entry in windowEntries {
+            guard let componentBytes = entry.memoryLedgerComponentBytes else { continue }
+            let familyBytes = Self.memoryLedgerFamilyBytes(from: componentBytes)
+            for (familyKey, residentBytes) in familyBytes where keys.contains(familyKey) {
+                if residentBytes > (recomputed[familyKey] ?? 0) {
+                    recomputed[familyKey] = residentBytes
+                }
+            }
+        }
+
+        for key in keys {
+            if windowMemoryLedgerIntegralByteSecondsByFamily[key] == nil {
+                windowPeakMemoryLedgerBytesByFamily.removeValue(forKey: key)
+            } else if let peakBytes = recomputed[key] {
+                windowPeakMemoryLedgerBytesByFamily[key] = peakBytes
+            } else {
+                windowPeakMemoryLedgerBytesByFamily.removeValue(forKey: key)
+            }
+        }
+    }
+
     private func snapshotFromWindowState() -> ProcessCPUSnapshot {
         let totalDuration = max(windowTotalDuration, 0)
         let cumulativeByGroup = windowCumulativeByGroup
@@ -1641,6 +1951,12 @@ private actor ProcessCPULogSampler {
         let memoryIntegralByteSecondsByGroup = windowMemoryIntegralByteSecondsByGroup
         let peakResidentBytesByGroup = windowPeakResidentBytesByGroup
         let currentResidentBytesByGroup = windowEntries.last?.groupResidentBytes ?? latestResidentBytesByGroup
+        let memoryIntegralByteSecondsByRetraceChild = windowMemoryIntegralByteSecondsByRetraceChild
+        let peakResidentBytesByRetraceChild = windowPeakResidentBytesByRetraceChild
+        let currentResidentBytesByRetraceChild = windowEntries.last?.retraceChildResidentBytes ?? latestResidentBytesByRetraceChild
+        let memoryIntegralByteSecondsByComponent = windowMemoryLedgerIntegralByteSecondsByComponent
+        let peakBytesByComponent = windowPeakMemoryLedgerBytesByComponent
+        let currentBytesByComponent = windowEntries.last?.memoryLedgerComponentBytes ?? latestMemoryLedgerComponentBytes
         let displayNamesByKey = groupDisplayNameByKey
         var effectiveRetraceGroupKey = retraceGroupKey
         let latestSampleDurationSeconds = tallyState?.latestSampleDurationSeconds
@@ -1697,50 +2013,27 @@ private actor ProcessCPULogSampler {
             ? memoryIntegralByteSecondsByGroup.values.reduce(0, +) / totalDuration
             : 0
         let totalTrackedAverageResidentBytes = Self.doubleToUInt64(totalTrackedAverageResidentBytesDouble)
-
-        let memoryKeys = Set(memoryIntegralByteSecondsByGroup.keys)
-            .union(currentResidentBytesByGroup.keys)
-            .union(peakResidentBytesByGroup.keys)
-
-        let rankedMemoryProcesses = memoryKeys
-            .map { key -> ProcessMemoryRow in
-                let currentBytes = currentResidentBytesByGroup[key] ?? 0
-                let averageBytesDouble = totalDuration > 0
-                    ? (memoryIntegralByteSecondsByGroup[key] ?? 0) / totalDuration
-                    : Double(currentBytes)
-                let averageBytes = Self.doubleToUInt64(averageBytesDouble)
-                let peakBytes = max(
-                    peakResidentBytesByGroup[key] ?? 0,
-                    currentBytes,
-                    averageBytes
-                )
-                let currentSharePercent = totalTrackedCurrentResidentBytes > 0
-                    ? (Double(currentBytes) / Double(totalTrackedCurrentResidentBytes)) * 100.0
-                    : 0
-                let averageSharePercent = totalTrackedAverageResidentBytesDouble > 0
-                    ? (averageBytesDouble / totalTrackedAverageResidentBytesDouble) * 100.0
-                    : 0
-                let name = displayNamesByKey[key] ?? key
-                return ProcessMemoryRow(
-                    id: key,
-                    name: name,
-                    currentBytes: currentBytes,
-                    averageBytes: averageBytes,
-                    peakBytes: peakBytes,
-                    currentSharePercent: currentSharePercent,
-                    averageSharePercent: averageSharePercent
-                )
-            }
-            .filter { $0.currentBytes > 0 || $0.averageBytes > 0 || $0.peakBytes > 0 }
-            .sorted { lhs, rhs in
-                if lhs.averageBytes != rhs.averageBytes {
-                    return lhs.averageBytes > rhs.averageBytes
-                }
-                if lhs.currentBytes != rhs.currentBytes {
-                    return lhs.currentBytes > rhs.currentBytes
-                }
-                return lhs.peakBytes > rhs.peakBytes
-            }
+        let rankedMemoryProcesses = ProcessCPUDisplayMetrics.buildMemoryRows(
+            currentBytesByKey: currentResidentBytesByGroup,
+            memoryByteSecondsByKey: memoryIntegralByteSecondsByGroup,
+            peakBytesByKey: peakResidentBytesByGroup,
+            displayNamesByKey: displayNamesByKey,
+            totalDuration: totalDuration
+        )
+        let rankedRetraceChildMemoryProcesses = ProcessCPUDisplayMetrics.buildMemoryRows(
+            currentBytesByKey: currentResidentBytesByRetraceChild,
+            memoryByteSecondsByKey: memoryIntegralByteSecondsByRetraceChild,
+            peakBytesByKey: peakResidentBytesByRetraceChild,
+            displayNamesByKey: displayNamesByKey,
+            totalDuration: totalDuration
+        )
+        let retraceMemoryAttributionRows = ProcessCPUDisplayMetrics.buildRetraceMemoryAttributionRows(
+            currentBytesByComponent: currentBytesByComponent,
+            memoryByteSecondsByComponent: memoryIntegralByteSecondsByComponent,
+            peakBytesByComponent: peakBytesByComponent,
+            peakBytesByFamily: windowPeakMemoryLedgerBytesByFamily,
+            totalDuration: totalDuration
+        )
 
         let retraceRank = effectiveRetraceGroupKey.flatMap { key in
             rankedProcesses.firstIndex(where: { $0.id == key }).map { $0 + 1 }
@@ -1767,6 +2060,9 @@ private actor ProcessCPULogSampler {
             totalTrackedAverageResidentBytes: totalTrackedAverageResidentBytes,
             peakResidentBytesByGroup: peakResidentBytesByGroup,
             topMemoryProcesses: rankedMemoryProcesses,
+            topRetraceChildMemoryProcesses: rankedRetraceChildMemoryProcesses,
+            topRetraceMemoryAttributionFamilies: retraceMemoryAttributionRows.families,
+            retraceMemoryAttributionChildrenByFamily: retraceMemoryAttributionRows.childrenByFamily,
             latestSampleTimestamp: windowEntries.last?.timestamp ?? latestTallySampleTimestamp
         )
     }
@@ -1852,26 +2148,6 @@ private actor ProcessCPULogSampler {
             category: .ui,
             minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
         )
-
-        maybeLogVMMapSummary(at: now)
-    }
-
-    private func maybeLogVMMapSummary(at now: Date) {
-        guard Self.isVMMapSummaryLoggingEnabled() else { return }
-        if let lastVMMapSummaryLogDate,
-           now.timeIntervalSince(lastVMMapSummaryLogDate) < Self.vmmapSummaryLogInterval {
-            return
-        }
-        lastVMMapSummaryLogDate = now
-
-        guard let lines = Self.captureVMMapSummaryLines(
-            pid: ProcessInfo.processInfo.processIdentifier
-        ), !lines.isEmpty else {
-            Log.warning("[ProcessMonitor-VMMap] vmmap summary unavailable", category: .ui)
-            return
-        }
-
-        Log.info("[ProcessMonitor-VMMap] \(lines.joined(separator: " | "))", category: .ui)
     }
 
     private func maybeCompactLog(at now: Date) {
@@ -1978,11 +2254,11 @@ private actor ProcessCPULogSampler {
         lastWindowDownsampleDate = nil
         lastTallyDownsampleDate = nil
         latestResidentBytesByGroup = [:]
+        latestResidentBytesByRetraceChild = [:]
         latestTallySampleTimestamp = nil
         retraceGroupKey = nil
         lastCompactionDate = nil
         lastMemoryCompositionLogDate = nil
-        lastVMMapSummaryLogDate = nil
     }
 
     private func clearTallyStateFile() {
@@ -2011,12 +2287,6 @@ private actor ProcessCPULogSampler {
             return true
         }
         return defaults.bool(forKey: memoryCompositionLoggingDefaultsKey)
-    }
-
-    private static func isVMMapSummaryLoggingEnabled(
-        defaults: UserDefaults = .standard
-    ) -> Bool {
-        defaults.bool(forKey: vmmapSummaryLoggingDefaultsKey)
     }
 
     private func compactEntryForStorage(_ entry: CPULogEntry) -> CPULogEntry {
@@ -2124,6 +2394,10 @@ private actor ProcessCPULogSampler {
                 let filtered = filteredUInt64Dictionary(residentByGroup, keepSet: keepSet)
                 return filtered.isEmpty ? nil : filtered
             }(),
+            retraceChildResidentBytes: entry.retraceChildResidentBytes,
+            memoryLedgerComponentBytes: entry.memoryLedgerComponentBytes.map {
+                cappedMemoryLedgerComponentDictionary($0, limit: 25)
+            },
             groupDisplayNames: {
                 let filtered = filteredStringDictionary(entry.groupDisplayNames ?? [:], keepSet: keepSet)
                 return filtered.isEmpty ? nil : filtered
@@ -2270,7 +2544,17 @@ private actor ProcessCPULogSampler {
             memoryByteSecondsByGroup: filteredDoubleDictionary(bucket.memoryByteSecondsByGroup, keepSet: keepSet),
             peakPercentByGroup: filteredDoubleDictionary(bucket.peakPercentByGroup, keepSet: keepSet),
             peakPowerByGroup: filteredDoubleDictionary(bucket.peakPowerByGroup, keepSet: keepSet),
-            peakResidentBytesByGroup: filteredUInt64Dictionary(bucket.peakResidentBytesByGroup, keepSet: keepSet)
+            peakResidentBytesByGroup: filteredUInt64Dictionary(bucket.peakResidentBytesByGroup, keepSet: keepSet),
+            retraceChildMemoryByteSecondsByKey: bucket.retraceChildMemoryByteSecondsByKey,
+            peakResidentBytesByRetraceChild: bucket.peakResidentBytesByRetraceChild,
+            memoryLedgerComponentByteSeconds: bucket.memoryLedgerComponentByteSeconds.map {
+                cappedMemoryLedgerComponentDoubleDictionary($0, limit: 25)
+            },
+            peakMemoryLedgerBytesByComponent: bucket.peakMemoryLedgerBytesByComponent.map {
+                cappedMemoryLedgerComponentDictionary($0, limit: 25)
+            },
+            memoryLedgerFamilyByteSeconds: bucket.memoryLedgerFamilyByteSeconds,
+            peakMemoryLedgerBytesByFamily: bucket.peakMemoryLedgerBytesByFamily
         )
     }
 
@@ -2318,7 +2602,13 @@ private actor ProcessCPULogSampler {
                 memoryByteSecondsByGroup: cappedBucket.memoryByteSecondsByGroup,
                 peakPercentByGroup: cappedBucket.peakPercentByGroup,
                 peakPowerByGroup: cappedBucket.peakPowerByGroup,
-                peakResidentBytesByGroup: cappedBucket.peakResidentBytesByGroup
+                peakResidentBytesByGroup: cappedBucket.peakResidentBytesByGroup,
+                retraceChildMemoryByteSecondsByKey: cappedBucket.retraceChildMemoryByteSecondsByKey,
+                peakResidentBytesByRetraceChild: cappedBucket.peakResidentBytesByRetraceChild,
+                memoryLedgerComponentByteSeconds: cappedBucket.memoryLedgerComponentByteSeconds,
+                peakMemoryLedgerBytesByComponent: cappedBucket.peakMemoryLedgerBytesByComponent,
+                memoryLedgerFamilyByteSeconds: cappedBucket.memoryLedgerFamilyByteSeconds,
+                peakMemoryLedgerBytesByFamily: cappedBucket.peakMemoryLedgerBytesByFamily
             )
 
             if let existingBucket = currentBucket,
@@ -2384,6 +2674,42 @@ private actor ProcessCPULogSampler {
             }
         }
 
+        var mergedRetraceChildMemoryByteSecondsByKey = lhs.retraceChildMemoryByteSecondsByKey ?? [:]
+        for (key, value) in rhs.retraceChildMemoryByteSecondsByKey ?? [:] {
+            mergedRetraceChildMemoryByteSecondsByKey[key, default: 0] += value
+        }
+
+        var mergedPeakResidentBytesByRetraceChild = lhs.peakResidentBytesByRetraceChild ?? [:]
+        for (key, value) in rhs.peakResidentBytesByRetraceChild ?? [:] {
+            if value > (mergedPeakResidentBytesByRetraceChild[key] ?? 0) {
+                mergedPeakResidentBytesByRetraceChild[key] = value
+            }
+        }
+
+        var mergedMemoryLedgerComponentByteSeconds = lhs.memoryLedgerComponentByteSeconds ?? [:]
+        for (key, value) in rhs.memoryLedgerComponentByteSeconds ?? [:] {
+            mergedMemoryLedgerComponentByteSeconds[key, default: 0] += value
+        }
+
+        var mergedPeakMemoryLedgerBytesByComponent = lhs.peakMemoryLedgerBytesByComponent ?? [:]
+        for (key, value) in rhs.peakMemoryLedgerBytesByComponent ?? [:] {
+            if value > (mergedPeakMemoryLedgerBytesByComponent[key] ?? 0) {
+                mergedPeakMemoryLedgerBytesByComponent[key] = value
+            }
+        }
+
+        var mergedMemoryLedgerFamilyByteSeconds = lhs.memoryLedgerFamilyByteSeconds ?? [:]
+        for (key, value) in rhs.memoryLedgerFamilyByteSeconds ?? [:] {
+            mergedMemoryLedgerFamilyByteSeconds[key, default: 0] += value
+        }
+
+        var mergedPeakMemoryLedgerBytesByFamily = lhs.peakMemoryLedgerBytesByFamily ?? [:]
+        for (key, value) in rhs.peakMemoryLedgerBytesByFamily ?? [:] {
+            if value > (mergedPeakMemoryLedgerBytesByFamily[key] ?? 0) {
+                mergedPeakMemoryLedgerBytesByFamily[key] = value
+            }
+        }
+
         return ProcessTallyBucket(
             startTimestamp: startTimestamp,
             durationSeconds: lhs.durationSeconds + rhs.durationSeconds,
@@ -2392,7 +2718,13 @@ private actor ProcessCPULogSampler {
             memoryByteSecondsByGroup: mergedMemoryByteSecondsByGroup,
             peakPercentByGroup: mergedPeakPercentByGroup,
             peakPowerByGroup: mergedPeakPowerByGroup,
-            peakResidentBytesByGroup: mergedPeakResidentBytesByGroup
+            peakResidentBytesByGroup: mergedPeakResidentBytesByGroup,
+            retraceChildMemoryByteSecondsByKey: mergedRetraceChildMemoryByteSecondsByKey.isEmpty ? nil : mergedRetraceChildMemoryByteSecondsByKey,
+            peakResidentBytesByRetraceChild: mergedPeakResidentBytesByRetraceChild.isEmpty ? nil : mergedPeakResidentBytesByRetraceChild,
+            memoryLedgerComponentByteSeconds: mergedMemoryLedgerComponentByteSeconds.isEmpty ? nil : mergedMemoryLedgerComponentByteSeconds,
+            peakMemoryLedgerBytesByComponent: mergedPeakMemoryLedgerBytesByComponent.isEmpty ? nil : mergedPeakMemoryLedgerBytesByComponent,
+            memoryLedgerFamilyByteSeconds: mergedMemoryLedgerFamilyByteSeconds.isEmpty ? nil : mergedMemoryLedgerFamilyByteSeconds,
+            peakMemoryLedgerBytesByFamily: mergedPeakMemoryLedgerBytesByFamily.isEmpty ? nil : mergedPeakMemoryLedgerBytesByFamily
         )
     }
 
@@ -2415,6 +2747,12 @@ private actor ProcessCPULogSampler {
             total += bucket.peakPercentByGroup.count
             total += bucket.peakPowerByGroup.count
             total += bucket.peakResidentBytesByGroup.count
+            total += bucket.retraceChildMemoryByteSecondsByKey?.count ?? 0
+            total += bucket.peakResidentBytesByRetraceChild?.count ?? 0
+            total += bucket.memoryLedgerComponentByteSeconds?.count ?? 0
+            total += bucket.peakMemoryLedgerBytesByComponent?.count ?? 0
+            total += bucket.memoryLedgerFamilyByteSeconds?.count ?? 0
+            total += bucket.peakMemoryLedgerBytesByFamily?.count ?? 0
         }
         return total
     }
@@ -2496,8 +2834,84 @@ private actor ProcessCPULogSampler {
             total += entry.groupDeltaNanoseconds.count
             total += entry.groupDeltaEnergyNanojoules?.count ?? 0
             total += entry.groupResidentBytes?.count ?? 0
+            total += entry.retraceChildResidentBytes?.count ?? 0
+            total += entry.memoryLedgerComponentBytes?.count ?? 0
         }
         return total
+    }
+
+    private static func cappedMemoryLedgerComponentBytes(
+        from snapshot: MemoryLedger.Snapshot,
+        limit: Int
+    ) -> [String: UInt64] {
+        let components = snapshot.components
+            .filter { $0.countsTowardTrackedMemory && $0.bytes > 0 }
+
+        var bytesByComponent: [String: UInt64] = [:]
+        bytesByComponent.reserveCapacity(components.count + 1)
+        for component in components {
+            bytesByComponent[component.tag] = UInt64(max(0, component.bytes))
+        }
+        if snapshot.unattributedBytes > 0 {
+            bytesByComponent[memoryLedgerUnattributedComponentTag] = snapshot.unattributedBytes
+        }
+        var capped = cappedMemoryLedgerComponentDictionary(bytesByComponent, limit: limit)
+        guard snapshot.unattributedBytes > 0,
+              capped[memoryLedgerUnattributedComponentTag] == nil else {
+            return capped
+        }
+
+        let smallestTrackedKey = capped.keys.min { lhs, rhs in
+            let lhsValue = capped[lhs] ?? 0
+            let rhsValue = capped[rhs] ?? 0
+            if lhsValue != rhsValue {
+                return lhsValue < rhsValue
+            }
+            return lhs > rhs
+        }
+        if let smallestTrackedKey {
+            capped.removeValue(forKey: smallestTrackedKey)
+        }
+        capped[memoryLedgerUnattributedComponentTag] = snapshot.unattributedBytes
+        return capped
+    }
+
+    private static func cappedMemoryLedgerComponentDictionary(
+        _ source: [String: UInt64],
+        limit: Int
+    ) -> [String: UInt64] {
+        let normalizedLimit = max(1, limit)
+        guard source.count > normalizedLimit else { return source }
+        let keptKeys = source.keys.sorted { lhs, rhs in
+            let lhsValue = source[lhs] ?? 0
+            let rhsValue = source[rhs] ?? 0
+            if lhsValue != rhsValue {
+                return lhsValue > rhsValue
+            }
+            return lhs < rhs
+        }
+        return filteredUInt64Dictionary(source, keepSet: Set(keptKeys.prefix(normalizedLimit)))
+    }
+
+    private static func cappedMemoryLedgerComponentDoubleDictionary(
+        _ source: [String: Double],
+        limit: Int
+    ) -> [String: Double] {
+        let normalizedLimit = max(1, limit)
+        guard source.count > normalizedLimit else { return source }
+        let keptKeys = source.keys.sorted { lhs, rhs in
+            let lhsValue = source[lhs] ?? 0
+            let rhsValue = source[rhs] ?? 0
+            if lhsValue != rhsValue {
+                return lhsValue > rhsValue
+            }
+            return lhs < rhs
+        }
+        return filteredDoubleDictionary(source, keepSet: Set(keptKeys.prefix(normalizedLimit)))
+    }
+
+    private static func memoryLedgerFamilyBytes(from componentBytes: [String: UInt64]) -> [String: UInt64] {
+        ProcessCPUDisplayMetrics.memoryLedgerFamilyBytes(from: componentBytes)
     }
 
     private static func filteredUInt64Dictionary(
@@ -2636,59 +3050,6 @@ private actor ProcessCPULogSampler {
 
         guard result == KERN_SUCCESS else { return nil }
         return info
-    }
-
-    private static let vmmapSummaryInterestingPrefixes: [String] = [
-        "Physical footprint:",
-        "Physical footprint (peak):",
-        "IOSurface",
-        "CG image",
-        "CoreUI image data",
-        "CoreAnimation",
-        "MALLOC_SMALL",
-        "MALLOC_SMALL (empty)",
-        "MALLOC_LARGE",
-        "MALLOC_LARGE (empty)",
-        "mapped file",
-        "TOTAL, minus reserved VM space",
-        "TOTAL"
-    ]
-
-    private static func captureVMMapSummaryLines(pid: pid_t) -> [String]? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/vmmap")
-        process.arguments = ["-summary", String(pid)]
-
-        let outputPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
-        }
-
-        guard process.terminationStatus == 0,
-              let data = try? outputPipe.fileHandleForReading.readToEnd(),
-              let output = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-
-        var selected: [String] = []
-        selected.reserveCapacity(16)
-
-        for rawLine in output.split(whereSeparator: \.isNewline) {
-            let line = String(rawLine).trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty else { continue }
-            guard vmmapSummaryInterestingPrefixes.contains(where: { line.hasPrefix($0) }) else {
-                continue
-            }
-            selected.append(line)
-        }
-
-        return selected.isEmpty ? nil : selected
     }
 
     private static func ensureLogFileExists(at fileURL: URL) {

@@ -184,8 +184,8 @@ fi
 echo -e "${YELLOW}[10/11] Updating frontend...${NC}"
 sed -i '' "s|https://cdn.retrace.to/Retrace-v[^\"]*\.dmg|https://cdn.retrace.to/${DMG_NAME}|g" "${FRONTEND_DIR}/src/lib/track-download.ts"
 sed -i '' "s/version: \"[^\"]*\"/version: \"${VERSION}\"/" "${FRONTEND_DIR}/src/lib/track-download.ts"
-sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/ui/download-button.tsx"
-sed -i '' "s/Download Retrace v[^\"]*/Download Retrace v${VERSION}/g" "${FRONTEND_DIR}/src/components/sections/hero-base.tsx"
+sed -i '' "s/Download (v[^\"]*)/Download (v${VERSION})/g" "${FRONTEND_DIR}/src/components/ui/download-button.tsx"
+sed -i '' "s/Download (v[^\"]*)/Download (v${VERSION})/g" "${FRONTEND_DIR}/src/components/sections/hero-base.tsx"
 echo -e "${GREEN}✓ Frontend download URL/text updated${NC}"
 
 # Step 11: Stage app version bump file

@@ -136,6 +136,9 @@ public actor CaptureManager: CaptureProtocol {
     private var currentCaptureDisplayID: UInt32?
     private var isCaptureExecutionInFlight = false
     private static let dedupedFrameBufferLimit = 8
+    private static let memoryLedgerCurrentFrameTag = "capture.stream.currentFrame"
+    private static let memoryLedgerLastKeptFrameTag = "capture.dedup.lastKeptFrame"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
 
     nonisolated(unsafe) public var onAccessibilityPermissionWarning: (() -> Void)?
     nonisolated(unsafe) public var onCaptureStopped: (@Sendable () async -> Void)?
@@ -246,6 +249,7 @@ public actor CaptureManager: CaptureProtocol {
         lastKeptMousePosition = nil
         lastNormalizedTitle = nil
         lastBundleID = nil
+        updateCaptureMemoryLedger(currentFrameBytes: 0)
         currentCaptureDisplayID = nil
         lastActualCaptureTime = nil
         totalCapturedBytes = 0
@@ -653,6 +657,11 @@ public actor CaptureManager: CaptureProtocol {
         _ frame: CapturedFrame,
         trigger: CaptureTrigger
     ) async {
+        updateCaptureMemoryLedger(currentFrameBytes: Int64(frame.imageData.count))
+        defer {
+            updateCaptureMemoryLedger(currentFrameBytes: 0)
+        }
+
         let triggerDescription = Self.triggerLogDescription(for: trigger)
         totalCapturedBytes += Int64(frame.imageData.count)
         let totalFrames = stats.totalFramesCaptured + 1
@@ -752,6 +761,34 @@ public actor CaptureManager: CaptureProtocol {
         Task {
             await onMouseClickCaptureOutcome(outcome, timestamp)
         }
+    }
+
+    private func updateCaptureMemoryLedger(currentFrameBytes: Int64) {
+        let normalizedCurrentFrameBytes = max(0, currentFrameBytes)
+        let lastKeptFrameBytes = Int64(lastKeptFrame?.imageData.count ?? 0)
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCurrentFrameTag,
+            bytes: normalizedCurrentFrameBytes,
+            count: normalizedCurrentFrameBytes > 0 ? 1 : 0,
+            unit: "frames",
+            function: "capture.stream",
+            kind: "current-frame"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerLastKeptFrameTag,
+            bytes: lastKeptFrameBytes,
+            count: lastKeptFrame == nil ? 0 : 1,
+            unit: "frames",
+            function: "capture.deduplication",
+            kind: "reference-frame",
+            note: "estimated"
+        )
+        MemoryLedger.emitSummary(
+            reason: "capture.stream.memory",
+            category: .capture,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
     }
 
     static func shouldKeepFrameForMouseMovement(

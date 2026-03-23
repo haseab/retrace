@@ -1,11 +1,31 @@
 import Foundation
 import Shared
 
+private struct BuildExtractedTextOutput {
+    let extractedText: ExtractedText
+    let attributedResidualBytes: Int64
+    let outputPayloadBytes: Int64
+}
+
+private enum OCRExtractionMode: Equatable {
+    case fullFrame
+    case regionBased
+}
+
+private struct OCRExtractionOutput {
+    let regions: [TextRegion]
+    let mode: OCRExtractionMode
+}
+
 // MARK: - ProcessingManager
 
 /// Main actor implementing ProcessingProtocol
 /// Coordinates OCR, Accessibility API, and text merging
 public actor ProcessingManager: ProcessingProtocol {
+    private static let memoryLedgerPreviousFrameTag = "processing.ocr.previousFrame"
+    private static let memoryLedgerRegionCacheTag = "processing.ocr.fullFrameRegionCache"
+    private static let memoryLedgerTileGridTag = "processing.ocr.fullFrameTileGrid"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
 
     // MARK: - Dependencies
 
@@ -54,25 +74,52 @@ public actor ProcessingManager: ProcessingProtocol {
 
 
     public func extractText(from frame: CapturedFrame) async throws -> ExtractedText {
+        let instrumentation = await ProcessingExtractRequestInstrumentation.begin()
         let startTime = Date()
-        let ocrRegions = try await extractOCRRegions(from: frame)
-        return try await buildExtractedText(
-            timestamp: frame.timestamp,
-            frameHeight: frame.height,
-            metadata: frame.metadata,
-            ocrRegions: ocrRegions,
-            startTime: startTime
-        )
+        do {
+            let ocrExtraction = try await extractOCRRegions(
+                from: frame,
+                instrumentation: instrumentation
+            )
+            let ocrRegions = ocrExtraction.regions
+            let ocrStage = await instrumentation.recordOCRStage(
+                ocrRegions: ocrRegions,
+                schedulesReturnResidualProbes: ocrExtraction.mode == .fullFrame
+            )
+
+            let buildOutput = try await buildExtractedText(
+                timestamp: frame.timestamp,
+                frameHeight: frame.height,
+                metadata: frame.metadata,
+                ocrRegions: ocrRegions,
+                startTime: startTime,
+                instrumentation: instrumentation
+            )
+            await instrumentation.recordExtractCompletion(
+                ocrStage: ocrStage,
+                attributedResidualBytes: buildOutput.attributedResidualBytes,
+                outputPayloadBytes: buildOutput.outputPayloadBytes
+            )
+
+            await instrumentation.finish()
+            return buildOutput.extractedText
+        } catch {
+            await instrumentation.finish()
+            throw error
+        }
     }
 
-    private func extractOCRRegions(from frame: CapturedFrame) async throws -> [TextRegion] {
+    private func extractOCRRegions(
+        from frame: CapturedFrame,
+        instrumentation: ProcessingExtractRequestInstrumentation
+    ) async throws -> OCRExtractionOutput {
         // Ensure full-frame cache is initialized for region-based OCR
         if fullFrameCache == nil {
             fullFrameCache = FullFrameOCRCache()
         }
 
         // Perform OCR (region-based or full-frame)
-        let ocrRegions: [TextRegion]
+        let ocrOutput: OCRExtractionOutput
 
         if useRegionBasedOCR, let cache = fullFrameCache {
             // Use region-based OCR for energy efficiency
@@ -81,9 +128,13 @@ public actor ProcessingManager: ProcessingProtocol {
                 frame: frame,
                 previousFrame: previousFrame,
                 cache: cache,
-                config: config
+                config: config,
+                extractInstrumentation: instrumentation
             )
-            ocrRegions = result.regions
+            ocrOutput = OCRExtractionOutput(
+                regions: result.regions,
+                mode: .regionBased
+            )
 
             // Track energy savings
             regionOCRFrameCount += 1
@@ -95,18 +146,24 @@ public actor ProcessingManager: ProcessingProtocol {
             }
         } else {
             // Fallback to full-frame OCR
-            ocrRegions = try await ocr.recognizeText(
+            let regions = try await ocr.recognizeText(
                 imageData: frame.imageData,
                 width: frame.width,
                 height: frame.height,
                 bytesPerRow: frame.bytesPerRow,
-                config: config
+                config: config,
+                extractInstrumentation: instrumentation
+            )
+            ocrOutput = OCRExtractionOutput(
+                regions: regions,
+                mode: .fullFrame
             )
         }
 
         // Store frame for next comparison (region-based OCR)
         previousFrame = frame
-        return ocrRegions
+        await updateMemoryLedger()
+        return ocrOutput
     }
 
     private func buildExtractedText(
@@ -114,8 +171,11 @@ public actor ProcessingManager: ProcessingProtocol {
         frameHeight: Int,
         metadata frameMetadata: FrameMetadata,
         ocrRegions: [TextRegion],
-        startTime: Date
-    ) async throws -> ExtractedText {
+        startTime: Date,
+        instrumentation: ProcessingExtractRequestInstrumentation
+    ) async throws -> BuildExtractedTextOutput {
+        var buildStage = await instrumentation.beginBuildStage()
+
         // Separate UI chrome from main content
         // Chrome = top 5% (menu bar/status bar) + bottom 5% (dock)
         // Coordinates are now in pixel space with Y flipped (0 = top)
@@ -140,6 +200,7 @@ public actor ProcessingManager: ProcessingProtocol {
                 mainRegions.append(region)
             }
         }
+        let partitionResidualBytes = await buildStage.recordChromePartition()
 
         // Extract accessibility text (if enabled and permitted)
         var axResult: AccessibilityResult? = nil
@@ -156,13 +217,16 @@ public actor ProcessingManager: ProcessingProtocol {
                 }
             }
         }
+        let accessibilityResidualBytes = await buildStage.recordAccessibilityFetch()
 
         // Build OCR text from main regions only (chrome text stored separately)
         let ocrText = mainRegions.map(\.text).joined(separator: " ")
         let chromeText = chromeRegions.map(\.text).joined(separator: " ")
+        let joinResidualBytes = await buildStage.recordTextJoin()
 
         // Merge OCR and accessibility text
         let fullText = merger.mergeText(ocrText: ocrText, accessibilityText: axText)
+        let mergeResidualBytes = await buildStage.recordTextMerge()
 
         // Merge accessibility metadata with existing metadata
         // Preserve browserURL from capture phase if accessibility doesn't provide one
@@ -189,6 +253,7 @@ public actor ProcessingManager: ProcessingProtocol {
             chromeText: chromeText,      // UI chrome text
             metadata: metadata
         )
+        let outputPayloadBytes = buildStage.recordOutputPayload(extractedText)
 
         // Update statistics
         let ocrTime = Date().timeIntervalSince(startTime) * 1000  // Convert to ms
@@ -196,7 +261,27 @@ public actor ProcessingManager: ProcessingProtocol {
         totalOCRTimeMs += ocrTime
         totalTextLength += extractedText.wordCount
 
-        return extractedText
+        let finalizeResidualBytes = await buildStage.recordFinalize(outputPayloadBytes: outputPayloadBytes)
+        let buildFallbackResidualBytes = buildStage.recordBuildResidual(
+            partitionResidualBytes: partitionResidualBytes,
+            accessibilityResidualBytes: accessibilityResidualBytes,
+            joinResidualBytes: joinResidualBytes,
+            mergeResidualBytes: mergeResidualBytes,
+            finalizeResidualBytes: finalizeResidualBytes,
+            outputPayloadBytes: outputPayloadBytes
+        )
+
+        return BuildExtractedTextOutput(
+            extractedText: extractedText,
+            attributedResidualBytes:
+                partitionResidualBytes +
+                accessibilityResidualBytes +
+                joinResidualBytes +
+                mergeResidualBytes +
+                finalizeResidualBytes +
+                buildFallbackResidualBytes,
+            outputPayloadBytes: outputPayloadBytes
+        )
     }
 
     public func extractTextViaOCR(from frame: CapturedFrame) async throws -> [TextRegion] {
@@ -299,6 +384,7 @@ public actor ProcessingManager: ProcessingProtocol {
             // Clear cache and previous frame when disabled
             Task {
                 await fullFrameCache?.invalidateAll()
+                await self.updateMemoryLedger()
             }
             previousFrame = nil
         }
@@ -313,6 +399,7 @@ public actor ProcessingManager: ProcessingProtocol {
     public func invalidateTileCache() async {
         await fullFrameCache?.invalidateAll()
         previousFrame = nil
+        await updateMemoryLedger()
     }
 
     // MARK: - Private Methods
@@ -338,6 +425,44 @@ public actor ProcessingManager: ProcessingProtocol {
         }
 
         isProcessing = false
+    }
+
+    private func updateMemoryLedger() async {
+        let previousFrameBytes = Int64(previousFrame?.imageData.count ?? 0)
+        let cacheEstimate = await fullFrameCache?.memoryEstimate()
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPreviousFrameTag,
+            bytes: previousFrameBytes,
+            count: previousFrame == nil ? 0 : 1,
+            unit: "frames",
+            function: "processing.ocr",
+            kind: "previous-frame",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRegionCacheTag,
+            bytes: cacheEstimate?.regionBytes ?? 0,
+            count: cacheEstimate?.regionCount ?? 0,
+            unit: "regions",
+            function: "processing.ocr",
+            kind: "region-cache",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerTileGridTag,
+            bytes: cacheEstimate?.tileGridBytes ?? 0,
+            count: cacheEstimate?.tileCount ?? 0,
+            unit: "tiles",
+            function: "processing.ocr",
+            kind: "tile-grid-cache",
+            note: "estimated"
+        )
+        MemoryLedger.emitSummary(
+            reason: "processing.ocr.functional_memory",
+            category: .processing,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
     }
 }
 

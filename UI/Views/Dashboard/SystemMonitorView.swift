@@ -702,6 +702,13 @@ public struct SystemMonitorView: View {
             onRowsHoverChanged: { hovering in
                 scrollLatch.updateHover(memory: hovering)
             },
+            onRetraceRowToggle: { expanded in
+                DashboardViewModel.recordSystemMonitorMemoryLogToggle(
+                    coordinator: coordinator,
+                    source: "monitor_memory_log_retrace_row",
+                    expanded: expanded
+                )
+            },
             isRowsScrollEnabled: isMemoryScrollEnabled,
             showsOCRBacklogAttribution: viewModel.shouldShowOCRBacklogAttribution
         )

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Darwin
 import Foundation
 import Shared
 import CoreMedia
@@ -367,6 +368,14 @@ fileprivate actor SegmentRewriteExecutor {
 
 /// Main StorageProtocol implementation.
 public actor StorageManager: StorageProtocol {
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
+    private static let memoryLedgerDecoderRetainDurationSeconds: TimeInterval = 4
+    private static let memoryLedgerGeneratorCacheTag = "storage.videoDecoding.generatorCache"
+    private static let memoryLedgerDecoderHeapTag = "storage.videoDecoding.decoderHeap"
+    private static let memoryLedgerDecodeSurfaceTag = "storage.videoDecoding.decodeSurface"
+    private static let memoryLedgerAppKitBridgeTag = "storage.videoDecoding.appKitBridge"
+    private static let memoryLedgerFrameCacheTag = "storage.videoDecoding.frameCache"
+    private static let memoryLedgerCIContextTag = "storage.videoDecoding.ciContext"
     private static let discardableQuarantinedWALRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     private var config: StorageConfig?
     private var storageRootURL: URL
@@ -401,6 +410,8 @@ public actor StorageManager: StorageProtocol {
         let generator: AVAssetImageGenerator
         let symlinkURL: URL?  // Keep symlink alive while generator is cached
         var lastAccessTime: Date
+        var estimatedGeneratorBytes: Int64
+        var estimatedDecoderHeapBytes: Int64
     }
 
     /// Cache for segment file paths, keyed by segment ID
@@ -430,6 +441,7 @@ public actor StorageManager: StorageProtocol {
         var frames: [DecodedFrame]  // Sorted by PTS (presentation order)
         var lastAccessTime: Date
         let totalFrameCount: Int
+        let estimatedBytes: Int64
     }
 
     /// A decoded frame with its presentation timestamp
@@ -438,6 +450,17 @@ public actor StorageManager: StorageProtocol {
         let image: CGImage
         let presentationIndex: Int  // Index in presentation order (0, 1, 2, ...)
     }
+
+    private enum VideoDecodingTransientBucket {
+        case decodeSurface
+        case appKitBridge
+        case ciContext
+    }
+
+    private var activeDecodeSurfaceBytesByToken: [UUID: Int64] = [:]
+    private var activeAppKitBridgeBytesByToken: [UUID: Int64] = [:]
+    private var activeCIContextBytesByToken: [UUID: Int64] = [:]
+    private var decodeRetainedGenerationByCacheKey: [String: UInt64] = [:]
 
     public func initialize(config: StorageConfig) async throws {
         self.config = config
@@ -589,10 +612,12 @@ public actor StorageManager: StorageProtocol {
             } else {
                 // Create fresh generator - invalidate cache first if this is a retry
                 if attempt > 0 {
+                    decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
                     if let entry = generatorCache.removeValue(forKey: cacheKey),
                        let oldSymlink = entry.symlinkURL {
                         try? FileManager.default.removeItem(at: oldSymlink)
                     }
+                    publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
                     Log.info("[VideoExtract] Invalidated stale cache for \(videoURL.lastPathComponent), creating fresh generator", category: .storage)
                 }
 
@@ -623,9 +648,12 @@ public actor StorageManager: StorageProtocol {
                 generatorCache[cacheKey] = GeneratorCacheEntry(
                     generator: generator,
                     symlinkURL: symlinkURL,
-                    lastAccessTime: Date()
+                    lastAccessTime: Date(),
+                    estimatedGeneratorBytes: 0,
+                    estimatedDecoderHeapBytes: 0
                 )
                 imageGenerator = generator
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
                 // Evict old generators if needed
                 evictOldGenerators()
@@ -634,7 +662,39 @@ public actor StorageManager: StorageProtocol {
             // Extract frame
             var actualTime = CMTime.zero
             do {
+                let decoderBaselineFootprintBytes = Self.currentProcessFootprintBytes()
                 let cgImage = try imageGenerator.copyCGImage(at: time, actualTime: &actualTime)
+                let frameBytes = Self.estimatedFrameBytes(width: cgImage.width, height: cgImage.height)
+                let generatorBytes = Self.estimatedGeneratorBytes(width: cgImage.width, height: cgImage.height)
+                let decoderHeapBytes = Self.measuredDecoderHeapBytes(
+                    baselineFootprintBytes: decoderBaselineFootprintBytes,
+                    width: cgImage.width,
+                    height: cgImage.height
+                )
+                if var updatedEntry = generatorCache[cacheKey] {
+                    updatedEntry.lastAccessTime = Date()
+                    updatedEntry.estimatedGeneratorBytes = generatorBytes
+                    generatorCache[cacheKey] = updatedEntry
+                }
+                refreshRetainedDecoderHeap(
+                    cacheKey: cacheKey,
+                    observedBytes: decoderHeapBytes,
+                    reason: "storage.video_decoding.cache"
+                )
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
+
+                let decodeSurfaceToken = beginVideoDecodingTransientBytes(
+                    bucket: .decodeSurface,
+                    bytes: frameBytes,
+                    reason: "storage.video_decoding.extract_frame"
+                )
+                defer {
+                    endVideoDecodingTransientBytes(
+                        bucket: .decodeSurface,
+                        token: decodeSurfaceToken,
+                        reason: "storage.video_decoding.extract_frame"
+                    )
+                }
 
                 // Check for time mismatch
                 let requestedSeconds = time.seconds
@@ -664,6 +724,8 @@ public actor StorageManager: StorageProtocol {
                    let oldSymlink = entry.symlinkURL {
                     try? FileManager.default.removeItem(at: oldSymlink)
                 }
+                decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+                publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
                 throw StorageError.fileReadFailed(
                     path: videoURL.path,
                     underlying: "Frame extraction failed: \(error.localizedDescription)"
@@ -685,11 +747,13 @@ public actor StorageManager: StorageProtocol {
 
         for (key, entry) in toRemove {
             generatorCache.removeValue(forKey: key)
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: key)
             // Clean up symlink
             if let symlinkURL = entry.symlinkURL {
                 try? FileManager.default.removeItem(at: symlinkURL)
             }
         }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
     }
 
     /// Read a frame from a video at a specific path
@@ -847,13 +911,16 @@ public actor StorageManager: StorageProtocol {
             segmentID: segmentIDValue,
             frames: frames,
             lastAccessTime: Date(),
-            totalFrameCount: frames.count
+            totalFrameCount: frames.count,
+            estimatedBytes: Self.estimatedDecodedFrameBytes(for: frames)
         )
         frameCache[segmentIDValue] = cacheEntry
         evictOldCacheEntries()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
 
         guard frameIndex < frames.count else {
             frameCache.removeValue(forKey: segmentIDValue)
+            publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
             throw StorageError.fileReadFailed(
                 path: segmentURL.path,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
@@ -895,13 +962,16 @@ public actor StorageManager: StorageProtocol {
             segmentID: cacheKey,
             frames: frames,
             lastAccessTime: Date(),
-            totalFrameCount: frames.count
+            totalFrameCount: frames.count,
+            estimatedBytes: Self.estimatedDecodedFrameBytes(for: frames)
         )
         frameCache[cacheKey] = cacheEntry
         evictOldCacheEntries()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
 
         guard frameIndex < frames.count else {
             frameCache.removeValue(forKey: cacheKey)
+            publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
             throw StorageError.fileReadFailed(
                 path: videoPath,
                 underlying: "Frame index \(frameIndex) out of range (0..<\(frames.count))"
@@ -978,7 +1048,20 @@ public actor StorageManager: StorageProtocol {
         // CRITICAL: Create CIContext ONCE outside the loop to avoid memory leak
         // Each CIContext allocates 20-50MB of Metal/GPU resources
         // Creating one per frame caused 40GB+ memory usage in VTDecoderXPCService
+        let ciContextBytes = Self.estimatedCIContextBytes()
+        let ciContextToken = beginVideoDecodingTransientBytes(
+            bucket: .ciContext,
+            bytes: ciContextBytes,
+            reason: "storage.video_decoding.decode_all"
+        )
         let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+        defer {
+            endVideoDecodingTransientBytes(
+                bucket: .ciContext,
+                token: ciContextToken,
+                reason: "storage.video_decoding.decode_all"
+            )
+        }
 
         while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -1030,6 +1113,19 @@ public actor StorageManager: StorageProtocol {
 
     /// Convert CGImage to JPEG data
     private func convertCGImageToJPEG(_ cgImage: CGImage) throws -> Data {
+        let bridgeToken = beginVideoDecodingTransientBytes(
+            bucket: .appKitBridge,
+            bytes: Self.estimatedAppKitBridgeBytes(width: cgImage.width, height: cgImage.height),
+            reason: "storage.video_decoding.jpeg_bridge"
+        )
+        defer {
+            endVideoDecodingTransientBytes(
+                bucket: .appKitBridge,
+                token: bridgeToken,
+                reason: "storage.video_decoding.jpeg_bridge"
+            )
+        }
+
         let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
         guard let tiffData = nsImage.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -1057,12 +1153,14 @@ public actor StorageManager: StorageProtocol {
                 Log.debug("[StorageManager] Evicted cache entry for segment \(oldestKey)", category: .storage)
             }
         }
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
     }
 
     /// Clear the frame cache (useful when video files are modified)
     public func clearFrameCache() {
         frameCache.removeAll()
         segmentPathCache.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
         Log.info("[StorageManager] Frame and segment path caches cleared", category: .storage)
     }
 
@@ -1070,6 +1168,7 @@ public actor StorageManager: StorageProtocol {
     public func clearFrameCache(for segmentID: VideoSegmentID) {
         frameCache.removeValue(forKey: segmentID.value)
         segmentPathCache.removeValue(forKey: segmentID.value)
+        publishVideoDecodingMemory(reason: "storage.video_decoding.frame_cache")
         Log.debug("[StorageManager] Cleared cache for segment \(segmentID.value)", category: .storage)
     }
 
@@ -1751,6 +1850,8 @@ public actor StorageManager: StorageProtocol {
             }
         }
         generatorCache.removeAll()
+        decodeRetainedGenerationByCacheKey.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
         Log.info("[StorageManager] All caches invalidated", category: .storage)
     }
@@ -1765,6 +1866,8 @@ public actor StorageManager: StorageProtocol {
             }
         }
         generatorCache.removeAll()
+        decodeRetainedGenerationByCacheKey.removeAll()
+        publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
 
         Log.info("[StorageManager] Purged frame extraction caches (\(reason))", category: .storage)
     }
@@ -1798,6 +1901,10 @@ public actor StorageManager: StorageProtocol {
         }
         for path in invalidPaths {
             generatorCache.removeValue(forKey: path)
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: path)
+        }
+        if !invalidSegmentIDs.isEmpty || !invalidPaths.isEmpty {
+            publishVideoDecodingMemory(reason: "storage.video_decoding.cache")
         }
 
         if !invalidSegmentIDs.isEmpty || !invalidPaths.isEmpty {
@@ -1806,6 +1913,260 @@ public actor StorageManager: StorageProtocol {
     }
 
     // MARK: - Private helpers
+
+    private func beginVideoDecodingTransientBytes(
+        bucket: VideoDecodingTransientBucket,
+        bytes: Int64,
+        reason: String
+    ) -> UUID? {
+        guard bytes > 0 else { return nil }
+        let token = UUID()
+        switch bucket {
+        case .decodeSurface:
+            activeDecodeSurfaceBytesByToken[token] = max(0, bytes)
+        case .appKitBridge:
+            activeAppKitBridgeBytesByToken[token] = max(0, bytes)
+        case .ciContext:
+            activeCIContextBytesByToken[token] = max(0, bytes)
+        }
+        publishVideoDecodingMemory(reason: reason)
+        return token
+    }
+
+    private func endVideoDecodingTransientBytes(
+        bucket: VideoDecodingTransientBucket,
+        token: UUID?,
+        reason: String
+    ) {
+        guard let token else { return }
+        switch bucket {
+        case .decodeSurface:
+            activeDecodeSurfaceBytesByToken.removeValue(forKey: token)
+        case .appKitBridge:
+            activeAppKitBridgeBytesByToken.removeValue(forKey: token)
+        case .ciContext:
+            activeCIContextBytesByToken.removeValue(forKey: token)
+        }
+        publishVideoDecodingMemory(reason: reason)
+    }
+
+    private func publishVideoDecodingMemory(reason: String) {
+        pruneExpiredRetainedDecoderHeap()
+
+        let generatorBytes = generatorCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedGeneratorBytes
+        }
+        let decoderHeapBytes = generatorCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedDecoderHeapBytes
+        }
+        let decoderHeapCount = generatorCache.values.reduce(into: 0) { partialResult, entry in
+            partialResult += entry.estimatedDecoderHeapBytes > 0 ? 1 : 0
+        }
+        let frameCacheBytes = frameCache.values.reduce(into: Int64(0)) { partialResult, entry in
+            partialResult += entry.estimatedBytes
+        }
+        let decodeSurfaceBytes = activeDecodeSurfaceBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+        let appKitBridgeBytes = activeAppKitBridgeBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+        let ciContextBytes = activeCIContextBytesByToken.values.reduce(into: Int64(0)) { partialResult, bytes in
+            partialResult += bytes
+        }
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerGeneratorCacheTag,
+            bytes: generatorBytes,
+            count: generatorCache.count,
+            unit: "generators",
+            function: "storage.video_decoding",
+            kind: "decode-generator-cache",
+            note: "estimated-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDecoderHeapTag,
+            bytes: decoderHeapBytes,
+            count: decoderHeapCount,
+            unit: "generators",
+            function: "storage.video_decoding",
+            kind: "decode-private-heap",
+            note: "observed-footprint-delta"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerFrameCacheTag,
+            bytes: frameCacheBytes,
+            count: frameCache.count,
+            unit: "segments",
+            function: "storage.video_decoding",
+            kind: "decoded-frame-cache",
+            note: "estimated-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDecodeSurfaceTag,
+            bytes: decodeSurfaceBytes,
+            count: activeDecodeSurfaceBytesByToken.count,
+            unit: "surfaces",
+            function: "storage.video_decoding",
+            kind: "decode-surface",
+            note: "estimated-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppKitBridgeTag,
+            bytes: appKitBridgeBytes,
+            count: activeAppKitBridgeBytesByToken.count,
+            unit: "bridges",
+            function: "storage.video_decoding",
+            kind: "appkit-jpeg-bridge",
+            note: "proxy-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCIContextTag,
+            bytes: ciContextBytes,
+            count: activeCIContextBytesByToken.count,
+            unit: "contexts",
+            function: "storage.video_decoding",
+            kind: "ci-context",
+            note: "proxy-native"
+        )
+        MemoryLedger.emitSummary(
+            reason: reason,
+            category: .storage,
+            minIntervalSeconds: Self.memoryLedgerSummaryIntervalSeconds
+        )
+    }
+
+    private static func estimatedFrameBytes(width: Int, height: Int) -> Int64 {
+        guard width > 0, height > 0 else { return 0 }
+        return max(0, Int64(width) * Int64(height) * 4)
+    }
+
+    private static func estimatedGeneratorBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes / 8, 1 * 1_024 * 1_024)
+    }
+
+    private static func estimatedDecoderHeapFallbackBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes / 2, 8 * 1_024 * 1_024)
+    }
+
+    private static func estimatedAppKitBridgeBytes(width: Int, height: Int) -> Int64 {
+        let frameBytes = estimatedFrameBytes(width: width, height: height)
+        guard frameBytes > 0 else { return 0 }
+        return max(frameBytes * 2, 16 * 1_024 * 1_024)
+    }
+
+    private static func estimatedCIContextBytes() -> Int64 {
+        24 * 1_024 * 1_024
+    }
+
+    private static func estimatedDecodedFrameBytes(for frames: [DecodedFrame]) -> Int64 {
+        frames.reduce(into: Int64(0)) { partialResult, frame in
+            partialResult += estimatedFrameBytes(width: frame.image.width, height: frame.image.height)
+        }
+    }
+
+    private func refreshRetainedDecoderHeap(
+        cacheKey: String,
+        observedBytes: Int64,
+        reason: String
+    ) {
+        guard var entry = generatorCache[cacheKey] else { return }
+
+        if observedBytes > 0 {
+            entry.estimatedDecoderHeapBytes = observedBytes
+        } else if entry.estimatedDecoderHeapBytes <= 0 {
+            entry.estimatedDecoderHeapBytes = 0
+            decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+            generatorCache[cacheKey] = entry
+            return
+        }
+
+        generatorCache[cacheKey] = entry
+        let generation = (decodeRetainedGenerationByCacheKey[cacheKey] ?? 0) + 1
+        decodeRetainedGenerationByCacheKey[cacheKey] = generation
+
+        Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.memoryLedgerDecoderRetainDurationSeconds))
+            await self?.clearRetainedDecoderHeapIfCurrent(
+                cacheKey: cacheKey,
+                generation: generation,
+                reason: reason
+            )
+        }
+    }
+
+    private func clearRetainedDecoderHeapIfCurrent(
+        cacheKey: String,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard decodeRetainedGenerationByCacheKey[cacheKey] == generation else { return }
+        decodeRetainedGenerationByCacheKey.removeValue(forKey: cacheKey)
+        guard var entry = generatorCache[cacheKey] else { return }
+        entry.estimatedDecoderHeapBytes = 0
+        generatorCache[cacheKey] = entry
+        publishVideoDecodingMemory(reason: reason)
+    }
+
+    private func pruneExpiredRetainedDecoderHeap() {
+        for cacheKey in Array(generatorCache.keys) {
+            guard decodeRetainedGenerationByCacheKey[cacheKey] == nil,
+                  var entry = generatorCache[cacheKey],
+                  entry.estimatedDecoderHeapBytes > 0 else { continue }
+            entry.estimatedDecoderHeapBytes = 0
+            generatorCache[cacheKey] = entry
+        }
+    }
+
+    private static func measuredDecoderHeapBytes(
+        baselineFootprintBytes: UInt64?,
+        width: Int,
+        height: Int
+    ) -> Int64 {
+        guard let baselineFootprintBytes,
+              let currentFootprintBytes = currentProcessFootprintBytes() else {
+            return estimatedDecoderHeapFallbackBytes(width: width, height: height)
+        }
+
+        guard currentFootprintBytes > baselineFootprintBytes else {
+            return 0
+        }
+
+        let deltaBytes = min(
+            currentFootprintBytes - baselineFootprintBytes,
+            UInt64(Int64.max)
+        )
+        return Int64(deltaBytes)
+    }
+
+    private static func currentProcessFootprintBytes() -> UInt64? {
+        currentTaskVMInfo()?.phys_footprint
+    }
+
+    private static func currentTaskVMInfo() -> task_vm_info_data_t? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+
+        let kernResult = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    reboundPointer,
+                    &count
+                )
+            }
+        }
+
+        guard kernResult == KERN_SUCCESS else { return nil }
+        return info
+    }
 
     private func parseSegmentID(from url: URL) -> VideoSegmentID? {
         // Files are named with just the Int64 ID (e.g., "12345") or with .mp4 extension (e.g., "12345.mp4")

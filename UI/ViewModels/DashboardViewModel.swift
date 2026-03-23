@@ -2598,6 +2598,21 @@ public class DashboardViewModel: ObservableObject {
         )
     }
 
+    public static func recordSystemMonitorMemoryLogToggle(
+        coordinator: AppCoordinator,
+        source: String,
+        expanded: Bool
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .systemMonitorMemoryLogToggle,
+            metadata: jsonMetadata([
+                "source": source,
+                "expanded": expanded
+            ])
+        )
+    }
+
     public static func recordFrameDeleted(
         coordinator: AppCoordinator,
         source: String,

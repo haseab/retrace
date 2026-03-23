@@ -89,10 +89,13 @@ UI/
 │   ├── SessionTimeline.swift            # App session visualization
 │   ├── DeeplinkHandler.swift            # URL scheme routing
 │   ├── ProcessCPUMonitor.swift          # Shared process CPU+memory sampler + 24h aggregation service
+│   ├── ProcessMemoryCardPresentation.swift # Local presentation controller + row builder for memory monitor card
+│   ├── ProcessMonitorModels.swift       # System Monitor snapshot/models + ranking/build helpers
 │   ├── ProcessCPUSummaryCard.swift      # System Monitor CPU table/card UI
-│   └── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   ├── ProcessMemorySummaryCard.swift   # System Monitor memory table/card UI
+│   └── UIMemoryEstimators.swift         # Shared UI memory-estimation helpers for telemetry
 ├── ViewModels/
-│   ├── TimelineViewModel.swift
+│   ├── SimpleTimelineViewModel.swift    # Fullscreen timeline state, caching, playback, filters, OCR overlays
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status

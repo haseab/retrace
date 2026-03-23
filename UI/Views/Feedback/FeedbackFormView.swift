@@ -726,7 +726,7 @@ public struct FeedbackFormView: View {
             }
 
             if viewModel.includesLogsInDiagnostics {
-                Text("Bug reports include recent logs plus a limited memory profile for Retrace and core media services.")
+                Text("Bug reports include recent logs plus a hierarchical Retrace memory summary from the system monitor sampler.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.72))
             }
@@ -997,7 +997,7 @@ public struct FeedbackFormView: View {
                     .font(.retraceCaptionBold)
                     .foregroundColor(.retracePrimary)
 
-                Text("Download the report as a .txt file. If you attached an image, Retrace saves it next to the text file.")
+                Text("Download the report to your Desktop as a .txt file. If you attached an image, Retrace saves it next to the text file.")
                     .font(.system(size: 10))
                     .foregroundColor(.retraceSecondary.opacity(0.78))
                     .fixedSize(horizontal: false, vertical: true)

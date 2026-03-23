@@ -153,7 +153,125 @@ enum OCRTextLayoutEstimator {
         return 1.0
     }
 }
+enum UIDirectFrameDecodeMemoryLedger {
+    static let shiftDragGeneratorTag = "ui.timeline.shiftDragDecodeGenerator"
+    static let zoomCopyGeneratorTag = "ui.timeline.zoomCopyGenerator"
+    static let contextMenuGeneratorTag = "ui.contextMenu.frameDecodeGenerator"
+    static let timelineWindowGeneratorTag = "ui.timeline.windowFrameDecodeGenerator"
 
+    private static let tracker = Tracker()
+    private static let summaryIntervalSeconds: TimeInterval = 30
+
+    static func begin(
+        tag: String,
+        function: String,
+        reason: String,
+        videoInfo: FrameVideoInfo?
+    ) -> Int64 {
+        let estimatedBytes = TimelineMemoryEstimator.directDecodeGeneratorBytes(for: videoInfo)
+        let note = generatorNote(for: videoInfo)
+        Task(priority: .utility) {
+            await tracker.increment(
+                tag: tag,
+                function: function,
+                kind: "direct-decode-generator",
+                note: note,
+                bytes: estimatedBytes
+            )
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .ui,
+                minIntervalSeconds: summaryIntervalSeconds
+            )
+        }
+        return estimatedBytes
+    }
+
+    static func end(tag: String, reason: String, bytes: Int64) {
+        Task(priority: .utility) {
+            await tracker.decrement(tag: tag, bytes: bytes)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .ui,
+                minIntervalSeconds: summaryIntervalSeconds
+            )
+        }
+    }
+
+    private static func generatorNote(for videoInfo: FrameVideoInfo?) -> String {
+        guard let width = videoInfo?.width,
+              let height = videoInfo?.height,
+              width > 0,
+              height > 0 else {
+            return "estimated-native,frame=unknown"
+        }
+        return "estimated-native,frame=\(width)x\(height)"
+    }
+
+    private actor Tracker {
+        private struct Entry {
+            var totalBytes: Int64
+            var count: Int
+            let function: String
+            let kind: String
+            var note: String
+        }
+
+        private var entries: [String: Entry] = [:]
+
+        func increment(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String,
+            bytes: Int64
+        ) {
+            var entry = entries[tag] ?? Entry(
+                totalBytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note
+            )
+            entry.totalBytes = clampedAdd(entry.totalBytes, bytes)
+            entry.count = clampedAdd(entry.count, 1)
+            entry.note = note
+            entries[tag] = entry
+            publish(tag: tag, entry: entry)
+        }
+
+        func decrement(tag: String, bytes: Int64) {
+            guard var entry = entries[tag] else { return }
+            entry.totalBytes = max(0, entry.totalBytes - bytes)
+            entry.count = max(0, entry.count - 1)
+            entries[tag] = entry
+            publish(tag: tag, entry: entry)
+        }
+
+        private func publish(tag: String, entry: Entry) {
+            MemoryLedger.set(
+                tag: tag,
+                bytes: entry.totalBytes,
+                count: entry.count,
+                unit: "requests",
+                function: entry.function,
+                kind: entry.kind,
+                note: entry.note
+            )
+        }
+
+        private func clampedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+            if lhs > Int64.max - rhs {
+                return Int64.max
+            }
+            return lhs + rhs
+        }
+
+        private func clampedAdd(_ lhs: Int, _ rhs: Int) -> Int {
+            lhs.addingReportingOverflow(rhs).overflow ? Int.max : lhs + rhs
+        }
+    }
+}
 /// A frame paired with its preloaded video info for instant access
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
@@ -2046,23 +2164,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         appBlockSnapshotBuildTask?.cancel()
         appBlockSnapshotApplyTask?.cancel()
         pendingDeleteCommitTask?.cancel()
-
-        MemoryLedger.set(
-            tag: Self.memoryLedgerDiskBufferTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "ui.timeline",
-            kind: "disk-frame-buffer"
-        )
-        MemoryLedger.set(
-            tag: Self.memoryLedgerFrameWindowTag,
-            bytes: 0,
-            count: 0,
-            unit: "frames",
-            function: "ui.timeline",
-            kind: "frame-window"
-        )
+        Self.clearTimelineMemoryLedger()
     }
 
     // MARK: - Private State
@@ -2130,7 +2232,9 @@ public class SimpleTimelineViewModel: ObservableObject {
         didSet {
             let oldCount = oldValue.count
             let newCount = diskFrameBufferIndex.count
-            diskFrameBufferBytes = Self.estimatedDiskFrameBufferBytes(diskFrameBufferIndex)
+            diskFrameBufferBytes = diskFrameBufferIndex.values.reduce(into: Int64(0)) { total, entry in
+                total += entry.sizeBytes
+            }
             if oldCount != newCount {
                 if Self.isVerboseTimelineLoggingEnabled {
                     Log.debug(
@@ -2159,6 +2263,17 @@ public class SimpleTimelineViewModel: ObservableObject {
     nonisolated private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 30
     nonisolated private static let memoryLedgerDiskBufferTag = "ui.timeline.diskFrameBuffer"
     nonisolated private static let memoryLedgerFrameWindowTag = "ui.timeline.frameWindow"
+    nonisolated private static let memoryLedgerCurrentImageTag = "ui.timeline.currentImage"
+    nonisolated private static let memoryLedgerWaitingFallbackTag = "ui.timeline.waitingFallbackImage"
+    nonisolated private static let memoryLedgerLiveScreenshotTag = "ui.timeline.liveScreenshot"
+    nonisolated private static let memoryLedgerShiftDragSnapshotTag = "ui.timeline.shiftDragSnapshot"
+    nonisolated private static let memoryLedgerOCRNodesTag = "ui.timeline.ocrNodes"
+    nonisolated private static let memoryLedgerPreviousOCRNodesTag = "ui.timeline.previousOcrNodes"
+    nonisolated private static let memoryLedgerHyperlinkMatchesTag = "ui.timeline.hyperlinkMatches"
+    nonisolated private static let memoryLedgerAppBlockSnapshotTag = "ui.timeline.appBlockSnapshot"
+    nonisolated private static let memoryLedgerTagCatalogTag = "ui.timeline.tagCatalog"
+    nonisolated private static let memoryLedgerNodeSelectionCacheTag = "ui.timeline.nodeSelectionCache"
+    nonisolated private static let memoryLedgerPendingExpansionTag = "ui.timeline.cacheExpansionQueue"
     private var diskFrameBufferInitializationTask: Task<Void, Never>?
     nonisolated private static let appLaunchDate = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime)
     private var diskFrameBufferMemoryLogTask: Task<Void, Never>?
@@ -2475,22 +2590,145 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func updateTimelineMemoryLedger() {
+        let frameWindowBytes = TimelineMemoryEstimator.frameWindowBytes(frames)
+        let currentImageBytes = UIMemoryEstimator.imageBytes(for: currentImage)
+        let waitingFallbackBytes = UIMemoryEstimator.imageBytes(for: waitingFallbackImage)
+        let liveScreenshotBytes = UIMemoryEstimator.imageBytes(for: liveScreenshot)
+        let shiftDragSnapshotBytes = UIMemoryEstimator.imageBytes(for: shiftDragDisplaySnapshot)
+        let ocrNodeBytes = TimelineMemoryEstimator.ocrNodeBytes(ocrNodes)
+        let previousOCRNodeBytes = TimelineMemoryEstimator.ocrNodeBytes(previousOcrNodes)
+        let hyperlinkBytes = TimelineMemoryEstimator.hyperlinkBytes(hyperlinkMatches)
+        let appBlockSnapshotBytes = TimelineMemoryEstimator.appBlockSnapshotBytes(
+            blocks: _cachedAppBlockSnapshot?.blocks ?? [],
+            frameToBlockIndexCount: _cachedAppBlockSnapshot?.frameToBlockIndex.count ?? 0,
+            videoBoundaryCount: _cachedAppBlockSnapshot?.videoBoundaryIndices.count ?? 0,
+            segmentBoundaryCount: _cachedAppBlockSnapshot?.segmentBoundaryIndices.count ?? 0
+        )
+        let tagCatalogBytes = TimelineMemoryEstimator.tagCatalogBytes(cachedAvailableTagsByID)
+        let nodeSelectionCacheBytes = TimelineMemoryEstimator.nodeSelectionCacheBytes(
+            sortedNodes: cachedSortedNodes,
+            indexMapCount: cachedNodeIndexMap?.count ?? 0
+        )
+        let pendingExpansionBytes = TimelineMemoryEstimator.pendingExpansionBytes(
+            queuedVideoPaths: pendingCacheExpansionQueue.map(\.videoPath),
+            queuedOrInFlightCount: queuedOrInFlightCacheExpansionFrameIDs.count
+        )
+
         MemoryLedger.set(
             tag: Self.memoryLedgerDiskBufferTag,
             bytes: diskFrameBufferBytes,
             count: diskFrameBufferIndex.count,
             unit: "frames",
-            function: "ui.timeline",
+            function: "ui.timeline.state",
             kind: "disk-frame-buffer"
         )
         MemoryLedger.set(
             tag: Self.memoryLedgerFrameWindowTag,
-            bytes: 0,
+            bytes: frameWindowBytes,
             count: frames.count,
             unit: "frames",
-            function: "ui.timeline",
+            function: "ui.timeline.state",
             kind: "frame-window",
-            note: "count-only"
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCurrentImageTag,
+            bytes: currentImageBytes,
+            count: currentImage == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "current-frame",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerWaitingFallbackTag,
+            bytes: waitingFallbackBytes,
+            count: waitingFallbackImage == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "waiting-fallback",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerLiveScreenshotTag,
+            bytes: liveScreenshotBytes,
+            count: liveScreenshot == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "live-screenshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerShiftDragSnapshotTag,
+            bytes: shiftDragSnapshotBytes,
+            count: shiftDragDisplaySnapshot == nil ? 0 : 1,
+            unit: "images",
+            function: "ui.timeline.images",
+            kind: "zoom-snapshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerOCRNodesTag,
+            bytes: ocrNodeBytes,
+            count: ocrNodes.count,
+            unit: "nodes",
+            function: "ui.timeline.ocr_overlay",
+            kind: "ocr-nodes",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPreviousOCRNodesTag,
+            bytes: previousOCRNodeBytes,
+            count: previousOcrNodes.count,
+            unit: "nodes",
+            function: "ui.timeline.ocr_overlay",
+            kind: "previous-ocr-nodes",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerHyperlinkMatchesTag,
+            bytes: hyperlinkBytes,
+            count: hyperlinkMatches.count,
+            unit: "matches",
+            function: "ui.timeline.ocr_overlay",
+            kind: "hyperlink-overlay",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerAppBlockSnapshotTag,
+            bytes: appBlockSnapshotBytes,
+            count: _cachedAppBlockSnapshot?.blocks.count ?? 0,
+            unit: "blocks",
+            function: "ui.timeline.state",
+            kind: "app-block-snapshot",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerTagCatalogTag,
+            bytes: tagCatalogBytes,
+            count: cachedAvailableTagsByID.count,
+            unit: "tags",
+            function: "ui.timeline.state",
+            kind: "tag-catalog",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerNodeSelectionCacheTag,
+            bytes: nodeSelectionCacheBytes,
+            count: cachedSortedNodes?.count ?? 0,
+            unit: "nodes",
+            function: "ui.timeline.state",
+            kind: "node-selection-cache",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerPendingExpansionTag,
+            bytes: pendingExpansionBytes,
+            count: queuedOrInFlightCacheExpansionFrameIDs.count,
+            unit: "frames",
+            function: "ui.timeline.state",
+            kind: "cache-expansion-queue",
+            note: "estimated"
         )
         MemoryLedger.emitSummary(
             reason: "ui.timeline.memory",
@@ -2535,6 +2773,10 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     nonisolated static func timelineDiskFrameBufferDirectoryURL() -> URL {
+        defaultDiskFrameBufferDirectoryURL()
+    }
+
+    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
@@ -2578,10 +2820,6 @@ public class SimpleTimelineViewModel: ObservableObject {
             )
             return nil
         }
-    }
-
-    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
-        timelineDiskFrameBufferDirectoryURL()
     }
 
     nonisolated private static func frameID(fromDiskFrameFileURL url: URL) -> FrameID? {
@@ -3003,6 +3241,35 @@ public class SimpleTimelineViewModel: ObservableObject {
         formatter.includesUnit = true
         formatter.isAdaptive = true
         return formatter.string(fromByteCount: max(0, bytes))
+    }
+
+    nonisolated private static func clearTimelineMemoryLedger() {
+        let zeroCountTags: [(tag: String, unit: String, function: String, kind: String)] = [
+            (Self.memoryLedgerDiskBufferTag, "frames", "ui.timeline.state", "disk-frame-buffer"),
+            (Self.memoryLedgerFrameWindowTag, "frames", "ui.timeline.state", "frame-window"),
+            (Self.memoryLedgerCurrentImageTag, "images", "ui.timeline.images", "current-frame"),
+            (Self.memoryLedgerWaitingFallbackTag, "images", "ui.timeline.images", "waiting-fallback"),
+            (Self.memoryLedgerLiveScreenshotTag, "images", "ui.timeline.images", "live-screenshot"),
+            (Self.memoryLedgerShiftDragSnapshotTag, "images", "ui.timeline.images", "zoom-snapshot"),
+            (Self.memoryLedgerOCRNodesTag, "nodes", "ui.timeline.ocr_overlay", "ocr-nodes"),
+            (Self.memoryLedgerPreviousOCRNodesTag, "nodes", "ui.timeline.ocr_overlay", "previous-ocr-nodes"),
+            (Self.memoryLedgerHyperlinkMatchesTag, "matches", "ui.timeline.ocr_overlay", "hyperlink-overlay"),
+            (Self.memoryLedgerAppBlockSnapshotTag, "blocks", "ui.timeline.state", "app-block-snapshot"),
+            (Self.memoryLedgerTagCatalogTag, "tags", "ui.timeline.state", "tag-catalog"),
+            (Self.memoryLedgerNodeSelectionCacheTag, "nodes", "ui.timeline.state", "node-selection-cache"),
+            (Self.memoryLedgerPendingExpansionTag, "frames", "ui.timeline.state", "cache-expansion-queue")
+        ]
+
+        for entry in zeroCountTags {
+            MemoryLedger.set(
+                tag: entry.tag,
+                bytes: 0,
+                count: 0,
+                unit: entry.unit,
+                function: entry.function,
+                kind: entry.kind
+            )
+        }
     }
 
     private func summarizeFiltersForLog(_ filters: FilterCriteria) -> String {
@@ -12378,6 +12645,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         let requestedTime = videoInfo.frameTimeCMTime
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.shiftDragGeneratorTag,
+            function: "ui.timeline.direct_decode",
+            reason: "ui.timeline.shift_drag_decode",
+            videoInfo: videoInfo
+        )
 
         let asset = AVURLAsset(url: url)
         let imageGenerator = AVAssetImageGenerator(asset: asset)
@@ -12387,6 +12660,11 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: requestedTime)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.shiftDragGeneratorTag,
+                    reason: "ui.timeline.shift_drag_decode",
+                    bytes: directDecodeBytes
+                )
                 guard requestID == self.shiftDragDisplayRequestID else {
                     return
                 }
@@ -13281,6 +13559,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.zoomCopyGeneratorTag,
+            function: "ui.timeline.direct_decode",
+            reason: "ui.timeline.zoom_copy_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
@@ -13290,6 +13574,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         let time = videoInfo.frameTimeCMTime
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.zoomCopyGeneratorTag,
+                    reason: "ui.timeline.zoom_copy_decode",
+                    bytes: directDecodeBytes
+                )
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)

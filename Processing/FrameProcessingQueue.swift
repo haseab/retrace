@@ -5,6 +5,447 @@ import Database
 import Search
 import ImageIO
 
+enum OCRStageMemoryLedger {
+    private static let tracker = Tracker()
+    private static let phaseResidualHoldSeconds: TimeInterval = 0.8
+    private static let summaryIntervalSeconds: TimeInterval = 30
+    private static let transientResidualSpecs: [(tag: String, function: String, kind: String)] = [
+        ("processing.ocr.stageFrameLoadResidual", "processing.ocr.stage_load", "stage-frame-load-residual"),
+        ("processing.ocr.stageExtractResidual", "processing.ocr.stage_extract", "stage-extract-residual"),
+        ("processing.ocr.stageReleaseResidual", "processing.ocr.stage_release", "stage-release-residual"),
+        ("processing.ocr.stageObservedResidual", "processing.ocr.stage", "stage-observed-residual"),
+        ("processing.ocr.stageResidual", "processing.ocr.stage_residual", "stage-residual")
+    ]
+
+    static func measuredResidualBytes(
+        before: MemoryLedger.Snapshot,
+        after: MemoryLedger.Snapshot
+    ) -> Int64 {
+        let processDelta = after.footprintBytes > before.footprintBytes
+            ? after.footprintBytes - before.footprintBytes
+            : 0
+        let trackedDelta = after.trackedMemoryBytes > before.trackedMemoryBytes
+            ? after.trackedMemoryBytes - before.trackedMemoryBytes
+            : 0
+        let clampedTrackedDelta = UInt64(max(0, trackedDelta))
+
+        guard processDelta > clampedTrackedDelta else { return 0 }
+        let residualBytes = processDelta - clampedTrackedDelta
+        return Int64(min(residualBytes, UInt64(Int64.max)))
+    }
+
+    static func currentUnattributedBytes(_ snapshot: MemoryLedger.Snapshot) -> Int64 {
+        Int64(min(snapshot.unattributedBytes, UInt64(Int64.max)))
+    }
+
+    static func beginActiveFrame(bytes: Int64, reason: String) {
+        tracker.begin(
+            tag: "processing.ocr.activeFrames",
+            function: "processing.ocr.pipeline",
+            kind: "active-frame",
+            note: "estimated",
+            unit: "frames",
+            bytes: bytes,
+            reason: reason
+        )
+    }
+
+    static func endActiveFrame(bytes: Int64, reason: String) {
+        tracker.end(
+            tag: "processing.ocr.activeFrames",
+            bytes: bytes,
+            reason: reason
+        )
+    }
+
+    static func currentActiveFrameCount() -> Int {
+        tracker.currentCount(tag: "processing.ocr.activeFrames")
+    }
+
+    static func currentTrackedBytes(tag: String) -> Int64 {
+        tracker.currentBytes(tag: tag)
+    }
+
+    static func clearTransientStageResiduals(reason: String) {
+        for spec in transientResidualSpecs {
+            tracker.clear(
+                tag: spec.tag,
+                function: spec.function,
+                kind: spec.kind,
+                note: "cycle-reset",
+                unit: "samples",
+                reason: reason,
+                emitSummary: false
+            )
+        }
+    }
+
+    static func setActiveFrameCountForTesting(
+        _ count: Int,
+        bytesPerFrame: Int64 = 1
+    ) {
+        tracker.setCountForTesting(
+            tag: "processing.ocr.activeFrames",
+            function: "processing.ocr.pipeline",
+            kind: "active-frame",
+            note: "estimated",
+            unit: "frames",
+            count: count,
+            bytesPerUnit: bytesPerFrame
+        )
+    }
+
+    static func beginJPEGDecodeSurface(width: Int, height: Int, reason: String) {
+        tracker.begin(
+            tag: "processing.ocr.jpegDecodeSurface",
+            function: "processing.ocr.pipeline",
+            kind: "jpeg-decode-surface",
+            note: "estimated-native",
+            unit: "surfaces",
+            bytes: estimatedSurfaceBytes(width: width, height: height),
+            reason: reason
+        )
+    }
+
+    static func endJPEGDecodeSurface(width: Int, height: Int, reason: String) {
+        tracker.end(
+            tag: "processing.ocr.jpegDecodeSurface",
+            bytes: estimatedSurfaceBytes(width: width, height: height),
+            reason: reason
+        )
+    }
+
+    static func emitObservedResidual(reason: String) async {
+        let snapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let residualBytes = Int64(min(snapshot.unattributedBytes, UInt64(Int64.max)))
+        tracker.setRetained(
+            tag: "processing.ocr.stageResidual",
+            function: "processing.ocr.stage_residual",
+            kind: "stage-residual",
+            note: "observed-unattributed",
+            unit: "samples",
+            bytes: residualBytes,
+            reason: reason,
+            delay: 0
+        )
+    }
+
+    static func setResidual(
+        tag: String,
+        function: String,
+        kind: String,
+        note: String,
+        bytes: Int64,
+        reason: String,
+        delay: TimeInterval = phaseResidualHoldSeconds,
+        forceSummary: Bool = true
+    ) {
+        tracker.setRetained(
+            tag: tag,
+            function: function,
+            kind: kind,
+            note: note,
+            unit: "samples",
+            bytes: bytes,
+            reason: reason,
+            delay: delay,
+            forceSummary: forceSummary
+        )
+    }
+
+    static func fallbackStageResidualBytes(
+        totalStageResidualBytes: Int64,
+        frameLoadResidualBytes: Int64,
+        extractResidualBytes: Int64,
+        releaseResidualBytes: Int64,
+        stageObservedResidualBytes: Int64,
+        stageResidualExclusionBytes: Int64
+    ) -> Int64 {
+        max(
+            0,
+            totalStageResidualBytes -
+                max(0, frameLoadResidualBytes) -
+                max(0, extractResidualBytes) -
+                max(0, releaseResidualBytes) -
+                max(0, stageObservedResidualBytes) -
+                max(0, stageResidualExclusionBytes)
+        )
+    }
+
+    static func stageObservedResidualBytes(
+        settledHandoffObservedResidualBytes: Int64,
+        currentUnattributedBytes: Int64,
+        activeOCRFrameCount: Int
+    ) -> Int64 {
+        guard settledHandoffObservedResidualBytes <= 0 else { return 0 }
+        guard activeOCRFrameCount <= 0 else { return 0 }
+        return max(0, currentUnattributedBytes)
+    }
+
+    private static func estimatedSurfaceBytes(width: Int, height: Int) -> Int64 {
+        guard width > 0, height > 0 else { return 0 }
+        return max(0, Int64(width) * Int64(height) * 4)
+    }
+
+    private final class Tracker: @unchecked Sendable {
+        private struct Entry {
+            var bytes: Int64
+            var count: Int
+            var function: String
+            var kind: String
+            var note: String?
+            var unit: String
+        }
+
+        private let lock = NSLock()
+        private var entriesByTag: [String: Entry] = [:]
+        private var retainedGenerationByTag: [String: UInt64] = [:]
+
+        func begin(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            bytes: Int64,
+            reason: String
+        ) {
+            guard bytes > 0 else { return }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit
+            )
+            entry.bytes += bytes
+            entry.count += 1
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func end(tag: String, bytes: Int64, reason: String) {
+            guard bytes > 0 else { return }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: "processing.ocr.pipeline",
+                kind: "active-frame",
+                note: nil,
+                unit: "items"
+            )
+            entry.bytes = max(0, entry.bytes - bytes)
+            entry.count = max(0, entry.count - 1)
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func setRetained(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            bytes: Int64,
+            reason: String,
+            delay: TimeInterval,
+            forceSummary: Bool = false
+        ) {
+            let generation: UInt64
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit
+            )
+            entry.bytes = max(0, bytes)
+            entry.count = entry.bytes > 0 ? 1 : 0
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entriesByTag[tag] = entry
+            generation = (retainedGenerationByTag[tag] ?? 0) + 1
+            retainedGenerationByTag[tag] = generation
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+
+            let boundedDelay = max(0, delay)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + boundedDelay) { [self] in
+                clearRetainedIfCurrent(tag: tag, generation: generation, reason: reason)
+            }
+        }
+
+        private func clearRetainedIfCurrent(tag: String, generation: UInt64, reason: String) {
+            lock.lock()
+            guard retainedGenerationByTag[tag] == generation else {
+                lock.unlock()
+                return
+            }
+
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-unattributed",
+                unit: "samples"
+            )
+            entry.bytes = 0
+            entry.count = 0
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func currentCount(tag: String) -> Int {
+            lock.lock()
+            let count = entriesByTag[tag]?.count ?? 0
+            lock.unlock()
+            return count
+        }
+
+        func currentBytes(tag: String) -> Int64 {
+            lock.lock()
+            let bytes = entriesByTag[tag]?.bytes ?? 0
+            lock.unlock()
+            return bytes
+        }
+
+        func clear(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            reason: String,
+            emitSummary: Bool
+        ) {
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit
+            )
+            entry.bytes = 0
+            entry.count = 0
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            guard emitSummary else { return }
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .processing,
+                minIntervalSeconds: OCRStageMemoryLedger.summaryIntervalSeconds
+            )
+        }
+
+        func setCountForTesting(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            count: Int,
+            bytesPerUnit: Int64
+        ) {
+            let sanitizedCount = max(0, count)
+            let sanitizedBytesPerUnit = max(0, bytesPerUnit)
+            let totalBytes: Int64
+            if sanitizedCount == 0 || sanitizedBytesPerUnit == 0 {
+                totalBytes = 0
+            } else {
+                let (product, overflowed) = Int64(sanitizedCount).addingReportingOverflow(0)
+                if overflowed {
+                    totalBytes = Int64.max
+                } else {
+                    let (multiplied, didOverflow) = product.multipliedReportingOverflow(by: sanitizedBytesPerUnit)
+                    totalBytes = didOverflow ? Int64.max : multiplied
+                }
+            }
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit
+            )
+            entry.bytes = totalBytes
+            entry.count = sanitizedCount
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+        }
+
+        private func publish(tag: String, entry: Entry) {
+            MemoryLedger.set(
+                tag: tag,
+                bytes: entry.bytes,
+                count: entry.count,
+                unit: entry.unit,
+                function: entry.function,
+                kind: entry.kind,
+                note: entry.note
+            )
+        }
+    }
+}
+
 /// Asynchronous frame processing queue with SQLite-backed durability
 ///
 /// Features:
@@ -553,6 +994,10 @@ public actor FrameProcessingQueue {
 
                     // Handle deferred processing result
                     if case .deferredSourceNotReady = result {
+                        // Dequeue now moves frames to `.processing` atomically, so deferred work
+                        // must explicitly return the frame to pending before re-enqueueing it.
+                        try await updateFrameProcessingStatus(queuedFrame.frameID, status: .pending)
+
                         // Frame's source is not readable yet (e.g. WAL write still catching up) - re-enqueue for later
                         try await databaseManager.enqueueFrameForProcessing(frameID: queuedFrame.frameID, priority: -1)
                         currentQueueDepth += 1
@@ -756,6 +1201,13 @@ public actor FrameProcessingQueue {
         videoSegment: VideoSegment,
         actualSegmentID: VideoSegmentID
     ) async throws -> OCRStageResult {
+        let residualEpoch = await MemoryLedger.beginResidualEpoch(
+            ownerFunction: "processing.ocr.stage",
+            candidateConcurrentFunctions: ["capture.screen_capture"]
+        )
+        OCRStageMemoryLedger.clearTransientStageResiduals(reason: "processing.ocr.stage")
+        let stageBaselineSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+
         // Source select:
         // - finalized video -> decode frame from encoded segment file
         // - non-finalized video -> read raw frame directly from WAL by frame index
@@ -772,6 +1224,7 @@ public actor FrameProcessingQueue {
                 Log.error("[Queue] This suggests database/storage path mismatch. Check AppPaths.storageRoot setting.", category: .processing)
 
                 try await updateFrameProcessingStatus(frameID, status: .failed)
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 return .failedPermanently
             }
 
@@ -782,6 +1235,7 @@ public actor FrameProcessingQueue {
 
             guard let convertedFrame = try convertJPEGToCapturedFrame(frameData, frameRef: frameRef) else {
                 Log.error("[Queue-DIAG] Frame \(frameID) image conversion failed!", category: .processing)
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 throw ProcessingError.imageConversionFailed
             }
             capturedFrame = convertedFrame
@@ -793,6 +1247,7 @@ public actor FrameProcessingQueue {
                 segmentID: actualSegmentID,
                 frameIndex: frameRef.frameIndexInSegment
             ) else {
+                await MemoryLedger.endResidualEpoch(residualEpoch)
                 return .deferred
             }
             capturedFrame = walFrame
@@ -800,11 +1255,174 @@ public actor FrameProcessingQueue {
             processedFrameHeight = walFrame.height
         }
 
-        try await updateFrameProcessingStatus(frameID, status: .processing)
+        let postFrameLoadSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let frameLoadResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+            before: stageBaselineSnapshot,
+            after: postFrameLoadSnapshot
+        )
+        OCRStageMemoryLedger.setResidual(
+            tag: "processing.ocr.stageFrameLoadResidual",
+            function: "processing.ocr.stage_load",
+            kind: "stage-frame-load-residual",
+            note: "observed-footprint-delta",
+            bytes: frameLoadResidualBytes,
+            reason: "processing.ocr.stage_frame_load"
+        )
+
         let ocrStartTime = CFAbsoluteTimeGetCurrent()
+        let activeFrameBytes = Int64(capturedFrame.imageData.count)
+        OCRStageMemoryLedger.beginActiveFrame(
+            bytes: activeFrameBytes,
+            reason: "processing.ocr.stage"
+        )
+        let extractedText: ExtractedText
+        do {
+            extractedText = try await processing.extractText(from: capturedFrame)
+            let postExtractSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let extractResidualBytes = max(
+                0,
+                OCRStageMemoryLedger.measuredResidualBytes(
+                before: postFrameLoadSnapshot,
+                after: postExtractSnapshot
+                ) - ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            await ProcessingExtractMemoryLedger.clearObservedResidualsForHandoff(
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageExtractResidual",
+                function: "processing.ocr.stage_extract",
+                kind: "stage-extract-residual",
+                note: "observed-footprint-delta-net-active-extract-residuals",
+                bytes: extractResidualBytes,
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.endActiveFrame(
+                bytes: activeFrameBytes,
+                reason: "processing.ocr.stage"
+            )
+            let postReleaseSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let releaseResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: postExtractSnapshot,
+                after: postReleaseSnapshot
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageReleaseResidual",
+                function: "processing.ocr.stage_release",
+                kind: "stage-release-residual",
+                note: "observed-footprint-delta",
+                bytes: releaseResidualBytes,
+                reason: "processing.ocr.stage_release"
+            )
+            _ = ProcessingExtractMemoryLedger.settleObservedResidualAtStageRelease(
+                snapshot: postReleaseSnapshot,
+                reason: "processing.ocr.stage_release"
+            )
+            let settledHandoffObservedResidualBytes =
+                ProcessingExtractMemoryLedger.currentHandoffObservedResidualBytes()
+            let stageObservedResidualBytes = OCRStageMemoryLedger.stageObservedResidualBytes(
+                settledHandoffObservedResidualBytes: settledHandoffObservedResidualBytes,
+                currentUnattributedBytes: OCRStageMemoryLedger.currentUnattributedBytes(postReleaseSnapshot),
+                activeOCRFrameCount: OCRStageMemoryLedger.currentActiveFrameCount()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageObservedResidual",
+                function: "processing.ocr.stage",
+                kind: "stage-observed-residual",
+                note: "observed-current-unattributed-after-stage-release",
+                bytes: stageObservedResidualBytes,
+                reason: "processing.ocr.stage_release",
+                delay: 0.8
+            )
+            let totalStageResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: stageBaselineSnapshot,
+                after: postReleaseSnapshot
+            )
+            let fallbackStageResidualBytes = OCRStageMemoryLedger.fallbackStageResidualBytes(
+                totalStageResidualBytes: totalStageResidualBytes,
+                frameLoadResidualBytes: frameLoadResidualBytes,
+                extractResidualBytes: extractResidualBytes,
+                releaseResidualBytes: releaseResidualBytes,
+                stageObservedResidualBytes: stageObservedResidualBytes,
+                stageResidualExclusionBytes: ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageResidual",
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-stage-remainder",
+                bytes: fallbackStageResidualBytes,
+                reason: "processing.ocr.stage"
+            )
+        } catch {
+            OCRStageMemoryLedger.endActiveFrame(
+                bytes: activeFrameBytes,
+                reason: "processing.ocr.stage"
+            )
+            let postFailureSnapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+            let extractResidualBytes = max(
+                0,
+                OCRStageMemoryLedger.measuredResidualBytes(
+                before: postFrameLoadSnapshot,
+                after: postFailureSnapshot
+                ) - ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            await ProcessingExtractMemoryLedger.clearObservedResidualsForHandoff(
+                reason: "processing.ocr.stage_extract"
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageExtractResidual",
+                function: "processing.ocr.stage_extract",
+                kind: "stage-extract-residual",
+                note: "observed-footprint-delta-net-active-extract-residuals",
+                bytes: extractResidualBytes,
+                reason: "processing.ocr.stage_extract"
+            )
+            let totalStageResidualBytes = OCRStageMemoryLedger.measuredResidualBytes(
+                before: stageBaselineSnapshot,
+                after: postFailureSnapshot
+            )
+            _ = ProcessingExtractMemoryLedger.settleObservedResidualAtStageRelease(
+                snapshot: postFailureSnapshot,
+                reason: "processing.ocr.stage_extract"
+            )
+            let settledHandoffObservedResidualBytes =
+                ProcessingExtractMemoryLedger.currentHandoffObservedResidualBytes()
+            let stageObservedResidualBytes = OCRStageMemoryLedger.stageObservedResidualBytes(
+                settledHandoffObservedResidualBytes: settledHandoffObservedResidualBytes,
+                currentUnattributedBytes: OCRStageMemoryLedger.currentUnattributedBytes(postFailureSnapshot),
+                activeOCRFrameCount: OCRStageMemoryLedger.currentActiveFrameCount()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageObservedResidual",
+                function: "processing.ocr.stage",
+                kind: "stage-observed-residual",
+                note: "observed-current-unattributed-after-stage-failure",
+                bytes: stageObservedResidualBytes,
+                reason: "processing.ocr.stage_extract",
+                delay: 0.8
+            )
+            let fallbackStageResidualBytes = OCRStageMemoryLedger.fallbackStageResidualBytes(
+                totalStageResidualBytes: totalStageResidualBytes,
+                frameLoadResidualBytes: frameLoadResidualBytes,
+                extractResidualBytes: extractResidualBytes,
+                releaseResidualBytes: 0,
+                stageObservedResidualBytes: stageObservedResidualBytes,
+                stageResidualExclusionBytes: ProcessingExtractMemoryLedger.currentStageResidualExclusionBytes()
+            )
+            OCRStageMemoryLedger.setResidual(
+                tag: "processing.ocr.stageResidual",
+                function: "processing.ocr.stage_residual",
+                kind: "stage-residual",
+                note: "observed-stage-remainder",
+                bytes: fallbackStageResidualBytes,
+                reason: "processing.ocr.stage"
+            )
+            await MemoryLedger.endResidualEpoch(residualEpoch)
+            throw error
+        }
 
-        let extractedText = try await processing.extractText(from: capturedFrame)
-
+        await MemoryLedger.endResidualEpoch(residualEpoch)
         return .ready(OCRStageOutput(
             extractedText: extractedText,
             frameWidth: processedFrameWidth,
@@ -827,6 +1445,19 @@ public actor FrameProcessingQueue {
             guard let imageSource = CGImageSourceCreateWithData(jpegData as CFData, sourceOptions),
                   let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, imageOptions) else {
                 return nil
+            }
+
+            OCRStageMemoryLedger.beginJPEGDecodeSurface(
+                width: cgImage.width,
+                height: cgImage.height,
+                reason: "processing.ocr.jpeg_decode"
+            )
+            defer {
+                OCRStageMemoryLedger.endJPEGDecodeSurface(
+                    width: cgImage.width,
+                    height: cgImage.height,
+                    reason: "processing.ocr.jpeg_decode"
+                )
             }
 
             let width = cgImage.width

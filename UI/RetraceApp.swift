@@ -59,6 +59,46 @@ enum SingleInstanceLock {
         descriptor = -1
     }
 }
+enum SingleInstanceLockRetryResult: Equatable {
+    case acquired(descriptor: CInt, attempts: Int)
+    case failedHeldByAnotherProcess(attempts: Int)
+    case failedError(code: Int32, attempts: Int)
+}
+
+enum SingleInstanceLockRetrier {
+    static func acquire(
+        maxAttempts: Int,
+        retryDelay: Duration,
+        existingDescriptor: CInt = -1,
+        acquire: (CInt) -> SingleInstanceLock.AcquireResult,
+        sleep: (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration, clock: .continuous)
+        }
+    ) async -> SingleInstanceLockRetryResult {
+        let attempts = max(maxAttempts, 1)
+
+        for attempt in 1...attempts {
+            switch acquire(existingDescriptor) {
+            case .alreadyHeld(let descriptor), .acquired(let descriptor):
+                return .acquired(descriptor: descriptor, attempts: attempt)
+
+            case .heldByAnotherProcess:
+                if attempt == attempts {
+                    return .failedHeldByAnotherProcess(attempts: attempt)
+                }
+
+            case .error(let code):
+                if attempt == attempts {
+                    return .failedError(code: code, attempts: attempt)
+                }
+            }
+
+            await sleep(retryDelay)
+        }
+
+        return .failedHeldByAnotherProcess(attempts: attempts)
+    }
+}
 /// Main app entry point
 @main
 struct RetraceApp: App {
@@ -196,8 +236,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private static let showDockIconPreferenceKey = "showDockIcon"
     private static let canonicalBundleIdentifier = "io.retrace.app"
     private static let singleInstanceLockPath = "/tmp/io.retrace.app.instance.lock"
+    private static let launchLockRetryAttempts = 5
     private static let relaunchLockRetryAttempts = 30
-    private static let relaunchLockRetryDelay: Duration = .milliseconds(100)
+    private static let singleInstanceLockRetryDelay: Duration = .milliseconds(100)
     nonisolated private static let watchdogSleepSuspensionSeconds: TimeInterval = 12 * 60 * 60
     nonisolated private static let watchdogWakeGracePeriodSeconds: TimeInterval = 60
 
@@ -220,46 +261,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if isRelaunch {
             Log.info("[AppDelegate] App relaunched successfully", category: .app)
             UserDefaults.standard.removeObject(forKey: "isRelaunching")
-            Task { @MainActor [weak self] in
-                guard let self else { return }
+        }
 
-                let hasSingleInstanceLock = await self.acquireSingleInstanceLockAfterRelaunch()
-                guard hasSingleInstanceLock else {
+        Task { @MainActor in
+            let retryAttempts = isRelaunch ? Self.relaunchLockRetryAttempts : Self.launchLockRetryAttempts
+            let hasSingleInstanceLock = await self.acquireSingleInstanceLock(
+                maxAttempts: retryAttempts,
+                reason: isRelaunch ? "relaunch handoff" : "launch"
+            )
+
+            guard hasSingleInstanceLock else {
+                if isRelaunch {
                     Log.warning(
                         "[AppDelegate] Relaunch could not reacquire the single-instance lock after handoff window; activating existing instance and terminating duplicate.",
                         category: .app
                     )
+                } else {
+                    Log.info(
+                        "[AppDelegate] Could not acquire the single-instance lock for launch; activating existing instance if available and terminating duplicate.",
+                        category: .app
+                    )
+                }
+                self.activateExistingInstance()
+                self.requestImmediateTermination(skipQuitConfirmation: true)
+                return
+            }
+
+            if !isRelaunch {
+                switch Self.freshLaunchAction(
+                    hasSingleInstanceLock: true,
+                    matchingRunningAppDetected: self.isAnotherInstanceRunning()
+                ) {
+                case .continueLaunch:
+                    break
+                case .continueLaunchIgnoringStaleRunningApp:
+                    Log.warning(
+                        "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
+                        category: .app
+                    )
+                case .activateExistingInstance:
+                    Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
                     self.activateExistingInstance()
                     self.requestImmediateTermination(skipQuitConfirmation: true)
                     return
                 }
-
-                self.finishApplicationLaunch()
             }
-            return
+
+            self.finishApplicationLaunch()
         }
-
-        let freshLaunchAction = Self.freshLaunchAction(
-            hasSingleInstanceLock: acquireSingleInstanceLock(),
-            matchingRunningAppDetected: isAnotherInstanceRunning()
-        )
-
-        switch freshLaunchAction {
-        case .continueLaunch:
-            break
-        case .continueLaunchIgnoringStaleRunningApp:
-            Log.warning(
-                "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
-                category: .app
-            )
-        case .activateExistingInstance:
-            Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
-            activateExistingInstance()
-            requestImmediateTermination(skipQuitConfirmation: true)
-            return
-        }
-
-        finishApplicationLaunch()
     }
 
     private func finishApplicationLaunch() {
@@ -291,46 +340,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Note: Permissions are now handled in the onboarding flow
-    }
-
-    private func acquireSingleInstanceLockAfterRelaunch() async -> Bool {
-        for attempt in 1...Self.relaunchLockRetryAttempts {
-            switch SingleInstanceLock.acquire(
-                atPath: Self.singleInstanceLockPath,
-                existingDescriptor: singleInstanceLockFileDescriptor
-            ) {
-            case .alreadyHeld(let descriptor), .acquired(let descriptor):
-                singleInstanceLockFileDescriptor = descriptor
-                Log.info(
-                    "[AppDelegate] Relaunch acquired single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
-                    category: .app
-                )
-                return true
-
-            case .heldByAnotherProcess:
-                if attempt == Self.relaunchLockRetryAttempts {
-                    return false
-                }
-
-                if attempt == 1 || attempt % 5 == 0 {
-                    Log.info(
-                        "[AppDelegate] Waiting for previous instance to release single-instance lock attempt=\(attempt)/\(Self.relaunchLockRetryAttempts)",
-                        category: .app
-                    )
-                }
-
-                try? await Task.sleep(for: Self.relaunchLockRetryDelay, clock: .continuous)
-
-            case .error(let lockError):
-                Log.error(
-                    "[AppDelegate] Failed to reacquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
-                    category: .app
-                )
-                return true
-            }
-        }
-
-        return false
     }
 
     private func applyDockIconVisibilityPreference() {
@@ -1577,24 +1586,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return Self.canonicalBundleIdentifier
     }
 
-    private func acquireSingleInstanceLock() -> Bool {
-        switch SingleInstanceLock.acquire(
-            atPath: Self.singleInstanceLockPath,
+    private func acquireSingleInstanceLock(maxAttempts: Int, reason: String) async -> Bool {
+        let result = await SingleInstanceLockRetrier.acquire(
+            maxAttempts: maxAttempts,
+            retryDelay: Self.singleInstanceLockRetryDelay,
             existingDescriptor: singleInstanceLockFileDescriptor
-        ) {
-        case .alreadyHeld(let descriptor), .acquired(let descriptor):
+        ) { descriptor in
+            SingleInstanceLock.acquire(
+                atPath: Self.singleInstanceLockPath,
+                existingDescriptor: descriptor
+            )
+        }
+
+        switch result {
+        case .acquired(let descriptor, let attempts):
             singleInstanceLockFileDescriptor = descriptor
+
+            if attempts > 1 {
+                Log.info(
+                    "[AppDelegate] Acquired single-instance lock for \(reason) after \(attempts) attempts",
+                    category: .app
+                )
+            }
+
             return true
 
-        case .heldByAnotherProcess:
-            return false
-
-        case .error(let lockError):
-            Log.error(
-                "[AppDelegate] Failed to acquire single-instance lock at \(Self.singleInstanceLockPath): \(String(cString: strerror(lockError)))",
+        case .failedHeldByAnotherProcess(let attempts):
+            let holder = lockFileInstancePID().map { String($0) } ?? "unknown"
+            Log.warning(
+                "[AppDelegate] Could not acquire single-instance lock for \(reason) after \(attempts) attempts because another process still holds it; holder pid=\(holder)",
                 category: .app
             )
-            return true
+            return false
+
+        case .failedError(let lockError, let attempts):
+            Log.error(
+                "[AppDelegate] Failed to acquire single-instance lock for \(reason) at \(Self.singleInstanceLockPath) after \(attempts) attempts: \(String(cString: strerror(lockError)))",
+                category: .app
+            )
+            return false
         }
     }
 

@@ -3530,6 +3530,12 @@ public class TimelineWindowController: NSObject {
         }
 
         let asset = AVURLAsset(url: url)
+        let directDecodeBytes = UIDirectFrameDecodeMemoryLedger.begin(
+            tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+            function: "ui.timeline.window_actions",
+            reason: "ui.timeline.window_frame_decode",
+            videoInfo: videoInfo
+        )
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.requestedTimeToleranceBefore = .zero
@@ -3539,6 +3545,11 @@ public class TimelineWindowController: NSObject {
 
         imageGenerator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
             DispatchQueue.main.async {
+                UIDirectFrameDecodeMemoryLedger.end(
+                    tag: UIDirectFrameDecodeMemoryLedger.timelineWindowGeneratorTag,
+                    reason: "ui.timeline.window_frame_decode",
+                    bytes: directDecodeBytes
+                )
                 if let cgImage = cgImage {
                     let nsImage = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
                     completion(nsImage)

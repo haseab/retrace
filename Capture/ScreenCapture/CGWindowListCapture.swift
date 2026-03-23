@@ -4,6 +4,178 @@ import AppKit
 import CoreImage
 import Shared
 
+private enum CaptureScreenResidualMemoryLedger {
+    private static let tracker = Tracker()
+    private static let concurrentResidualTag = "concurrent.captureProcessing.observedResidual"
+    private static let concurrentResidualFunction = "concurrent.capture_processing"
+    private static let processingOwnedResidualFunctions: Set<String> = [
+        "processing.extract_text.residual",
+        "processing.extract_text.ocr_call",
+        "processing.extract_text.handoff",
+        "processing.extract_text.ocr_tail",
+        "processing.ocr.region_reocr",
+        "processing.ocr.full_frame",
+        "processing.ocr.stage"
+    ]
+
+    static func emitObservedResidual(
+        reason: String,
+        residualEpoch: MemoryLedger.ResidualEpoch
+    ) async {
+        let snapshot = await MemoryLedger.snapshot(waitForPendingUpdates: true)
+        let activeProcessingResidualBytes = snapshot.functions
+            .filter { processingOwnedResidualFunctions.contains($0.function) }
+            .reduce(into: Int64(0)) { runningTotal, summary in
+                if runningTotal > Int64.max - summary.trackedBytes {
+                    runningTotal = Int64.max
+                } else {
+                    runningTotal += max(0, summary.trackedBytes)
+                }
+            }
+        let requestedBytes = max(
+            0,
+            Int64(min(snapshot.unattributedBytes, UInt64(Int64.max))) - activeProcessingResidualBytes
+        )
+        await MemoryLedger.flushPendingUpdates()
+        let claim = await MemoryLedger.claimCurrentUnattributed(
+            epoch: residualEpoch,
+            requestedBytes: requestedBytes
+        )
+
+        let tag: String
+        let function: String
+        let kind: String
+        let note: String
+
+        switch claim.target {
+        case .owner:
+            tag = "capture.screenCapture.observedResidual"
+            function = "capture.screen_capture"
+            kind = "screen-capture-residual"
+            note = "epoch-arbited-current-unattributed"
+        case .concurrent:
+            tag = concurrentResidualTag
+            function = concurrentResidualFunction
+            kind = "concurrent-capture-processing-residual"
+            note = "epoch-arbited-current-unattributed"
+        case .none:
+            return
+        }
+
+        tracker.setRetained(
+            tag: tag,
+            function: function,
+            kind: kind,
+            note: note,
+            unit: "samples",
+            bytes: claim.bytes,
+            reason: reason,
+            delay: 0
+        )
+    }
+
+    private final class Tracker: @unchecked Sendable {
+        private struct Entry {
+            var bytes: Int64
+            var count: Int
+            var function: String
+            var kind: String
+            var note: String?
+            var unit: String
+        }
+
+        private let lock = NSLock()
+        private var entriesByTag: [String: Entry] = [:]
+        private var retainedGenerationByTag: [String: UInt64] = [:]
+
+        func setRetained(
+            tag: String,
+            function: String,
+            kind: String,
+            note: String?,
+            unit: String,
+            bytes: Int64,
+            reason: String,
+            delay: TimeInterval
+        ) {
+            let generation: UInt64
+
+            lock.lock()
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: function,
+                kind: kind,
+                note: note,
+                unit: unit
+            )
+            entry.bytes = max(0, bytes)
+            entry.count = entry.bytes > 0 ? 1 : 0
+            entry.function = function
+            entry.kind = kind
+            entry.note = note
+            entry.unit = unit
+            entriesByTag[tag] = entry
+            generation = (retainedGenerationByTag[tag] ?? 0) + 1
+            retainedGenerationByTag[tag] = generation
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .capture,
+                minIntervalSeconds: 1,
+                force: true
+            )
+
+            let boundedDelay = max(0, delay)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + boundedDelay) { [self] in
+                clearRetainedIfCurrent(tag: tag, generation: generation, reason: reason)
+            }
+        }
+
+        private func clearRetainedIfCurrent(tag: String, generation: UInt64, reason: String) {
+            lock.lock()
+            guard retainedGenerationByTag[tag] == generation else {
+                lock.unlock()
+                return
+            }
+
+            var entry = entriesByTag[tag] ?? Entry(
+                bytes: 0,
+                count: 0,
+                function: "capture.screen_capture",
+                kind: "screen-capture-residual",
+                note: "observed-unattributed",
+                unit: "samples"
+            )
+            entry.bytes = 0
+            entry.count = 0
+            entriesByTag[tag] = entry
+            lock.unlock()
+
+            publish(tag: tag, entry: entry)
+            MemoryLedger.emitSummary(
+                reason: reason,
+                category: .capture,
+                minIntervalSeconds: 1
+            )
+        }
+
+        private func publish(tag: String, entry: Entry) {
+            MemoryLedger.set(
+                tag: tag,
+                bytes: entry.bytes,
+                count: entry.count,
+                unit: entry.unit,
+                function: entry.function,
+                kind: entry.kind,
+                note: entry.note
+            )
+        }
+    }
+}
+
 /// Service that uses legacy CGWindowList API for screen capture
 /// Unlike ScreenCaptureKit, this approach:
 /// - Does NOT show the purple privacy indicator
@@ -11,6 +183,11 @@ import Shared
 /// - Works on older macOS versions
 /// - Filters excluded apps and private windows on EVERY capture
 public actor CGWindowListCapture {
+    private static let memoryLedgerDisplaySurfaceTag = "capture.screenCapture.displaySurface"
+    private static let memoryLedgerIOSurfacePoolTag = "capture.screenCapture.ioSurfacePool"
+    private static let memoryLedgerCompositorBackingTag = "capture.screenCapture.compositorBacking"
+    private static let memoryLedgerRedactionSurfaceTag = "capture.screenCapture.redactionSurface"
+    private static let memoryLedgerSummaryIntervalSeconds: TimeInterval = 5
 
     // MARK: - Properties
 
@@ -71,6 +248,7 @@ public actor CGWindowListCapture {
     private let redactionMaskCornerRadius: CGFloat = 12
     private let redactionBorderWidth: CGFloat = 2
     private let redactionCIContext = CIContext()
+    private var lastDisplaySurfaceBytes: Int64 = 0
 
     // MARK: - Lifecycle
 
@@ -100,6 +278,8 @@ public actor CGWindowListCapture {
         isActive = false
         lastCaptureBlockReason = nil
         screenLockStateMonitor.stop()
+        lastDisplaySurfaceBytes = 0
+        updatePersistentCaptureNativeLedger()
     }
 
     /// Update capture configuration
@@ -128,6 +308,20 @@ public actor CGWindowListCapture {
     /// Capture a single frame with real-time filtering of excluded apps and private windows
     private func captureFrameInternal(displayID: CGWindowID) async -> CapturedFrame? {
         guard isActive, let config = currentConfig else { return nil }
+        let residualEpoch = await MemoryLedger.beginResidualEpoch(
+            ownerFunction: "capture.screen_capture",
+            candidateConcurrentFunctions: [
+                "processing.ocr.region_reocr",
+                "processing.ocr.full_frame",
+                "processing.extract_text",
+                "processing.ocr.stage"
+            ]
+        )
+        defer {
+            Task(priority: .utility) {
+                await MemoryLedger.endResidualEpoch(residualEpoch)
+            }
+        }
 
         // Compute excluded window IDs for THIS capture (real-time filtering)
         let exclusionResult = await computeExcludedWindowIDs(config: config, displayID: displayID)
@@ -149,6 +343,33 @@ public actor CGWindowListCapture {
             return nil
         }
         let cgImage = captureResult.image
+        let displaySurfaceBytes = Self.estimatedImageSurfaceBytes(width: cgImage.width, height: cgImage.height)
+        lastDisplaySurfaceBytes = displaySurfaceBytes
+        updatePersistentCaptureNativeLedger()
+        MemoryLedger.set(
+            tag: Self.memoryLedgerDisplaySurfaceTag,
+            bytes: displaySurfaceBytes,
+            count: displaySurfaceBytes > 0 ? 1 : 0,
+            unit: "surfaces",
+            function: "capture.screen_capture",
+            kind: "cgimage-surface",
+            note: "estimated-native"
+        )
+        await CaptureScreenResidualMemoryLedger.emitObservedResidual(
+            reason: "capture.screen_capture.memory",
+            residualEpoch: residualEpoch
+        )
+        defer {
+            MemoryLedger.set(
+                tag: Self.memoryLedgerDisplaySurfaceTag,
+                bytes: 0,
+                count: 0,
+                unit: "surfaces",
+                function: "capture.screen_capture",
+                kind: "cgimage-surface",
+                note: "estimated-native"
+            )
+        }
 
         // Convert CGImage to BGRA data format (matching ScreenCaptureKit output)
         guard let frameData = convertCGImageToBGRAData(cgImage) else {
@@ -875,6 +1096,32 @@ public actor CGWindowListCapture {
             return FilteredCaptureResult(image: fullScreenImage, visibleExcludedWindowIDs: [])
         }
 
+        let redactionSurfaceBytes = Self.estimatedImageSurfaceBytes(
+            width: fullScreenImage.width,
+            height: fullScreenImage.height,
+            copies: 3
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerRedactionSurfaceTag,
+            bytes: redactionSurfaceBytes,
+            count: redactionSurfaceBytes > 0 ? 3 : 0,
+            unit: "surfaces",
+            function: "capture.screen_capture",
+            kind: "redaction-surface",
+            note: "estimated-native"
+        )
+        defer {
+            MemoryLedger.set(
+                tag: Self.memoryLedgerRedactionSurfaceTag,
+                bytes: 0,
+                count: 0,
+                unit: "surfaces",
+                function: "capture.screen_capture",
+                kind: "redaction-surface",
+                note: "estimated-native"
+            )
+        }
+
         let displayBounds = CGDisplayBounds(displayID)
         let scale = CGFloat(fullScreenImage.width) / displayBounds.width
 
@@ -1131,5 +1378,37 @@ public actor CGWindowListCapture {
         }
 
         return success ? pixelData : nil
+    }
+
+    private static func estimatedImageSurfaceBytes(width: Int, height: Int, copies: Int64 = 1) -> Int64 {
+        guard width > 0, height > 0, copies > 0 else { return 0 }
+        let rowBytes = Int64(width) * 4
+        let bytes = rowBytes * Int64(height)
+        return max(0, bytes * copies)
+    }
+
+    private func updatePersistentCaptureNativeLedger() {
+        let displaySurfaceBytes = max(0, lastDisplaySurfaceBytes)
+        let ioSurfacePoolBytes = displaySurfaceBytes > 0 ? displaySurfaceBytes * 2 : 0
+        let compositorBackingBytes = displaySurfaceBytes
+
+        MemoryLedger.set(
+            tag: Self.memoryLedgerIOSurfacePoolTag,
+            bytes: ioSurfacePoolBytes,
+            count: ioSurfacePoolBytes > 0 ? 2 : 0,
+            unit: "surfaces",
+            function: "capture.screen_capture",
+            kind: "iosurface-pool",
+            note: "proxy-native"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerCompositorBackingTag,
+            bytes: compositorBackingBytes,
+            count: compositorBackingBytes > 0 ? 1 : 0,
+            unit: "surfaces",
+            function: "capture.screen_capture",
+            kind: "compositor-backing",
+            note: "proxy-native"
+        )
     }
 }

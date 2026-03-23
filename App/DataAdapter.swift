@@ -8,6 +8,7 @@ import SQLCipher
 /// Unified data adapter that owns connections directly and runs SQL
 /// Seamlessly blends data from Retrace (native) and Rewind (encrypted) databases
 public actor DataAdapter {
+    private static let memoryLedgerSegmentCacheTag = "app.dataAdapter.segmentCache"
 
     /// High-frequency function words that should not use prefix expansion.
     /// These still participate in MATCH, but as exact token matches.
@@ -99,6 +100,7 @@ public actor DataAdapter {
         self.rewindConfig = config
         self.rewindImageExtractor = imageExtractor
         self.cutoffDate = cutoffDate
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Rewind source configured with cutoff \(cutoffDate)", category: .app)
     }
 
@@ -127,6 +129,7 @@ public actor DataAdapter {
         self.rewindConfig = nil
         self.rewindImageExtractor = nil
         self.cutoffDate = nil
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Rewind source disconnected", category: .app)
     }
 
@@ -172,6 +175,8 @@ public actor DataAdapter {
         cachedHiddenTagId = nil
         await rewindSearchConnectionPool?.close()
         rewindSearchConnectionPool = nil
+        segmentCache.removeAll()
+        updateSegmentCacheLedger()
         Log.info("[DataAdapter] Shutdown complete", category: .app)
     }
 
@@ -1013,6 +1018,7 @@ public actor DataAdapter {
                 return cached.segments
             }
             segmentCache.removeValue(forKey: cacheKey)
+            updateSegmentCacheLedger()
         }
 
         var allSegments: [Segment] = []
@@ -1054,12 +1060,50 @@ public actor DataAdapter {
 
         // Cache
         segmentCache[cacheKey] = SegmentCacheEntry(segments: allSegments, timestamp: Date())
+        updateSegmentCacheLedger()
         return allSegments
     }
 
     /// Invalidate the segment cache
     public func invalidateSessionCache() {
         segmentCache.removeAll()
+        updateSegmentCacheLedger()
+    }
+
+    private func updateSegmentCacheLedger() {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerSegmentCacheTag,
+            bytes: Self.estimatedSegmentCacheBytes(segmentCache),
+            count: segmentCache.count,
+            unit: "windows",
+            function: "app.dataAdapter",
+            kind: "segment-cache",
+            note: "estimated"
+        )
+    }
+
+    private static func estimatedSegmentCacheBytes(_ cache: [SegmentCacheKey: SegmentCacheEntry]) -> Int64 {
+        cache.reduce(into: Int64(0)) { total, element in
+            total += Int64(MemoryLayout<SegmentCacheKey>.stride + MemoryLayout<SegmentCacheEntry>.stride)
+            total += estimatedSegmentArrayBytes(element.value.segments)
+        }
+    }
+
+    private static func estimatedSegmentArrayBytes(_ segments: [Segment]) -> Int64 {
+        segments.reduce(into: Int64(MemoryLayout<Segment>.stride * segments.count)) { total, segment in
+            total += estimatedStringBytes(segment.bundleID)
+            total += estimatedOptionalStringBytes(segment.windowName)
+            total += estimatedOptionalStringBytes(segment.browserUrl)
+        }
+    }
+
+    private static func estimatedOptionalStringBytes(_ string: String?) -> Int64 {
+        guard let string else { return 0 }
+        return estimatedStringBytes(string)
+    }
+
+    private static func estimatedStringBytes(_ string: String) -> Int64 {
+        Int64(MemoryLayout<String>.stride + string.utf8.count)
     }
 
     // MARK: - OCR Nodes

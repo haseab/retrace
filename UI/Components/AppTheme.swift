@@ -410,6 +410,10 @@ private struct NSImageBox: @unchecked Sendable {
 @MainActor
 public final class AppMetadataCache: ObservableObject {
     public static let shared = AppMetadataCache()
+    private static let memoryLedgerBundleIconsTag = "ui.appMetadata.bundleIcons"
+    private static let memoryLedgerFileIconsTag = "ui.appMetadata.fileIcons"
+    private static let memoryLedgerProcessIconsTag = "ui.appMetadata.processIcons"
+    private static let memoryLedgerNamesTag = "ui.appMetadata.names"
 
     @Published private var appIcons: [String: NSImage] = [:]
     @Published private var appNames: [String: String] = [:]
@@ -468,6 +472,7 @@ public final class AppMetadataCache: ObservableObject {
                 }
                 self.pendingBundleIDs.remove(bundleID)
                 self.resolvedBundleIDs.insert(bundleID)
+                self.updateMemoryLedger()
             }
         }
     }
@@ -495,6 +500,7 @@ public final class AppMetadataCache: ObservableObject {
                 }
                 self.pendingAppPaths.remove(appPath)
                 self.resolvedAppPaths.insert(appPath)
+                self.updateMemoryLedger()
             }
         }
     }
@@ -521,8 +527,79 @@ public final class AppMetadataCache: ObservableObject {
                 }
                 self.pendingProcessNames.remove(normalizedName)
                 self.resolvedProcessNames.insert(normalizedName)
+                self.updateMemoryLedger()
             }
         }
+    }
+
+    private func updateMemoryLedger() {
+        MemoryLedger.set(
+            tag: Self.memoryLedgerBundleIconsTag,
+            bytes: Self.estimatedImageBytes(appIcons),
+            count: appIcons.count,
+            unit: "icons",
+            function: "ui.app_metadata",
+            kind: "bundle-icons",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerFileIconsTag,
+            bytes: Self.estimatedImageBytes(fileIcons),
+            count: fileIcons.count,
+            unit: "icons",
+            function: "ui.app_metadata",
+            kind: "file-icons",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerProcessIconsTag,
+            bytes: Self.estimatedImageBytes(processNameIcons),
+            count: processNameIcons.count,
+            unit: "icons",
+            function: "ui.app_metadata",
+            kind: "process-icons",
+            note: "estimated"
+        )
+        MemoryLedger.set(
+            tag: Self.memoryLedgerNamesTag,
+            bytes: Self.estimatedStringDictionaryBytes(appNames),
+            count: appNames.count,
+            unit: "names",
+            function: "ui.app_metadata",
+            kind: "display-names",
+            note: "estimated"
+        )
+    }
+
+    private static func estimatedImageBytes(_ images: [String: NSImage]) -> Int64 {
+        images.reduce(into: Int64(0)) { total, entry in
+            total += estimatedStringBytes(entry.key)
+            total += estimatedMemoryBytes(for: entry.value)
+        }
+    }
+
+    private static func estimatedStringDictionaryBytes(_ values: [String: String]) -> Int64 {
+        values.reduce(into: Int64(0)) { total, entry in
+            total += estimatedStringBytes(entry.key)
+            total += estimatedStringBytes(entry.value)
+        }
+    }
+
+    private static func estimatedMemoryBytes(for image: NSImage) -> Int64 {
+        if let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            return Int64(cgImage.bytesPerRow * cgImage.height)
+        }
+        if let bitmapRep = image.representations.first(where: { $0 is NSBitmapImageRep }) as? NSBitmapImageRep {
+            return Int64(bitmapRep.bytesPerRow * bitmapRep.pixelsHigh)
+        }
+
+        let width = max(Int(image.size.width.rounded()), 1)
+        let height = max(Int(image.size.height.rounded()), 1)
+        return Int64(width * height * 4)
+    }
+
+    private static func estimatedStringBytes(_ string: String) -> Int64 {
+        Int64(MemoryLayout<String>.stride + string.utf8.count)
     }
 
     nonisolated private static func normalizedProcessName(_ processName: String) -> String {

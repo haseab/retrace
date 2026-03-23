@@ -272,7 +272,11 @@ public struct DiagnosticInfo: Codable {
         guard let markerRange = entry.range(of: memoryProfileLogMarker) else {
             return entry
         }
-        return String(entry[markerRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+        let message = String(entry[markerRange.upperBound...]).trimmingCharacters(in: .newlines)
+        if message.hasPrefix(" ") {
+            return String(message.dropFirst())
+        }
+        return message
     }
 
     /// Format as readable text for display (summary without full logs).
@@ -319,10 +323,10 @@ public struct DiagnosticInfo: Codable {
         text += "\n- Processors: \(performanceInfo.processorCount)"
 
         if !memoryProfileEntries.isEmpty {
-            text += "\n\n=== MEMORY PROFILE ==="
-            text += "\n(Allow-listed Retrace/media system services only — helps diagnose decoder and swap spikes)"
+            text += "\n\n=== RETRACE MEMORY SUMMARY ==="
+            text += "\n(Hierarchical breakdown from the system monitor sampler included with this report)"
             for entry in memoryProfileEntries {
-                text += "\n- \(entry)"
+                text += "\n\(entry)"
             }
         }
 
@@ -369,7 +373,7 @@ public struct DiagnosticInfo: Codable {
         }
 
         if !recentLogs.isEmpty {
-            text += "\nRecent Logs: \(recentLogs.count) entries (recent log tail + memory profile)"
+            text += "\nRecent Logs: \(recentLogs.count) entries (recent log tail + Retrace memory summary)"
         }
 
         return text
