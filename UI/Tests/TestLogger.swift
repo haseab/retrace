@@ -855,6 +855,94 @@ final class DashboardWindowTitleFormatterTests: XCTestCase {
 
 @MainActor
 final class DateJumpTimeOnlyParsingTests: XCTestCase {
+    func testMinuteAgoAbbreviationParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2 min ago", now: now) else {
+            XCTFail("Expected parser to resolve minute abbreviation")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(now), -2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 58)
+    }
+
+    func testHourAbbreviationWithPeriodParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2 hr. ago", now: now) else {
+            XCTFail("Expected parser to resolve hour abbreviation with period")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(now), -2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 8, minute: 0)
+    }
+
+    func testCompactDayAgoShorthandParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2da", now: now) else {
+            XCTFail("Expected parser to resolve compact day-ago shorthand")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 2, day: 21, hour: 0, minute: 0)
+    }
+
+    func testSingleLetterDayUnitWithAgoParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2d ago", now: now) else {
+            XCTFail("Expected parser to resolve single-letter day unit with ago")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 2, day: 21, hour: 0, minute: 0)
+    }
+
+    func testCompactHourAgoShorthandParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2ha", now: now) else {
+            XCTFail("Expected parser to resolve compact hour-ago shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(now), -2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 8, minute: 0)
+    }
+
+    func testCompactMinuteAgoShorthandParses() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2ma", now: now) else {
+            XCTFail("Expected parser to resolve compact minute-ago shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(now), -2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 58)
+    }
+
+    func testCompactDayAgoWithExplicitTimeParsesAsExactTime() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
+
+        guard let result = viewModel.test_parseNaturalLanguageDateForDateSearch("2da 6pm", now: now) else {
+            XCTFail("Expected parser to resolve compact day-ago shorthand with explicit time")
+            return
+        }
+
+        assertDateComponents(result, year: 2026, month: 2, day: 21, hour: 18, minute: 0)
+    }
+
     func testFutureTimeOnlyInputResolvesToPreviousDay() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let now = makeDate(year: 2026, month: 2, day: 23, hour: 10, minute: 0)
@@ -1538,6 +1626,136 @@ final class DateJumpRelativeDayAnchoringTests: XCTestCase {
 
 @MainActor
 final class DateJumpPlayheadRelativeParsingTests: XCTestCase {
+    func testCompactDayBeforeShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2db", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact day-before shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), -2 * 24 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 21, hour: 9, minute: 48)
+    }
+
+    func testCompactMinuteBeforeShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2mb", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact minute-before shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), -2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 46)
+    }
+
+    func testCompactHourBeforeShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2hb", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact before shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), -2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 7, minute: 48)
+    }
+
+    func testCompactHourLaterShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2hl", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact later shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), 2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 11, minute: 48)
+    }
+
+    func testCompactMinuteLaterShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2ml", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact minute-later shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), 2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 50)
+    }
+
+    func testCompactHourEarlierShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2he", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact earlier shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), -2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 7, minute: 48)
+    }
+
+    func testCompactMinuteEarlierShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2me", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact minute-earlier shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), -2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 46)
+    }
+
+    func testCompactHourAfterShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2haf", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact after shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), 2 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 11, minute: 48)
+    }
+
+    func testCompactMinuteAfterShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2maf", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact minute-after shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), 2 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 23, hour: 9, minute: 50)
+    }
+
+    func testCompactDayAfterShorthandUsesPlayheadBase() {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)
+
+        guard let result = viewModel.test_parsePlayheadRelativeDateForDateSearch("2daf", baseTimestamp: base) else {
+            XCTFail("Expected parser to resolve compact day-after shorthand")
+            return
+        }
+
+        XCTAssertEqual(result.timeIntervalSince(base), 2 * 24 * 60 * 60, accuracy: 0.001)
+        assertDateComponents(result, year: 2026, month: 2, day: 25, hour: 9, minute: 48)
+    }
+
     func testDayEarlierResolvesToExact1440MinutesFromPlayhead() {
         let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
         let base = makeDate(year: 2026, month: 2, day: 23, hour: 9, minute: 48)

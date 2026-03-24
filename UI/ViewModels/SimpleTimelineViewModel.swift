@@ -13365,16 +13365,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         let normalized = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+        let normalizedRelativeInput = normalizeRelativeDateShorthand(normalized)
 
         let baseTimestamp: Date
         if let currentTimestamp {
             baseTimestamp = currentTimestamp
         } else {
             baseTimestamp = Date()
-            Log.warning("[DateSearch] Relative '\(normalized)' had no playhead timestamp; falling back to now", category: .ui)
+            Log.warning("[DateSearch] Relative '\(normalizedRelativeInput)' had no playhead timestamp; falling back to now", category: .ui)
         }
 
-        guard let resolvedDate = parsePlayheadRelativeDate(normalized, relativeTo: baseTimestamp) else {
+        guard let resolvedDate = parsePlayheadRelativeDate(normalizedRelativeInput, relativeTo: baseTimestamp) else {
             return nil
         }
 
@@ -13403,6 +13404,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func parsePlayheadRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
+        let normalizedInput = normalizeRelativeDateShorthand(normalizedText)
         guard let regex = try? NSRegularExpression(
             pattern: #"^\s*(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs|h|day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(earlier|later|before|after)\s*$"#,
             options: [.caseInsensitive]
@@ -13410,18 +13412,18 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
 
-        let range = NSRange(normalizedText.startIndex..., in: normalizedText)
-        guard let match = regex.firstMatch(in: normalizedText, options: [], range: range),
-              let amountRange = Range(match.range(at: 1), in: normalizedText),
-              let unitRange = Range(match.range(at: 2), in: normalizedText),
-              let directionRange = Range(match.range(at: 3), in: normalizedText),
-              let amount = Int(normalizedText[amountRange]),
+        let range = NSRange(normalizedInput.startIndex..., in: normalizedInput)
+        guard let match = regex.firstMatch(in: normalizedInput, options: [], range: range),
+              let amountRange = Range(match.range(at: 1), in: normalizedInput),
+              let unitRange = Range(match.range(at: 2), in: normalizedInput),
+              let directionRange = Range(match.range(at: 3), in: normalizedInput),
+              let amount = Int(normalizedInput[amountRange]),
               amount > 0 else {
             return nil
         }
 
-        let unitToken = String(normalizedText[unitRange])
-        let directionToken = String(normalizedText[directionRange])
+        let unitToken = String(normalizedInput[unitRange])
+        let directionToken = String(normalizedInput[directionRange])
 
         let direction: PlayheadRelativeDirection
         switch directionToken {
@@ -13468,15 +13470,16 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func parseNaturalLanguageDate(_ text: String, now: Date = Date()) -> Date? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let calendar = Calendar.current
-        let normalizedInput = trimmed.lowercased()
-        let collapsedInput = normalizedInput.replacingOccurrences(
+        let lowercasedInput = trimmed.lowercased()
+        let collapsedInput = lowercasedInput.replacingOccurrences(
             of: #"\s+"#,
             with: " ",
             options: .regularExpression
         )
-        let normalizedWithCompactTimes = normalizeCompactTimeFormat(collapsedInput)
+        let normalizedRelativeInput = normalizeRelativeDateShorthand(collapsedInput)
+        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
 
-        if collapsedInput.range(of: #"^start of (the )?day$"#, options: .regularExpression) != nil {
+        if normalizedRelativeInput.range(of: #"^start of (the )?day$"#, options: .regularExpression) != nil {
             return calendar.startOfDay(for: now)
         }
 
@@ -13494,13 +13497,13 @@ public class SimpleTimelineViewModel: ObservableObject {
 
             var normalized = adjustYearlessAbsoluteFutureDateToRecentPastIfNeeded(
                 dateForYearAdjustment,
-                input: normalizedInput,
+                input: normalizedRelativeInput,
                 now: now,
                 calendar: calendar
             )
             normalized = adjustTimeOnlyFutureDateToRecentPastIfNeeded(
                 normalized,
-                input: normalizedInput,
+                input: normalizedRelativeInput,
                 now: now,
                 calendar: calendar
             )
@@ -13514,7 +13517,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // Try SwiftyChrono first for comprehensive natural language parsing
         // Handles: "next Friday", "3 days from now", "last Monday", "in 2 weeks", etc.
         let chrono = Chrono()
-        let chronoInputs = normalizedWithCompactTimes == collapsedInput
+        let chronoInputs = normalizedWithCompactTimes == trimmed
             ? [trimmed]
             : [normalizedWithCompactTimes, trimmed]
         for chronoInput in chronoInputs {
@@ -13527,7 +13530,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         // === FALLBACK: Time-only and absolute date parsing ===
         // SwiftyChrono handles all relative dates (X days/weeks/months/years ago, yesterday, etc.)
         // We only need fallback for compact time formats and explicit date strings
-        let trimmedLower = normalizedInput
+        let trimmedLower = normalizedRelativeInput
 
         // === TIME-ONLY INPUT ===
 
@@ -13852,6 +13855,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func parseAgoRelativeOffset(_ normalizedText: String) -> PlayheadRelativeOffset? {
+        let normalizedInput = normalizeRelativeDateShorthand(normalizedText)
         guard let regex = try? NSRegularExpression(
             pattern: #"^\s*(\d+)\s*(minute|minutes|min|mins|hour|hours|hr|hrs|h|day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s+ago\s*$"#,
             options: [.caseInsensitive]
@@ -13859,16 +13863,16 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
 
-        let range = NSRange(normalizedText.startIndex..., in: normalizedText)
-        guard let match = regex.firstMatch(in: normalizedText, options: [], range: range),
-              let amountRange = Range(match.range(at: 1), in: normalizedText),
-              let unitRange = Range(match.range(at: 2), in: normalizedText),
-              let amount = Int(normalizedText[amountRange]),
+        let range = NSRange(normalizedInput.startIndex..., in: normalizedInput)
+        guard let match = regex.firstMatch(in: normalizedInput, options: [], range: range),
+              let amountRange = Range(match.range(at: 1), in: normalizedInput),
+              let unitRange = Range(match.range(at: 2), in: normalizedInput),
+              let amount = Int(normalizedInput[amountRange]),
               amount > 0 else {
             return nil
         }
 
-        let unitToken = String(normalizedText[unitRange])
+        let unitToken = String(normalizedInput[unitRange])
         guard let unit = PlayheadRelativeUnit(token: unitToken) else {
             return nil
         }
@@ -13880,31 +13884,32 @@ public class SimpleTimelineViewModel: ObservableObject {
         let normalized = input
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalized)
+        let normalizedRelativeInput = normalizeRelativeDateShorthand(normalized)
+        let normalizedWithCompactTimes = normalizeCompactTimeFormat(normalizedRelativeInput)
 
-        if normalized.range(
+        if normalizedRelativeInput.range(
             of: #"\b\d+\s*(minute|minutes|min|mins)\s+ago\b"#,
             options: .regularExpression
         ) != nil {
             return .firstFrameInMinute
         }
 
-        if normalized.range(
+        if normalizedRelativeInput.range(
             of: #"\b\d+\s*(hour|hours|hr|hrs|h)\s+ago\b"#,
             options: .regularExpression
         ) != nil {
             return .firstFrameInHour
         }
 
-        let hasCalendarDateToken = normalized.range(
+        let hasCalendarDateToken = normalizedRelativeInput.range(
             of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b"#,
             options: .regularExpression
         ) != nil
-        let hasDayLevelNaturalLanguageToken = normalized.range(
+        let hasDayLevelNaturalLanguageToken = normalizedRelativeInput.range(
             of: #"\b(?:today|tomorrow|yesterday|(?:next|last|this)\s+(?:mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)|mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b"#,
             options: .regularExpression
         ) != nil
-        let hasDayLevelRelativeOffsetToken = normalized.range(
+        let hasDayLevelRelativeOffsetToken = normalizedRelativeInput.range(
             of: #"\b(?:in\s+\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)|\d+\s*(?:day|days|week|weeks|wk|wks|month|months|mo|mos|year|years|yr|yrs)\s*(?:ago|from now))\b"#,
             options: .regularExpression
         ) != nil
@@ -13984,8 +13989,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceYearlessAbsoluteDateToPast(_ input: String) -> Bool {
+        let normalizedInput = normalizeRelativeDateShorthand(input)
         // Keep relative expressions as-is (tomorrow/next/last/etc).
-        if input.range(
+        if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight)\b|from now"#,
             options: .regularExpression
         ) != nil {
@@ -13993,7 +13999,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // Only coerce yearless month/day style inputs.
-        let hasMonthDay = input.range(
+        let hasMonthDay = normalizedInput.range(
             of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}\b"#,
             options: .regularExpression
         ) != nil
@@ -14001,7 +14007,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard hasMonthDay else { return false }
 
         // If user explicitly gave a year, respect it.
-        if input.range(
+        if normalizedInput.range(
             of: #"\b\d{4}\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{2,4}[/-]\d{1,2}[/-]\d{1,2}\b"#,
             options: .regularExpression
         ) != nil {
@@ -14012,8 +14018,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     }
 
     private func shouldCoerceTimeOnlyDateToPast(_ input: String) -> Bool {
+        let normalizedInput = normalizeRelativeDateShorthand(input)
         // Keep explicit relative expressions as-is (tomorrow/next/in 2 hours/etc).
-        if input.range(
+        if normalizedInput.range(
             of: #"\b(today|tomorrow|yesterday|next|last|ago|this|now|tonight|earlier|later|before|after)\b|from now|\bin\s+\d+"#,
             options: .regularExpression
         ) != nil {
@@ -14021,14 +14028,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
 
         // If the input includes any explicit calendar date token, this is not a time-only query.
-        if input.range(
+        if normalizedInput.range(
             of: #"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b|\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b|\b\d{4}-\d{1,2}-\d{1,2}\b"#,
             options: .regularExpression
         ) != nil {
             return false
         }
 
-        let normalized = input
+        let normalized = normalizedInput
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: #"^\s*at\s+"#, with: "", options: .regularExpression)
 
@@ -14036,6 +14043,122 @@ public class SimpleTimelineViewModel: ObservableObject {
             of: #"^(?:\d{1,2}(?::\d{2})?\s*(?:am|pm|a|p)?|\d{3,4}\s*(?:am|pm|a|p)?|noon|midnight)$"#,
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    private func normalizeRelativeDateShorthand(_ text: String) -> String {
+        var normalized = text
+
+        normalized = rewriteRelativeDateShorthand(
+            in: normalized,
+            pattern: #"(?<!\w)(\d+)\s*(minute|minutes|min|mins|m|hour|hours|hr|hrs|h|day|days|d|week|weeks|wk|wks|w|month|months|mo|mos|year|years|yr|yrs|y)\.?\s*(ago|before|later|earlier|after)\b"#
+        ) { amountToken, unitToken, directionToken in
+            guard
+                let amount = Int(amountToken),
+                amount > 0,
+                let unit = canonicalRelativeDateUnit(token: unitToken, amount: amount)
+            else {
+                return nil
+            }
+
+            return "\(amount) \(unit) \(directionToken)"
+        }
+
+        normalized = rewriteRelativeDateShorthand(
+            in: normalized,
+            pattern: #"(?<!\w)(\d+)\s*(minute|minutes|min|mins|m|hour|hours|hr|hrs|h|day|days|d|week|weeks|wk|wks|w|month|months|mo|mos|year|years|yr|yrs|y)(af|a|b|e|l)\b"#
+        ) { amountToken, unitToken, directionToken in
+            guard
+                let amount = Int(amountToken),
+                amount > 0,
+                let unit = canonicalRelativeDateUnit(token: unitToken, amount: amount),
+                let direction = canonicalRelativeDateCompactDirection(token: directionToken)
+            else {
+                return nil
+            }
+
+            return "\(amount) \(unit) \(direction)"
+        }
+
+        return normalized
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func rewriteRelativeDateShorthand(
+        in text: String,
+        pattern: String,
+        transform: (_ amount: String, _ unit: String, _ direction: String) -> String?
+    ) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return text
+        }
+
+        let searchRange = NSRange(text.startIndex..., in: text)
+        let matches = regex.matches(in: text, options: [], range: searchRange)
+        guard !matches.isEmpty else {
+            return text
+        }
+
+        var result = text
+        for match in matches.reversed() {
+            guard
+                let fullRange = Range(match.range(at: 0), in: result),
+                let amountRange = Range(match.range(at: 1), in: text),
+                let unitRange = Range(match.range(at: 2), in: text),
+                let directionRange = Range(match.range(at: 3), in: text)
+            else {
+                continue
+            }
+
+            let amountToken = String(text[amountRange]).lowercased()
+            let unitToken = String(text[unitRange]).lowercased()
+            let directionToken = String(text[directionRange]).lowercased()
+            guard let replacement = transform(amountToken, unitToken, directionToken) else {
+                continue
+            }
+
+            result.replaceSubrange(fullRange, with: replacement)
+        }
+
+        return result
+    }
+
+    private func canonicalRelativeDateUnit(token: String, amount: Int) -> String? {
+        let isPlural = amount != 1
+
+        switch token {
+        case "minute", "minutes", "min", "mins", "m":
+            return isPlural ? "minutes" : "minute"
+        case "hour", "hours", "hr", "hrs", "h":
+            return isPlural ? "hours" : "hour"
+        case "day", "days", "d":
+            return isPlural ? "days" : "day"
+        case "week", "weeks", "wk", "wks", "w":
+            return isPlural ? "weeks" : "week"
+        case "month", "months", "mo", "mos":
+            return isPlural ? "months" : "month"
+        case "year", "years", "yr", "yrs", "y":
+            return isPlural ? "years" : "year"
+        default:
+            return nil
+        }
+    }
+
+    private func canonicalRelativeDateCompactDirection(token: String) -> String? {
+        switch token {
+        case "af":
+            return "after"
+        case "a":
+            return "ago"
+        case "b":
+            return "before"
+        case "e":
+            return "earlier"
+        case "l":
+            return "later"
+        default:
+            return nil
+        }
     }
 
     /// Extract first number from a string
