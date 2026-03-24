@@ -592,11 +592,10 @@ You depend on:
 
 ## Testing Requirements
 
-- SwiftUI Preview for all views
-- UI tests for keyboard shortcuts
-- UI tests for search flow
-- UI tests for timeline navigation
-- Accessibility tests (VoiceOver support)
+- SwiftUI Preview for views where a preview is practical
+- Add UI tests for keyboard shortcuts, search flow, and timeline navigation when those behaviors change and can be exercised reliably
+- Add accessibility tests when VoiceOver or keyboard navigation behavior changes and can be exercised reliably
+- Do not add low-signal tests for insignificant visual polish or other non-behavioral edits
 
 ## Accessibility
 
@@ -620,6 +619,6 @@ You depend on:
 5. Create `SettingsView` with all preferences
 6. Build `DashboardView` with analytics
 7. Add keyboard shortcut handling
-8. Write UI tests
+8. Add UI tests for behaviorally significant flows when warranted
 
 Focus on getting the timeline + search working first before polishing dashboard/settings.

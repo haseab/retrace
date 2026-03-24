@@ -55,6 +55,105 @@ private enum MemoryTracker {
     }
 }
 
+enum OCRTextLayoutEstimator {
+    private static let narrowCharacters = Set("ilIjtf|!,:;.`'".map(\.self))
+    private static let mediumNarrowCharacters = Set("[](){}\\/".map(\.self))
+    private static let wideCharacters = Set("MW@%&QGODmwo".map(\.self))
+    private static let mediumWideCharacters = Set("ABHNUVXY02345689#".map(\.self))
+
+    static func spanFractions(
+        in text: String,
+        range: Range<String.Index>
+    ) -> (start: CGFloat, end: CGFloat) {
+        let lowerBound = text.distance(from: text.startIndex, to: range.lowerBound)
+        let upperBound = text.distance(from: text.startIndex, to: range.upperBound)
+        return spanFractions(in: text, start: lowerBound, end: upperBound)
+    }
+
+    static func spanFractions(
+        in text: String,
+        start: Int,
+        end: Int
+    ) -> (start: CGFloat, end: CGFloat) {
+        let characters = Array(text)
+        guard !characters.isEmpty else { return (start: 0, end: 1) }
+
+        let clampedStart = min(max(start, 0), max(characters.count - 1, 0))
+        let clampedEnd = min(max(end, clampedStart + 1), characters.count)
+        let cumulativeWidths = cumulativeCharacterWidths(for: characters)
+        let totalWidth = max(cumulativeWidths.last ?? 0, 1)
+        let startWidth = cumulativeWidths[clampedStart]
+        let endWidth = cumulativeWidths[clampedEnd]
+        let minimumSpanWidth = max(characterWidth(for: characters[clampedStart]) * 0.75, 0.01)
+        let clampedEndWidth = min(max(endWidth, startWidth + minimumSpanWidth), totalWidth)
+
+        return (
+            start: startWidth / totalWidth,
+            end: clampedEndWidth / totalWidth
+        )
+    }
+
+    static func characterIndex(
+        in text: String,
+        atFraction fraction: CGFloat
+    ) -> Int {
+        let characters = Array(text)
+        guard !characters.isEmpty else { return 0 }
+
+        let clampedFraction = min(max(fraction, 0), 1)
+        guard clampedFraction > 0 else { return 0 }
+        guard clampedFraction < 1 else { return characters.count }
+
+        let cumulativeWidths = cumulativeCharacterWidths(for: characters)
+        let totalWidth = max(cumulativeWidths.last ?? 0, 1)
+        let targetWidth = clampedFraction * totalWidth
+
+        for index in 1..<cumulativeWidths.count where targetWidth < cumulativeWidths[index] {
+            return index - 1
+        }
+
+        return characters.count
+    }
+
+    private static func cumulativeCharacterWidths(for characters: [Character]) -> [CGFloat] {
+        var widths: [CGFloat] = [0]
+        widths.reserveCapacity(characters.count + 1)
+
+        var runningTotal: CGFloat = 0
+        for character in characters {
+            runningTotal += characterWidth(for: character)
+            widths.append(runningTotal)
+        }
+
+        return widths
+    }
+
+    private static func characterWidth(for character: Character) -> CGFloat {
+        if character.unicodeScalars.allSatisfy(\.properties.isWhitespace) {
+            return 0.35
+        }
+
+        guard character.unicodeScalars.allSatisfy(\.isASCII) else {
+            return 1.1
+        }
+
+        if narrowCharacters.contains(character) {
+            return 0.55
+        }
+        if mediumNarrowCharacters.contains(character) {
+            return 0.75
+        }
+        if wideCharacters.contains(character) {
+            return 1.35
+        }
+        if mediumWideCharacters.contains(character) {
+            return 1.15
+        }
+
+        return 1.0
+    }
+}
+
 /// A frame paired with its preloaded video info for instant access
 public struct TimelineFrame: Identifiable, Equatable {
     public let frame: FrameReference
@@ -273,18 +372,23 @@ public struct OCRHyperlinkMatch: Identifiable, Equatable, Sendable {
     /// Normalized X origin for the linked word span (falls back to full node).
     public var highlightX: CGFloat {
         let range = clampedHighlightRange
-        let textCount = max(nodeText.count, 1)
-        let startFraction = CGFloat(range.start) / CGFloat(textCount)
-        return x + (width * startFraction)
+        let fractions = OCRTextLayoutEstimator.spanFractions(
+            in: nodeText,
+            start: range.start,
+            end: range.end
+        )
+        return x + (width * fractions.start)
     }
 
     /// Normalized width for the linked word span (falls back to full node).
     public var highlightWidth: CGFloat {
         let range = clampedHighlightRange
-        let textCount = max(nodeText.count, 1)
-        let minimumFraction = 1.0 / CGFloat(textCount)
-        let spanFraction = max(CGFloat(range.end - range.start) / CGFloat(textCount), minimumFraction)
-        return width * min(spanFraction, 1.0)
+        let fractions = OCRTextLayoutEstimator.spanFractions(
+            in: nodeText,
+            start: range.start,
+            end: range.end
+        )
+        return width * max(fractions.end - fractions.start, 0)
     }
 
     private var clampedHighlightRange: (start: Int, end: Int) {
@@ -881,7 +985,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Incremented to request keyboard focus for the in-frame search field.
     @Published public var focusInFrameSearchFieldSignal: Int = 0
 
-    private static let inFrameSearchDebounceNanoseconds: UInt64 = 300_000_000
+    // Keep a tiny debounce so rapid typing coalesces, but the highlight still feels immediate.
+    private static let inFrameSearchDebounceNanoseconds: UInt64 = 20_000_000
     private var inFrameSearchDebounceTask: Task<Void, Never>?
 
     /// Persistent SearchViewModel that survives overlay open/close
@@ -7960,11 +8065,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         var matchingNodes: [(node: OCRNodeWithText, ranges: [Range<String.Index>])] = []
 
         for node in nodes {
-            let nodeText = node.text.lowercased()
             var ranges: [Range<String.Index>] = []
 
             for token in queryTokens {
-                ranges.append(contentsOf: rangesForSearchHighlightToken(token, in: nodeText))
+                ranges.append(contentsOf: rangesForSearchHighlightToken(token, in: node.text))
             }
 
             if !ranges.isEmpty {
@@ -8012,7 +8116,12 @@ public class SimpleTimelineViewModel: ObservableObject {
         var searchStartIndex = haystack.startIndex
 
         while searchStartIndex < haystack.endIndex,
-              let range = haystack.range(of: needle, range: searchStartIndex..<haystack.endIndex) {
+              let range = haystack.range(
+                of: needle,
+                options: [.caseInsensitive, .diacriticInsensitive],
+                range: searchStartIndex..<haystack.endIndex,
+                locale: .current
+              ) {
             ranges.append(range)
             searchStartIndex = range.upperBound
         }
@@ -11843,8 +11952,14 @@ public class SimpleTimelineViewModel: ObservableObject {
         let visibleStartFraction = (clippedX - node.x) / node.width
         let visibleEndFraction = (clippedRight - node.x) / node.width
 
-        let visibleStartChar = Int(visibleStartFraction * CGFloat(textLength))
-        let visibleEndChar = Int(visibleEndFraction * CGFloat(textLength))
+        let visibleStartChar = OCRTextLayoutEstimator.characterIndex(
+            in: node.text,
+            atFraction: visibleStartFraction
+        )
+        let visibleEndChar = OCRTextLayoutEstimator.characterIndex(
+            in: node.text,
+            atFraction: visibleEndFraction
+        )
 
         return (start: max(0, visibleStartChar), end: min(textLength, visibleEndChar))
     }
@@ -11871,8 +11986,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                point.y >= node.y && point.y <= node.y + node.height {
                 // Point is inside this node - calculate character position
                 let relativeX = (point.x - node.x) / node.width
-                let charIndex = Int(relativeX * CGFloat(node.text.count))
-                let clampedIndex = max(0, min(node.text.count, charIndex))
+                let clampedIndex = OCRTextLayoutEstimator.characterIndex(
+                    in: node.text,
+                    atFraction: relativeX
+                )
                 return (nodeID: node.id, charIndex: clampedIndex)
             }
         }
@@ -11889,8 +12006,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // Point is near this node - calculate character position
                 let clampedX = max(node.x, min(node.x + node.width, point.x))
                 let relativeX = (clampedX - node.x) / node.width
-                let charIndex = Int(relativeX * CGFloat(node.text.count))
-                let clampedIndex = max(0, min(node.text.count, charIndex))
+                let clampedIndex = OCRTextLayoutEstimator.characterIndex(
+                    in: node.text,
+                    atFraction: relativeX
+                )
                 return (nodeID: node.id, charIndex: clampedIndex)
             }
         }
@@ -11978,8 +12097,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // If point is within node bounds, calculate precise character
                 if point.x >= nodeStart && point.x <= nodeEnd {
                     let relativeX = (point.x - node.x) / node.width
-                    let charIndex = Int(relativeX * CGFloat(node.text.count))
-                    return (nodeID: node.id, charIndex: max(0, min(node.text.count, charIndex)))
+                    return (
+                        nodeID: node.id,
+                        charIndex: OCRTextLayoutEstimator.characterIndex(
+                            in: node.text,
+                            atFraction: relativeX
+                        )
+                    )
                 }
             }
 
@@ -12019,8 +12143,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                point.y >= node.y && point.y <= node.y + node.height {
                 // Point is inside this node - calculate character position
                 let relativeX = (point.x - node.x) / node.width
-                let charIndex = Int(relativeX * CGFloat(node.text.count))
-                let clampedIndex = max(0, min(node.text.count, charIndex))
+                let clampedIndex = OCRTextLayoutEstimator.characterIndex(
+                    in: node.text,
+                    atFraction: relativeX
+                )
                 return (nodeID: node.id, charIndex: clampedIndex)
             }
         }
@@ -12038,8 +12164,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // Clamp the relative X to the actual node bounds
                 let clampedX = max(node.x, min(node.x + node.width, point.x))
                 let relativeX = (clampedX - node.x) / node.width
-                let charIndex = Int(relativeX * CGFloat(node.text.count))
-                let clampedIndex = max(0, min(node.text.count, charIndex))
+                let clampedIndex = OCRTextLayoutEstimator.characterIndex(
+                    in: node.text,
+                    atFraction: relativeX
+                )
                 return (nodeID: node.id, charIndex: clampedIndex)
             }
         }
@@ -12138,8 +12266,13 @@ public class SimpleTimelineViewModel: ObservableObject {
                 // If point is within node bounds, calculate precise character
                 if point.x >= nodeStart && point.x <= nodeEnd {
                     let relativeX = (point.x - node.x) / node.width
-                    let charIndex = Int(relativeX * CGFloat(node.text.count))
-                    return (nodeID: node.id, charIndex: max(0, min(node.text.count, charIndex)))
+                    return (
+                        nodeID: node.id,
+                        charIndex: OCRTextLayoutEstimator.characterIndex(
+                            in: node.text,
+                            atFraction: relativeX
+                        )
+                    )
                 }
             }
 

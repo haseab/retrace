@@ -65,6 +65,43 @@ final class SearchHighlightTooltipTests: XCTestCase {
         )
     }
 
+    func testPaddedHighlightRectExpandsBeyondOriginalBounds() {
+        let frameRect = CGRect(x: 0, y: 0, width: 400, height: 240)
+        let originalRect = CGRect(x: 120, y: 80, width: 90, height: 24)
+
+        let paddedRect = SearchHighlightOverlay.paddedHighlightRect(originalRect, within: frameRect)
+
+        XCTAssertLessThan(paddedRect.minX, originalRect.minX)
+        XCTAssertGreaterThan(paddedRect.maxX, originalRect.maxX)
+        XCTAssertLessThan(paddedRect.minY, originalRect.minY)
+        XCTAssertGreaterThan(paddedRect.maxY, originalRect.maxY)
+    }
+
+    func testPaddedHighlightRectClipsToFrameBounds() {
+        let frameRect = CGRect(x: 0, y: 0, width: 400, height: 240)
+        let originalRect = CGRect(x: 2, y: 1, width: 60, height: 20)
+
+        let paddedRect = SearchHighlightOverlay.paddedHighlightRect(originalRect, within: frameRect)
+
+        XCTAssertEqual(paddedRect.minX, frameRect.minX, accuracy: 0.001)
+        XCTAssertEqual(paddedRect.minY, frameRect.minY, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(paddedRect.maxX, frameRect.maxX)
+        XCTAssertLessThanOrEqual(paddedRect.maxY, frameRect.maxY)
+    }
+
+    func testTextSpanEstimatorShiftsSpanForWideVsNarrowPrefixes() {
+        let widePrefixText = "WWW padding tail"
+        let narrowPrefixText = "iii padding tail"
+        let wideRange = widePrefixText.range(of: "padding")!
+        let narrowRange = narrowPrefixText.range(of: "padding")!
+
+        let wideFractions = OCRTextLayoutEstimator.spanFractions(in: widePrefixText, range: wideRange)
+        let narrowFractions = OCRTextLayoutEstimator.spanFractions(in: narrowPrefixText, range: narrowRange)
+
+        XCTAssertGreaterThan(wideFractions.start, narrowFractions.start)
+        XCTAssertGreaterThan(wideFractions.end, narrowFractions.end)
+    }
+
     @MainActor
     func testPhraseLevelRedactionTooltipStateIsQueuedWhileRewriteIsPending() {
         XCTAssertEqual(
@@ -179,7 +216,29 @@ final class SearchHighlightTooltipTests: XCTestCase {
         XCTAssertEqual(matches.count, 1)
         XCTAssertEqual(matches[0].node.id, node.id)
         XCTAssertEqual(matches[0].ranges.count, 1)
-        XCTAssertEqual(String(node.text.lowercased()[matches[0].ranges[0]]), "sohrab")
+        XCTAssertEqual(String(node.text[matches[0].ranges[0]]).lowercased(), "sohrab")
+    }
+
+    @MainActor
+    func testCmdFHighlightModeKeepsRangesOnOriginalStringForCaseInsensitiveMatches() {
+        let node = OCRNodeWithText(
+            id: 1,
+            frameId: 42,
+            x: 0.2,
+            y: 0.3,
+            width: 0.4,
+            height: 0.1,
+            text: "hello SOHRAB there"
+        )
+
+        let matches = SimpleTimelineViewModel.searchHighlightMatches(
+            in: [node],
+            query: "sohrab",
+            mode: .matchedTextRanges
+        )
+
+        XCTAssertEqual(matches.count, 1)
+        XCTAssertEqual(String(node.text[matches[0].ranges[0]]), "SOHRAB")
     }
 
     @MainActor

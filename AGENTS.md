@@ -219,10 +219,12 @@ retrace/
 
 ### Testing
 
-- **Write tests first** - Follow TDD: RED → GREEN → REFACTOR
+- **Write tests first when behavior changes in a meaningful, testable way** - Follow TDD: RED -> GREEN -> REFACTOR when a reliable behavioral test exists
 - **Test locations**: `{Module}/Tests/`
 - **Test against protocols** - Not implementations
 - **Mock dependencies** - Using protocol conformance
+- **Do not add contrived tests for insignificant or non-behavioral edits** - Skip tests for copy tweaks, comments, formatting, tiny visual polish, mechanical renames, or other changes where no meaningful behavioral assertion exists
+- **If tests are skipped, say why briefly** - Note that the change is insignificant or not behaviorally testable
 
 ### ⚠️ CRITICAL: Test with REAL Input Data, Not Fake Structures
 
@@ -249,6 +251,7 @@ XCTAssertTrue(tables.contains("segment"))  // validates real SQLite schema
 - ✅ Uses real production input (real screenshots, real OCR output)
 - ✅ Validates end-to-end workflows (screenshot → OCR → database → search)
 - ❌ NOT testing struct field assignment or string concatenation
+- ❌ NOT adding low-signal tests just to satisfy policy for insignificant or non-behavioral edits
 
 ---
 
@@ -412,12 +415,13 @@ Then check which path actually executes and fix the right code.
 - Don't create duplicate types - use what exists
 - If you need a new shared type, document the need (don't create it)
 
-### 4. Testing is Mandatory
+### 4. Testing is Required for Meaningful Behavior Changes
 
-- Write tests BEFORE implementation (TDD)
+- Write tests BEFORE implementation when the change has meaningful, behaviorally testable impact
 - Test against protocols, not implementations
-- Cover edge cases thoroughly
-- All tests must pass before submitting changes
+- Cover edge cases thoroughly when behavior changes
+- Do not add contrived tests for insignificant or non-behavioral edits
+- All relevant tests must pass before submitting changes
 
 ### 5. Keep AGENTS.md Up-to-Date
 

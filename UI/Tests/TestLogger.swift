@@ -1995,7 +1995,7 @@ final class InFrameSearchTests: XCTestCase {
         XCTAssertNil(viewModel.searchHighlightQuery)
         XCTAssertFalse(viewModel.isShowingSearchHighlight)
 
-        try? await Task.sleep(for: .milliseconds(350), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(60), clock: .continuous)
 
         XCTAssertEqual(viewModel.searchHighlightQuery, "error")
         XCTAssertTrue(viewModel.isShowingSearchHighlight)
@@ -2011,7 +2011,7 @@ final class InFrameSearchTests: XCTestCase {
         viewModel.openInFrameSearch()
         viewModel.setInFrameSearchQuery("error")
         viewModel.closeInFrameSearch(clearQuery: true)
-        try? await Task.sleep(for: .milliseconds(350), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(60), clock: .continuous)
 
         XCTAssertFalse(viewModel.isInFrameSearchVisible)
         XCTAssertEqual(viewModel.inFrameSearchQuery, "")
@@ -2027,7 +2027,7 @@ final class InFrameSearchTests: XCTestCase {
 
         viewModel.toggleInFrameSearch()
         viewModel.setInFrameSearchQuery("error")
-        try? await Task.sleep(for: .milliseconds(350), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(60), clock: .continuous)
         XCTAssertTrue(viewModel.isInFrameSearchVisible)
         XCTAssertTrue(viewModel.isShowingSearchHighlight)
 
@@ -2064,7 +2064,7 @@ final class InFrameSearchTests: XCTestCase {
 
         viewModel.openInFrameSearch()
         viewModel.setInFrameSearchQuery("error")
-        try? await Task.sleep(for: .milliseconds(350), clock: .continuous)
+        try? await Task.sleep(for: .milliseconds(60), clock: .continuous)
         viewModel.navigateToFrame(1)
 
         XCTAssertEqual(viewModel.currentIndex, 1)

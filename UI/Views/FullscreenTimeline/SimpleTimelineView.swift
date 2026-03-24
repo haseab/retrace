@@ -4179,8 +4179,14 @@ struct ZoomedTextSelectionNSView: NSViewRepresentable {
             let textLength = node.text.count
             let visibleStartFraction = (clippedX - node.x) / node.width
             let visibleEndFraction = (clippedRight - node.x) / node.width
-            let visibleStartChar = Int(visibleStartFraction * CGFloat(textLength))
-            let visibleEndChar = Int(visibleEndFraction * CGFloat(textLength))
+            let visibleStartChar = OCRTextLayoutEstimator.characterIndex(
+                in: node.text,
+                atFraction: visibleStartFraction
+            )
+            let visibleEndChar = OCRTextLayoutEstimator.characterIndex(
+                in: node.text,
+                atFraction: visibleEndFraction
+            )
 
             // Extract only the visible portion of text
             let visibleText: String
@@ -4453,13 +4459,16 @@ class ZoomedSelectionView: NSView {
             let textLength = node.text.count
             guard textLength > 0 else { continue }
 
-            let startFraction = CGFloat(range.start) / CGFloat(textLength)
-            let endFraction = CGFloat(range.end) / CGFloat(textLength)
+            let spanFractions = OCRTextLayoutEstimator.spanFractions(
+                in: node.text,
+                start: range.start,
+                end: range.end
+            )
 
             let highlightRect = NSRect(
-                x: node.rect.origin.x + node.rect.width * startFraction,
+                x: node.rect.origin.x + node.rect.width * spanFractions.start,
                 y: node.rect.origin.y,
-                width: node.rect.width * (endFraction - startFraction),
+                width: node.rect.width * max(spanFractions.end - spanFractions.start, 0),
                 height: node.rect.height
             )
 
@@ -5252,13 +5261,16 @@ class TextSelectionView: NSView {
             let textLength = node.text.count
             guard textLength > 0 else { continue }
 
-            let startFraction = CGFloat(range.start) / CGFloat(textLength)
-            let endFraction = CGFloat(range.end) / CGFloat(textLength)
+            let spanFractions = OCRTextLayoutEstimator.spanFractions(
+                in: node.text,
+                start: range.start,
+                end: range.end
+            )
 
             let highlightRect = NSRect(
-                x: node.rect.origin.x + node.rect.width * startFraction,
+                x: node.rect.origin.x + node.rect.width * spanFractions.start,
                 y: node.rect.origin.y,
-                width: node.rect.width * (endFraction - startFraction),
+                width: node.rect.width * max(spanFractions.end - spanFractions.start, 0),
                 height: node.rect.height
             )
             highlightRects.append(highlightRect)
@@ -5466,8 +5478,6 @@ struct SearchHighlightOverlay: View {
     private let tooltipSize = CGSize(width: 210, height: 34)
     private let tooltipInset: CGFloat = 12
     private let tooltipGap: CGFloat = 8
-    private let highlightHorizontalPaddingFraction: CGFloat = 0.12
-    private let highlightVerticalPaddingFraction: CGFloat = 0.14
     private let tooltipHideDelay: TimeInterval = 0.18
     private let tooltipHoverExitDelay: TimeInterval = 0.12
 
@@ -5754,51 +5764,43 @@ struct SearchHighlightOverlay: View {
         return true
     }
 
+    static func paddedHighlightRect(_ rect: CGRect, within frameRect: CGRect) -> CGRect {
+        guard !rect.isEmpty else { return .zero }
+        guard !frameRect.isEmpty else { return rect }
+
+        // Push the border slightly beyond the OCR bounds so it does not sit directly on the glyphs.
+        let horizontalOutset = min(max(rect.height * 0.21, 4), 10)
+        let verticalOutset = min(max(rect.height * 0.12, 3), 8)
+        return rect
+            .insetBy(dx: -horizontalOutset, dy: -verticalOutset)
+            .intersection(frameRect)
+    }
+
     private func screenRect(for node: OCRNodeWithText) -> CGRect {
-        CGRect(
+        let rect = CGRect(
             x: actualFrameRect.origin.x + (node.x * actualFrameRect.width),
             y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
             width: node.width * actualFrameRect.width,
             height: node.height * actualFrameRect.height
         )
+        return Self.paddedHighlightRect(rect, within: actualFrameRect)
     }
 
     private func screenRect(
         for node: OCRNodeWithText,
         range: Range<String.Index>
     ) -> CGRect {
-        let textCount = node.text.count
-        guard textCount > 0 else { return screenRect(for: node) }
+        guard !node.text.isEmpty else { return screenRect(for: node) }
 
-        let lowerBound = node.text.distance(from: node.text.startIndex, to: range.lowerBound)
-        let upperBound = node.text.distance(from: node.text.startIndex, to: range.upperBound)
-        let clampedLowerBound = min(max(lowerBound, 0), textCount - 1)
-        let clampedUpperBound = min(max(upperBound, clampedLowerBound + 1), textCount)
+        let spanFractions = OCRTextLayoutEstimator.spanFractions(in: node.text, range: range)
 
-        let startFraction = CGFloat(clampedLowerBound) / CGFloat(textCount)
-        let endFraction = CGFloat(clampedUpperBound) / CGFloat(textCount)
-        let horizontalPadding = min(
-            highlightHorizontalPaddingFraction / CGFloat(textCount),
-            startFraction
+        let rect = CGRect(
+            x: actualFrameRect.origin.x + ((node.x + (node.width * spanFractions.start)) * actualFrameRect.width),
+            y: actualFrameRect.origin.y + (node.y * actualFrameRect.height),
+            width: node.width * max(spanFractions.end - spanFractions.start, 0) * actualFrameRect.width,
+            height: node.height * actualFrameRect.height
         )
-        let trailingPadding = min(
-            highlightHorizontalPaddingFraction / CGFloat(textCount),
-            max(0, 1.0 - endFraction)
-        )
-        let paddedStartFraction = max(0, startFraction - horizontalPadding)
-        let paddedEndFraction = min(1.0, endFraction + trailingPadding)
-        let widthFraction = max(
-            paddedEndFraction - paddedStartFraction,
-            1.0 / CGFloat(textCount)
-        )
-        let verticalPadding = node.height * highlightVerticalPaddingFraction
-
-        return CGRect(
-            x: actualFrameRect.origin.x + ((node.x + (node.width * paddedStartFraction)) * actualFrameRect.width),
-            y: actualFrameRect.origin.y + ((node.y - verticalPadding) * actualFrameRect.height),
-            width: node.width * min(widthFraction, 1.0) * actualFrameRect.width,
-            height: min(node.height + (verticalPadding * 2), max(0, 1.0 - max(0, node.y - verticalPadding))) * actualFrameRect.height
-        )
+        return Self.paddedHighlightRect(rect, within: actualFrameRect)
     }
 }
 
