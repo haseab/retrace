@@ -9629,13 +9629,22 @@ public class SimpleTimelineViewModel: ObservableObject {
         titleText: String,
         urlString: String
     ) -> String {
-        let safeChannelName = escapeMarkdownInlineText(sanitizedMarkdownClipboardComponent(channelName))
+        let safeChannelName = escapeMarkdownInlineText(
+            sanitizedYouTubeMarkdownChannelName(channelName)
+        )
         let safeTitleText = escapeMarkdownInlineText(sanitizedMarkdownClipboardComponent(titleText))
         let destination = urlString
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: ")", with: "%29")
 
         return "\(safeChannelName) - [\(safeTitleText)](\(destination))"
+    }
+
+    private static func sanitizedYouTubeMarkdownChannelName(_ channelName: String) -> String {
+        let sanitized = sanitizedMarkdownClipboardComponent(channelName)
+        return sanitized
+            .replacingOccurrences(of: #"\s+[oO0]$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func resolveYouTubeOCRMatch(
