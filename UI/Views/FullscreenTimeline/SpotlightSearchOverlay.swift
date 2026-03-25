@@ -1126,9 +1126,7 @@ public struct SpotlightSearchOverlay: View {
 
                             // Infinite scroll: load more when near the end
                             if index >= visibleResults.count - 3 && viewModel.canLoadMore {
-                                Task {
-                                    await viewModel.loadMore()
-                                }
+                                viewModel.loadMore()
                             }
                         }
                     }

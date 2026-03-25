@@ -2264,6 +2264,16 @@ public class DashboardViewModel: ObservableObject {
         return json
     }
 
+    private static func timelineAutoDismissMetadata(
+        activatedBundleID: String? = nil
+    ) -> String? {
+        var payload: [String: Any] = ["trigger": "app_activation"]
+        if let activatedBundleID {
+            payload["activatedBundleID"] = activatedBundleID
+        }
+        return jsonMetadata(payload)
+    }
+
     public static func recordBrowserLinkOpened(
         coordinator: AppCoordinator,
         source: String,
@@ -2434,6 +2444,19 @@ public class DashboardViewModel: ObservableObject {
                 "source": source,
                 "isCollapsed": isCollapsed
             ])
+        )
+    }
+
+    public static func recordTimelineAutoDismissed(
+        coordinator: AppCoordinator,
+        activatedBundleID: String? = nil
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .timelineAutoDismissed,
+            metadata: timelineAutoDismissMetadata(
+                activatedBundleID: activatedBundleID
+            )
         )
     }
 

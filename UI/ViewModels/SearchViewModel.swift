@@ -1598,11 +1598,22 @@ public class SearchViewModel: ObservableObject {
     }
 
     /// Load more results for infinite scroll
-    public func loadMore() async {
+    public func loadMore() {
+        currentLoadMoreTask?.cancel()
+        currentLoadMoreTask = Task { @MainActor [weak self] in
+            await self?.performLoadMore()
+        }
+    }
+
+    private func performLoadMore() async {
         guard canLoadMore, let currentResults = results else { return }
 
         Log.info("[SearchViewModel] Loading more results, current count: \(currentResults.results.count)", category: .ui)
         isLoadingMore = true
+
+        defer {
+            currentLoadMoreTask = nil
+        }
 
         do {
             // Check for cancellation before starting

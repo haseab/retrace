@@ -26,6 +26,7 @@ public enum DailyMetricsQueries {
         case timelineFilterQuery = "timeline_filter_query"  // metadata: JSON {bundleID, windowName, browserUrl, startDate, endDate}
         case scrubDistance = "scrub_distance"  // metadata: distance in pixels per session
         case searchDialogOpens = "search_dialog_opens"
+        case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
         case ocrReprocessRequests = "ocr_reprocess_requests"
         case arrowKeyNavigation = "arrow_key_navigation"  // metadata: "left" or "right"
         case shiftDragZoomRegion = "shift_drag_zoom_region"  // metadata: JSON {region, screenSize}

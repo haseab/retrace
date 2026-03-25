@@ -38,6 +38,8 @@ public class TimelineWindowController: NSObject {
     private var liveModeCaptureTask: Task<Void, Never>?
     private var windowFadeInTask: Task<Void, Never>?
     private var windowFadeInGeneration: UInt64 = 0
+    private var workspaceActivationObserver: Any?
+    private let hideCompletionCoordinator = HideCompletionCoordinator()
     private var isHiding = false
     /// Ignore scroll-wheel input for a short grace period after opening in live mode.
     /// This prevents residual trackpad momentum from immediately exiting live mode.
@@ -96,6 +98,29 @@ public class TimelineWindowController: NSObject {
     struct FocusRestoreTarget: Equatable {
         let processIdentifier: pid_t
         let bundleIdentifier: String?
+    }
+
+    @MainActor
+    final class HideCompletionCoordinator {
+        private var continuations: [CheckedContinuation<Bool, Never>] = []
+
+        func wait() async -> Bool {
+            await withCheckedContinuation { continuation in
+                continuations.append(continuation)
+            }
+        }
+
+        func append(_ continuation: CheckedContinuation<Bool, Never>) {
+            continuations.append(continuation)
+        }
+
+        func resumeAll(hidden: Bool) {
+            let pendingContinuations = continuations
+            continuations.removeAll()
+            for continuation in pendingContinuations {
+                continuation.resume(returning: hidden)
+            }
+        }
     }
 
     /// The app that was frontmost before the timeline was shown.
@@ -174,6 +199,15 @@ public class TimelineWindowController: NSObject {
     ) -> Bool {
         guard isTimelineVisible, let frontmostProcessID else { return false }
         return frontmostProcessID == currentProcessID
+    }
+
+    nonisolated static func shouldDismissTimelineForActivatedApplication(
+        isTimelineVisible: Bool,
+        activatedProcessID: pid_t?,
+        currentProcessID: pid_t
+    ) -> Bool {
+        guard isTimelineVisible, let activatedProcessID else { return false }
+        return activatedProcessID != currentProcessID
     }
 
     nonisolated static func shouldToggleSearchOverlayFromShortcut(isActivelyScrolling: Bool) -> Bool {
@@ -265,6 +299,71 @@ public class TimelineWindowController: NSObject {
             frontmostProcessID: frontmostProcessID,
             currentProcessID: currentProcessID
         )
+    }
+
+    private func startObservingApplicationActivation() {
+        guard workspaceActivationObserver == nil else { return }
+        let currentProcessID = ProcessInfo.processInfo.processIdentifier
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let activatedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard Self.shouldDismissTimelineForActivatedApplication(
+                    isTimelineVisible: self.isVisible,
+                    activatedProcessID: activatedApp?.processIdentifier,
+                    currentProcessID: currentProcessID
+                ) else {
+                    return
+                }
+                self.dismissForActivatedApplication(activatedApp)
+            }
+        }
+    }
+
+    private func stopObservingApplicationActivation() {
+        guard let workspaceActivationObserver else { return }
+        NSWorkspace.shared.notificationCenter.removeObserver(workspaceActivationObserver)
+        self.workspaceActivationObserver = nil
+    }
+
+    private func dismissForActivatedApplication(_ activatedApplication: NSRunningApplication?) {
+        guard isVisible, !isHiding else { return }
+        stopObservingApplicationActivation()
+        if let coordinator {
+            DashboardViewModel.recordTimelineAutoDismissed(
+                coordinator: coordinator,
+                activatedBundleID: activatedApplication?.bundleIdentifier
+            )
+        }
+        Log.info(
+            "[TIMELINE-AUTO-DISMISS] Dismissing timeline trigger=app_activation activatedPID=\(activatedApplication?.processIdentifier ?? -1) activatedBundleID=\(activatedApplication?.bundleIdentifier ?? "nil")",
+            category: .ui
+        )
+        hide(restorePreviousFocus: false)
+    }
+
+    func hideAndWait(restorePreviousFocus: Bool = true) async -> Bool {
+        if isHiding {
+            return await hideCompletionCoordinator.wait()
+        }
+
+        guard isVisible else { return true }
+        guard window != nil else {
+            Log.warning(
+                "[TimelineToggle] Cannot await hide completion because the timeline window is missing while marked visible",
+                category: .ui
+            )
+            return false
+        }
+
+        return await withCheckedContinuation { continuation in
+            hideCompletionCoordinator.append(continuation)
+            hide(restorePreviousFocus: restorePreviousFocus)
+        }
     }
 
     private func captureFocusRestoreTarget() {
@@ -696,6 +795,8 @@ public class TimelineWindowController: NSObject {
             })
             isVisible = true
             Self.setEmergencyTimelineVisible(true)
+            hideCompletionCoordinator.resumeAll(hidden: false)
+            startObservingApplicationActivation()
             return
         }
 
@@ -923,6 +1024,7 @@ public class TimelineWindowController: NSObject {
         Self.setEmergencyTimelineVisible(true)  // For emergency escape tap
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        startObservingApplicationActivation()
         if let hostingView = hostingView {
             DispatchQueue.main.async { [weak hostingView] in
                 hostingView?.layoutSubtreeIfNeeded()
@@ -989,6 +1091,7 @@ public class TimelineWindowController: NSObject {
         )
         let hideRequestStartedAt = CFAbsoluteTimeGetCurrent()
         isHiding = true
+        stopObservingApplicationActivation()
         cancelWindowFadeIn(reason: "hide")
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
@@ -1021,6 +1124,8 @@ public class TimelineWindowController: NSObject {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
                 viewModel.isTapeHidden = true
             }
+            // Abort in-flight search work now that the timeline is dismissing.
+            viewModel.searchViewModel.cancelSearch()
             // Ensure right-click menus don't persist across timeline sessions.
             viewModel.dismissContextMenu()
             viewModel.dismissTimelineContextMenu()
@@ -1109,6 +1214,8 @@ public class TimelineWindowController: NSObject {
                 if let coordinator = self.coordinator {
                     await coordinator.setTimelineVisible(false)
                 }
+
+                self.hideCompletionCoordinator.resumeAll(hidden: true)
 
                 await self.compactHiddenPresentationState()
 
@@ -1392,6 +1499,7 @@ public class TimelineWindowController: NSObject {
         cancelWindowFadeIn(reason: "destroyMountedPresentation")
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
+        stopObservingApplicationActivation()
         timelineViewModel?.setPresentationWorkEnabled(false, reason: "destroyMountedPresentation")
 
         window?.orderOut(nil)

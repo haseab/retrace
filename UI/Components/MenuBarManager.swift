@@ -292,12 +292,23 @@ public class MenuBarManager: ObservableObject {
     /// Open the standalone quick-comment composer at the current moment.
     private func openCommentComposerFromHotkey() {
         Task { @MainActor in
+            let source = "global_hotkey_comment"
             DashboardViewModel.recordKeyboardShortcut(
                 coordinator: coordinator,
                 shortcut: keyboardShortcutMetricIdentifier(for: commentShortcut)
             )
+            let didHideTimeline = await TimelineWindowController.shared.hideAndWait(
+                restorePreviousFocus: false
+            )
+            guard didHideTimeline else {
+                Log.warning(
+                    "[QuickComment] Aborting hotkey open because timeline did not finish hiding",
+                    category: .ui
+                )
+                return
+            }
             StandaloneCommentComposerWindowController.shared.openCommentComposerAtCurrentMoment(
-                source: "global_hotkey_comment"
+                source: source
             )
         }
     }
