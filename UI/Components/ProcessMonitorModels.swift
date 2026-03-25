@@ -264,7 +264,7 @@ enum ProcessCPUDisplayMetrics {
 
     static func memoryLedgerFamilyDisplayName(for familyKey: String) -> String {
         if familyKey == unattributedMemoryFamilyKey {
-            return "Unattributed"
+            return "unattributed"
         }
         return familyKey
     }

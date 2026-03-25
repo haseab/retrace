@@ -50,10 +50,7 @@ extension VisionOCR {
         VisionOCRResetSpec(tag: "processing.ocr.regionReturnResidual", function: "processing.ocr.region_reocr", kind: "region-return-residual", note: "epoch-arbited-current-unattributed-after-cache-refresh", unit: "requests"),
         VisionOCRResetSpec(tag: "processing.ocr.regionMergeScratch", function: "processing.ocr.region_reocr", kind: "region-merge-scratch", note: "observed-plus-buffer", unit: "requests"),
         VisionOCRResetSpec(tag: "processing.ocr.regionCacheRefresh", function: "processing.ocr.region_reocr", kind: "region-cache-refresh", note: "observed-plus-buffer", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionRequestShortTail", function: "processing.ocr.region_reocr", kind: "region-request-short-tail", note: "observed-short-tail-residual", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionRequestTail", function: "processing.ocr.region_reocr", kind: "region-request-tail", note: "observed-long-tail-residual", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionCacheShortTail", function: "processing.ocr.region_reocr", kind: "region-cache-short-tail", note: "observed-short-tail-residual-net-request-tail", unit: "requests"),
-        VisionOCRResetSpec(tag: "processing.ocr.regionCacheTail", function: "processing.ocr.region_reocr", kind: "region-cache-tail", note: "observed-long-tail-residual-net-request-tail", unit: "requests")
+        VisionOCRResetSpec(tag: "processing.ocr.regionTailResidual", function: "processing.ocr.region_reocr", kind: "region-tail-residual", note: "observed-delayed-tail-residual", unit: "requests")
     ]
 
     static func measuredLedgerResidualBytes(
@@ -222,10 +219,7 @@ extension VisionOCR {
             "processing.ocr.regionBlindResidual",
             "processing.ocr.regionOCRCallResidual",
             "processing.ocr.regionReturnResidual",
-            "processing.ocr.regionRequestShortTail",
-            "processing.ocr.regionRequestTail",
-            "processing.ocr.regionCacheShortTail",
-            "processing.ocr.regionCacheTail",
+            "processing.ocr.regionTailResidual",
             Self.concurrentCaptureResidualTag
         ]
 

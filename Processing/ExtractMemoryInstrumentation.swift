@@ -45,40 +45,10 @@ enum ProcessingExtractMemoryLedger {
             note: "epoch-arbited-current-unattributed-after-ocr-call"
         ),
         ResetSpec(
-            tag: "processing.extract.ocrReturnShortTail",
+            tag: "processing.extract.ocrReturnResidual",
             function: "processing.extract_text.ocr_tail",
-            kind: "extract-ocr-return-short-tail",
-            note: "observed-short-tail-residual-after-ocr-call"
-        ),
-        ResetSpec(
-            tag: "processing.extract.ocrReturnTail",
-            function: "processing.extract_text.ocr_tail",
-            kind: "extract-ocr-return-tail",
-            note: "observed-long-tail-residual-after-ocr-tails"
-        ),
-        ResetSpec(
-            tag: "processing.extract.chromePartition",
-            function: "processing.extract_text.partition",
-            kind: "extract-chrome-partition-residual",
-            note: "observed-footprint-delta"
-        ),
-        ResetSpec(
-            tag: "processing.extract.accessibilityFetch",
-            function: "processing.extract_text.accessibility",
-            kind: "extract-accessibility-residual",
-            note: "observed-footprint-delta"
-        ),
-        ResetSpec(
-            tag: "processing.extract.textJoin",
-            function: "processing.extract_text.string_join",
-            kind: "extract-text-join-residual",
-            note: "observed-footprint-delta"
-        ),
-        ResetSpec(
-            tag: "processing.extract.textMerge",
-            function: "processing.extract_text.merge",
-            kind: "extract-text-merge-residual",
-            note: "observed-footprint-delta"
+            kind: "extract-ocr-return-residual",
+            note: "observed-delayed-residual-after-ocr-call"
         ),
         ResetSpec(
             tag: "processing.extract.outputPayload",
@@ -87,16 +57,10 @@ enum ProcessingExtractMemoryLedger {
             note: "estimated-result-graph"
         ),
         ResetSpec(
-            tag: "processing.extract.finalize",
-            function: "processing.extract_text.finalize",
-            kind: "extract-finalize-residual",
-            note: "observed-footprint-delta"
-        ),
-        ResetSpec(
             tag: "processing.extract.buildResidual",
             function: "processing.extract_text.build_residual",
             kind: "extract-build-residual",
-            note: "observed-build-remainder"
+            note: "observed-build-residual-net-output-payload"
         ),
         ResetSpec(
             tag: "processing.extract.totalResidual",
@@ -276,20 +240,11 @@ enum ProcessingExtractMemoryLedger {
                 reason: reason,
                 emitSummary: false
             )
-        case "processing.extract.ocrReturnShortTail":
+        case "processing.extract.ocrReturnResidual":
             tracker.clear(
                 tag: tag,
                 function: "processing.extract_text.ocr_tail",
-                kind: "extract-ocr-return-short-tail",
-                note: "handoff-cleared",
-                reason: reason,
-                emitSummary: false
-            )
-        case "processing.extract.ocrReturnTail":
-            tracker.clear(
-                tag: tag,
-                function: "processing.extract_text.ocr_tail",
-                kind: "extract-ocr-return-tail",
+                kind: "extract-ocr-return-residual",
                 note: "handoff-cleared",
                 reason: reason,
                 emitSummary: false
@@ -546,8 +501,7 @@ enum ProcessingExtractMemoryLedger {
             max(0, regionReturnResidualBytes),
             max(0, tracker.currentBytes(tag: "processing.extract.ocrCallObservedResidual")),
             max(0, tracker.currentBytes(tag: "processing.extract.totalObservedResidual")),
-            max(0, tracker.currentBytes(tag: "processing.extract.ocrReturnShortTail")),
-            max(0, tracker.currentBytes(tag: "processing.extract.ocrReturnTail"))
+            max(0, tracker.currentBytes(tag: "processing.extract.ocrReturnResidual"))
         )
         let currentSnapshot = await synchronizedLedgerSnapshot()
         let currentObservedResidualBytes = currentUnattributedBytes(currentSnapshot)
@@ -647,17 +601,9 @@ enum ProcessingExtractMemoryLedger {
             emitSummary: false
         )
         tracker.clear(
-            tag: "processing.extract.ocrReturnShortTail",
+            tag: "processing.extract.ocrReturnResidual",
             function: "processing.extract_text.ocr_tail",
-            kind: "extract-ocr-return-short-tail",
-            note: "handoff-cleared",
-            reason: reason,
-            emitSummary: false
-        )
-        tracker.clear(
-            tag: "processing.extract.ocrReturnTail",
-            function: "processing.extract_text.ocr_tail",
-            kind: "extract-ocr-return-tail",
+            kind: "extract-ocr-return-residual",
             note: "handoff-cleared",
             reason: reason,
             emitSummary: false

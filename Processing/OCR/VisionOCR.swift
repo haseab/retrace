@@ -522,7 +522,7 @@ public final class VisionOCR: OCRProtocol, @unchecked Sendable {
                 returnResidualClaimBytes: max(0, regionReturnResidualClaim.bytes),
                 callResidualBytes: regionCallResidualBytes
             )
-            ProcessingExtractRequestInstrumentation.scheduleRegionTailResiduals(
+            ProcessingExtractRequestInstrumentation.scheduleRegionTailResidual(
                 reason: regionReason,
                 requestBaselineSnapshot: regionOCRBaselineSnapshot,
                 requestPayloadBytes: newRegionsPayloadBytes,

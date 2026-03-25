@@ -275,7 +275,7 @@ final class ProcessCPUDisplayMetricsTests: XCTestCase {
             "memory.unattributed",
             "storage.videoEncoding"
         ])
-        XCTAssertEqual(rows.families.first?.name, "Unattributed")
+        XCTAssertEqual(rows.families.first?.name, "unattributed")
         XCTAssertEqual(rows.childrenByFamily["memory.unattributed"]?.map(\.name), ["unattributed"])
     }
 

@@ -174,7 +174,7 @@ public actor ProcessingManager: ProcessingProtocol {
         startTime: Date,
         instrumentation: ProcessingExtractRequestInstrumentation
     ) async throws -> BuildExtractedTextOutput {
-        var buildStage = await instrumentation.beginBuildStage()
+        let buildStage = await instrumentation.beginBuildStage()
 
         // Separate UI chrome from main content
         // Chrome = top 5% (menu bar/status bar) + bottom 5% (dock)
@@ -200,8 +200,6 @@ public actor ProcessingManager: ProcessingProtocol {
                 mainRegions.append(region)
             }
         }
-        let partitionResidualBytes = await buildStage.recordChromePartition()
-
         // Extract accessibility text (if enabled and permitted)
         var axResult: AccessibilityResult? = nil
         var axText: String? = nil
@@ -217,16 +215,12 @@ public actor ProcessingManager: ProcessingProtocol {
                 }
             }
         }
-        let accessibilityResidualBytes = await buildStage.recordAccessibilityFetch()
-
         // Build OCR text from main regions only (chrome text stored separately)
         let ocrText = mainRegions.map(\.text).joined(separator: " ")
         let chromeText = chromeRegions.map(\.text).joined(separator: " ")
-        let joinResidualBytes = await buildStage.recordTextJoin()
 
         // Merge OCR and accessibility text
         let fullText = merger.mergeText(ocrText: ocrText, accessibilityText: axText)
-        let mergeResidualBytes = await buildStage.recordTextMerge()
 
         // Merge accessibility metadata with existing metadata
         // Preserve browserURL from capture phase if accessibility doesn't provide one
@@ -261,25 +255,13 @@ public actor ProcessingManager: ProcessingProtocol {
         totalOCRTimeMs += ocrTime
         totalTextLength += extractedText.wordCount
 
-        let finalizeResidualBytes = await buildStage.recordFinalize(outputPayloadBytes: outputPayloadBytes)
-        let buildFallbackResidualBytes = buildStage.recordBuildResidual(
-            partitionResidualBytes: partitionResidualBytes,
-            accessibilityResidualBytes: accessibilityResidualBytes,
-            joinResidualBytes: joinResidualBytes,
-            mergeResidualBytes: mergeResidualBytes,
-            finalizeResidualBytes: finalizeResidualBytes,
+        let buildResidualBytes = await buildStage.recordBuildResidual(
             outputPayloadBytes: outputPayloadBytes
         )
 
         return BuildExtractedTextOutput(
             extractedText: extractedText,
-            attributedResidualBytes:
-                partitionResidualBytes +
-                accessibilityResidualBytes +
-                joinResidualBytes +
-                mergeResidualBytes +
-                finalizeResidualBytes +
-                buildFallbackResidualBytes,
+            attributedResidualBytes: buildResidualBytes,
             outputPayloadBytes: outputPayloadBytes
         )
     }

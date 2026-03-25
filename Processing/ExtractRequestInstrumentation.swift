@@ -11,53 +11,11 @@ private struct ProcessingExtractResidualRepublishSpec {
 
 struct ProcessingExtractBuildStageInstrumentation {
     private let baselineSnapshot: MemoryLedger.Snapshot
-    private var previousSnapshot: MemoryLedger.Snapshot
 
     static func begin() async -> ProcessingExtractBuildStageInstrumentation {
         let baselineSnapshot = await ProcessingExtractMemoryLedger.synchronizedLedgerSnapshot()
         return ProcessingExtractBuildStageInstrumentation(
-            baselineSnapshot: baselineSnapshot,
-            previousSnapshot: baselineSnapshot
-        )
-    }
-
-    mutating func recordChromePartition() async -> Int64 {
-        await recordPhase(
-            tag: "processing.extract.chromePartition",
-            function: "processing.extract_text.partition",
-            kind: "extract-chrome-partition-residual",
-            note: "observed-footprint-delta",
-            reason: "processing.extract_text.partition"
-        )
-    }
-
-    mutating func recordAccessibilityFetch() async -> Int64 {
-        await recordPhase(
-            tag: "processing.extract.accessibilityFetch",
-            function: "processing.extract_text.accessibility",
-            kind: "extract-accessibility-residual",
-            note: "observed-footprint-delta",
-            reason: "processing.extract_text.accessibility"
-        )
-    }
-
-    mutating func recordTextJoin() async -> Int64 {
-        await recordPhase(
-            tag: "processing.extract.textJoin",
-            function: "processing.extract_text.string_join",
-            kind: "extract-text-join-residual",
-            note: "observed-footprint-delta",
-            reason: "processing.extract_text.text_join"
-        )
-    }
-
-    mutating func recordTextMerge() async -> Int64 {
-        await recordPhase(
-            tag: "processing.extract.textMerge",
-            function: "processing.extract_text.merge",
-            kind: "extract-text-merge-residual",
-            note: "observed-footprint-delta",
-            reason: "processing.extract_text.text_merge"
+            baselineSnapshot: baselineSnapshot
         )
     }
 
@@ -74,74 +32,22 @@ struct ProcessingExtractBuildStageInstrumentation {
         return outputPayloadBytes
     }
 
-    mutating func recordFinalize(outputPayloadBytes: Int64) async -> Int64 {
-        await recordPhase(
-            tag: "processing.extract.finalize",
-            function: "processing.extract_text.finalize",
-            kind: "extract-finalize-residual",
-            note: "observed-footprint-delta",
-            reason: "processing.extract_text.finalize",
-            subtractingBytes: outputPayloadBytes
-        )
-    }
-
-    func recordBuildResidual(
-        partitionResidualBytes: Int64,
-        accessibilityResidualBytes: Int64,
-        joinResidualBytes: Int64,
-        mergeResidualBytes: Int64,
-        finalizeResidualBytes: Int64,
-        outputPayloadBytes: Int64
-    ) -> Int64 {
-        let totalBuildResidualBytes = ProcessingExtractMemoryLedger.measuredResidualBytes(
+    func recordBuildResidual(outputPayloadBytes: Int64) async -> Int64 {
+        let currentSnapshot = await ProcessingExtractMemoryLedger.synchronizedLedgerSnapshot()
+        let buildResidualBytes = ProcessingExtractMemoryLedger.measuredResidualBytes(
             before: baselineSnapshot,
-            after: previousSnapshot
-        )
-        let buildFallbackResidualBytes = max(
-            0,
-            totalBuildResidualBytes -
-                partitionResidualBytes -
-                accessibilityResidualBytes -
-                joinResidualBytes -
-                mergeResidualBytes -
-                finalizeResidualBytes -
-                outputPayloadBytes
+            after: currentSnapshot,
+            subtractingBytes: outputPayloadBytes
         )
         ProcessingExtractMemoryLedger.setResidual(
             tag: "processing.extract.buildResidual",
             function: "processing.extract_text.build_residual",
             kind: "extract-build-residual",
-            note: "observed-build-remainder",
-            bytes: buildFallbackResidualBytes,
+            note: "observed-build-residual-net-output-payload",
+            bytes: buildResidualBytes,
             reason: "processing.extract_text"
         )
-        return buildFallbackResidualBytes
-    }
-
-    private mutating func recordPhase(
-        tag: String,
-        function: String,
-        kind: String,
-        note: String,
-        reason: String,
-        subtractingBytes: Int64 = 0
-    ) async -> Int64 {
-        let currentSnapshot = await ProcessingExtractMemoryLedger.synchronizedLedgerSnapshot()
-        let residualBytes = ProcessingExtractMemoryLedger.measuredResidualBytes(
-            before: previousSnapshot,
-            after: currentSnapshot,
-            subtractingBytes: subtractingBytes
-        )
-        ProcessingExtractMemoryLedger.setResidual(
-            tag: tag,
-            function: function,
-            kind: kind,
-            note: note,
-            bytes: residualBytes,
-            reason: reason
-        )
-        previousSnapshot = currentSnapshot
-        return residualBytes
+        return buildResidualBytes
     }
 }
 
@@ -258,7 +164,7 @@ struct ProcessingExtractRequestInstrumentation: Sendable {
             returnResidualClaimBytes: returnResidualClaimBytes,
             callResidualBytes: callResidualBytes
         )
-        Self.scheduleRegionTailResiduals(
+        Self.scheduleRegionTailResidual(
             reason: reason,
             requestBaselineSnapshot: requestBaselineSnapshot,
             requestPayloadBytes: requestPayloadBytes,
@@ -337,39 +243,10 @@ struct ProcessingExtractRequestInstrumentation: Sendable {
         )
 
         if schedulesReturnResidualProbes {
-            ProcessingExtractMemoryLedger.scheduleObservedResidualProbe(
-                tag: "processing.extract.ocrReturnShortTail",
-                function: "processing.extract_text.ocr_tail",
-                kind: "extract-ocr-return-short-tail",
-                note: "observed-short-tail-residual-after-ocr-call-net-ocr-local-residuals",
+            Self.scheduleOCRReturnResidual(
                 reason: "processing.extract_text.ocr_call",
                 baselineSnapshot: extractBaselineSnapshot,
-                delay: 0.25,
-                holdDelay: 0.8,
-                subtractingBytes: ocrRegionPayloadBytes,
-                liveSubtractiveBytes: {
-                    VisionOCR.currentExtractResidualExclusionBytes() +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.ocrCallObservedResidual") +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.totalObservedResidual") +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.handoffObservedResidual")
-                }
-            )
-            ProcessingExtractMemoryLedger.scheduleObservedResidualProbe(
-                tag: "processing.extract.ocrReturnTail",
-                function: "processing.extract_text.ocr_tail",
-                kind: "extract-ocr-return-tail",
-                note: "observed-long-tail-residual-after-ocr-tails-net-ocr-local-residuals",
-                reason: "processing.extract_text.ocr_call",
-                baselineSnapshot: extractBaselineSnapshot,
-                delay: 2.0,
-                holdDelay: 1.5,
-                subtractingBytes: ocrRegionPayloadBytes,
-                liveSubtractiveBytes: {
-                    VisionOCR.currentExtractResidualExclusionBytes() +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.ocrCallObservedResidual") +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.totalObservedResidual") +
-                        ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.handoffObservedResidual")
-                }
+                outputPayloadBytes: ocrRegionPayloadBytes
             )
         }
 
@@ -449,6 +326,34 @@ struct ProcessingExtractRequestInstrumentation: Sendable {
             note: spec.note,
             delay: spec.delay,
             forceSummary: true
+        )
+    }
+
+    private static func currentOCRReturnResidualExclusionBytes() -> Int64 {
+        VisionOCR.currentExtractResidualExclusionBytes() +
+            ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.ocrCallObservedResidual") +
+            ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.totalObservedResidual") +
+            ProcessingExtractMemoryLedger.currentTrackedBytes(tag: "processing.extract.handoffObservedResidual")
+    }
+
+    static func scheduleOCRReturnResidual(
+        reason: String,
+        baselineSnapshot: MemoryLedger.Snapshot,
+        outputPayloadBytes: Int64,
+        delaySeconds: TimeInterval = 1.5,
+        holdDelaySeconds: TimeInterval = 1.5
+    ) {
+        ProcessingExtractMemoryLedger.scheduleObservedResidualProbe(
+            tag: "processing.extract.ocrReturnResidual",
+            function: "processing.extract_text.ocr_tail",
+            kind: "extract-ocr-return-residual",
+            note: "observed-delayed-residual-after-ocr-call-net-ocr-local-residuals",
+            reason: reason,
+            baselineSnapshot: baselineSnapshot,
+            delay: delaySeconds,
+            holdDelay: holdDelaySeconds,
+            subtractingBytes: outputPayloadBytes,
+            liveSubtractiveBytes: { Self.currentOCRReturnResidualExclusionBytes() }
         )
     }
 
@@ -633,107 +538,71 @@ struct ProcessingExtractRequestInstrumentation: Sendable {
         }
     }
 
-    static func scheduleRegionTailResiduals(
+    static func combinedRegionTailResidualBytes(
+        requestTailBytes: Int64,
+        cacheTailTotalBytes: Int64,
+        availableUnattributedBytes: Int64
+    ) -> Int64 {
+        let boundedRequestTailBytes = max(0, requestTailBytes)
+        let boundedCacheTailTotalBytes = max(0, cacheTailTotalBytes)
+        let boundedAvailableUnattributedBytes = max(0, availableUnattributedBytes)
+        return min(
+            max(boundedRequestTailBytes, boundedCacheTailTotalBytes),
+            boundedAvailableUnattributedBytes
+        )
+    }
+
+    static func scheduleRegionTailResidual(
         reason: String,
         requestBaselineSnapshot: MemoryLedger.Snapshot,
         requestPayloadBytes: Int64,
         cacheBaselineSnapshot: MemoryLedger.Snapshot,
-        shortDelaySeconds: TimeInterval = 0.25,
-        shortHoldSeconds: TimeInterval = 0.8,
-        longDelaySeconds: TimeInterval = 1.5,
-        longHoldSeconds: TimeInterval = 1.5
+        delaySeconds: TimeInterval = 1.5,
+        holdSeconds: TimeInterval = 1.5
     ) {
-        guard
-            let requestShortGeneration = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionRequestShortTail"),
-            let requestLongGeneration = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionRequestTail"),
-            let cacheShortGeneration = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionCacheShortTail"),
-            let cacheLongGeneration = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionCacheTail")
-        else {
+        guard let generation = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionTailResidual") else {
             return
         }
 
-        let probes: [(requestTag: String, requestKind: String, requestNote: String, requestGeneration: UInt64, cacheTag: String, cacheKind: String, cacheNote: String, cacheGeneration: UInt64, delaySeconds: TimeInterval, holdSeconds: TimeInterval)] = [
-            (
-                requestTag: "processing.ocr.regionRequestShortTail",
-                requestKind: "region-request-short-tail",
-                requestNote: "observed-short-tail-residual",
-                requestGeneration: requestShortGeneration,
-                cacheTag: "processing.ocr.regionCacheShortTail",
-                cacheKind: "region-cache-short-tail",
-                cacheNote: "observed-short-tail-residual-net-request-tail",
-                cacheGeneration: cacheShortGeneration,
-                delaySeconds: shortDelaySeconds,
-                holdSeconds: shortHoldSeconds
-            ),
-            (
-                requestTag: "processing.ocr.regionRequestTail",
-                requestKind: "region-request-tail",
-                requestNote: "observed-long-tail-residual",
-                requestGeneration: requestLongGeneration,
-                cacheTag: "processing.ocr.regionCacheTail",
-                cacheKind: "region-cache-tail",
-                cacheNote: "observed-long-tail-residual-net-request-tail",
-                cacheGeneration: cacheLongGeneration,
-                delaySeconds: longDelaySeconds,
-                holdSeconds: longHoldSeconds
-            )
-        ]
-
-        for probe in probes {
-            Task.detached(priority: .utility) {
-                if probe.delaySeconds > 0 {
-                    try? await Task.sleep(for: .seconds(probe.delaySeconds))
-                }
-
-                let delayedSnapshot = await VisionOCR.synchronizedLedgerSnapshot()
-                guard VisionOCRMemoryLedger.isCurrentDeferredProbe(
-                    tag: probe.requestTag,
-                    generation: probe.requestGeneration
-                ), VisionOCRMemoryLedger.isCurrentDeferredProbe(
-                    tag: probe.cacheTag,
-                    generation: probe.cacheGeneration
-                ) else {
-                    return
-                }
-
-                let requestTailBytes = VisionOCR.measuredLedgerResidualBytes(
-                    before: requestBaselineSnapshot,
-                    after: delayedSnapshot,
-                    subtractingBytes: requestPayloadBytes
-                )
-                let cacheTailTotalBytes = VisionOCR.measuredLedgerResidualBytes(
-                    before: cacheBaselineSnapshot,
-                    after: delayedSnapshot
-                )
-                let cacheTailBytes = max(0, cacheTailTotalBytes - requestTailBytes)
-                let availableUnattributedBytes = VisionOCR.currentUnattributedBytes(delayedSnapshot)
-                let boundedRequestTailBytes = min(requestTailBytes, availableUnattributedBytes)
-                let boundedCacheTailBytes = min(
-                    cacheTailBytes,
-                    max(0, availableUnattributedBytes - boundedRequestTailBytes)
-                )
-
-                VisionOCRMemoryLedger.setObservedResidual(
-                    tag: probe.requestTag,
-                    function: "processing.ocr.region_reocr",
-                    reason: reason,
-                    bytes: boundedRequestTailBytes,
-                    kind: probe.requestKind,
-                    note: probe.requestNote,
-                    delay: probe.holdSeconds,
-                    forceSummary: true
-                )
-                VisionOCRMemoryLedger.setObservedResidual(
-                    tag: probe.cacheTag,
-                    function: "processing.ocr.region_reocr",
-                    reason: reason,
-                    bytes: boundedCacheTailBytes,
-                    kind: probe.cacheKind,
-                    note: probe.cacheNote,
-                    delay: probe.holdSeconds,
-                    forceSummary: true
-                )
+        Task.detached(priority: .utility) {
+            if delaySeconds > 0 {
+                try? await Task.sleep(for: .seconds(delaySeconds))
             }
+
+            let delayedSnapshot = await VisionOCR.synchronizedLedgerSnapshot()
+            guard VisionOCRMemoryLedger.isCurrentDeferredProbe(
+                tag: "processing.ocr.regionTailResidual",
+                generation: generation
+            ) else {
+                return
+            }
+
+            let requestTailBytes = VisionOCR.measuredLedgerResidualBytes(
+                before: requestBaselineSnapshot,
+                after: delayedSnapshot,
+                subtractingBytes: requestPayloadBytes
+            )
+            let cacheTailTotalBytes = VisionOCR.measuredLedgerResidualBytes(
+                before: cacheBaselineSnapshot,
+                after: delayedSnapshot
+            )
+            let availableUnattributedBytes = VisionOCR.currentUnattributedBytes(delayedSnapshot)
+            let combinedTailBytes = combinedRegionTailResidualBytes(
+                requestTailBytes: requestTailBytes,
+                cacheTailTotalBytes: cacheTailTotalBytes,
+                availableUnattributedBytes: availableUnattributedBytes
+            )
+
+            VisionOCRMemoryLedger.setObservedResidual(
+                tag: "processing.ocr.regionTailResidual",
+                function: "processing.ocr.region_reocr",
+                reason: reason,
+                bytes: combinedTailBytes,
+                kind: "region-tail-residual",
+                note: "observed-delayed-tail-residual",
+                delay: holdSeconds,
+                forceSummary: true
+            )
         }
     }
 
@@ -741,29 +610,28 @@ struct ProcessingExtractRequestInstrumentation: Sendable {
         reason: String,
         blindResidualClaimBytes: Int64,
         returnResidualClaimBytes: Int64,
-        callResidualBytes: Int64
+        callResidualBytes: Int64,
+        delaySeconds: TimeInterval = 1.5
     ) {
-        let probes: [(tag: String, delaySeconds: TimeInterval)] = [
-            ("processing.ocr.regionSettledReconcileShort", 0.9),
-            ("processing.ocr.regionSettledReconcileLong", 2.0)
-        ]
+        guard let generation = VisionOCRMemoryLedger.beginDeferredProbe(tag: "processing.ocr.regionSettledReconcile") else {
+            return
+        }
 
-        for probe in probes {
-            guard let generation = VisionOCRMemoryLedger.beginDeferredProbe(tag: probe.tag) else { continue }
-
-            Task.detached(priority: .utility) {
-                try? await Task.sleep(for: .seconds(probe.delaySeconds))
-                guard VisionOCRMemoryLedger.isCurrentDeferredProbe(tag: probe.tag, generation: generation) else {
-                    return
-                }
-
-                await reconcileRegionResiduals(
-                    reason: reason,
-                    blindResidualClaimBytes: blindResidualClaimBytes,
-                    returnResidualClaimBytes: returnResidualClaimBytes,
-                    callResidualBytes: callResidualBytes
-                )
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            guard VisionOCRMemoryLedger.isCurrentDeferredProbe(
+                tag: "processing.ocr.regionSettledReconcile",
+                generation: generation
+            ) else {
+                return
             }
+
+            await reconcileRegionResiduals(
+                reason: reason,
+                blindResidualClaimBytes: blindResidualClaimBytes,
+                returnResidualClaimBytes: returnResidualClaimBytes,
+                callResidualBytes: callResidualBytes
+            )
         }
     }
 }
