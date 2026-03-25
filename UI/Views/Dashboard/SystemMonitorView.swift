@@ -120,6 +120,7 @@ public struct SystemMonitorView: View {
     // MARK: - Header
 
     @State private var isHoveringBack = false
+    @State private var isHoveringHelp = false
     @State private var isHoveringSettings = false
     @State private var settingsRotation: Double = 0
 
@@ -166,7 +167,7 @@ public struct SystemMonitorView: View {
 
             Spacer()
 
-            // Right side: Live indicator + Settings button
+            // Right side: Live indicator + Help + Settings button
             HStack(spacing: 12) {
                 // Live indicator
                 HStack(spacing: 6) {
@@ -183,6 +184,39 @@ public struct SystemMonitorView: View {
                     Text("Live")
                         .font(.retraceCaption2Medium)
                         .foregroundColor(.retraceSecondary)
+                }
+
+                Button(action: {
+                    DashboardViewModel.recordHelpOpened(
+                        coordinator: coordinator,
+                        source: "system_monitor_header"
+                    )
+                    NotificationCenter.default.post(name: .openFeedback, object: nil)
+                }) {
+                    Image(systemName: "questionmark.circle")
+                        .font(.retraceCalloutMedium)
+                        .foregroundColor(.retraceSecondary)
+                        .padding(10)
+                        .background(Color.white.opacity(0.05))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+                .help("Help")
+                .scaleEffect(isHoveringHelp ? 1.03 : 1.0)
+                .animation(.easeOut(duration: 0.12), value: isHoveringHelp)
+                .onHover { hovering in
+                    isHoveringHelp = hovering
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
                 }
 
                 // Settings button
@@ -211,6 +245,7 @@ public struct SystemMonitorView: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+                .help("Settings")
                 .onHover { hovering in
                     isHoveringSettings = hovering
                     if hovering {

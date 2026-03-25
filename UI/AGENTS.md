@@ -23,7 +23,11 @@ UI/
 │   │   └── SessionIndicator.swift       # App session markers
 │   ├── FullscreenTimeline/
 │   │   ├── SpotlightSearchOverlay.swift # Primary search overlay UI
-│   │   └── SearchFilterBar.swift        # Search filters and controls
+│   │   ├── SearchFilterBar.swift        # Search filters and controls
+│   │   ├── CommentComposerChrome.swift  # Shared header/button/chip/editor chrome for timeline and quick-comment composers
+│   │   ├── CommentContextPreviewCard.swift # Shared context-preview card used by timeline and quick-comment composers
+│   │   ├── StandaloneCommentComposerWindowController.swift # Floating quick-comment window controller
+│   │   └── StandaloneQuickCommentView.swift # Dedicated standalone quick-comment UI
 │   ├── Dashboard/
 │   │   ├── DashboardView.swift          # Main dashboard
 │   │   ├── ChangelogView.swift          # Appcast-powered release notes view
@@ -61,12 +65,15 @@ UI/
 │   ├── SearchViewModel.swift
 │   ├── DashboardViewModel.swift
 │   ├── CrashRecoveryBannerModel.swift   # Dashboard-facing banner state derived from crash recovery manager status
+│   ├── CommentComposerTargetDisplayInfo.swift # Shared display metadata/title logic for timeline and quick-comment composers
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
 │   ├── FeedbackSubmissionProgress.swift # Feedback submission stage copy/progress metadata
+│   ├── QuickCommentComposerViewModel.swift # Standalone quick-comment target, tag, attachment, and submit state
 │   └── SettingsViewModel.swift
 └── Tests/
     ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
+    ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
     ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
     ├── CrashReportSupportTests.swift     # Dashboard crash/WAL report discovery and launch-context coverage
     ├── QuitConfirmationPresentationTests.swift # Quit alert anchor-window selection coverage

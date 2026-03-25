@@ -71,6 +71,19 @@ public struct Segment: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public extension Sequence where Element == SegmentID {
+    func uniquePreservingOrder() -> [SegmentID] {
+        var seen = Set<Int64>()
+        var ordered: [SegmentID] = []
+
+        for segmentID in self where seen.insert(segmentID.value).inserted {
+            ordered.append(segmentID)
+        }
+
+        return ordered
+    }
+}
+
 // MARK: - Encoding Status
 
 /// Status of frame encoding in async pipeline

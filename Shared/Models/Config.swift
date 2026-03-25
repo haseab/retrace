@@ -93,9 +93,9 @@ public struct ShortcutConfig: Codable, Sendable, Equatable {
         modifiers: [.command, .shift]
     )
 
-    /// Default feedback shortcut: Cmd+Shift+H
-    public static let defaultFeedback = ShortcutConfig(
-        key: "H",
+    /// Default quick-comment shortcut: Cmd+Shift+C
+    public static let defaultCommentCapture = ShortcutConfig(
+        key: "C",
         modifiers: [.command, .shift]
     )
 }

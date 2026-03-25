@@ -710,7 +710,6 @@ public class TimelineWindowController: NSObject {
         liveModeCaptureTask?.cancel()
         liveModeCaptureTask = nil
         captureFocusRestoreTarget()
-
         // Only capture/use live screenshot if playhead is at or near the latest frame (last 3 frames)
         // Otherwise, user was viewing a historical frame and should see that instead
         var shouldUseLiveMode = true
@@ -978,6 +977,7 @@ public class TimelineWindowController: NSObject {
 
         // Post notification so menu bar can hide recording indicator
         NotificationCenter.default.post(name: .timelineDidOpen, object: nil)
+
     }
 
     /// Hide the timeline overlay
@@ -1340,6 +1340,10 @@ public class TimelineWindowController: NSObject {
         return viewModel
     }
 
+    func refreshTapeIndicatorsAfterExternalMutation(reason: String) {
+        timelineViewModel?.refreshTapeIndicatorsAfterExternalMutation(reason: reason)
+    }
+
     private func mountPresentationIfNeeded(
         on screen: NSScreen,
         coordinator: AppCoordinator,
@@ -1675,7 +1679,7 @@ public class TimelineWindowController: NSObject {
     }
 
     /// Open the timeline segment "Add Comment" composer for the current playhead index.
-    private func openAddCommentComposerAtPlayhead(trigger _: String) {
+    private func openAddCommentComposerAtPlayhead(source: String) {
         guard let viewModel = timelineViewModel else {
             return
         }
@@ -1690,7 +1694,7 @@ public class TimelineWindowController: NSObject {
 
         viewModel.dismissOtherDialogs()
         withAnimation(.easeOut(duration: 0.15)) {
-            viewModel.openCommentSubmenuForTimelineBlock(block, source: "keyboard_opt_c")
+            viewModel.openCommentSubmenuForTimelineBlock(block, source: source)
         }
     }
 
@@ -2611,9 +2615,9 @@ public class TimelineWindowController: NSObject {
         }
 
         // Add Comment composer for segment block at playhead (Option+C)
-        if let trigger = addCommentTrigger {
+        if addCommentTrigger != nil {
             recordShortcut("opt+c")
-            openAddCommentComposerAtPlayhead(trigger: trigger)
+            openAddCommentComposerAtPlayhead(source: "keyboard_opt_c")
             return true
         }
 
@@ -3447,8 +3451,29 @@ extension Notification.Name {
 /// Custom NSWindow subclass that can become key window even when borderless
 /// This is required for text fields to receive keyboard input properly
 class KeyableWindow: NSWindow {
+    var onEscape: (() -> Void)?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.type == .keyDown, modifiers.isEmpty, event.keyCode == 53 {
+            onEscape?()
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func cancelOperation(_ sender: Any?) {
+        if let onEscape {
+            onEscape()
+            return
+        }
+
+        super.cancelOperation(sender)
+    }
 }
 
 /// Custom hosting view that accepts first mouse to enable hover on first interaction

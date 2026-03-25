@@ -250,8 +250,7 @@ private extension DashboardWindowController {
         }
 
         let hasOtherForegroundWindows = NSApp.windows.contains { candidate in
-            guard candidate !== dashboardWindow else { return false }
-            return candidate.level.rawValue == 0 && candidate.isVisible
+            isForegroundAppWindow(candidate, ignoring: dashboardWindow)
         }
 
         guard !hasOtherForegroundWindows else {
@@ -261,6 +260,17 @@ private extension DashboardWindowController {
 
         Log.info("[DashboardWindowController] hiding app after dashboard hide (no foreground windows visible)", category: .ui)
         NSApp.hide(nil)
+    }
+
+    func isForegroundAppWindow(_ candidate: NSWindow, ignoring ignoredWindow: NSWindow?) -> Bool {
+        guard candidate !== ignoredWindow else { return false }
+        guard candidate.isVisible, !candidate.isMiniaturized else { return false }
+        guard candidate.alphaValue > 0.01 else { return false }
+
+        return candidate.canBecomeKey
+            || candidate.canBecomeMain
+            || candidate.isKeyWindow
+            || candidate.isMainWindow
     }
 
     func windowStateSnapshot() -> String {

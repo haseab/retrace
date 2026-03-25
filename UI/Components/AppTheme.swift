@@ -2249,6 +2249,7 @@ private let menuContainerSettingsStore = UserDefaults(suiteName: "io.retrace.app
 /// Border color adapts based on user's color theme preference
 public struct RetraceMenuContainer: ViewModifier {
     var addPadding: Bool = true
+    var cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
 
     private var showColoredBorders: Bool {
         menuContainerSettingsStore.bool(forKey: "timelineColoredBorders")
@@ -2271,7 +2272,7 @@ public struct RetraceMenuContainer: ViewModifier {
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(RetraceMenuStyle.backgroundColor)
                 .shadow(
                     color: RetraceMenuStyle.shadowColor,
@@ -2280,7 +2281,7 @@ public struct RetraceMenuContainer: ViewModifier {
                 )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: RetraceMenuStyle.cornerRadius)
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .stroke(borderColor, lineWidth: RetraceMenuStyle.borderWidth)
         )
     }
@@ -2288,8 +2289,11 @@ public struct RetraceMenuContainer: ViewModifier {
 
 extension View {
     /// Apply standardized menu/popover container styling
-    public func retraceMenuContainer(addPadding: Bool = true) -> some View {
-        self.modifier(RetraceMenuContainer(addPadding: addPadding))
+    public func retraceMenuContainer(
+        addPadding: Bool = true,
+        cornerRadius: CGFloat = RetraceMenuStyle.cornerRadius
+    ) -> some View {
+        self.modifier(RetraceMenuContainer(addPadding: addPadding, cornerRadius: cornerRadius))
     }
 }
 

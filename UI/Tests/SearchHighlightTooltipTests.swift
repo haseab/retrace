@@ -1,5 +1,6 @@
 import XCTest
 @testable import Retrace
+import App
 import Shared
 import App
 

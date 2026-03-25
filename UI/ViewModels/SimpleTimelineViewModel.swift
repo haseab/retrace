@@ -1319,16 +1319,23 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Draft file attachments for the pending comment
     @Published public var newCommentAttachmentDrafts: [CommentAttachmentDraft] = []
 
-    /// Existing comments linked to the selected timeline block (deduplicated by comment ID)
+    /// Metrics source for actions taken from the currently open comment composer session.
+    private var currentCommentMetricsSource = "timeline_comment_submenu"
+
+    /// Existing comments linked to the currently selected timeline block thread.
     @Published public var selectedBlockComments: [SegmentComment] = []
 
-    /// Preferred fallback segment context for each selected-block comment.
+    /// Preferred fallback segment context for each selected-thread comment.
     private var selectedBlockCommentPreferredSegmentByID: [Int64: SegmentID] = [:]
 
-    /// Whether existing comments are loading for the selected timeline block
+    private var activeBlockCommentsLoadSegmentIDValues: [Int64]?
+    private var blockCommentsLoadTask: Task<Void, Never>?
+    private var blockCommentsLoadVersion: UInt64 = 0
+
+    /// Whether existing comments are loading for the currently selected segment thread.
     @Published public var isLoadingBlockComments: Bool = false
 
-    /// Optional error surfaced when loading selected block comments fails
+    /// Optional error surfaced when loading selected segment comments fails
     @Published public var blockCommentsLoadError: String? = nil
 
     /// Flattened timeline rows for "All Comments" browsing.
@@ -1408,6 +1415,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Dismiss the timeline context menu
     public func dismissTimelineContextMenu() {
         let resetMenuState = {
+            self.cancelSelectedBlockCommentsLoad()
             self.showTimelineContextMenu = false
             self.showTagSubmenu = false
             self.showCommentSubmenu = false
@@ -1447,6 +1455,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard showCommentSubmenu else { return }
 
         withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
+            self.cancelSelectedBlockCommentsLoad()
             self.showCommentSubmenu = false
             self.isCommentLinkPopoverPresented = false
             self.showTagSubmenu = false
@@ -1472,6 +1481,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             self.returnToThreadCommentsSignal = 0
             self.resetCommentTimelineState()
             self.resetCommentSearchState()
+            self.currentCommentMetricsSource = "timeline_comment_submenu"
         }
     }
 
@@ -1614,6 +1624,9 @@ public class SimpleTimelineViewModel: ObservableObject {
     private static let commentSearchPageSize = 10
     /// Debounce delay for comment search input.
     private static let commentSearchDebounceNanoseconds: UInt64 = 250_000_000
+    /// Latest-wins tape-indicator refresh task triggered by external mutations.
+    private var tapeIndicatorRefreshTask: Task<Void, Never>?
+    private var tapeIndicatorRefreshVersion: UInt64 = 0
 
     /// Number of active filters (for badge display)
     public var activeFilterCount: Int {
@@ -1688,6 +1701,29 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Current frame reference - derived from currentIndex
     public var currentFrame: FrameReference? {
         currentTimelineFrame?.frame
+    }
+
+    public var selectedCommentTargetTimelineFrame: TimelineFrame? {
+        guard let index = selectedCommentTargetIndex else {
+            return nil
+        }
+        return frames[index]
+    }
+
+    public var selectedCommentComposerTarget: CommentComposerTargetDisplayInfo? {
+        guard let index = selectedCommentTargetIndex,
+              index >= 0,
+              index < frames.count else { return nil }
+
+        let timelineFrame = frames[index]
+        let block = getBlock(forFrameAt: index)
+
+        return Self.makeCommentComposerTargetDisplayInfo(
+            timelineFrame: timelineFrame,
+            block: block,
+            availableTagsByID: availableTagsByID,
+            selectedSegmentTagIDs: Set(selectedSegmentTags.map { $0.value })
+        )
     }
 
     var displayableCurrentImage: NSImage? {
@@ -1989,6 +2025,8 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     deinit {
         commentSearchTask?.cancel()
+        blockCommentsLoadTask?.cancel()
+        tapeIndicatorRefreshTask?.cancel()
         diskFrameBufferMemoryLogTask?.cancel()
         diskFrameBufferInactivityCleanupTask?.cancel()
         foregroundFrameLoadTask?.cancel()
@@ -2323,6 +2361,23 @@ public class SimpleTimelineViewModel: ObservableObject {
     struct DragStartStillOCRTestHooks {
         var recognizeTextFromCGImage: ((CGImage) async throws -> [TextRegion])?
     }
+    struct BlockCommentsTestHooks {
+        var getCommentsForSegments: (([SegmentID]) async throws -> [AppCoordinator.LinkedSegmentComment])?
+        var createCommentForSegments: ((
+            _ body: String,
+            _ segmentIDs: [SegmentID],
+            _ attachments: [SegmentCommentAttachment],
+            _ frameID: FrameID?,
+            _ author: String?
+        ) async throws -> AppCoordinator.SegmentCommentCreateResult)?
+    }
+    struct TapeIndicatorRefreshTestHooks {
+        var fetchIndicatorData: (() async throws -> (
+            tags: [Tag],
+            segmentTagsMap: [Int64: Set<Int64>],
+            segmentCommentCountsMap: [Int64: Int]
+        ))?
+    }
     var test_refreshProcessingStatusesHooks = RefreshProcessingStatusesTestHooks()
     var test_refreshFrameDataHooks = RefreshFrameDataTestHooks()
     var test_windowFetchHooks = WindowFetchTestHooks()
@@ -2330,6 +2385,8 @@ public class SimpleTimelineViewModel: ObservableObject {
     var test_frameLookupHooks = FrameLookupTestHooks()
     var test_frameOverlayLoadHooks = FrameOverlayLoadTestHooks()
     var test_dragStartStillOCRHooks = DragStartStillOCRTestHooks()
+    var test_blockCommentsHooks = BlockCommentsTestHooks()
+    var test_tapeIndicatorRefreshHooks = TapeIndicatorRefreshTestHooks()
 #endif
 
     // MARK: - Initialization
@@ -2462,12 +2519,54 @@ public class SimpleTimelineViewModel: ObservableObject {
         }
     }
 
-    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
+    nonisolated static func timelineDiskFrameBufferDirectoryURL() -> URL {
         let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return cachesDirectory
             .appendingPathComponent("io.retrace.app", isDirectory: true)
             .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
+    }
+
+    nonisolated static func timelineDiskFrameBufferFileURL(for frameID: FrameID) -> URL {
+        timelineDiskFrameBufferDirectoryURL()
+            .appendingPathComponent("\(frameID.value)")
+            .appendingPathExtension(Self.diskFrameBufferFilenameExtension)
+    }
+
+    nonisolated static func loadTimelineDiskFrameBufferPreviewImage(
+        for frameID: FrameID,
+        logPrefix: String
+    ) async -> NSImage? {
+        let fileURL = timelineDiskFrameBufferFileURL(for: frameID)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return nil
+        }
+
+        do {
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+            }.value
+
+            guard let image = NSImage(data: data) else {
+                Log.warning(
+                    "\(logPrefix) Failed to decode timeline disk-buffer preview for frame \(frameID.value)",
+                    category: .ui
+                )
+                return nil
+            }
+
+            return image
+        } catch {
+            Log.warning(
+                "\(logPrefix) Failed to read timeline disk-buffer preview for frame \(frameID.value): \(error)",
+                category: .ui
+            )
+            return nil
+        }
+    }
+
+    private static func defaultDiskFrameBufferDirectoryURL() -> URL {
+        timelineDiskFrameBufferDirectoryURL()
     }
 
     nonisolated private static func frameID(fromDiskFrameFileURL url: URL) -> FrameID? {
@@ -3901,16 +4000,23 @@ public class SimpleTimelineViewModel: ObservableObject {
         return true
     }
 
-    /// Get all unique segment IDs within a visible block
-    public func getSegmentIds(inBlock block: AppBlock) -> Set<SegmentID> {
-        var segmentIds = Set<SegmentID>()
+    /// Get all unique segment IDs within a visible block, preserving timeline order.
+    public func getOrderedSegmentIds(inBlock block: AppBlock) -> [SegmentID] {
+        var seen = Set<Int64>()
+        var orderedSegmentIDs: [SegmentID] = []
         for index in block.startIndex...block.endIndex {
             if index < frames.count {
-                let segmentId = SegmentID(value: frames[index].frame.segmentID.value)
-                segmentIds.insert(segmentId)
+                let segmentIDValue = frames[index].frame.segmentID.value
+                guard seen.insert(segmentIDValue).inserted else { continue }
+                orderedSegmentIDs.append(SegmentID(value: segmentIDValue))
             }
         }
-        return segmentIds
+        return orderedSegmentIDs
+    }
+
+    /// Get all unique segment IDs within a visible block.
+    public func getSegmentIds(inBlock block: AppBlock) -> Set<SegmentID> {
+        Set(getOrderedSegmentIds(inBlock: block))
     }
 
     /// Get the number of frames in the selected segment
@@ -4048,25 +4154,41 @@ public class SimpleTimelineViewModel: ObservableObject {
     /// Opens the timeline context menu directly into the tag submenu for a tape block.
     public func openTagSubmenuForTimelineBlock(_ block: AppBlock, source: String = "timeline_block") {
         guard block.frameCount > 0 else { return }
+        let anchorIndex = Self.resolveTagSubmenuAnchorIndex(
+            requestedIndex: block.startIndex,
+            in: block
+        )
+        openTagSubmenu(at: anchorIndex, in: block, source: source)
+    }
 
-        timelineContextMenuSegmentIndex = block.startIndex
-        selectedFrameIndex = block.startIndex
-        newCommentText = ""
-        newCommentAttachmentDrafts = []
-        selectedBlockComments = []
-        selectedBlockCommentPreferredSegmentByID = [:]
-        blockCommentsLoadError = nil
-        resetCommentTimelineState()
-        showTagSubmenu = true
-        showCommentSubmenu = false
-        isHoveringAddTagButton = false
-        isHoveringAddCommentButton = false
-
-        if let pointerLocation = currentMouseLocationInContentCoordinates() {
-            timelineContextMenuLocation = pointerLocation
+    public func openTagSubmenuForSelectedCommentTarget(source: String = "comment_target_add_tag") {
+        guard let selectionIndex = selectedCommentTargetIndex,
+              selectionIndex >= 0,
+              selectionIndex < frames.count,
+              let block = getBlock(forFrameAt: selectionIndex) else {
+            return
         }
 
-        showTimelineContextMenu = true
+        let anchorIndex = Self.resolveTagSubmenuAnchorIndex(
+            requestedIndex: selectionIndex,
+            in: block
+        )
+
+        timelineContextMenuSegmentIndex = anchorIndex
+        selectedFrameIndex = anchorIndex
+
+        if showTagSubmenu {
+            withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
+                showTagSubmenu = false
+            }
+            return
+        }
+
+        withAnimation(.easeOut(duration: Self.timelineMenuDismissAnimationDuration)) {
+            showTimelineContextMenu = false
+            showCommentSubmenu = true
+            showTagSubmenu = true
+        }
         recordTagSubmenuOpen(source: source, block: block)
 
         Task { await loadTags() }
@@ -4076,8 +4198,14 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func openCommentSubmenuForTimelineBlock(_ block: AppBlock, source: String = "timeline_block") {
         guard block.frameCount > 0 else { return }
 
-        timelineContextMenuSegmentIndex = block.startIndex
-        selectedFrameIndex = block.startIndex
+        let anchorIndex = Self.resolvePreferredCommentTargetIndex(
+            in: block,
+            currentIndex: currentIndex,
+            selectedFrameIndex: selectedFrameIndex,
+            timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
+        )
+        timelineContextMenuSegmentIndex = anchorIndex
+        selectedFrameIndex = anchorIndex
         newCommentText = ""
         newCommentAttachmentDrafts = []
         selectedBlockComments = []
@@ -4086,6 +4214,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         resetCommentTimelineState()
         showTagSubmenu = false
         showCommentSubmenu = true
+        currentCommentMetricsSource = source
         isHoveringAddTagButton = false
         isHoveringAddCommentButton = false
 
@@ -4100,11 +4229,96 @@ public class SimpleTimelineViewModel: ObservableObject {
         Task { await loadCommentsForSelectedTimelineBlock() }
     }
 
+    private var selectedCommentTargetIndex: Int? {
+        guard let selectionIndex = timelineContextMenuSegmentIndex,
+              selectionIndex >= 0,
+              selectionIndex < frames.count else {
+            return nil
+        }
+
+        guard let block = getBlock(forFrameAt: selectionIndex) else {
+            return selectionIndex
+        }
+
+        return Self.resolvePreferredCommentTargetIndex(
+            in: block,
+            currentIndex: currentIndex,
+            selectedFrameIndex: selectedFrameIndex,
+            timelineContextMenuSegmentIndex: timelineContextMenuSegmentIndex
+        )
+    }
+
+    static func resolvePreferredCommentTargetIndex(
+        in block: AppBlock,
+        currentIndex: Int,
+        selectedFrameIndex: Int?,
+        timelineContextMenuSegmentIndex: Int?
+    ) -> Int {
+        let candidateIndices = [
+            currentIndex,
+            selectedFrameIndex,
+            timelineContextMenuSegmentIndex
+        ]
+
+        for candidateIndex in candidateIndices.compactMap({ $0 }) {
+            guard candidateIndex >= block.startIndex, candidateIndex <= block.endIndex else { continue }
+            return candidateIndex
+        }
+
+        return block.startIndex
+    }
+
+    static func resolveTagSubmenuAnchorIndex(
+        requestedIndex: Int?,
+        in block: AppBlock
+    ) -> Int {
+        guard let requestedIndex,
+              requestedIndex >= block.startIndex,
+              requestedIndex <= block.endIndex else {
+            return block.startIndex
+        }
+
+        return requestedIndex
+    }
+
+    private func openTagSubmenu(
+        at anchorIndex: Int,
+        in block: AppBlock,
+        source: String
+    ) {
+        guard anchorIndex >= 0, anchorIndex < frames.count else { return }
+
+        timelineContextMenuSegmentIndex = anchorIndex
+        selectedFrameIndex = anchorIndex
+        newCommentText = ""
+        newCommentAttachmentDrafts = []
+        selectedBlockComments = []
+        selectedBlockCommentPreferredSegmentByID = [:]
+        blockCommentsLoadError = nil
+        resetCommentTimelineState()
+        showNewTagInput = false
+        newTagName = ""
+        showTagSubmenu = true
+        showCommentSubmenu = false
+        isHoveringAddTagButton = true
+        isHoveringAddCommentButton = false
+
+        if let pointerLocation = currentMouseLocationInContentCoordinates() {
+            timelineContextMenuLocation = pointerLocation
+        }
+
+        showTimelineContextMenu = true
+        recordTagSubmenuOpen(source: source, block: block)
+
+        Task { await loadTags() }
+    }
+
     /// Load existing comments linked anywhere in the currently selected timeline block.
-    /// Results are deduplicated by comment ID and sorted oldest → newest.
-    public func loadCommentsForSelectedTimelineBlock() async {
+    /// Results are sorted oldest → newest.
+    public func loadCommentsForSelectedTimelineBlock(forceRefresh: Bool = false) async {
         guard let index = timelineContextMenuSegmentIndex,
               let block = getBlock(forFrameAt: index) else {
+            cancelSelectedBlockCommentsLoad()
             selectedBlockComments = []
             selectedBlockCommentPreferredSegmentByID = [:]
             blockCommentsLoadError = nil
@@ -4112,8 +4326,9 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
-        let segmentIDs = getSegmentIds(inBlock: block).sorted { $0.value < $1.value }
-        guard !segmentIDs.isEmpty else {
+        let orderedSegmentIDs = getOrderedSegmentIds(inBlock: block)
+        guard !orderedSegmentIDs.isEmpty else {
+            cancelSelectedBlockCommentsLoad()
             selectedBlockComments = []
             selectedBlockCommentPreferredSegmentByID = [:]
             blockCommentsLoadError = nil
@@ -4121,37 +4336,101 @@ public class SimpleTimelineViewModel: ObservableObject {
             return
         }
 
+        let requestSegmentIDValues = orderedSegmentIDs.map(\.value)
+        if !forceRefresh,
+           activeBlockCommentsLoadSegmentIDValues == requestSegmentIDValues,
+           let loadTask = blockCommentsLoadTask {
+            await loadTask.value
+            return
+        }
+
+        blockCommentsLoadTask?.cancel()
+        activeBlockCommentsLoadSegmentIDValues = requestSegmentIDValues
+        blockCommentsLoadVersion &+= 1
+        let loadVersion = blockCommentsLoadVersion
         isLoadingBlockComments = true
         blockCommentsLoadError = nil
+        let loadStart = CFAbsoluteTimeGetCurrent()
 
-        do {
-            var commentsByID: [Int64: SegmentComment] = [:]
-            var preferredSegmentByCommentID: [Int64: SegmentID] = [:]
-            for segmentID in segmentIDs {
-                let comments = try await coordinator.getCommentsForSegment(segmentId: segmentID)
-                for comment in comments {
-                    if preferredSegmentByCommentID[comment.id.value] == nil {
-                        preferredSegmentByCommentID[comment.id.value] = segmentID
-                    }
-                    commentsByID[comment.id.value] = comment
+        let loadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.blockCommentsLoadVersion == loadVersion {
+                    self.blockCommentsLoadTask = nil
+                    self.activeBlockCommentsLoadSegmentIDValues = nil
+                    self.isLoadingBlockComments = false
                 }
             }
 
-            selectedBlockComments = commentsByID.values.sorted {
-                if $0.createdAt == $1.createdAt {
-                    return $0.id.value < $1.id.value
-                }
-                return $0.createdAt < $1.createdAt
+            do {
+                let linkedComments = try await fetchBlockCommentsForSegments(orderedSegmentIDs)
+                guard !Task.isCancelled, self.blockCommentsLoadVersion == loadVersion else { return }
+
+                selectedBlockComments = linkedComments.map(\.comment)
+                selectedBlockCommentPreferredSegmentByID = Dictionary(
+                    uniqueKeysWithValues: linkedComments.map { ($0.comment.id.value, $0.preferredSegmentID) }
+                )
+                let elapsedMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
+                Log.recordLatency(
+                    "timeline.comments.thread_load_ms",
+                    valueMs: elapsedMs,
+                    category: .ui,
+                    summaryEvery: 20,
+                    warningThresholdMs: 120,
+                    criticalThresholdMs: 300
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.blockCommentsLoadVersion == loadVersion else { return }
+
+                selectedBlockComments = []
+                selectedBlockCommentPreferredSegmentByID = [:]
+                blockCommentsLoadError = "Could not load comments."
+                Log.error("[Comments] Failed to load block comments: \(error)", category: .ui)
             }
-            selectedBlockCommentPreferredSegmentByID = preferredSegmentByCommentID
-            isLoadingBlockComments = false
-        } catch {
-            isLoadingBlockComments = false
-            selectedBlockComments = []
-            selectedBlockCommentPreferredSegmentByID = [:]
-            blockCommentsLoadError = "Could not load comments."
-            Log.error("[Comments] Failed to load block comments: \(error)", category: .ui)
         }
+
+        blockCommentsLoadTask = loadTask
+        await loadTask.value
+    }
+
+    private func fetchBlockCommentsForSegments(_ segmentIDs: [SegmentID]) async throws -> [AppCoordinator.LinkedSegmentComment] {
+#if DEBUG
+        if let override = test_blockCommentsHooks.getCommentsForSegments {
+            return try await override(segmentIDs)
+        }
+#endif
+        return try await coordinator.getCommentsForSegments(segmentIds: segmentIDs)
+    }
+
+    private func createCommentForSelectedTimelineBlock(
+        body: String,
+        segmentIDs: [SegmentID],
+        attachments: [SegmentCommentAttachment],
+        frameID: FrameID?,
+        author: String?
+    ) async throws -> AppCoordinator.SegmentCommentCreateResult {
+#if DEBUG
+        if let override = test_blockCommentsHooks.createCommentForSegments {
+            return try await override(body, segmentIDs, attachments, frameID, author)
+        }
+#endif
+        return try await coordinator.createCommentForSegments(
+            body: body,
+            segmentIds: segmentIDs,
+            attachments: attachments,
+            frameID: frameID,
+            author: author
+        )
+    }
+
+    private func cancelSelectedBlockCommentsLoad() {
+        blockCommentsLoadTask?.cancel()
+        blockCommentsLoadTask = nil
+        activeBlockCommentsLoadSegmentIDValues = nil
+        blockCommentsLoadVersion &+= 1
+        isLoadingBlockComments = false
     }
 
     /// Preferred segment context for a comment shown in the selected block thread.
@@ -4249,6 +4528,62 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
             } catch {
                 Log.error("[Tags] Failed to load tape tag indicator data: \(error)", category: .ui)
+            }
+        }
+    }
+
+    func refreshTapeIndicatorsAfterExternalMutation(reason: String) {
+        refreshTapeIndicatorDataFromDatabase(reason: reason)
+    }
+
+    private func fetchTapeIndicatorRefreshData() async throws -> (
+        tags: [Tag],
+        segmentTagsMap: [Int64: Set<Int64>],
+        segmentCommentCountsMap: [Int64: Int]
+    ) {
+#if DEBUG
+        if let override = test_tapeIndicatorRefreshHooks.fetchIndicatorData {
+            return try await override()
+        }
+#endif
+
+        async let tagsTask = coordinator.getAllTags()
+        async let segmentTagsTask = coordinator.getSegmentTagsMap()
+        async let commentCountsTask = coordinator.getSegmentCommentCountsMap()
+        return try await (tagsTask, segmentTagsTask, commentCountsTask)
+    }
+
+    private func refreshTapeIndicatorDataFromDatabase(reason: String) {
+        guard !frames.isEmpty else { return }
+        tapeIndicatorRefreshTask?.cancel()
+        tapeIndicatorRefreshVersion &+= 1
+        let refreshVersion = tapeIndicatorRefreshVersion
+
+        Log.debug("[TimelineIndicatorSync] Refresh requested reason=\(reason)", category: .ui)
+        tapeIndicatorRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.tapeIndicatorRefreshVersion == refreshVersion {
+                    self.tapeIndicatorRefreshTask = nil
+                }
+            }
+
+            do {
+                let (tags, segmentTags, segmentCommentCounts) = try await fetchTapeIndicatorRefreshData()
+                guard !Task.isCancelled, self.tapeIndicatorRefreshVersion == refreshVersion else { return }
+
+                self.availableTags = tags
+                self.segmentTagsMap = segmentTags
+                self.segmentCommentCountsMap = segmentCommentCounts
+                Log.debug(
+                    "[TimelineIndicatorSync] Refreshed indicator data reason=\(reason) tags=\(tags.count) taggedSegments=\(segmentTags.count) commentSegments=\(segmentCommentCounts.count)",
+                    category: .ui
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.tapeIndicatorRefreshVersion == refreshVersion else { return }
+                Log.error("[TimelineIndicatorSync] Failed refreshing indicator data reason=\(reason): \(error)", category: .ui)
             }
         }
     }
@@ -4592,7 +4927,10 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     /// Toggle a tag on all segments in the visible block (add if not present, remove if present)
     /// This affects all consecutive frames with the same bundleID as shown in the UI
-    public func toggleTagOnSelectedSegment(tag: Tag) {
+    public func toggleTagOnSelectedSegment(
+        tag: Tag,
+        source: String = "timeline_tag_submenu"
+    ) {
         guard let index = timelineContextMenuSegmentIndex,
               let block = getBlock(forFrameAt: index) else {
             return
@@ -4612,7 +4950,7 @@ public class SimpleTimelineViewModel: ObservableObject {
 
         DashboardViewModel.recordTagToggleOnBlock(
             coordinator: coordinator,
-            source: "timeline_tag_submenu",
+            source: source,
             tagID: tag.id.value,
             tagName: tag.name,
             action: action,
@@ -4704,7 +5042,6 @@ public class SimpleTimelineViewModel: ObservableObject {
                     tagName: newTag.name,
                     segmentCount: segmentIds.count
                 )
-
                 Log.debug("[Tags] Created tag '\(tagName)' and added to \(segmentIds.count) segments in block", category: .ui)
             } catch {
                 Log.error("[Tags] Failed to create tag: \(error)", category: .ui)
@@ -4738,7 +5075,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     public func selectCommentAttachmentFiles() {
         DashboardViewModel.recordCommentAttachmentPickerOpened(
             coordinator: coordinator,
-            source: "timeline_comment_submenu"
+            source: currentCommentMetricsSource
         )
 
         let panel = NSOpenPanel()
@@ -4789,7 +5126,7 @@ public class SimpleTimelineViewModel: ObservableObject {
         NSWorkspace.shared.open(url)
         DashboardViewModel.recordCommentAttachmentOpened(
             coordinator: coordinator,
-            source: "timeline_comment_submenu",
+            source: currentCommentMetricsSource,
             fileExtension: url.pathExtension.lowercased()
         )
     }
@@ -4843,7 +5180,7 @@ public class SimpleTimelineViewModel: ObservableObject {
             decrementCommentCountsForSegments(linkedSegmentIDs)
             DashboardViewModel.recordCommentDeletedFromBlock(
                 coordinator: coordinator,
-                source: "timeline_comment_submenu",
+                source: currentCommentMetricsSource,
                 linkedSegmentCount: linkedSegmentIDs.count,
                 hadFrameAnchor: comment.frameID != nil
             )
@@ -4893,9 +5230,9 @@ public class SimpleTimelineViewModel: ObservableObject {
                     try Self.persistCommentAttachmentDrafts(attachmentDrafts)
                 }.value
 
-                let createResult = try await coordinator.createCommentForSegments(
+                let createResult = try await createCommentForSelectedTimelineBlock(
                     body: commentBody,
-                    segmentIds: Array(segmentIds),
+                    segmentIDs: Array(segmentIds),
                     attachments: persistedAttachments,
                     frameID: selectedFrameID,
                     author: nil
@@ -4909,14 +5246,14 @@ public class SimpleTimelineViewModel: ObservableObject {
                 }
                 DashboardViewModel.recordCommentAdded(
                     coordinator: coordinator,
-                    source: "timeline_comment_submenu",
+                    source: currentCommentMetricsSource,
                     requestedSegmentCount: segmentIds.count,
                     linkedSegmentCount: createResult.linkedSegmentIDs.count,
                     bodyLength: commentBody.count,
                     attachmentCount: persistedAttachments.count,
                     hasFrameAnchor: selectedFrameID != nil
                 )
-                await loadCommentsForSelectedTimelineBlock()
+                await loadCommentsForSelectedTimelineBlock(forceRefresh: true)
             } catch {
                 Self.cleanupPersistedCommentAttachments(persistedAttachments)
                 Log.error("[Comments] Failed to add comment: \(error)", category: .ui)
@@ -4925,6 +5262,40 @@ public class SimpleTimelineViewModel: ObservableObject {
                     showToast("Failed to add comment", icon: "xmark.circle.fill")
                 }
             }
+        }
+    }
+
+    public func loadCommentPreviewImage(for frameID: FrameID) async -> NSImage? {
+        if currentImageFrameID == frameID, let currentImage {
+            return currentImage
+        }
+
+        if let currentFrame, currentFrame.id == frameID {
+            if isInLiveMode, let liveScreenshot {
+                return liveScreenshot
+            }
+
+            if let waitingFallbackImage {
+                return waitingFallbackImage
+            }
+        }
+
+        if let diskBufferedPreview = await Self.loadTimelineDiskFrameBufferPreviewImage(
+            for: frameID,
+            logPrefix: "[Comments]"
+        ) {
+            return diskBufferedPreview
+        }
+
+        guard let timelineFrame = frames.first(where: { $0.frame.id == frameID }) else {
+            return nil
+        }
+
+        do {
+            return try await loadForegroundPresentationImage(timelineFrame).image
+        } catch {
+            Log.error("[Comments] Failed to load target preview for frame \(frameID.value): \(error)", category: .ui)
+            return nil
         }
     }
 
@@ -9964,6 +10335,37 @@ public class SimpleTimelineViewModel: ObservableObject {
         guard let rawValue else { return nil }
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func makeCommentComposerTargetDisplayInfo(
+        timelineFrame: TimelineFrame,
+        block: AppBlock?,
+        availableTagsByID: [Int64: Tag],
+        selectedSegmentTagIDs: Set<Int64> = []
+    ) -> CommentComposerTargetDisplayInfo {
+        let metadata = timelineFrame.frame.metadata
+        let candidateTagIDs: [Int64]
+        if let block, !block.tagIDs.isEmpty {
+            candidateTagIDs = block.tagIDs
+        } else {
+            candidateTagIDs = Array(selectedSegmentTagIDs).sorted()
+        }
+
+        let tagNames = candidateTagIDs
+            .compactMap { availableTagsByID[$0]?.name }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+
+        return CommentComposerTargetDisplayInfo(
+            frameID: timelineFrame.frame.id,
+            segmentID: SegmentID(value: timelineFrame.frame.segmentID.value),
+            source: timelineFrame.frame.source,
+            timestamp: timelineFrame.frame.timestamp,
+            appBundleID: metadata.appBundleID,
+            appName: metadata.appName,
+            windowName: metadata.windowName,
+            browserURL: metadata.browserURL,
+            tagNames: tagNames
+        )
     }
 
     private static func sanitizedMarkdownClipboardComponent(_ value: String) -> String {

@@ -1609,6 +1609,7 @@ public struct DashboardView: View {
                     .animation(.easeInOut(duration: 0.15), value: isHoveringFeedback)
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut("h", modifiers: [.command, .shift])
                 .onHover { hovering in
                     isHoveringFeedback = hovering
                     if hovering {
@@ -1781,14 +1782,29 @@ public struct DashboardView: View {
     }
 
     private func presentFeedbackSheet(launchContext: FeedbackLaunchContext? = nil) {
+        Log.info(
+            "[FeedbackSheet] dashboard presentFeedbackSheet source=\(launchContext?.source.rawValue ?? FeedbackLaunchContext.Source.manual.rawValue) " +
+            "showFeedbackSheet(before)=\(showFeedbackSheet)",
+            category: .ui
+        )
         feedbackLaunchContext = launchContext
         feedbackPresentationID = UUID()
         if launchContext?.source == .crashBanner {
             viewModel.recordRecentCrashReportFeedbackOpened()
         } else if launchContext?.source == .walFailureCrashBanner {
             viewModel.recordRecentWALFailureCrashFeedbackOpened()
+        } else {
+            DashboardViewModel.recordHelpOpened(
+                coordinator: coordinatorWrapper.coordinator,
+                source: "dashboard_footer"
+            )
         }
         showFeedbackSheet = true
+        Log.info(
+            "[FeedbackSheet] dashboard presentFeedbackSheet showFeedbackSheet(after)=\(showFeedbackSheet) " +
+            "feedbackPresentationID=\(feedbackPresentationID)",
+            category: .ui
+        )
     }
 
 }

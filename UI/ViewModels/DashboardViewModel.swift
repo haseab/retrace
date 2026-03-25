@@ -2400,6 +2400,43 @@ public class DashboardViewModel: ObservableObject {
         )
     }
 
+    public static func recordQuickCommentOpened(
+        coordinator: AppCoordinator,
+        source: String
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .quickCommentOpened,
+            metadata: jsonMetadata(["source": source])
+        )
+    }
+
+    public static func recordQuickCommentClosed(
+        coordinator: AppCoordinator,
+        source: String
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .quickCommentClosed,
+            metadata: jsonMetadata(["source": source])
+        )
+    }
+
+    public static func recordQuickCommentContextPreviewToggle(
+        coordinator: AppCoordinator,
+        source: String,
+        isCollapsed: Bool
+    ) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .quickCommentContextPreviewToggle,
+            metadata: jsonMetadata([
+                "source": source,
+                "isCollapsed": isCollapsed
+            ])
+        )
+    }
+
     public static func recordCommentAdded(
         coordinator: AppCoordinator,
         source: String,
@@ -2555,6 +2592,14 @@ public class DashboardViewModel: ObservableObject {
         recordMetric(
             coordinator: coordinator,
             type: .systemMonitorOpened,
+            metadata: jsonMetadata(["source": source])
+        )
+    }
+
+    public static func recordHelpOpened(coordinator: AppCoordinator, source: String) {
+        recordMetric(
+            coordinator: coordinator,
+            type: .helpOpened,
             metadata: jsonMetadata(["source": source])
         )
     }

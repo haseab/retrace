@@ -1049,6 +1049,7 @@ public struct SimpleTimelineView: View {
 
     // MARK: - Top Right Controls
 
+    @State private var isHelpButtonHovering = false
     @State private var isCloseButtonHovering = false
 
     private var topRightControls: some View {
@@ -1058,6 +1059,7 @@ public struct SimpleTimelineView: View {
                 inFrameSearchBar
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
+            helpButton
             closeButton
         }
         .animation(.easeOut(duration: 0.15), value: viewModel.isInFrameSearchVisible)
@@ -1148,6 +1150,63 @@ public struct SimpleTimelineView: View {
     }
 
     // MARK: - Close Button
+
+    private func openHelpFromTimeline() {
+        DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "timeline_header")
+        viewModel.dismissContextMenu()
+
+        Task { @MainActor in
+            if TimelineWindowController.shared.isVisible {
+                TimelineWindowController.shared.hideToShowDashboard()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NotificationCenter.default.post(name: .openFeedback, object: nil)
+                }
+            } else {
+                NotificationCenter.default.post(name: .openFeedback, object: nil)
+            }
+        }
+    }
+
+    private var helpButton: some View {
+        let scale = TimelineScaleFactor.current
+        let buttonSize = 44 * scale
+        let expandedWidth = 118 * scale
+
+        return Button(action: openHelpFromTimeline) {
+            ZStack(alignment: .trailing) {
+                Color.clear
+                    .frame(width: expandedWidth, height: buttonSize)
+
+                HStack(spacing: 10 * scale) {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 18 * scale, weight: .semibold))
+                    if isHelpButtonHovering {
+                        Text("Help")
+                            .font(.system(size: 17 * scale, weight: .medium))
+                    }
+                }
+                .foregroundColor(isHelpButtonHovering ? .white : .white.opacity(0.8))
+                .frame(width: isHelpButtonHovering ? nil : buttonSize, height: buttonSize)
+                .padding(.horizontal, isHelpButtonHovering ? 20 * scale : 0)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(isHelpButtonHovering ? 0.7 : 0.5))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+                )
+                .animation(.easeOut(duration: 0.15), value: isHelpButtonHovering)
+            }
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .keyboardShortcut("h", modifiers: [.command, .shift])
+        .help("Help")
+        .onHover { hovering in
+            isHelpButtonHovering = hovering
+        }
+    }
 
     private var closeButton: some View {
         let scale = TimelineScaleFactor.current
@@ -7670,233 +7729,45 @@ struct TimelineTagMenuButton: View {
 
 /// Submenu showing available tags with search/create functionality
 struct TagSubmenu: View {
+    enum Presentation {
+        case contextMenu
+        case commentOverlay
+    }
+
     @ObservedObject var viewModel: SimpleTimelineViewModel
+    let presentation: Presentation
     @State private var isHoveringSubmenu = false
     @State private var closeTask: Task<Void, Never>?
-    @State private var searchText = ""
-    @State private var highlightedTagID: Int64?
-    @State private var isHoveringSettingsButton = false
-    @FocusState private var isSearchFocused: Bool
 
-    // Filter out the "hidden" tag, apply search filter, and sort with selected tags first
-    private var visibleTags: [Tag] {
-        let nonHidden = viewModel.availableTags.filter { !$0.isHidden }
-        let filtered = searchText.isEmpty
-            ? nonHidden
-            : nonHidden.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    init(viewModel: SimpleTimelineViewModel, presentation: Presentation = .contextMenu) {
+        self.viewModel = viewModel
+        self.presentation = presentation
+    }
 
-        // Sort: selected tags first, then alphabetically within each group
-        return filtered.sorted { tag1, tag2 in
-            let tag1Selected = viewModel.selectedSegmentTags.contains(tag1.id)
-            let tag2Selected = viewModel.selectedSegmentTags.contains(tag2.id)
-
-            if tag1Selected != tag2Selected {
-                return tag1Selected // Selected tags come first
-            }
-            return tag1.name.localizedCaseInsensitiveCompare(tag2.name) == .orderedAscending
+    private var style: CommentTagPickerStyle {
+        switch presentation {
+        case .contextMenu:
+            return .contextMenu
+        case .commentOverlay:
+            return .commentOverlay
         }
-    }
-
-    // Check if search text matches an existing tag exactly
-    private var exactTagMatch: Bool {
-        viewModel.availableTags.contains { $0.name.lowercased() == searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-    }
-
-    // Show "Create" option if there's search text that doesn't match an existing tag
-    private var showCreateOption: Bool {
-        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !exactTagMatch
-    }
-
-    private var visibleTagIDs: [Int64] {
-        visibleTags.map { $0.id.value }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Search/Create input field - always visible
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.5))
-
-                TextField("Search or create...", text: $searchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(.white)
-                    .focused($isSearchFocused)
-                    .onSubmit {
-                        if showCreateOption {
-                            createTagFromSearch()
-                        } else if let highlightedTagID,
-                           let highlightedTag = visibleTags.first(where: { $0.id.value == highlightedTagID }) {
-                            viewModel.toggleTagOnSelectedSegment(tag: highlightedTag)
-                        }
-                    }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.white.opacity(0.08))
-            )
-            .contentShape(Rectangle())
-            .onTapGesture {
-                isSearchFocused = true
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 4)
-            .padding(.bottom, 6)
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.horizontal, 8)
-
-            // Tag list
-            if visibleTags.isEmpty && !showCreateOption {
-                Text("No tags found")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.5))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        // Existing tags that match search
-                        ForEach(visibleTags) { tag in
-                            TagSubmenuRow(
-                                tag: tag,
-                                isSelected: viewModel.selectedSegmentTags.contains(tag.id),
-                                isKeyboardHighlighted: highlightedTagID == tag.id.value,
-                                onHoverChanged: { hovering in
-                                    if hovering {
-                                        highlightedTagID = tag.id.value
-                                    }
-                                }
-                            ) {
-                                viewModel.toggleTagOnSelectedSegment(tag: tag)
-                            }
-                        }
-
-                        // "Create [searchtext]" option if search text doesn't match existing tag
-                        if showCreateOption {
-                            Button(action: createTagFromSearch) {
-                                HStack(spacing: 10) {
-                                    Image(systemName: "plus")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
-
-                                    Text("Create \"\(searchText.trimmingCharacters(in: .whitespacesAndNewlines))\"")
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundStyle(LinearGradient.retraceAccentGradient)
-
-                                    Spacer()
-                                }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .onHover { hovering in
-                                if hovering { NSCursor.pointingHand.push() }
-                                else { NSCursor.pop() }
-                            }
-                        }
-                    }
-                }
-                .frame(maxHeight: 120) // Limit height for scrolling
-            }
-
-            Divider()
-                .background(Color.white.opacity(0.1))
-                .padding(.horizontal, 8)
-                .padding(.top, 6)
-
-            Button(action: openTagSettings) {
-                HStack(spacing: 10) {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white.opacity(0.72))
-
-                    Text("Tag Settings")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white.opacity(0.9))
-
-                    Spacer()
-                }
-                .padding(.leading, 0)
-                .padding(.trailing, 12)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isHoveringSettingsButton ? Color.white.opacity(0.1) : Color.clear)
-                )
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 8)
-            .padding(.top, 4)
-            .padding(.bottom, 6)
-            .onHover { hovering in
-                withAnimation(.easeOut(duration: 0.1)) {
-                    isHoveringSettingsButton = hovering
-                }
-                if hovering { NSCursor.pointingHand.push() }
-                else { NSCursor.pop() }
-            }
-        }
-        .padding(.vertical, 2)
-        .frame(width: 180)
-        .retraceMenuContainer()
-        .onAppear {
-            // Delay focus slightly to ensure the view is in the responder chain
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isSearchFocused = true
-            }
-            syncHighlightedTagToFirstVisibleResult()
-        }
-        .onChange(of: searchText) { _ in
-            syncHighlightedTagToFirstVisibleResult()
-        }
-        .onChange(of: visibleTagIDs) { _ in
-            syncHighlightedTagToFirstVisibleResult()
-        }
-        .onHover { hovering in
-            isHoveringSubmenu = hovering
-            if !hovering {
-                // Small delay before closing to allow mouse to move back to main menu or Add Tag button
-                closeTask?.cancel()
-                closeTask = Task {
-                    try? await Task.sleep(for: .nanoseconds(Int64(150_000_000)), clock: .continuous) // 150ms delay
-                    if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
-                        await MainActor.run {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                viewModel.showTagSubmenu = false
-                                searchText = ""
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Cancel any pending close
-                closeTask?.cancel()
-            }
-        }
-    }
-
-    private func syncHighlightedTagToFirstVisibleResult() {
-        if let highlightedTagID, visibleTagIDs.contains(highlightedTagID) {
-            return
-        }
-        highlightedTagID = visibleTagIDs.first
-    }
-
-    private func createTagFromSearch() {
-        let tagName = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tagName.isEmpty else { return }
-
-        viewModel.newTagName = tagName
-        viewModel.createAndAddTag()
-        searchText = ""
+        CommentTagPickerMenu(
+            tags: viewModel.availableTags.filter { !$0.isHidden },
+            selectedTagIDs: viewModel.selectedSegmentTags,
+            style: style,
+            onHoverChanged: handleHoverChange,
+            onSelectTag: { tag in
+                viewModel.toggleTagOnSelectedSegment(tag: tag)
+            },
+            onCreateTag: { tagName in
+                viewModel.newTagName = tagName
+                viewModel.createAndAddTag()
+            },
+            onOpenSettings: openTagSettings
+        )
     }
 
     private func openTagSettings() {
@@ -7904,13 +7775,31 @@ struct TagSubmenu: View {
         withAnimation(.easeOut(duration: 0.12)) {
             viewModel.showTagSubmenu = false
             viewModel.showTimelineContextMenu = false
-            searchText = ""
         }
 
         TimelineWindowController.shared.hideToShowDashboard()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             DashboardWindowController.shared.show()
             NotificationCenter.default.post(name: .openSettingsTags, object: nil)
+        }
+    }
+
+    private func handleHoverChange(_ hovering: Bool) {
+        isHoveringSubmenu = hovering
+        if !hovering {
+            closeTask?.cancel()
+            closeTask = Task {
+                try? await Task.sleep(for: .nanoseconds(Int64(220_000_000)), clock: .continuous)
+                if !Task.isCancelled && !isHoveringSubmenu && !viewModel.isHoveringAddTagButton {
+                    await MainActor.run {
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            viewModel.showTagSubmenu = false
+                        }
+                    }
+                }
+            }
+        } else {
+            closeTask?.cancel()
         }
     }
 }
@@ -7941,12 +7830,15 @@ struct CommentSubmenu: View {
     @State private var isRequestingNewerCommentPage = false
     @State private var pendingAnchorPinnedCommentID: SegmentCommentID?
     @State private var isNavigatingLinkedCommentFrame = false
+    @State private var commentTargetPreviewImage: NSImage?
+    @State private var isLoadingCommentTargetPreview = false
     @FocusState private var isAllCommentsSearchFieldFocused: Bool
     @FocusState private var isLinkFieldFocused: Bool
-    private let submenuWidth: CGFloat = 420
-    private let submenuHeight: CGFloat = 560
+    private let submenuWidth: CGFloat = 450
+    private let submenuHeight: CGFloat = 720
     private let sectionCornerRadius: CGFloat = 14
     private let allCommentsPageSize: Int = 10
+    private let commentTargetTagOverlayOffsetY: CGFloat = 30
 
     private enum CommentBrowserMode {
         case thread
@@ -7984,6 +7876,14 @@ struct CommentSubmenu: View {
         Self.normalizedURL(from: pendingLinkURL)
     }
 
+    private var commentTarget: CommentComposerTargetDisplayInfo? {
+        viewModel.selectedCommentComposerTarget
+    }
+
+    private var commentTargetFrameIDValue: Int64? {
+        commentTarget?.frameID.value
+    }
+
     private var isDeleteConfirmationPresented: Binding<Bool> {
         Binding(
             get: { pendingDeleteComment != nil },
@@ -7996,13 +7896,31 @@ struct CommentSubmenu: View {
         )
     }
 
+    private var shouldShowThreadSection: Bool {
+        commentBrowserMode == .thread
+    }
+
+    private var commentHeaderTitle: String {
+        commentBrowserMode == .allComments ? "All Comments" : "Comments"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             commentHeader
             if commentBrowserMode == .thread {
-                commentThreadSection
-                    .frame(maxHeight: .infinity)
-                    .layoutPriority(1)
+                commentTargetSection
+                    .fixedSize(horizontal: false, vertical: true)
+                if shouldShowThreadSection {
+                    commentThreadSection
+                        .frame(maxHeight: .infinity)
+                        .layoutPriority(1)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .top).combined(with: .opacity),
+                                removal: .scale(scale: 0.96, anchor: .top).combined(with: .opacity)
+                            )
+                        )
+                }
                 commentComposerSection
                     .fixedSize(horizontal: false, vertical: true)
             } else {
@@ -8016,6 +7934,8 @@ struct CommentSubmenu: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 15)
         .retraceMenuContainer(addPadding: false)
+        .animation(.spring(response: 0.26, dampingFraction: 0.88), value: shouldShowThreadSection)
+        .animation(.spring(response: 0.26, dampingFraction: 0.88), value: commentBrowserMode)
         .onAppear {
             installCommentKeyboardMonitor()
             commentBrowserMode = .thread
@@ -8029,12 +7949,12 @@ struct CommentSubmenu: View {
             highlightedCommentSearchResultID = nil
             isAllCommentsSearchFieldFocused = false
             viewModel.isAllCommentsBrowserActive = false
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 isCommentFocused = true
             }
-            if viewModel.selectedBlockComments.isEmpty && !viewModel.isLoadingBlockComments {
-                Task { await viewModel.loadCommentsForSelectedTimelineBlock() }
-            }
+            Task { await viewModel.loadTags() }
         }
         .onChange(of: commentBrowserMode) { mode in
             viewModel.isAllCommentsBrowserActive = (mode == .allComments)
@@ -8060,6 +7980,17 @@ struct CommentSubmenu: View {
         .onChange(of: viewModel.commentSearchResults.map { $0.id.value }) { _ in
             syncHighlightedCommentSearchSelection()
         }
+        .onChange(of: viewModel.showTagSubmenu) { isPresented in
+            if isPresented {
+                // Prevent the markdown editor from stealing first responder
+                // while the tag submenu search field is trying to become active.
+                isCommentFocused = false
+            } else if commentBrowserMode == .thread && !isLinkPopoverPresented {
+                DispatchQueue.main.async {
+                    isCommentFocused = true
+                }
+            }
+        }
         .onChange(of: isLinkPopoverPresented) { isPresented in
             viewModel.isCommentLinkPopoverPresented = isPresented
         }
@@ -8073,7 +8004,12 @@ struct CommentSubmenu: View {
             viewModel.isCommentLinkPopoverPresented = false
             viewModel.isAllCommentsBrowserActive = false
             isAllCommentsSearchFieldFocused = false
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
             viewModel.resetCommentTimelineState()
+        }
+        .task(id: commentTargetFrameIDValue) {
+            await refreshCommentTargetPreview()
         }
         .alert(
             "Delete comment?",
@@ -8093,44 +8029,28 @@ struct CommentSubmenu: View {
     }
 
     private var commentHeader: some View {
-        HStack(spacing: 12) {
+        CommentChromeHeader(title: commentHeaderTitle, onClose: onClose) {
             if commentBrowserMode == .allComments {
-                Button(action: exitAllCommentsView) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.retracePrimary.opacity(0.9))
-                        .frame(width: 24, height: 24)
-                        .background(
-                            Circle()
-                                .fill(Color.white.opacity(0.08))
-                        )
-                }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() }
-                    else { NSCursor.pop() }
-                }
-            }
-
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 34, height: 34)
-                .overlay(
-                    Image(systemName: "text.bubble.fill")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(.retracePrimary.opacity(0.92))
+                CommentChromeCircleButton(
+                    icon: "chevron.left",
+                    action: exitAllCommentsView,
+                    iconFont: .system(size: 12, weight: .semibold),
+                    baseForeground: Color.retracePrimary.opacity(0.9),
+                    hoverForeground: Color.retracePrimary.opacity(0.98),
+                    baseFill: Color.white.opacity(0.08),
+                    hoverFill: Color.white.opacity(0.12),
+                    baseStroke: .clear,
+                    hoverStroke: .clear
                 )
-
-            VStack(alignment: .leading, spacing: 0) {
-                Text(commentBrowserMode == .allComments ? "All Comments" : "Comments")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundColor(.retracePrimary)
             }
-
-            Spacer()
-
+        } accessory: {
             if commentBrowserMode == .thread {
-                Button(action: { openAllComments(anchoredAt: allCommentsLaunchAnchorComment) }) {
+                CommentChromeCapsuleButton(
+                    action: { openAllComments(anchoredAt: allCommentsLaunchAnchorComment) },
+                    horizontalPadding: 9,
+                    verticalPadding: 5,
+                    style: .accentOutline
+                ) {
                     HStack(spacing: 6) {
                         Image(systemName: "list.bullet")
                             .font(.system(size: 10, weight: .semibold))
@@ -8141,98 +8061,206 @@ struct CommentSubmenu: View {
                             .foregroundColor(.retraceSecondary.opacity(0.85))
                             .padding(.leading, 2)
                     }
-                    .foregroundColor(.retracePrimary.opacity(0.9))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(
-                        Capsule()
-                            .fill(Color.white.opacity(0.08))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
-                    )
                 }
-                .buttonStyle(.plain)
                 .help("Open All Comments (Option+A)")
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() }
-                    else { NSCursor.pop() }
-                }
-            }
-
-            Button(action: onClose) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.retraceSecondary)
-                    .frame(width: 24, height: 24)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(0.08))
-                    )
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering in
-                if hovering { NSCursor.pointingHand.push() }
-                else { NSCursor.pop() }
             }
         }
     }
 
     private var commentThreadSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Text(threadCountLabel)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.retraceSecondary)
-            }
-
-            if viewModel.isLoadingBlockComments {
+        CommentChromeSectionCard(cornerRadius: sectionCornerRadius) {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Loading thread...")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.retraceSecondary)
-                }
-                .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
-            } else if let loadError = viewModel.blockCommentsLoadError {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(threadCountLabel)
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(.retraceDanger.opacity(0.9))
-                    Text(loadError)
-                        .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.retraceSecondary)
                 }
-                .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
-            } else if viewModel.selectedBlockComments.isEmpty {
-                Text("No comments yet. Start the thread below.")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.retraceSecondary)
-                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(viewModel.selectedBlockComments) { comment in
-                            commentThreadCard(comment)
-                        }
+
+                if viewModel.isLoadingBlockComments {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Loading thread...")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.retraceSecondary)
                     }
-                    .padding(.vertical, 3)
+                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
+                } else if let loadError = viewModel.blockCommentsLoadError {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.retraceDanger.opacity(0.9))
+                        Text(loadError)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.retraceSecondary)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 58, alignment: .center)
+                } else if viewModel.selectedBlockComments.isEmpty {
+                    commentThreadEmptyState
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(viewModel.selectedBlockComments) { comment in
+                                commentThreadCard(comment)
+                            }
+                        }
+                        .padding(.vertical, 3)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .zIndex(0)
+    }
+
+    private var commentThreadEmptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "text.bubble")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.92))
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.06))
+                )
+
+            Text("No comments yet.")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.retracePrimary.opacity(0.95))
+
+            Text("Start the thread below.")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.retraceSecondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 72, alignment: .center)
+    }
+
+    @ViewBuilder
+    private var commentTargetSection: some View {
+        if let context = commentTarget {
+            CommentContextPreviewCard(
+                title: context.title,
+                subtitle: context.subtitle,
+                timestamp: context.timestamp,
+                appBundleID: context.appBundleID,
+                previewImage: commentTargetPreviewImage,
+                isPreviewLoading: isLoadingCommentTargetPreview,
+                shouldUseExpandedTitle: context.shouldUseExpandedWindowTitle,
+                metadataLayout: .stacked
+            ) {
+                commentTargetTagRow(context.tagNames)
+            }
+            .zIndex(viewModel.showTagSubmenu ? 8 : 1)
+        }
+    }
+
+    private func commentTargetTagRow(_ tagNames: [String]) -> some View {
+        let selectedTags = commentTargetDisplayTags(orderedBy: tagNames)
+
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .center, spacing: 8) {
+                commentTargetAddTagPill
+
+                if !selectedTags.isEmpty {
+                    ForEach(selectedTags) { tag in
+                        commentTargetTagChip(tag)
+                    }
+                } else {
+                    ForEach(tagNames, id: \.self) { tagName in
+                        commentMetaChip(
+                            text: tagName,
+                            icon: "tag.fill",
+                            accent: Color.retracePrimary.opacity(0.9)
+                        )
+                    }
+                }
+            }
+            .padding(.vertical, 1)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .topLeading) {
+            if viewModel.showTagSubmenu {
+                TagSubmenu(viewModel: viewModel, presentation: .commentOverlay)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .offset(y: commentTargetTagOverlayOffsetY)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topLeading)))
+                    .zIndex(1)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: sectionCornerRadius)
-                .fill(Color.white.opacity(0.03))
+    }
+
+    private func commentTargetDisplayTags(orderedBy tagNames: [String]) -> [Tag] {
+        let preferredOrder = Dictionary(
+            uniqueKeysWithValues: tagNames.enumerated().map { (offset, name) in
+                (name, offset)
+            }
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: sectionCornerRadius)
-                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-        )
+
+        return viewModel.availableTags
+            .filter { !($0.isHidden) && viewModel.selectedSegmentTags.contains($0.id) }
+            .sorted { lhs, rhs in
+                let lhsOrder = preferredOrder[lhs.name] ?? Int.max
+                let rhsOrder = preferredOrder[rhs.name] ?? Int.max
+                if lhsOrder != rhsOrder {
+                    return lhsOrder < rhsOrder
+                }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    private func commentTargetTagChip(_ tag: Tag) -> some View {
+        CommentChromeChip(
+            text: tag.name,
+            icon: "tag.fill",
+            foregroundColor: Color.retracePrimary.opacity(0.9),
+            backgroundColor: Color.white.opacity(0.08),
+            borderColor: Color.white.opacity(0.12)
+        ) { isHovering in
+            if isHovering {
+                Button {
+                    viewModel.toggleTagOnSelectedSegment(
+                        tag: tag,
+                        source: "comment_target_tag_chip_remove"
+                    )
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(.white.opacity(0.9))
+                        .frame(width: 13, height: 13)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.12))
+                        )
+                }
+                .buttonStyle(.plain)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+    }
+
+    private var commentTargetAddTagPill: some View {
+        CommentChromeCapsuleButton(
+            action: {
+                isCommentFocused = false
+                viewModel.openTagSubmenuForSelectedCommentTarget(source: "comment_target_add_tag")
+            },
+            horizontalPadding: 11,
+            verticalPadding: 5,
+            style: .accentOutline,
+            onHoverChanged: { hovering in
+                viewModel.isHoveringAddTagButton = hovering
+            }
+        ) {
+            HStack(spacing: 7) {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .bold))
+
+                Text("Add tag")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+        }
     }
 
     private var allCommentsAnchorIndex: Int? {
@@ -8506,100 +8534,74 @@ struct CommentSubmenu: View {
     }
 
     private var commentComposerSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                formattingButton(icon: "bold") { sendEditorCommand(.bold) }
-                formattingButton(icon: "italic") { sendEditorCommand(.italic) }
-                linkFormattingButton
-                formattingButton(icon: "clock") { viewModel.insertCommentTimestampMarkup() }
-                formattingButton(icon: "paperclip") { viewModel.selectCommentAttachmentFiles() }
-                Spacer()
-                Button(action: {
-                    viewModel.addCommentToSelectedSegment()
-                }) {
-                    HStack(spacing: 5) {
-                        if viewModel.isAddingComment {
-                            ProgressView()
-                                .controlSize(.small)
+        CommentChromeSectionCard(cornerRadius: sectionCornerRadius) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    formattingButton(icon: "bold") { sendEditorCommand(.bold) }
+                    formattingButton(icon: "italic") { sendEditorCommand(.italic) }
+                    linkFormattingButton
+                    formattingButton(icon: "clock") { viewModel.insertCommentTimestampMarkup() }
+                    formattingButton(icon: "paperclip") { viewModel.selectCommentAttachmentFiles() }
+                    Spacer()
+                    CommentChromeCapsuleButton(
+                        action: {
+                            viewModel.addCommentToSelectedSegment()
+                        },
+                        isEnabled: canSubmit,
+                        style: .submit
+                    ) {
+                        HStack(spacing: 5) {
+                            if viewModel.isAddingComment {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Text(viewModel.isAddingComment ? "Adding..." : "Add Comment")
+                                .font(.system(size: 12, weight: .semibold))
                         }
-                        Text(viewModel.isAddingComment ? "Adding..." : "Add Comment")
-                            .font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundColor(canSubmit ? .white : .retraceSecondary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(canSubmit ? Color.retraceSubmitAccent.opacity(0.92) : Color.white.opacity(0.08))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(canSubmit ? Color.retraceSubmitAccent.opacity(0.35) : Color.white.opacity(0.12), lineWidth: 1)
-                    )
                 }
-                .buttonStyle(.plain)
-                .disabled(!canSubmit)
-                .onHover { hovering in
-                    if hovering && canSubmit { NSCursor.pointingHand.push() }
-                    else { NSCursor.pop() }
-                }
-            }
-
-            ZStack(alignment: .topLeading) {
-                CommentMarkdownEditor(
-                    text: $viewModel.newCommentText,
-                    isFocused: $isCommentFocused,
-                    command: editorCommand,
-                    commandNonce: editorCommandNonce,
-                    onSubmit: submitCommentFromKeyboard,
-                    onRequestLink: presentLinkPopover
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color.white.opacity(0.035))
                 )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+
+                CommentChromeEditorSurface(
+                    isFocused: isCommentFocused,
+                    textIsEmpty: viewModel.newCommentText.isEmpty,
+                    placeholder: "Write a comment... Markdown supported."
+                ) {
+                    CommentMarkdownEditor(
+                        text: $viewModel.newCommentText,
+                        isFocused: $isCommentFocused,
+                        onSubmit: submitCommentFromKeyboard,
+                        formatting: .init(
+                            command: editorCommand,
+                            commandNonce: editorCommandNonce,
+                            onRequestLink: presentLinkPopover
+                        )
+                    )
                     .frame(minHeight: 78, maxHeight: 78)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)
-
-                if viewModel.newCommentText.isEmpty {
-                    Text("Write a comment... Markdown supported.")
-                        .font(.system(size: 12))
-                        .foregroundColor(.retraceSecondary.opacity(0.75))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                        .allowsHitTesting(false)
                 }
-            }
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.white.opacity(0.04))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(
-                        isCommentFocused ? Color.white.opacity(0.22) : Color.white.opacity(0.1),
-                        lineWidth: 1
-                    )
-            )
-            .animation(.easeOut(duration: 0.12), value: isCommentFocused)
 
-            if !viewModel.newCommentAttachmentDrafts.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(viewModel.newCommentAttachmentDrafts) { draft in
-                            draftAttachmentChip(draft)
+                if !viewModel.newCommentAttachmentDrafts.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(viewModel.newCommentAttachmentDrafts) { draft in
+                                draftAttachmentChip(draft)
+                            }
                         }
+                        .padding(.vertical, 1)
                     }
-                    .padding(.vertical, 1)
                 }
             }
         }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: sectionCornerRadius)
-                .fill(Color.white.opacity(0.03))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: sectionCornerRadius)
-                .stroke(Color.white.opacity(0.06), lineWidth: 1)
-        )
     }
 
     private func sendEditorCommand(_ command: CommentEditorCommand) {
@@ -8858,38 +8860,56 @@ struct CommentSubmenu: View {
         let isNavigable = true
         let isSearchHighlighted = row.id == highlightedCommentSearchResultID
         let isHoveringInteractiveRow = isNavigable && hoveredAllCommentsRowID == row.id
-        let rowHeaderLabel = row.context?.appBundleID ?? row.comment.author
+        let rowHeaderLabel = row.context?.appName ?? row.context?.appBundleID ?? row.comment.author
+        let rowHeaderSubtitle = row.context?.appName == nil ? nil : row.context?.appBundleID
 
-        return VStack(alignment: .leading, spacing: 7) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(rowHeaderLabel)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(.retracePrimary.opacity(0.9))
-                    .lineLimit(1)
-
-                if let tagName = row.primaryTagName {
-                    Text(tagName)
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.retracePrimary.opacity(0.88))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 10) {
+                if let bundleID = row.context?.appBundleID {
+                    AppIconView(bundleID: bundleID, size: 20)
+                        .frame(width: 20, height: 20)
+                } else {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.9))
+                        .frame(width: 20, height: 20)
                         .background(
-                            Capsule()
-                                .fill(Color.white.opacity(0.08))
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.07))
                         )
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.13), lineWidth: 1)
-                        )
-                        .lineLimit(1)
                 }
 
-                Spacer()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(rowHeaderLabel)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.retracePrimary.opacity(0.95))
+                        .lineLimit(1)
 
-                Text(Self.threadDateFormatter.string(from: row.comment.createdAt))
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.retraceSecondary.opacity(0.85))
-                    .lineLimit(1)
+                    if let rowHeaderSubtitle {
+                        Text(rowHeaderSubtitle)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.retraceSecondary.opacity(0.82))
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 6) {
+                    if let tagName = row.primaryTagName {
+                        commentMetaChip(
+                            text: tagName,
+                            icon: "tag.fill",
+                            accent: Color.retracePrimary.opacity(0.88)
+                        )
+                    }
+
+                    commentMetaChip(
+                        text: Self.threadDateFormatter.string(from: row.comment.createdAt),
+                        icon: "clock",
+                        accent: Color.retraceSecondary.opacity(0.88)
+                    )
+                }
             }
 
             Text(commentPreviewText(from: row.comment.body))
@@ -8899,10 +8919,15 @@ struct CommentSubmenu: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             if let browserURL = row.context?.browserURL {
-                Text(browserURL)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.retraceSecondary.opacity(0.88))
-                    .lineLimit(1)
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "globe")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.retraceSecondary.opacity(0.84))
+                    Text(browserURL)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.retraceSecondary.opacity(0.88))
+                        .lineLimit(1)
+                }
             }
         }
         .padding(.horizontal, 12)
@@ -8912,7 +8937,7 @@ struct CommentSubmenu: View {
                 .fill(
                     isAnchor
                     ? Color.retraceSubmitAccent.opacity(0.16)
-                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.12) : Color.white.opacity(0.05))
+                    : (isSearchHighlighted ? Color.retraceSubmitAccent.opacity(0.12) : Color.white.opacity(0.055))
                 )
         )
         .overlay(
@@ -8961,6 +8986,40 @@ struct CommentSubmenu: View {
         }
         let index = candidate.index(candidate.startIndex, offsetBy: 180)
         return "\(candidate[..<index])..."
+    }
+
+    private func commentMetaChip(text: String, icon: String, accent: Color) -> some View {
+        CommentChromeChip(
+            text: text,
+            icon: icon,
+            foregroundColor: accent,
+            backgroundColor: Color.white.opacity(0.08),
+            borderColor: Color.white.opacity(0.12)
+        )
+    }
+
+    private func refreshCommentTargetPreview() async {
+        if viewModel.isInLiveMode, let liveScreenshot = viewModel.liveScreenshot {
+            commentTargetPreviewImage = liveScreenshot
+            isLoadingCommentTargetPreview = false
+            return
+        }
+
+        guard let frameID = commentTarget?.frameID else {
+            commentTargetPreviewImage = nil
+            isLoadingCommentTargetPreview = false
+            return
+        }
+
+        commentTargetPreviewImage = nil
+        isLoadingCommentTargetPreview = true
+
+        let previewImage = await viewModel.loadCommentPreviewImage(for: frameID)
+        guard !Task.isCancelled else { return }
+        guard commentTarget?.frameID == frameID else { return }
+
+        commentTargetPreviewImage = previewImage
+        isLoadingCommentTargetPreview = false
     }
 
     private var linkFormattingButton: some View {
@@ -9148,7 +9207,7 @@ struct CommentSubmenu: View {
         let isNavigable = true
         let isHoveringInteractiveCard = isNavigable && isHoveringCard
 
-        return VStack(alignment: .leading, spacing: 6) {
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(comment.author)
                     .font(.system(size: 11, weight: .semibold))
@@ -9235,11 +9294,20 @@ struct CommentSubmenu: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(Color.white.opacity(0.05))
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(0.075),
+                                Color.white.opacity(0.038)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
             )
             .scaleEffect(isHoveringInteractiveCard ? 1.01 : 1.0)
             .animation(.easeOut(duration: 0.12), value: isHoveringInteractiveCard)
@@ -9302,6 +9370,36 @@ struct CommentSubmenu: View {
 
     private func handleCommentSubmenuKeyEvent(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+        if modifiers.isEmpty && event.keyCode == 53 {
+            guard pendingDeleteComment == nil else { return false }
+
+            if viewModel.showTagSubmenu {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    viewModel.showTagSubmenu = false
+                    viewModel.showNewTagInput = false
+                    viewModel.newTagName = ""
+                    viewModel.isHoveringAddTagButton = false
+                }
+                return true
+            }
+
+            if isLinkPopoverPresented {
+                isLinkPopoverPresented = false
+                isCommentFocused = true
+                return true
+            }
+
+            if commentBrowserMode == .allComments {
+                withAnimation(.easeOut(duration: 0.14)) {
+                    exitAllCommentsView()
+                }
+                return true
+            }
+
+            onClose()
+            return true
+        }
 
         // Option+A opens all-comments when currently in thread mode.
         if modifiers == [.option], event.keyCode == 0, commentBrowserMode == .thread {
@@ -9496,19 +9594,23 @@ struct CommentSubmenu: View {
     }
 }
 
-private enum CommentEditorCommand: Equatable {
+enum CommentEditorCommand: Equatable {
     case bold
     case italic
     case link(url: String)
 }
 
-private struct CommentMarkdownEditor: NSViewRepresentable {
+struct CommentMarkdownEditor: NSViewRepresentable {
+    struct FormattingBridge {
+        let command: CommentEditorCommand
+        let commandNonce: Int
+        let onRequestLink: (() -> Void)?
+    }
+
     @Binding var text: String
     @Binding var isFocused: Bool
-    let command: CommentEditorCommand
-    let commandNonce: Int
     let onSubmit: (() -> Void)?
-    let onRequestLink: (() -> Void)?
+    let formatting: FormattingBridge?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -9555,7 +9657,7 @@ private struct CommentMarkdownEditor: NSViewRepresentable {
             context.coordinator.apply(command: command, in: textView)
         }
         textView.requestLinkHandler = {
-            context.coordinator.parent.onRequestLink?()
+            context.coordinator.parent.formatting?.onRequestLink?()
         }
         textView.submitHandler = {
             context.coordinator.parent.onSubmit?()
@@ -9579,16 +9681,17 @@ private struct CommentMarkdownEditor: NSViewRepresentable {
             context.coordinator.lastSerializedMarkdown = text
         }
 
-        if context.coordinator.lastHandledCommandNonce != commandNonce {
-            context.coordinator.lastHandledCommandNonce = commandNonce
-            context.coordinator.apply(command: command, in: textView)
+        if let formatting,
+           context.coordinator.lastHandledCommandNonce != formatting.commandNonce {
+            context.coordinator.lastHandledCommandNonce = formatting.commandNonce
+            context.coordinator.apply(command: formatting.command, in: textView)
         }
 
         textView.submitHandler = {
             context.coordinator.parent.onSubmit?()
         }
         textView.requestLinkHandler = {
-            context.coordinator.parent.onRequestLink?()
+            context.coordinator.parent.formatting?.onRequestLink?()
         }
 
         if isFocused, let window = textView.window, window.firstResponder !== textView {
@@ -9599,7 +9702,7 @@ private struct CommentMarkdownEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: CommentMarkdownEditor
         var isApplyingProgrammaticUpdate = false
-        var lastHandledCommandNonce: Int = -1
+        var lastHandledCommandNonce: Int?
         var lastSerializedMarkdown: String = ""
 
         private static let baseFont = NSFont.systemFont(ofSize: 12, weight: .regular)
@@ -9629,7 +9732,7 @@ private struct CommentMarkdownEditor: NSViewRepresentable {
 
         init(parent: CommentMarkdownEditor) {
             self.parent = parent
-            self.lastHandledCommandNonce = parent.commandNonce
+            self.lastHandledCommandNonce = parent.formatting?.commandNonce
             self.lastSerializedMarkdown = parent.text
         }
 
@@ -10220,7 +10323,7 @@ private struct CommentMarkdownEditor: NSViewRepresentable {
     }
 }
 
-private final class CommentMarkdownTextView: NSTextView {
+final class CommentMarkdownTextView: NSTextView {
     var commandHandler: ((CommentEditorCommand) -> Void)?
     var submitHandler: (() -> Void)?
     var requestLinkHandler: (() -> Void)?
@@ -10253,8 +10356,11 @@ private final class CommentMarkdownTextView: NSTextView {
             commandHandler?(.italic)
             return true
         case "k":
-            requestLinkHandler?()
-            return true
+            if let requestLinkHandler {
+                requestLinkHandler()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
         default:
             return super.performKeyEquivalent(with: event)
         }

@@ -44,6 +44,9 @@ public enum DailyMetricsQueries {
         case tagToggleOnBlock = "tag_toggle_on_block"
         case tagCreateAndAddOnBlock = "tag_create_and_add_on_block"
         case commentSubmenuOpen = "comment_submenu_open"
+        case quickCommentOpened = "quick_comment_opened"  // metadata: JSON {source}
+        case quickCommentClosed = "quick_comment_closed"  // metadata: JSON {source}
+        case quickCommentContextPreviewToggle = "quick_comment_context_preview_toggle"  // metadata: JSON {source, isCollapsed}
         case commentAdded = "comment_added"
         case commentDeletedFromBlock = "comment_deleted_from_block"
         case commentAttachmentPickerOpened = "comment_attachment_picker_opened"
@@ -58,6 +61,7 @@ public enum DailyMetricsQueries {
         case recordingTurnedOff = "recording_turned_off"
         case recordingAutoResumed = "recording_auto_resumed"
         case systemMonitorOpened = "system_monitor_opened"
+        case helpOpened = "help_opened"  // metadata: JSON {source}
         case settingsSearchOpened = "settings_search_opened"
         case dockIconVisibilityToggle = "dock_icon_visibility_toggle"  // metadata: JSON {enabled, source}
         case dockMenuAction = "dock_menu_action"  // metadata: JSON {action, source}

@@ -220,11 +220,19 @@ private struct InPageURLVerificationTraceContext {
 /// Main settings view with sidebar navigation
 /// Activated with Cmd+,
 public struct SettingsView: View {
+    private enum ManagedShortcutKind: Hashable {
+        case timeline
+        case dashboard
+        case recording
+        case systemMonitor
+        case comment
+    }
 
     // MARK: - Properties
 
     /// Optional initial tab to open (passed from parent when navigating to specific section)
     private let initialTab: SettingsTab?
+    private let onboardingManager = OnboardingManager()
 
     @State private var selectedTab: SettingsTab = .general
     @State private var hoveredTab: SettingsTab? = nil
@@ -238,7 +246,6 @@ public struct SettingsView: View {
     @State private var ocrPrioritySliderHighlightTask: Task<Void, Never>? = nil
     @State private var isTimelineScrollOrientationHighlighted = false
     @State private var timelineScrollOrientationHighlightTask: Task<Void, Never>? = nil
-
     // Settings search
     @State private var showSettingsSearch = false
     @State private var settingsSearchQuery = ""
@@ -281,8 +288,8 @@ public struct SettingsView: View {
     @State private var isRecordingRecordingShortcut = false
     @State private var systemMonitorShortcut = SettingsShortcutKey(from: .defaultSystemMonitor)
     @State private var isRecordingSystemMonitorShortcut = false
-    @State private var feedbackShortcut = SettingsShortcutKey(from: .defaultFeedback)
-    @State private var isRecordingFeedbackShortcut = false
+    @State private var commentShortcut = SettingsShortcutKey(from: .defaultCommentCapture)
+    @State private var isRecordingCommentShortcut = false
     @State private var shortcutError: String? = nil
     @State private var recordingTimeoutTask: Task<Void, Never>? = nil
 
@@ -525,8 +532,8 @@ public struct SettingsView: View {
     // 3. Add a case in cardView(for:) to map the entry ID to the card view
     private static let searchIndex: [SettingsSearchEntry] = [
         // General
-        SettingsSearchEntry(id: "general.shortcuts", tab: .general, cardTitle: "Keyboard Shortcuts", cardIcon: "command",
-            searchableText: ["keyboard shortcuts", "open timeline", "open dashboard", "toggle recording", "hotkey", "shortcut"]),
+        SettingsSearchEntry(id: "general.shortcuts", tab: .general, cardTitle: "Keyboard Shortcuts (Global)", cardIcon: "command",
+            searchableText: ["keyboard shortcuts", "global keyboard shortcuts", "open timeline", "open dashboard", "toggle recording", "quick comment", "add comment", "comment hotkey", "hotkey", "shortcut"]),
         SettingsSearchEntry(id: "general.updates", tab: .general, cardTitle: "Updates", cardIcon: "arrow.down.circle",
             searchableText: ["updates", "automatic updates", "check for updates", "check now"]),
         SettingsSearchEntry(id: "general.startup", tab: .general, cardTitle: "Startup", cardIcon: "power",
@@ -685,7 +692,28 @@ public struct SettingsView: View {
         privateModeAXCompatibleBrowserBundleIDs
     }
 
-    public var body: some View {
+    private var settingsBackground: some View {
+        ZStack {
+            themeBaseBackground
+
+            // Subtle gradient orb
+            Circle()
+                .fill(
+                    RadialGradient(
+                        colors: [Color.retraceAccent.opacity(0.05), Color.clear],
+                        center: .center,
+                        startRadius: 0,
+                        endRadius: 400
+                    )
+                )
+                .frame(width: 800, height: 800)
+                .offset(x: 200, y: -100)
+                .blur(radius: 80)
+        }
+        .ignoresSafeArea()
+    }
+
+    private var settingsShell: some View {
         GeometryReader { geometry in
             let windowWidth = geometry.size.width
             let detached = windowWidth > settingsMaxWidth
@@ -708,26 +736,11 @@ public struct SettingsView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         }
         .frame(minWidth: settingsMinWidth, minHeight: 650)
-        .background(
-            ZStack {
-                themeBaseBackground
+        .background(settingsBackground)
+    }
 
-                // Subtle gradient orb
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [Color.retraceAccent.opacity(0.05), Color.clear],
-                            center: .center,
-                            startRadius: 0,
-                            endRadius: 400
-                        )
-                    )
-                    .frame(width: 800, height: 800)
-                    .offset(x: 200, y: -100)
-                    .blur(radius: 80)
-            }
-            .ignoresSafeArea()
-        )
+    private var settingsBodyBase: some View {
+        settingsShell
         .onAppear {
             // Capture the Retrace DB path the app was launched with (only once)
             if !launchedPathInitialized {
@@ -744,44 +757,6 @@ public struct SettingsView: View {
             }
 
             postSelectedTabNotification(selectedTab)
-        }
-        .onChange(of: selectedTab) { newTab in
-            postSelectedTabNotification(newTab)
-        }
-        .onChange(of: timelineShortcut) { _ in
-            Task { await saveShortcuts() }
-        }
-        .onChange(of: dashboardShortcut) { _ in
-            Task { await saveShortcuts() }
-        }
-        .onChange(of: recordingShortcut) { _ in
-            Task { await saveShortcuts() }
-        }
-        .onChange(of: systemMonitorShortcut) { _ in
-            Task { await saveShortcuts() }
-        }
-        .onChange(of: feedbackShortcut) { _ in
-            Task { await saveShortcuts() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
-            selectedTab = .power
-            pendingScrollTargetID = nil
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
-            selectedTab = .tags
-            pendingScrollTargetID = nil
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
-            requestNavigation(to: Self.pauseReminderIntervalTargetID)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTimelineScrollOrientation)) { _ in
-            requestNavigation(to: Self.timelineScrollOrientationTargetID)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
-            requestNavigation(to: Self.powerOCRCardTargetID)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
-            requestNavigation(to: Self.powerOCRPriorityTargetID)
         }
         .onDisappear {
             pauseReminderHighlightTask?.cancel()
@@ -854,6 +829,37 @@ public struct SettingsView: View {
             .frame(width: 0, height: 0)
             .opacity(0)
         }
+    }
+
+    private func persistShortcutChange(_ kind: ManagedShortcutKind) {
+        Task { await saveShortcut(kind) }
+    }
+
+    public var body: some View {
+        settingsBodyBase
+            .onChange(of: selectedTab) { newTab in
+                postSelectedTabNotification(newTab)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsPower)) { _ in
+                selectedTab = .power
+                pendingScrollTargetID = nil
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsTags)) { _ in
+                selectedTab = .tags
+                pendingScrollTargetID = nil
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsPauseReminderInterval)) { _ in
+                requestNavigation(to: Self.pauseReminderIntervalTargetID)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsTimelineScrollOrientation)) { _ in
+                requestNavigation(to: Self.timelineScrollOrientationTargetID)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRCard)) { _ in
+                requestNavigation(to: Self.powerOCRCardTargetID)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .openSettingsPowerOCRPriority)) { _ in
+                requestNavigation(to: Self.powerOCRPriorityTargetID)
+            }
     }
 
     private var privateWindowRedactionBinding: Binding<Bool> {
@@ -1846,13 +1852,14 @@ public struct SettingsView: View {
 
     @ViewBuilder
     private var keyboardShortcutsCard: some View {
-        ModernSettingsCard(title: "Keyboard Shortcuts", icon: "command") {
+        ModernSettingsCard(title: "Keyboard Shortcuts (Global)", icon: "command") {
             VStack(spacing: 12) {
                 settingsShortcutRecorderRow(
                     label: "Open Timeline",
+                    kind: .timeline,
                     shortcut: $timelineShortcut,
                     isRecording: $isRecordingTimelineShortcut,
-                    otherShortcuts: [dashboardShortcut, recordingShortcut, systemMonitorShortcut, feedbackShortcut]
+                    otherShortcuts: [dashboardShortcut, recordingShortcut, systemMonitorShortcut, commentShortcut]
                 )
 
                 Divider()
@@ -1860,9 +1867,10 @@ public struct SettingsView: View {
 
                 settingsShortcutRecorderRow(
                     label: "Open Dashboard",
+                    kind: .dashboard,
                     shortcut: $dashboardShortcut,
                     isRecording: $isRecordingDashboardShortcut,
-                    otherShortcuts: [timelineShortcut, recordingShortcut, systemMonitorShortcut, feedbackShortcut]
+                    otherShortcuts: [timelineShortcut, recordingShortcut, systemMonitorShortcut, commentShortcut]
                 )
 
                 Divider()
@@ -1870,9 +1878,10 @@ public struct SettingsView: View {
 
                 settingsShortcutRecorderRow(
                     label: "Toggle Recording",
+                    kind: .recording,
                     shortcut: $recordingShortcut,
                     isRecording: $isRecordingRecordingShortcut,
-                    otherShortcuts: [timelineShortcut, dashboardShortcut, systemMonitorShortcut, feedbackShortcut]
+                    otherShortcuts: [timelineShortcut, dashboardShortcut, systemMonitorShortcut, commentShortcut]
                 )
 
                 Divider()
@@ -1880,18 +1889,20 @@ public struct SettingsView: View {
 
                 settingsShortcutRecorderRow(
                     label: "System Monitor",
+                    kind: .systemMonitor,
                     shortcut: $systemMonitorShortcut,
                     isRecording: $isRecordingSystemMonitorShortcut,
-                    otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, feedbackShortcut]
+                    otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, commentShortcut]
                 )
 
                 Divider()
                     .background(Color.retraceBorder)
 
                 settingsShortcutRecorderRow(
-                    label: "Help",
-                    shortcut: $feedbackShortcut,
-                    isRecording: $isRecordingFeedbackShortcut,
+                    label: "Quick Comment",
+                    kind: .comment,
+                    shortcut: $commentShortcut,
+                    isRecording: $isRecordingCommentShortcut,
                     otherShortcuts: [timelineShortcut, dashboardShortcut, recordingShortcut, systemMonitorShortcut]
                 )
 
@@ -1911,12 +1922,12 @@ public struct SettingsView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             // Cancel recording if user clicks outside
-            if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut || isRecordingSystemMonitorShortcut || isRecordingFeedbackShortcut {
+            if isRecordingTimelineShortcut || isRecordingDashboardShortcut || isRecordingRecordingShortcut || isRecordingSystemMonitorShortcut || isRecordingCommentShortcut {
                 isRecordingTimelineShortcut = false
                 isRecordingDashboardShortcut = false
                 isRecordingRecordingShortcut = false
                 isRecordingSystemMonitorShortcut = false
-                isRecordingFeedbackShortcut = false
+                isRecordingCommentShortcut = false
                 recordingTimeoutTask?.cancel()
             }
         }
@@ -2362,6 +2373,7 @@ public struct SettingsView: View {
 
     private func settingsShortcutRecorderRow(
         label: String,
+        kind: ManagedShortcutKind,
         shortcut: Binding<SettingsShortcutKey>,
         isRecording: Binding<Bool>,
         otherShortcuts: [SettingsShortcutKey]
@@ -2380,7 +2392,7 @@ public struct SettingsView: View {
                 isRecordingDashboardShortcut = false
                 isRecordingRecordingShortcut = false
                 isRecordingSystemMonitorShortcut = false
-                isRecordingFeedbackShortcut = false
+                isRecordingCommentShortcut = false
                 shortcutError = nil
                 recordingTimeoutTask?.cancel()
 
@@ -2454,7 +2466,7 @@ public struct SettingsView: View {
                         shortcutError = "This shortcut is already in use"
                     },
                     onShortcutCaptured: {
-                        // Saving is now handled by .onChange modifiers
+                        persistShortcutChange(kind)
                     }
                 )
                 .frame(width: 0, height: 0)
@@ -2464,7 +2476,7 @@ public struct SettingsView: View {
             if !shortcut.wrappedValue.isEmpty && !isRecording.wrappedValue {
                 Button(action: {
                     shortcut.wrappedValue = .empty
-                    // Saving is now handled by .onChange modifiers
+                    persistShortcutChange(kind)
                 }) {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .semibold))
@@ -2479,55 +2491,49 @@ public struct SettingsView: View {
         }
     }
 
-    // MARK: - Shortcut Persistence
-
-    private static let timelineShortcutKey = "timelineShortcutConfig"
-    private static let dashboardShortcutKey = "dashboardShortcutConfig"
-    private static let recordingShortcutKey = "recordingShortcutConfig"
-    private static let systemMonitorShortcutKey = "systemMonitorShortcutConfig"
-    private static let feedbackShortcutKey = "feedbackShortcutConfig"
-
     private func loadSavedShortcuts() async {
-        // Load directly from UserDefaults (same as OnboardingManager)
-        if let data = settingsStore.data(forKey: Self.timelineShortcutKey),
-           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
-            timelineShortcut = SettingsShortcutKey(from: config)
-        }
-        if let data = settingsStore.data(forKey: Self.dashboardShortcutKey),
-           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
-            dashboardShortcut = SettingsShortcutKey(from: config)
-        }
-        if let data = settingsStore.data(forKey: Self.recordingShortcutKey),
-           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
-            recordingShortcut = SettingsShortcutKey(from: config)
-        }
-        if let data = settingsStore.data(forKey: Self.systemMonitorShortcutKey),
-           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
-            systemMonitorShortcut = SettingsShortcutKey(from: config)
-        }
-        if let data = settingsStore.data(forKey: Self.feedbackShortcutKey),
-           let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) {
-            feedbackShortcut = SettingsShortcutKey(from: config)
-        }
+        let timeline = await onboardingManager.timelineShortcut
+        let dashboard = await onboardingManager.dashboardShortcut
+        let recording = await onboardingManager.recordingShortcut
+        let systemMonitor = await onboardingManager.systemMonitorShortcut
+        let comment = await onboardingManager.commentShortcut
+
+        let timelineValue = SettingsShortcutKey(from: timeline)
+        let dashboardValue = SettingsShortcutKey(from: dashboard)
+        let recordingValue = SettingsShortcutKey(from: recording)
+        let systemMonitorValue = SettingsShortcutKey(from: systemMonitor)
+        let commentValue = SettingsShortcutKey(from: comment)
+
+        timelineShortcut = timelineValue
+        dashboardShortcut = dashboardValue
+        recordingShortcut = recordingValue
+        systemMonitorShortcut = systemMonitorValue
+        commentShortcut = commentValue
     }
 
-    private func saveShortcuts() async {
-        if let data = try? JSONEncoder().encode(timelineShortcut.toConfig) {
-            settingsStore.set(data, forKey: Self.timelineShortcutKey)
+    private func saveShortcut(_ kind: ManagedShortcutKind) async {
+        switch kind {
+        case .timeline:
+            await onboardingManager.setTimelineShortcut(timelineShortcut.toConfig)
+        case .dashboard:
+            await onboardingManager.setDashboardShortcut(dashboardShortcut.toConfig)
+        case .recording:
+            await onboardingManager.setRecordingShortcut(recordingShortcut.toConfig)
+        case .systemMonitor:
+            await onboardingManager.setSystemMonitorShortcut(systemMonitorShortcut.toConfig)
+        case .comment:
+            await onboardingManager.setCommentShortcut(commentShortcut.toConfig)
         }
-        if let data = try? JSONEncoder().encode(dashboardShortcut.toConfig) {
-            settingsStore.set(data, forKey: Self.dashboardShortcutKey)
-        }
-        if let data = try? JSONEncoder().encode(recordingShortcut.toConfig) {
-            settingsStore.set(data, forKey: Self.recordingShortcutKey)
-        }
-        if let data = try? JSONEncoder().encode(systemMonitorShortcut.toConfig) {
-            settingsStore.set(data, forKey: Self.systemMonitorShortcutKey)
-        }
-        if let data = try? JSONEncoder().encode(feedbackShortcut.toConfig) {
-            settingsStore.set(data, forKey: Self.feedbackShortcutKey)
-        }
-        settingsStore.synchronize()
+
+        MenuBarManager.shared?.reloadShortcuts()
+    }
+
+    private func saveAllShortcuts() async {
+        await onboardingManager.setTimelineShortcut(timelineShortcut.toConfig)
+        await onboardingManager.setDashboardShortcut(dashboardShortcut.toConfig)
+        await onboardingManager.setRecordingShortcut(recordingShortcut.toConfig)
+        await onboardingManager.setSystemMonitorShortcut(systemMonitorShortcut.toConfig)
+        await onboardingManager.setCommentShortcut(commentShortcut.toConfig)
         MenuBarManager.shared?.reloadShortcuts()
     }
 
@@ -11026,12 +11032,18 @@ extension SettingsView {
     /// Reset all General settings to defaults
     func resetGeneralSettings() {
         // Keyboard shortcuts
-        timelineShortcut = SettingsShortcutKey(from: .defaultTimeline)
-        dashboardShortcut = SettingsShortcutKey(from: .defaultDashboard)
-        recordingShortcut = SettingsShortcutKey(from: .defaultRecording)
-        systemMonitorShortcut = SettingsShortcutKey(from: .defaultSystemMonitor)
-        feedbackShortcut = SettingsShortcutKey(from: .defaultFeedback)
-        Task { await saveShortcuts() }
+        let timelineValue = SettingsShortcutKey(from: .defaultTimeline)
+        let dashboardValue = SettingsShortcutKey(from: .defaultDashboard)
+        let recordingValue = SettingsShortcutKey(from: .defaultRecording)
+        let systemMonitorValue = SettingsShortcutKey(from: .defaultSystemMonitor)
+        let commentValue = SettingsShortcutKey(from: .defaultCommentCapture)
+
+        timelineShortcut = timelineValue
+        dashboardShortcut = dashboardValue
+        recordingShortcut = recordingValue
+        systemMonitorShortcut = systemMonitorValue
+        commentShortcut = commentValue
+        Task { await saveAllShortcuts() }
 
         // Startup
         launchAtLogin = SettingsDefaults.launchAtLogin

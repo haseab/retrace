@@ -27,6 +27,7 @@ public struct FeedbackFormView: View {
     @State private var measuredFormContentHeight: CGFloat = 0
     @State private var measuredFormFooterHeight: CGFloat = 0
     @State private var keyboardFocusTarget: KeyboardFocusTarget = .description
+    @State private var suppressAutomaticFocusScroll = true
 
     private enum FocusedField {
         case email
@@ -85,6 +86,7 @@ public struct FeedbackFormView: View {
         .clipped()
         .animation(.spring(response: 0.42, dampingFraction: 0.88), value: presentationState)
         .onAppear {
+            suppressAutomaticFocusScroll = true
             viewModel.setCoordinator(coordinatorWrapper)
             setupEscapeKeyHandler()
             applyInitialFocusIfNeeded()
@@ -193,11 +195,11 @@ public struct FeedbackFormView: View {
     }
 
     private func applyInitialFocusIfNeeded() {
+        let initialTarget: KeyboardFocusTarget = launchContext?.preferredFocusField == .email ? .email : .description
         DispatchQueue.main.async {
-            if launchContext?.preferredFocusField == .email {
-                setKeyboardFocus(.email)
-            } else {
-                setKeyboardFocus(.description)
+            self.setKeyboardFocus(initialTarget)
+            DispatchQueue.main.async {
+                self.suppressAutomaticFocusScroll = false
             }
         }
     }
@@ -326,7 +328,8 @@ public struct FeedbackFormView: View {
     }
 
     private func scrollToFocusedControl(_ target: KeyboardFocusTarget, proxy: ScrollViewProxy) {
-        guard let anchorTarget = scrollAnchorTarget(for: target) else { return }
+        guard !suppressAutomaticFocusScroll,
+              let anchorTarget = scrollAnchorTarget(for: target) else { return }
 
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.18)) {
@@ -443,10 +446,11 @@ public struct FeedbackFormView: View {
                     .padding(20)
                     .background(
                         GeometryReader { geometry in
-                            Color.clear.preference(
-                                key: FormContentHeightKey.self,
-                                value: geometry.size.height
-                            )
+                            Color.clear
+                                .preference(
+                                    key: FormContentHeightKey.self,
+                                    value: geometry.size.height
+                                )
                         }
                     )
                 }

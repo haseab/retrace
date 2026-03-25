@@ -2109,6 +2109,47 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(resolvedFrame?.value, firstFrameInA)
     }
 
+    func testSegmentComment_GetCommentsForSegments_DeduplicatesAndUsesRequestedSegmentOrder() async throws {
+        let segmentA = try await insertTestAppSegment(bundleID: "com.test.batch.a")
+        let segmentB = try await insertTestAppSegment(bundleID: "com.test.batch.b")
+        let segmentC = try await insertTestAppSegment(bundleID: "com.test.batch.c")
+
+        let sharedComment = try await database.createSegmentComment(
+            body: "Shared across A and C",
+            author: "Test User",
+            attachments: []
+        )
+        let onlyBComment = try await database.createSegmentComment(
+            body: "Only on B",
+            author: "Test User",
+            attachments: []
+        )
+        let onlyAComment = try await database.createSegmentComment(
+            body: "Only on A",
+            author: "Test User",
+            attachments: []
+        )
+
+        try await database.addCommentToSegment(segmentId: segmentA, commentId: sharedComment.id)
+        try await database.addCommentToSegment(segmentId: segmentC, commentId: sharedComment.id)
+        try await database.addCommentToSegment(segmentId: segmentB, commentId: onlyBComment.id)
+        try await database.addCommentToSegment(segmentId: segmentA, commentId: onlyAComment.id)
+
+        let linkedComments = try await database.getCommentsForSegments(
+            segmentIds: [segmentB, segmentC, segmentA, segmentC]
+        )
+
+        XCTAssertEqual(linkedComments.count, 3)
+        XCTAssertEqual(linkedComments.map(\.comment.id), [sharedComment.id, onlyBComment.id, onlyAComment.id])
+
+        let preferredSegmentByCommentID = Dictionary(
+            uniqueKeysWithValues: linkedComments.map { ($0.comment.id, $0.preferredSegmentID) }
+        )
+        XCTAssertEqual(preferredSegmentByCommentID[sharedComment.id], segmentC)
+        XCTAssertEqual(preferredSegmentByCommentID[onlyBComment.id], segmentB)
+        XCTAssertEqual(preferredSegmentByCommentID[onlyAComment.id], segmentA)
+    }
+
     func testSegmentComment_SearchReturnsMatches() async throws {
         let matching = try await database.createSegmentComment(
             body: "Investigate crash in sidebar panel",

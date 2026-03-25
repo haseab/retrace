@@ -1459,6 +1459,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleDockOpenFeedback() {
         recordDockMenuActionMetric("open_help")
+        if let coordinator = coordinatorWrapper?.coordinator {
+            Task { @MainActor in
+                DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "dock_menu")
+            }
+        }
         NotificationCenter.default.post(name: .openFeedback, object: nil)
     }
 
@@ -1760,6 +1765,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminationDecisionInProgress else { return false }
         guard !isTerminationFlushInProgress else { return false }
         guard !TimelineWindowController.shared.isVisible else { return false }
+        guard !StandaloneCommentComposerWindowController.shared.isVisible else { return false }
+        guard !StandaloneCommentComposerWindowController.shared.isPresentationPending else { return false }
         guard !DashboardWindowController.shared.isVisible else { return false }
         guard !PauseReminderWindowController.shared.isVisible else { return false }
 

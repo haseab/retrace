@@ -194,6 +194,8 @@ public actor AppCoordinator {
         }
     }
 
+    public typealias LinkedSegmentComment = Database.LinkedSegmentComment
+
     public struct FrameInPageURLRow: Sendable, Equatable {
         public let order: Int
         public let url: String
@@ -2862,9 +2864,38 @@ public actor AppCoordinator {
         Log.info("[AppCoordinator] Removed comment \(commentId.value) from \(removedCount) segments", category: .app)
     }
 
+    private func withDatabaseActorTrace<T>(
+        _ operation: String,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        let enqueuedAt = CFAbsoluteTimeGetCurrent()
+        let traceID = String(UUID().uuidString.prefix(8))
+
+        return try await DatabaseActorTraceContext.$requestEnqueuedAt.withValue(enqueuedAt) {
+            try await DatabaseActorTraceContext.$operationName.withValue(operation) {
+                try await DatabaseActorTraceContext.$traceID.withValue(traceID) {
+                    try await body()
+                }
+            }
+        }
+    }
+
     /// Get comments linked to a segment
     public func getCommentsForSegment(segmentId: SegmentID) async throws -> [SegmentComment] {
-        try await services.database.getCommentsForSegment(segmentId: segmentId)
+        try await withDatabaseActorTrace("get_comments_for_segment") {
+            try await services.database.getCommentsForSegment(segmentId: segmentId)
+        }
+    }
+
+    /// Get unique comments linked to any of the provided segments, keeping the earliest
+    /// requested segment as the preferred fallback target for each comment.
+    public func getCommentsForSegments(segmentIds: [SegmentID]) async throws -> [LinkedSegmentComment] {
+        let orderedSegmentIDs = segmentIds.uniquePreservingOrder()
+        guard !orderedSegmentIDs.isEmpty else { return [] }
+
+        return try await withDatabaseActorTrace("get_comments_for_segments") {
+            try await services.database.getCommentsForSegments(segmentIds: orderedSegmentIDs)
+        }
     }
 
     /// Get all linked comments with representative segment context (Retrace DB only).

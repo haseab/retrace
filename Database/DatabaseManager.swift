@@ -51,6 +51,16 @@ public struct PendingNodeRedactionJob: Sendable, Equatable {
     }
 }
 
+public struct LinkedSegmentComment: Sendable, Equatable {
+    public let comment: SegmentComment
+    public let preferredSegmentID: SegmentID
+
+    public init(comment: SegmentComment, preferredSegmentID: SegmentID) {
+        self.comment = comment
+        self.preferredSegmentID = preferredSegmentID
+    }
+}
+
 /// Task-local diagnostics propagated across actor hops so callers can stamp enqueue time.
 public enum DatabaseActorTraceContext {
     @TaskLocal public static var requestEnqueuedAt: CFAbsoluteTime?
@@ -1473,35 +1483,126 @@ public actor DatabaseManager: DatabaseProtocol {
 
     /// Get all comments linked to a segment
     public func getCommentsForSegment(segmentId: SegmentID) async throws -> [SegmentComment] {
-        guard let db = db else {
-            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        try withTracedDatabaseOperation(
+            "get_comments_for_segment",
+            warningMs: 120
+        ) { db in
+            let sql = """
+                SELECT c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt
+                FROM segment_comment c
+                JOIN segment_comment_link scl ON c.id = scl.commentId
+                WHERE scl.segmentId = ?
+                ORDER BY c.createdAt ASC, c.id ASC;
+                """
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: sql,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            sqlite3_bind_int64(statement, 1, segmentId.value)
+
+            var comments: [SegmentComment] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                comments.append(parseSegmentComment(statement: statement!))
+            }
+
+            return comments
         }
+    }
 
-        let sql = """
-            SELECT c.id, c.body, c.author, c.attachmentsJson, c.frameId, c.createdAt, c.updatedAt
-            FROM segment_comment c
-            JOIN segment_comment_link scl ON c.id = scl.commentId
-            WHERE scl.segmentId = ?
-            ORDER BY c.createdAt ASC, c.id ASC;
-            """
-        var statement: OpaquePointer?
-        defer { sqlite3_finalize(statement) }
+    /// Get all unique comments linked to any of the provided segments.
+    /// If a comment is linked to multiple requested segments, the earliest requested segment
+    /// becomes the preferred fallback segment for navigation.
+    public func getCommentsForSegments(segmentIds: [SegmentID]) async throws -> [LinkedSegmentComment] {
+        let orderedSegmentIDs = segmentIds.uniquePreservingOrder()
+        guard !orderedSegmentIDs.isEmpty else { return [] }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.queryFailed(
-                query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
-            )
+        return try withTracedDatabaseOperation(
+            "get_comments_for_segments",
+            warningMs: 120
+        ) { db in
+            let valuesClause = orderedSegmentIDs
+                .enumerated()
+                .map { _ in "(?, ?)" }
+                .joined(separator: ", ")
+            let sql = """
+                WITH requested_segments(segmentId, ordinal) AS (
+                    VALUES \(valuesClause)
+                ),
+                matched_comments AS (
+                    SELECT
+                        c.id,
+                        c.body,
+                        c.author,
+                        c.attachmentsJson,
+                        c.frameId,
+                        c.createdAt,
+                        c.updatedAt,
+                        rs.segmentId AS preferredSegmentId,
+                        rs.ordinal AS preferredOrdinal
+                    FROM requested_segments rs
+                    JOIN segment_comment_link scl ON scl.segmentId = rs.segmentId
+                    JOIN segment_comment c ON c.id = scl.commentId
+                ),
+                preferred_segments AS (
+                    SELECT
+                        id AS commentId,
+                        MIN(preferredOrdinal) AS preferredOrdinal
+                    FROM matched_comments
+                    GROUP BY id
+                )
+                SELECT
+                    mc.id,
+                    mc.body,
+                    mc.author,
+                    mc.attachmentsJson,
+                    mc.frameId,
+                    mc.createdAt,
+                    mc.updatedAt,
+                    mc.preferredSegmentId
+                FROM matched_comments mc
+                JOIN preferred_segments ps
+                    ON ps.commentId = mc.id
+                    AND ps.preferredOrdinal = mc.preferredOrdinal
+                ORDER BY mc.createdAt ASC, mc.id ASC;
+                """
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw DatabaseError.queryFailed(
+                    query: sql,
+                    underlying: String(cString: sqlite3_errmsg(db))
+                )
+            }
+
+            var bindIndex: Int32 = 1
+            for (ordinal, segmentID) in orderedSegmentIDs.enumerated() {
+                sqlite3_bind_int64(statement, bindIndex, segmentID.value)
+                bindIndex += 1
+                sqlite3_bind_int64(statement, bindIndex, Int64(ordinal))
+                bindIndex += 1
+            }
+
+            var linkedComments: [LinkedSegmentComment] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let comment = parseSegmentComment(statement: statement!)
+                let preferredSegmentID = SegmentID(value: sqlite3_column_int64(statement, 7))
+                linkedComments.append(
+                    LinkedSegmentComment(
+                        comment: comment,
+                        preferredSegmentID: preferredSegmentID
+                    )
+                )
+            }
+
+            return linkedComments
         }
-
-        sqlite3_bind_int64(statement, 1, segmentId.value)
-
-        var comments: [SegmentComment] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            comments.append(parseSegmentComment(statement: statement!))
-        }
-
-        return comments
     }
 
     /// Get all linked comments with a representative segment context per comment.

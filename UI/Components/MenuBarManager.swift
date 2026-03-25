@@ -37,7 +37,7 @@ public class MenuBarManager: ObservableObject {
     private var dashboardShortcut: ShortcutConfig = .defaultDashboard
     private var recordingShortcut: ShortcutConfig = .defaultRecording
     private var systemMonitorShortcut: ShortcutConfig = .defaultSystemMonitor
-    private var feedbackShortcut: ShortcutConfig = .defaultFeedback
+    private var commentShortcut: ShortcutConfig = .defaultCommentCapture
 
     /// Timer for icon fill animation
     private var iconAnimationTimer: Timer?
@@ -102,6 +102,7 @@ public class MenuBarManager: ObservableObject {
             await loadShortcuts()
             setupMenu()
             setupTimelineNotifications()
+            configureWindowControllers()
 
             // Only setup global hotkeys if onboarding is past the permissions step (step 3)
             // This prevents HotkeyManager from calling AXIsProcessTrusted() before user grants permission
@@ -170,8 +171,11 @@ public class MenuBarManager: ObservableObject {
         dashboardShortcut = await onboardingManager.dashboardShortcut
         recordingShortcut = await onboardingManager.recordingShortcut
         systemMonitorShortcut = await onboardingManager.systemMonitorShortcut
-        feedbackShortcut = await onboardingManager.feedbackShortcut
-        Log.info("[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString), Monitor: \(systemMonitorShortcut.displayString), Feedback: \(feedbackShortcut.displayString)", category: .ui)
+        commentShortcut = await onboardingManager.commentShortcut
+        Log.info(
+            "[MenuBarManager] Loaded shortcuts - Timeline: \(timelineShortcut.displayString), Dashboard: \(dashboardShortcut.displayString), Recording: \(recordingShortcut.displayString), Monitor: \(systemMonitorShortcut.displayString), Comment: \(commentShortcut.displayString)",
+            category: .ui
+        )
     }
 
     /// Reload shortcuts from storage and re-register hotkeys (called from Settings)
@@ -181,6 +185,12 @@ public class MenuBarManager: ObservableObject {
             setupGlobalHotkey()
             setupMenu()
         }
+    }
+
+    @MainActor
+    private func configureWindowControllers() {
+        TimelineWindowController.shared.configure(coordinator: coordinator)
+        StandaloneCommentComposerWindowController.shared.configure(coordinator: coordinator)
     }
 
     /// Setup notifications for timeline open/close
@@ -248,19 +258,14 @@ public class MenuBarManager: ObservableObject {
             }
         }
 
-        // Register feedback global hotkey (skip if cleared)
-        if !feedbackShortcut.key.isEmpty {
+        // Register quick-comment global hotkey (skip if cleared)
+        if !commentShortcut.key.isEmpty {
             HotkeyManager.shared.registerHotkey(
-                key: feedbackShortcut.key,
-                modifiers: feedbackShortcut.modifiers.nsModifiers
+                key: commentShortcut.key,
+                modifiers: commentShortcut.modifiers.nsModifiers
             ) { [weak self] in
-                self?.openFeedbackFromHotkey()
+                self?.openCommentComposerFromHotkey()
             }
-        }
-
-        // Also configure the timeline window controller
-        Task { @MainActor in
-            TimelineWindowController.shared.configure(coordinator: coordinator)
         }
     }
 
@@ -268,6 +273,32 @@ public class MenuBarManager: ObservableObject {
     private func toggleTimelineOverlay() {
         Task { @MainActor in
             TimelineWindowController.shared.toggle()
+        }
+    }
+
+    private func keyboardShortcutMetricIdentifier(for shortcut: ShortcutConfig) -> String {
+        var parts: [String] = []
+        let modifiers = shortcut.modifiers
+        if modifiers.contains(.control) { parts.append("ctrl") }
+        if modifiers.contains(.option) { parts.append("opt") }
+        if modifiers.contains(.shift) { parts.append("shift") }
+        if modifiers.contains(.command) { parts.append("cmd") }
+
+        let normalizedKey = shortcut.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        parts.append(normalizedKey == "space" ? "space" : normalizedKey)
+        return parts.joined(separator: "+")
+    }
+
+    /// Open the standalone quick-comment composer at the current moment.
+    private func openCommentComposerFromHotkey() {
+        Task { @MainActor in
+            DashboardViewModel.recordKeyboardShortcut(
+                coordinator: coordinator,
+                shortcut: keyboardShortcutMetricIdentifier(for: commentShortcut)
+            )
+            StandaloneCommentComposerWindowController.shared.openCommentComposerAtCurrentMoment(
+                source: "global_hotkey_comment"
+            )
         }
     }
 
@@ -927,11 +958,8 @@ public class MenuBarManager: ObservableObject {
         let feedbackItem = NSMenuItem(
             title: "Get Help...",
             action: #selector(openFeedback),
-            keyEquivalent: feedbackShortcut.key.isEmpty ? "" : feedbackShortcut.menuKeyEquivalent
+            keyEquivalent: ""
         )
-        if !feedbackShortcut.key.isEmpty {
-            feedbackItem.keyEquivalentModifierMask = feedbackShortcut.modifiers.nsModifiers
-        }
         feedbackItem.image = NSImage(systemSymbolName: "exclamationmark.bubble", accessibilityDescription: nil)
         menu.addItem(feedbackItem)
 
@@ -1225,20 +1253,6 @@ public class MenuBarManager: ObservableObject {
         }
     }
 
-    /// Open feedback from global hotkey - hides timeline if open first
-    private func openFeedbackFromHotkey() {
-        Task { @MainActor in
-            if TimelineWindowController.shared.isVisible {
-                TimelineWindowController.shared.hideToShowDashboard()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    NotificationCenter.default.post(name: .openFeedback, object: nil)
-                }
-            } else {
-                NotificationCenter.default.post(name: .openFeedback, object: nil)
-            }
-        }
-    }
-
     /// Sync recording status with coordinator
     /// Uses thread-safe statusHolder to avoid actor hop and prevent task pile-up
     public func syncWithCoordinator() {
@@ -1262,6 +1276,9 @@ public class MenuBarManager: ObservableObject {
     }
 
     @objc private func openFeedback() {
+        Task { @MainActor in
+            DashboardViewModel.recordHelpOpened(coordinator: coordinator, source: "menu_bar_menu")
+        }
         NotificationCenter.default.post(name: .openFeedback, object: nil)
     }
 

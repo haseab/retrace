@@ -19,7 +19,7 @@ public actor OnboardingManager {
     private static let dashboardShortcutKey = "dashboardShortcutConfig"
     private static let recordingShortcutKey = "recordingShortcutConfig"
     private static let systemMonitorShortcutKey = "systemMonitorShortcutConfig"
-    private static let feedbackShortcutKey = "feedbackShortcutConfig"
+    private static let commentShortcutKey = "commentShortcutConfig"
     private static let hasRewindDataKey = "hasRewindData"
     private static let rewindMigrationCompletedKey = "rewindMigrationCompleted"
 
@@ -77,11 +77,11 @@ public actor OnboardingManager {
         return config
     }
 
-    /// Feedback shortcut configuration (key + modifiers)
-    public var feedbackShortcut: ShortcutConfig {
-        guard let data = settingsDefaults.data(forKey: Self.feedbackShortcutKey),
+    /// Quick-comment shortcut configuration (key + modifiers)
+    public var commentShortcut: ShortcutConfig {
+        guard let data = settingsDefaults.data(forKey: Self.commentShortcutKey),
               let config = try? JSONDecoder().decode(ShortcutConfig.self, from: data) else {
-            return .defaultFeedback
+            return .defaultCommentCapture
         }
         return config
     }
@@ -159,11 +159,11 @@ public actor OnboardingManager {
         }
     }
 
-    /// Set feedback shortcut (full config with key + modifiers)
-    public func setFeedbackShortcut(_ config: ShortcutConfig) {
+    /// Set quick-comment shortcut (full config with key + modifiers)
+    public func setCommentShortcut(_ config: ShortcutConfig) {
         if let data = try? JSONEncoder().encode(config) {
-            settingsDefaults.set(data, forKey: Self.feedbackShortcutKey)
-            Log.info("Feedback shortcut set to: \(config.displayString)", category: .app)
+            settingsDefaults.set(data, forKey: Self.commentShortcutKey)
+            Log.info("Comment shortcut set to: \(config.displayString)", category: .app)
         }
     }
 
@@ -189,6 +189,8 @@ public actor OnboardingManager {
         settingsDefaults.removeObject(forKey: Self.timelineShortcutKey)
         settingsDefaults.removeObject(forKey: Self.dashboardShortcutKey)
         settingsDefaults.removeObject(forKey: Self.recordingShortcutKey)
+        settingsDefaults.removeObject(forKey: Self.systemMonitorShortcutKey)
+        settingsDefaults.removeObject(forKey: Self.commentShortcutKey)
         settingsDefaults.removeObject(forKey: Self.hasRewindDataKey)
         settingsDefaults.removeObject(forKey: Self.rewindMigrationCompletedKey)
         Log.info("Onboarding state reset", category: .app)

@@ -4118,13 +4118,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
     }
 
     private func timelineDiskBufferFileURL(frameID: FrameID) -> URL {
-        let cachesDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return cachesDirectory
-            .appendingPathComponent("io.retrace.app", isDirectory: true)
-            .appendingPathComponent("TimelineFrameBuffer", isDirectory: true)
-            .appendingPathComponent("\(frameID.value)")
-            .appendingPathExtension("jpg")
+        SimpleTimelineViewModel.timelineDiskFrameBufferFileURL(for: frameID)
     }
 
     private func makeJPEGData(_ image: NSImage) throws -> Data {
