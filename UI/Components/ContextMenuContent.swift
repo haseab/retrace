@@ -284,12 +284,10 @@ struct ContextMenuRow: View {
 
                     if showGuideRing {
                         RoundedRectangle(cornerRadius: RetraceMenuStyle.itemCornerRadius)
-                            .stroke(
-                                Color.yellow.opacity(guidePulse ? 0.95 : 0.7),
-                                lineWidth: guidePulse ? 2.6 : 2.0
-                            )
+                            .stroke(Color.retraceAccent, lineWidth: guidePulse ? 2.6 : 2.0)
+                            .opacity(guidePulse ? 0.95 : 0.7)
                             .shadow(
-                                color: Color.yellow.opacity(guidePulse ? 0.45 : 0.25),
+                                color: Color.retraceAccent.opacity(guidePulse ? 0.45 : 0.25),
                                 radius: guidePulse ? 8 : 5
                             )
                             .animation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true), value: guidePulse)
