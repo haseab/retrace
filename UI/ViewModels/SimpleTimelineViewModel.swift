@@ -10189,31 +10189,50 @@ public class SimpleTimelineViewModel: ObservableObject {
             }
         }
 
-        return candidateNodes.compactMap { node in
-            youTubeUsableChannelText(
+        return candidateNodes.compactMap { node -> (text: String, score: Double)? in
+            guard let text = youTubeUsableChannelText(
                 from: node.text,
                 titleCandidates: titleCandidates
+            ) else {
+                return nil
+            }
+
+            return (
+                text: text,
+                score: youTubeChannelNodeScore(
+                    node: node,
+                    titleNode: titleNode,
+                    text: text
+                )
             )
-        }.first
+        }.max { lhs, rhs in
+            if lhs.score != rhs.score {
+                return lhs.score < rhs.score
+            }
+            return lhs.text.count < rhs.text.count
+        }?.text
     }
 
     private static func youTubeNodesBelowTitle(
         titleNode: OCRNodeWithText,
         nodes: [OCRNodeWithText]
     ) -> [OCRNodeWithText] {
-        let leftColumnBoundary = youTubeLeftMetadataRightBoundary(for: titleNode)
+        let horizontalRange = youTubeMetadataHorizontalRange(for: titleNode)
         let titleBottom = titleNode.y + titleNode.height
+        let maximumVerticalGap = youTubeMetadataVerticalGapLimit(for: titleNode)
 
         return nodes.filter { node in
             guard node.id != titleNode.id else {
                 return false
             }
-            guard node.x <= leftColumnBoundary else {
+            let nodeRight = node.x + node.width
+            guard nodeRight >= horizontalRange.lowerBound,
+                  node.x <= horizontalRange.upperBound else {
                 return false
             }
 
             let verticalGap = node.y - titleBottom
-            return verticalGap >= -0.01 && verticalGap <= 0.18
+            return verticalGap >= -0.01 && verticalGap <= maximumVerticalGap
         }.sorted {
             if $0.y != $1.y {
                 return $0.y < $1.y
@@ -10264,6 +10283,28 @@ public class SimpleTimelineViewModel: ObservableObject {
             return nil
         }
         return sanitizedMarkdownClipboardComponent(cleanedText)
+    }
+
+    private static func youTubeChannelNodeScore(
+        node: OCRNodeWithText,
+        titleNode: OCRNodeWithText,
+        text: String
+    ) -> Double {
+        let titleBottom = titleNode.y + titleNode.height
+        let verticalGap = max(0, node.y - titleBottom)
+        let leadingOffset = abs(node.x - titleNode.x)
+
+        var score = 320.0
+        score -= Double(verticalGap) * 1_800.0
+        score -= Double(leadingOffset) * 900.0
+        score += Double(min(max(0, node.width), 0.24)) * 140.0
+        score += Double(min(text.count, 28)) * 6.0
+
+        if node.x + node.width < titleNode.x {
+            score -= 120.0
+        }
+
+        return score
     }
 
     private static func youTubeTitleNodeScore(
@@ -10319,9 +10360,17 @@ public class SimpleTimelineViewModel: ObservableObject {
         return Array(NSOrderedSet(array: candidates)) as? [String] ?? candidates
     }
 
-    private static func youTubeLeftMetadataRightBoundary(for titleNode: OCRNodeWithText) -> CGFloat {
+    private static func youTubeMetadataHorizontalRange(for titleNode: OCRNodeWithText) -> ClosedRange<CGFloat> {
         let titleWidth = max(0, titleNode.width)
-        return titleNode.x + min(max(titleWidth * 0.35, 0.16), 0.22)
+        let leftPadding = min(max(titleWidth * 0.12, 0.02), 0.05)
+        let rightSpan = min(max(titleWidth * 0.9, 0.34), 0.52)
+        let minX = max(0, titleNode.x - leftPadding)
+        let maxX = min(titleNode.x + rightSpan, 0.62)
+        return minX...max(minX, maxX)
+    }
+
+    private static func youTubeMetadataVerticalGapLimit(for titleNode: OCRNodeWithText) -> CGFloat {
+        min(max(titleNode.height * 5.0, 0.18), 0.24)
     }
 
     private static func youTubeInlineChannelText(
@@ -10797,6 +10846,10 @@ public class SimpleTimelineViewModel: ObservableObject {
         "share",
         "save",
         "download",
+        "clip",
+        "thanks",
+        "more",
+        "show more",
     ]
 
     private static let textFragmentExcludedDomains: [String] = [

@@ -164,6 +164,98 @@ final class HyperlinkResolutionTests: XCTestCase {
     }
 
     @MainActor
+    func testResolveYouTubeOCRMatchFindsShiftedMetadataColumnOnWideLayouts() throws {
+        let match = try XCTUnwrap(
+            SimpleTimelineViewModel.resolveYouTubeOCRMatch(
+                windowName: "Why This Layout Breaks OCR - YouTube",
+                nodes: [
+                    makeYouTubeOCRNode(
+                        id: 1,
+                        text: "Why This Layout Breaks OCR",
+                        x: 0.22,
+                        y: 0.18,
+                        width: 0.18,
+                        height: 0.038
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 2,
+                        text: "Veritasium",
+                        x: 0.43,
+                        y: 0.27,
+                        width: 0.11,
+                        height: 0.028
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 3,
+                        text: "17.3M subscribers",
+                        x: 0.43,
+                        y: 0.31,
+                        width: 0.15,
+                        height: 0.026
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 4,
+                        text: "Up next",
+                        x: 0.74,
+                        y: 0.27,
+                        width: 0.10,
+                        height: 0.028
+                    )
+                ]
+            )
+        )
+
+        XCTAssertEqual(match.titleText, "Why This Layout Breaks OCR")
+        XCTAssertEqual(match.channelText, "Veritasium")
+    }
+
+    @MainActor
+    func testResolveYouTubeOCRMatchIgnoresGenericUiLabelsWhenSubscriberLineIsMissing() throws {
+        let match = try XCTUnwrap(
+            SimpleTimelineViewModel.resolveYouTubeOCRMatch(
+                windowName: "Building For Multiple Displays - YouTube",
+                nodes: [
+                    makeYouTubeOCRNode(
+                        id: 1,
+                        text: "Building For Multiple Displays",
+                        x: 0.21,
+                        y: 0.17,
+                        width: 0.20,
+                        height: 0.04
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 2,
+                        text: "More",
+                        x: 0.40,
+                        y: 0.27,
+                        width: 0.05,
+                        height: 0.024
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 3,
+                        text: "Practical Engineering",
+                        x: 0.43,
+                        y: 0.28,
+                        width: 0.16,
+                        height: 0.03
+                    ),
+                    makeYouTubeOCRNode(
+                        id: 4,
+                        text: "Autoplay",
+                        x: 0.68,
+                        y: 0.28,
+                        width: 0.09,
+                        height: 0.028
+                    )
+                ]
+            )
+        )
+
+        XCTAssertEqual(match.titleText, "Building For Multiple Displays")
+        XCTAssertEqual(match.channelText, "Practical Engineering")
+    }
+
+    @MainActor
     func testAppendingSmartTextFragmentAddsDirectiveWhenNoFragmentExists() {
         XCTAssertEqual(
             SimpleTimelineViewModel.appendingSmartTextFragment(
@@ -281,4 +373,23 @@ final class HyperlinkResolutionTests: XCTestCase {
             .none
         )
     }
+}
+
+private func makeYouTubeOCRNode(
+    id: Int,
+    text: String,
+    x: CGFloat,
+    y: CGFloat,
+    width: CGFloat,
+    height: CGFloat
+) -> OCRNodeWithText {
+    OCRNodeWithText(
+        id: id,
+        frameId: 1,
+        x: x,
+        y: y,
+        width: width,
+        height: height,
+        text: text
+    )
 }
