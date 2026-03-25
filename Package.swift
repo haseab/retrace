@@ -126,7 +126,9 @@ let package = Package(
             name: "Processing",
             dependencies: [
                 "Shared",
-                "Database"
+                "Database",
+                "Storage",
+                "Search"
             ],
             path: "Processing",
             exclude: [
