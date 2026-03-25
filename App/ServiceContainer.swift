@@ -727,6 +727,7 @@ extension CaptureConfig {
 
         // Capture on window change - instantly capture when switching apps/windows
         let captureOnWindowChange = defaults.object(forKey: "captureOnWindowChange") as? Bool ?? true
+        let captureOnMouseClick = defaults.object(forKey: "captureOnMouseClick") as? Bool ?? false
 
         return CaptureConfig(
             captureIntervalSeconds: captureIntervalSeconds,
@@ -739,7 +740,8 @@ extension CaptureConfig {
             showCursor: showCursor,
             redactWindowTitlePatterns: redactWindowTitlePatterns,
             redactBrowserURLPatterns: redactBrowserURLPatterns,
-            captureOnWindowChange: captureOnWindowChange
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick
         )
     }
 

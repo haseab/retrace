@@ -84,6 +84,7 @@ enum SettingsDefaults {
     static let deduplicationThreshold: Double = CaptureConfig.defaultDeduplicationThreshold
     static let keepFramesOnMouseMovement = true
     static let captureOnWindowChange = true
+    static let captureOnMouseClick = false
     static let collectInPageURLsExperimental = false
 
     // MARK: Storage
@@ -305,8 +306,12 @@ public struct SettingsView: View {
     @AppStorage("deduplicationThreshold", store: settingsStore) private var deduplicationThreshold: Double = SettingsDefaults.deduplicationThreshold
     @AppStorage("keepFramesOnMouseMovement", store: settingsStore) private var keepFramesOnMouseMovement = SettingsDefaults.keepFramesOnMouseMovement
     @AppStorage("captureOnWindowChange", store: settingsStore) private var captureOnWindowChange: Bool = SettingsDefaults.captureOnWindowChange
+    @AppStorage("captureOnMouseClick", store: settingsStore) private var captureOnMouseClick: Bool = SettingsDefaults.captureOnMouseClick
     @AppStorage("collectInPageURLsExperimental", store: settingsStore) private var collectInPageURLsExperimental: Bool = SettingsDefaults.collectInPageURLsExperimental
     @AppStorage("inPageURLPermissionCache", store: settingsStore) private var inPageURLPermissionCacheRaw = ""
+    @State private var lastNonZeroCaptureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
+    @State private var isProgrammaticCaptureIntervalChange = false
+    @State private var isProgrammaticWindowChangeCaptureToggleChange = false
 
     // MARK: Storage Settings
     @AppStorage("retentionDays", store: settingsStore) private var retentionDays: Int = SettingsDefaults.retentionDays
@@ -483,6 +488,8 @@ public struct SettingsView: View {
     // Permission states
     @State private var hasScreenRecordingPermission = false
     @State private var hasAccessibilityPermission = false
+    @State private var hasListenEventAccess = false
+    @State private var isProgrammaticMouseClickCaptureToggleChange = false
     @State private var browserExtractionPermissionStatus: PermissionStatus = .notDetermined
     @State private var inPageURLTargets: [InPageURLBrowserTarget] = []
     @State private var inPageURLPermissionStateByBundleID: [String: InPageURLPermissionState] = [:]
@@ -2549,15 +2556,6 @@ public struct SettingsView: View {
             pauseReminderCard
             inPageURLCollectionCard
 
-            // TODO: Re-enable when using ScreenCaptureKit (CGWindowList doesn't support cursor capture)
-//            ModernSettingsCard(title: "Display Options", icon: "display") {
-//                ModernToggleRow(
-//                    title: "Exclude Cursor",
-//                    subtitle: "Hide the mouse cursor in captures",
-//                    isOn: $excludeCursor
-//                )
-//            }
-
             // TODO: Add Auto-Pause settings later
 //            ModernSettingsCard(title: "Auto-Pause", icon: "pause.circle") {
 //                ModernToggleRow(
@@ -2602,8 +2600,11 @@ public struct SettingsView: View {
                     }
 
                     CaptureIntervalPicker(selectedInterval: $captureIntervalSeconds)
-                        .onChange(of: captureIntervalSeconds) { _ in
-                            showCaptureUpdateFeedback()
+                        .onAppear {
+                            syncCaptureTriggerFallbackState()
+                        }
+                        .onChange(of: captureIntervalSeconds) { newValue in
+                            updateCaptureIntervalSetting(to: newValue)
                         }
 
                     // Estimated storage description and reset button on same line
@@ -2618,7 +2619,6 @@ public struct SettingsView: View {
                         if captureIntervalSeconds != SettingsDefaults.captureIntervalSeconds {
                             Button(action: {
                                 captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
-                                showCaptureUpdateFeedback()
                             }) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "arrow.counterclockwise")
@@ -2635,23 +2635,27 @@ public struct SettingsView: View {
                     Divider()
                         .background(Color.white.opacity(0.1))
 
-                    // Capture on window change toggle
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Capture on window change")
-                                .font(.retraceCalloutMedium)
-                                .foregroundColor(.retracePrimary)
-                            Text("Instantly capture when switching apps or windows")
-                                .font(.retraceCaption2)
-                                .foregroundColor(.retraceSecondary.opacity(0.7))
-                        }
-                        Spacer()
-                        Toggle("", isOn: $captureOnWindowChange)
-                            .toggleStyle(SwitchToggleStyle(tint: .retraceAccent))
-                            .labelsHidden()
-                            .onChange(of: captureOnWindowChange) { _ in
-                                updateCaptureOnWindowChangeSetting()
-                            }
+                    ModernToggleRow(
+                        title: "Capture on window change",
+                        subtitle: "Instantly capture when switching apps or windows",
+                        isOn: $captureOnWindowChange
+                    )
+                    .onChange(of: captureOnWindowChange) { _ in
+                        updateCaptureOnWindowChangeSetting()
+                    }
+
+                    Divider()
+                        .background(Color.white.opacity(0.1))
+
+                    ModernToggleRow(
+                        title: "Capture on mouse click",
+                        subtitle: hasListenEventAccess
+                            ? "Capture shortly after a left click so the frame matches the post-click window metadata"
+                            : "Capture shortly after a left click so the frame matches the post-click window metadata. Requires Input Monitoring permission.",
+                        isOn: $captureOnMouseClick
+                    )
+                    .onChange(of: captureOnMouseClick) { _ in
+                        updateCaptureOnMouseClickSetting()
                     }
 
                     Divider()
@@ -2699,10 +2703,15 @@ public struct SettingsView: View {
                             .cornerRadius(8)
                     }
 
-                    ModernSlider(value: $videoQuality, range: 0...1, step: 0.05)
-                        .onChange(of: videoQuality) { _ in
+                    ModernSlider(
+                        value: $videoQuality,
+                        range: 0...1,
+                        step: 0.05,
+                        onCommit: {
+                            updateVideoQualitySetting(to: videoQuality)
                             showCompressionUpdateFeedback()
                         }
+                    )
 
                     // Estimated storage description and reset button on same line
                     HStack {
@@ -2716,6 +2725,7 @@ public struct SettingsView: View {
                         if videoQuality != SettingsDefaults.videoQuality {
                             Button(action: {
                                 videoQuality = SettingsDefaults.videoQuality
+                                updateVideoQualitySetting(to: SettingsDefaults.videoQuality)
                                 showCompressionUpdateFeedback()
                             }) {
                                 HStack(spacing: 4) {
@@ -4632,6 +4642,17 @@ public struct SettingsView: View {
             )
 
             ModernPermissionRow(
+                label: "Input Monitoring",
+                status: hasListenEventAccess ? .granted : .notDetermined,
+                enableAction: hasListenEventAccess ? nil : {
+                    Task {
+                        _ = await requestListenEventAccessIfNeeded()
+                    }
+                },
+                openSettingsAction: { openListenEventSettings() }
+            )
+
+            ModernPermissionRow(
                 label: "Browser URL Extraction Permissions",
                 status: browserExtractionPermissionStatus,
                 enableAction: { openAutomationSettings() },
@@ -6302,8 +6323,21 @@ private struct ModernSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
     let step: Double
+    let onCommit: (() -> Void)?
 
-    @GestureState private var isDragging = false
+    @State private var isDragging = false
+
+    init(
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double,
+        onCommit: (() -> Void)? = nil
+    ) {
+        self._value = value
+        self.range = range
+        self.step = step
+        self.onCommit = onCommit
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -6336,19 +6370,23 @@ private struct ModernSlider: View {
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
-                    .updating($isDragging) { _, state, _ in
-                        state = true
-                    }
                     .onChanged { gestureValue in
+                        if !isDragging {
+                            isDragging = true
+                        }
+
                         let x = gestureValue.location.x
                         let percentage = max(0, min(1, x / trackWidth))
                         let rawValue = range.lowerBound + (range.upperBound - range.lowerBound) * Double(percentage)
-                        // Snap to step
-                        let steppedValue = round(rawValue / step) * step
-                        let clampedValue = max(range.lowerBound, min(range.upperBound, steppedValue))
-                        if clampedValue != value {
-                            value = clampedValue
-                        }
+                        updateValue(rawValue)
+                    }
+                    .onEnded { gestureValue in
+                        let x = gestureValue.location.x
+                        let percentage = max(0, min(1, x / trackWidth))
+                        let rawValue = range.lowerBound + (range.upperBound - range.lowerBound) * Double(percentage)
+                        updateValue(rawValue)
+                        isDragging = false
+                        onCommit?()
                     }
             )
         }
@@ -6357,6 +6395,14 @@ private struct ModernSlider: View {
 
     private var progress: CGFloat {
         CGFloat((value - range.lowerBound) / (range.upperBound - range.lowerBound))
+    }
+
+    private func updateValue(_ rawValue: Double) {
+        let steppedValue = round(rawValue / step) * step
+        let clampedValue = max(range.lowerBound, min(range.upperBound, steppedValue))
+        if clampedValue != value {
+            value = clampedValue
+        }
     }
 }
 
@@ -6727,8 +6773,8 @@ private struct ColorThemePicker: View {
 private struct CaptureIntervalPicker: View {
     @Binding var selectedInterval: Double
 
-    // Discrete interval options: 2s, 5s, 10s, 15s, 30s, 60s
-    private let intervals: [Double] = [2, 5, 10, 15, 30, 60]
+    // Discrete interval options: 2s, 5s, 10s, 15s, 30s, 60s, none
+    private let intervals: [Double] = [2, 5, 10, 15, 30, 60, 0]
 
     var body: some View {
         HStack(spacing: 6) {
@@ -6754,7 +6800,9 @@ private struct CaptureIntervalPicker: View {
     }
 
     private func intervalLabel(_ interval: Double) -> String {
-        if interval >= 60 {
+        if interval <= 0 {
+            return "none"
+        } else if interval >= 60 {
             return "\(Int(interval / 60))m"
         } else {
             return "\(Int(interval))s"
@@ -7316,12 +7364,45 @@ extension SettingsView {
     }
 
     var captureIntervalDisplayText: String {
-        if captureIntervalSeconds >= 60 {
+        Self.captureIntervalDisplayText(for: captureIntervalSeconds)
+    }
+
+    static func captureIntervalDisplayText(for captureIntervalSeconds: Double) -> String {
+        if captureIntervalSeconds <= 0 {
+            return "None"
+        } else if captureIntervalSeconds >= 60 {
             let minutes = Int(captureIntervalSeconds / 60)
             return "Every \(minutes) min"
         } else {
             return "Every \(Int(captureIntervalSeconds))s"
         }
+    }
+
+    static func hasAutomaticCaptureTrigger(
+        captureIntervalSeconds: Double,
+        captureOnWindowChange: Bool,
+        captureOnMouseClick: Bool
+    ) -> Bool {
+        captureIntervalSeconds > 0 || captureOnWindowChange || captureOnMouseClick
+    }
+
+    static func shouldRejectCaptureIntervalSelection(
+        _ captureIntervalSeconds: Double,
+        captureOnWindowChange: Bool,
+        captureOnMouseClick: Bool
+    ) -> Bool {
+        !hasAutomaticCaptureTrigger(
+            captureIntervalSeconds: captureIntervalSeconds,
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick
+        )
+    }
+
+    static func shouldRejectEventDrivenTriggerDisable(
+        captureIntervalSeconds: Double,
+        otherEventDrivenTriggerEnabled: Bool
+    ) -> Bool {
+        captureIntervalSeconds <= 0 && !otherEventDrivenTriggerEnabled
     }
 
     var videoQualityDisplayText: String {
@@ -7368,9 +7449,9 @@ extension SettingsView {
         }
     }
 
-    /// Calculate storage multiplier based on video quality setting
-    /// Reference: 50% quality = 1.0x multiplier
-    private func videoQualityMultiplier() -> Double {
+    /// Calculate storage multiplier based on video quality setting.
+    /// Reference: 50% quality = 1.0x multiplier.
+    private static func videoQualityMultiplier(for videoQuality: Double) -> Double {
         // Interpolation based on quality percentage
         // At 50% (0.5): baseline multiplier = 1.0
         // Multipliers relative to 50%:
@@ -7400,10 +7481,12 @@ extension SettingsView {
         }
     }
 
-    /// Calculate storage multiplier based on capture interval
-    /// Reference: 2 seconds = 1.0x multiplier (baseline)
-    /// Longer intervals = less storage (linear relationship)
-    private func captureIntervalMultiplier() -> Double {
+    /// Calculate storage multiplier based on capture interval.
+    /// Reference: 2 seconds = 1.0x multiplier (baseline).
+    /// Longer intervals = less storage (linear relationship).
+    private static func captureIntervalMultiplier(for captureIntervalSeconds: Double) -> Double {
+        guard captureIntervalSeconds > 0 else { return 0 }
+
         // At 2s interval: 1.0x (baseline)
         // At 5s interval: 0.4x (2/5)
         // At 10s interval: 0.2x (2/10)
@@ -7411,22 +7494,37 @@ extension SettingsView {
         return 2.0 / captureIntervalSeconds
     }
 
-    /// Estimated storage per month based on video quality and capture interval settings
-    /// Reference: 50% quality at 2s interval ≈ 6-14 GB/month
-    var videoQualityEstimateText: String {
-        let qualityMultiplier = videoQualityMultiplier()
-        let intervalMultiplier = captureIntervalMultiplier()
-        let combinedMultiplier = qualityMultiplier * intervalMultiplier
+    /// Approximate monthly storage overhead from event-driven capture triggers.
+    static func eventDrivenCaptureStorageHeuristicGB(
+        captureOnWindowChange: Bool,
+        captureOnMouseClick: Bool
+    ) -> (lowGB: Double, highGB: Double) {
+        var lowGB = 0.0
+        var highGB = 0.0
 
-        let lowGB = 6.0 * combinedMultiplier
-        let highGB = 14.0 * combinedMultiplier
+        if captureOnWindowChange {
+            lowGB += 0.5
+            highGB += 2.0
+        }
+
+        if captureOnMouseClick {
+            lowGB += 0.25
+            highGB += 1.0
+        }
+
+        return (lowGB, highGB)
+    }
+
+    private static func formatStorageEstimate(lowGB: Double, highGB: Double) -> String {
+        let sanitizedLowGB = max(lowGB, 0)
+        let sanitizedHighGB = max(highGB, sanitizedLowGB)
 
         // Format with 1 decimal place
-        let lowStr = String(format: "%.1f", lowGB)
-        let highStr = String(format: "%.1f", highGB)
+        let lowStr = String(format: "%.1f", sanitizedLowGB)
+        let highStr = String(format: "%.1f", sanitizedHighGB)
 
         // Handle case where estimate is very small
-        if highGB < 0.1 {
+        if sanitizedHighGB < 0.1 {
             return "Estimated: <0.1 GB per month"
         } else if lowStr == highStr {
             return "Estimated: ~\(lowStr) GB per month"
@@ -7435,9 +7533,39 @@ extension SettingsView {
         return "Estimated: ~\(lowStr)-\(highStr) GB per month"
     }
 
+    /// Estimated storage per month based on timer capture plus event-driven heuristics.
+    static func captureStorageEstimateText(
+        videoQuality: Double,
+        captureIntervalSeconds: Double,
+        captureOnWindowChange: Bool,
+        captureOnMouseClick: Bool
+    ) -> String {
+        let qualityMultiplier = Self.videoQualityMultiplier(for: videoQuality)
+        let intervalMultiplier = Self.captureIntervalMultiplier(for: captureIntervalSeconds)
+        let combinedMultiplier = qualityMultiplier * intervalMultiplier
+        let eventDrivenHeuristic = Self.eventDrivenCaptureStorageHeuristicGB(
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick
+        )
+
+        let lowGB = (6.0 * combinedMultiplier) + eventDrivenHeuristic.lowGB
+        let highGB = (14.0 * combinedMultiplier) + eventDrivenHeuristic.highGB
+        return Self.formatStorageEstimate(lowGB: lowGB, highGB: highGB)
+    }
+
+    /// Estimated storage per month based on video quality, interval, and event-driven capture settings.
+    var videoQualityEstimateText: String {
+        Self.captureStorageEstimateText(
+            videoQuality: videoQuality,
+            captureIntervalSeconds: captureIntervalSeconds,
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick
+        )
+    }
+
     /// Estimated storage for capture interval section (same calculation)
     var captureIntervalEstimateText: String {
-        videoQualityEstimateText
+        return videoQualityEstimateText
     }
 
     var deduplicationThresholdDisplayText: String {
@@ -8498,39 +8626,24 @@ extension SettingsView {
         showExcludedAppsUpdateFeedback(removed: app.name)
     }
 
+    private func excludedAppBundleIDsForCaptureConfig() -> Set<String> {
+        var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"]
+        for app in excludedApps {
+            excludedBundleIDs.insert(app.bundleID)
+        }
+        return excludedBundleIDs
+    }
+
     /// Update the capture config with current excluded apps
     private func updateExcludedAppsConfig() {
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-            let currentConfig = await coordinator.getCaptureConfig()
+            let excludedBundleIDs = excludedAppBundleIDsForCaptureConfig()
 
-            // Build new excluded bundle IDs set
-            var excludedBundleIDs: Set<String> = ["com.apple.loginwindow"] // Always exclude login screen
-            for app in excludedApps {
-                excludedBundleIDs.insert(app.bundleID)
-            }
-
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: excludedBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Excluded apps updated: \(excludedBundleIDs.count - 1) apps excluded",
+                failureLog: "[SettingsView] Failed to update excluded apps config",
+                transform: { $0.updating(excludedAppBundleIDs: excludedBundleIDs) }
             )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Excluded apps updated: \(excludedBundleIDs.count - 1) apps excluded", category: .ui)
-            } catch {
-                Log.error("[SettingsView] Failed to update excluded apps config: \(error)", category: .ui)
-            }
         }
     }
 
@@ -8542,80 +8655,53 @@ extension SettingsView {
     }
 
     private func updatePrivateWindowRedactionSetting() {
+        let excludePrivateWindowsEnabled = excludePrivateWindows
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
-            )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                DashboardViewModel.recordPrivateWindowRedactionToggle(
-                    coordinator: coordinator,
-                    enabled: excludePrivateWindows,
-                    source: "settings_privacy"
-                )
-                await MainActor.run {
-                    showSettingsToast(excludePrivateWindows ? "Incognito/private redaction enabled" : "Incognito/private redaction disabled")
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Private window redaction updated to: \(excludePrivateWindowsEnabled)",
+                failureLog: "[SettingsView] Failed to update private window redaction setting",
+                transform: { $0.updating(excludePrivateWindows: excludePrivateWindowsEnabled) },
+                onSuccess: { coordinator in
+                    DashboardViewModel.recordPrivateWindowRedactionToggle(
+                        coordinator: coordinator,
+                        enabled: excludePrivateWindowsEnabled,
+                        source: "settings_privacy"
+                    )
+                    await MainActor.run {
+                        showSettingsToast(
+                            excludePrivateWindowsEnabled
+                                ? "Incognito/private redaction enabled"
+                                : "Incognito/private redaction disabled"
+                        )
+                    }
                 }
-                Log.info("[SettingsView] Private window redaction updated to: \(excludePrivateWindows)", category: .ui)
-            } catch {
-                Log.error("[SettingsView] Failed to update private window redaction setting: \(error)", category: .ui)
-            }
+            )
         }
     }
 
     private func updateRedactionRulesConfig() {
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-            let currentConfig = await coordinator.getCaptureConfig()
-
             let windowPatterns = enableCustomPatternWindowRedaction ? parseRedactionPatterns(redactWindowTitlePatternsRaw) : []
             let urlPatterns = enableCustomPatternWindowRedaction ? parseRedactionPatterns(redactBrowserURLPatternsRaw) : []
 
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: windowPatterns,
-                redactBrowserURLPatterns: urlPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Updated redaction rules: windowPatterns=\(windowPatterns.count), urlPatterns=\(urlPatterns.count)",
+                failureLog: "[SettingsView] Failed to update redaction rules",
+                transform: {
+                    $0.updating(
+                        redactWindowTitlePatterns: windowPatterns,
+                        redactBrowserURLPatterns: urlPatterns
+                    )
+                },
+                onSuccess: { coordinator in
+                    showRedactionRulesUpdateFeedback()
+                    DashboardViewModel.recordRedactionRulesUpdated(
+                        coordinator: coordinator,
+                        windowPatternCount: windowPatterns.count,
+                        urlPatternCount: urlPatterns.count
+                    )
+                }
             )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                showRedactionRulesUpdateFeedback()
-                DashboardViewModel.recordRedactionRulesUpdated(
-                    coordinator: coordinator,
-                    windowPatternCount: windowPatterns.count,
-                    urlPatternCount: urlPatterns.count
-                )
-                Log.info(
-                    "[SettingsView] Updated redaction rules: windowPatterns=\(windowPatterns.count), urlPatterns=\(urlPatterns.count)",
-                    category: .ui
-                )
-            } catch {
-                Log.error("[SettingsView] Failed to update redaction rules: \(error)", category: .ui)
-            }
         }
     }
 
@@ -8694,6 +8780,7 @@ extension SettingsView {
     func checkPermissions() async {
         hasScreenRecordingPermission = checkScreenRecordingPermission()
         hasAccessibilityPermission = checkAccessibilityPermission()
+        hasListenEventAccess = checkListenEventAccess()
         browserExtractionPermissionStatus = await checkBrowserExtractionPermissionStatus()
     }
 
@@ -8709,6 +8796,11 @@ extension SettingsView {
             kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false
         ]
         return AXIsProcessTrustedWithOptions(options) as Bool
+    }
+
+    /// Check listen-event access without prompting.
+    func checkListenEventAccess() -> Bool {
+        CGPreflightListenEventAccess()
     }
 
     /// Request screen recording permission (triggers system dialog)
@@ -8750,6 +8842,19 @@ extension SettingsView {
         }
     }
 
+    /// Request listen-event access (Input Monitoring) from the user.
+    @MainActor
+    func requestListenEventAccessIfNeeded() async -> Bool {
+        let alreadyGranted = checkListenEventAccess()
+        hasListenEventAccess = alreadyGranted
+        guard !alreadyGranted else { return true }
+
+        let requested = CGRequestListenEventAccess()
+        let grantedAfterRequest = requested || checkListenEventAccess()
+        hasListenEventAccess = grantedAfterRequest
+        return grantedAfterRequest
+    }
+
     /// Open System Settings to Screen Recording privacy pane
     func openScreenRecordingSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
@@ -8759,6 +8864,12 @@ extension SettingsView {
     /// Open System Settings to Accessibility privacy pane
     func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
+    /// Open System Settings to Input Monitoring privacy pane.
+    func openListenEventSettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!
         NSWorkspace.shared.open(url)
     }
 
@@ -10858,6 +10969,34 @@ extension SettingsView {
         }
     }
 
+    private func recordMouseClickCaptureToggleMetric(enabled: Bool, outcome: String) {
+        Task {
+            let metadata = Self.inPageURLMetricMetadata([
+                "enabled": enabled,
+                "outcome": outcome,
+                "source": "settings_capture_card"
+            ])
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .mouseClickCaptureToggle,
+                metadata: metadata
+            )
+        }
+    }
+
+    private func recordCaptureIntervalUpdatedMetric(seconds: Double) {
+        Task {
+            let metadata = Self.inPageURLMetricMetadata([
+                "seconds": seconds,
+                "mode": seconds <= 0 ? "off" : "interval",
+                "source": "settings_capture_card"
+            ])
+            try? await coordinatorWrapper.coordinator.recordMetricEvent(
+                metricType: .captureIntervalUpdated,
+                metadata: metadata
+            )
+        }
+    }
+
     /// Apply theme preference
     private func applyTheme(_ theme: ThemePreference) {
         switch theme {
@@ -10870,139 +11009,207 @@ extension SettingsView {
         }
     }
 
+    private func applyCaptureConfigMutation(
+        successLog: String,
+        failureLog: String,
+        transform: @escaping @Sendable (CaptureConfig) -> CaptureConfig,
+        onSuccess: ((AppCoordinator) async -> Void)? = nil
+    ) async {
+        let coordinator = coordinatorWrapper.coordinator
+
+        do {
+            try await coordinator.updateCaptureConfig(transform)
+            if let onSuccess {
+                await onSuccess(coordinator)
+            }
+            Log.info(successLog, category: .ui)
+        } catch {
+            Log.error("\(failureLog): \(error)", category: .ui)
+        }
+    }
+
+    private func syncCaptureTriggerFallbackState() {
+        guard captureIntervalSeconds > 0 else { return }
+        lastNonZeroCaptureIntervalSeconds = captureIntervalSeconds
+    }
+
+    private func showCaptureTriggerRequirementToast() {
+        Task { @MainActor in
+            showSettingsToast(
+                "Enable at least one capture trigger to keep recording active.",
+                isError: true,
+                duration: .seconds(3.2)
+            )
+        }
+    }
+
     /// Update deduplication setting in capture config
     private func updateDeduplicationSetting(enabled: Bool) {
+        let threshold = deduplicationThreshold
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-
-            // Get current config from capture manager
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            // Create new config with updated deduplication setting
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: enabled,
-                deduplicationThreshold: deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Deduplication setting updated to: \(enabled)",
+                failureLog: "[SettingsView] Failed to update deduplication setting",
+                transform: {
+                    $0.updating(
+                        adaptiveCaptureEnabled: enabled,
+                        deduplicationThreshold: threshold
+                    )
+                }
             )
+        }
+    }
 
-            // Update the capture manager config
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Deduplication setting updated to: \(enabled)", category: .ui)
-            } catch {
-                Log.error("[SettingsView] Failed to update deduplication setting: \(error)", category: .ui)
-            }
+    private func updateCaptureIntervalSetting(to captureIntervalSeconds: Double) {
+        if isProgrammaticCaptureIntervalChange {
+            isProgrammaticCaptureIntervalChange = false
+            return
+        }
+
+        guard !Self.shouldRejectCaptureIntervalSelection(
+            captureIntervalSeconds,
+            captureOnWindowChange: captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick
+        ) else {
+            isProgrammaticCaptureIntervalChange = true
+            self.captureIntervalSeconds =
+                lastNonZeroCaptureIntervalSeconds > 0
+                ? lastNonZeroCaptureIntervalSeconds
+                : SettingsDefaults.captureIntervalSeconds
+            showCaptureTriggerRequirementToast()
+            return
+        }
+
+        Task {
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Capture interval updated to: \(captureIntervalSeconds)s",
+                failureLog: "[SettingsView] Failed to update capture interval",
+                transform: { $0.updating(captureIntervalSeconds: captureIntervalSeconds) },
+                onSuccess: { _ in
+                    if captureIntervalSeconds > 0 {
+                        await MainActor.run {
+                            lastNonZeroCaptureIntervalSeconds = captureIntervalSeconds
+                        }
+                    }
+                    recordCaptureIntervalUpdatedMetric(seconds: captureIntervalSeconds)
+                    showCaptureUpdateFeedback()
+                }
+            )
+        }
+    }
+
+    private func updateVideoQualitySetting(to videoQuality: Double) {
+        Task {
+            await coordinatorWrapper.coordinator.updateVideoQuality(videoQuality)
+            Log.info("[SettingsView] Video quality updated to: \(videoQuality)", category: .ui)
         }
     }
 
     /// Update deduplication threshold in capture config
     private func updateDeduplicationThreshold() {
+        let threshold = deduplicationThreshold
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-
-            // Get current config from capture manager
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            // Create new config with updated threshold
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Deduplication threshold updated to: \(threshold)",
+                failureLog: "[SettingsView] Failed to update deduplication threshold",
+                transform: { $0.updating(deduplicationThreshold: threshold) },
+                onSuccess: { _ in
+                    showCompressionUpdateFeedback()
+                }
             )
-
-            // Update the capture manager config
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Deduplication threshold updated to: \(deduplicationThreshold)", category: .ui)
-                showCompressionUpdateFeedback()
-            } catch {
-                Log.error("[SettingsView] Failed to update deduplication threshold: \(error)", category: .ui)
-            }
         }
     }
 
     /// Update keep-frames-on-mouse-movement setting in capture config
     private func updateKeepFramesOnMouseMovementSetting() {
+        let keepFramesEnabled = keepFramesOnMouseMovement
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Keep frames on mouse movement updated to: \(keepFramesEnabled)",
+                failureLog: "[SettingsView] Failed to update keep-frames-on-mouse-movement setting",
+                transform: { $0.updating(keepFramesOnMouseMovement: keepFramesEnabled) },
+                onSuccess: { _ in
+                    showCompressionUpdateFeedback()
+                }
             )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Keep frames on mouse movement updated to: \(keepFramesOnMouseMovement)", category: .ui)
-                showCompressionUpdateFeedback()
-            } catch {
-                Log.error("[SettingsView] Failed to update keep-frames-on-mouse-movement setting: \(error)", category: .ui)
-            }
         }
     }
 
     /// Update capture on window change setting in capture config
     private func updateCaptureOnWindowChangeSetting() {
+        if isProgrammaticWindowChangeCaptureToggleChange {
+            isProgrammaticWindowChangeCaptureToggleChange = false
+            return
+        }
+
+        let requestedEnabled = captureOnWindowChange
+        guard requestedEnabled || !Self.shouldRejectEventDrivenTriggerDisable(
+            captureIntervalSeconds: captureIntervalSeconds,
+            otherEventDrivenTriggerEnabled: captureOnMouseClick
+        ) else {
+            isProgrammaticWindowChangeCaptureToggleChange = true
+            captureOnWindowChange = true
+            showCaptureTriggerRequirementToast()
+            return
+        }
+
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-
-            // Get current config from capture manager
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            // Create new config with updated setting
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Capture on window change updated to: \(requestedEnabled)",
+                failureLog: "[SettingsView] Failed to update capture on window change",
+                transform: { $0.updating(captureOnWindowChange: requestedEnabled) },
+                onSuccess: { _ in
+                    showCaptureUpdateFeedback()
+                }
             )
+        }
+    }
 
-            // Update the capture manager config
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Capture on window change updated to: \(captureOnWindowChange)", category: .ui)
-                showCaptureUpdateFeedback()
-            } catch {
-                Log.error("[SettingsView] Failed to update capture on window change: \(error)", category: .ui)
+    /// Update capture on mouse click setting in capture config
+    private func updateCaptureOnMouseClickSetting() {
+        if isProgrammaticMouseClickCaptureToggleChange {
+            isProgrammaticMouseClickCaptureToggleChange = false
+            return
+        }
+
+        let requestedEnabled = captureOnMouseClick
+        guard requestedEnabled || !Self.shouldRejectEventDrivenTriggerDisable(
+            captureIntervalSeconds: captureIntervalSeconds,
+            otherEventDrivenTriggerEnabled: captureOnWindowChange
+        ) else {
+            isProgrammaticMouseClickCaptureToggleChange = true
+            captureOnMouseClick = true
+            showCaptureTriggerRequirementToast()
+            return
+        }
+
+        Task {
+            if requestedEnabled {
+                let granted = await requestListenEventAccessIfNeeded()
+                guard granted else {
+                    await MainActor.run {
+                        isProgrammaticMouseClickCaptureToggleChange = true
+                        captureOnMouseClick = false
+                        recordMouseClickCaptureToggleMetric(enabled: requestedEnabled, outcome: "permission_denied")
+                        showSettingsToast(
+                            "Mouse click capture needs Input Monitoring permission. Allow Retrace in System Settings, then turn it on again.",
+                            isError: true,
+                            duration: .seconds(3.6)
+                        )
+                    }
+                    return
+                }
             }
+
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Capture on mouse click updated to: \(requestedEnabled)",
+                failureLog: "[SettingsView] Failed to update capture on mouse click",
+                transform: { $0.updating(captureOnMouseClick: requestedEnabled) },
+                onSuccess: { _ in
+                    recordMouseClickCaptureToggleMetric(enabled: requestedEnabled, outcome: "applied")
+                    showCaptureUpdateFeedback()
+                }
+            )
         }
     }
 
@@ -11073,10 +11280,12 @@ extension SettingsView {
         pauseReminderDelayMinutes = SettingsDefaults.pauseReminderDelayMinutes
         captureIntervalSeconds = SettingsDefaults.captureIntervalSeconds
         videoQuality = SettingsDefaults.videoQuality
+        updateVideoQualitySetting(to: SettingsDefaults.videoQuality)
         deduplicationThreshold = SettingsDefaults.deduplicationThreshold
         deleteDuplicateFrames = SettingsDefaults.deleteDuplicateFrames
         keepFramesOnMouseMovement = SettingsDefaults.keepFramesOnMouseMovement
         captureOnWindowChange = SettingsDefaults.captureOnWindowChange
+        captureOnMouseClick = SettingsDefaults.captureOnMouseClick
         captureMousePosition = SettingsDefaults.captureMousePosition
         collectInPageURLsExperimental = SettingsDefaults.collectInPageURLsExperimental
         inPageURLVerificationByBundleID = [:]
@@ -11085,30 +11294,20 @@ extension SettingsView {
 
         // Apply capture config changes immediately
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: SettingsDefaults.captureIntervalSeconds,
-                adaptiveCaptureEnabled: true,
-                deduplicationThreshold: SettingsDefaults.deduplicationThreshold,
-                keepFramesOnMouseMovement: SettingsDefaults.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: currentConfig.excludedAppBundleIDs,
-                excludePrivateWindows: currentConfig.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: currentConfig.redactWindowTitlePatterns,
-                redactBrowserURLPatterns: currentConfig.redactBrowserURLPatterns,
-                captureOnWindowChange: SettingsDefaults.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Capture settings reset to defaults",
+                failureLog: "[SettingsView] Failed to reset capture settings",
+                transform: {
+                    $0.updating(
+                        captureIntervalSeconds: SettingsDefaults.captureIntervalSeconds,
+                        adaptiveCaptureEnabled: SettingsDefaults.deleteDuplicateFrames,
+                        deduplicationThreshold: SettingsDefaults.deduplicationThreshold,
+                        keepFramesOnMouseMovement: SettingsDefaults.keepFramesOnMouseMovement,
+                        captureOnWindowChange: SettingsDefaults.captureOnWindowChange,
+                        captureOnMouseClick: SettingsDefaults.captureOnMouseClick
+                    )
+                }
             )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Capture settings reset to defaults", category: .ui)
-            } catch {
-                Log.error("[SettingsView] Failed to reset capture settings: \(error)", category: .ui)
-            }
         }
 
         showCaptureUpdateFeedback()
@@ -11137,31 +11336,20 @@ extension SettingsView {
         excludeChromeIncognito = SettingsDefaults.excludeChromeIncognito
 
         // Apply to capture config immediately
+        let excludedBundleIDs = excludedAppBundleIDsForCaptureConfig()
         Task {
-            let coordinator = coordinatorWrapper.coordinator
-            let currentConfig = await coordinator.getCaptureConfig()
-
-            let newConfig = CaptureConfig(
-                captureIntervalSeconds: currentConfig.captureIntervalSeconds,
-                adaptiveCaptureEnabled: currentConfig.adaptiveCaptureEnabled,
-                deduplicationThreshold: currentConfig.deduplicationThreshold,
-                keepFramesOnMouseMovement: currentConfig.keepFramesOnMouseMovement,
-                maxResolution: currentConfig.maxResolution,
-                excludedAppBundleIDs: [],
-                excludePrivateWindows: SettingsDefaults.excludePrivateWindows,
-                customPrivateWindowPatterns: currentConfig.customPrivateWindowPatterns,
-                showCursor: currentConfig.showCursor,
-                redactWindowTitlePatterns: [],
-                redactBrowserURLPatterns: [],
-                captureOnWindowChange: currentConfig.captureOnWindowChange
+            await applyCaptureConfigMutation(
+                successLog: "[SettingsView] Privacy settings reset to defaults",
+                failureLog: "[SettingsView] Failed to reset privacy settings",
+                transform: {
+                    $0.updating(
+                        excludedAppBundleIDs: excludedBundleIDs,
+                        excludePrivateWindows: SettingsDefaults.excludePrivateWindows,
+                        redactWindowTitlePatterns: [],
+                        redactBrowserURLPatterns: []
+                    )
+                }
             )
-
-            do {
-                try await coordinator.updateCaptureConfig(newConfig)
-                Log.info("[SettingsView] Privacy settings reset to defaults", category: .ui)
-            } catch {
-                Log.error("[SettingsView] Failed to reset privacy settings: \(error)", category: .ui)
-            }
         }
     }
 

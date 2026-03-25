@@ -17,12 +17,19 @@ public actor PermissionMonitor {
     private var monitorTask: Task<Void, Never>?
     private var lastAccessibilityStatus = false
     private var lastScreenRecordingStatus = false
+    private var lastListenEventAccessStatus = false
 
     /// Callback when accessibility permission is revoked while app is running
     nonisolated(unsafe) public var onAccessibilityRevoked: (@Sendable () async -> Void)?
 
     /// Callback when screen recording permission is revoked while app is running
     nonisolated(unsafe) public var onScreenRecordingRevoked: (@Sendable () async -> Void)?
+
+    /// Callback when listen-event access is granted while app is running
+    nonisolated(unsafe) public var onListenEventAccessGranted: (@Sendable () async -> Void)?
+
+    /// Callback when listen-event access is revoked while app is running
+    nonisolated(unsafe) public var onListenEventAccessRevoked: (@Sendable () async -> Void)?
 
     /// Callback when any permission is revoked (for UI alerts)
     nonisolated(unsafe) public var onPermissionRevoked: (@Sendable (_ permission: String) async -> Void)?
@@ -213,14 +220,19 @@ public actor PermissionMonitor {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
         let axStatus = AXIsProcessTrustedWithOptions(options as CFDictionary)
         let screenStatus = CGPreflightScreenCaptureAccess()
+        let listenEventStatus = CGPreflightListenEventAccess()
 
         lastAccessibilityStatus = axStatus
         lastScreenRecordingStatus = screenStatus
+        lastListenEventAccessStatus = listenEventStatus
         _cachedAccessibilityStatus = axStatus
         _cachedScreenRecordingStatus = screenStatus
         _hasCachedStatus = true
 
-        Log.info("[PermissionMonitor] Starting permission monitoring (AX: \(lastAccessibilityStatus), Screen: \(lastScreenRecordingStatus))", category: .capture)
+        Log.info(
+            "[PermissionMonitor] Starting permission monitoring (AX: \(lastAccessibilityStatus), Screen: \(lastScreenRecordingStatus), Listen: \(lastListenEventAccessStatus))",
+            category: .capture
+        )
 
         monitorTask = Task { [weak self] in
             // Check every 2 seconds
@@ -249,6 +261,7 @@ public actor PermissionMonitor {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
         let currentAX = AXIsProcessTrustedWithOptions(options as CFDictionary)
         let currentScreen = CGPreflightScreenCaptureAccess()
+        let currentListenEventAccess = CGPreflightListenEventAccess()
 
         // Update cached values
         _cachedAccessibilityStatus = currentAX
@@ -285,6 +298,25 @@ public actor PermissionMonitor {
         } else if !lastScreenRecordingStatus && currentScreen {
             Log.info("[PermissionMonitor] Screen recording permission was GRANTED", category: .capture)
             lastScreenRecordingStatus = currentScreen
+        }
+
+        if lastListenEventAccessStatus && !currentListenEventAccess {
+            Log.warning("[PermissionMonitor] Listen-event access was REVOKED", category: .capture)
+            lastListenEventAccessStatus = currentListenEventAccess
+
+            if let callback = onListenEventAccessRevoked {
+                await callback()
+            }
+            if let callback = onPermissionRevoked {
+                await callback("Listen Event Access")
+            }
+        } else if !lastListenEventAccessStatus && currentListenEventAccess {
+            Log.info("[PermissionMonitor] Listen-event access was GRANTED", category: .capture)
+            lastListenEventAccessStatus = currentListenEventAccess
+
+            if let callback = onListenEventAccessGranted {
+                await callback()
+            }
         }
     }
 

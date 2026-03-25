@@ -279,6 +279,7 @@ public actor AppCoordinator {
 
     // Signal to flush pending frames to the OCR queue
     private var shouldFlushPendingFrames = false
+    private var pendingVideoWriterRotationReason: String?
 
     // Permission monitoring - stops recording gracefully if permissions are revoked
     private var permissionMonitorSetup = false
@@ -333,6 +334,47 @@ public actor AppCoordinator {
     /// Update capture configuration
     public func updateCaptureConfig(_ config: CaptureConfig) async throws {
         try await services.capture.updateConfig(config)
+    }
+
+    public func updateCaptureConfig(
+        _ transform: @Sendable (CaptureConfig) -> CaptureConfig
+    ) async throws {
+        try await services.capture.updateConfig(transform)
+    }
+
+    public func updateVideoQuality(
+        _ quality: Double,
+        source: String = "settings_capture_card"
+    ) async {
+        let clampedQuality = min(max(quality, 0.0), 1.0)
+        let currentConfig = await services.storage.getVideoEncoderConfig()
+        let currentQuality = Double(currentConfig.quality)
+        guard abs(currentQuality - clampedQuality) > 0.0001 else { return }
+
+        let newConfig = VideoEncoderConfig(
+            codec: currentConfig.codec,
+            targetBitrate: currentConfig.targetBitrate,
+            keyframeInterval: currentConfig.keyframeInterval,
+            useHardwareEncoder: currentConfig.useHardwareEncoder,
+            quality: Float(clampedQuality)
+        )
+
+        await services.storage.updateVideoEncoderConfig(newConfig)
+        await recordVideoQualityMetricIfNeeded(
+            quality: clampedQuality,
+            source: source,
+            isRunning: isRunning
+        )
+
+        if isRunning {
+            pendingVideoWriterRotationReason = "video_quality_update"
+            Log.info(
+                "[AppCoordinator] Video quality updated to \(clampedQuality); active video writers will rotate on the next frame",
+                category: .app
+            )
+        } else {
+            Log.info("[AppCoordinator] Video quality updated to \(clampedQuality)", category: .app)
+        }
     }
 
     private static func privateRedactionTracePreview(_ value: String?, limit: Int = 180) -> String {
@@ -675,6 +717,13 @@ public actor AppCoordinator {
             guard let self = self else { return }
             await self.handleCaptureStopped()
         }
+        services.capture.onMouseClickCaptureOutcome = { [weak self] outcome, timestamp in
+            guard let self else { return }
+            await self.recordMouseClickCaptureMetricIfNeeded(
+                outcome: outcome,
+                timestamp: timestamp
+            )
+        }
 
         // Start screen capture
         try await services.capture.startCapture(config: await services.capture.getConfig())
@@ -989,6 +1038,18 @@ public actor AppCoordinator {
             }
         }
 
+        PermissionMonitor.shared.onListenEventAccessGranted = { [weak self] in
+            guard let self else { return }
+            Log.info("[AppCoordinator] Listen-event access granted - retrying mouse click capture monitoring", category: .app)
+            await self.services.capture.retryMouseClickMonitoringIfNeeded()
+        }
+
+        PermissionMonitor.shared.onListenEventAccessRevoked = { [weak self] in
+            guard let self else { return }
+            Log.warning("[AppCoordinator] Listen-event access revoked - suspending mouse click capture monitoring", category: .app)
+            await self.services.capture.suspendMouseClickMonitoringForPermissionLoss()
+        }
+
         // Start the periodic permission check
         await PermissionMonitor.shared.startMonitoring()
         Log.info("[AppCoordinator] Permission monitoring started", category: .app)
@@ -1207,6 +1268,8 @@ public actor AppCoordinator {
                 Log.info("Pipeline task cancelled", category: .app)
                 break
             }
+
+            await rotateActiveVideoWritersIfNeeded(&writersByResolution)
 
             // Skip frames entirely when loginwindow is frontmost (lock screen, login, etc.)
             if frame.metadata.appBundleID == "com.apple.loginwindow" {
@@ -1481,6 +1544,36 @@ public actor AppCoordinator {
         }
 
         Log.info("Pipeline processing completed. Total frames: \(totalFramesProcessed), Errors: \(totalErrors)", category: .app)
+    }
+
+    private func rotateActiveVideoWritersIfNeeded(
+        _ writersByResolution: inout [String: VideoWriterState]
+    ) async {
+        guard let reason = pendingVideoWriterRotationReason else { return }
+        pendingVideoWriterRotationReason = nil
+
+        guard !writersByResolution.isEmpty else {
+            Log.info("[Pipeline] No active video writers to rotate for \(reason)", category: .app)
+            return
+        }
+
+        let processingQueue = await services.processingQueue
+
+        for (resolutionKey, var writerState) in writersByResolution {
+            do {
+                try await finalizeWriter(&writerState, processingQueue: processingQueue)
+                Log.info("[Pipeline] Rotated video writer for \(resolutionKey) due to \(reason)", category: .app)
+            } catch {
+                Log.error(
+                    "[Pipeline] Failed to rotate video writer for \(resolutionKey) due to \(reason)",
+                    category: .app,
+                    error: error
+                )
+                await cancelBrokenWriterPreservingRecoveryData(writerState.writer)
+            }
+        }
+
+        writersByResolution.removeAll()
     }
 
     private func logPipelineMemorySnapshot(writersByResolution: [String: VideoWriterState], reason: String) {
@@ -3366,6 +3459,49 @@ public actor AppCoordinator {
             timestamp: timestamp,
             metadata: metadata
         )
+    }
+
+    private func recordMouseClickCaptureMetricIfNeeded(
+        outcome: MouseClickCaptureOutcome,
+        timestamp: Date
+    ) async {
+        let metadata = Self.captureTriggerMetricMetadata([
+            "trigger": "mouse_click",
+            "outcome": outcome.rawValue,
+            "button": "left"
+        ])
+
+        try? await recordMetricEvent(
+            metricType: .mouseClickCapture,
+            timestamp: timestamp,
+            metadata: metadata
+        )
+    }
+
+    private func recordVideoQualityMetricIfNeeded(
+        quality: Double,
+        source: String,
+        isRunning: Bool
+    ) async {
+        let metadata = Self.captureTriggerMetricMetadata([
+            "quality": quality,
+            "source": source,
+            "isRunning": isRunning
+        ])
+
+        try? await recordMetricEvent(
+            metricType: .videoQualityUpdated,
+            metadata: metadata
+        )
+    }
+
+    private static func captureTriggerMetricMetadata(_ payload: [String: Any]) -> String? {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
     }
 
     /// Get daily counts for a metric type (for 7-day graphs)

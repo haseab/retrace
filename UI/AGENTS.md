@@ -88,6 +88,7 @@ UI/
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
+    ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
     └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
 ```

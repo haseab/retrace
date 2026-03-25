@@ -3314,6 +3314,7 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
 
         viewModel.frames = [timelineFrame]
         viewModel.currentIndex = 0
+        viewModel.test_setBoundaryPaginationState(hasMoreOlder: false, hasMoreNewer: false)
 
         var ocrStatusLoads = 0
         var ocrNodeLoads = 0
@@ -3924,6 +3925,64 @@ final class TimelineHeadlessPrerenderStateTests: XCTestCase {
         XCTAssertTrue(viewModel.isPendingVideoPresentationReady)
         XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .none)
         XCTAssertNil(viewModel.waitingFallbackImage)
+    }
+
+    func testAdjacentVideoSeekDropsStaleOlderFallbackBeforeNextSeek() async throws {
+        let viewModel = SimpleTimelineViewModel(coordinator: AppCoordinator())
+        viewModel.setPresentationWorkEnabled(true, reason: "unit-test")
+
+        let olderFrameID = FrameID(value: 50_901_532)
+        let intermediateFrameID = FrameID(value: 50_901_534)
+        let targetFrameID = FrameID(value: 50_901_535)
+        viewModel.frames = [
+            makeVideoTimelineFrame(
+                frameID: olderFrameID,
+                timestamp: Date(timeIntervalSince1970: 1_700_100_300),
+                frameIndex: 32,
+                processingStatus: 2
+            ),
+            makeVideoTimelineFrame(
+                frameID: intermediateFrameID,
+                timestamp: Date(timeIntervalSince1970: 1_700_100_301),
+                frameIndex: 34,
+                processingStatus: 2
+            ),
+            makeVideoTimelineFrame(
+                frameID: targetFrameID,
+                timestamp: Date(timeIntervalSince1970: 1_700_100_302),
+                frameIndex: 35,
+                processingStatus: 2
+            ),
+        ]
+        viewModel.currentIndex = 0
+
+        let fallbackImage = makeSolidImage(size: NSSize(width: 35, height: 35), color: .systemOrange)
+        let fallbackData = try makeJPEGData(fallbackImage)
+        let cacheFileURL = timelineDiskBufferFileURL(frameID: olderFrameID)
+        try FileManager.default.createDirectory(
+            at: cacheFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fallbackData.write(to: cacheFileURL, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: cacheFileURL) }
+
+        let didPreload = await viewModel.prepareHistoricalOpenStillFallbackIfNeeded()
+        XCTAssertTrue(didPreload)
+        XCTAssertEqual(viewModel.waitingFallbackImageFrameID, olderFrameID)
+
+        viewModel.currentIndex = 1
+
+        XCTAssertEqual(viewModel.pendingVideoPresentationFrameID, intermediateFrameID)
+        XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .waitingFallback)
+        XCTAssertEqual(viewModel.waitingFallbackImageFrameID, olderFrameID)
+
+        viewModel.currentIndex = 2
+
+        XCTAssertEqual(viewModel.pendingVideoPresentationFrameID, targetFrameID)
+        XCTAssertEqual(viewModel.currentFrameMediaDisplayMode, .decodedVideo)
+        XCTAssertEqual(viewModel.currentFrameStillDisplayMode, .none)
+        XCTAssertNil(viewModel.waitingFallbackImage)
+        XCTAssertNil(viewModel.waitingFallbackImageFrameID)
     }
 
     func testCompactPresentationStateClearsPresentationPayloadsButPreservesTimelineState() {

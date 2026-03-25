@@ -157,6 +157,10 @@ public struct CaptureConfig: Codable, Sendable {
     /// Default is true.
     public let captureOnWindowChange: Bool
 
+    /// Whether to capture shortly after a left mouse click.
+    /// Default is false until the user enables it and grants Input Monitoring permission.
+    public let captureOnMouseClick: Bool
+
     public init(
         captureIntervalSeconds: Double = 2.0,
         adaptiveCaptureEnabled: Bool = true,
@@ -170,7 +174,8 @@ public struct CaptureConfig: Codable, Sendable {
         redactWindowTitlePatterns: [String] = [],
         redactBrowserURLPatterns: [String] = [],
         idleThresholdSeconds: Double = 120.0,
-        captureOnWindowChange: Bool = true
+        captureOnWindowChange: Bool = true,
+        captureOnMouseClick: Bool = false
     ) {
         self.captureIntervalSeconds = captureIntervalSeconds
         self.adaptiveCaptureEnabled = adaptiveCaptureEnabled
@@ -185,6 +190,41 @@ public struct CaptureConfig: Codable, Sendable {
         self.redactBrowserURLPatterns = redactBrowserURLPatterns
         self.idleThresholdSeconds = idleThresholdSeconds
         self.captureOnWindowChange = captureOnWindowChange
+        self.captureOnMouseClick = captureOnMouseClick
+    }
+
+    public func updating(
+        captureIntervalSeconds: Double? = nil,
+        adaptiveCaptureEnabled: Bool? = nil,
+        deduplicationThreshold: Double? = nil,
+        keepFramesOnMouseMovement: Bool? = nil,
+        maxResolution: Resolution? = nil,
+        excludedAppBundleIDs: Set<String>? = nil,
+        excludePrivateWindows: Bool? = nil,
+        customPrivateWindowPatterns: [String]? = nil,
+        showCursor: Bool? = nil,
+        redactWindowTitlePatterns: [String]? = nil,
+        redactBrowserURLPatterns: [String]? = nil,
+        idleThresholdSeconds: Double? = nil,
+        captureOnWindowChange: Bool? = nil,
+        captureOnMouseClick: Bool? = nil
+    ) -> Self {
+        Self(
+            captureIntervalSeconds: captureIntervalSeconds ?? self.captureIntervalSeconds,
+            adaptiveCaptureEnabled: adaptiveCaptureEnabled ?? self.adaptiveCaptureEnabled,
+            deduplicationThreshold: deduplicationThreshold ?? self.deduplicationThreshold,
+            keepFramesOnMouseMovement: keepFramesOnMouseMovement ?? self.keepFramesOnMouseMovement,
+            maxResolution: maxResolution ?? self.maxResolution,
+            excludedAppBundleIDs: excludedAppBundleIDs ?? self.excludedAppBundleIDs,
+            excludePrivateWindows: excludePrivateWindows ?? self.excludePrivateWindows,
+            customPrivateWindowPatterns: customPrivateWindowPatterns ?? self.customPrivateWindowPatterns,
+            showCursor: showCursor ?? self.showCursor,
+            redactWindowTitlePatterns: redactWindowTitlePatterns ?? self.redactWindowTitlePatterns,
+            redactBrowserURLPatterns: redactBrowserURLPatterns ?? self.redactBrowserURLPatterns,
+            idleThresholdSeconds: idleThresholdSeconds ?? self.idleThresholdSeconds,
+            captureOnWindowChange: captureOnWindowChange ?? self.captureOnWindowChange,
+            captureOnMouseClick: captureOnMouseClick ?? self.captureOnMouseClick
+        )
     }
 
     /// Default deduplication threshold (99.85% similarity)

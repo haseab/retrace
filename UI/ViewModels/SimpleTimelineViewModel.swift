@@ -560,9 +560,19 @@ public class SimpleTimelineViewModel: ObservableObject {
                     }
                 }
 
+                let previousTimelineFrame: TimelineFrame?
+                if oldValue >= 0 && oldValue < frames.count {
+                    previousTimelineFrame = frames[oldValue]
+                } else {
+                    previousTimelineFrame = nil
+                }
+
                 // CRITICAL: Clear previous frame state IMMEDIATELY to prevent old frame from showing.
                 // Preserve the last visible frame only as a temporary overlay while video catches up.
-                prepareCurrentFramePresentationState(for: currentTimelineFrame)
+                prepareCurrentFramePresentationState(
+                    for: currentTimelineFrame,
+                    previousTimelineFrame: previousTimelineFrame
+                )
 
                 // Pre-check if frame will have loading issues (synchronous check)
                 // This prevents showing a fallback frame before the async error is detected
@@ -587,6 +597,7 @@ public class SimpleTimelineViewModel: ObservableObject {
     @Published public var currentImage: NSImage?
     @Published private(set) var currentImageFrameID: FrameID?
     @Published private(set) var waitingFallbackImage: NSImage?
+    @Published private(set) var waitingFallbackImageFrameID: FrameID?
     @Published private(set) var pendingVideoPresentationFrameID: FrameID?
     @Published private(set) var isPendingVideoPresentationReady = false
 
@@ -6642,6 +6653,15 @@ public class SimpleTimelineViewModel: ObservableObject {
 
     private func clearWaitingFallbackImage() {
         waitingFallbackImage = nil
+        waitingFallbackImageFrameID = nil
+    }
+
+    private func setWaitingFallbackImage(
+        _ image: NSImage,
+        frameID: FrameID
+    ) {
+        waitingFallbackImage = image
+        waitingFallbackImageFrameID = frameID
     }
 
     private func clearPendingVideoPresentationState() {
@@ -6649,13 +6669,29 @@ public class SimpleTimelineViewModel: ObservableObject {
         isPendingVideoPresentationReady = false
     }
 
-    private func preserveWaitingFallbackImage(for timelineFrame: TimelineFrame?) {
-        guard let timelineFrame, timelineFrame.videoInfo != nil else {
+    private func preserveWaitingFallbackImage(
+        from previousTimelineFrame: TimelineFrame?,
+        for nextTimelineFrame: TimelineFrame?
+    ) {
+        guard let nextTimelineFrame, nextTimelineFrame.videoInfo != nil else {
             clearWaitingFallbackImage()
             return
         }
 
-        waitingFallbackImage = currentImage ?? waitingFallbackImage
+        guard let previousFrameID = previousTimelineFrame?.frame.id else {
+            clearWaitingFallbackImage()
+            return
+        }
+
+        if let currentImage, currentImageFrameID == previousFrameID {
+            setWaitingFallbackImage(currentImage, frameID: previousFrameID)
+            return
+        }
+
+        guard waitingFallbackImageFrameID == previousFrameID else {
+            clearWaitingFallbackImage()
+            return
+        }
     }
 
     private func configurePendingVideoPresentationState(for timelineFrame: TimelineFrame?) {
@@ -6669,8 +6705,11 @@ public class SimpleTimelineViewModel: ObservableObject {
         isPendingVideoPresentationReady = false
     }
 
-    private func prepareCurrentFramePresentationState(for timelineFrame: TimelineFrame?) {
-        preserveWaitingFallbackImage(for: timelineFrame)
+    private func prepareCurrentFramePresentationState(
+        for timelineFrame: TimelineFrame?,
+        previousTimelineFrame: TimelineFrame?
+    ) {
+        preserveWaitingFallbackImage(from: previousTimelineFrame, for: timelineFrame)
         clearCurrentImagePresentation()
         configurePendingVideoPresentationState(for: timelineFrame)
     }
@@ -7621,8 +7660,12 @@ public class SimpleTimelineViewModel: ObservableObject {
             isPendingVideoPresentationReady = false
         }
 
-        if waitingFallbackImage != nil {
+        if waitingFallbackImage != nil, waitingFallbackImageFrameID == frameID {
             return true
+        }
+
+        if waitingFallbackImage != nil {
+            clearWaitingFallbackImage()
         }
 
         guard let bufferedData = await readFrameDataFromDiskFrameBuffer(frameID: frameID) else {
@@ -7646,7 +7689,7 @@ public class SimpleTimelineViewModel: ObservableObject {
                 return false
             }
 
-            waitingFallbackImage = image
+            setWaitingFallbackImage(image, frameID: frameID)
             frameNotReady = false
             frameLoadError = false
             return true
@@ -8971,7 +9014,10 @@ public class SimpleTimelineViewModel: ObservableObject {
                         return
                     }
 
-                    self.waitingFallbackImage = fallback.image
+                    self.setWaitingFallbackImage(
+                        fallback.image,
+                        frameID: fallback.sourceFrameID
+                    )
                     if Self.isTimelineStillLoggingEnabled {
                         let direction = fallback.sourceIndex < lookupIndex ? "older" : "newer"
                         Log.info(

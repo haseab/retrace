@@ -1621,3 +1621,53 @@ final class OCRReprocessSafetyTests: XCTestCase {
         }
     }
 }
+
+final class VideoQualityMetricsTests: XCTestCase {
+    private func makeServices(storageRoot: URL) -> ServiceContainer {
+        let crashReportDirectory = storageRoot.appendingPathComponent("crash_reports", isDirectory: true).path
+        return ServiceContainer(
+            databasePath: storageRoot.appendingPathComponent("retrace.db").path,
+            storageConfig: StorageConfig(
+                storageRootPath: storageRoot.path,
+                retentionDays: nil,
+                maxStorageGB: nil,
+                segmentDurationSeconds: 300
+            ),
+            storageCrashReportDirectory: crashReportDirectory
+        )
+    }
+
+    func testUpdateVideoQualityRecordsDailyMetric() async throws {
+        let storageRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VideoQualityMetricsTests_\(UUID().uuidString)", isDirectory: true)
+        let services = makeServices(storageRoot: storageRoot)
+        let coordinator = AppCoordinator(services: services)
+        let startDate = Date().addingTimeInterval(-60)
+        let endDate = Date().addingTimeInterval(60)
+
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: storageRoot) }
+
+        do {
+            try await services.initialize()
+
+            await coordinator.updateVideoQuality(0.85)
+
+            let metricRows = try await coordinator.getDailyMetrics(
+                metricType: .videoQualityUpdated,
+                from: startDate,
+                to: endDate
+            )
+            let totalCount = metricRows.reduce(into: Int64(0)) { partialResult, row in
+                partialResult += row.value
+            }
+
+            XCTAssertEqual(totalCount, 1)
+
+            try await services.shutdown()
+        } catch {
+            try? await services.shutdown()
+            throw error
+        }
+    }
+}

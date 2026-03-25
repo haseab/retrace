@@ -371,11 +371,11 @@ public actor StorageManager: StorageProtocol {
     private var config: StorageConfig?
     private var storageRootURL: URL
     private let directoryManager: DirectoryManager
-    private let encoderConfig: VideoEncoderConfig
+    private var encoderConfig: VideoEncoderConfig
     private let walRootURL: URL
     private let walManager: WALManager
     private let crashReportDirectory: String
-    private let segmentRewriteExecutor: SegmentRewriteExecutor
+    private var segmentRewriteExecutor: SegmentRewriteExecutor
     private var walAvailabilityIssue: WALAvailabilityIssue?
 
     /// Counter to ensure unique segment IDs even if created within same millisecond
@@ -452,6 +452,15 @@ public actor StorageManager: StorageProtocol {
                 olderThan: Date().addingTimeInterval(-Self.discardableQuarantinedWALRetentionInterval)
             )
         }
+    }
+
+    public func getVideoEncoderConfig() -> VideoEncoderConfig {
+        encoderConfig
+    }
+
+    public func updateVideoEncoderConfig(_ config: VideoEncoderConfig) {
+        encoderConfig = config
+        segmentRewriteExecutor = SegmentRewriteExecutor(encoderConfig: config)
     }
 
     public func createSegmentWriter() async throws -> SegmentWriter {

@@ -13,6 +13,7 @@ public enum CaptureError: RetraceError {
     case permissionDenied
     case accessibilityPermissionDenied
     case noDisplaysAvailable
+    case invalidConfiguration(reason: String)
     case captureSessionFailed(underlying: String)
     case encodingFailed(underlying: String)
     case invalidFrame
@@ -21,6 +22,7 @@ public enum CaptureError: RetraceError {
         switch self {
         case .permissionDenied: return "CAPTURE_001"
         case .noDisplaysAvailable: return "CAPTURE_002"
+        case .invalidConfiguration: return "CAPTURE_007"
         case .captureSessionFailed: return "CAPTURE_003"
         case .encodingFailed: return "CAPTURE_004"
         case .invalidFrame: return "CAPTURE_005"
@@ -34,6 +36,8 @@ public enum CaptureError: RetraceError {
             return "Screen recording permission denied. Please enable in System Settings > Privacy & Security > Screen Recording."
         case .accessibilityPermissionDenied:
             return "Accessibility permission denied. Retrace needs accessibility access to detect which display you're working on. Please enable in System Settings > Privacy & Security > Accessibility."
+        case .invalidConfiguration(let reason):
+            return "Invalid capture configuration: \(reason)"
         case .noDisplaysAvailable:
             return "No displays available for capture."
         case .captureSessionFailed(let underlying):

@@ -7,14 +7,13 @@ import Shared
 /// Service that uses legacy CGWindowList API for screen capture
 /// Unlike ScreenCaptureKit, this approach:
 /// - Does NOT show the purple privacy indicator
-/// - Uses polling instead of streaming
+/// - Uses polling driven by CaptureManager
 /// - Works on older macOS versions
 /// - Filters excluded apps and private windows on EVERY capture
 public actor CGWindowListCapture {
 
     // MARK: - Properties
 
-    nonisolated(unsafe) private var timer: Timer?
     nonisolated(unsafe) private var currentDisplayID: CGWindowID?
     private var isActive = false
     private var currentConfig: CaptureConfig?
@@ -24,9 +23,6 @@ public actor CGWindowListCapture {
     /// Track if array-based capture has been tested and found broken
     /// Once we know it's broken, skip directly to fallback masking
     private var arrayCaptureBroken = false
-
-    /// Callback when frame is captured
-    nonisolated(unsafe) var onFrameCaptured: (@Sendable (CapturedFrame) -> Void)?
 
     private struct RedactionWindowContext: Sendable {
         let reason: String
@@ -81,11 +77,9 @@ public actor CGWindowListCapture {
     /// Start capturing frames with the given configuration
     /// - Parameters:
     ///   - config: Capture configuration
-    ///   - frameContinuation: Continuation to yield captured frames
     ///   - displayID: The display to capture (defaults to main display if nil)
     func startCapture(
         config: CaptureConfig,
-        frameContinuation: AsyncStream<CapturedFrame>.Continuation,
         displayID: CGDirectDisplayID? = nil
     ) async throws {
         guard !isActive else { return }
@@ -95,18 +89,8 @@ public actor CGWindowListCapture {
         self.lastCaptureBlockReason = nil
         self.screenLockStateMonitor.start()
 
-        // Set up frame callback
-        self.onFrameCaptured = { frame in
-            frameContinuation.yield(frame)
-        }
-
         // Use provided display ID or fall back to main display
-        let targetDisplayID = displayID ?? CGMainDisplayID()
-
-        // Start timer-based polling on main thread
-        await MainActor.run {
-            self.startPolling(displayID: targetDisplayID, interval: config.captureIntervalSeconds)
-        }
+        self.currentDisplayID = displayID ?? CGMainDisplayID()
     }
 
     /// Stop capturing frames
@@ -114,14 +98,6 @@ public actor CGWindowListCapture {
         guard isActive else { return }
 
         isActive = false
-
-        // Stop timer on main thread
-        await MainActor.run {
-            timer?.invalidate()
-            timer = nil
-        }
-
-        onFrameCaptured = nil
         lastCaptureBlockReason = nil
         screenLockStateMonitor.stop()
     }
@@ -144,51 +120,14 @@ public actor CGWindowListCapture {
 
     // MARK: - Private Helpers
 
-    /// Start polling for frames
-    @MainActor
-    private func startPolling(displayID: CGWindowID, interval: TimeInterval) {
-        // Store display ID for immediate captures
-        self.currentDisplayID = displayID
-
-        // Invalidate existing timer
-        timer?.invalidate()
-
-        // Create new timer
-        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task {
-                await self?.captureFrame(displayID: displayID)
-            }
-        }
-
-        // Fire immediately
-        Task {
-            await self.captureFrame(displayID: displayID)
-        }
-    }
-
-    /// Trigger an immediate capture and reset the timer
-    /// Called when window changes and captureOnWindowChange is enabled
-    func captureImmediateAndResetTimer() async {
-        guard let displayID = currentDisplayID else { return }
-        guard let config = currentConfig else { return }
-
-        // Capture immediately
-        await captureFrame(displayID: displayID)
-
-        // Reset the timer to restart the interval on main actor
-        await MainActor.run {
-            timer?.invalidate()
-            timer = Timer.scheduledTimer(withTimeInterval: config.captureIntervalSeconds, repeats: true) { [weak self] _ in
-                Task {
-                    await self?.captureFrame(displayID: displayID)
-                }
-            }
-        }
+    func captureFrame(displayID: CGDirectDisplayID) async -> CapturedFrame? {
+        currentDisplayID = displayID
+        return await captureFrameInternal(displayID: displayID)
     }
 
     /// Capture a single frame with real-time filtering of excluded apps and private windows
-    private func captureFrame(displayID: CGWindowID) async {
-        guard isActive, let config = currentConfig else { return }
+    private func captureFrameInternal(displayID: CGWindowID) async -> CapturedFrame? {
+        guard isActive, let config = currentConfig else { return nil }
 
         // Compute excluded window IDs for THIS capture (real-time filtering)
         let exclusionResult = await computeExcludedWindowIDs(config: config, displayID: displayID)
@@ -196,7 +135,7 @@ public actor CGWindowListCapture {
 
         if let captureBlockReason = screenLockStateMonitor.captureBlockReason() ?? exclusionResult.captureBlockReason {
             logCapturePauseIfNeeded(reason: captureBlockReason)
-            return
+            return nil
         }
         logCaptureResumeIfNeeded()
 
@@ -207,14 +146,14 @@ public actor CGWindowListCapture {
             forceMasking: !exclusionResult.redactedWindowIDs.isEmpty
         ) else {
             Log.warning("[CGWindowListCapture] Failed to capture CGImage for displayID=\(displayID), excludedCount=\(excludedIDs.count)", category: .capture)
-            return
+            return nil
         }
         let cgImage = captureResult.image
 
         // Convert CGImage to BGRA data format (matching ScreenCaptureKit output)
         guard let frameData = convertCGImageToBGRAData(cgImage) else {
             Log.warning("[CGWindowListCapture] Failed to convert CGImage to BGRA data for displayID=\(displayID)", category: .capture)
-            return
+            return nil
         }
 
         // Get display info and captured image dimensions
@@ -253,8 +192,7 @@ public actor CGWindowListCapture {
             )
         )
 
-        // Yield frame
-        onFrameCaptured?(frame)
+        return frame
     }
 
     /// Compute which window IDs should be excluded based on current config
