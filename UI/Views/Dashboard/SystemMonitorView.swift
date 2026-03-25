@@ -894,7 +894,7 @@ struct ActivityBarChart: View {
     private let tooltipEstimatedHeight: CGFloat = 56
     private let tooltipGapAboveBar: CGFloat = 8
     private let tooltipTopOverflowAllowance: CGFloat = 14
-    private let tooltipBubbleWidth: CGFloat = 55
+    private let tooltipBubbleWidth: CGFloat = 60
     private let tooltipHorizontalOverflowAllowance: CGFloat = 20
     private let tooltipPointerInset: CGFloat = 14
     private let backlogTransitionAnimation = Animation.spring(response: 0.28, dampingFraction: 0.84)
