@@ -81,6 +81,11 @@ final class CaptureIntervalSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsView.captureIntervalDisplayText(for: 0), "None")
     }
 
+    func testCaptureIntervalPickerIncludesDisabledOption() {
+        XCTAssertTrue(CaptureIntervalPicker.intervals.contains(0))
+        XCTAssertEqual(CaptureIntervalPicker.intervalLabel(0), "None")
+    }
+
     func testEventDrivenCaptureStorageHeuristicAddsRequestedWindowChangeAndClickOverheads() {
         let windowChangeOnly = SettingsView.eventDrivenCaptureStorageHeuristicGB(
             captureOnWindowChange: true,

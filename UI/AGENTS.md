@@ -39,11 +39,43 @@ UI/
 │   │   ├── FeedbackModels.swift         # Feedback launch context, diagnostics, and payload models
 │   │   └── FeedbackService.swift        # Feedback submission and export implementation
 │   └── Settings/
-│       ├── SettingsView.swift           # Settings root
-│       ├── CaptureSettings.swift        # Capture config
-│       ├── StorageSettings.swift        # Storage/retention
-│       ├── PrivacySettings.swift        # Exclusions/permissions
-│       └── AdvancedSettings.swift       # Power user options
+│       ├── SettingsView.swift           # Thin settings shell hosting navigation, alerts, and top-level wiring
+│       ├── SettingsSidebar.swift        # Sidebar navigation + content header
+│       ├── SettingsSearchOverlay.swift  # Cmd+K overlay and card routing
+│       ├── SettingsDefaults.swift       # Shared settings defaults + master-key setup support types
+│       ├── SettingsTab.swift            # Tab metadata and reset routing
+│       ├── SettingsSearchEntry.swift    # Search index entry model
+│       ├── SettingsSearchField.swift    # AppKit-backed search field
+│       ├── SettingsShortcutCaptureField.swift # Global shortcut recorder
+│       ├── SettingsCard.swift           # Shared settings card container
+│       ├── ExcludedAppChip.swift        # App exclusion chip
+│       ├── RetentionAppsChip.swift      # Retention app exclusion chip
+│       ├── RetentionTagsChip.swift      # Retention tag exclusion chip
+│       ├── FlowLayout.swift             # Flow layout helper for settings chips
+│       ├── DatabaseSchemaView.swift     # Database schema sheet content
+│       ├── InPageURLInstructionViews.swift # Reusable in-page URL instructions UI
+│       └── Sections/
+│           ├── GeneralSettingsView.swift
+│           ├── GeneralSettingsActions.swift
+│           ├── CaptureSettingsView.swift
+│           ├── CaptureSettingsActions.swift
+│           ├── InPageURLCollectionSettingsView.swift
+│           ├── InPageURLTargetSettingsActions.swift
+│           ├── InPageURLVerificationSettingsActions.swift
+│           ├── InPageURLVerificationScriptActions.swift
+│           ├── StorageSettingsView.swift
+│           ├── ExportDataSettingsView.swift
+│           ├── PrivacySettingsView.swift
+│           ├── PrivacyMasterKeyActions.swift
+│           ├── PrivacySettingsActions.swift
+│           ├── PhraseLevelRedactionSettingsView.swift
+│           ├── PrivateModeAutomationSettingsView.swift
+│           ├── PowerSettingsView.swift
+│           ├── TagManagementSettingsView.swift
+│           ├── AdvancedSettingsView.swift
+│           ├── SettingsFeedbackActions.swift
+│           ├── SettingsUtilityActions.swift
+│           └── SettingsLaunchAndResetActions.swift
 ├── CrashRecoveryHelper/
 │   └── main.swift                       # Bundled launch-agent XPC helper supervising unexpected app termination
 ├── CrashRecoverySupport/
@@ -69,9 +101,18 @@ UI/
 │   ├── FeedbackViewModel.swift          # Feedback form state, diagnostics, export, submission
 │   ├── FeedbackSubmissionProgress.swift # Feedback submission stage copy/progress metadata
 │   ├── QuickCommentComposerViewModel.swift # Standalone quick-comment target, tag, attachment, and submit state
-│   └── SettingsViewModel.swift
+│   ├── SettingsViewModel.swift
+│   └── Settings/
+│       ├── SettingsShellViewModel.swift
+│       ├── GeneralSettingsViewModel.swift
+│       ├── CaptureSettingsViewModel.swift
+│       ├── InPageURLSettingsViewModel.swift
+│       ├── StorageSettingsViewModel.swift
+│       ├── PrivacySettingsViewModel.swift
+│       ├── PowerSettingsViewModel.swift
+│       ├── TagsSettingsViewModel.swift
+│       └── AdvancedSettingsViewModel.swift
 └── Tests/
-    ├── TestLogger.swift                  # Shared UI test logging helpers
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
     ├── CrashRecoverySupportTests.swift   # Crash-recovery bundle resolution and registration policy coverage
@@ -90,7 +131,14 @@ UI/
     ├── DashboardAppUsageDateRangeTests.swift # Dashboard app-usage date-range normalization coverage
     ├── CaptureIntervalSettingsTests.swift # Live capture-interval config update coverage
     ├── ProcessCPUDisplayMetricsTests.swift # CPU sampler display math and live ranking coverage
-    └── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
+    ├── SearchHighlightTooltipTests.swift # Search highlight tooltip hover/dismiss coverage
+    ├── Dashboard/                        # Dashboard-specific XCTestCase files
+    ├── MenuBar/                          # Menu bar interaction tests
+    ├── Search/                           # Search/deeplink/overlay XCTestCase files
+    ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
+    ├── Support/                          # Shared XCTest helpers and support-only tests
+    ├── SystemMonitor/                    # System monitor XCTestCase files
+    └── Timeline/                         # Timeline XCTestCase files
 ```
 
 ## Feature Requirements

@@ -1,13 +1,13 @@
 import Foundation
 
 private enum EmbeddedBuildMetadata {
-    static let version = "dev"
-    static let buildNumber = "unknown"
-    static let gitCommit = "unknown"
-    static let gitCommitFull = "unknown"
-    static let gitBranch = "unknown"
-    static let buildDate = "unknown"
-    static let forkName = ""
+    static let version = SwiftPMBuildMetadata.version
+    static let buildNumber = SwiftPMBuildMetadata.buildNumber
+    static let gitCommit = SwiftPMBuildMetadata.gitCommit
+    static let gitCommitFull = SwiftPMBuildMetadata.gitCommitFull
+    static let gitBranch = SwiftPMBuildMetadata.gitBranch
+    static let buildDate = SwiftPMBuildMetadata.buildDate
+    static let forkName = SwiftPMBuildMetadata.forkName
 }
 
 /// Build metadata used by UI version surfaces.
@@ -15,7 +15,7 @@ private enum EmbeddedBuildMetadata {
 /// Resolution order:
 /// 1. Environment variables (for explicit local overrides)
 /// 2. Bundle Info.plist keys (for packaged apps)
-/// 3. Safe embedded defaults
+/// 3. SwiftPM-generated embedded defaults for local repo builds
 public enum BuildInfo {
     // MARK: - Defaults
 

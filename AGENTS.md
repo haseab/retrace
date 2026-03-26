@@ -164,15 +164,24 @@ retrace/
     ├── LaunchAgents/            # Embedded SMAppService launch-agent plists
     ├── Components/              # Reusable UI components (MenuBarManager, HotkeyManager, etc.)
     │   └── MasterKeyRedactionFlowCoordinator.swift # Shared missing-master-key prompt/recovery coordinator
-    ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback)
+    ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
+    │   └── Settings/            # Settings-specific view models and extracted helper logic
     ├── Views/
     │   ├── Dashboard/           # App usage analytics views
     │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
     │   ├── Search/              # Search UI (SearchView, ResultRow, FrameViewer)
-    │   ├── Settings/            # Settings panel
+    │   ├── Settings/            # Settings shell, support components, and extracted section/action files
+    │   │   └── Sections/        # Concern-split settings sections, verification flows, and shared actions
     │   ├── Onboarding/          # Onboarding flow
     │   └── Feedback/            # Feedback form & submission
     └── Tests/
+        ├── Dashboard/           # Dashboard-specific XCTestCase files
+        ├── MenuBar/             # Menu bar XCTestCase files
+        ├── Search/              # Search/deeplink XCTestCase files
+        ├── Settings/            # Settings XCTestCase files
+        ├── Support/             # Shared XCTest helpers and support-only tests
+        ├── SystemMonitor/       # System monitor XCTestCase files
+        └── Timeline/            # Timeline XCTestCase files
 ```
 
 ---
@@ -464,4 +473,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-21_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-03-24_
