@@ -222,7 +222,8 @@ public class MenuBarManager: ObservableObject {
         if !timelineShortcut.key.isEmpty {
             HotkeyManager.shared.registerHotkey(
                 key: timelineShortcut.key,
-                modifiers: timelineShortcut.modifiers.nsModifiers
+                modifiers: timelineShortcut.modifiers.nsModifiers,
+                allowsCarbonFallback: true
             ) { [weak self] in
                 self?.toggleTimelineOverlay()
             }
@@ -232,7 +233,8 @@ public class MenuBarManager: ObservableObject {
         if !dashboardShortcut.key.isEmpty {
             HotkeyManager.shared.registerHotkey(
                 key: dashboardShortcut.key,
-                modifiers: dashboardShortcut.modifiers.nsModifiers
+                modifiers: dashboardShortcut.modifiers.nsModifiers,
+                allowsCarbonFallback: true
             ) { [weak self] in
                 self?.toggleDashboard()
             }

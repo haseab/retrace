@@ -8,6 +8,20 @@ import Shared
 public class HotkeyManager: NSObject {
 
     private static let accessibilityPermissionRevokedNotification = Notification.Name("AccessibilityPermissionRevoked")
+    private static let carbonHotkeySignature: OSType = 0x5254484B // "RTHK"
+
+    private struct RegisteredHotkey {
+        let key: String
+        let modifiers: NSEvent.ModifierFlags
+        let allowsCarbonFallback: Bool
+        let callback: () -> Void
+    }
+
+    private struct CarbonHotkeyRegistration {
+        let id: UInt32
+        let hotkey: RegisteredHotkey
+        let ref: EventHotKeyRef
+    }
 
     // MARK: - Singleton
 
@@ -23,10 +37,12 @@ public class HotkeyManager: NSObject {
     private var eventTapRetainedSelf: UnsafeMutableRawPointer?
     private var isSettingUpEventTap = false
     private var eventTapSetupToken: UInt64 = 0
+    private var carbonEventHandler: EventHandlerRef?
+    private var carbonHotkeyRegistrations: [CarbonHotkeyRegistration] = []
 
     /// Registered hotkeys with their callbacks
     /// Uses character-based matching to support non-QWERTY keyboard layouts (DVORAK, Colemak, etc.)
-    private var hotkeys: [(key: String, modifiers: NSEvent.ModifierFlags, callback: () -> Void)] = []
+    private var hotkeys: [RegisteredHotkey] = []
 
     /// Whether hotkeys are pending registration (waiting for permissions)
     private var pendingSetup = false
@@ -87,11 +103,19 @@ public class HotkeyManager: NSObject {
     public func registerHotkey(
         key: String,
         modifiers: NSEvent.ModifierFlags,
+        allowsCarbonFallback: Bool = false,
         callback: @escaping () -> Void
     ) {
         Log.info("[HotkeyManager] Registering hotkey: key='\(key)' modifiers=\(modifierDescription(modifiers))", category: .ui)
         withStateLock {
-            hotkeys.append((key, modifiers, callback))
+            hotkeys.append(
+                RegisteredHotkey(
+                    key: key,
+                    modifiers: modifiers,
+                    allowsCarbonFallback: allowsCarbonFallback,
+                    callback: callback
+                )
+            )
         }
 
         // Start monitoring if not already
@@ -105,6 +129,7 @@ public class HotkeyManager: NSObject {
         withStateLock {
             hotkeys.removeAll()
         }
+        unregisterCarbonHotkeys()
         disableEventTap()
     }
 
@@ -112,6 +137,7 @@ public class HotkeyManager: NSObject {
         withStateLock {
             hotkeys.removeAll()
         }
+        unregisterCarbonHotkeys()
         tearDownEventTap()
     }
 
@@ -128,11 +154,16 @@ public class HotkeyManager: NSObject {
     /// Retry setting up event tap if permissions are now available
     /// Call this after user grants accessibility permission
     public func retrySetupIfNeeded() {
-        let shouldRetry = withStateLock {
-            pendingSetup && !hotkeys.isEmpty
+        let hasHotkeys = withStateLock { !hotkeys.isEmpty }
+        guard hasHotkeys else { return }
+
+        if hasHotkeyPermission() {
+            let shouldRetry = withStateLock { pendingSetup }
+            guard shouldRetry else { return }
+            startEventTap()
+        } else {
+            rebuildCarbonFallbackHotkeys()
         }
-        guard shouldRetry else { return }
-        startEventTap()
     }
 
     // MARK: - Keyboard Layout Cache
@@ -196,8 +227,11 @@ public class HotkeyManager: NSObject {
             withStateLock {
                 pendingSetup = true
             }
+            rebuildCarbonFallbackHotkeys()
             return
         }
+
+        unregisterCarbonHotkeys()
 
         // If tap already exists, just ensure it is enabled.
         if let tap = withStateLock({ eventTap }), CFMachPortIsValid(tap) {
@@ -241,6 +275,167 @@ public class HotkeyManager: NSObject {
         }
 
         thread.start()
+    }
+
+    private func rebuildCarbonFallbackHotkeys() {
+        guard !hasHotkeyPermission() else {
+            unregisterCarbonHotkeys()
+            return
+        }
+
+        let fallbackHotkeys = withStateLock {
+            hotkeys.filter(\.allowsCarbonFallback)
+        }
+        unregisterCarbonHotkeys()
+
+        guard !fallbackHotkeys.isEmpty else {
+            return
+        }
+
+        ensureCarbonEventHandlerInstalled()
+        let hasHandler = withStateLock { carbonEventHandler != nil }
+        guard hasHandler else { return }
+
+        for (index, hotkey) in fallbackHotkeys.enumerated() {
+            registerCarbonHotkey(hotkey, id: UInt32(index + 1))
+        }
+    }
+
+    private func ensureCarbonEventHandlerInstalled() {
+        let alreadyInstalled = withStateLock { carbonEventHandler != nil }
+        guard !alreadyInstalled else { return }
+
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let userData = Unmanaged.passUnretained(self).toOpaque()
+        var handlerRef: EventHandlerRef?
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                guard let event, let userData else {
+                    return OSStatus(eventNotHandledErr)
+                }
+                let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
+                return manager.handleCarbonHotkeyEvent(event)
+            },
+            1,
+            &eventType,
+            userData,
+            &handlerRef
+        )
+
+        guard status == noErr, let handlerRef else {
+            Log.error("[HotkeyManager] Failed to install Carbon hotkey handler status=\(status)", category: .ui)
+            return
+        }
+
+        withStateLock {
+            carbonEventHandler = handlerRef
+        }
+    }
+
+    private func registerCarbonHotkey(_ hotkey: RegisteredHotkey, id: UInt32) {
+        let keyCode = UInt32(keyCodeForString(hotkey.key))
+        let modifiers = carbonModifierFlags(from: hotkey.modifiers)
+        let hotKeyID = EventHotKeyID(signature: Self.carbonHotkeySignature, id: id)
+
+        var hotKeyRef: EventHotKeyRef?
+        var status = RegisterEventHotKey(
+            keyCode,
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            OptionBits(kEventHotKeyExclusive),
+            &hotKeyRef
+        )
+
+        if status == eventHotKeyExistsErr {
+            status = RegisterEventHotKey(
+                keyCode,
+                modifiers,
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &hotKeyRef
+            )
+        }
+
+        guard status == noErr, let hotKeyRef else {
+            Log.warning(
+                "[HotkeyManager] Failed to register Carbon fallback hotkey key='\(hotkey.key)' modifiers=\(modifierDescription(hotkey.modifiers)) status=\(status)",
+                category: .ui
+            )
+            return
+        }
+
+        withStateLock {
+            carbonHotkeyRegistrations.append(
+                CarbonHotkeyRegistration(id: id, hotkey: hotkey, ref: hotKeyRef)
+            )
+        }
+        Log.info(
+            "[HotkeyManager] Registered Carbon fallback hotkey key='\(hotkey.key)' modifiers=\(modifierDescription(hotkey.modifiers))",
+            category: .ui
+        )
+    }
+
+    private func unregisterCarbonHotkeys() {
+        let teardownState = withStateLock { () -> ([CarbonHotkeyRegistration], EventHandlerRef?) in
+            let registrations = carbonHotkeyRegistrations
+            let handler = carbonEventHandler
+            carbonHotkeyRegistrations.removeAll()
+            carbonEventHandler = nil
+            return (registrations, handler)
+        }
+
+        for registration in teardownState.0 {
+            let status = UnregisterEventHotKey(registration.ref)
+            if status != noErr {
+                Log.warning(
+                    "[HotkeyManager] Failed to unregister Carbon hotkey id=\(registration.id) status=\(status)",
+                    category: .ui
+                )
+            }
+        }
+
+        if let handler = teardownState.1 {
+            RemoveEventHandler(handler)
+        }
+    }
+
+    private func handleCarbonHotkeyEvent(_ event: EventRef) -> OSStatus {
+        var hotKeyID = EventHotKeyID(signature: 0, id: 0)
+        let status = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+
+        guard status == noErr else {
+            return status
+        }
+
+        guard hotKeyID.signature == Self.carbonHotkeySignature else {
+            return OSStatus(eventNotHandledErr)
+        }
+
+        let hotkey = withStateLock {
+            carbonHotkeyRegistrations.first { $0.id == hotKeyID.id }?.hotkey
+        }
+        guard let hotkey else {
+            return OSStatus(eventNotHandledErr)
+        }
+
+        DispatchQueue.main.async {
+            hotkey.callback()
+        }
+        return noErr
     }
 
     private func setupEventTapOnDedicatedThread(expectedSetupToken: UInt64) {
@@ -324,6 +519,7 @@ public class HotkeyManager: NSObject {
         withStateLock {
             pendingSetup = true
         }
+        rebuildCarbonFallbackHotkeys()
     }
 
     private func disableEventTap() {
@@ -486,31 +682,46 @@ public class HotkeyManager: NSObject {
 
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         // Get the character for this key event, respecting keyboard layout
-        let pressedKey = characterForEvent(event, keyCode: keyCode)
+        let pressedKey = characterForKeyCode(keyCode)
 
         let eventModifiers = modifierFlags(from: flags)
 
-        // Check if this matches any registered hotkey using character-based comparison
+        if handleMatchedHotkey(
+            pressedKey: pressedKey,
+            eventModifiers: eventModifiers,
+            hotkeysSnapshot: hotkeysSnapshot
+        ) {
+            // Consume the event to prevent system beep
+            // Return nil to indicate the event was handled
+            return nil
+        }
+
+        return Unmanaged.passUnretained(event)
+    }
+
+    @discardableResult
+    private func handleMatchedHotkey(
+        pressedKey: String,
+        eventModifiers: NSEvent.ModifierFlags,
+        hotkeysSnapshot: [RegisteredHotkey]
+    ) -> Bool {
+        let relevantModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control]
+
         for hotkey in hotkeysSnapshot {
             // Compare characters case-insensitively for letter keys
             let keysMatch = pressedKey.lowercased() == hotkey.key.lowercased()
             let modifiersMatch = eventModifiers.intersection(relevantModifiers) == hotkey.modifiers.intersection(relevantModifiers)
 
             if keysMatch && modifiersMatch {
-                // Execute callback on main thread
                 let callback = hotkey.callback
-
                 DispatchQueue.main.async {
                     callback()
                 }
-
-                // Consume the event to prevent system beep
-                // Return nil to indicate the event was handled
-                return nil
+                return true
             }
         }
 
-        return Unmanaged.passUnretained(event)
+        return false
     }
 
     private func modifierFlags(from flags: CGEventFlags) -> NSEvent.ModifierFlags {
@@ -520,6 +731,15 @@ public class HotkeyManager: NSObject {
         if flags.contains(.maskAlternate) { modifiers.insert(.option) }
         if flags.contains(.maskControl) { modifiers.insert(.control) }
         return modifiers
+    }
+
+    private func carbonModifierFlags(from modifiers: NSEvent.ModifierFlags) -> UInt32 {
+        var carbonFlags: UInt32 = 0
+        if modifiers.contains(.command) { carbonFlags |= UInt32(cmdKey) }
+        if modifiers.contains(.shift) { carbonFlags |= UInt32(shiftKey) }
+        if modifiers.contains(.option) { carbonFlags |= UInt32(optionKey) }
+        if modifiers.contains(.control) { carbonFlags |= UInt32(controlKey) }
+        return carbonFlags
     }
 
     @discardableResult
@@ -534,7 +754,7 @@ public class HotkeyManager: NSObject {
     ///   - event: The CGEvent to extract the character from
     ///   - keyCode: The key code (used for special keys like Space, Return, etc.)
     /// - Returns: The character string representing the pressed key
-    private func characterForEvent(_ event: CGEvent, keyCode: UInt16) -> String {
+    private func characterForKeyCode(_ keyCode: UInt16) -> String {
         // Handle special keys that don't have character representations
         switch keyCode {
         case 49: return "Space"
