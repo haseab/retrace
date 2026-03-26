@@ -7,6 +7,48 @@ import App
 
 @MainActor
 final class SystemMonitorChartGeometryTests: XCTestCase {
+    func testLayoutMetricsClampUndersizedContainerToNonNegativeFrames() {
+        let metrics = ActivityBarChart.layoutMetrics(
+            totalWidth: 12,
+            totalHeight: 8,
+            dataPointCount: 30,
+            pendingCount: 250,
+            backlogBarCap: 100,
+            maxVisibleBacklogBars: 10,
+            xAxisHeight: 1,
+            labelPadding: 4,
+            labelHeight: 12,
+            singleBarWidth: 28,
+            backlogSpacing: 2,
+            spacing: 1
+        )
+
+        XCTAssertEqual(metrics.chartHeight, 0, accuracy: 0.001)
+        XCTAssertEqual(metrics.chartWidth, 0, accuracy: 0.001)
+        XCTAssertEqual(metrics.barWidth, 3, accuracy: 0.001)
+    }
+
+    func testLayoutMetricsHandleEmptyDataWithoutNonFiniteBarWidth() {
+        let metrics = ActivityBarChart.layoutMetrics(
+            totalWidth: 320,
+            totalHeight: 160,
+            dataPointCount: 0,
+            pendingCount: 0,
+            backlogBarCap: 100,
+            maxVisibleBacklogBars: 10,
+            xAxisHeight: 1,
+            labelPadding: 4,
+            labelHeight: 12,
+            singleBarWidth: 28,
+            backlogSpacing: 2,
+            spacing: 1
+        )
+
+        XCTAssertEqual(metrics.chartHeight, 143, accuracy: 0.001)
+        XCTAssertEqual(metrics.chartWidth, 320, accuracy: 0.001)
+        XCTAssertEqual(metrics.barWidth, 320, accuracy: 0.001)
+    }
+
     func testHoveredDataIndexMapsExtremeEdgesToFirstAndLastBars() {
         XCTAssertEqual(
             ActivityBarChart.hoveredDataIndex(

@@ -195,9 +195,9 @@ let package = Package(
         // Models (*.bin, *.gguf) - downloaded at runtime on first launch
 
         // SQLCipher for reading encrypted Rewind database
-        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", from: "1.0.0"),
+        .package(url: "https://github.com/skiptools/swift-sqlcipher.git", exact: "1.7.0"),
         // Sparkle for auto-updates
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.6.0"),
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", exact: "2.8.1"),
         // SwiftyChrono for natural language date parsing (batmac fork with Swift 5.5+ support)
         .package(url: "https://github.com/batmac/SwiftyChrono.git", revision: "e1bf3bde0f09112909157360b6bf39302f10ae5f")
     ],

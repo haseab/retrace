@@ -33,6 +33,8 @@ public actor FTSManager: FTSProtocol {
             let errorMsg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
+
+        SQLiteRuntimeDiagnostics.log(label: "FTSManager/open", db: db)
     }
 
     /// Close the database connection
@@ -75,9 +77,14 @@ public actor FTSManager: FTSProtocol {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSManager] Failed to prepare search statement: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -167,9 +174,14 @@ public actor FTSManager: FTSProtocol {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSManager] Failed to prepare count statement: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 

@@ -876,6 +876,16 @@ private struct ActivityMonitorCardModel {
 // MARK: - Processing Bar Chart
 
 struct ActivityBarChart: View {
+    struct LayoutMetrics {
+        let chartHeight: CGFloat
+        let chartWidth: CGFloat
+        let barWidth: CGFloat
+        let backlogWidth: CGFloat
+        let separatorWidth: CGFloat
+        let totalBacklogBarCount: Int
+        let visibleBacklogBarCount: Int
+    }
+
     let dataPoints: [ProcessingDataPoint]
     let pendingCount: Int
     let processingCount: Int
@@ -901,27 +911,34 @@ struct ActivityBarChart: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let totalWidth = geometry.size.width
             let xAxisHeight: CGFloat = 1  // x-axis line
             let labelPadding: CGFloat = 4  // space between axis and labels
             let labelHeight: CGFloat = 12  // actual label height
-            let bottomAreaHeight = xAxisHeight + labelPadding + labelHeight
-            let chartHeight = geometry.size.height - bottomAreaHeight
-
-            // Reserve space for backlog section if there's pending work
-            let hasBacklog = pendingCount > 0
-            // Total backlog bars represented by pending count (each bar shows up to backlogBarCap)
-            let totalBacklogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
-            // Render only the most recent backlog bars to avoid overflow in the chart UI.
-            let visibleBacklogBarCount = min(totalBacklogBarCount, maxVisibleBacklogBars)
-            let singleBarWidth: CGFloat = 28
             let backlogSpacing: CGFloat = 2
-            let backlogWidth: CGFloat = hasBacklog ? CGFloat(visibleBacklogBarCount) * singleBarWidth + CGFloat(max(0, visibleBacklogBarCount - 1)) * backlogSpacing + 12 : 0
-            let separatorWidth: CGFloat = hasBacklog ? 12 : 0
-            let chartWidth = totalWidth - backlogWidth - separatorWidth
-
             let spacing: CGFloat = 1
-            let barWidth = max(3, (chartWidth - CGFloat(dataPoints.count - 1) * spacing) / CGFloat(dataPoints.count))
+            let singleBarWidth: CGFloat = 28
+            let metrics = Self.layoutMetrics(
+                totalWidth: geometry.size.width,
+                totalHeight: geometry.size.height,
+                dataPointCount: dataPoints.count,
+                pendingCount: pendingCount,
+                backlogBarCap: backlogBarCap,
+                maxVisibleBacklogBars: maxVisibleBacklogBars,
+                xAxisHeight: xAxisHeight,
+                labelPadding: labelPadding,
+                labelHeight: labelHeight,
+                singleBarWidth: singleBarWidth,
+                backlogSpacing: backlogSpacing,
+                spacing: spacing
+            )
+            let chartHeight = metrics.chartHeight
+            let chartWidth = metrics.chartWidth
+            let barWidth = metrics.barWidth
+            let backlogWidth = metrics.backlogWidth
+            let separatorWidth = metrics.separatorWidth
+            let totalBacklogBarCount = metrics.totalBacklogBarCount
+            let visibleBacklogBarCount = metrics.visibleBacklogBarCount
+            let hasBacklog = totalBacklogBarCount > 0
 
             // For live bar: total = processed this minute + currently processing
             let lastIndex = dataPoints.count - 1
@@ -1059,7 +1076,7 @@ struct ActivityBarChart: View {
                 // X-axis line (spans full width including backlog)
                 Rectangle()
                     .fill(Color.retraceSecondary.opacity(0.2))
-                    .frame(height: -1)
+                    .frame(height: xAxisHeight)
 
                 // X-axis labels
                 HStack(spacing: 0) {
@@ -1395,6 +1412,52 @@ struct ActivityBarChart: View {
 
         let index = Int(floor((max(0, x) + (spacing / 2)) / stride))
         return min(max(index, 0), dataPointCount - 1)
+    }
+
+    static func layoutMetrics(
+        totalWidth: CGFloat,
+        totalHeight: CGFloat,
+        dataPointCount: Int,
+        pendingCount: Int,
+        backlogBarCap: Int,
+        maxVisibleBacklogBars: Int,
+        xAxisHeight: CGFloat,
+        labelPadding: CGFloat,
+        labelHeight: CGFloat,
+        singleBarWidth: CGFloat,
+        backlogSpacing: CGFloat,
+        spacing: CGFloat
+    ) -> LayoutMetrics {
+        let clampedTotalWidth = max(totalWidth, 0)
+        let clampedTotalHeight = max(totalHeight, 0)
+        let bottomAreaHeight = xAxisHeight + labelPadding + labelHeight
+        // Clamp chart dimensions so transient window/layout states never feed
+        // negative or non-finite frame sizes back into SwiftUI.
+        let chartHeight = max(clampedTotalHeight - bottomAreaHeight, 0)
+
+        let hasBacklog = pendingCount > 0
+        let totalBacklogBarCount = hasBacklog ? max(1, Int(ceil(Double(pendingCount) / Double(backlogBarCap)))) : 0
+        let visibleBacklogBarCount = min(totalBacklogBarCount, maxVisibleBacklogBars)
+        let separatorWidth: CGFloat = hasBacklog ? 12 : 0
+        let backlogWidth: CGFloat = hasBacklog
+            ? CGFloat(visibleBacklogBarCount) * singleBarWidth
+                + CGFloat(max(0, visibleBacklogBarCount - 1)) * backlogSpacing
+                + 12
+            : 0
+        let chartWidth = max(clampedTotalWidth - backlogWidth - separatorWidth, 0)
+        let safeDataPointCount = max(dataPointCount, 1)
+        let spacingWidth = CGFloat(max(dataPointCount - 1, 0)) * spacing
+        let barWidth = max(3, max(chartWidth - spacingWidth, 0) / CGFloat(safeDataPointCount))
+
+        return LayoutMetrics(
+            chartHeight: chartHeight,
+            chartWidth: chartWidth,
+            barWidth: barWidth,
+            backlogWidth: backlogWidth,
+            separatorWidth: separatorWidth,
+            totalBacklogBarCount: totalBacklogBarCount,
+            visibleBacklogBarCount: visibleBacklogBarCount
+        )
     }
 
     static func clampedTooltipCenterX(

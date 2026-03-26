@@ -54,6 +54,26 @@ final class QuitConfirmationPresentationTests: XCTestCase {
 
         XCTAssertNil(anchor)
     }
+
+    func testFreshLaunchContinuesWhenCurrentProcessOwnsLockEvenIfMatchingRunningAppStillExists() {
+        XCTAssertEqual(
+            AppDelegate.freshLaunchAction(
+                hasSingleInstanceLock: true,
+                matchingRunningAppDetected: true
+            ),
+            .continueLaunchIgnoringStaleRunningApp
+        )
+    }
+
+    func testFreshLaunchActivatesExistingInstanceWhenLockCannotBeAcquired() {
+        XCTAssertEqual(
+            AppDelegate.freshLaunchAction(
+                hasSingleInstanceLock: false,
+                matchingRunningAppDetected: true
+            ),
+            .activateExistingInstance
+        )
+    }
 }
 
 private final class StubQuitConfirmationWindow: NSWindow {

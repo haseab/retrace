@@ -73,6 +73,34 @@ final class DatabaseManagerTests: XCTestCase {
         )
     }
 
+    func testDatabaseSupportsFTS5VirtualTablesAtRuntime() async throws {
+        guard let db = await database.getConnection() else {
+            XCTFail("Database connection should be available after initialization")
+            return
+        }
+
+        try executeRawSQL(
+            """
+            CREATE VIRTUAL TABLE temp.retrace_fts5_runtime_probe USING fts5(content);
+            """,
+            db: db
+        )
+
+        XCTAssertEqual(
+            try fetchInt64(
+                """
+                SELECT COUNT(*)
+                FROM sqlite_temp_master
+                WHERE type = 'table' AND name = 'retrace_fts5_runtime_probe';
+                """,
+                db: db
+            ),
+            1
+        )
+
+        try executeRawSQL("DROP TABLE temp.retrace_fts5_runtime_probe;", db: db)
+    }
+
     func testMigrationFromV14LeavesLegacyDocSegmentAndFTSStateUntouched() async throws {
         let testRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("RetraceDatabaseLegacyMigrationTests_\(UUID().uuidString)", isDirectory: true)

@@ -21,6 +21,10 @@ BUNDLE_ID="io.retrace.app"
 BUILD_DIR="build/Release"
 RELEASES_DIR="releases"
 APPCAST_FILE="appcast.xml"
+XCODE_PROJECT_PATH="Retrace.xcodeproj"
+DERIVED_DATA_PATH="build/DerivedData"
+SWIFTPM_RESOLVED_SOURCE="Package.resolved"
+SWIFTPM_RESOLVED_DEST="${XCODE_PROJECT_PATH}/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 
 # Colors for output
 RED='\033[0;31m'
@@ -28,6 +32,16 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+sync_swiftpm_resolution() {
+    if [ ! -f "$SWIFTPM_RESOLVED_SOURCE" ]; then
+        echo -e "${RED}ERROR: Missing ${SWIFTPM_RESOLVED_SOURCE}${NC}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$SWIFTPM_RESOLVED_DEST")"
+    cp "$SWIFTPM_RESOLVED_SOURCE" "$SWIFTPM_RESOLVED_DEST"
+}
 
 echo -e "${BLUE}================================================${NC}"
 echo -e "${BLUE}  Retrace Release Builder${NC}"
@@ -75,6 +89,14 @@ echo ""
 echo -e "${YELLOW}Step 2: Generating Xcode project...${NC}"
 if command -v xcodegen &> /dev/null; then
     xcodegen generate
+    sync_swiftpm_resolution
+    rm -rf "$DERIVED_DATA_PATH"
+    xcodebuild -resolvePackageDependencies \
+        -project "$XCODE_PROJECT_PATH" \
+        -scheme Retrace \
+        -derivedDataPath "$DERIVED_DATA_PATH" \
+        -disableAutomaticPackageResolution \
+        -onlyUsePackageVersionsFromResolvedFile
     echo "  Xcode project generated"
 else
     echo -e "${RED}  ERROR: xcodegen not found. Install with: brew install xcodegen${NC}"
@@ -109,17 +131,23 @@ echo -e "${YELLOW}Step 3: Archiving...${NC}"
 ARCHIVE_PATH="build/${APP_NAME}.xcarchive"
 rm -rf "$ARCHIVE_PATH"
 
-xcodebuild -project Retrace.xcodeproj \
+xcodebuild -project "$XCODE_PROJECT_PATH" \
     -scheme Retrace \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
+    -derivedDataPath "$DERIVED_DATA_PATH" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
     clean archive \
     "${XCODE_BUILDINFO_ARGS[@]}" \
     CODE_SIGN_IDENTITY="Developer ID Application" \
-    | xcbeautify || xcodebuild -project Retrace.xcodeproj \
+    | xcbeautify || xcodebuild -project "$XCODE_PROJECT_PATH" \
     -scheme Retrace \
     -configuration Release \
     -archivePath "$ARCHIVE_PATH" \
+    -derivedDataPath "$DERIVED_DATA_PATH" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
     clean archive \
     "${XCODE_BUILDINFO_ARGS[@]}" \
     CODE_SIGN_IDENTITY="Developer ID Application"

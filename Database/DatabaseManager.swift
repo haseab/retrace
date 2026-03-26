@@ -1,7 +1,88 @@
+import CryptoKit
+import Darwin
 import Foundation
 import SQLCipher
 import Shared
-import CryptoKit
+
+enum SQLiteRuntimeDiagnostics {
+    static func summary(db: OpaquePointer?) -> String {
+        let version = String(cString: sqlite3_libversion())
+        let sourceID = String(cString: sqlite3_sourceid())
+        let sourcePrefix = String(sourceID.prefix(18))
+        let fts5Enabled = compileOptionEnabled("ENABLE_FTS5")
+        let hasCodec = compileOptionEnabled("HAS_CODEC")
+        let omitLoadExtension = compileOptionEnabled("OMIT_LOAD_EXTENSION")
+        let threadsafe = sqlite3_threadsafe()
+        let mainDatabase = mainDatabaseFilename(db: db)
+        let openImage = imagePath(forSymbolNamed: "sqlite3_open_v2")
+        let prepareImage = imagePath(forSymbolNamed: "sqlite3_prepare_v2")
+        let errmsgImage = imagePath(forSymbolNamed: "sqlite3_errmsg")
+        let probeResult = fts5ProbeResult(db: db)
+
+        return """
+        version=\(version) source=\(sourcePrefix) \
+        compile(fts5=\(fts5Enabled),codec=\(hasCodec),omitLoadExtension=\(omitLoadExtension),threadsafe=\(threadsafe)) \
+        images(open=\(openImage),prepare=\(prepareImage),errmsg=\(errmsgImage)) \
+        mainDb=\(mainDatabase) probe=\(probeResult)
+        """
+    }
+
+    static func log(label: String, db: OpaquePointer?) {
+        Log.info("[\(label)] SQLite runtime: \(summary(db: db))", category: .database)
+    }
+
+    private static func compileOptionEnabled(_ option: String) -> Bool {
+        option.withCString { sqlite3_compileoption_used($0) == 1 }
+    }
+
+    private static func mainDatabaseFilename(db: OpaquePointer?) -> String {
+        guard let db else { return "nil" }
+        guard let filename = "main".withCString({ sqlite3_db_filename(db, $0) }) else {
+            return "unknown"
+        }
+        return String(cString: filename)
+    }
+
+    private static func imagePath(forSymbolNamed symbolName: String) -> String {
+        guard let handle = dlopen(nil, RTLD_NOW), let symbol = dlsym(handle, symbolName) else {
+            return "unresolved"
+        }
+
+        var info = Dl_info()
+        guard dladdr(symbol, &info) != 0, let filename = info.dli_fname else {
+            return "unresolved"
+        }
+
+        return String(cString: filename)
+    }
+
+    private static func fts5ProbeResult(db: OpaquePointer?) -> String {
+        guard let db else { return "no-db" }
+
+        let tableName = "__retrace_runtime_probe_\(UUID().uuidString.replacingOccurrences(of: "-", with: "_"))"
+        let createSQL = "CREATE VIRTUAL TABLE temp.\(tableName) USING fts5(content);"
+        var errorMessage: UnsafeMutablePointer<CChar>?
+
+        if sqlite3_exec(db, createSQL, nil, nil, &errorMessage) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(errorMessage)
+            return "failed(\(message))"
+        }
+
+        sqlite3_free(errorMessage)
+        errorMessage = nil
+
+        let dropSQL = "DROP TABLE IF EXISTS temp.\(tableName);"
+        if sqlite3_exec(db, dropSQL, nil, nil, &errorMessage) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            sqlite3_free(errorMessage)
+            return "ok/drop-failed(\(message))"
+        }
+
+        sqlite3_free(errorMessage)
+        return "ok"
+    }
+}
 
 public struct FrameInPageURLRow: Sendable, Equatable {
     public let order: Int
@@ -210,6 +291,7 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: errorMsg)
         }
         Log.debug("[DatabaseManager] Database opened successfully", category: .database)
+        SQLiteRuntimeDiagnostics.log(label: "DatabaseManager/open", db: db)
 
         // Set encryption key (SQLCipher) if encryption is enabled and not in-memory
         if !isInMemory {
@@ -220,6 +302,10 @@ public actor DatabaseManager: DatabaseProtocol {
         Log.debug("[DatabaseManager] Executing pragmas...", category: .database)
         try executePragmas()
         Log.debug("[DatabaseManager] Pragmas executed", category: .database)
+
+        Log.debug("[DatabaseManager] Verifying FTS5 runtime support...", category: .database)
+        try verifyFTS5RuntimeSupport()
+        Log.debug("[DatabaseManager] FTS5 runtime support verified", category: .database)
 
         // Run migrations
         Log.debug("[DatabaseManager] Running migrations...", category: .database)
@@ -2989,6 +3075,43 @@ public actor DatabaseManager: DatabaseProtocol {
         }
 
         Log.debug("[DatabaseManager] Database encryption key set successfully", category: .database)
+    }
+
+    private func verifyFTS5RuntimeSupport() throws {
+        guard let db = db else {
+            throw DatabaseError.connectionFailed(underlying: "Database not initialized")
+        }
+
+        let failureGuidance = "This build's SQLite/SQLCipher runtime cannot support search indexing. Verify that Xcode is using the pinned Package.resolved versions for swift-sqlcipher."
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        defer {
+            sqlite3_free(errorMessage)
+        }
+
+        let createProbeSQL = "CREATE VIRTUAL TABLE temp.__retrace_fts5_probe USING fts5(content);"
+        guard sqlite3_exec(db, createProbeSQL, nil, nil, &errorMessage) == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            let runtimeSummary = SQLiteRuntimeDiagnostics.summary(db: db)
+            Log.critical(
+                "[DatabaseManager] FTS5 runtime probe failed: \(message). \(failureGuidance) Runtime: \(runtimeSummary)",
+                category: .database
+            )
+            throw DatabaseError.connectionFailed(
+                underlying: "FTS5 runtime probe failed: \(message). \(failureGuidance) Runtime: \(runtimeSummary)"
+            )
+        }
+
+        sqlite3_free(errorMessage)
+        errorMessage = nil
+
+        let dropProbeSQL = "DROP TABLE temp.__retrace_fts5_probe;"
+        if sqlite3_exec(db, dropProbeSQL, nil, nil, &errorMessage) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "Unknown error"
+            Log.warning(
+                "[DatabaseManager] Failed to drop temporary FTS5 probe table: \(message)",
+                category: .database
+            )
+        }
     }
 
     /// Save encryption key to Keychain

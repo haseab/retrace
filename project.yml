@@ -280,10 +280,10 @@ schemes:
 packages:
   swift-sqlcipher:
     url: https://github.com/skiptools/swift-sqlcipher.git
-    from: "1.0.0"
+    exactVersion: "1.7.0"
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle.git
-    from: "2.6.0"
+    exactVersion: "2.8.1"
   SwiftyChrono:
     url: https://github.com/batmac/SwiftyChrono.git
     revision: "e1bf3bde0f09112909157360b6bf39302f10ae5f"

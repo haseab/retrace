@@ -40,9 +40,14 @@ enum FTSQueries {
         }
 
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSQueries] Failed to prepare searchRanking insert: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 
@@ -51,9 +56,14 @@ enum FTSQueries {
         bindTextOrNull(statement, 3, windowTitle)
 
         guard sqlite3_step(statement) == SQLITE_DONE else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            Log.error(
+                "[FTSQueries] Failed to execute searchRanking insert: \(errorMessage). Runtime: \(SQLiteRuntimeDiagnostics.summary(db: db))",
+                category: .database
+            )
             throw DatabaseError.queryFailed(
                 query: sql,
-                underlying: String(cString: sqlite3_errmsg(db))
+                underlying: errorMessage
             )
         }
 

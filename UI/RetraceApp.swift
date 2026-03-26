@@ -162,6 +162,12 @@ struct RetraceApp: App {
 class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static private(set) var isApplicationTerminating = false
 
+    enum FreshLaunchAction: Equatable {
+        case continueLaunch
+        case continueLaunchIgnoringStaleRunningApp
+        case activateExistingInstance
+    }
+
     var menuBarManager: MenuBarManager?
     private var coordinatorWrapper: AppCoordinatorWrapper?
     private var sleepWakeObservers: [NSObjectProtocol] = []
@@ -233,8 +239,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let hasSingleInstanceLock = acquireSingleInstanceLock()
-        if !hasSingleInstanceLock || isAnotherInstanceRunning() {
+        let freshLaunchAction = Self.freshLaunchAction(
+            hasSingleInstanceLock: acquireSingleInstanceLock(),
+            matchingRunningAppDetected: isAnotherInstanceRunning()
+        )
+
+        switch freshLaunchAction {
+        case .continueLaunch:
+            break
+        case .continueLaunchIgnoringStaleRunningApp:
+            Log.warning(
+                "[AppDelegate] Matching running application detected after acquiring the single-instance lock; continuing launch because the lock is authoritative and the other instance is likely terminating.",
+                category: .app
+            )
+        case .activateExistingInstance:
             Log.info("[AppDelegate] Another instance already running, activating it", category: .app)
             activateExistingInstance()
             requestImmediateTermination(skipQuitConfirmation: true)
@@ -1581,6 +1599,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         SingleInstanceLock.release(descriptor: &singleInstanceLockFileDescriptor)
     }
 
+    static func freshLaunchAction(
+        hasSingleInstanceLock: Bool,
+        matchingRunningAppDetected: Bool
+    ) -> FreshLaunchAction {
+        guard hasSingleInstanceLock else {
+            return .activateExistingInstance
+        }
+
+        if matchingRunningAppDetected {
+            return .continueLaunchIgnoringStaleRunningApp
+        }
+
+        return .continueLaunch
+    }
+
     private func lockFileInstancePID() -> pid_t? {
         guard let data = FileManager.default.contents(atPath: Self.singleInstanceLockPath),
               let lockContents = String(data: data, encoding: .utf8)?
@@ -1778,7 +1811,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Self.isApplicationTerminating = true
-        releaseSingleInstanceLock()
+        // Keep the single-instance lock until the process actually exits.
+        // Releasing it here lets a fresh launch race against a half-dead instance
+        // that still appears in NSWorkspace.runningApplications.
 
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         for observer in sleepWakeObservers {
@@ -1806,7 +1841,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         Log.info("[AppDelegate] Application terminating", category: .app)
     }
-
     // MARK: - URL Handling
 
     func application(_ application: NSApplication, open urls: [URL]) {

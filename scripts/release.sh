@@ -17,6 +17,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+sync_swiftpm_resolution() {
+    if [ ! -f "${SWIFTPM_RESOLVED_SOURCE}" ]; then
+        echo -e "${RED}✗ Missing ${SWIFTPM_RESOLVED_SOURCE}${NC}"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "${SWIFTPM_RESOLVED_DEST}")"
+    cp "${SWIFTPM_RESOLVED_SOURCE}" "${SWIFTPM_RESOLVED_DEST}"
+}
+
 # Check arguments
 if [ $# -lt 2 ]; then
     echo -e "${RED}Usage: $0 <version> <build_number>${NC}"
@@ -33,6 +43,10 @@ DMG_PATH="${PROJECT_DIR}/build/${DMG_NAME}"
 SPARKLE_SIGN="/Users/haseab/Library/Developer/Xcode/DerivedData/Retrace-geulxxkzgiewidaakescdtxvqmpc/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
 R2_BUCKET="retrace"
 ENV_FILE="${PROJECT_DIR}/.env"
+XCODE_PROJECT_PATH="${PROJECT_DIR}/Retrace.xcodeproj"
+DERIVED_DATA_PATH="${PROJECT_DIR}/build/DerivedData"
+SWIFTPM_RESOLVED_SOURCE="${PROJECT_DIR}/Package.resolved"
+SWIFTPM_RESOLVED_DEST="${XCODE_PROJECT_PATH}/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 
 # Load local environment variables for release credentials.
 if [ -f "${ENV_FILE}" ]; then
@@ -73,11 +87,26 @@ echo -e "${GREEN}✓ Updated to version ${VERSION} (build ${BUILD_NUMBER})${NC}"
 echo -e "${YELLOW}[2/10] Regenerating Xcode project...${NC}"
 cd "${PROJECT_DIR}"
 xcodegen generate
-echo -e "${GREEN}✓ Xcode project regenerated${NC}"
+sync_swiftpm_resolution
+rm -rf "${DERIVED_DATA_PATH}"
+xcodebuild -project "${XCODE_PROJECT_PATH}" \
+    -scheme Retrace \
+    -derivedDataPath "${DERIVED_DATA_PATH}" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
+    -resolvePackageDependencies > /dev/null
+echo -e "${GREEN}✓ Xcode project regenerated with pinned Swift packages${NC}"
 
 # Step 3: Archive
 echo -e "${YELLOW}[3/10] Archiving app (this may take a few minutes)...${NC}"
-xcodebuild -scheme Retrace -configuration Release -archivePath build/Retrace.xcarchive archive 2>&1 | grep -E "(ARCHIVE SUCCEEDED|error:)" || true
+xcodebuild -project "${XCODE_PROJECT_PATH}" \
+    -scheme Retrace \
+    -configuration Release \
+    -archivePath "${PROJECT_DIR}/build/Retrace.xcarchive" \
+    -derivedDataPath "${DERIVED_DATA_PATH}" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
+    archive 2>&1 | grep -E "(ARCHIVE SUCCEEDED|error:)" || true
 if [ ! -d "${PROJECT_DIR}/build/Retrace.xcarchive" ]; then
     echo -e "${RED}✗ Archive failed${NC}"
     exit 1
